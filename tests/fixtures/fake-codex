@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+record="${FAKE_RECORD_DIR:?}"
+mkdir -p "$record"
+printf '%s\n' "$*" >> "$record/codex-argv.txt"
+
+if [ "${1:-}" = "queue" ]; then
+  prev=
+  msg=
+  thread=
+  for arg in "$@"; do
+    if [ "$prev" = "--message" ]; then
+      msg=$arg
+    fi
+    if [ "$prev" = "--thread" ]; then
+      thread=$arg
+    fi
+    prev=$arg
+  done
+  printf '%s\n' "$thread" >> "$record/queue-threads.txt"
+  printf '%s\n' "$msg" >> "$record/queue-messages.txt"
+  n=1
+  if [ -f "$record/queue-count" ]; then
+    n=$(($(cat "$record/queue-count") + 1))
+  fi
+  printf '%s\n' "$n" > "$record/queue-count"
+  fails="${FAKE_CODEX_QUEUE_FAILS:-0}"
+  if [ -f "$record/queue-fails" ]; then
+    fails=$(cat "$record/queue-fails")
+  fi
+  if [ "$fails" -gt 0 ] && [ "$n" -le "$fails" ]; then
+    printf 'queue fail attempt %s\n' "$n" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ]; then
+  script=$(dirname "$0")/fake-agent
+  exec "$script" "$@"
+fi
+
+printf 'unknown codex invocation: %s\n' "$*" >&2
+exit 1

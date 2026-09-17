@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+record="${FAKE_RECORD_DIR:?}"
+mkdir -p "$record"
+{
+  printf 'argv0=%s\n' "$0"
+  printf 'argv=%s\n' "$*"
+  printf 'PATH=%s\n' "${PATH:-}"
+  printf 'HOME=%s\n' "${HOME:-}"
+  printf 'HOMEBASED_TASK_ID=%s\n' "${HOMEBASED_TASK_ID:-}"
+  printf 'HOMEBASED_HOME=%s\n' "${HOMEBASED_HOME:-}"
+} > "$record/agent-meta.txt"
+
+cat > "$record/stdin.txt" || true
+
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then
+    cp "$arg" "$record/prompt-file.txt" || true
+  fi
+  prev=$arg
+done
+
+sleep_for="${FAKE_SLEEP:-}"
+if [ -f "$record/sleep" ]; then
+  sleep_for=$(cat "$record/sleep")
+fi
+if [ -n "$sleep_for" ]; then
+  sleep "$sleep_for"
+fi
+
+run_report() {
+  file=$1
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  outcome=$(head -n1 "$file")
+  summary=$(tail -n +2 "$file")
+  extra=
+  if [ -f "$record/notify" ]; then
+    extra=--notify
+  fi
+  homebased task report --outcome "$outcome" --summary "$summary" $extra
+}
+
+if [ -n "${FAKE_REPORT:-}" ]; then
+  extra=
+  if [ -n "${FAKE_NOTIFY:-}" ]; then
+    extra=--notify
+  fi
+  homebased task report --outcome "${FAKE_OUTCOME:-succeeded}" --summary "$FAKE_REPORT" $extra
+fi
+
+run_report "$record/report"
+if [ -n "${FAKE_REPORT2:-}" ]; then
+  homebased task report --outcome "${FAKE_OUTCOME2:-succeeded}" --summary "$FAKE_REPORT2"
+fi
+run_report "$record/report2"
+
+exit_code="${FAKE_EXIT:-0}"
+if [ -f "$record/exit" ]; then
+  exit_code=$(cat "$record/exit")
+fi
+exit "$exit_code"

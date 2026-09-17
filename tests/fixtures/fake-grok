@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+script=$(dirname "$0")/fake-agent
+exec "$script" "$@"
