@@ -4,17 +4,17 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::domain::{
-    check_callback_sent, check_report_allowed, check_status_transition, Agent, AgentKind,
-    AgentReport, CallbackStatus, ExitReason, ProcessStatus, ReportOutcome, TaskEnv, TaskId,
-    TaskRow, ThreadId, REPORTS_MAX, SUMMARY_MAX_BYTES,
+    Agent, AgentKind, AgentReport, CallbackStatus, ExitReason, ProcessStatus, REPORTS_MAX,
+    ReportOutcome, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskRow, TaskState, ThreadId,
+    check_callback_sent, check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = r"
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
@@ -49,7 +49,7 @@ CREATE TABLE reports (
     PRIMARY KEY (task_id, seq),
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
-"#;
+";
 
 /// Open or create the database.
 pub struct Store {
@@ -102,13 +102,10 @@ impl Store {
                 row.env.path,
                 row.env.home,
                 row.binary.to_string_lossy(),
-                row.status.as_str(),
-                row.exit_reason
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
+                row.status().as_str(),
+                row.exit_reason().map(serde_json::to_string).transpose()?,
                 row.callback_status.as_str(),
-                row.pid,
+                row.pid(),
                 row.cancel_requested_at.map(fmt_time),
                 fmt_time(row.created_at),
                 fmt_time(row.updated_at),
@@ -181,35 +178,60 @@ impl Store {
         self.list_tasks(&[ProcessStatus::Queued, ProcessStatus::Running], None)
     }
 
-    /// Count of queued or running tasks.
-    pub fn in_flight_count(&self) -> Result<usize, AppError> {
-        Ok(self.non_terminal()?.len())
+    /// Terminal tasks whose exit callback was never finished. A daemon that
+    /// died between the exit CAS and `finish_callback` leaves these behind; no
+    /// worker will ever retry them.
+    pub fn pending_callbacks(&self) -> Result<Vec<TaskRow>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, agent_kind, model, cwd, timeout_secs, extra_args,
+                    report_trailer, env_path, env_home, binary, status, exit_reason,
+                    callback_status, pid, cancel_requested_at, created_at, updated_at
+             FROM tasks
+             WHERE status IN ('succeeded', 'failed', 'cancelled', 'lost')
+               AND callback_status IN ('pending', 'sending')
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], parse_task_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
-    /// Compare-and-swap process status.
+    /// Count of queued or running tasks.
+    pub fn in_flight_count(&self) -> Result<usize, AppError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Compare-and-swap process status. `None` means the CAS did not match.
     pub fn cas_status(
         &self,
         id: TaskId,
         from: ProcessStatus,
         to: ProcessStatus,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Option<TaskRow>, AppError> {
         check_status_transition(from, to)?;
         let now = fmt_time(Utc::now());
         let n = self.conn.execute(
             "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
             params![to.as_str(), now, id.to_string(), from.as_str()],
         )?;
-        Ok(n == 1)
+        self.row_after_cas(id, n)
     }
 
-    /// CAS status and store an exit reason.
+    /// CAS status and store an exit reason. The target status is derived from
+    /// the reason. `None` means the CAS did not match.
     pub fn cas_exit(
         &self,
         id: TaskId,
         from: ProcessStatus,
-        to: ProcessStatus,
         reason: &ExitReason,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Option<TaskRow>, AppError> {
+        let to = ProcessStatus::from(reason);
         check_status_transition(from, to)?;
         let now = fmt_time(Utc::now());
         let reason_json = serde_json::to_string(reason)?;
@@ -218,7 +240,15 @@ impl Store {
              WHERE id = ?4 AND status = ?5",
             params![to.as_str(), reason_json, now, id.to_string(), from.as_str()],
         )?;
-        Ok(n == 1)
+        self.row_after_cas(id, n)
+    }
+
+    fn row_after_cas(&self, id: TaskId, updated: usize) -> Result<Option<TaskRow>, AppError> {
+        if updated == 1 {
+            Ok(Some(self.require_task(id)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Record the worker pid.
@@ -232,28 +262,48 @@ impl Store {
     }
 
     /// Mark cancel requested. Terminal tasks are unchanged (idempotent).
+    ///
+    /// The stamp and the `Queued → Cancelled` CAS run inside one
+    /// `BEGIN IMMEDIATE` transaction, so the worker's own `Queued → Running`
+    /// CAS either lands entirely before or entirely after this call. The result
+    /// is decided by the CAS row count, never by a separate read.
     pub fn request_cancel(&self, id: TaskId) -> Result<CancelResult, AppError> {
-        let row = self.require_task(id)?;
-        if row.status.is_terminal() {
-            return Ok(CancelResult::AlreadyTerminal(row));
-        }
-        let now = Utc::now();
-        if row.status == ProcessStatus::Queued {
-            let _ = self.cas_exit(
-                id,
-                ProcessStatus::Queued,
-                ProcessStatus::Cancelled,
-                &ExitReason::Cancelled,
+        self.immediate(|| {
+            // reject an unknown id before writing anything
+            self.require_task(id)?;
+            self.conn.execute(
+                "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')",
+                params![fmt_time(Utc::now()), id.to_string()],
             )?;
+            if let Some(row) = self.cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)? {
+                return Ok(CancelResult::CancelledQueued(row));
+            }
             let row = self.require_task(id)?;
-            return Ok(CancelResult::CancelledQueued(row));
+            if row.state.is_terminal() {
+                Ok(CancelResult::AlreadyTerminal(row))
+            } else {
+                Ok(CancelResult::SignalWorker(row))
+            }
+        })
+    }
+
+    /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error. The write
+    /// lock is taken up front so a concurrent writer cannot interleave.
+    fn immediate<T>(&self, body: impl FnOnce() -> Result<T, AppError>) -> Result<T, AppError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match body() {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(err) => {
+                if let Err(rollback) = self.conn.execute_batch("ROLLBACK") {
+                    tracing::warn!("rollback after {err}: {rollback}");
+                }
+                Err(err)
+            }
         }
-        self.conn.execute(
-            "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1 WHERE id = ?2",
-            params![fmt_time(now), id.to_string()],
-        )?;
-        let row = self.require_task(id)?;
-        Ok(CancelResult::SignalWorker(row))
     }
 
     /// Claim the exit callback: `pending|sending` → `sending`.
@@ -276,7 +326,7 @@ impl Store {
         }
         let row = self.require_task(id)?;
         if status == CallbackStatus::Sent {
-            check_callback_sent(row.status)?;
+            check_callback_sent(row.status())?;
         }
         let now = fmt_time(Utc::now());
         self.conn.execute(
@@ -297,9 +347,9 @@ impl Store {
             return Err(AppError::SummaryTooLong { len: summary.len() });
         }
         let row = self.require_task(id)?;
-        check_report_allowed(row.status).map_err(|_| AppError::TaskTerminal {
+        check_report_allowed(row.status()).map_err(|_| AppError::TaskTerminal {
             id,
-            status: row.status,
+            status: row.status(),
         })?;
         let existing = self.reports(id)?;
         if existing.len() >= REPORTS_MAX {
@@ -453,10 +503,8 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
             home: env_home,
         },
         binary: Path::new(&binary).to_path_buf(),
-        status,
-        exit_reason,
+        state: TaskState::from_storage(status, exit_reason, pid).map_err(parse_err)?,
         callback_status,
-        pid,
         cancel_requested_at,
         created_at: parse_time(&created_at).map_err(parse_err)?,
         updated_at: parse_time(&updated_at).map_err(parse_err)?,
@@ -486,6 +534,7 @@ pub struct NewTask {
 }
 
 /// Build a queued row for insert.
+#[must_use]
 pub fn new_queued_task(new: NewTask) -> TaskRow {
     let now = Utc::now();
     TaskRow {
@@ -498,10 +547,8 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         report_trailer: new.report_trailer,
         env: new.env,
         binary: new.binary,
-        status: ProcessStatus::Queued,
-        exit_reason: None,
+        state: TaskState::Queued,
         callback_status: CallbackStatus::Pending,
-        pid: None,
         cancel_requested_at: None,
         created_at: now,
         updated_at: now,
@@ -582,7 +629,7 @@ mod tests {
         store.insert_task(&sample_row(id)).unwrap();
         let got = store.require_task(id).unwrap();
         assert_eq!(got.agent.kind, AgentKind::Claude);
-        assert_eq!(got.status, ProcessStatus::Queued);
+        assert_eq!(got.state, TaskState::Queued);
         let listed = store.list_tasks(&[ProcessStatus::Queued], None).unwrap();
         assert_eq!(listed.len(), 1);
         let none = store.list_tasks(&[ProcessStatus::Running], None).unwrap();
@@ -602,15 +649,20 @@ mod tests {
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
         store.insert_task(&sample_row(id)).unwrap();
-        assert!(store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Lost)
-            .unwrap());
+        assert!(
+            store
+                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Lost)
+                .unwrap()
+                .is_some()
+        );
         let err = store
             .cas_status(id, ProcessStatus::Lost, ProcessStatus::Running)
             .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Lost") || matches!(err, AppError::Internal { .. }));
-        let _ = TransitionError::LostToRunning;
+        assert_eq!(
+            err.to_string(),
+            TransitionError::LostToRunning.to_string(),
+            "CAS must surface the transition rule, not a generic failure"
+        );
     }
 
     #[test]
@@ -619,9 +671,12 @@ mod tests {
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
         store.insert_task(&sample_row(id)).unwrap();
-        assert!(store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-            .unwrap());
+        assert!(
+            store
+                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+                .unwrap()
+                .is_some()
+        );
         assert!(store.claim_callback(id).unwrap());
         store.finish_callback(id, CallbackStatus::Sent).unwrap();
         let row = store.require_task(id).unwrap();
@@ -636,7 +691,10 @@ mod tests {
         store.insert_task(&sample_row(id)).unwrap();
         store.claim_callback(id).unwrap();
         let err = store.finish_callback(id, CallbackStatus::Sent).unwrap_err();
-        assert!(err.to_string().contains("Queued") || err.to_string().contains("callback"));
+        assert_eq!(
+            err.to_string(),
+            TransitionError::CallbackSentWhileQueued.to_string()
+        );
     }
 
     #[test]
@@ -692,17 +750,51 @@ mod tests {
         let id = TaskId::new();
         store.insert_task(&sample_row(id)).unwrap();
         store
-            .cas_exit(
-                id,
-                ProcessStatus::Queued,
-                ProcessStatus::Cancelled,
-                &ExitReason::Cancelled,
-            )
-            .unwrap();
+            .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
+            .unwrap()
+            .expect("queued task cancels");
         let err = store
             .append_report(id, ReportOutcome::Succeeded, "late")
             .unwrap_err();
         assert!(matches!(err, AppError::TaskTerminal { .. }));
+    }
+
+    #[test]
+    fn cancel_race_reports_cancelled_queued() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let store = Store::open(&db).unwrap();
+        let worker = Store::open(&db).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&sample_row(id)).unwrap();
+
+        // open a write transaction that flips the row to Running but do not
+        // commit. In WAL mode `request_cancel`'s read still sees Queued, while
+        // its UPDATE blocks on this writer until the commit below lands. That
+        // puts the worker's CAS exactly inside the read/CAS window.
+        worker.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        worker
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'running' WHERE id = ?1 AND status = 'queued'",
+                params![id.to_string()],
+            )
+            .unwrap();
+
+        let cancel = std::thread::spawn(move || {
+            let result = store.request_cancel(id).unwrap();
+            (store, result)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        worker.conn.execute_batch("COMMIT").unwrap();
+
+        let (store, result) = cancel.join().unwrap();
+        let row = store.require_task(id).unwrap();
+        assert_eq!(row.status(), ProcessStatus::Running);
+        assert!(
+            matches!(result, CancelResult::SignalWorker(_)),
+            "a row that reached Running must be signalled, not reported cancelled: {result:?}"
+        );
     }
 
     #[test]
@@ -714,9 +806,12 @@ mod tests {
         store
             .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap();
-        assert!(store
-            .cas_status(id, ProcessStatus::Running, ProcessStatus::Lost)
-            .unwrap());
-        assert_eq!(store.require_task(id).unwrap().status, ProcessStatus::Lost);
+        assert!(
+            store
+                .cas_status(id, ProcessStatus::Running, ProcessStatus::Lost)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.require_task(id).unwrap().state, TaskState::Lost);
     }
 }

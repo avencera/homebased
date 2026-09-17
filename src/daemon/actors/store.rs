@@ -33,24 +33,28 @@ pub enum StoreMsg {
     NonTerminal {
         reply: RpcReplyPort<Result<Vec<TaskRow>, AppError>>,
     },
+    /// Terminal tasks whose exit callback is still `pending` or `sending`.
+    PendingCallbacks {
+        reply: RpcReplyPort<Result<Vec<TaskRow>, AppError>>,
+    },
     /// Count of queued or running tasks.
     InFlightCount {
         reply: RpcReplyPort<Result<usize, AppError>>,
     },
-    /// Compare-and-swap process status.
+    /// Compare-and-swap process status. Replies with the post-update row, or
+    /// `None` when the CAS did not match.
     CasStatus {
         id: TaskId,
         from: ProcessStatus,
         to: ProcessStatus,
-        reply: RpcReplyPort<Result<bool, AppError>>,
+        reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
-    /// Compare-and-swap status plus exit reason.
+    /// Compare-and-swap to the status the reason implies, storing the reason.
     CasExit {
         id: TaskId,
         from: ProcessStatus,
-        to: ProcessStatus,
         reason: ExitReason,
-        reply: RpcReplyPort<Result<bool, AppError>>,
+        reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
     /// Record the worker pid.
     SetPid {
@@ -112,6 +116,7 @@ impl Actor for StoreActor {
                 reply,
             } => send_reply(reply, state.list_tasks(&statuses, thread)),
             StoreMsg::NonTerminal { reply } => send_reply(reply, state.non_terminal()),
+            StoreMsg::PendingCallbacks { reply } => send_reply(reply, state.pending_callbacks()),
             StoreMsg::InFlightCount { reply } => send_reply(reply, state.in_flight_count()),
             StoreMsg::CasStatus {
                 id,
@@ -122,10 +127,9 @@ impl Actor for StoreActor {
             StoreMsg::CasExit {
                 id,
                 from,
-                to,
                 reason,
                 reply,
-            } => send_reply(reply, state.cas_exit(id, from, to, &reason)),
+            } => send_reply(reply, state.cas_exit(id, from, &reason)),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
             StoreMsg::RequestCancel { id, reply } => send_reply(reply, state.request_cancel(id)),
             StoreMsg::ClaimCallback { id, reply } => send_reply(reply, state.claim_callback(id)),

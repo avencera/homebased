@@ -43,6 +43,7 @@ pub struct Cli {
     /// State directory. Overrides `HOMEBASED_HOME`.
     #[arg(long, global = true, env = "HOMEBASED_HOME")]
     pub home: Option<PathBuf>,
+    /// Subcommand to run.
     #[command(subcommand)]
     pub command: Command,
 }
@@ -52,11 +53,13 @@ pub struct Cli {
 pub enum Command {
     /// Host-unit and serve lifecycle.
     Daemon {
+        /// Daemon subcommand.
         #[command(subcommand)]
         command: daemon::DaemonCommand,
     },
     /// Submit, inspect, cancel, and report tasks.
     Task {
+        /// Task subcommand.
         #[command(subcommand)]
         command: task::TaskCommand,
     },
@@ -157,15 +160,19 @@ impl Ctx {
 
     /// Write an error to stderr.
     pub fn print_error(&self, err: &AppError) {
-        match self.output {
-            OutputMode::Json => {
-                let _ = writeln!(io::stderr(), "{}", err.to_json());
-            }
-            _ => {
-                let _ = writeln!(io::stderr(), "error: {err} [{}]", err.code());
-            }
-        }
+        print_error(self.output, err);
     }
+}
+
+/// Write an error to stderr in the requested output mode.
+fn print_error(output: OutputMode, err: &AppError) {
+    // stderr is already failing if this write fails; there is nowhere left to report
+    let _ = match output {
+        OutputMode::Json => writeln!(io::stderr(), "{}", err.to_json()),
+        OutputMode::Human | OutputMode::Quiet => {
+            writeln!(io::stderr(), "error: {err} [{}]", err.code())
+        }
+    };
 }
 
 /// Parse argv and run.
@@ -173,22 +180,19 @@ pub async fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
+            // clap already wrote its own message
             let _ = err.print();
-            let code = err.exit_code();
-            let code = u8::try_from(code).unwrap_or(2);
+            let code = u8::try_from(err.exit_code()).unwrap_or(2);
             return ExitCode::from(code);
         }
     };
+    // the mode comes from the parsed flags, so a failure before `Ctx` exists
+    // still reports in the shape the caller asked for
+    let output = OutputMode::from_flags(cli.json, cli.quiet);
     match dispatch(cli).await {
         Ok(code) => code,
         Err(err) => {
-            // ctx may not exist; print JSON if --json was set via env-less parse
-            let json = std::env::args().any(|a| a == "--json");
-            if json {
-                let _ = writeln!(io::stderr(), "{}", err.to_json());
-            } else {
-                let _ = writeln!(io::stderr(), "error: {err} [{}]", err.code());
-            }
+            print_error(output, &err);
             err.to_exit_code()
         }
     }

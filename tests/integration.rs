@@ -1,15 +1,26 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use homebased::domain::{
+    Agent, AgentKind, CallbackStatus, ExitReason, ProcessStatus, TaskEnv, TaskId,
+};
+use homebased::store::{NewTask, Store, new_queued_task};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
+
+/// `HOMEBASED_WEB_LISTEN` for a harness daemon. Tests run in parallel, so the
+/// default port would be shared; only the dashboard test binds one, on port 0.
+const WEB_OFF: &str = "off";
+const WEB_EPHEMERAL: &str = "127.0.0.1:0";
 
 struct Harness {
     _dir: TempDir,
@@ -17,11 +28,21 @@ struct Harness {
     record: PathBuf,
     hb: PathBuf,
     path: String,
+    web_listen: String,
     daemon: Option<Child>,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::with_web_listen(WEB_OFF)
+    }
+
+    /// Harness whose daemon also serves the dashboard on a free port.
+    fn with_dashboard() -> Self {
+        Self::with_web_listen(WEB_EPHEMERAL)
+    }
+
+    fn with_web_listen(web_listen: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let home = dir.path().join("state");
         let record = dir.path().join("record");
@@ -41,6 +62,7 @@ impl Harness {
             record,
             hb,
             path,
+            web_listen: web_listen.to_string(),
             daemon: None,
         };
         h.start_daemon();
@@ -51,6 +73,7 @@ impl Harness {
         let mut cmd = Command::new(&self.hb);
         cmd.env("PATH", &self.path)
             .env("HOMEBASED_HOME", &self.home)
+            .env("HOMEBASED_WEB_LISTEN", &self.web_listen)
             .env("HOMEBASED_CODEX", fixture("fake-codex"))
             .env("HOMEBASED_CLAUDE", fixture("fake-claude"))
             .env("HOMEBASED_GROK", fixture("fake-grok"))
@@ -140,6 +163,34 @@ impl Harness {
         self.show(id)
     }
 
+    /// Pid the fake agent recorded for itself. VER-05 is about the agent
+    /// process, not the worker pid the test signalled.
+    fn agent_pid(&self, id: &str) -> i32 {
+        let path = self.record.join(format!("agent-pid-{id}.txt"));
+        assert!(
+            wait_until(Duration::from_secs(10), || path.exists()),
+            "agent for {id} never recorded its pid"
+        );
+        fs::read_to_string(&path).unwrap().trim().parse().unwrap()
+    }
+
+    /// Bytes the fake agent read on stdin for exactly this task.
+    fn agent_stdin(&self, id: &str) -> String {
+        fs::read_to_string(self.record.join(format!("stdin-{id}.txt"))).unwrap()
+    }
+
+    fn store(&self) -> Store {
+        Store::open(&self.home.join("homebased.sqlite")).unwrap()
+    }
+
+    fn stop_daemon(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_file(self.home.join("homebased.sock"));
+    }
+
     fn queue_messages(&self) -> Vec<String> {
         let path = self.record.join("queue-messages.txt");
         if !path.exists() {
@@ -177,6 +228,7 @@ impl Harness {
             "notify",
             "exit",
             "queue-fails",
+            "stdout",
         ] {
             let _ = fs::remove_file(self.record.join(name));
         }
@@ -302,6 +354,7 @@ fn kill9_worker_marks_lost() {
         .to_string();
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
         == "running"));
+    let agent_pid = h.agent_pid(&id);
     let pid = h.show(&id)["pid"].as_i64().unwrap() as i32;
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
@@ -316,11 +369,10 @@ fn kill9_worker_marks_lost() {
     assert_eq!(ev["process"]["kind"], "runner_lost");
     #[cfg(target_os = "linux")]
     {
-        let _ = pid;
-        let leftover = wait_until(Duration::from_secs(2), || {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+        let gone = wait_until(Duration::from_secs(5), || {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
         });
-        assert!(leftover, "worker group should be gone");
+        assert!(gone, "fake agent {agent_pid} outlived the killed worker");
     }
 }
 
@@ -371,7 +423,7 @@ fn timeout_and_cancel() {
         .to_string();
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
         == "running"));
-    let pid = h.show(&id)["pid"].as_i64().unwrap() as i32;
+    let agent_pid = h.agent_pid(&id);
     let out = h.cmd().args(["task", "cancel", &id]).output().unwrap();
     assert!(
         out.status.success(),
@@ -383,9 +435,9 @@ fn timeout_and_cancel() {
     let last = event_json(msgs.last().unwrap());
     assert_eq!(last["event"], "TASK_CANCELLED");
     let gone = wait_until(Duration::from_secs(5), || {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
     });
-    assert!(gone, "cancelled group still alive");
+    assert!(gone, "cancelled agent {agent_pid} still alive");
 }
 
 #[test]
@@ -448,7 +500,6 @@ fn report_variants() {
     assert!(first["process"].is_null());
     assert_eq!(second["event"], "TASK_BLOCKED");
 
-    let terminal_id = id.clone();
     let out = h
         .cmd()
         .args([
@@ -456,7 +507,7 @@ fn report_variants() {
             "task",
             "report",
             "--id",
-            &terminal_id,
+            &id,
             "--outcome",
             "succeeded",
             "--summary",
@@ -466,14 +517,9 @@ fn report_variants() {
         .unwrap();
     assert_eq!(out.status.code(), Some(5));
 
-    let stdin = fs::read_to_string(h.record.join("stdin.txt")).unwrap();
+    let stdin = h.agent_stdin(&id);
+    assert!(stdin.starts_with("notify"), "{stdin}");
     assert!(stdin.contains("--- homebased ---"), "{stdin}");
-    assert!(
-        stdin.contains("do the work")
-            || stdin.contains("notify")
-            || stdin.contains("reports")
-            || stdin.contains("no report")
-    );
 }
 
 #[test]
@@ -497,11 +543,7 @@ fn report_with_daemon_stopped_and_trailer_off() {
         .to_string();
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
         == "running"));
-    if let Some(mut child) = h.daemon.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let _ = fs::remove_file(h.home.join("homebased.sock"));
+    h.stop_daemon();
     let out = h
         .cmd()
         .args([
@@ -564,7 +606,11 @@ fn stop_refusal_and_yes() {
     );
     assert!(!h.home.join("homebased.sock").exists());
     let msgs = h.queue_messages();
-    assert!(!msgs.is_empty());
+    let last = event_json(msgs.last().unwrap());
+    assert_eq!(last["event"], "TASK_CANCELLED", "{msgs:?}");
+    assert_eq!(last["task"], id);
+    let row = h.store().require_task(id.parse().unwrap()).unwrap();
+    assert_eq!(row.callback_status, CallbackStatus::Sent);
 }
 
 #[test]
@@ -657,7 +703,7 @@ fn grok_gets_feed_file() {
 fn submit_dry_run_and_schema() {
     let h = Harness::new();
     let spec = Harness::spec("claude", "preview");
-    let out = h
+    let mut child = h
         .cmd()
         .args(["--json", "task", "submit", "--dry-run", "--spec", "-"])
         .stdin(Stdio::piped())
@@ -665,8 +711,6 @@ fn submit_dry_run_and_schema() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // write stdin
-    let mut child = out;
     {
         use std::io::Write;
         child
@@ -684,11 +728,13 @@ fn submit_dry_run_and_schema() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v.get("argv").is_some(), "{v}");
-    assert!(v["argv"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|a| a.as_str() == Some("-p")));
+    assert!(
+        v["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.as_str() == Some("-p"))
+    );
 
     let out = h.cmd().args(["task", "schema"]).output().unwrap();
     assert!(out.status.success());
@@ -756,6 +802,33 @@ fn install_dry_run_text() {
     assert!(!text.contains("ExecStop"), "{text}");
     assert!(text.contains("ExecStart="), "{text}");
     assert!(text.contains("Environment=PATH="), "{text}");
+    assert!(!text.contains("HOMEBASED_WEB_LISTEN"), "{text}");
+
+    // the installing shell's bind is baked in, and a bad one fails install
+    let out = Command::new(&hb)
+        .env("HOMEBASED_WEB_LISTEN", "0.0.0.0:7677")
+        .args(["daemon", "install", "--dry-run", "--home"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Environment=HOMEBASED_WEB_LISTEN=0.0.0.0:7677"),
+        "{text}"
+    );
+    let out = Command::new(&hb)
+        .env("HOMEBASED_WEB_LISTEN", "lan")
+        .args(["daemon", "install", "--dry-run", "--home"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -916,6 +989,7 @@ fn stuck_agent_is_killed_after_grace() {
         .as_str()
         .unwrap()
         .to_string();
+    let agent_pid = h.agent_pid(&id);
     let show = h.wait_status(&id, "failed");
     assert!(
         start.elapsed() < Duration::from_secs(15),
@@ -923,12 +997,10 @@ fn stuck_agent_is_killed_after_grace() {
         start.elapsed()
     );
     assert_eq!(show["exit_reason"]["kind"], "timeout");
-    if let Some(pid) = show["pid"].as_i64() {
-        let gone = wait_until(Duration::from_secs(2), || {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err()
-        });
-        assert!(gone, "agent/worker still alive");
-    }
+    let gone = wait_until(Duration::from_secs(5), || {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
+    });
+    assert!(gone, "agent {agent_pid} survived the kill grace");
 }
 
 #[test]
@@ -944,11 +1016,15 @@ fn counter_evidence_scan() {
         .collect();
     assert!(execstop.is_empty(), "ExecStop= in systemd.rs: {execstop:?}");
     let cli = src.join("cli");
-    let flags = grep_src(&cli, r#"arg\("--prompt"|arg\("--agent""#);
-    assert!(flags.is_empty(), "per-field submit flags: {flags:?}");
+    for flag in ["arg(\"--prompt", "arg(\"--agent"] {
+        let flags = grep_src(&cli, flag);
+        assert!(flags.is_empty(), "per-field submit flag {flag}: {flags:?}");
+    }
     let report = src.join("report.rs");
-    let http = grep_src(&report, r"UnixStream|/v1/");
-    assert!(http.is_empty(), "report talks HTTP: {http:?}");
+    for token in ["UnixStream", "/v1/"] {
+        let http = grep_src(&report, token);
+        assert!(http.is_empty(), "report talks HTTP ({token}): {http:?}");
+    }
 
     let daemon = src.join("daemon");
     let mutex = grep_src(&daemon, "Mutex");
@@ -965,35 +1041,35 @@ fn counter_evidence_scan() {
     assert!(conn.is_empty(), "Connection::open in daemon: {conn:?}");
 }
 
-fn grep_daemon_except_callback(daemon: &Path, pattern: &str) -> Vec<String> {
-    grep_src(daemon, pattern)
+fn grep_daemon_except_callback(daemon: &Path, needle: &str) -> Vec<String> {
+    grep_src(daemon, needle)
         .into_iter()
         .filter(|line| !line.contains("/actors/callback.rs:"))
         .collect()
 }
 
-fn grep_daemon_except_store(daemon: &Path, pattern: &str) -> Vec<String> {
-    grep_src(daemon, pattern)
+fn grep_daemon_except_store(daemon: &Path, needle: &str) -> Vec<String> {
+    grep_src(daemon, needle)
         .into_iter()
         .filter(|line| !line.contains("/actors/store.rs:"))
         .collect()
 }
 
-fn grep_src(path: &Path, pattern: &str) -> Vec<String> {
+/// Plain substring scan over `.rs` files under `path`.
+fn grep_src(path: &Path, needle: &str) -> Vec<String> {
     let mut matches = Vec::new();
     let files = if path.is_file() {
         vec![path.to_path_buf()]
     } else {
         walkdir_files(path)
     };
-    let re = regex_lite(pattern);
     for file in files {
         if file.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
         if let Ok(text) = fs::read_to_string(&file) {
             for (i, line) in text.lines().enumerate() {
-                if re(line) {
+                if line.contains(needle) {
                     matches.push(format!("{}:{}:{line}", file.display(), i + 1));
                 }
             }
@@ -1020,15 +1096,516 @@ fn walkdir_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn regex_lite(pattern: &str) -> impl Fn(&str) -> bool {
-    let pattern = pattern.to_string();
-    move |line: &str| {
-        if pattern.contains('|') && pattern.contains("arg(") {
-            return line.contains("arg(\"--prompt") || line.contains("arg(\"--agent");
-        }
-        if pattern.contains('|') {
-            return pattern.split('|').any(|p| line.contains(p));
-        }
-        line.contains(&pattern)
+#[test]
+fn cancel_on_terminal_task_is_idempotent() {
+    let h = Harness::new();
+    let id = h.submit(&Harness::spec("claude", "quick"));
+    h.wait_status(&id, "succeeded");
+    let before = h.queue_messages().len();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "cancel", &id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cancel on a terminal task must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "succeeded");
+    assert_eq!(
+        h.queue_messages().len(),
+        before,
+        "cancel re-sent a callback"
+    );
+}
+
+#[test]
+fn daemon_status_reports_socket_down() {
+    let mut h = Harness::new();
+    let id = h.submit(&Harness::spec("claude", "quick"));
+    h.wait_status(&id, "succeeded");
+    let out = h
+        .cmd()
+        .args(["--json", "daemon", "status"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["socket"], "up");
+
+    h.stop_daemon();
+    let out = h
+        .cmd()
+        .args(["--json", "daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["socket"], "down");
+    assert_eq!(value["in_flight"], 0);
+
+    let out = h.cmd().args(["daemon", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("socket: down"), "{text}");
+}
+
+#[test]
+fn list_filters_by_status_and_thread() {
+    let h = Harness::new();
+    let other_thread = "01a0ab97-a7aa-7463-a5b0-8d500e40e999";
+    let done = h.submit(&Harness::spec("claude", "done"));
+    h.wait_status(&done, "succeeded");
+
+    let mut spec = Harness::spec("claude", "still running");
+    spec["timeout"] = json!("30s");
+    spec["thread"] = json!(other_thread);
+    let spec_path = h.home.join("spec-running.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    h.set_control("sleep", "20");
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let running = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        || h.show(&running)["status"] == "running"
+    ));
+
+    assert_eq!(list_ids(&h, &["--status", "succeeded"]), vec![done.clone()]);
+    assert_eq!(
+        list_ids(&h, &["--status", "running"]),
+        vec![running.clone()]
+    );
+    let mut both = list_ids(&h, &["--status", "succeeded,running"]);
+    both.sort();
+    let mut want = vec![done.clone(), running.clone()];
+    want.sort();
+    assert_eq!(both, want);
+    assert_eq!(list_ids(&h, &["--thread", THREAD]), vec![done]);
+    assert_eq!(list_ids(&h, &["--thread", other_thread]), vec![running]);
+    assert!(list_ids(&h, &["--status", "lost"]).is_empty());
+}
+
+fn list_ids(h: &Harness, args: &[&str]) -> Vec<String> {
+    let out = h
+        .cmd()
+        .args(["--quiet", "task", "list"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn log_tail_returns_the_last_lines() {
+    let h = Harness::new();
+    h.set_control("stdout", "line one\nline two\nline three\n");
+    let id = h.submit(&Harness::spec("claude", "logging"));
+    h.wait_status(&id, "succeeded");
+
+    let out = h.cmd().args(["task", "log", &id]).output().unwrap();
+    let full = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(full.contains("line one"), "{full}");
+
+    let out = h
+        .cmd()
+        .args(["task", "log", &id, "--tail", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tail = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(tail, "line three\n");
+
+    let out = h
+        .cmd()
+        .args(["task", "log", &id, "--tail", "2"])
+        .output()
+        .unwrap();
+    let tail = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(tail, "line two\nline three\n");
+}
+
+#[test]
+fn web_listener_serves_read_only_api() {
+    let h = Harness::with_dashboard();
+    h.set_control("stdout", "line one\nline two\nline three\n");
+    let id = h.submit(&Harness::spec("claude", "dashboard"));
+    h.wait_status(&id, "succeeded");
+
+    let list = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let socket_list: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(
+        socket_list["tasks"][0]["created_at"].is_string(),
+        "{socket_list}"
+    );
+
+    let addr = dashboard_addr(&h);
+
+    let tasks = http_get(&addr, "/v1/tasks");
+    assert_eq!(tasks.status, 200, "{tasks:?}");
+    assert!(tasks.content_type_contains("application/json"), "{tasks:?}");
+    let body: Value = serde_json::from_str(&tasks.body).unwrap();
+    let first = &body["tasks"][0];
+    assert_eq!(first["id"], id, "{body}");
+    assert!(first["created_at"].is_string(), "{body}");
+    assert_eq!(first["timeout_secs"], 15, "{body}");
+
+    let log = http_get(&addr, &format!("/v1/tasks/{id}/log?tail=1"));
+    assert_eq!(log.status, 200, "{log:?}");
+    let body: Value = serde_json::from_str(&log.body).unwrap();
+    assert_eq!(body["log"], "line three", "{body}");
+    assert_eq!(body["truncated"], true, "{body}");
+
+    // mutations stay on the 0600 socket; the TCP router only knows GET here
+    let submit = http_request(&addr, "POST", "/v1/tasks");
+    assert_eq!(submit.status, 405, "{submit:?}");
+
+    let index = http_get(&addr, "/");
+    assert!(
+        index.status == 200 || index.status == 503,
+        "unexpected index status: {index:?}"
+    );
+    assert!(index.content_type_contains("text/html"), "{index:?}");
+
+    let missing = http_get(&addr, "/v1/nope");
+    assert_eq!(missing.status, 404, "{missing:?}");
+    let body: Value = serde_json::from_str(&missing.body).unwrap();
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+}
+
+/// `host:port` of the running dashboard, from the daemon's own status body.
+fn dashboard_addr(h: &Harness) -> String {
+    let out = h
+        .cmd()
+        .args(["--json", "daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let url = status["web"]
+        .as_str()
+        .unwrap_or_else(|| panic!("daemon status has no dashboard url: {status}"));
+    url.trim_start_matches("http://").to_string()
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    /// Response headers, lowercased, for substring checks.
+    head: String,
+    body: String,
+}
+
+impl HttpResponse {
+    fn content_type_contains(&self, needle: &str) -> bool {
+        self.head
+            .lines()
+            .filter(|line| line.starts_with("content-type:"))
+            .any(|line| line.contains(needle))
     }
+}
+
+fn http_get(addr: &str, path: &str) -> HttpResponse {
+    http_request(addr, "GET", path)
+}
+
+/// Hand-written HTTP/1.1 over a plain socket: the assertions are about what a
+/// browser sees, so no client crate sits in between.
+fn http_request(addr: &str, method: &str, path: &str) -> HttpResponse {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in response: {text}"));
+    HttpResponse {
+        status,
+        head: head.to_lowercase(),
+        body: body.to_string(),
+    }
+}
+
+#[test]
+fn report_reads_summary_from_stdin() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "running");
+    spec["timeout"] = json!("30s");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    h.set_control("sleep", "20");
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+
+    let mut child = h
+        .cmd()
+        .args([
+            "--json",
+            "task",
+            "report",
+            "--id",
+            &id,
+            "--outcome",
+            "blocked",
+            "--summary-file",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"summary read from stdin")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["seq"], 1);
+    assert_eq!(value["reports"][0]["summary"], "summary read from stdin");
+    assert_eq!(value["reports"][0]["outcome"], "blocked");
+}
+
+#[test]
+fn report_without_id_or_env_is_usage_error() {
+    let h = Harness::new();
+    let out = h
+        .cmd()
+        .env_remove("HOMEBASED_TASK_ID")
+        .args([
+            "task",
+            "report",
+            "--outcome",
+            "succeeded",
+            "--summary",
+            "orphan",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HOMEBASED_TASK_ID"), "{stderr}");
+}
+
+#[test]
+fn daemon_exits_on_sigterm_with_a_live_worker() {
+    let mut h = Harness::new();
+    let mut spec = Harness::spec("claude", "hold");
+    spec["timeout"] = json!("30s");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    h.set_control("sleep", "20");
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+
+    let mut daemon = h.daemon.take().unwrap();
+    let daemon_pid = daemon.id() as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon_pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let exited = wait_until(Duration::from_secs(2), || {
+        matches!(daemon.try_wait(), Ok(Some(_)))
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert!(
+        exited,
+        "daemon {daemon_pid} did not exit within 2s of SIGTERM"
+    );
+}
+
+#[test]
+fn sigterm_right_after_cas_is_cancelled_not_lost() {
+    let h = Harness::new();
+    // the window runs from the Queued->Running CAS to `signal()` inside
+    // `run_agent`, and the only work in it is the feed read. Swap a very large
+    // feed in behind the daemon so that read takes long enough to signal into.
+    let big = h.home.join("big-feed.txt");
+    fs::write(&big, vec![b'x'; 512 * 1024 * 1024]).unwrap();
+
+    let mut spec = Harness::spec("claude", "widen the window");
+    spec["timeout"] = json!("30s");
+    spec["report_trailer"] = json!(false);
+    h.set_control("no-stdin", "");
+    h.set_control("sleep", "20");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id: TaskId = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // rename is atomic and instant, unlike writing the bytes here
+    fs::rename(
+        &big,
+        h.home
+            .join("tasks")
+            .join(id.to_string())
+            .join("prompt.feed.txt"),
+    )
+    .unwrap();
+
+    // poll SQLite directly with no back-off and signal from this process:
+    // going through the socket would cost more than the window is wide.
+    let store = h.store();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        assert!(Instant::now() < deadline, "task never reached running");
+        let row = store.require_task(id).unwrap();
+        if row.status() == ProcessStatus::Running {
+            break row.pid().expect("running row records the worker pid");
+        }
+    };
+    store.request_cancel(id).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    drop(store);
+
+    let show = h.wait_status(&id.to_string(), "cancelled");
+    assert_eq!(show["exit_reason"]["kind"], "cancelled");
+    // the worker delivers the exit event just after the CAS `wait_status` saw
+    let delivered = wait_until(Duration::from_secs(10), || {
+        h.queue_messages()
+            .iter()
+            .any(|m| event_json(m)["task"] == id.to_string())
+    });
+    assert!(delivered, "worker never delivered an exit event for {id}");
+    let last = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(last["event"], "TASK_CANCELLED");
+}
+
+#[test]
+fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
+    let mut h = Harness::new();
+    h.stop_daemon();
+
+    let id = TaskId::new();
+    let store = h.store();
+    fs::create_dir_all(h.home.join("tasks").join(id.to_string())).unwrap();
+    store
+        .insert_task(&new_queued_task(NewTask {
+            id,
+            thread: THREAD.parse().unwrap(),
+            agent: Agent::new(AgentKind::Claude, None),
+            cwd: std::env::temp_dir(),
+            timeout: Duration::from_secs(30),
+            extra_args: vec![],
+            report_trailer: false,
+            env: TaskEnv {
+                path: h.path.clone(),
+                home: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+            },
+            binary: fixture("fake-claude"),
+        }))
+        .unwrap();
+    // the daemon died between the exit CAS and FinishCallback
+    let row = store
+        .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
+        .unwrap()
+        .expect("queued row cancels");
+    assert_eq!(row.callback_status, CallbackStatus::Pending);
+    drop(store);
+
+    let before = h.queue_messages().len();
+    h.start_daemon();
+    let delivered = wait_until(Duration::from_secs(10), || {
+        h.queue_messages()
+            .iter()
+            .skip(before)
+            .any(|m| event_json(m)["task"] == id.to_string())
+    });
+    assert!(delivered, "reconcile never delivered the pending callback");
+    assert_eq!(
+        h.store().require_task(id).unwrap().callback_status,
+        CallbackStatus::Sent
+    );
 }

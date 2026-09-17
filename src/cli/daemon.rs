@@ -1,17 +1,16 @@
 //! `homebased daemon` commands.
 
-use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use crate::callback::{deliver_exit_event, exit_event};
 use crate::client::Client;
-use crate::domain::CallbackStatus;
+use crate::daemon::web::WebListen;
 use crate::error::AppError;
 use crate::install;
 use crate::store::{CancelResult, Store};
 use clap::Subcommand;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::Ctx;
 
@@ -32,7 +31,13 @@ pub enum DaemonCommand {
         yes: bool,
     },
     /// Run the daemon in the foreground.
-    Serve,
+    Serve {
+        /// Dashboard listen address, or `off`. The API has no auth and exposes
+        /// prompts and logs, so bind a non-loopback address only on a trusted
+        /// network.
+        #[arg(long, env = install::WEB_LISTEN_ENV, default_value_t)]
+        web_listen: WebListen,
+    },
     /// Restart only `serve`. Allowed with in-flight tasks.
     Restart,
     /// Stop `serve`. Refuses if tasks are in flight unless `--yes`.
@@ -50,8 +55,8 @@ pub async fn run(ctx: &Ctx, command: DaemonCommand) -> Result<ExitCode, AppError
     match command {
         DaemonCommand::Install { dry_run } => install(ctx, dry_run),
         DaemonCommand::Uninstall { yes } => uninstall(ctx, yes).await,
-        DaemonCommand::Serve => {
-            crate::daemon::serve(ctx.home.clone()).await?;
+        DaemonCommand::Serve { web_listen } => {
+            crate::daemon::serve(ctx.home.clone(), web_listen).await?;
             Ok(ExitCode::SUCCESS)
         }
         DaemonCommand::Restart => restart(ctx).await,
@@ -104,7 +109,18 @@ async fn uninstall(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
 
 async fn status(ctx: &Ctx) -> Result<ExitCode, AppError> {
     let client = Client::new(ctx.home.sock_path());
-    let socket_up = ctx.home.sock_path().exists() && client.get("/v1/status").await.is_ok();
+    let body = if ctx.home.sock_path().exists() {
+        client.get("/v1/status").await.ok()
+    } else {
+        None
+    };
+    let socket_up = body.is_some();
+    // only the running daemon knows the port it bound, so a down socket means
+    // no dashboard URL to print
+    let web = body
+        .as_ref()
+        .and_then(|body| body.get("web"))
+        .and_then(Value::as_str);
     let store = Store::open(&ctx.home.db_path())?;
     let in_flight = store.in_flight_count()?;
     match ctx.output {
@@ -114,12 +130,14 @@ async fn status(ctx: &Ctx) -> Result<ExitCode, AppError> {
             "socket": if socket_up { "up" } else { "down" },
             "in_flight": in_flight,
             "home": ctx.home.root(),
+            "web": web,
         }))?,
         super::OutputMode::Human => {
             println!(
-                "socket: {}  in_flight: {in_flight}  home: {}",
+                "socket: {}  in_flight: {in_flight}  home: {}  web: {}",
                 if socket_up { "up" } else { "down" },
-                ctx.home.root().display()
+                ctx.home.root().display(),
+                web.unwrap_or("down"),
             );
         }
     }
@@ -130,12 +148,15 @@ async fn stop(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
     let client = Client::new(ctx.home.sock_path());
     let socket_up = client.get("/v1/status").await.ok();
     ensure_idle_or_cancel(ctx, yes, socket_up.is_some()).await?;
-    if let Some(body) = socket_up {
-        if let Some(pid) = body.get("pid").and_then(|v| v.as_u64()) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+    if let Some(body) = socket_up
+        && let Some(pid) = body.get("pid").and_then(Value::as_u64)
+    {
+        // the daemon may already have exited between the status call and here
+        if let Err(err) = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        ) {
+            eprintln!("warning: SIGTERM daemon {pid}: {err}");
         }
     }
     if install::unit_installed() {
@@ -156,11 +177,14 @@ async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
     } else {
         let client = Client::new(ctx.home.sock_path());
         if let Ok(body) = client.get("/v1/status").await {
-            if let Some(pid) = body.get("pid").and_then(|v| v.as_u64()) {
-                let _ = nix::sys::signal::kill(
+            if let Some(pid) = body.get("pid").and_then(Value::as_u64) {
+                // the daemon may already have exited between the status call and here
+                if let Err(err) = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid as i32),
                     nix::sys::signal::Signal::SIGTERM,
-                );
+                ) {
+                    eprintln!("warning: SIGTERM daemon {pid}: {err}");
+                }
             }
             wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
         }
@@ -206,7 +230,7 @@ async fn ensure_idle_or_cancel(ctx: &Ctx, yes: bool, socket_up: bool) -> Result<
         return Err(AppError::TasksInFlight { count: in_flight });
     }
     cancel_in_flight(ctx, &store, socket_up).await?;
-    wait_terminal_and_callback(&ctx.home.db_path(), Duration::from_secs(60))?;
+    wait_terminal_and_callback(&store, Duration::from_secs(60))?;
     Ok(())
 }
 
@@ -215,9 +239,13 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
     if socket_up {
         let client = Client::new(ctx.home.sock_path());
         for row in tasks {
-            let _ = client
+            // cancel is idempotent and the daemon may be shutting down already
+            if let Err(err) = client
                 .post(&format!("/v1/tasks/{}/cancel", row.id), &json!({}))
-                .await;
+                .await
+            {
+                eprintln!("warning: cancel {}: {err}", row.id);
+            }
         }
         return Ok(());
     }
@@ -230,11 +258,13 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
                 deliver_exit_event(store, &ctx.home, &row, &event)?;
             }
             CancelResult::SignalWorker(row) => {
-                if let Some(pid) = row.pid {
-                    let _ = nix::sys::signal::kill(
+                if let Some(pid) = row.pid()
+                    && let Err(err) = nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(pid),
                         nix::sys::signal::Signal::SIGTERM,
-                    );
+                    )
+                {
+                    eprintln!("warning: SIGTERM worker {pid}: {err}");
                 }
             }
         }
@@ -242,18 +272,14 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
     Ok(())
 }
 
-fn wait_terminal_and_callback(db: &Path, budget: Duration) -> Result<(), AppError> {
+fn wait_terminal_and_callback(store: &Store, budget: Duration) -> Result<(), AppError> {
     let start = std::time::Instant::now();
     loop {
-        let store = Store::open(db)?;
-        let busy = !store.non_terminal()?.is_empty()
-            || store.list_tasks(&[], None)?.iter().any(|row| {
-                row.status.is_terminal()
-                    && matches!(
-                        row.callback_status,
-                        CallbackStatus::Pending | CallbackStatus::Sending
-                    )
-            });
+        let busy = store.in_flight_count()? > 0
+            || store
+                .list_tasks(&[], None)?
+                .iter()
+                .any(|row| row.state.is_terminal() && row.callback_outstanding());
         if !busy {
             return Ok(());
         }

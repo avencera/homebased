@@ -1,5 +1,7 @@
 //! Axum routes and error mapping.
 
+pub mod views;
+
 use std::path::PathBuf;
 
 use axum::extract::{Path, Query, State};
@@ -8,15 +10,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::agents::{build_argv, resolve_binary};
+use crate::agents::{ArgvInputs, build_argv, resolve_binary};
 use crate::callback::last_event_for_row;
-use crate::daemon::actors::{call_store, flatten_call, StoreMsg, SupervisorMsg, CALL_TIMEOUT};
-use crate::daemon::{spawn_and_watch, AppState};
-use crate::domain::{ProcessStatus, TaskEnv, TaskId, ThreadId, API_VERSION};
+use crate::daemon::actors::{CALL_TIMEOUT, StoreMsg, SupervisorMsg, call_store, flatten_call};
+use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
+use crate::daemon::{AppState, spawn_and_watch, web};
+use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
-use crate::spec::{self, NormalizedSpec, SubmitSpec};
+use crate::spec::{self, NormalizedSpec};
 use crate::store::{self, CancelResult};
 
 impl IntoResponse for AppError {
@@ -26,38 +29,45 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Build the HTTP router.
-pub fn router(state: AppState) -> Router {
+/// Routes that only read state. Safe to expose on the TCP listener.
+pub fn read_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/status", get(status))
-        .route("/v1/tasks", post(submit).get(list))
-        .route("/v1/tasks/dry-run", post(dry_run))
+        .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
-        .route("/v1/tasks/{id}/cancel", post(cancel))
-        .with_state(state)
+        .route("/v1/tasks/{id}/log", get(log))
 }
 
-#[derive(Serialize)]
-struct StatusBody {
-    api_version: u32,
-    pid: u32,
-    socket: String,
-    in_flight: usize,
+/// Routes that change state. Unix socket only: the socket is mode 0600, while a
+/// loopback port is reachable from any page the user has open.
+pub fn write_routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/tasks", post(submit))
+        .route("/v1/tasks/dry-run", post(dry_run))
+        .route("/v1/tasks/{id}/cancel", post(cancel))
+}
+
+/// Full API for the Unix socket.
+pub fn socket_router(state: AppState) -> Router {
+    read_routes().merge(write_routes()).with_state(state)
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {
     let in_flight = call_store(&state.store, |reply| StoreMsg::InFlightCount { reply }).await?;
     Ok(Json(StatusBody {
         api_version: API_VERSION,
+        version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
         socket: state.home.sock_path().display().to_string(),
+        web: state.web.map(web::url_for),
         in_flight,
     }))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubmitBody {
-    spec: Value,
+    spec: NormalizedSpec,
     env: TaskEnv,
 }
 
@@ -94,11 +104,12 @@ async fn dry_run(
     State(state): State<AppState>,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<DryRunResponse>, AppError> {
-    let spec = parse_incoming(body.spec)?;
+    let spec = body.spec;
+    check_api_version(&spec)?;
     spec::check_cwd(&spec.cwd)?;
     let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
     let prompt_file = grok_placeholder(state.home.root(), &spec);
-    let argv = build_argv(&spec, &binary, prompt_file.as_deref());
+    let argv = build_argv(&ArgvInputs::from(&spec), &binary, prompt_file.as_deref());
     Ok(Json(DryRunResponse {
         api_version: API_VERSION,
         spec,
@@ -125,7 +136,7 @@ struct ListQuery {
 async fn list(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<TaskList>, AppError> {
     let mut statuses = Vec::new();
     if let Some(raw) = query.status {
         for part in raw.split(',') {
@@ -150,55 +161,59 @@ async fn list(
         reply,
     })
     .await?;
-    let tasks: Vec<Value> = rows
-        .iter()
-        .map(|row| {
-            json!({
-                "id": row.id,
-                "status": row.status,
-                "agent": row.agent.kind,
-                "model": row.agent.model,
-                "thread": row.thread,
-                "cwd": row.cwd,
-                "pid": row.pid,
-                "callback": row.callback_status,
-            })
-        })
-        .collect();
-    Ok(Json(json!({
-        "api_version": API_VERSION,
-        "tasks": tasks,
-    })))
+    Ok(Json(TaskList::from_rows(&rows)))
 }
 
 async fn show(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<TaskDetail>, AppError> {
     let row = call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
     let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let last_event = last_event_for_row(&row, &reports, evidence.clone());
-    Ok(Json(json!({
-        "api_version": API_VERSION,
-        "id": row.id,
-        "status": row.status,
-        "agent": row.agent.kind,
-        "model": row.agent.model,
-        "thread": row.thread,
-        "cwd": row.cwd,
-        "pid": row.pid,
-        "callback": row.callback_status,
-        "timeout": humantime::format_duration(row.timeout).to_string(),
-        "reports": reports,
-        "output_log": state.home.task_paths(id).output,
-        "evidence": evidence,
-        "last_event": last_event,
-        "exit_reason": row.exit_reason,
-        "cancel_requested_at": row.cancel_requested_at,
-    })))
+    Ok(Json(TaskDetail {
+        api_version: API_VERSION,
+        summary: TaskSummary::from(&row),
+        reports,
+        output_log: state.home.task_paths(id).output,
+        evidence,
+        last_event,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+async fn log(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<LogTail>, AppError> {
+    // the row decides whether the task exists; `output.log` only appears once
+    // the worker has spawned the agent
+    if call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
+        .await?
+        .is_none()
+    {
+        return Err(AppError::TaskNotFound { id });
+    }
+    let tail = state.home.task_paths(id).read_output(query.tail)?;
+    let (log, truncated) = match tail {
+        Some(output) => (output.text, output.truncated),
+        None => (String::new(), false),
+    };
+    Ok(Json(LogTail {
+        api_version: API_VERSION,
+        id,
+        log,
+        truncated,
+    }))
 }
 
 async fn cancel(
@@ -218,7 +233,7 @@ async fn cancel(
         CancelResult::AlreadyTerminal(row) => Ok(Json(json!({
             "api_version": API_VERSION,
             "id": row.id,
-            "status": row.status,
+            "status": row.status(),
         }))),
         CancelResult::CancelledQueued(_) => Ok(Json(json!({
             "api_version": API_VERSION,
@@ -228,33 +243,28 @@ async fn cancel(
         CancelResult::SignalWorker(row) => Ok(Json(json!({
             "api_version": API_VERSION,
             "id": id,
-            "status": row.status,
+            "status": row.status(),
         }))),
     }
 }
 
-fn parse_incoming(value: Value) -> Result<NormalizedSpec, AppError> {
-    if value.get("prompt").is_some()
-        && value.get("agent").is_some()
-        && value.get("prompt_file").is_none()
-    {
-        if let Ok(normalized) = serde_json::from_value::<NormalizedSpec>(value.clone()) {
-            if normalized.api_version == API_VERSION {
-                spec::check_cwd(&normalized.cwd)?;
-                return Ok(normalized);
-            }
-        }
+fn check_api_version(spec: &NormalizedSpec) -> Result<(), AppError> {
+    if spec.api_version == API_VERSION {
+        return Ok(());
     }
-    let spec: SubmitSpec = spec::parse_spec_value(value)?;
-    spec::check_cwd(&spec.cwd)?;
-    spec::normalize(&spec)
+    Err(AppError::InvalidSpec {
+        pointer: "/spec/api_version".into(),
+        value: json!(spec.api_version),
+        message: format!("api_version must be {API_VERSION}"),
+    })
 }
 
 async fn accept_task(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, ProcessStatus), AppError> {
-    let spec = parse_incoming(body.spec)?;
+    let spec = body.spec;
+    check_api_version(&spec)?;
     spec::check_cwd(&spec.cwd)?;
     let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
     let id = TaskId::new();

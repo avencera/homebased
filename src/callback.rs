@@ -1,17 +1,16 @@
 //! `HOMEBASED_EVENT` formatting and `codex queue` invocation.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::Value;
 
+use crate::agents::resolve_binary;
 use crate::domain::{
-    AgentKind, AgentReport, CallbackStatus, ExitReason, ProcessStatus, ReportOutcome, TaskId,
-    TaskRow, ThreadId,
+    AgentKind, AgentReport, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskRow, TaskState,
+    ThreadId,
 };
 use crate::error::AppError;
 use crate::home::Home;
@@ -56,15 +55,27 @@ pub enum NextAction {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessPayload {
     /// Process exited.
-    Exit { code: i32 },
+    Exit {
+        /// Exit code the process returned.
+        code: i32,
+    },
     /// Signalled.
-    Signal { signal: i32 },
+    Signal {
+        /// Signal number that ended the process.
+        signal: i32,
+    },
     /// Timed out.
-    Timeout { secs: u64 },
+    Timeout {
+        /// Timeout budget in seconds.
+        secs: u64,
+    },
     /// Cancelled.
     Cancelled,
     /// Spawn failed.
-    SpawnFailed { message: String },
+    SpawnFailed {
+        /// Why the spawn failed.
+        message: String,
+    },
     /// Runner lost.
     RunnerLost,
 }
@@ -146,7 +157,7 @@ pub fn exit_event(row: &TaskRow, reports: &[AgentReport], evidence: PathBuf) -> 
         row,
         reports,
         evidence,
-        row.exit_reason.as_ref().map(ProcessPayload::from),
+        row.exit_reason().map(ProcessPayload::from),
     )
 }
 
@@ -248,7 +259,7 @@ pub fn deliver_notify(home: &Home, row: &TaskRow, event: &HomebasedEvent) -> Res
 
 /// Run `codex queue` up to three times. Blocking; call from `spawn_blocking` in the daemon.
 pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(), AppError> {
-    let binary = resolve_codex(&row.env.path, &row.cwd)?;
+    let binary = resolve_binary(AgentKind::Codex, &row.env.path, &row.cwd)?;
     let mut last_err = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -268,9 +279,8 @@ pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(
             .output();
         match output {
             Ok(out) if out.status.success() => {
-                let mut body = out.stdout.clone();
-                body.extend_from_slice(&out.stderr);
-                let _ = std::fs::write(log_path, body);
+                // the transcript is evidence only; a failed write must not fail delivery
+                let _ = std::fs::write(log_path, transcript(&out));
                 return Ok(());
             }
             Ok(out) => {
@@ -279,9 +289,8 @@ pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(
                     out.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&out.stderr)
                 );
-                let mut body = out.stdout.clone();
-                body.extend_from_slice(&out.stderr);
-                let _ = std::fs::write(log_path, body);
+                // same: keep the last attempt's transcript, but never fail on it
+                let _ = std::fs::write(log_path, transcript(&out));
             }
             Err(err) => {
                 last_err = err.to_string();
@@ -291,17 +300,10 @@ pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(
     Err(AppError::Internal { message: last_err })
 }
 
-fn resolve_codex(path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
-    if let Ok(override_path) = std::env::var("HOMEBASED_CODEX") {
-        if !override_path.is_empty() && Path::new(&override_path).is_file() {
-            return Ok(PathBuf::from(override_path));
-        }
-    }
-    which::which_in("codex", Some(OsString::from(path)), cwd).map_err(|_| {
-        AppError::AgentBinaryMissing {
-            agent: AgentKind::Codex,
-        }
-    })
+fn transcript(out: &std::process::Output) -> Vec<u8> {
+    let mut body = out.stdout.clone();
+    body.extend_from_slice(&out.stderr);
+    body
 }
 
 /// Append the event line and last stderr to the fallback log.
@@ -316,25 +318,21 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
     Ok(())
 }
 
-/// JSON value of an event (no prefix), for `last_event`.
-pub fn event_value(event: &HomebasedEvent) -> Result<Value, AppError> {
-    Ok(serde_json::to_value(event)?)
-}
-
 /// Last event for `task show`, if the process is terminal or a notify happened.
+#[must_use]
 pub fn last_event_for_row(
     row: &TaskRow,
     reports: &[AgentReport],
     evidence: PathBuf,
 ) -> Option<HomebasedEvent> {
-    match row.status {
-        ProcessStatus::Queued | ProcessStatus::Running => reports
+    match row.state {
+        TaskState::Queued | TaskState::Running { .. } => reports
             .iter()
             .rev()
             .find(|r| r.notified_at.is_some())
             .map(|r| notify_event(row, r, evidence)),
-        ProcessStatus::Lost => Some(lost_event(row, reports, evidence)),
-        _ => Some(exit_event(row, reports, evidence)),
+        TaskState::Lost => Some(lost_event(row, reports, evidence)),
+        TaskState::Finished { .. } => Some(exit_event(row, reports, evidence)),
     }
 }
 
@@ -345,7 +343,7 @@ mod tests {
     use chrono::Utc;
     use std::time::Duration;
 
-    fn row(status: ProcessStatus, reason: Option<ExitReason>) -> TaskRow {
+    fn row(state: TaskState) -> TaskRow {
         TaskRow {
             id: TaskId::new(),
             thread: "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap(),
@@ -359,10 +357,8 @@ mod tests {
                 home: "/home/u".into(),
             },
             binary: PathBuf::from("/bin/claude"),
-            status,
-            exit_reason: reason,
+            state,
             callback_status: CallbackStatus::Pending,
-            pid: Some(1),
             cancel_requested_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -382,7 +378,9 @@ mod tests {
     #[test]
     fn cancelled_wins() {
         let event = exit_event(
-            &row(ProcessStatus::Cancelled, Some(ExitReason::Cancelled)),
+            &row(TaskState::Finished {
+                reason: ExitReason::Cancelled,
+            }),
             &[report(1, ReportOutcome::Succeeded)],
             PathBuf::from("/e"),
         );
@@ -392,7 +390,7 @@ mod tests {
 
     #[test]
     fn lost_runner_event() {
-        let event = lost_event(&row(ProcessStatus::Lost, None), &[], PathBuf::from("/e"));
+        let event = lost_event(&row(TaskState::Lost), &[], PathBuf::from("/e"));
         assert_eq!(event.event, EventKind::TaskLost);
         assert!(matches!(event.process, Some(ProcessPayload::RunnerLost)));
     }
@@ -400,7 +398,9 @@ mod tests {
     #[test]
     fn blocked_then_succeeded() {
         let event = exit_event(
-            &row(ProcessStatus::Succeeded, Some(ExitReason::Exit { code: 0 })),
+            &row(TaskState::Finished {
+                reason: ExitReason::Exit { code: 0 },
+            }),
             &[
                 report(1, ReportOutcome::Blocked),
                 report(2, ReportOutcome::Succeeded),
@@ -416,7 +416,9 @@ mod tests {
     #[test]
     fn no_reports_exit_zero() {
         let event = exit_event(
-            &row(ProcessStatus::Succeeded, Some(ExitReason::Exit { code: 0 })),
+            &row(TaskState::Finished {
+                reason: ExitReason::Exit { code: 0 },
+            }),
             &[],
             PathBuf::from("/e"),
         );
@@ -426,7 +428,7 @@ mod tests {
 
     #[test]
     fn notify_has_null_process() {
-        let r = row(ProcessStatus::Running, None);
+        let r = row(TaskState::Running { pid: Some(1) });
         let report = report(1, ReportOutcome::Blocked);
         let event = notify_event(&r, &report, PathBuf::from("/e"));
         assert_eq!(event.event, EventKind::TaskReported);
@@ -440,7 +442,9 @@ mod tests {
     #[test]
     fn key_order_starts_with_api_version_event_task() {
         let event = exit_event(
-            &row(ProcessStatus::Succeeded, Some(ExitReason::Exit { code: 0 })),
+            &row(TaskState::Finished {
+                reason: ExitReason::Exit { code: 0 },
+            }),
             &[],
             PathBuf::from("/e"),
         );

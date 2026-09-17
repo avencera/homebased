@@ -30,6 +30,7 @@ fn install_hooks() -> Result<(), color_eyre::Report> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("homebased=info"));
+    // a second init in the same process is harmless: the first subscriber wins
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

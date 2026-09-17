@@ -9,26 +9,41 @@ pub mod systemd {
     use crate::home::Home;
     use std::path::PathBuf;
 
+    /// Always fails: systemd units exist only on Linux.
     pub fn render(_home: &Home) -> Result<String, AppError> {
         Err(AppError::Internal {
             message: "systemd install is Linux-only".into(),
         })
     }
-    pub fn install(_home: &Home) -> Result<(), AppError> {
-        render(_home).map(|_| ())
+
+    /// Always fails with the same error as `render`.
+    pub fn install(home: &Home) -> Result<(), AppError> {
+        render(home).map(|_| ())
     }
+
+    /// No-op: nothing can be installed on this host.
     pub fn uninstall() -> Result<(), AppError> {
         Ok(())
     }
+
+    /// Unit file name, for messages only.
+    #[must_use]
     pub fn unit_path() -> PathBuf {
         PathBuf::from("homebased.service")
     }
+
+    /// Always false.
+    #[must_use]
     pub fn unit_installed() -> bool {
         false
     }
+
+    /// No-op.
     pub fn host_stop() -> Result<(), AppError> {
         Ok(())
     }
+
+    /// No-op.
     pub fn host_restart() -> Result<(), AppError> {
         Ok(())
     }
@@ -104,6 +119,9 @@ pub fn host_restart() -> Result<(), AppError> {
     }
 }
 
+/// Environment variable that sets the dashboard bind.
+pub const WEB_LISTEN_ENV: &str = "HOMEBASED_WEB_LISTEN";
+
 /// Kind name for JSON.
 #[must_use]
 pub fn kind_name() -> &'static str {
@@ -129,6 +147,17 @@ pub fn agent_paths() -> Vec<(&'static str, std::path::PathBuf)> {
         }
     }
     out
+}
+
+/// Dashboard bind baked into the unit, when the installing shell sets
+/// `HOMEBASED_WEB_LISTEN`. Validated here so a typo fails `install`, not the
+/// unit at boot.
+pub fn web_listen_env() -> Result<Option<(&'static str, String)>, AppError> {
+    let Ok(raw) = std::env::var(WEB_LISTEN_ENV) else {
+        return Ok(None);
+    };
+    let listen: crate::daemon::web::WebListen = raw.parse()?;
+    Ok(Some((WEB_LISTEN_ENV, listen.to_string())))
 }
 
 /// Current PATH for the unit Environment=.

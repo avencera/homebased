@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 
-use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
+use crate::callback::{exit_event, lost_event};
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
-use crate::daemon::actors::task::{TaskActor, TaskMsg};
-use crate::daemon::actors::{call_store, send_reply, StoreActor, StoreMsg, CALL_TIMEOUT};
-use crate::domain::TaskId;
+use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
+use crate::daemon::actors::{CALL_TIMEOUT, StoreActor, StoreMsg, call_store, send_reply};
+use crate::domain::{TaskId, TaskState};
 use crate::error::AppError;
 use crate::home::Home;
 use crate::store::CancelResult;
@@ -49,10 +49,6 @@ pub struct SupervisorState {
     store: ActorRef<StoreMsg>,
     callback: ActorRef<CallbackMsg>,
     tasks: HashMap<TaskId, ActorRef<TaskMsg>>,
-    /// Join handles so `ActorTerminated` can drop them.
-    handles: HashMap<TaskId, JoinHandle<()>>,
-    store_handle: Option<JoinHandle<()>>,
-    callback_handle: Option<JoinHandle<()>>,
 }
 
 /// Root actor.
@@ -68,14 +64,14 @@ impl Actor for SupervisorActor {
         myself: ActorRef<Self::Msg>,
         home: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let (store, store_handle) = StoreActor::spawn_linked(
+        let (store, _store_handle) = StoreActor::spawn_linked(
             Some(STORE_NAME.into()),
             StoreActor,
             home.db_path(),
             myself.get_cell(),
         )
         .await?;
-        let (callback, callback_handle) = CallbackActor::spawn_linked(
+        let (callback, _callback_handle) = CallbackActor::spawn_linked(
             Some(CALLBACK_NAME.into()),
             CallbackActor,
             CallbackArgs {
@@ -90,14 +86,12 @@ impl Actor for SupervisorActor {
             store: store.clone(),
             callback: callback.clone(),
             tasks: HashMap::new(),
-            handles: HashMap::new(),
-            store_handle: Some(store_handle),
-            callback_handle: Some(callback_handle),
         };
         let rows = call_store(&store, |reply| StoreMsg::NonTerminal { reply }).await?;
         for row in rows {
             spawn_task_actor(&myself, &mut state, row.id).await?;
         }
+        deliver_pending_callbacks(&state).await?;
         Ok(state)
     }
 
@@ -121,7 +115,7 @@ impl Actor for SupervisorActor {
                 send_reply(reply, spawn_task_actor(&myself, state, id).await);
             }
             SupervisorMsg::Cancel { id, reply } => {
-                send_reply(reply, cancel(&myself, state, id).await);
+                send_reply(reply, cancel(state, id).await);
             }
         }
         Ok(())
@@ -135,21 +129,24 @@ impl Actor for SupervisorActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             SupervisionEvent::ActorFailed(who, err) => {
-                tracing::error!(actor = ?who.get_name(), "actor failed: {err}");
-                if who.get_name().as_deref() == Some(STORE_NAME) {
-                    respawn_store(&myself, state).await?;
-                } else if who.get_name().as_deref() == Some(CALLBACK_NAME) {
-                    respawn_callback(&myself, state).await?;
-                } else if let Some(id) = task_id_from_name(who.get_name()) {
+                let name = who.get_name();
+                // store and callback are singletons the whole daemon depends on
+                // and every live task actor holds their refs; there is no
+                // correct in-process recovery, so fail and let the host unit
+                // restart `serve` (DEC-20)
+                if name.as_deref() == Some(STORE_NAME) || name.as_deref() == Some(CALLBACK_NAME) {
+                    tracing::error!(actor = ?name, "daemon actor failed; stopping serve: {err}");
+                    return Err(err);
+                }
+                tracing::error!(actor = ?name, "actor failed: {err}");
+                if let Some(id) = task_id_from_name(name) {
                     state.tasks.remove(&id);
-                    state.handles.remove(&id);
                     spawn_task_actor(&myself, state, id).await?;
                 }
             }
             SupervisionEvent::ActorTerminated(who, _, _) => {
                 if let Some(id) = task_id_from_name(who.get_name()) {
                     state.tasks.remove(&id);
-                    state.handles.remove(&id);
                 }
             }
             _ => {}
@@ -181,63 +178,41 @@ async fn spawn_task_actor(
         store: state.store.clone(),
         callback: state.callback.clone(),
     };
-    let (task_ref, handle) =
+    let (task_ref, _handle) =
         TaskActor::spawn_linked(Some(task_name(id)), actor, id, supervisor.get_cell())
             .await
             .map_err(|err| AppError::Internal {
                 message: format!("spawn task actor: {err}"),
             })?;
     state.tasks.insert(id, task_ref);
-    state.handles.insert(id, handle);
     Ok(())
 }
 
-async fn cancel(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    id: TaskId,
-) -> Result<CancelResult, AppError> {
+async fn cancel(state: &SupervisorState, id: TaskId) -> Result<CancelResult, AppError> {
     if let Some(task) = state.tasks.get(&id) {
         return crate::daemon::actors::flatten_call(
             task.call(|reply| TaskMsg::Cancel { reply }, Some(CALL_TIMEOUT))
                 .await,
         );
     }
-    let _ = supervisor;
-    call_store(&state.store, |reply| StoreMsg::RequestCancel { id, reply }).await
+    cancel_task(&state.store, &state.callback, &state.home, id).await
 }
 
-async fn respawn_store(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-) -> Result<(), ActorProcessingErr> {
-    let (store, handle) = StoreActor::spawn_linked(
-        Some(STORE_NAME.into()),
-        StoreActor,
-        state.home.db_path(),
-        supervisor.get_cell(),
-    )
-    .await?;
-    state.store = store.clone();
-    state.store_handle = Some(handle);
-    respawn_callback(supervisor, state).await
-}
-
-async fn respawn_callback(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-) -> Result<(), ActorProcessingErr> {
-    let (callback, handle) = CallbackActor::spawn_linked(
-        Some(CALLBACK_NAME.into()),
-        CallbackActor,
-        CallbackArgs {
-            store: state.store.clone(),
-            home: state.home.clone(),
-        },
-        supervisor.get_cell(),
-    )
-    .await?;
-    state.callback = callback;
-    state.callback_handle = Some(handle);
+/// Deliver exit callbacks stranded on terminal rows. A daemon that died between
+/// the exit CAS and `FinishCallback` leaves `callback_status` at
+/// `pending|sending` with no worker and no task actor left to retry.
+async fn deliver_pending_callbacks(state: &SupervisorState) -> Result<(), AppError> {
+    let rows = call_store(&state.store, |reply| StoreMsg::PendingCallbacks { reply }).await?;
+    for row in rows {
+        let id = row.id;
+        let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
+        let dir = state.home.task_dir(id);
+        let event = match &row.state {
+            TaskState::Lost => lost_event(&row, &reports, dir),
+            _ => exit_event(&row, &reports, dir),
+        };
+        tracing::info!(%id, "redelivering pending callback");
+        state.callback.cast(CallbackMsg::Deliver { row, event })?;
+    }
     Ok(())
 }

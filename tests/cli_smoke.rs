@@ -11,7 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use homebased::agents::build_argv;
+use homebased::agents::{ArgvInputs, build_argv};
 use homebased::domain::AgentKind;
 use homebased::spec::NormalizedSpec;
 use tempfile::TempDir;
@@ -67,7 +67,7 @@ fn live_claude_accepts_unattended_argv() {
     assert_unattended_help(AgentKind::Claude, None);
 
     // `--help` ignores unknown flags on claude; a fake flag without `--help`
-    // is the parse check that would fail if an unattended flag were renamed.
+    // is the parse check that would fail if an unattended flag were renamed
     let dir = TempDir::new().unwrap();
     let argv = unattended_argv(AgentKind::Claude, dir.path(), None);
     let mut probe = argv.args.clone();
@@ -142,7 +142,7 @@ fn unattended_argv(
         extra_args: vec![],
         report_trailer: false,
     };
-    build_argv(&spec, &live_binary(kind), prompt_file)
+    build_argv(&ArgvInputs::from(&spec), &live_binary(kind), prompt_file)
 }
 
 fn live_binary(kind: AgentKind) -> PathBuf {

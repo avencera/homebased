@@ -2,6 +2,10 @@
 set -eu
 record="${FAKE_RECORD_DIR:?}"
 mkdir -p "$record"
+task="${HOMEBASED_TASK_ID:-unknown}"
+# the agent's own pid, so tests can assert the agent group is gone rather than
+# re-checking the worker pid they signalled
+printf '%s\n' "$$" > "$record/agent-pid-$task.txt"
 {
   printf 'argv0=%s\n' "$0"
   printf 'argv=%s\n' "$*"
@@ -20,6 +24,7 @@ if [ -f "$record/no-stdin" ]; then
 else
   cat > "$record/stdin.txt" || true
 fi
+cp "$record/stdin.txt" "$record/stdin-$task.txt" || true
 
 prev=
 for arg in "$@"; do
@@ -28,6 +33,10 @@ for arg in "$@"; do
   fi
   prev=$arg
 done
+
+if [ -f "$record/stdout" ]; then
+  cat "$record/stdout"
+fi
 
 sleep_for="${FAKE_SLEEP:-}"
 if [ -f "$record/sleep" ]; then

@@ -2,8 +2,8 @@
 
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 
-use crate::callback::{append_fallback, send_queue, HomebasedEvent};
-use crate::daemon::actors::{call_store, StoreMsg};
+use crate::callback::{HomebasedEvent, append_fallback, send_queue};
+use crate::daemon::actors::{StoreMsg, call_store};
 use crate::domain::{CallbackStatus, TaskRow};
 use crate::home::Home;
 

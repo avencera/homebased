@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::domain::{AgentKind, ProcessStatus, TaskId};
 
@@ -13,50 +13,97 @@ use crate::domain::{AgentKind, ProcessStatus, TaskId};
 pub enum AppError {
     /// Daemon socket is missing or not accepting connections.
     #[error("{message}")]
-    DaemonUnavailable { message: String },
+    DaemonUnavailable {
+        /// Why the socket could not be reached.
+        message: String,
+    },
     /// No task row for this id.
     #[error("task not found: {id}")]
-    TaskNotFound { id: TaskId },
+    TaskNotFound {
+        /// Id that had no row.
+        id: TaskId,
+    },
     /// Spec `cwd` is missing or not a directory.
     #[error("cwd not found: {}", path.display())]
-    CwdNotFound { path: PathBuf },
+    CwdNotFound {
+        /// Directory the spec asked for.
+        path: PathBuf,
+    },
     /// Agent binary is not on PATH and no HOMEBASED_* override exists.
     #[error("agent binary missing: {agent}")]
-    AgentBinaryMissing { agent: AgentKind },
+    AgentBinaryMissing {
+        /// Agent whose binary could not be resolved.
+        agent: AgentKind,
+    },
     /// Report summary exceeds 4 KiB.
     #[error("summary too long: {len} bytes")]
-    SummaryTooLong { len: usize },
+    SummaryTooLong {
+        /// Summary length in bytes.
+        len: usize,
+    },
     /// Task already has 20 reports.
     #[error("too many reports: {count}")]
-    TooManyReports { count: usize },
+    TooManyReports {
+        /// Reports already stored for the task.
+        count: usize,
+    },
     /// Report or mutate attempted on a terminal task.
     #[error("task {id} is terminal ({status})")]
-    TaskTerminal { id: TaskId, status: ProcessStatus },
+    TaskTerminal {
+        /// Task that is already finished.
+        id: TaskId,
+        /// Terminal status the task holds.
+        status: ProcessStatus,
+    },
     /// Submit spec failed validation.
     #[error("{message}")]
     InvalidSpec {
+        /// JSON pointer to the offending key.
         pointer: String,
+        /// Value found at `pointer`.
         value: Value,
+        /// Why the value was rejected.
         message: String,
     },
     /// Another serve process holds `daemon.lock`.
     #[error("daemon already running")]
     DaemonAlreadyRunning,
+    /// A non-blocking `flock` found the file locked by another process.
+    #[error("lock held: {}", path.display())]
+    LockHeld {
+        /// Lock file another process holds.
+        path: PathBuf,
+    },
     /// Stop or uninstall without `--yes` while tasks are queued or running.
     #[error("{count} task(s) in flight")]
-    TasksInFlight { count: usize },
+    TasksInFlight {
+        /// Queued or running tasks that block the operation.
+        count: usize,
+    },
     /// Generated host unit failed `systemd-analyze` or `plutil`.
     #[error("unit invalid: {message}")]
-    UnitInvalid { message: String },
+    UnitInvalid {
+        /// Validator output.
+        message: String,
+    },
     /// Usage error (conflicting flags, bad UUID).
     #[error("{message}")]
-    Usage { message: String },
+    Usage {
+        /// What the caller got wrong.
+        message: String,
+    },
     /// Permission denied.
     #[error("{message}")]
-    Permission { message: String },
+    Permission {
+        /// Operation that was denied.
+        message: String,
+    },
     /// Unexpected internal failure.
     #[error("{message}")]
-    Internal { message: String },
+    Internal {
+        /// Underlying failure text.
+        message: String,
+    },
 }
 
 impl AppError {
@@ -73,6 +120,7 @@ impl AppError {
             Self::TaskTerminal { .. } => "task_terminal",
             Self::InvalidSpec { .. } => "invalid_spec",
             Self::DaemonAlreadyRunning => "daemon_already_running",
+            Self::LockHeld { .. } => "lock_held",
             Self::TasksInFlight { .. } => "tasks_in_flight",
             Self::UnitInvalid { .. } => "unit_invalid",
             Self::Usage { .. } => "usage",
@@ -85,7 +133,10 @@ impl AppError {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::DaemonUnavailable { .. } | Self::UnitInvalid { .. } | Self::Internal { .. } => 1,
+            Self::DaemonUnavailable { .. }
+            | Self::UnitInvalid { .. }
+            | Self::LockHeld { .. }
+            | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => 2,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
@@ -113,9 +164,10 @@ impl AppError {
             | Self::TaskTerminal { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. } => http::StatusCode::CONFLICT,
-            Self::DaemonUnavailable { .. } | Self::UnitInvalid { .. } | Self::Internal { .. } => {
-                http::StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::DaemonUnavailable { .. }
+            | Self::UnitInvalid { .. }
+            | Self::LockHeld { .. }
+            | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -145,6 +197,7 @@ impl AppError {
             Self::Internal { message } => json!({ "message": message }),
             Self::DaemonUnavailable { message } => json!({ "message": message }),
             Self::DaemonAlreadyRunning => json!({}),
+            Self::LockHeld { path } => json!({ "path": path }),
         }
     }
 
@@ -166,18 +219,6 @@ impl AppError {
     #[must_use]
     pub fn to_exit_code(&self) -> ExitCode {
         ExitCode::from(self.exit_code())
-    }
-
-    /// Map an HTTP status from the daemon to a CLI exit code.
-    #[must_use]
-    pub fn exit_from_http(status: http::StatusCode) -> u8 {
-        match status.as_u16() {
-            400 => 2,
-            404 => 3,
-            403 => 4,
-            409 => 5,
-            _ => 1,
-        }
     }
 }
 

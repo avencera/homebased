@@ -1,6 +1,6 @@
 //! Hyper HTTP/1 client over a Unix socket.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -25,12 +25,6 @@ impl Client {
     #[must_use]
     pub fn new(sock: PathBuf) -> Self {
         Self { sock }
-    }
-
-    /// Socket path.
-    #[must_use]
-    pub fn sock(&self) -> &Path {
-        &self.sock
     }
 
     /// GET.
@@ -71,6 +65,7 @@ impl Client {
                     message: format!("handshake: {err}"),
                 })?;
         tokio::spawn(async move {
+            // connection errors surface on `send_request` and the body read below
             let _ = conn.await;
         });
         let payload = match body {
@@ -115,20 +110,20 @@ impl Client {
 }
 
 fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        if let Some(error) = value.get("error") {
-            let code = error
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("internal");
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("daemon error")
-                .to_string();
-            let input = error.get("input").cloned().unwrap_or(Value::Null);
-            return from_code(code, message, input, status);
-        }
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes)
+        && let Some(error) = value.get("error")
+    {
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("internal");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("daemon error")
+            .to_string();
+        let input = error.get("input").unwrap_or(&Value::Null);
+        return from_code(code, message, input, status);
     }
     AppError::Internal {
         message: format!(
@@ -139,7 +134,7 @@ fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
     }
 }
 
-fn from_code(code: &str, message: String, input: Value, status: StatusCode) -> AppError {
+fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> AppError {
     match code {
         "daemon_unavailable" => AppError::DaemonUnavailable { message },
         "task_not_found" => {

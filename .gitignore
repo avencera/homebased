@@ -1,5 +1,18 @@
 /target
 _plans
 _scratch
+.claude
 .DS_Store
 *.swp
+.env
+.env.*
+
+# dashboard: installed deps, generated bundle, and SvelteKit's cache
+web/node_modules
+web/build
+web/.svelte-kit
+
+# the homebased skill is owned by this repo and must be tracked
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/homebased/

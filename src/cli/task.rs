@@ -4,12 +4,13 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use clap::Subcommand;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::callback::{deliver_notify, last_event_for_row, notify_event};
 use crate::client::Client;
 use crate::domain::{ProcessStatus, ReportOutcome, TaskId, ThreadId};
 use crate::error::AppError;
+use crate::home::OutputTail;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
 
@@ -217,24 +218,23 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
 }
 
 fn log_cmd(ctx: &Ctx, id: TaskId, tail: Option<usize>) -> Result<ExitCode, AppError> {
-    let path = ctx.home.task_paths(id).output;
-    let text = std::fs::read_to_string(&path).map_err(|_| AppError::TaskNotFound { id })?;
-    let out = if let Some(n) = tail {
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(n);
-        lines[start..].join("\n")
-    } else {
-        text
-    };
+    // this command reads the disk, not the socket, so a missing log is the only
+    // signal it has that the id is unknown
+    let OutputTail { text, truncated } = ctx
+        .home
+        .task_paths(id)
+        .read_output(tail)?
+        .ok_or(AppError::TaskNotFound { id })?;
     match ctx.output {
         super::OutputMode::Json => ctx.print_json(json!({
             "api_version": crate::domain::API_VERSION,
             "id": id,
-            "log": out,
+            "log": text,
+            "truncated": truncated,
         }))?,
-        _ => print!("{out}"),
+        _ => print!("{text}"),
     }
-    if !out.ends_with('\n') && ctx.output != super::OutputMode::Json {
+    if !text.ends_with('\n') && ctx.output != super::OutputMode::Json {
         println!();
     }
     Ok(ExitCode::SUCCESS)
@@ -275,17 +275,19 @@ fn report(
         }
     };
     let store = Store::open(&ctx.home.db_path())?;
-    let reports = crate::report::append_report(&store, id, outcome, &summary)?;
+    let reports = store.append_report(id, outcome, &summary)?;
     if notify {
         let row = store.require_task(id)?;
         if let Some(report) = reports.last() {
             let event = notify_event(&row, report, ctx.home.task_dir(id));
-            if deliver_notify(&ctx.home, &row, &event).is_ok() {
-                let _ = store.mark_notified(id, report.seq);
+            match deliver_notify(&ctx.home, &row, &event) {
+                Ok(()) => store.mark_notified(id, report.seq)?,
+                // an interim notify is best-effort: the exit callback still carries the report
+                Err(err) => eprintln!("warning: notify failed: {err}"),
             }
         }
     }
-    let seq = reports.last().map(|r| r.seq).unwrap_or(0);
+    let seq = reports.last().map_or(0, |r| r.seq);
     ctx.print_id(
         &seq.to_string(),
         &format!("reported seq={seq}"),

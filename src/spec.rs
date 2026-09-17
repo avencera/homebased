@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::domain::{Agent, AgentKind, ThreadId, API_VERSION};
+use crate::domain::{API_VERSION, Agent, AgentKind, ThreadId};
 use crate::error::AppError;
 
 /// Default wall-clock timeout.
+#[must_use]
 pub fn default_timeout() -> Duration {
     Duration::from_secs(4 * 3600)
 }
@@ -29,48 +30,131 @@ fn default_true() -> bool {
     true
 }
 
-/// JSON document accepted by `task submit --spec`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Wire shape of `task submit --spec`. `prompt` and `prompt_file` are two keys
+/// here because that is the documented JSON; `SubmitSpec` collapses them into
+/// one `PromptSource`. `deny_unknown_fields` rules out `flatten`, so the raw
+/// keys stay on this struct.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(rename = "SubmitSpec")]
+struct SubmitSpecWire {
+    /// Must be 1.
+    api_version: u32,
+    /// Agent CLI.
+    agent: AgentKind,
+    /// Optional model alias. Empty becomes unset.
+    #[serde(default)]
+    model: Option<String>,
+    /// Codex thread that receives `HOMEBASED_EVENT`.
+    thread: ThreadId,
+    /// Working directory for the child.
+    cwd: PathBuf,
+    /// Inline prompt. Mutually exclusive with `prompt_file`.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Prompt file. Relative paths resolve against `cwd`.
+    #[serde(default)]
+    prompt_file: Option<PathBuf>,
+    /// Wall-clock timeout.
+    #[serde(default = "default_timeout", with = "humantime_serde")]
+    #[schemars(schema_with = "timeout_schema")]
+    timeout: Duration,
+    /// Extra argv appended after the unattended flags.
+    #[serde(default)]
+    extra_args: Vec<String>,
+    /// Append the reporting trailer to the child feed.
+    #[serde(default = "default_true")]
+    report_trailer: bool,
+}
+
+/// Where the prompt text comes from. Exactly one of the two wire keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptSource {
+    /// `prompt`: the text itself.
+    Inline(String),
+    /// `prompt_file`: a path, resolved against `cwd` when relative.
+    File(PathBuf),
+}
+
+impl PromptSource {
+    /// Pick the source from the two mutually exclusive wire keys.
+    fn from_wire(
+        prompt: Option<String>,
+        prompt_file: Option<PathBuf>,
+        raw: &Value,
+    ) -> Result<Self, AppError> {
+        match (prompt, prompt_file) {
+            (Some(text), None) => Ok(Self::Inline(text)),
+            (None, Some(path)) => Ok(Self::File(path)),
+            (Some(_), Some(_)) => Err(exactly_one_prompt(
+                raw.get("prompt").cloned().unwrap_or(Value::Null),
+            )),
+            (None, None) => Err(exactly_one_prompt(Value::Null)),
+        }
+    }
+
+    /// Read the prompt text, resolving a relative file against `cwd`.
+    fn read(&self, cwd: &Path) -> Result<String, AppError> {
+        match self {
+            Self::Inline(text) => Ok(text.clone()),
+            Self::File(path) => {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    cwd.join(path)
+                };
+                fs::read_to_string(&resolved).map_err(|err| AppError::InvalidSpec {
+                    pointer: "/prompt_file".into(),
+                    value: json!(path),
+                    message: format!("failed to read prompt_file {}: {err}", resolved.display()),
+                })
+            }
+        }
+    }
+}
+
+fn exactly_one_prompt(value: Value) -> AppError {
+    AppError::InvalidSpec {
+        pointer: "/prompt".into(),
+        value,
+        message: "exactly one of prompt or prompt_file is required".into(),
+    }
+}
+
+/// Validated submit spec.
+#[derive(Debug, Clone)]
 pub struct SubmitSpec {
     /// Must be 1.
     pub api_version: u32,
     /// Agent CLI.
     pub agent: AgentKind,
     /// Optional model alias. Empty becomes unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     pub thread: ThreadId,
     /// Working directory for the child.
     pub cwd: PathBuf,
-    /// Inline prompt. Mutually exclusive with `prompt_file`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// Prompt file. Relative paths resolve against `cwd`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_file: Option<PathBuf>,
+    /// Where the prompt text comes from.
+    pub prompt: PromptSource,
     /// Wall-clock timeout.
-    #[serde(default = "default_timeout", with = "humantime_serde")]
-    #[schemars(schema_with = "timeout_schema")]
     pub timeout: Duration,
     /// Extra argv appended after the unattended flags.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
     /// Append the reporting trailer to the child feed.
-    #[serde(default = "default_true")]
     pub report_trailer: bool,
 }
 
-/// Spec with prompt inlined and `prompt_file` removed.
+/// Spec with prompt inlined and `prompt_file` removed. This is the only shape
+/// the daemon socket accepts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedSpec {
     /// Schema version.
     pub api_version: u32,
     /// Agent CLI.
     pub agent: AgentKind,
     /// Optional model.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Codex thread.
     pub thread: ThreadId,
@@ -121,92 +205,77 @@ pub fn parse_spec_bytes(bytes: &[u8]) -> Result<SubmitSpec, AppError> {
         value: Value::Null,
         message: format!("invalid JSON: {err}"),
     })?;
-    parse_spec_value(value)
+    parse_spec_value(&value)
 }
 
 /// Parse an already-decoded JSON value.
-pub fn parse_spec_value(value: Value) -> Result<SubmitSpec, AppError> {
-    let pointer_value = value.clone();
-    let spec: SubmitSpec = serde_path_to_error::deserialize(&value).map_err(|err| {
-        let path = err.path().to_string();
-        let pointer = json_pointer(&path);
-        let field_value = pointer_value
-            .pointer(&pointer)
-            .cloned()
-            .unwrap_or(Value::Null);
+pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
+    let wire: SubmitSpecWire = serde_path_to_error::deserialize(value).map_err(|err| {
+        let pointer = json_pointer(err.path());
+        let field_value = value.pointer(&pointer).cloned().unwrap_or(Value::Null);
         AppError::InvalidSpec {
             pointer,
             value: field_value,
             message: err.to_string(),
         }
     })?;
-    validate_spec(&spec, &pointer_value)
+    validate_spec(wire, value)
 }
 
-fn json_pointer(serde_path: &str) -> String {
-    if serde_path.is_empty() || serde_path == "." {
-        return String::new();
+/// Render a `serde_path_to_error` path as an RFC 6901 JSON pointer. The crate's
+/// `Display` writes array elements as `extra_args[0]`, which `Value::pointer`
+/// cannot resolve, so walk the segments instead.
+fn json_pointer(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+
+    let mut pointer = String::new();
+    for segment in path.iter() {
+        pointer.push('/');
+        match segment {
+            Segment::Seq { index } => pointer.push_str(&index.to_string()),
+            Segment::Map { key } => pointer.push_str(&escape_token(key)),
+            Segment::Enum { variant } => pointer.push_str(&escape_token(variant)),
+            // a non-string map key has no pointer form; keep the crate's marker
+            Segment::Unknown => pointer.push('?'),
+        }
     }
-    let trimmed = serde_path.trim_start_matches('.');
-    format!("/{trimmed}").replace('.', "/")
+    pointer
 }
 
-fn validate_spec(spec: &SubmitSpec, raw: &Value) -> Result<SubmitSpec, AppError> {
-    if spec.api_version != API_VERSION {
+/// RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order.
+fn escape_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
+fn validate_spec(wire: SubmitSpecWire, raw: &Value) -> Result<SubmitSpec, AppError> {
+    if wire.api_version != API_VERSION {
         return Err(AppError::InvalidSpec {
             pointer: "/api_version".into(),
-            value: json!(spec.api_version),
+            value: json!(wire.api_version),
             message: format!("api_version must be {API_VERSION}"),
         });
     }
-    match (spec.prompt.is_some(), spec.prompt_file.is_some()) {
-        (true, true) => {
-            return Err(AppError::InvalidSpec {
-                pointer: "/prompt".into(),
-                value: raw.get("prompt").cloned().unwrap_or(Value::Null),
-                message: "exactly one of prompt or prompt_file is required".into(),
-            });
-        }
-        (false, false) => {
-            return Err(AppError::InvalidSpec {
-                pointer: "/prompt".into(),
-                value: Value::Null,
-                message: "exactly one of prompt or prompt_file is required".into(),
-            });
-        }
-        _ => {}
-    }
-    Ok(spec.clone())
+    let prompt = PromptSource::from_wire(wire.prompt, wire.prompt_file, raw)?;
+    Ok(SubmitSpec {
+        api_version: wire.api_version,
+        agent: wire.agent,
+        model: wire.model,
+        thread: wire.thread,
+        cwd: wire.cwd,
+        prompt,
+        timeout: wire.timeout,
+        extra_args: wire.extra_args,
+        report_trailer: wire.report_trailer,
+    })
 }
 
 /// Resolve prompt bytes and produce a normalized spec.
 pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
-    let prompt = if let Some(text) = &spec.prompt {
-        text.clone()
-    } else if let Some(path) = &spec.prompt_file {
-        let resolved = if path.is_absolute() {
-            path.clone()
-        } else {
-            spec.cwd.join(path)
-        };
-        fs::read_to_string(&resolved).map_err(|err| AppError::InvalidSpec {
-            pointer: "/prompt_file".into(),
-            value: json!(path),
-            message: format!("failed to read prompt_file {}: {err}", resolved.display()),
-        })?
-    } else {
-        return Err(AppError::InvalidSpec {
-            pointer: "/prompt".into(),
-            value: Value::Null,
-            message: "exactly one of prompt or prompt_file is required".into(),
-        });
-    };
-
-    let model = spec.agent().model;
+    let prompt = spec.prompt.read(&spec.cwd)?;
     Ok(NormalizedSpec {
         api_version: API_VERSION,
         agent: spec.agent,
-        model,
+        model: spec.agent().model,
         thread: spec.thread,
         cwd: spec.cwd.clone(),
         prompt,
@@ -218,7 +287,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
 
 /// JSON Schema for the submit spec.
 pub fn schema_json() -> Result<Value, AppError> {
-    let schema = schemars::schema_for!(SubmitSpec);
+    let schema = schemars::schema_for!(SubmitSpecWire);
     Ok(serde_json::to_value(&schema)?)
 }
 
@@ -226,17 +295,14 @@ pub fn schema_json() -> Result<Value, AppError> {
 pub fn check_cwd(cwd: &Path) -> Result<(), AppError> {
     match fs::metadata(cwd) {
         Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(AppError::CwdNotFound {
-            path: cwd.to_path_buf(),
-        }),
-        Err(_) => Err(AppError::CwdNotFound {
+        _ => Err(AppError::CwdNotFound {
             path: cwd.to_path_buf(),
         }),
     }
 }
 
-/// Example document from the plan, used in tests.
-pub fn example_json() -> Value {
+#[cfg(test)]
+fn example_json() -> Value {
     json!({
         "api_version": 1,
         "agent": "claude",
@@ -268,11 +334,9 @@ mod tests {
     fn unknown_field_rejected() {
         let mut value = valid_spec();
         value["typo"] = json!(true);
-        let err = parse_spec_value(value).unwrap_err();
+        let err = parse_spec_value(&value).unwrap_err();
         match err {
-            AppError::InvalidSpec { pointer, .. } => {
-                assert!(pointer.contains("typo") || pointer.is_empty() || pointer == "/typo");
-            }
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/typo"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -281,7 +345,7 @@ mod tests {
     fn both_prompt_and_file_rejected() {
         let mut value = valid_spec();
         value["prompt_file"] = json!("/tmp/p.txt");
-        let err = parse_spec_value(value).unwrap_err();
+        let err = parse_spec_value(&value).unwrap_err();
         match err {
             AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/prompt"),
             other => panic!("unexpected {other:?}"),
@@ -292,9 +356,27 @@ mod tests {
     fn neither_prompt_rejected() {
         let mut value = valid_spec();
         value.as_object_mut().unwrap().remove("prompt");
-        let err = parse_spec_value(value).unwrap_err();
+        let err = parse_spec_value(&value).unwrap_err();
         match err {
             AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/prompt"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pointer_on_bad_array_element() {
+        let mut value = valid_spec();
+        value["extra_args"] = json!([1]);
+        let err = parse_spec_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec {
+                pointer,
+                value: field,
+                ..
+            } => {
+                assert_eq!(pointer, "/extra_args/0");
+                assert_eq!(field, json!(1));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -303,7 +385,7 @@ mod tests {
     fn pointer_on_bad_thread() {
         let mut value = valid_spec();
         value["thread"] = json!("not-a-uuid");
-        let err = parse_spec_value(value).unwrap_err();
+        let err = parse_spec_value(&value).unwrap_err();
         match err {
             AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/thread"),
             other => panic!("unexpected {other:?}"),
@@ -321,8 +403,7 @@ mod tests {
             model: None,
             thread: ThreadId::from_str_ok(),
             cwd: dir.path().to_path_buf(),
-            prompt: None,
-            prompt_file: Some(PathBuf::from("p.txt")),
+            prompt: PromptSource::File(PathBuf::from("p.txt")),
             timeout: default_timeout(),
             extra_args: vec![],
             report_trailer: true,
@@ -335,7 +416,7 @@ mod tests {
     fn schema_contains_example_fields() {
         let schema = schema_json().unwrap();
         let example = example_json();
-        parse_spec_value(example.clone()).unwrap();
+        parse_spec_value(&example).unwrap();
         let props = schema
             .get("properties")
             .or_else(|| schema.pointer("/$defs/SubmitSpec/properties"))
@@ -349,7 +430,7 @@ mod tests {
 
     #[test]
     fn default_timeout_is_four_hours() {
-        let spec = parse_spec_value(valid_spec()).unwrap();
+        let spec = parse_spec_value(&valid_spec()).unwrap();
         assert_eq!(spec.timeout, Duration::from_secs(4 * 3600));
         assert!(spec.report_trailer);
     }

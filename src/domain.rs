@@ -263,15 +263,27 @@ impl fmt::Display for ProcessStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExitReason {
     /// Process exited.
-    Exit { code: i32 },
+    Exit {
+        /// Exit code the process returned.
+        code: i32,
+    },
     /// Process received a signal.
-    Signal { signal: i32 },
+    Signal {
+        /// Signal number that ended the process.
+        signal: i32,
+    },
     /// Wall-clock timeout.
-    Timeout { secs: u64 },
+    Timeout {
+        /// Timeout budget in seconds.
+        secs: u64,
+    },
     /// Cancelled.
     Cancelled,
     /// `task-run` or the agent binary could not start.
-    SpawnFailed { message: String },
+    SpawnFailed {
+        /// Why the spawn failed.
+        message: String,
+    },
 }
 
 /// Callback delivery state.
@@ -401,6 +413,84 @@ pub struct AgentReport {
     pub notified_at: Option<DateTime<Utc>>,
 }
 
+/// Lifecycle of one task, derived from the `status`, `exit_reason` and `pid`
+/// columns. Every terminal state except `Lost` carries the reason it ended, so
+/// `status` is never read without the data that explains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskState {
+    /// Inserted, worker not yet CAS-marked running.
+    Queued,
+    /// Worker holds `runner.lock`. `pid` is recorded just after the CAS.
+    Running {
+        /// Worker pid (also pgid). Display and signalling only.
+        pid: Option<i32>,
+    },
+    /// Worker wrote an exit reason.
+    Finished {
+        /// Why the process ended.
+        reason: ExitReason,
+    },
+    /// Lock free and no `exit.json`.
+    Lost,
+}
+
+impl TaskState {
+    /// Rebuild the state from the stored columns.
+    pub fn from_storage(
+        status: ProcessStatus,
+        exit_reason: Option<ExitReason>,
+        pid: Option<i32>,
+    ) -> Result<Self, AppError> {
+        match (status, exit_reason) {
+            (ProcessStatus::Queued, _) => Ok(Self::Queued),
+            (ProcessStatus::Running, _) => Ok(Self::Running { pid }),
+            (ProcessStatus::Lost, _) => Ok(Self::Lost),
+            (
+                ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled,
+                Some(reason),
+            ) => Ok(Self::Finished { reason }),
+            (status, None) => Err(AppError::Internal {
+                message: format!("task row is {status} with no exit_reason"),
+            }),
+        }
+    }
+
+    /// Storage tag for the `status` column.
+    #[must_use]
+    pub fn status(&self) -> ProcessStatus {
+        match self {
+            Self::Queued => ProcessStatus::Queued,
+            Self::Running { .. } => ProcessStatus::Running,
+            Self::Finished { reason } => ProcessStatus::from(reason),
+            Self::Lost => ProcessStatus::Lost,
+        }
+    }
+
+    /// Stored exit reason, if the task ended with one.
+    #[must_use]
+    pub fn exit_reason(&self) -> Option<&ExitReason> {
+        match self {
+            Self::Finished { reason } => Some(reason),
+            Self::Queued | Self::Running { .. } | Self::Lost => None,
+        }
+    }
+
+    /// Worker pid while running.
+    #[must_use]
+    pub fn pid(&self) -> Option<i32> {
+        match self {
+            Self::Running { pid } => *pid,
+            Self::Queued | Self::Finished { .. } | Self::Lost => None,
+        }
+    }
+
+    /// Whether the task can no longer change process status.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finished { .. } | Self::Lost)
+    }
+}
+
 /// Persisted task row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
@@ -422,20 +512,45 @@ pub struct TaskRow {
     pub env: TaskEnv,
     /// Resolved agent binary.
     pub binary: PathBuf,
-    /// Process status.
-    pub status: ProcessStatus,
-    /// Exit reason once known.
-    pub exit_reason: Option<ExitReason>,
-    /// Callback delivery.
+    /// Process lifecycle.
+    pub state: TaskState,
+    /// Callback delivery. A second axis: it outlives the process state.
     pub callback_status: CallbackStatus,
-    /// Worker pid (also pgid). Display and signalling only.
-    pub pid: Option<i32>,
     /// When cancel was requested.
     pub cancel_requested_at: Option<DateTime<Utc>>,
     /// Insert time.
     pub created_at: DateTime<Utc>,
     /// Last row update.
     pub updated_at: DateTime<Utc>,
+}
+
+impl TaskRow {
+    /// Storage status of the process.
+    #[must_use]
+    pub fn status(&self) -> ProcessStatus {
+        self.state.status()
+    }
+
+    /// Exit reason once known.
+    #[must_use]
+    pub fn exit_reason(&self) -> Option<&ExitReason> {
+        self.state.exit_reason()
+    }
+
+    /// Worker pid while running.
+    #[must_use]
+    pub fn pid(&self) -> Option<i32> {
+        self.state.pid()
+    }
+
+    /// Whether the callback still has to be delivered.
+    #[must_use]
+    pub fn callback_outstanding(&self) -> bool {
+        matches!(
+            self.callback_status,
+            CallbackStatus::Pending | CallbackStatus::Sending
+        )
+    }
 }
 
 /// Illegal transition.
@@ -449,11 +564,16 @@ pub enum TransitionError {
     CallbackSentWhileQueued,
     /// Reports cannot be appended after the process is terminal.
     #[error("cannot report on terminal task ({status})")]
-    ReportOnTerminal { status: ProcessStatus },
+    ReportOnTerminal {
+        /// Terminal status that rejected the report.
+        status: ProcessStatus,
+    },
     /// Any other illegal process-status pair.
     #[error("illegal status transition {from} -> {to}")]
     IllegalStatus {
+        /// Status the task holds.
         from: ProcessStatus,
+        /// Status the caller asked for.
         to: ProcessStatus,
     },
 }
@@ -509,27 +629,22 @@ pub fn check_report_allowed(status: ProcessStatus) -> Result<(), TransitionError
 
 impl From<TransitionError> for AppError {
     fn from(err: TransitionError) -> Self {
-        match err {
-            TransitionError::ReportOnTerminal { status } => Self::Internal {
-                message: format!("report on terminal task ({status})"),
-            },
-            other => Self::Internal {
-                message: other.to_string(),
-            },
+        Self::Internal {
+            message: err.to_string(),
         }
     }
 }
 
-/// Map an agent wait result to process status and reason.
-#[must_use]
-pub fn status_from_exit(reason: &ExitReason) -> ProcessStatus {
-    match reason {
-        ExitReason::Exit { code: 0 } => ProcessStatus::Succeeded,
-        ExitReason::Cancelled => ProcessStatus::Cancelled,
-        ExitReason::Exit { .. }
-        | ExitReason::Signal { .. }
-        | ExitReason::Timeout { .. }
-        | ExitReason::SpawnFailed { .. } => ProcessStatus::Failed,
+impl From<&ExitReason> for ProcessStatus {
+    fn from(reason: &ExitReason) -> Self {
+        match reason {
+            ExitReason::Exit { code: 0 } => Self::Succeeded,
+            ExitReason::Cancelled => Self::Cancelled,
+            ExitReason::Exit { .. }
+            | ExitReason::Signal { .. }
+            | ExitReason::Timeout { .. }
+            | ExitReason::SpawnFailed { .. } => Self::Failed,
+        }
     }
 }
 
@@ -596,6 +711,34 @@ mod tests {
             }
         ));
         check_report_allowed(ProcessStatus::Running).unwrap();
+    }
+
+    #[test]
+    fn state_derives_status_and_rejects_a_terminal_row_without_a_reason() {
+        let running = TaskState::from_storage(ProcessStatus::Running, None, Some(42)).unwrap();
+        assert_eq!(running.status(), ProcessStatus::Running);
+        assert_eq!(running.pid(), Some(42));
+        assert_eq!(running.exit_reason(), None);
+
+        let finished = TaskState::from_storage(
+            ProcessStatus::Failed,
+            Some(ExitReason::Timeout { secs: 3 }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(finished.status(), ProcessStatus::Failed);
+        assert_eq!(
+            finished.exit_reason(),
+            Some(&ExitReason::Timeout { secs: 3 })
+        );
+
+        // Lost is the one terminal state with no exit.json to explain it
+        assert_eq!(
+            TaskState::from_storage(ProcessStatus::Lost, None, Some(7)).unwrap(),
+            TaskState::Lost
+        );
+        let err = TaskState::from_storage(ProcessStatus::Succeeded, None, None).unwrap_err();
+        assert!(matches!(err, AppError::Internal { .. }), "{err:?}");
     }
 
     #[test]

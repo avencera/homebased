@@ -1,6 +1,7 @@
 //! State directory resolution and task directory layout.
 
 use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -8,10 +9,13 @@ use std::path::{Path, PathBuf};
 use crate::domain::TaskId;
 use crate::error::AppError;
 
-/// Names under `$HOMEBASED_HOME`.
+/// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
+/// SQLite database file name under `$HOMEBASED_HOME`.
 pub const DB_NAME: &str = "homebased.sqlite";
+/// Daemon singleton lock file name under `$HOMEBASED_HOME`.
 pub const DAEMON_LOCK: &str = "daemon.lock";
+/// Log that records callbacks `codex queue` could not deliver.
 pub const FALLBACK_LOG: &str = "callback-fallback.log";
 
 /// Resolved state root plus helpers for the on-disk layout.
@@ -26,19 +30,19 @@ impl Home {
         if let Some(path) = cli_home {
             return Ok(Self { root: path });
         }
-        if let Ok(path) = std::env::var("HOMEBASED_HOME") {
-            if !path.is_empty() {
-                return Ok(Self {
-                    root: PathBuf::from(path),
-                });
-            }
+        if let Ok(path) = std::env::var("HOMEBASED_HOME")
+            && !path.is_empty()
+        {
+            return Ok(Self {
+                root: PathBuf::from(path),
+            });
         }
-        if let Ok(path) = std::env::var("XDG_STATE_HOME") {
-            if !path.is_empty() {
-                return Ok(Self {
-                    root: PathBuf::from(path).join("homebased"),
-                });
-            }
+        if let Ok(path) = std::env::var("XDG_STATE_HOME")
+            && !path.is_empty()
+        {
+            return Ok(Self {
+                root: PathBuf::from(path).join("homebased"),
+            });
         }
         let home = std::env::var("HOME").map_err(|_| AppError::Internal {
             message: "HOME is unset".into(),
@@ -110,6 +114,20 @@ impl Home {
     }
 }
 
+/// Upper bound on `tail`, so one request cannot pull an unbounded log into
+/// memory or into a JSON body.
+pub const MAX_TAIL_LINES: usize = 5000;
+
+/// Text of `output.log`, whole or tailed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTail {
+    /// Log text. Tailed text is the kept lines joined with `\n` and carries no
+    /// trailing newline.
+    pub text: String,
+    /// Whether earlier lines were dropped.
+    pub truncated: bool,
+}
+
 /// Files inside `tasks/<id>/`.
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -166,25 +184,67 @@ impl TaskPaths {
         fs::write(&self.feed, feed)?;
         Ok(())
     }
+
+    /// Read `output.log`, keeping only the last `tail` lines when asked.
+    /// `tail` is capped at [`MAX_TAIL_LINES`]. `Ok(None)` means the file does
+    /// not exist: either the agent has written nothing yet, or the task id has
+    /// no directory.
+    ///
+    /// Agent output is arbitrary bytes, so invalid UTF-8 is replaced rather
+    /// than rejected.
+    pub fn read_output(&self, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
+        let bytes = match fs::read(&self.output) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(tail) = tail else {
+            return Ok(Some(OutputTail {
+                text,
+                truncated: false,
+            }));
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(tail.min(MAX_TAIL_LINES));
+        Ok(Some(OutputTail {
+            text: lines[start..].join("\n"),
+            truncated: start > 0,
+        }))
+    }
 }
 
-/// Open (or create) a file and take an exclusive `flock`.
-pub fn flock_exclusive(path: &Path, nonblock: bool) -> Result<File, AppError> {
+/// Whether `flock_exclusive` waits for a held lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Wait until the lock is free.
+    Blocking,
+    /// Fail with `AppError::LockHeld` when another process holds the lock.
+    NonBlocking,
+}
+
+/// Open (or create) a file and take an exclusive `flock`. The caller keeps the
+/// returned `File`; the lock lives as long as any descriptor on the same open
+/// file description, so a spawned child keeps it after the parent closes.
+pub fn flock_exclusive(path: &Path, mode: LockMode) -> Result<File, AppError> {
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)?;
-    let arg = if nonblock {
-        nix::fcntl::FlockArg::LockExclusiveNonblock
-    } else {
-        nix::fcntl::FlockArg::LockExclusive
+    let arg = match mode {
+        LockMode::Blocking => nix::fcntl::FlockArg::LockExclusive,
+        LockMode::NonBlocking => nix::fcntl::FlockArg::LockExclusiveNonblock,
     };
     match flock_raw(&file, arg) {
         Ok(()) => Ok(file),
-        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EWOULDBLOCK) if nonblock => {
-            Err(AppError::DaemonAlreadyRunning)
+        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EWOULDBLOCK)
+            if mode == LockMode::NonBlocking =>
+        {
+            Err(AppError::LockHeld {
+                path: path.to_path_buf(),
+            })
         }
         Err(err) => Err(AppError::Internal {
             message: format!("flock {}: {err}", path.display()),
@@ -192,22 +252,9 @@ pub fn flock_exclusive(path: &Path, nonblock: bool) -> Result<File, AppError> {
     }
 }
 
-/// Blocking exclusive flock. Returns the held file.
-pub fn flock_exclusive_blocking(path: &Path) -> Result<File, AppError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
-    match flock_raw(&file, nix::fcntl::FlockArg::LockExclusive) {
-        Ok(()) => Ok(file),
-        Err(err) => Err(AppError::Internal {
-            message: format!("flock {}: {err}", path.display()),
-        }),
-    }
-}
-
+// `nix::fcntl::Flock` releases the lock in `Drop`, which would drop the lock the
+// spawned worker inherits when the daemon closes its own descriptor. The
+// deprecated free function keeps close-on-drop semantics
 #[allow(deprecated)]
 fn flock_raw(file: &File, arg: nix::fcntl::FlockArg) -> nix::Result<()> {
     nix::fcntl::flock(file.as_raw_fd(), arg)
@@ -232,13 +279,18 @@ mod tests {
         let mut old: Vec<(&str, Option<OsString>)> = Vec::new();
         for (key, value) in pairs {
             old.push((*key, std::env::var_os(key)));
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
+            set_env(key, value.map(OsString::from).as_deref());
         }
         f();
         for (key, value) in old {
+            set_env(key, value.as_deref());
+        }
+    }
+
+    fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
+        // SAFETY: every caller holds ENV_LOCK, so no other test thread reads or
+        // writes the process environment while it is mutated here
+        unsafe {
             match value {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
@@ -312,10 +364,10 @@ mod tests {
     fn flock_nonblock_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
-        let held = flock_exclusive(&path, false).unwrap();
-        let err = flock_exclusive(&path, true).unwrap_err();
-        assert!(matches!(err, AppError::DaemonAlreadyRunning));
+        let held = flock_exclusive(&path, LockMode::Blocking).unwrap();
+        let err = flock_exclusive(&path, LockMode::NonBlocking).unwrap_err();
+        assert!(matches!(err, AppError::LockHeld { path: p } if p == path));
         drop(held);
-        let _second = flock_exclusive(&path, true).unwrap();
+        let _second = flock_exclusive(&path, LockMode::NonBlocking).unwrap();
     }
 }

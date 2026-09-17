@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::domain::AgentKind;
+use crate::domain::{AgentKind, TaskRow};
 use crate::error::AppError;
 use crate::spec::NormalizedSpec;
 
@@ -30,21 +30,57 @@ impl ChildArgv {
 
 /// Resolve the agent binary: `HOMEBASED_<AGENT>` then `which` on `path`.
 pub fn resolve_binary(kind: AgentKind, path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
-    if let Ok(override_path) = std::env::var(kind.binary_env()) {
-        if !override_path.is_empty() {
-            let p = PathBuf::from(&override_path);
-            if p.is_file() {
-                return Ok(p);
-            }
+    if let Ok(override_path) = std::env::var(kind.binary_env())
+        && !override_path.is_empty()
+    {
+        let p = PathBuf::from(&override_path);
+        if p.is_file() {
+            return Ok(p);
         }
     }
     which::which_in(kind.binary_name(), Some(OsString::from(path)), cwd)
         .map_err(|_| AppError::AgentBinaryMissing { agent: kind })
 }
 
-/// Build unattended argv for a normalized spec.
-pub fn build_argv(spec: &NormalizedSpec, binary: &Path, prompt_file: Option<&Path>) -> ChildArgv {
-    let (mut args, stdin_prompt) = match spec.agent {
+/// Everything `build_argv` reads, independent of where it is stored.
+#[derive(Debug, Clone, Copy)]
+pub struct ArgvInputs<'a> {
+    /// Agent CLI.
+    pub kind: AgentKind,
+    /// Model alias, if any.
+    pub model: Option<&'a str>,
+    /// Working directory for the child.
+    pub cwd: &'a Path,
+    /// Extra argv appended after the unattended flags.
+    pub extra_args: &'a [String],
+}
+
+impl<'a> From<&'a NormalizedSpec> for ArgvInputs<'a> {
+    fn from(spec: &'a NormalizedSpec) -> Self {
+        Self {
+            kind: spec.agent,
+            model: spec.model.as_deref(),
+            cwd: &spec.cwd,
+            extra_args: &spec.extra_args,
+        }
+    }
+}
+
+impl<'a> From<&'a TaskRow> for ArgvInputs<'a> {
+    fn from(row: &'a TaskRow) -> Self {
+        Self {
+            kind: row.agent.kind,
+            model: row.agent.model.as_deref(),
+            cwd: &row.cwd,
+            extra_args: &row.extra_args,
+        }
+    }
+}
+
+/// Build unattended argv for one agent invocation.
+#[must_use]
+pub fn build_argv(spec: &ArgvInputs<'_>, binary: &Path, prompt_file: Option<&Path>) -> ChildArgv {
+    let (mut args, stdin_prompt) = match spec.kind {
         AgentKind::Codex => {
             let mut args = vec![
                 "exec".into(),
@@ -54,17 +90,17 @@ pub fn build_argv(spec: &NormalizedSpec, binary: &Path, prompt_file: Option<&Pat
                 "danger-full-access".into(),
                 "--dangerously-bypass-approvals-and-sandbox".into(),
             ];
-            if let Some(model) = &spec.model {
+            if let Some(model) = spec.model {
                 args.push("-m".into());
-                args.push(model.clone());
+                args.push(model.to_string());
             }
             (args, true)
         }
         AgentKind::Claude => {
             let mut args = vec!["-p".into()];
-            if let Some(model) = &spec.model {
+            if let Some(model) = spec.model {
                 args.push("--model".into());
-                args.push(model.clone());
+                args.push(model.to_string());
             }
             args.push("--permission-mode".into());
             args.push("auto".into());
@@ -83,9 +119,9 @@ pub fn build_argv(spec: &NormalizedSpec, binary: &Path, prompt_file: Option<&Pat
                 "--prompt-file".into(),
                 file,
             ];
-            if let Some(model) = &spec.model {
+            if let Some(model) = spec.model {
                 args.push("-m".into());
-                args.push(model.clone());
+                args.push(model.to_string());
             }
             (args, false)
         }
@@ -121,7 +157,11 @@ mod tests {
 
     #[test]
     fn claude_argv() {
-        let argv = build_argv(&spec(AgentKind::Claude), Path::new("/bin/claude"), None);
+        let argv = build_argv(
+            &ArgvInputs::from(&spec(AgentKind::Claude)),
+            Path::new("/bin/claude"),
+            None,
+        );
         assert_eq!(
             argv.to_vec(),
             vec![
@@ -140,7 +180,11 @@ mod tests {
 
     #[test]
     fn codex_argv() {
-        let argv = build_argv(&spec(AgentKind::Codex), Path::new("/bin/codex"), None);
+        let argv = build_argv(
+            &ArgvInputs::from(&spec(AgentKind::Codex)),
+            Path::new("/bin/codex"),
+            None,
+        );
         let v = argv.to_vec();
         assert_eq!(v[0], "/bin/codex");
         assert_eq!(v[1], "exec");
@@ -153,7 +197,7 @@ mod tests {
     #[test]
     fn grok_argv_uses_prompt_file_not_dash_p() {
         let argv = build_argv(
-            &spec(AgentKind::Grok),
+            &ArgvInputs::from(&spec(AgentKind::Grok)),
             Path::new("/bin/grok"),
             Some(Path::new("/state/tasks/id/prompt.feed.txt")),
         );

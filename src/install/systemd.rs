@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::error::AppError;
 use crate::home::Home;
-use crate::install::{agent_paths, binary_path, installer_path};
+use crate::install::{agent_paths, binary_path, installer_path, web_listen_env};
 
 /// Unit file path.
 #[must_use]
@@ -27,6 +27,9 @@ pub fn render(home: &Home) -> Result<String, AppError> {
     env_lines.push_str(&format!("Environment=PATH={}\n", installer_path()));
     for (key, path) in agent_paths() {
         env_lines.push_str(&format!("Environment={key}={}\n", path.display()));
+    }
+    if let Some((key, value)) = web_listen_env()? {
+        env_lines.push_str(&format!("Environment={key}={value}\n"));
     }
     Ok(format!(
         "[Unit]\n\
@@ -64,11 +67,13 @@ pub fn install(home: &Home) -> Result<(), AppError> {
 
 /// Disable and remove the unit file. Does not delete the database.
 pub fn uninstall() -> Result<(), AppError> {
+    // uninstall must succeed even when the unit was never enabled
     let _ = run_systemctl(&["disable", "--now", "homebased.service"]);
     let path = unit_path();
     if path.exists() {
         std::fs::remove_file(path)?;
     }
+    // a stale generation only matters to systemd, not to this command's result
     let _ = run_systemctl(&["daemon-reload"]);
     Ok(())
 }
@@ -123,7 +128,9 @@ fn warn_linger() {
     if let Ok(out) = out {
         let text = String::from_utf8_lossy(&out.stdout);
         if text.contains("Linger=no") {
-            eprintln!("warning: user lingering is off; `loginctl enable-linger` so homebased starts at login");
+            eprintln!(
+                "warning: user lingering is off; `loginctl enable-linger` so homebased starts at login"
+            );
         }
     }
 }

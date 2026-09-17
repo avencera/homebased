@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::error::AppError;
 use crate::home::Home;
-use crate::install::{agent_paths, binary_path, installer_path};
+use crate::install::{agent_paths, binary_path, installer_path, web_listen_env};
 
 /// LaunchAgent label.
 pub const LABEL: &str = "dev.praveen.homebased";
@@ -30,6 +30,13 @@ pub fn render(home: &Home) -> Result<String, AppError> {
             "    <key>{}</key>\n    <string>{}</string>\n",
             xml_escape(key),
             xml_escape(&path.display().to_string())
+        ));
+    }
+    if let Some((key, value)) = web_listen_env()? {
+        env.push_str(&format!(
+            "    <key>{}</key>\n    <string>{}</string>\n",
+            xml_escape(key),
+            xml_escape(&value)
         ));
     }
     Ok(format!(
@@ -74,6 +81,7 @@ pub fn install(home: &Home) -> Result<(), AppError> {
     std::fs::write(&path, &text)?;
     lint(&path)?;
     let uid = nix::unistd::getuid().as_raw();
+    // bootout fails when nothing is loaded; the bootstrap below is the real step
     let _ = Command::new("launchctl")
         .args([
             "bootout",
@@ -101,6 +109,7 @@ pub fn install(home: &Home) -> Result<(), AppError> {
 pub fn uninstall() -> Result<(), AppError> {
     let path = plist_path();
     let uid = nix::unistd::getuid().as_raw();
+    // uninstall must succeed even when the job was never loaded
     let _ = Command::new("launchctl")
         .args([
             "bootout",
@@ -117,6 +126,7 @@ pub fn uninstall() -> Result<(), AppError> {
 /// `launchctl bootout` equivalent of stop.
 pub fn host_stop() -> Result<(), AppError> {
     let uid = nix::unistd::getuid().as_raw();
+    // stopping an already-stopped job is a success for the caller
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("gui/{uid}/{LABEL}")])
         .status();
@@ -175,6 +185,9 @@ mod tests {
         assert!(text.contains("daemon"), "{text}");
         assert!(text.contains("serve"), "{text}");
         assert!(text.contains("/tmp/hb-state"), "{text}");
-        assert!(text.contains("<string>") && text.contains("homebased") || text.contains("/"));
+        assert!(
+            text.contains(&format!("<key>Label</key>\n  <string>{LABEL}</string>")),
+            "plist must carry the reverse-DNS label: {text}"
+        );
     }
 }
