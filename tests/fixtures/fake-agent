@@ -11,7 +11,15 @@ mkdir -p "$record"
   printf 'HOMEBASED_HOME=%s\n' "${HOMEBASED_HOME:-}"
 } > "$record/agent-meta.txt"
 
-cat > "$record/stdin.txt" || true
+if [ -f "$record/ignore-term" ]; then
+  trap '' TERM
+fi
+
+if [ -f "$record/no-stdin" ]; then
+  : > "$record/stdin.txt"
+else
+  cat > "$record/stdin.txt" || true
+fi
 
 prev=
 for arg in "$@"; do

@@ -759,19 +759,224 @@ fn install_dry_run_text() {
 }
 
 #[test]
+fn status_responds_while_callback_hangs() {
+    let h = Harness::new();
+    h.set_control("queue-sleep", "5");
+    let id = h.submit(&Harness::spec("claude", "fast"));
+    thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    let list = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    let list_elapsed = start.elapsed();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(
+        list_elapsed < Duration::from_millis(500),
+        "task list took {list_elapsed:?}"
+    );
+    let start = Instant::now();
+    let status = h
+        .cmd()
+        .args(["--json", "daemon", "status"])
+        .output()
+        .unwrap();
+    let status_elapsed = start.elapsed();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status_elapsed < Duration::from_millis(500),
+        "daemon status took {status_elapsed:?}"
+    );
+    let _ = id;
+}
+
+#[test]
+fn sigterm_without_cancel_is_failed() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "hold");
+    spec["timeout"] = json!("30s");
+    h.set_control("sleep", "20");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+    let pid = h.show(&id)["pid"].as_i64().unwrap() as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let show = h.wait_status(&id, "failed");
+    assert_eq!(show["exit_reason"]["kind"], "signal");
+    assert_eq!(show["exit_reason"]["signal"], 15);
+    assert!(show["cancel_requested_at"].is_null(), "{show}");
+    let ev = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(ev["event"], "TASK_FAILED");
+}
+
+#[test]
+fn cancel_immediately_after_submit() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "hold");
+    spec["timeout"] = json!("30s");
+    h.set_control("sleep", "20");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for _ in 0..20 {
+        let _ = h.cmd().args(["task", "cancel", &id]).output();
+    }
+    let show = h.wait_status(&id, "cancelled");
+    assert_eq!(show["status"], "cancelled");
+    let msgs = h.queue_messages();
+    assert!(
+        msgs.iter()
+            .any(|m| event_json(m)["event"] == "TASK_CANCELLED"),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().all(|m| event_json(m)["event"] != "TASK_LOST"),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn large_prompt_early_exit_keeps_code() {
+    let h = Harness::new();
+    h.set_control("no-stdin", "");
+    h.set_control("exit", "3");
+    let mut spec = Harness::spec("claude", &"x".repeat(1024 * 1024));
+    spec["timeout"] = json!("15s");
+    let spec_path = h.home.join("spec-big.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let show = h.wait_status(&id, "failed");
+    assert_eq!(show["exit_reason"]["kind"], "exit");
+    assert_eq!(show["exit_reason"]["code"], 3);
+    let ev = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(ev["event"], "TASK_FAILED");
+    assert_ne!(ev["process"]["kind"], "spawn_failed");
+}
+
+#[test]
+fn stuck_agent_is_killed_after_grace() {
+    let h = Harness::new();
+    h.set_control("ignore-term", "");
+    h.set_control("sleep", "30");
+    let mut spec = Harness::spec("claude", "trap");
+    spec["timeout"] = json!("1s");
+    let spec_path = h.home.join("spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let start = Instant::now();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let show = h.wait_status(&id, "failed");
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(show["exit_reason"]["kind"], "timeout");
+    if let Some(pid) = show["pid"].as_i64() {
+        let gone = wait_until(Duration::from_secs(2), || {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err()
+        });
+        assert!(gone, "agent/worker still alive");
+    }
+}
+
+#[test]
 fn counter_evidence_scan() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let execstop = grep_src(&src, "ExecStop");
-    assert!(execstop.is_empty(), "ExecStop in src: {execstop:?}");
-    let reconcile = src.join("daemon/reconcile.rs");
-    let sleep = grep_src(&reconcile, "sleep");
-    assert!(sleep.is_empty(), "sleep in reconcile: {sleep:?}");
+    let systemd = src.join("install/systemd.rs");
+    let execstop: Vec<_> = fs::read_to_string(&systemd)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("ExecStop="))
+        .map(|(i, line)| format!("{}:{}:{line}", systemd.display(), i + 1))
+        .collect();
+    assert!(execstop.is_empty(), "ExecStop= in systemd.rs: {execstop:?}");
     let cli = src.join("cli");
     let flags = grep_src(&cli, r#"arg\("--prompt"|arg\("--agent""#);
     assert!(flags.is_empty(), "per-field submit flags: {flags:?}");
     let report = src.join("report.rs");
     let http = grep_src(&report, r"UnixStream|/v1/");
     assert!(http.is_empty(), "report talks HTTP: {http:?}");
+
+    let daemon = src.join("daemon");
+    let mutex = grep_src(&daemon, "Mutex");
+    assert!(mutex.is_empty(), "Mutex in daemon: {mutex:?}");
+    let rwlock = grep_src(&daemon, "RwLock");
+    assert!(rwlock.is_empty(), "RwLock in daemon: {rwlock:?}");
+    let sleep = grep_daemon_except_callback(&daemon, "thread::sleep");
+    assert!(sleep.is_empty(), "thread::sleep in daemon: {sleep:?}");
+    let cmd = grep_daemon_except_callback(&daemon, "Command::new");
+    assert!(cmd.is_empty(), "Command::new in daemon: {cmd:?}");
+    let open = grep_daemon_except_store(&daemon, "Store::open");
+    assert!(open.is_empty(), "Store::open in daemon: {open:?}");
+    let conn = grep_daemon_except_store(&daemon, "Connection::open");
+    assert!(conn.is_empty(), "Connection::open in daemon: {conn:?}");
+}
+
+fn grep_daemon_except_callback(daemon: &Path, pattern: &str) -> Vec<String> {
+    grep_src(daemon, pattern)
+        .into_iter()
+        .filter(|line| !line.contains("/actors/callback.rs:"))
+        .collect()
+}
+
+fn grep_daemon_except_store(daemon: &Path, pattern: &str) -> Vec<String> {
+    grep_src(daemon, pattern)
+        .into_iter()
+        .filter(|line| !line.contains("/actors/store.rs:"))
+        .collect()
 }
 
 fn grep_src(path: &Path, pattern: &str) -> Vec<String> {

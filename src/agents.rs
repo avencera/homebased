@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{Agent, AgentKind};
+use crate::domain::AgentKind;
 use crate::error::AppError;
 use crate::spec::NormalizedSpec;
 
@@ -96,28 +96,6 @@ pub fn build_argv(spec: &NormalizedSpec, binary: &Path, prompt_file: Option<&Pat
         args,
         stdin_prompt,
     }
-}
-
-/// Convenience: argv from an already-resolved `Agent` plus extras.
-pub fn build_argv_for_agent(
-    agent: &Agent,
-    cwd: &Path,
-    extra_args: &[String],
-    binary: &Path,
-    prompt_file: Option<&Path>,
-) -> ChildArgv {
-    let spec = NormalizedSpec {
-        api_version: crate::domain::API_VERSION,
-        agent: agent.kind,
-        model: agent.model.clone(),
-        thread: crate::domain::ThreadId(uuid::Uuid::nil()),
-        cwd: cwd.to_path_buf(),
-        prompt: String::new(),
-        timeout: std::time::Duration::from_secs(1),
-        extra_args: extra_args.to_vec(),
-        report_trailer: true,
-    };
-    build_argv(&spec, binary, prompt_file)
 }
 
 #[cfg(test)]

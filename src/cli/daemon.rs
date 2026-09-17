@@ -180,9 +180,7 @@ async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
             use std::os::unix::process::CommandExt;
             unsafe {
                 cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                    nix::unistd::setsid().map_err(std::io::Error::from)?;
                     Ok(())
                 });
             }
@@ -228,13 +226,13 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
             CancelResult::AlreadyTerminal(_) => {}
             CancelResult::CancelledQueued(row) => {
                 let reports = store.reports(row.id)?;
-                let event = exit_event(&row, &reports, ctx.home.task_dir(row.id), false);
+                let event = exit_event(&row, &reports, ctx.home.task_dir(row.id));
                 deliver_exit_event(store, &ctx.home, &row, &event)?;
             }
             CancelResult::SignalWorker(row) => {
                 if let Some(pid) = row.pid {
                     let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(-pid),
+                        nix::unistd::Pid::from_raw(pid),
                         nix::sys::signal::Signal::SIGTERM,
                     );
                 }

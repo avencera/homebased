@@ -176,26 +176,20 @@ pub fn flock_exclusive(path: &Path, nonblock: bool) -> Result<File, AppError> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    let op = if nonblock {
-        libc::LOCK_EX | libc::LOCK_NB
+    let arg = if nonblock {
+        nix::fcntl::FlockArg::LockExclusiveNonblock
     } else {
-        libc::LOCK_EX
+        nix::fcntl::FlockArg::LockExclusive
     };
-    let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-    if rc == 0 {
-        return Ok(file);
+    match flock_raw(&file, arg) {
+        Ok(()) => Ok(file),
+        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EWOULDBLOCK) if nonblock => {
+            Err(AppError::DaemonAlreadyRunning)
+        }
+        Err(err) => Err(AppError::Internal {
+            message: format!("flock {}: {err}", path.display()),
+        }),
     }
-    let err = std::io::Error::last_os_error();
-    if nonblock && matches!(err.kind(), std::io::ErrorKind::WouldBlock) {
-        return Err(AppError::DaemonAlreadyRunning);
-    }
-    // Some platforms report EAGAIN rather than EWOULDBLOCK.
-    if nonblock && err.raw_os_error() == Some(libc::EAGAIN) {
-        return Err(AppError::DaemonAlreadyRunning);
-    }
-    Err(AppError::Internal {
-        message: format!("flock {}: {err}", path.display()),
-    })
 }
 
 /// Blocking exclusive flock. Returns the held file.
@@ -206,18 +200,17 @@ pub fn flock_exclusive_blocking(path: &Path) -> Result<File, AppError> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc == 0 {
-        Ok(file)
-    } else {
-        Err(AppError::Internal {
-            message: format!(
-                "flock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ),
-        })
+    match flock_raw(&file, nix::fcntl::FlockArg::LockExclusive) {
+        Ok(()) => Ok(file),
+        Err(err) => Err(AppError::Internal {
+            message: format!("flock {}: {err}", path.display()),
+        }),
     }
+}
+
+#[allow(deprecated)]
+fn flock_raw(file: &File, arg: nix::fcntl::FlockArg) -> nix::Result<()> {
+    nix::fcntl::flock(file.as_raw_fd(), arg)
 }
 
 /// Set a path to mode 0600.

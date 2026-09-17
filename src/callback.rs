@@ -139,19 +139,29 @@ impl HomebasedEvent {
     }
 }
 
-/// Build an exit event from row + reports + process.
+/// Build an exit event from the row's stored reason.
 #[must_use]
-pub fn exit_event(
+pub fn exit_event(row: &TaskRow, reports: &[AgentReport], evidence: PathBuf) -> HomebasedEvent {
+    build_event(
+        row,
+        reports,
+        evidence,
+        row.exit_reason.as_ref().map(ProcessPayload::from),
+    )
+}
+
+/// Build a lost-runner event.
+#[must_use]
+pub fn lost_event(row: &TaskRow, reports: &[AgentReport], evidence: PathBuf) -> HomebasedEvent {
+    build_event(row, reports, evidence, Some(ProcessPayload::RunnerLost))
+}
+
+fn build_event(
     row: &TaskRow,
     reports: &[AgentReport],
     evidence: PathBuf,
-    lost: bool,
+    process: Option<ProcessPayload>,
 ) -> HomebasedEvent {
-    let process = if lost {
-        Some(ProcessPayload::RunnerLost)
-    } else {
-        row.exit_reason.as_ref().map(ProcessPayload::from)
-    };
     let (event, next_action) = derive_exit(process.as_ref(), reports);
     HomebasedEvent {
         api_version: crate::domain::API_VERSION,
@@ -218,12 +228,12 @@ pub fn deliver_exit_event(
         return Ok(());
     }
     let line = event.to_message_line()?;
-    let result = send_queue(home, row, &line, &home.task_paths(row.id).callback_log);
+    let result = send_queue(row, &line, &home.task_paths(row.id).callback_log);
     match result {
         Ok(()) => store.finish_callback(row.id, CallbackStatus::Sent)?,
         Err(err) => {
             store.finish_callback(row.id, CallbackStatus::Failed)?;
-            append_fallback(home, &line, &err.to_string())?;
+            append_fallback(&home.fallback_log_path(), &line, &err.to_string())?;
         }
     }
     Ok(())
@@ -233,10 +243,11 @@ pub fn deliver_exit_event(
 pub fn deliver_notify(home: &Home, row: &TaskRow, event: &HomebasedEvent) -> Result<(), AppError> {
     let line = event.to_message_line()?;
     let log = home.task_paths(row.id).callback_log;
-    send_queue(home, row, &line, &log)
+    send_queue(row, &line, &log)
 }
 
-fn send_queue(home: &Home, row: &TaskRow, line: &str, log_path: &Path) -> Result<(), AppError> {
+/// Run `codex queue` up to three times. Blocking; call from `spawn_blocking` in the daemon.
+pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(), AppError> {
     let binary = resolve_codex(&row.env.path, &row.cwd)?;
     let mut last_err = String::new();
     for attempt in 0..3 {
@@ -277,7 +288,6 @@ fn send_queue(home: &Home, row: &TaskRow, line: &str, log_path: &Path) -> Result
             }
         }
     }
-    let _ = home;
     Err(AppError::Internal { message: last_err })
 }
 
@@ -294,12 +304,13 @@ fn resolve_codex(path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-fn append_fallback(home: &Home, line: &str, stderr: &str) -> Result<(), AppError> {
+/// Append the event line and last stderr to the fallback log.
+pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(), AppError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(home.fallback_log_path())?;
+        .open(path)?;
     writeln!(file, "{line}")?;
     writeln!(file, "{stderr}")?;
     Ok(())
@@ -322,8 +333,8 @@ pub fn last_event_for_row(
             .rev()
             .find(|r| r.notified_at.is_some())
             .map(|r| notify_event(row, r, evidence)),
-        ProcessStatus::Lost => Some(exit_event(row, reports, evidence, true)),
-        _ => Some(exit_event(row, reports, evidence, false)),
+        ProcessStatus::Lost => Some(lost_event(row, reports, evidence)),
+        _ => Some(exit_event(row, reports, evidence)),
     }
 }
 
@@ -374,20 +385,14 @@ mod tests {
             &row(ProcessStatus::Cancelled, Some(ExitReason::Cancelled)),
             &[report(1, ReportOutcome::Succeeded)],
             PathBuf::from("/e"),
-            false,
         );
         assert_eq!(event.event, EventKind::TaskCancelled);
         assert_eq!(event.next_action, NextAction::None);
     }
 
     #[test]
-    fn lost_event() {
-        let event = exit_event(
-            &row(ProcessStatus::Lost, None),
-            &[],
-            PathBuf::from("/e"),
-            true,
-        );
+    fn lost_runner_event() {
+        let event = lost_event(&row(ProcessStatus::Lost, None), &[], PathBuf::from("/e"));
         assert_eq!(event.event, EventKind::TaskLost);
         assert!(matches!(event.process, Some(ProcessPayload::RunnerLost)));
     }
@@ -401,7 +406,6 @@ mod tests {
                 report(2, ReportOutcome::Succeeded),
             ],
             PathBuf::from("/e"),
-            false,
         );
         assert_eq!(event.event, EventKind::TaskSucceeded);
         assert_eq!(event.reports.len(), 2);
@@ -415,7 +419,6 @@ mod tests {
             &row(ProcessStatus::Succeeded, Some(ExitReason::Exit { code: 0 })),
             &[],
             PathBuf::from("/e"),
-            false,
         );
         assert_eq!(event.event, EventKind::TaskSucceeded);
         assert!(event.reports.is_empty());
@@ -440,7 +443,6 @@ mod tests {
             &row(ProcessStatus::Succeeded, Some(ExitReason::Exit { code: 0 })),
             &[],
             PathBuf::from("/e"),
-            false,
         );
         let line = event.to_message_line().unwrap();
         let json = line.strip_prefix("HOMEBASED_EVENT ").unwrap();

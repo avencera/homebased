@@ -8,8 +8,11 @@ use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(target_os = "linux")]
+use nix::sys::prctl;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::{getpgrp, Pid};
+use nix::unistd::{setsid, Pid};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::signal::unix::{signal, SignalKind};
@@ -60,16 +63,12 @@ pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppErr
 }
 
 fn prepare_worker(fd: RawFd) -> io::Result<()> {
-    if unsafe { libc::setsid() } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    setsid().map_err(io::Error::from)?;
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = fcntl(borrowed, FcntlArg::F_GETFD).map_err(io::Error::from)?;
+    let mut fdflag = FdFlag::from_bits_truncate(flags);
+    fdflag.remove(FdFlag::FD_CLOEXEC);
+    fcntl(borrowed, FcntlArg::F_SETFD(fdflag)).map_err(io::Error::from)?;
     Ok(())
 }
 
@@ -116,6 +115,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         &paths,
         feed,
         row.timeout,
+        &store,
     )
     .await
     {
@@ -127,11 +127,13 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
 
     store::write_exit_json(&paths.exit_json, &reason)?;
     let to = status_from_exit(&reason);
-    let _ = store.cas_exit(id, ProcessStatus::Running, to, &reason)?;
+    if !store.cas_exit(id, ProcessStatus::Running, to, &reason)? {
+        let current = store.require_task(id)?;
+        warn!(%id, status = %current.status, "cas_exit failed");
+    }
     let row = store.require_task(id)?;
     let reports = store.reports(id)?;
-    let lost = false;
-    let event = exit_event(&row, &reports, paths.dir.clone(), lost);
+    let event = exit_event(&row, &reports, paths.dir.clone());
     deliver_exit_event(&store, &home, &row, &event)?;
     Ok(())
 }
@@ -147,7 +149,11 @@ async fn run_agent(
     paths: &TaskPaths,
     feed: Vec<u8>,
     timeout: Duration,
+    store: &Store,
 ) -> Result<ExitReason, AppError> {
+    let mut sigterm = signal(SignalKind::terminate()).map_err(|err| AppError::Internal {
+        message: format!("signal: {err}"),
+    })?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -164,7 +170,8 @@ async fn run_agent(
         .env("HOMEBASED_HOME", home.root())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
     if argv.stdin_prompt {
         cmd.stdin(Stdio::piped());
     } else {
@@ -173,9 +180,7 @@ async fn run_agent(
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            prctl::set_pdeathsig(Some(Signal::SIGKILL)).map_err(io::Error::from)?;
             Ok(())
         });
     }
@@ -183,35 +188,42 @@ async fn run_agent(
     let mut child = cmd.spawn().map_err(|err| AppError::Internal {
         message: format!("spawn agent: {err}"),
     })?;
+    let agent_pgid = child.id().ok_or_else(|| AppError::Internal {
+        message: "agent pid missing after spawn".into(),
+    })? as i32;
     if argv.stdin_prompt {
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&feed)
-                .await
-                .map_err(|err| AppError::Internal {
-                    message: format!("write prompt: {err}"),
-                })?;
+            tokio::spawn(async move {
+                match stdin.write_all(&feed).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {}
+                    Err(err) => warn!("prompt stdin write: {err}"),
+                }
+            });
         }
     }
 
-    let mut sigterm = signal(SignalKind::terminate()).map_err(|err| AppError::Internal {
-        message: format!("signal: {err}"),
-    })?;
     let deadline = Instant::now() + timeout;
     let remaining = deadline.saturating_duration_since(Instant::now());
     tokio::select! {
         status = child.wait() => {
-            Ok(status_to_reason(status, false, timeout))
+            Ok(status_to_reason(status))
         }
         _ = sigterm.recv() => {
-            warn!(%id, "SIGTERM: forwarding to agent");
-            forward_sigterm();
-            Ok(wait_then_kill(&mut child, true, timeout).await)
+            let cancelled = store.require_task(id)?.cancel_requested_at.is_some();
+            warn!(%id, cancelled, "SIGTERM: forwarding to agent group");
+            forward_sigterm(agent_pgid);
+            wait_then_kill(&mut child, agent_pgid).await;
+            if cancelled {
+                Ok(ExitReason::Cancelled)
+            } else {
+                Ok(ExitReason::Signal { signal: 15 })
+            }
         }
         _ = time::sleep(remaining) => {
             warn!(%id, "timeout: killing agent group");
-            forward_sigterm();
-            let _ = wait_then_kill(&mut child, false, timeout).await;
+            forward_sigterm(agent_pgid);
+            wait_then_kill(&mut child, agent_pgid).await;
             Ok(ExitReason::Timeout {
                 secs: timeout.as_secs(),
             })
@@ -219,15 +231,7 @@ async fn run_agent(
     }
 }
 
-fn status_to_reason(
-    status: io::Result<std::process::ExitStatus>,
-    cancel_requested: bool,
-    timeout: Duration,
-) -> ExitReason {
-    let _ = timeout;
-    if cancel_requested {
-        return ExitReason::Cancelled;
-    }
+fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> ExitReason {
     match status {
         Ok(st) => {
             if let Some(code) = st.code() {
@@ -249,56 +253,18 @@ fn status_to_reason(
     }
 }
 
-async fn wait_then_kill(
-    child: &mut tokio::process::Child,
-    cancel_requested: bool,
-    timeout: Duration,
-) -> ExitReason {
+async fn wait_then_kill(child: &mut tokio::process::Child, agent_pgid: i32) {
     match time::timeout(KILL_GRACE, child.wait()).await {
-        Ok(status) => status_to_reason(status, cancel_requested, timeout),
+        Ok(_) => {}
         Err(_) => {
-            kill_group_except_self();
-            let status = child.wait().await;
-            if cancel_requested {
-                ExitReason::Cancelled
-            } else {
-                status_to_reason(status, false, timeout)
-            }
+            let _ = kill(Pid::from_raw(-agent_pgid), Signal::SIGKILL);
+            let _ = child.wait().await;
         }
     }
 }
 
-fn forward_sigterm() {
-    let pgid = getpgrp();
-    let _ = kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGTERM);
-}
-
-fn kill_group_except_self() {
-    let me = std::process::id() as i32;
-    let pgid = getpgrp().as_raw();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        if proc_pgid(pid) == Some(pgid) {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-        }
-    }
-}
-
-fn proc_pgid(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.rsplit_once(')')?.1;
-    let mut fields = rest.split_whitespace();
-    let _state = fields.next()?;
-    let _ppid = fields.next()?;
-    fields.next()?.parse().ok()
+fn forward_sigterm(agent_pgid: i32) {
+    let _ = kill(Pid::from_raw(-agent_pgid), Signal::SIGTERM);
 }
 
 /// Write prompt files for a new task.

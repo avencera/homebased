@@ -17,8 +17,8 @@ humantime = "2.4.0"
 humantime-serde = "1.1.1"
 hyper = { version = "1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
-libc = "0.2.189"
-nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
+nix = { version = "0.31.3", features = ["fs", "process", "signal", "user"] }
+ractor = "0.16.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = { version = "1.2.2", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }

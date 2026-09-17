@@ -138,8 +138,10 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let text = render(&home).unwrap();
         assert!(text.contains("KillMode=process"), "{text}");
-        let forbidden = ["Exec", "Stop"].concat();
-        assert!(!text.contains(&forbidden), "{text}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("ExecStop=")),
+            "{text}"
+        );
         assert!(text.contains("ExecStart="), "{text}");
         assert!(text.contains("daemon serve --home /tmp/hb-state"), "{text}");
         assert!(text.contains("Environment=PATH="), "{text}");

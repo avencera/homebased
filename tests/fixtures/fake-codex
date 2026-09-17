@@ -32,6 +32,9 @@ if [ "${1:-}" = "queue" ]; then
     printf 'queue fail attempt %s\n' "$n" >&2
     exit 1
   fi
+  if [ -f "$record/queue-sleep" ]; then
+    sleep "$(cat "$record/queue-sleep")"
+  fi
   exit 0
 fi
 

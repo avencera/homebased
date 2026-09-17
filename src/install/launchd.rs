@@ -73,7 +73,7 @@ pub fn install(home: &Home) -> Result<(), AppError> {
     }
     std::fs::write(&path, &text)?;
     lint(&path)?;
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let _ = Command::new("launchctl")
         .args([
             "bootout",
@@ -100,7 +100,7 @@ pub fn install(home: &Home) -> Result<(), AppError> {
 /// Unload and remove the plist.
 pub fn uninstall() -> Result<(), AppError> {
     let path = plist_path();
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let _ = Command::new("launchctl")
         .args([
             "bootout",
@@ -116,7 +116,7 @@ pub fn uninstall() -> Result<(), AppError> {
 
 /// `launchctl bootout` equivalent of stop.
 pub fn host_stop() -> Result<(), AppError> {
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("gui/{uid}/{LABEL}")])
         .status();
@@ -125,7 +125,7 @@ pub fn host_stop() -> Result<(), AppError> {
 
 /// `launchctl kickstart -k`.
 pub fn host_restart() -> Result<(), AppError> {
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let status = Command::new("launchctl")
         .args(["kickstart", "-k", &format!("gui/{uid}/{LABEL}")])
         .status()

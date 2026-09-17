@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 
 use crate::agents::{build_argv, resolve_binary};
 use crate::callback::last_event_for_row;
-use crate::daemon::{lock_store, spawn_and_watch, AppState};
+use crate::daemon::actors::{call_store, flatten_call, StoreMsg, SupervisorMsg, CALL_TIMEOUT};
+use crate::daemon::{spawn_and_watch, AppState};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, ThreadId, API_VERSION};
 use crate::error::AppError;
 use crate::spec::{self, NormalizedSpec, SubmitSpec};
@@ -45,8 +46,7 @@ struct StatusBody {
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {
-    let store = lock_store(&state.store);
-    let in_flight = store.in_flight_count()?;
+    let in_flight = call_store(&state.store, |reply| StoreMsg::InFlightCount { reply }).await?;
     Ok(Json(StatusBody {
         api_version: API_VERSION,
         pid: std::process::id(),
@@ -72,7 +72,7 @@ async fn submit(
     State(state): State<AppState>,
     Json(body): Json<SubmitBody>,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
-    let (id, status) = accept_task(&state, body, false)?;
+    let (id, status) = accept_task(&state, body).await?;
     Ok((
         StatusCode::OK,
         Json(SubmitResponse {
@@ -97,9 +97,8 @@ async fn dry_run(
     let spec = parse_incoming(body.spec)?;
     spec::check_cwd(&spec.cwd)?;
     let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
-    let prompt_file = grok_placeholder(&state, &spec);
+    let prompt_file = grok_placeholder(state.home.root(), &spec);
     let argv = build_argv(&spec, &binary, prompt_file.as_deref());
-    let _ = state;
     Ok(Json(DryRunResponse {
         api_version: API_VERSION,
         spec,
@@ -107,16 +106,9 @@ async fn dry_run(
     }))
 }
 
-fn grok_placeholder(state: &AppState, spec: &NormalizedSpec) -> Option<PathBuf> {
+fn grok_placeholder(root: &std::path::Path, spec: &NormalizedSpec) -> Option<PathBuf> {
     if spec.agent == crate::domain::AgentKind::Grok {
-        Some(
-            state
-                .home
-                .root()
-                .join("tasks")
-                .join("<task-id>")
-                .join("prompt.feed.txt"),
-        )
+        Some(root.join("tasks").join("<task-id>").join("prompt.feed.txt"))
     } else {
         None
     }
@@ -152,8 +144,12 @@ async fn list(
         Some(s) => Some(s.parse::<ThreadId>()?),
         None => None,
     };
-    let store = lock_store(&state.store);
-    let rows = store.list_tasks(&statuses, thread)?;
+    let rows = call_store(&state.store, |reply| StoreMsg::ListTasks {
+        statuses,
+        thread,
+        reply,
+    })
+    .await?;
     let tasks: Vec<Value> = rows
         .iter()
         .map(|row| {
@@ -179,9 +175,10 @@ async fn show(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Value>, AppError> {
-    let store = lock_store(&state.store);
-    let row = store.require_task(id)?;
-    let reports = store.reports(id)?;
+    let row = call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
+        .await?
+        .ok_or(AppError::TaskNotFound { id })?;
+    let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let last_event = last_event_for_row(&row, &reports, evidence.clone());
     Ok(Json(json!({
@@ -208,40 +205,31 @@ async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Value>, AppError> {
-    let result = {
-        let store = lock_store(&state.store);
-        store.request_cancel(id)?
-    };
+    let result = flatten_call(
+        state
+            .supervisor
+            .call(
+                |reply| SupervisorMsg::Cancel { id, reply },
+                Some(CALL_TIMEOUT),
+            )
+            .await,
+    )?;
     match result {
         CancelResult::AlreadyTerminal(row) => Ok(Json(json!({
             "api_version": API_VERSION,
             "id": row.id,
             "status": row.status,
         }))),
-        CancelResult::CancelledQueued(row) => {
-            let store = lock_store(&state.store);
-            let reports = store.reports(id)?;
-            let event = crate::callback::exit_event(&row, &reports, state.home.task_dir(id), false);
-            crate::callback::deliver_exit_event(&store, &state.home, &row, &event)?;
-            Ok(Json(json!({
-                "api_version": API_VERSION,
-                "id": id,
-                "status": crate::domain::ProcessStatus::Cancelled,
-            })))
-        }
-        CancelResult::SignalWorker(row) => {
-            if let Some(pid) = row.pid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-pid),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
-            Ok(Json(json!({
-                "api_version": API_VERSION,
-                "id": id,
-                "status": row.status,
-            })))
-        }
+        CancelResult::CancelledQueued(_) => Ok(Json(json!({
+            "api_version": API_VERSION,
+            "id": id,
+            "status": crate::domain::ProcessStatus::Cancelled,
+        }))),
+        CancelResult::SignalWorker(row) => Ok(Json(json!({
+            "api_version": API_VERSION,
+            "id": id,
+            "status": row.status,
+        }))),
     }
 }
 
@@ -262,17 +250,13 @@ fn parse_incoming(value: Value) -> Result<NormalizedSpec, AppError> {
     spec::normalize(&spec)
 }
 
-fn accept_task(
+async fn accept_task(
     state: &AppState,
     body: SubmitBody,
-    dry: bool,
 ) -> Result<(TaskId, ProcessStatus), AppError> {
     let spec = parse_incoming(body.spec)?;
     spec::check_cwd(&spec.cwd)?;
     let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
-    if dry {
-        return Ok((TaskId::new(), ProcessStatus::Queued));
-    }
     let id = TaskId::new();
     let paths = state.home.prepare_task(id)?;
     crate::runner::write_task_files(&paths, &spec.prompt, spec.report_trailer)?;
@@ -287,11 +271,12 @@ fn accept_task(
         env: body.env,
         binary,
     });
-    {
-        let store = lock_store(&state.store);
-        store.insert_task(&row)?;
-    }
-    spawn_and_watch(state, id)?;
+    call_store(&state.store, |reply| StoreMsg::InsertTask {
+        row: Box::new(row),
+        reply,
+    })
+    .await?;
+    spawn_and_watch(state, id).await?;
     Ok((id, ProcessStatus::Queued))
 }
 

@@ -1,30 +1,37 @@
-//! Serve: daemon lock, socket, reconcile, shutdown.
+//! Serve: daemon lock, socket, actors, shutdown.
 
+pub mod actors;
 pub mod api;
-pub mod reconcile;
 
 use std::fs::File;
-use std::sync::{Arc, Mutex};
 
+use ractor::{Actor, ActorRef};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
-use crate::domain::TaskId;
+use crate::callback::exit_event;
+use crate::daemon::actors::{
+    call_store, flatten_call, CallbackMsg, StoreMsg, SupervisorActor, SupervisorMsg, CALL_TIMEOUT,
+};
+use crate::domain::{ExitReason, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::home::{chmod_600, flock_exclusive, Home};
-use crate::store::Store;
 
-/// Shared daemon state.
+/// Axum state: actor refs plus immutable path config.
 #[derive(Clone)]
 pub struct AppState {
-    /// State directory.
+    /// State directory (immutable layout).
     pub home: Home,
-    /// SQLite store.
-    pub store: Arc<Mutex<Store>>,
+    /// Store actor.
+    pub store: ActorRef<StoreMsg>,
+    /// Callback actor.
+    pub callback: ActorRef<CallbackMsg>,
+    /// Supervisor.
+    pub supervisor: ActorRef<SupervisorMsg>,
 }
 
-/// Hold `daemon.lock`, bind the socket, reconcile, serve until SIGTERM.
+/// Hold `daemon.lock`, bind the socket, start actors, serve until SIGTERM.
 pub async fn serve(home: Home) -> Result<(), AppError> {
     home.ensure()?;
     let _daemon_lock = acquire_daemon_lock(&home)?;
@@ -36,13 +43,23 @@ pub async fn serve(home: Home) -> Result<(), AppError> {
         message: format!("bind {}: {err}", sock.display()),
     })?;
     chmod_600(&sock)?;
-    let store = Store::open(&home.db_path())?;
+    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
+        .await
+        .map_err(|err| AppError::Internal {
+            message: format!("spawn supervisor: {err}"),
+        })?;
+    let refs = flatten_call(
+        supervisor
+            .call(|reply| SupervisorMsg::GetRefs { reply }, Some(CALL_TIMEOUT))
+            .await,
+    )?;
     let state = AppState {
         home: home.clone(),
-        store: Arc::new(Mutex::new(store)),
+        store: refs.store,
+        callback: refs.callback,
+        supervisor: supervisor.clone(),
     };
-    reconcile::reconcile_all(&state).await?;
-    let app = api::router(state.clone());
+    let app = api::router(state);
     info!(sock = %sock.display(), "homebased listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -50,6 +67,8 @@ pub async fn serve(home: Home) -> Result<(), AppError> {
         .map_err(|err| AppError::Internal {
             message: format!("serve: {err}"),
         })?;
+    supervisor.stop(None);
+    let _ = handle.await;
     if sock.exists() {
         let _ = std::fs::remove_file(&sock);
     }
@@ -77,45 +96,47 @@ async fn shutdown_signal() {
     }
 }
 
-pub(crate) fn lock_store(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
-    store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Spawn a worker after a successful insert.
-pub fn spawn_and_watch(state: &AppState, id: TaskId) -> Result<(), AppError> {
+/// Spawn a worker after a successful insert, then ask the supervisor to watch.
+pub async fn spawn_and_watch(state: &AppState, id: TaskId) -> Result<(), AppError> {
     let paths = state.home.task_paths(id);
     let lock = crate::runner::lock_before_spawn(&paths)?;
     match crate::runner::spawn_task_run(&state.home, id, lock) {
         Ok(pid) => {
-            {
-                let store = lock_store(&state.store);
-                store.set_pid(id, pid as i32)?;
-            }
-            let watch_state = state.clone();
-            tokio::spawn(async move {
-                if let Err(err) = reconcile::watch_lock(&watch_state, id).await {
-                    warn!(%id, "watch: {err}");
-                }
-            });
+            call_store(&state.store, |reply| StoreMsg::SetPid {
+                id,
+                pid: pid as i32,
+                reply,
+            })
+            .await?;
+            flatten_call(
+                state
+                    .supervisor
+                    .call(
+                        |reply| SupervisorMsg::SpawnTask { id, reply },
+                        Some(CALL_TIMEOUT),
+                    )
+                    .await,
+            )?;
             Ok(())
         }
         Err(err) => {
-            let store = lock_store(&state.store);
-            let reason = crate::domain::ExitReason::SpawnFailed {
+            let reason = ExitReason::SpawnFailed {
                 message: err.to_string(),
             };
-            let _ = store.cas_exit(
+            let _ = call_store(&state.store, |reply| StoreMsg::CasExit {
                 id,
-                crate::domain::ProcessStatus::Queued,
-                crate::domain::ProcessStatus::Failed,
-                &reason,
-            )?;
-            let row = store.require_task(id)?;
-            let reports = store.reports(id)?;
-            let event = crate::callback::exit_event(&row, &reports, paths.dir, false);
-            crate::callback::deliver_exit_event(&store, &state.home, &row, &event)?;
+                from: ProcessStatus::Queued,
+                to: ProcessStatus::Failed,
+                reason: reason.clone(),
+                reply,
+            })
+            .await?;
+            let row = call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
+                .await?
+                .ok_or(AppError::TaskNotFound { id })?;
+            let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
+            let event = exit_event(&row, &reports, paths.dir);
+            let _ = state.callback.cast(CallbackMsg::Deliver { row, event });
             Err(err)
         }
     }
