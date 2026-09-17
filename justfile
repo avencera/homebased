@@ -25,6 +25,11 @@ alias br := build-release
 test *args="":
     cargo test {{args}}
 
+# Real `codex`/`claude`/`grok` on PATH. Opt-in; not part of ci.
+[group('test')]
+smoke-cli *args="":
+    cargo test --test cli_smoke -- --ignored --nocapture {{args}}
+
 # ------------------------------------------------------------------------------
 # lint
 # ------------------------------------------------------------------------------
