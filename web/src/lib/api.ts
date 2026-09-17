@@ -48,9 +48,15 @@ export type ReportOutcome = 'succeeded' | 'failed' | 'blocked';
 export type ExitReason =
 	| { kind: 'exit'; code: number }
 	| { kind: 'signal'; signal: number }
-	| { kind: 'timeout'; secs: number }
 	| { kind: 'cancelled' }
 	| { kind: 'spawn_failed'; message: string };
+
+/** Public workload view. Omits private prompt and extra-arg fields. */
+export type WorkloadView =
+	{ type: 'agent'; agent: AgentKind; model: string | null } | { type: 'task'; command: string[] };
+
+/** Attention-reminder state for the check timeout. */
+export type CheckTimeoutStatus = 'pending' | 'sent';
 
 /** `GET /v1/status`. */
 export interface DaemonStatus {
@@ -70,16 +76,17 @@ export interface DaemonStatus {
 export interface TaskSummary {
 	id: string;
 	status: ProcessStatus;
-	agent: AgentKind;
-	model: string | null;
+	workload: WorkloadView;
 	/** Submitting Codex thread. */
 	thread: string;
 	cwd: string;
 	/** Worker pid while running. */
 	pid: number | null;
 	callback: CallbackStatus;
-	/** Wall-clock budget in seconds. */
+	/** Attention timer in seconds. */
 	timeout_secs: number;
+	/** Whether the attention reminder is pending or sent. */
+	check_timeout: CheckTimeoutStatus;
 	exit_reason: ExitReason | null;
 	cancel_requested_at: string | null;
 	created_at: string;
@@ -88,7 +95,7 @@ export interface TaskSummary {
 }
 
 /** One append-only worker report. */
-export interface AgentReport {
+export interface TaskReport {
 	/** 1-based sequence. */
 	seq: number;
 	outcome: ReportOutcome;
@@ -110,8 +117,8 @@ export interface TaskEvent {
 /** `GET /v1/tasks/{id}`: the list fields plus everything on disk. */
 export interface TaskDetail extends TaskSummary {
 	api_version: number;
-	reports: AgentReport[];
-	/** Combined stdout and stderr of the agent. */
+	reports: TaskReport[];
+	/** Combined stdout and stderr of the child. */
 	output_log: string;
 	/** Task directory. */
 	evidence: string;
@@ -122,7 +129,7 @@ export interface TaskDetail extends TaskSummary {
 export interface LogTail {
 	api_version: number;
 	id: string;
-	/** Log text. Empty while the agent has written nothing. */
+	/** Log text. Empty while the child has written nothing. */
 	log: string;
 	/** Whether earlier lines were dropped. */
 	truncated: boolean;

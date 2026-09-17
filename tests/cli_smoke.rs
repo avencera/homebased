@@ -11,9 +11,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use homebased::agents::{ArgvInputs, build_argv};
+use homebased::agents::{AgentArgvInputs, build_agent_invocation};
 use homebased::domain::AgentKind;
-use homebased::spec::NormalizedSpec;
+use homebased::invocation::ChildInvocation;
 use tempfile::TempDir;
 
 const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
@@ -126,23 +126,18 @@ fn assert_unattended_help(kind: AgentKind, prompt_file: Option<&Path>) -> String
     help
 }
 
-fn unattended_argv(
-    kind: AgentKind,
-    cwd: &Path,
-    prompt_file: Option<&Path>,
-) -> homebased::agents::ChildArgv {
-    let spec = NormalizedSpec {
-        api_version: 1,
-        agent: kind,
-        model: Some("smoke-model".into()),
-        thread: THREAD.parse().unwrap(),
-        cwd: cwd.to_path_buf(),
-        prompt: "smoke".into(),
-        timeout: Duration::from_secs(4),
-        extra_args: vec![],
-        report_trailer: false,
-    };
-    build_argv(&ArgvInputs::from(&spec), &live_binary(kind), prompt_file)
+fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> ChildInvocation {
+    let feed = prompt_file.unwrap_or_else(|| Path::new("/tmp/prompt.feed.txt"));
+    build_agent_invocation(
+        AgentArgvInputs {
+            kind,
+            model: Some("smoke-model"),
+            cwd,
+            extra_args: &[],
+        },
+        &live_binary(kind),
+        feed,
+    )
 }
 
 fn live_binary(kind: AgentKind) -> PathBuf {

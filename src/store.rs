@@ -1,4 +1,4 @@
-//! SQLite source of truth: migrations, CAS transitions, callback claim.
+//! SQLite source of truth: schema, CAS transitions, callback claim.
 
 use std::path::Path;
 use std::time::Duration;
@@ -8,28 +8,30 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::domain::{
-    Agent, AgentKind, AgentReport, CallbackStatus, ExitReason, ProcessStatus, REPORTS_MAX,
-    ReportOutcome, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskRow, TaskState, ThreadId,
-    check_callback_sent, check_report_allowed, check_status_transition,
+    AttentionState, CallbackStatus, ExitReason, ProcessStatus, REPORTS_MAX, ReportOutcome,
+    SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskReport, TaskRow, TaskState, ThreadId,
+    Workload, check_callback_sent, check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 
+/// `timeout_secs` is decimal TEXT, not INTEGER: the attention timer has no
+/// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
+/// in SQLite's signed INTEGER without a lossy cast.
 const SCHEMA: &str = r"
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
-    agent_kind TEXT NOT NULL,
-    model TEXT,
+    workload_json TEXT NOT NULL,
     cwd TEXT NOT NULL,
-    timeout_secs INTEGER NOT NULL,
-    extra_args TEXT NOT NULL,
-    report_trailer INTEGER NOT NULL,
+    timeout_secs TEXT NOT NULL,
     env_path TEXT NOT NULL,
     env_home TEXT NOT NULL,
     binary TEXT NOT NULL,
     status TEXT NOT NULL,
     exit_reason TEXT,
     callback_status TEXT NOT NULL,
+    attention_state TEXT NOT NULL,
+    timeout_notified_at TEXT,
     pid INTEGER,
     cancel_requested_at TEXT,
     created_at TEXT NOT NULL,
@@ -51,13 +53,18 @@ CREATE TABLE reports (
 );
 ";
 
+const TASK_SELECT: &str = "SELECT id, thread_id, workload_json, cwd, timeout_secs,
+    env_path, env_home, binary, status, exit_reason, callback_status,
+    attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at
+ FROM tasks";
+
 /// Open or create the database.
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
-    /// Open the SQLite file at `path`, applying migrations.
+    /// Open the SQLite file at `path`, applying the initial schema when empty.
     pub fn open(path: &Path) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -70,9 +77,9 @@ impl Store {
         match version {
             0 => {
                 conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", 1)?;
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
-            1 => {}
+            v if v == SCHEMA_VERSION => {}
             other => {
                 return Err(AppError::Internal {
                     message: format!("unsupported schema user_version={other}"),
@@ -86,25 +93,25 @@ impl Store {
     pub fn insert_task(&self, row: &TaskRow) -> Result<(), AppError> {
         self.conn.execute(
             "INSERT INTO tasks (
-                id, thread_id, agent_kind, model, cwd, timeout_secs, extra_args,
-                report_trailer, env_path, env_home, binary, status, exit_reason,
-                callback_status, pid, cancel_requested_at, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                id, thread_id, workload_json, cwd, timeout_secs,
+                env_path, env_home, binary, status, exit_reason,
+                callback_status, attention_state, timeout_notified_at,
+                pid, cancel_requested_at, created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 row.id.to_string(),
                 row.thread.to_string(),
-                row.agent.kind.binary_name(),
-                row.agent.model,
+                serde_json::to_string(&row.workload)?,
                 row.cwd.to_string_lossy(),
-                row.timeout.as_secs() as i64,
-                serde_json::to_string(&row.extra_args)?,
-                i64::from(row.report_trailer),
+                fmt_timeout(row.timeout),
                 row.env.path,
                 row.env.home,
                 row.binary.to_string_lossy(),
                 row.status().as_str(),
                 row.exit_reason().map(serde_json::to_string).transpose()?,
                 row.callback_status.as_str(),
+                row.attention.as_str(),
+                row.attention.delivered_at().map(fmt_time),
                 row.pid(),
                 row.cancel_requested_at.map(fmt_time),
                 fmt_time(row.created_at),
@@ -116,12 +123,7 @@ impl Store {
 
     /// Fetch one task.
     pub fn get_task(&self, id: TaskId) -> Result<Option<TaskRow>, AppError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, thread_id, agent_kind, model, cwd, timeout_secs, extra_args,
-                    report_trailer, env_path, env_home, binary, status, exit_reason,
-                    callback_status, pid, cancel_requested_at, created_at, updated_at
-             FROM tasks WHERE id = ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!("{TASK_SELECT} WHERE id = ?1"))?;
         let row = stmt
             .query_row(params![id.to_string()], parse_task_row)
             .optional()?;
@@ -139,19 +141,14 @@ impl Store {
         statuses: &[ProcessStatus],
         thread: Option<ThreadId>,
     ) -> Result<Vec<TaskRow>, AppError> {
-        let mut sql = String::from(
-            "SELECT id, thread_id, agent_kind, model, cwd, timeout_secs, extra_args,
-                    report_trailer, env_path, env_home, binary, status, exit_reason,
-                    callback_status, pid, cancel_requested_at, created_at, updated_at
-             FROM tasks WHERE 1=1",
-        );
+        let mut sql = String::from(TASK_SELECT);
+        sql.push_str(" WHERE 1=1");
         if !statuses.is_empty() {
             sql.push_str(" AND status IN (");
             for (i, status) in statuses.iter().enumerate() {
                 if i > 0 {
                     sql.push(',');
                 }
-                // status.as_str() is a closed enum, not user text
                 sql.push('\'');
                 sql.push_str(status.as_str());
                 sql.push('\'');
@@ -178,19 +175,14 @@ impl Store {
         self.list_tasks(&[ProcessStatus::Queued, ProcessStatus::Running], None)
     }
 
-    /// Terminal tasks whose exit callback was never finished. A daemon that
-    /// died between the exit CAS and `finish_callback` leaves these behind; no
-    /// worker will ever retry them.
+    /// Terminal tasks whose exit callback was never finished.
     pub fn pending_callbacks(&self) -> Result<Vec<TaskRow>, AppError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, thread_id, agent_kind, model, cwd, timeout_secs, extra_args,
-                    report_trailer, env_path, env_home, binary, status, exit_reason,
-                    callback_status, pid, cancel_requested_at, created_at, updated_at
-             FROM tasks
+        let mut stmt = self.conn.prepare(&format!(
+            "{TASK_SELECT}
              WHERE status IN ('succeeded', 'failed', 'cancelled', 'lost')
                AND callback_status IN ('pending', 'sending')
-             ORDER BY id",
-        )?;
+             ORDER BY id"
+        ))?;
         let rows = stmt
             .query_map([], parse_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -223,8 +215,7 @@ impl Store {
         self.row_after_cas(id, n)
     }
 
-    /// CAS status and store an exit reason. The target status is derived from
-    /// the reason. `None` means the CAS did not match.
+    /// CAS status and store an exit reason.
     pub fn cas_exit(
         &self,
         id: TaskId,
@@ -262,14 +253,8 @@ impl Store {
     }
 
     /// Mark cancel requested. Terminal tasks are unchanged (idempotent).
-    ///
-    /// The stamp and the `Queued → Cancelled` CAS run inside one
-    /// `BEGIN IMMEDIATE` transaction, so the worker's own `Queued → Running`
-    /// CAS either lands entirely before or entirely after this call. The result
-    /// is decided by the CAS row count, never by a separate read.
     pub fn request_cancel(&self, id: TaskId) -> Result<CancelResult, AppError> {
         self.immediate(|| {
-            // reject an unknown id before writing anything
             self.require_task(id)?;
             self.conn.execute(
                 "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
@@ -288,8 +273,7 @@ impl Store {
         })
     }
 
-    /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error. The write
-    /// lock is taken up front so a concurrent writer cannot interleave.
+    /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error.
     fn immediate<T>(&self, body: impl FnOnce() -> Result<T, AppError>) -> Result<T, AppError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match body() {
@@ -307,14 +291,26 @@ impl Store {
     }
 
     /// Claim the exit callback: `pending|sending` → `sending`.
-    pub fn claim_callback(&self, id: TaskId) -> Result<bool, AppError> {
-        let now = fmt_time(Utc::now());
-        let n = self.conn.execute(
-            "UPDATE tasks SET callback_status = 'sending', updated_at = ?1
-             WHERE id = ?2 AND callback_status IN ('pending', 'sending')",
-            params![now, id.to_string()],
-        )?;
-        Ok(n == 1)
+    ///
+    /// A live attention claim blocks the terminal callback. Every caller CASes
+    /// the row terminal before it claims, so a reminder that has not started
+    /// can no longer start, and one that is in flight finishes first. That
+    /// orders `TASK_CHECK_DUE` strictly before the terminal event.
+    pub fn claim_callback(&self, id: TaskId) -> Result<CallbackClaim, AppError> {
+        self.immediate(|| {
+            if self.require_task(id)?.attention == AttentionState::Sending {
+                Ok(CallbackClaim::WaitForAttention)
+            } else if self.conn.execute(
+                "UPDATE tasks SET callback_status = 'sending', updated_at = ?1
+                 WHERE id = ?2 AND callback_status IN ('pending', 'sending')",
+                params![fmt_time(Utc::now()), id.to_string()],
+            )? == 1
+            {
+                Ok(CallbackClaim::Claimed)
+            } else {
+                Ok(CallbackClaim::NotOurs)
+            }
+        })
     }
 
     /// Finish a claimed callback as `sent` or `failed`.
@@ -336,13 +332,51 @@ impl Store {
         Ok(())
     }
 
+    /// Claim the attention reminder: `pending|sending` → `sending`, and only
+    /// while the task is non-terminal. Re-claiming `sending` is how a daemon
+    /// that died mid-send retries; at-least-once transport allows the
+    /// duplicate. `false` means the reminder must not be sent at all.
+    pub fn claim_attention(&self, id: TaskId) -> Result<bool, AppError> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET attention_state = 'sending', updated_at = ?1
+             WHERE id = ?2
+               AND attention_state IN ('pending', 'sending')
+               AND status IN ('queued', 'running')",
+            params![fmt_time(Utc::now()), id.to_string()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record a delivered reminder. Only a live claim can finish, and the
+    /// timestamp is written only after the queue send succeeded.
+    pub fn mark_attention_delivered(&self, id: TaskId) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE tasks SET attention_state = 'delivered',
+                 timeout_notified_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND attention_state = 'sending'",
+            params![fmt_time(Utc::now()), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a claim that did not deliver, so a later attempt can take it.
+    /// Also the release valve for a claim stranded by a dead daemon.
+    pub fn release_attention(&self, id: TaskId) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE tasks SET attention_state = 'pending', updated_at = ?1
+             WHERE id = ?2 AND attention_state = 'sending'",
+            params![fmt_time(Utc::now()), id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Append a report. Enforces cap, summary length, and terminal rejection.
     pub fn append_report(
         &self,
         id: TaskId,
         outcome: ReportOutcome,
         summary: &str,
-    ) -> Result<Vec<AgentReport>, AppError> {
+    ) -> Result<Vec<TaskReport>, AppError> {
         if summary.len() > SUMMARY_MAX_BYTES {
             return Err(AppError::SummaryTooLong { len: summary.len() });
         }
@@ -383,7 +417,7 @@ impl Store {
     }
 
     /// Reports in seq order.
-    pub fn reports(&self, id: TaskId) -> Result<Vec<AgentReport>, AppError> {
+    pub fn reports(&self, id: TaskId) -> Result<Vec<TaskReport>, AppError> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, outcome, summary, reported_at, notified_at
              FROM reports WHERE task_id = ?1 ORDER BY seq",
@@ -400,7 +434,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
         for (seq, outcome, summary, reported_at, notified_at) in rows {
-            out.push(AgentReport {
+            out.push(TaskReport {
                 seq,
                 outcome: ReportOutcome::from_storage(&outcome)?,
                 summary,
@@ -410,6 +444,18 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Outcome of claiming the terminal callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackClaim {
+    /// The caller owns delivery and must finish the claim.
+    Claimed,
+    /// Another sender already owns or finished delivery.
+    NotOurs,
+    /// An attention reminder is in flight. Delivering now could put
+    /// `TASK_CHECK_DUE` after the terminal event, so the caller waits.
+    WaitForAttention,
 }
 
 /// Result of `request_cancel`.
@@ -427,6 +473,21 @@ fn fmt_time(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Whole seconds as decimal text. `u64` is wider than SQLite's INTEGER, and
+/// the attention timer has no product maximum.
+fn fmt_timeout(timeout: Duration) -> String {
+    timeout.as_secs().to_string()
+}
+
+fn parse_timeout(value: &str) -> Result<Duration, AppError> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|err| AppError::Internal {
+            message: format!("bad timeout_secs {value}: {err}"),
+        })
+}
+
 fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&Utc))
@@ -438,40 +499,27 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
 fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let id: String = row.get(0)?;
     let thread: String = row.get(1)?;
-    let kind: String = row.get(2)?;
-    let model: Option<String> = row.get(3)?;
-    let cwd: String = row.get(4)?;
-    let timeout_secs: i64 = row.get(5)?;
-    let extra_args: String = row.get(6)?;
-    let report_trailer: i64 = row.get(7)?;
-    let env_path: String = row.get(8)?;
-    let env_home: String = row.get(9)?;
-    let binary: String = row.get(10)?;
-    let status: String = row.get(11)?;
-    let exit_reason: Option<String> = row.get(12)?;
-    let callback_status: String = row.get(13)?;
-    let pid: Option<i32> = row.get(14)?;
-    let cancel_requested_at: Option<String> = row.get(15)?;
-    let created_at: String = row.get(16)?;
-    let updated_at: String = row.get(17)?;
+    let workload_json: String = row.get(2)?;
+    let cwd: String = row.get(3)?;
+    let timeout_secs: String = row.get(4)?;
+    let env_path: String = row.get(5)?;
+    let env_home: String = row.get(6)?;
+    let binary: String = row.get(7)?;
+    let status: String = row.get(8)?;
+    let exit_reason: Option<String> = row.get(9)?;
+    let callback_status: String = row.get(10)?;
+    let attention_state: String = row.get(11)?;
+    let timeout_notified_at: Option<String> = row.get(12)?;
+    let pid: Option<i32> = row.get(13)?;
+    let cancel_requested_at: Option<String> = row.get(14)?;
+    let created_at: String = row.get(15)?;
+    let updated_at: String = row.get(16)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
     let id: TaskId = id.parse().map_err(parse_err)?;
     let thread: ThreadId = thread.parse().map_err(parse_err)?;
-    let kind = match kind.as_str() {
-        "codex" => AgentKind::Codex,
-        "claude" => AgentKind::Claude,
-        "grok" => AgentKind::Grok,
-        other => {
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                AppError::Internal {
-                    message: format!("unknown agent {other}"),
-                },
-            )));
-        }
-    };
-    let extra_args: Vec<String> = serde_json::from_str(&extra_args).map_err(|err| {
+    let workload: Workload = serde_json::from_str(&workload_json).map_err(|err| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
             message: err.to_string(),
         }))
@@ -486,6 +534,12 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     };
     let status = ProcessStatus::from_storage(&status).map_err(parse_err)?;
     let callback_status = CallbackStatus::from_storage(&callback_status).map_err(parse_err)?;
+    let timeout_notified_at = match timeout_notified_at {
+        Some(raw) => Some(parse_time(&raw).map_err(parse_err)?),
+        None => None,
+    };
+    let attention =
+        AttentionState::from_storage(&attention_state, timeout_notified_at).map_err(parse_err)?;
     let cancel_requested_at = match cancel_requested_at {
         Some(raw) => Some(parse_time(&raw).map_err(parse_err)?),
         None => None,
@@ -493,11 +547,9 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
         id,
         thread,
-        agent: Agent::new(kind, model),
+        workload,
         cwd: Path::new(&cwd).to_path_buf(),
-        timeout: Duration::from_secs(timeout_secs as u64),
-        extra_args,
-        report_trailer: report_trailer != 0,
+        timeout: parse_timeout(&timeout_secs).map_err(parse_err)?,
         env: TaskEnv {
             path: env_path,
             home: env_home,
@@ -505,6 +557,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         binary: Path::new(&binary).to_path_buf(),
         state: TaskState::from_storage(status, exit_reason, pid).map_err(parse_err)?,
         callback_status,
+        attention,
         cancel_requested_at,
         created_at: parse_time(&created_at).map_err(parse_err)?,
         updated_at: parse_time(&updated_at).map_err(parse_err)?,
@@ -517,16 +570,12 @@ pub struct NewTask {
     pub id: TaskId,
     /// Submitting thread.
     pub thread: ThreadId,
-    /// Agent.
-    pub agent: Agent,
+    /// Workload configuration.
+    pub workload: Workload,
     /// Working directory.
     pub cwd: std::path::PathBuf,
-    /// Timeout.
+    /// Attention timeout.
     pub timeout: Duration,
-    /// Extra argv.
-    pub extra_args: Vec<String>,
-    /// Trailer flag.
-    pub report_trailer: bool,
     /// Captured env.
     pub env: TaskEnv,
     /// Resolved binary.
@@ -540,15 +589,14 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
     TaskRow {
         id: new.id,
         thread: new.thread,
-        agent: new.agent,
+        workload: new.workload,
         cwd: new.cwd,
         timeout: new.timeout,
-        extra_args: new.extra_args,
-        report_trailer: new.report_trailer,
         env: new.env,
         binary: new.binary,
         state: TaskState::Queued,
         callback_status: CallbackStatus::Pending,
+        attention: AttentionState::Pending,
         cancel_requested_at: None,
         created_at: now,
         updated_at: now,
@@ -589,24 +637,51 @@ pub fn write_exit_json(path: &Path, reason: &ExitReason) -> Result<(), AppError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::TransitionError;
+    use crate::domain::{
+        Agent, AgentKind, AgentWorkload, AttentionState, TaskWorkload, TransitionError, Workload,
+    };
+    use crate::invocation::CommandLine;
     use std::str::FromStr;
     use tempfile::tempdir;
 
-    fn sample_row(id: TaskId) -> TaskRow {
+    fn agent_row(id: TaskId) -> TaskRow {
         new_queued_task(NewTask {
             id,
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
-            agent: Agent::new(AgentKind::Claude, Some("fable".into())),
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, Some("fable".into())),
+                extra_args: vec!["--verbose".into()],
+                report_trailer: true,
+            }),
             cwd: Path::new("/tmp").to_path_buf(),
-            timeout: Duration::from_secs(3600),
-            extra_args: vec!["--verbose".into()],
-            report_trailer: true,
+            timeout: Duration::from_secs(4 * 3600),
             env: TaskEnv {
                 path: "/bin".into(),
                 home: "/home/u".into(),
             },
             binary: Path::new("/bin/true").to_path_buf(),
+        })
+    }
+
+    fn task_row(id: TaskId) -> TaskRow {
+        new_queued_task(NewTask {
+            id,
+            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+            workload: Workload::Task(TaskWorkload {
+                command: CommandLine::try_from_argv(vec![
+                    "cargo".into(),
+                    "build".into(),
+                    "--release".into(),
+                ])
+                .unwrap(),
+            }),
+            cwd: Path::new("/tmp").to_path_buf(),
+            timeout: Duration::from_secs(4 * 3600),
+            env: TaskEnv {
+                path: "/bin".into(),
+                home: "/home/u".into(),
+            },
+            binary: Path::new("/bin/cargo").to_path_buf(),
         })
     }
 
@@ -618,29 +693,23 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
-    fn insert_list_get() {
+    fn insert_list_get_agent_and_task() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
-        let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
-        let got = store.require_task(id).unwrap();
-        assert_eq!(got.agent.kind, AgentKind::Claude);
-        assert_eq!(got.state, TaskState::Queued);
+        let agent_id = TaskId::new();
+        let task_id = TaskId::new();
+        store.insert_task(&agent_row(agent_id)).unwrap();
+        store.insert_task(&task_row(task_id)).unwrap();
+        let got = store.require_task(agent_id).unwrap();
+        assert!(matches!(got.workload, Workload::Agent(_)));
+        let got = store.require_task(task_id).unwrap();
+        assert!(matches!(got.workload, Workload::Task(_)));
         let listed = store.list_tasks(&[ProcessStatus::Queued], None).unwrap();
-        assert_eq!(listed.len(), 1);
-        let none = store.list_tasks(&[ProcessStatus::Running], None).unwrap();
-        assert!(none.is_empty());
-        let by_thread = store
-            .list_tasks(
-                &[],
-                Some(ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap()),
-            )
-            .unwrap();
-        assert_eq!(by_thread.len(), 1);
+        assert_eq!(listed.len(), 2);
     }
 
     #[test]
@@ -648,7 +717,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         assert!(
             store
                 .cas_status(id, ProcessStatus::Queued, ProcessStatus::Lost)
@@ -670,14 +739,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         assert!(
             store
                 .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
                 .unwrap()
                 .is_some()
         );
-        assert!(store.claim_callback(id).unwrap());
+        assert_eq!(store.claim_callback(id).unwrap(), CallbackClaim::Claimed);
         store.finish_callback(id, CallbackStatus::Sent).unwrap();
         let row = store.require_task(id).unwrap();
         assert_eq!(row.callback_status, CallbackStatus::Sent);
@@ -688,7 +757,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         store.claim_callback(id).unwrap();
         let err = store.finish_callback(id, CallbackStatus::Sent).unwrap_err();
         assert_eq!(
@@ -698,11 +767,112 @@ mod tests {
     }
 
     #[test]
+    fn attention_claim_records_the_time_only_after_delivery() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&agent_row(id)).unwrap();
+        assert_eq!(
+            store.require_task(id).unwrap().attention,
+            AttentionState::Pending
+        );
+
+        assert!(store.claim_attention(id).unwrap());
+        let claimed = store.require_task(id).unwrap();
+        assert_eq!(claimed.attention, AttentionState::Sending);
+        assert_eq!(claimed.attention.delivered_at(), None);
+
+        store.mark_attention_delivered(id).unwrap();
+        let delivered = store.require_task(id).unwrap();
+        assert!(delivered.attention.is_delivered());
+        assert!(delivered.attention.delivered_at().is_some());
+
+        // one logical reminder: a delivered row can never be claimed again
+        assert!(!store.claim_attention(id).unwrap());
+    }
+
+    #[test]
+    fn attention_release_allows_a_later_retry() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&agent_row(id)).unwrap();
+        assert!(store.claim_attention(id).unwrap());
+        store.release_attention(id).unwrap();
+        assert_eq!(
+            store.require_task(id).unwrap().attention,
+            AttentionState::Pending
+        );
+        assert!(store.claim_attention(id).unwrap());
+        // a claim stranded by a dead daemon is re-claimable, not stuck
+        assert!(store.claim_attention(id).unwrap());
+    }
+
+    #[test]
+    fn attention_cannot_be_claimed_once_terminal() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&agent_row(id)).unwrap();
+        store
+            .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
+            .unwrap();
+        assert!(!store.claim_attention(id).unwrap());
+        assert_eq!(
+            store.require_task(id).unwrap().attention,
+            AttentionState::Pending
+        );
+    }
+
+    #[test]
+    fn terminal_callback_waits_for_an_in_flight_attention_send() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&agent_row(id)).unwrap();
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap();
+        assert!(store.claim_attention(id).unwrap());
+
+        // the child exits while the reminder is still on the wire
+        store
+            .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
+            .unwrap();
+        assert_eq!(
+            store.claim_callback(id).unwrap(),
+            CallbackClaim::WaitForAttention,
+            "the terminal event must not overtake an in-flight TASK_CHECK_DUE"
+        );
+
+        store.mark_attention_delivered(id).unwrap();
+        assert_eq!(store.claim_callback(id).unwrap(), CallbackClaim::Claimed);
+        assert_eq!(store.claim_callback(id).unwrap(), CallbackClaim::Claimed);
+        store.finish_callback(id, CallbackStatus::Sent).unwrap();
+        assert_eq!(store.claim_callback(id).unwrap(), CallbackClaim::NotOurs);
+    }
+
+    #[test]
+    fn timeout_seconds_above_i64_max_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        let mut row = agent_row(id);
+        row.timeout = Duration::from_secs(u64::MAX);
+        store.insert_task(&row).unwrap();
+        assert_eq!(
+            store.require_task(id).unwrap().timeout,
+            Duration::from_secs(u64::MAX),
+            "a timeout wider than SQLite INTEGER must survive persistence"
+        );
+    }
+
+    #[test]
     fn report_append_order_and_cap() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         store
             .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap();
@@ -732,7 +902,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         store
             .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap();
@@ -748,7 +918,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         store
             .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
             .unwrap()
@@ -766,12 +936,8 @@ mod tests {
         let store = Store::open(&db).unwrap();
         let worker = Store::open(&db).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
 
-        // open a write transaction that flips the row to Running but do not
-        // commit. In WAL mode `request_cancel`'s read still sees Queued, while
-        // its UPDATE blocks on this writer until the commit below lands. That
-        // puts the worker's CAS exactly inside the read/CAS window.
         worker.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         worker
             .conn
@@ -802,7 +968,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
-        store.insert_task(&sample_row(id)).unwrap();
+        store.insert_task(&agent_row(id)).unwrap();
         store
             .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap();

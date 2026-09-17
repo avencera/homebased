@@ -17,6 +17,16 @@ if [ "${1:-}" = "queue" ]; then
     fi
     prev=$arg
   done
+  # hold one event kind on the wire until the test lifts the gate, so
+  # queue-messages.txt records completion order, not invocation order
+  gate="$record/queue-gate"
+  if [ -f "$gate" ] && printf '%s' "$msg" | grep -q "$(cat "$gate")"; then
+    printf 'entered\n' > "$record/queue-gate-entered"
+    while [ -f "$gate" ]; do
+      sleep 0.05
+    done
+  fi
+
   printf '%s\n' "$thread" >> "$record/queue-threads.txt"
   printf '%s\n' "$msg" >> "$record/queue-messages.txt"
   n=1

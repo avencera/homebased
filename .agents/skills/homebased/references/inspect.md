@@ -12,7 +12,7 @@ homebased --quiet task list --status running               # bare ids, one per l
 
 Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list.
 
-Each entry: `id`, `status`, `agent`, `model`, `thread`, `cwd`, `pid`, `callback`, `timeout_secs`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. Entries come back in id order, which is creation order.
+Each entry: `id`, `status`, `workload`, `thread`, `cwd`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. Entries come back in id order, which is creation order. Human list output shows a workload column (agent/model or program plus a short argv preview).
 
 ## Show
 
@@ -23,15 +23,17 @@ homebased --json task show <id>
 | Field | Meaning |
 | --- | --- |
 | `status` | Process status, see above. |
-| `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `timeout`, `cancelled`, `spawn_failed`). |
+| `workload` | `{"type":"agent","agent":"…","model":null\|string}` or `{"type":"task","command":[…]}`. |
+| `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
 | `callback` | `pending`, `sending`, `sent`, or `failed`. `failed` means three `codex queue` attempts failed; the line is in `<home>/callback-fallback.log`. |
 | `cancel_requested_at` | Set once `task cancel` ran. |
 | `reports` | Worker reports with `seq`, `outcome`, `summary`, `reported_at`, and `notified_at` when `--notify` succeeded. |
 | `evidence` | Task directory. |
-| `output_log` | Path of the combined stdout and stderr of the agent. |
-| `last_event` | The event object already sent, or the one that will be sent. `null` while running with no `--notify` report. |
+| `output_log` | Path of the combined stdout and stderr of the child. |
+| `last_event` | The event object already sent, or the one that will be sent. `null` while running with no interim event. |
 | `pid` | Worker pid, for display only. Liveness is the lock, not the pid. |
-| `timeout_secs` | Wall-clock budget in seconds. |
+| `timeout_secs` | Attention (check) timeout in seconds. Not remaining execution budget. |
+| `check_timeout` | `pending` or `sent` for the attention reminder. |
 | `created_at` | Insert time. |
 | `updated_at` | Last row change. For a terminal task this is the finish time. |
 
@@ -42,7 +44,7 @@ homebased task log <id> --tail 100
 homebased --json task log <id>       # {"id", "log", "truncated"}
 ```
 
-Reads `output.log` directly from disk. The log can be empty while the agent has not written anything yet. `--tail` keeps at most 5000 lines; `truncated` is true when earlier lines were dropped.
+Reads `output.log` directly from disk. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines; `truncated` is true when earlier lines were dropped.
 
 ## Dashboard
 
@@ -62,10 +64,10 @@ The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/tasks/<id>`, an
 
 | File | Content |
 | --- | --- |
-| `prompt.txt` | The submitted prompt, byte for byte. |
-| `prompt.trailer.txt` | The reporting trailer, when enabled. |
-| `prompt.feed.txt` | What the agent actually received: prompt plus trailer. |
-| `output.log` | Agent stdout and stderr. |
+| `prompt.txt` | Agent only: the submitted prompt, byte for byte. |
+| `prompt.trailer.txt` | Agent only: the reporting trailer, when enabled. |
+| `prompt.feed.txt` | Agent only: what the agent actually received. |
+| `output.log` | Child stdout and stderr. |
 | `exit.json` | Written by the worker parent at exit. Absent for `lost` tasks. |
 | `callback.log` | Output of the last `codex queue` attempt. |
 | `runner.lock` | Liveness lock. Held while the worker parent is alive. |
@@ -78,4 +80,4 @@ The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/tasks/<id>`, an
 homebased --json task cancel <id>
 ```
 
-Sends SIGTERM to the worker, which forwards it to the agent's process group and kills it after 10 seconds if it ignores the signal. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.
+Sends SIGTERM to the worker, which forwards it to the child's process group, waits for the group to disappear, and sends SIGKILL after 10 seconds if descendants remain. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::domain::{AgentKind, ProcessStatus, TaskId};
+use crate::domain::{ProcessStatus, TaskId};
 
 /// Application error with a stable machine-readable code.
 #[derive(Debug, thiserror::Error)]
@@ -29,11 +29,11 @@ pub enum AppError {
         /// Directory the spec asked for.
         path: PathBuf,
     },
-    /// Agent binary is not on PATH and no HOMEBASED_* override exists.
-    #[error("agent binary missing: {agent}")]
-    AgentBinaryMissing {
-        /// Agent whose binary could not be resolved.
-        agent: AgentKind,
+    /// Requested program is missing, not a file, or not executable.
+    #[error("executable missing: {program}")]
+    ExecutableMissing {
+        /// Program name or path the caller requested.
+        program: String,
     },
     /// Report summary exceeds 4 KiB.
     #[error("summary too long: {len} bytes")]
@@ -114,7 +114,7 @@ impl AppError {
             Self::DaemonUnavailable { .. } => "daemon_unavailable",
             Self::TaskNotFound { .. } => "task_not_found",
             Self::CwdNotFound { .. } => "cwd_not_found",
-            Self::AgentBinaryMissing { .. } => "agent_binary_missing",
+            Self::ExecutableMissing { .. } => "executable_missing",
             Self::SummaryTooLong { .. } => "summary_too_long",
             Self::TooManyReports { .. } => "too_many_reports",
             Self::TaskTerminal { .. } => "task_terminal",
@@ -140,7 +140,7 @@ impl AppError {
             Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => 2,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
-            | Self::AgentBinaryMissing { .. } => 3,
+            | Self::ExecutableMissing { .. } => 3,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -158,7 +158,7 @@ impl AppError {
             }
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
-            | Self::AgentBinaryMissing { .. } => http::StatusCode::NOT_FOUND,
+            | Self::ExecutableMissing { .. } => http::StatusCode::NOT_FOUND,
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -183,7 +183,7 @@ impl AppError {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
             Self::CwdNotFound { path } => json!({ "cwd": path }),
-            Self::AgentBinaryMissing { agent } => json!({ "agent": agent }),
+            Self::ExecutableMissing { program } => json!({ "program": program }),
             Self::SummaryTooLong { len } => json!({ "len": len }),
             Self::TooManyReports { count } => json!({ "count": count }),
             Self::TaskTerminal { id, status } => json!({ "id": id, "status": status }),

@@ -1,6 +1,6 @@
 // Display helpers. Everything here is pure so the components stay declarative.
 
-import { isInFlight, type ExitReason, type TaskSummary } from './api';
+import { isInFlight, type ExitReason, type TaskSummary, type WorkloadView } from './api';
 
 /** Home directories the daemon can run under, matched so paths can show `~`. */
 const HOME_PREFIX = /^(\/home\/[^/]+|\/Users\/[^/]+|\/root)(?=\/|$)/;
@@ -58,20 +58,26 @@ export function taskDurationMs(task: TaskSummary, now: number): number {
 	return end - start;
 }
 
-/**
- * Time left on the wall-clock budget. Measured from `created_at` because the
- * API reports no separate start time, so queue time counts against it.
- */
-export function timeoutRemainingMs(task: TaskSummary, now: number): number | null {
-	if (!isInFlight(task.status)) return null;
-	const start = epochMs(task.created_at);
-	if (start === null) return null;
-	return start + task.timeout_secs * 1000 - now;
+/** Dense workload label for list rows. */
+export function workloadLabel(task: Pick<TaskSummary, 'workload'>): string {
+	return formatWorkload(task.workload);
 }
 
-/** Agent plus model, as one dense label. */
-export function agentLabel(task: Pick<TaskSummary, 'agent' | 'model'>): string {
-	return task.model ? `${task.agent}:${task.model}` : task.agent;
+/** Format a workload view for display. */
+export function formatWorkload(workload: WorkloadView): string {
+	if (workload.type === 'agent') {
+		return workload.model ? `${workload.agent}:${workload.model}` : workload.agent;
+	}
+	const [program, ...args] = workload.command;
+	if (!program) return 'task';
+	if (args.length === 0) return program;
+	const preview = args.slice(0, 2).join(' ');
+	return args.length > 2 ? `${program} ${preview}…` : `${program} ${preview}`;
+}
+
+/** Full argv for the detail page. No shell quoting. */
+export function formatCommandArgv(command: string[]): string {
+	return command.join('\n');
 }
 
 /** One line per `ExitReason` variant. */
@@ -82,8 +88,6 @@ export function exitReasonText(reason: ExitReason | null): string {
 			return reason.code === 0 ? 'exit 0' : `exit ${reason.code}`;
 		case 'signal':
 			return `signal ${reason.signal}`;
-		case 'timeout':
-			return `timeout after ${formatDuration(reason.secs * 1000)}`;
 		case 'cancelled':
 			return 'cancelled';
 		case 'spawn_failed':

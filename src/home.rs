@@ -139,7 +139,7 @@ pub struct TaskPaths {
     pub trailer: PathBuf,
     /// Concatenation fed to the child (prompt + optional trailer).
     pub feed: PathBuf,
-    /// Combined stdout/stderr of the agent.
+    /// Combined stdout/stderr of the child.
     pub output: PathBuf,
     /// Exclusive flock held by `task-run`.
     pub runner_lock: PathBuf,
@@ -163,7 +163,8 @@ impl TaskPaths {
         }
     }
 
-    /// Write prompt and trailer files. `prompt.txt` is byte-identical to `prompt`.
+    /// Write agent prompt evidence. Task workloads skip this helper.
+    /// `prompt.txt` is byte-identical to `prompt`.
     pub fn write_prompt(&self, prompt: &str, trailer: Option<&str>) -> Result<(), AppError> {
         fs::write(&self.prompt, prompt.as_bytes())?;
         let feed = match trailer {
@@ -187,10 +188,10 @@ impl TaskPaths {
 
     /// Read `output.log`, keeping only the last `tail` lines when asked.
     /// `tail` is capped at [`MAX_TAIL_LINES`]. `Ok(None)` means the file does
-    /// not exist: either the agent has written nothing yet, or the task id has
+    /// not exist: either the child has written nothing yet, or the task id has
     /// no directory.
     ///
-    /// Agent output is arbitrary bytes, so invalid UTF-8 is replaced rather
+    /// Child output is arbitrary bytes, so invalid UTF-8 is replaced rather
     /// than rejected.
     pub fn read_output(&self, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
         let bytes = match fs::read(&self.output) {

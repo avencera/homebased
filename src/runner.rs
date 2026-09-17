@@ -1,4 +1,4 @@
-//! `task-run`: lock, setsid, spawn, timeout, `exit.json`, callback.
+//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, callback.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,15 +18,16 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::agents::{ArgvInputs, build_argv};
 use crate::callback::{deliver_exit_event, exit_event};
-use crate::domain::{AgentKind, ExitReason, ProcessStatus, TaskId, TaskRow};
+use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskRow};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
+use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
 use crate::report::REPORT_TRAILER;
 use crate::store::{self, Store};
 
 const KILL_GRACE: Duration = Duration::from_secs(10);
+const GROUP_POLL: Duration = Duration::from_millis(50);
 
 /// Spawn `homebased task-run` with an inherited exclusive flock.
 pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppError> {
@@ -78,7 +79,6 @@ fn prepare_worker(fd: RawFd) -> io::Result<()> {
 
 /// Worker entry: hold the inherited lock until exit.json and callback complete.
 pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
-    // keep the inherited flock open for the process lifetime
     let _lock = unsafe { File::from_raw_fd(lock_fd) };
     // install the SIGTERM handler before any other work. Everything below (the
     // Queued->Running CAS, set_pid, the feed read) is a window in which the
@@ -101,16 +101,16 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     store.set_pid(id, pid)?;
     let row = store.require_task(id)?;
     let paths = home.task_paths(id);
-    let prompt_file = if row.agent.kind == AgentKind::Grok {
-        Some(paths.feed.as_path())
+    let invocation = invocation_from_workload(&row.workload, &row.binary, &row.cwd, &paths.feed);
+    // only stdin-fed agents need the bytes; Grok reads the feed path from argv
+    let feed = if invocation.stdin == StdinPolicy::PromptFeed {
+        Some(std::fs::read(&paths.feed)?)
     } else {
         None
     };
-    let argv = build_argv(&ArgvInputs::from(&row), &row.binary, prompt_file);
-    // the daemon always writes the feed before spawning this worker
-    let feed = std::fs::read(&paths.feed)?;
 
-    let reason = match run_agent(&argv, &row, &home, &paths, feed, &store, &mut sigterm).await {
+    let reason = match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm).await
+    {
         Ok(reason) => reason,
         Err(err) => ExitReason::SpawnFailed {
             message: err.to_string(),
@@ -132,12 +132,12 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn run_agent(
-    argv: &crate::agents::ChildArgv,
+async fn run_child(
+    invocation: &ChildInvocation,
     row: &TaskRow,
     home: &Home,
     paths: &TaskPaths,
-    feed: Vec<u8>,
+    feed: Option<Vec<u8>>,
     store: &Store,
     sigterm: &mut SignalStream,
 ) -> Result<ExitReason, AppError> {
@@ -149,8 +149,8 @@ async fn run_agent(
     let stdout = log.try_clone()?;
     let stderr = log;
 
-    let mut cmd = TokioCommand::new(&argv.program);
-    cmd.args(&argv.args)
+    let mut cmd = TokioCommand::new(&invocation.program);
+    cmd.args(&invocation.args)
         .current_dir(&row.cwd)
         .env("PATH", &row.env.path)
         .env("HOME", &row.env.home)
@@ -160,10 +160,13 @@ async fn run_agent(
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true)
         .process_group(0);
-    if argv.stdin_prompt {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
+    match invocation.stdin {
+        StdinPolicy::PromptFeed => {
+            cmd.stdin(Stdio::piped());
+        }
+        StdinPolicy::Null => {
+            cmd.stdin(Stdio::null());
+        }
     }
     #[cfg(target_os = "linux")]
     unsafe {
@@ -174,12 +177,13 @@ async fn run_agent(
     }
 
     let mut child = cmd.spawn().map_err(|err| AppError::Internal {
-        message: format!("spawn agent: {err}"),
+        message: format!("spawn child: {err}"),
     })?;
-    let agent_pgid = child.id().ok_or_else(|| AppError::Internal {
-        message: "agent pid missing after spawn".into(),
+    let child_pgid = child.id().ok_or_else(|| AppError::Internal {
+        message: "child pid missing after spawn".into(),
     })? as i32;
-    if argv.stdin_prompt
+    if invocation.stdin == StdinPolicy::PromptFeed
+        && let Some(feed) = feed
         && let Some(mut stdin) = child.stdin.take()
     {
         tokio::spawn(async move {
@@ -193,33 +197,26 @@ async fn run_agent(
 
     tokio::select! {
         status = child.wait() => {
-            status_to_reason(status)
+            let reason = status_to_reason(status)?;
+            // direct-child exit is not proof the process group is empty
+            cleanup_process_group(child_pgid).await;
+            Ok(reason)
         }
         _ = sigterm.recv() => {
             let cancelled = store.require_task(id)?.cancel_requested_at.is_some();
-            warn!(%id, cancelled, "SIGTERM: forwarding to agent group");
-            forward_sigterm(agent_pgid);
-            wait_then_kill(&mut child, agent_pgid).await;
+            warn!(%id, cancelled, "SIGTERM: forwarding to child group");
+            forward_sigterm(child_pgid);
+            wait_child_then_cleanup(&mut child, child_pgid).await;
             if cancelled {
                 Ok(ExitReason::Cancelled)
             } else {
                 Ok(ExitReason::Signal { signal: 15 })
             }
         }
-        _ = time::sleep(row.timeout) => {
-            warn!(%id, "timeout: killing agent group");
-            forward_sigterm(agent_pgid);
-            wait_then_kill(&mut child, agent_pgid).await;
-            Ok(ExitReason::Timeout {
-                secs: row.timeout.as_secs(),
-            })
-        }
     }
 }
 
-/// A Unix wait status is either an exit code or a terminating signal; neither
-/// means the child was only stopped, which `wait` on a non-traced child never
-/// reports.
+/// A Unix wait status is either an exit code or a terminating signal.
 fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<ExitReason, AppError> {
     let status = match status {
         Ok(status) => status,
@@ -236,29 +233,57 @@ fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<Exit
         return Ok(ExitReason::Signal { signal });
     }
     Err(AppError::Internal {
-        message: format!("agent wait status has neither code nor signal: {status:?}"),
+        message: format!("child wait status has neither code nor signal: {status:?}"),
     })
 }
 
-async fn wait_then_kill(child: &mut tokio::process::Child, agent_pgid: i32) {
-    if time::timeout(KILL_GRACE, child.wait()).await.is_ok() {
+async fn wait_child_then_cleanup(child: &mut tokio::process::Child, child_pgid: i32) {
+    let _ = time::timeout(KILL_GRACE, child.wait()).await;
+    cleanup_process_group(child_pgid).await;
+    if let Err(err) = child.wait().await {
+        warn!(child_pgid, "wait after group cleanup: {err}");
+    }
+}
+
+/// Terminate remaining members of the child process group.
+async fn cleanup_process_group(child_pgid: i32) {
+    if !process_group_alive(child_pgid) {
         return;
     }
-    if let Err(err) = kill(Pid::from_raw(-agent_pgid), Signal::SIGKILL) {
-        warn!(agent_pgid, "SIGKILL agent group: {err}");
+    forward_sigterm(child_pgid);
+    let deadline = time::Instant::now() + KILL_GRACE;
+    while process_group_alive(child_pgid) && time::Instant::now() < deadline {
+        time::sleep(GROUP_POLL).await;
     }
-    if let Err(err) = child.wait().await {
-        warn!(agent_pgid, "wait after SIGKILL: {err}");
+    if process_group_alive(child_pgid) {
+        if let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGKILL) {
+            warn!(child_pgid, "SIGKILL child group: {err}");
+        }
+        let deadline = time::Instant::now() + KILL_GRACE;
+        while process_group_alive(child_pgid) && time::Instant::now() < deadline {
+            time::sleep(GROUP_POLL).await;
+        }
     }
 }
 
-fn forward_sigterm(agent_pgid: i32) {
-    if let Err(err) = kill(Pid::from_raw(-agent_pgid), Signal::SIGTERM) {
-        warn!(agent_pgid, "SIGTERM agent group: {err}");
+fn process_group_alive(pgid: i32) -> bool {
+    match kill(Pid::from_raw(-pgid), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(err) => {
+            warn!(pgid, "process group probe: {err}");
+            false
+        }
     }
 }
 
-/// Write prompt files for a new task.
+fn forward_sigterm(child_pgid: i32) {
+    if let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGTERM) {
+        warn!(child_pgid, "SIGTERM child group: {err}");
+    }
+}
+
+/// Write prompt evidence for an agent workload.
 pub fn write_task_files(
     paths: &TaskPaths,
     prompt: &str,

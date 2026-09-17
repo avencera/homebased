@@ -5,10 +5,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::callback::HomebasedEvent;
+use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::domain::{
-    API_VERSION, AgentKind, AgentReport, CallbackStatus, ExitReason, ProcessStatus, TaskId,
-    TaskRow, ThreadId,
+    API_VERSION, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId,
 };
 
 /// `GET /v1/status`.
@@ -28,6 +27,17 @@ pub struct StatusBody {
     pub in_flight: usize,
 }
 
+/// Attention-reminder state for the check timeout. Public and two-valued: a
+/// send that is still in flight has not been delivered, so it reads `pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckTimeoutStatus {
+    /// Reminder not yet delivered.
+    Pending,
+    /// Reminder delivered successfully.
+    Sent,
+}
+
 /// One task in `GET /v1/tasks` and the head of `GET /v1/tasks/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSummary {
@@ -35,10 +45,8 @@ pub struct TaskSummary {
     pub id: TaskId,
     /// Process status.
     pub status: ProcessStatus,
-    /// Agent CLI.
-    pub agent: AgentKind,
-    /// Model alias, or `null`.
-    pub model: Option<String>,
+    /// Workload view.
+    pub workload: WorkloadView,
     /// Submitting Codex thread.
     pub thread: ThreadId,
     /// Working directory.
@@ -47,8 +55,10 @@ pub struct TaskSummary {
     pub pid: Option<i32>,
     /// Callback delivery state.
     pub callback: CallbackStatus,
-    /// Wall-clock budget in seconds.
+    /// Attention timer in seconds.
     pub timeout_secs: u64,
+    /// Whether the attention reminder is pending or sent.
+    pub check_timeout: CheckTimeoutStatus,
     /// Why the process ended, once known.
     pub exit_reason: Option<ExitReason>,
     /// When cancel was requested.
@@ -64,13 +74,17 @@ impl From<&TaskRow> for TaskSummary {
         Self {
             id: row.id,
             status: row.status(),
-            agent: row.agent.kind,
-            model: row.agent.model.clone(),
+            workload: WorkloadView::from(&row.workload),
             thread: row.thread,
             cwd: row.cwd.clone(),
             pid: row.pid(),
             callback: row.callback_status,
             timeout_secs: row.timeout.as_secs(),
+            check_timeout: if row.attention.is_delivered() {
+                CheckTimeoutStatus::Sent
+            } else {
+                CheckTimeoutStatus::Pending
+            },
             exit_reason: row.exit_reason().cloned(),
             cancel_requested_at: row.cancel_requested_at,
             created_at: row.created_at,
@@ -108,13 +122,13 @@ pub struct TaskDetail {
     #[serde(flatten)]
     pub summary: TaskSummary,
     /// Worker reports in seq order.
-    pub reports: Vec<AgentReport>,
-    /// Combined stdout and stderr of the agent.
+    pub reports: Vec<TaskReport>,
+    /// Combined stdout and stderr of the child.
     pub output_log: PathBuf,
     /// Task directory.
     pub evidence: PathBuf,
     /// Event already sent, or the one that will be sent. `None` while running
-    /// with no `--notify` report.
+    /// with no interim event.
     pub last_event: Option<HomebasedEvent>,
 }
 
@@ -125,7 +139,7 @@ pub struct LogTail {
     pub api_version: u32,
     /// Task id.
     pub id: TaskId,
-    /// Log text. Empty while the agent has written nothing.
+    /// Log text. Empty while the child has written nothing.
     pub log: String,
     /// Whether earlier lines were dropped by `tail`.
     pub truncated: bool,

@@ -14,6 +14,16 @@ use crate::error::AppError;
 /// Public JSON schema version.
 pub const API_VERSION: u32 = 1;
 
+/// SQLite `user_version` for the fresh unreleased schema. There is no migration
+/// path; development databases from an older layout must be removed.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Minimum attention timeout. Values below this are rejected at submit.
+pub const MIN_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
+
+/// Default attention timeout when the submitter omits `timeout`.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
+
 /// Maximum length of one report summary.
 pub const SUMMARY_MAX_BYTES: usize = 4096;
 
@@ -159,7 +169,8 @@ impl fmt::Display for AgentKind {
 /// Agent kind plus optional model alias.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
-    /// CLI kind.
+    /// CLI kind. Serialized as `agent` to match the public workload shape.
+    #[serde(rename = "agent")]
     pub kind: AgentKind,
     /// Model alias such as `fable` or `grok-4.6`. Empty becomes `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,11 +211,11 @@ impl Agent {
 pub enum ProcessStatus {
     /// Inserted, worker not yet CAS-marked running.
     Queued,
-    /// Worker holds `runner.lock` and the agent may be alive.
+    /// Worker holds `runner.lock` and the child may be alive.
     Running,
-    /// Agent exited 0.
+    /// Child exited 0.
     Succeeded,
-    /// Agent exited non-zero, timed out, or failed to spawn.
+    /// Child exited non-zero, failed to spawn, or was signalled without cancel.
     Failed,
     /// Cancelled by `task cancel` or `stop --yes`.
     Cancelled,
@@ -272,14 +283,9 @@ pub enum ExitReason {
         /// Signal number that ended the process.
         signal: i32,
     },
-    /// Wall-clock timeout.
-    Timeout {
-        /// Timeout budget in seconds.
-        secs: u64,
-    },
     /// Cancelled.
     Cancelled,
-    /// `task-run` or the agent binary could not start.
+    /// `task-run` or the child binary could not start.
     SpawnFailed {
         /// Why the spawn failed.
         message: String,
@@ -332,8 +338,74 @@ impl fmt::Display for CallbackStatus {
     }
 }
 
-/// Caller environment captured at submit.
+/// Attention-reminder delivery state. A third axis, independent of the process
+/// status and of the terminal callback: a reminder never changes either one.
+/// `Delivered` carries its timestamp, so "delivered with no time" cannot exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionState {
+    /// No reminder claimed yet.
+    Pending,
+    /// A sender holds the claim and the queue send is in flight.
+    Sending,
+    /// `TASK_CHECK_DUE` was delivered.
+    Delivered {
+        /// When the queue send succeeded.
+        at: DateTime<Utc>,
+    },
+}
+
+impl AttentionState {
+    /// SQLite storage tag for the `attention_state` column.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sending => "sending",
+            Self::Delivered { .. } => "delivered",
+        }
+    }
+
+    /// Rebuild from the `attention_state` and `timeout_notified_at` columns.
+    pub fn from_storage(tag: &str, at: Option<DateTime<Utc>>) -> Result<Self, AppError> {
+        match (tag, at) {
+            ("pending", None) => Ok(Self::Pending),
+            ("sending", None) => Ok(Self::Sending),
+            ("delivered", Some(at)) => Ok(Self::Delivered { at }),
+            (state, timestamp) => Err(AppError::Internal {
+                message: format!(
+                    "invalid attention state: state={state} notified={}",
+                    timestamp.is_some()
+                ),
+            }),
+        }
+    }
+
+    /// When the reminder was delivered, if it was.
+    #[must_use]
+    pub fn delivered_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Delivered { at } => Some(*at),
+            Self::Pending | Self::Sending => None,
+        }
+    }
+
+    /// Whether `TASK_CHECK_DUE` has already been delivered.
+    #[must_use]
+    pub fn is_delivered(&self) -> bool {
+        matches!(self, Self::Delivered { .. })
+    }
+}
+
+impl fmt::Display for AttentionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Caller environment captured at submit. Closed like every other socket
+/// shape: an unrecognised key is a caller mistake, not data to ignore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskEnv {
     /// Caller's `PATH`.
     pub path: String,
@@ -397,9 +469,9 @@ impl fmt::Display for ReportOutcome {
     }
 }
 
-/// One append-only worker report.
+/// One append-only worker report. Belongs to the supervised task, not only to an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentReport {
+pub struct TaskReport {
     /// 1-based sequence.
     pub seq: i64,
     /// Worker outcome.
@@ -411,6 +483,41 @@ pub struct AgentReport {
     /// When an interim `--notify` send succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notified_at: Option<DateTime<Utc>>,
+}
+
+/// Persisted agent workload. Prompt bytes live in task evidence files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWorkload {
+    /// Agent identity.
+    #[serde(flatten)]
+    pub agent: Agent,
+    /// Extra argv appended after the unattended flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Whether the reporting trailer is fed to the child.
+    #[serde(default = "default_true")]
+    pub report_trailer: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Persisted task workload: a validated argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskWorkload {
+    /// Validated command line.
+    pub command: crate::invocation::CommandLine,
+}
+
+/// Persisted workload discriminant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Workload {
+    /// Agent CLI with prompt evidence on disk.
+    Agent(AgentWorkload),
+    /// Arbitrary non-interactive command.
+    Task(TaskWorkload),
 }
 
 /// Lifecycle of one task, derived from the `status`, `exit_reason` and `pid`
@@ -498,24 +605,22 @@ pub struct TaskRow {
     pub id: TaskId,
     /// Submitting Codex thread.
     pub thread: ThreadId,
-    /// Agent identity.
-    pub agent: Agent,
+    /// Workload configuration.
+    pub workload: Workload,
     /// Working directory.
     pub cwd: PathBuf,
-    /// Wall-clock timeout.
+    /// Attention timeout. Reminds the submitter; does not kill the child.
     pub timeout: Duration,
-    /// Extra argv appended to the agent.
-    pub extra_args: Vec<String>,
-    /// Whether the reporting trailer is fed to the child.
-    pub report_trailer: bool,
     /// Captured caller environment.
     pub env: TaskEnv,
-    /// Resolved agent binary.
+    /// Resolved executable path.
     pub binary: PathBuf,
     /// Process lifecycle.
     pub state: TaskState,
-    /// Callback delivery. A second axis: it outlives the process state.
+    /// Terminal callback delivery. A second axis: it outlives the process state.
     pub callback_status: CallbackStatus,
+    /// Attention-reminder delivery state.
+    pub attention: AttentionState,
     /// When cancel was requested.
     pub cancel_requested_at: Option<DateTime<Utc>>,
     /// Insert time.
@@ -642,7 +747,6 @@ impl From<&ExitReason> for ProcessStatus {
             ExitReason::Cancelled => Self::Cancelled,
             ExitReason::Exit { .. }
             | ExitReason::Signal { .. }
-            | ExitReason::Timeout { .. }
             | ExitReason::SpawnFailed { .. } => Self::Failed,
         }
     }
@@ -702,6 +806,27 @@ mod tests {
     }
 
     #[test]
+    fn attention_state_rejects_impossible_storage_pairs() {
+        let at = Utc::now();
+        assert_eq!(
+            AttentionState::from_storage("pending", None).unwrap(),
+            AttentionState::Pending
+        );
+        assert_eq!(
+            AttentionState::from_storage("sending", None).unwrap(),
+            AttentionState::Sending
+        );
+        assert_eq!(
+            AttentionState::from_storage("delivered", Some(at)).unwrap(),
+            AttentionState::Delivered { at }
+        );
+        assert!(AttentionState::from_storage("pending", Some(at)).is_err());
+        assert!(AttentionState::from_storage("sending", Some(at)).is_err());
+        assert!(AttentionState::from_storage("delivered", None).is_err());
+        assert!(AttentionState::from_storage("unknown", None).is_err());
+    }
+
+    #[test]
     fn report_on_terminal_rejected() {
         let err = check_report_allowed(ProcessStatus::Succeeded).unwrap_err();
         assert!(matches!(
@@ -722,15 +847,12 @@ mod tests {
 
         let finished = TaskState::from_storage(
             ProcessStatus::Failed,
-            Some(ExitReason::Timeout { secs: 3 }),
+            Some(ExitReason::Exit { code: 1 }),
             None,
         )
         .unwrap();
         assert_eq!(finished.status(), ProcessStatus::Failed);
-        assert_eq!(
-            finished.exit_reason(),
-            Some(&ExitReason::Timeout { secs: 3 })
-        );
+        assert_eq!(finished.exit_reason(), Some(&ExitReason::Exit { code: 1 }));
 
         // Lost is the one terminal state with no exit.json to explain it
         assert_eq!(

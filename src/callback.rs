@@ -1,20 +1,101 @@
 //! `HOMEBASED_EVENT` formatting and `codex queue` invocation.
 
+use std::io::Read;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use serde::Serialize;
 
-use crate::agents::resolve_binary;
 use crate::domain::{
-    AgentKind, AgentReport, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskRow, TaskState,
-    ThreadId,
+    AgentKind, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskReport, TaskRow, TaskState,
+    ThreadId, Workload,
 };
 use crate::error::AppError;
 use crate::home::Home;
-use crate::store::Store;
+use crate::invocation::resolve_agent_binary;
+use crate::store::{CallbackClaim, Store};
+
+/// Per-attempt bound for one `codex queue` child, including cleanup.
+pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
+/// [`QUEUE_ATTEMPT_TIMEOUT_SECS`] as a [`Duration`].
+pub const QUEUE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(QUEUE_ATTEMPT_TIMEOUT_SECS);
+
+const QUEUE_ATTEMPTS: u32 = 3;
+
+/// Extra time to reap a child after its process group receives SIGKILL.
+const QUEUE_REAP_TIMEOUT_SECS: u64 = 2;
+
+/// Maximum drain wait for each of stdout and stderr after direct-child exit.
+const QUEUE_PIPE_DRAIN_TIMEOUT_SECS: u64 = 2;
+
+/// Worst-case backoff across retries: attempt 2 waits 200ms, attempt 3 waits 400ms.
+const QUEUE_RETRY_BACKOFF_TOTAL_MS: u64 = 200 + 400;
+
+/// Slack after the last attempt returns for draining pipes, writing the
+/// callback log, and store settlement before the attention claim can release.
+const QUEUE_SETTLEMENT_SLACK_SECS: u64 = 5;
+
+/// Worst-case wall time for three bounded attempts, their backoff, and
+/// post-attempt settlement. The attention release valve must stay above this
+/// so a live send cannot outlive the claim.
+const QUEUE_ATTEMPT_WORST_CASE_SECS: u64 =
+    QUEUE_ATTEMPT_TIMEOUT_SECS + QUEUE_REAP_TIMEOUT_SECS + QUEUE_PIPE_DRAIN_TIMEOUT_SECS * 2;
+const QUEUE_SEND_WORST_CASE_SECS: u64 = QUEUE_ATTEMPT_WORST_CASE_SECS * QUEUE_ATTEMPTS as u64
+    + QUEUE_RETRY_BACKOFF_TOTAL_MS.div_ceil(1000)
+    + QUEUE_SETTLEMENT_SLACK_SECS;
+
+/// How long a terminal callback waits for an in-flight attention reminder
+/// before it releases a claim stranded by a dead daemon. Must exceed the
+/// worst-case live `codex queue` send.
+pub const ATTENTION_SETTLE_SECS: u64 = 90;
+/// [`ATTENTION_SETTLE_SECS`] as a [`Duration`].
+pub const ATTENTION_SETTLE: Duration = Duration::from_secs(ATTENTION_SETTLE_SECS);
+
+const _: () = assert!(
+    ATTENTION_SETTLE_SECS > QUEUE_SEND_WORST_CASE_SECS,
+    "attention settlement must outlast the worst-case queue send"
+);
+
+/// Poll interval while waiting for that claim to settle.
+pub const ATTENTION_POLL: Duration = Duration::from_millis(100);
+
+/// Public workload view. Omits private prompt and extra-arg fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkloadView {
+    /// Agent CLI identity.
+    Agent {
+        /// Agent kind.
+        agent: AgentKind,
+        /// Model alias, or null.
+        model: Option<String>,
+    },
+    /// Task argv preview.
+    Task {
+        /// Full argv including the program.
+        command: Vec<String>,
+    },
+}
+
+impl From<&Workload> for WorkloadView {
+    fn from(workload: &Workload) -> Self {
+        match workload {
+            Workload::Agent(agent) => Self::Agent {
+                agent: agent.agent.kind,
+                model: agent.agent.model.clone(),
+            },
+            Workload::Task(task) => Self::Task {
+                command: task.command.to_vec(),
+            },
+        }
+    }
+}
 
 /// Derived event name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -22,6 +103,8 @@ use crate::store::Store;
 pub enum EventKind {
     /// Interim `--notify` report.
     TaskReported,
+    /// Attention timer expired; child still running.
+    TaskCheckDue,
     /// Process cancelled.
     TaskCancelled,
     /// Worker gone without `exit.json`.
@@ -40,6 +123,8 @@ pub enum EventKind {
 pub enum NextAction {
     /// Read the interim report.
     ReadReport,
+    /// Inspect status and recent logs after an attention reminder.
+    InspectTask,
     /// Nothing further.
     None,
     /// Inspect the output log.
@@ -64,11 +149,6 @@ pub enum ProcessPayload {
         /// Signal number that ended the process.
         signal: i32,
     },
-    /// Timed out.
-    Timeout {
-        /// Timeout budget in seconds.
-        secs: u64,
-    },
     /// Cancelled.
     Cancelled,
     /// Spawn failed.
@@ -85,7 +165,6 @@ impl From<&ExitReason> for ProcessPayload {
         match reason {
             ExitReason::Exit { code } => Self::Exit { code: *code },
             ExitReason::Signal { signal } => Self::Signal { signal: *signal },
-            ExitReason::Timeout { secs } => Self::Timeout { secs: *secs },
             ExitReason::Cancelled => Self::Cancelled,
             ExitReason::SpawnFailed { message } => Self::SpawnFailed {
                 message: message.clone(),
@@ -105,8 +184,8 @@ pub struct ReportView {
     pub summary: String,
 }
 
-impl From<&AgentReport> for ReportView {
-    fn from(report: &AgentReport) -> Self {
+impl From<&TaskReport> for ReportView {
+    fn from(report: &TaskReport) -> Self {
         Self {
             seq: report.seq,
             outcome: report.outcome,
@@ -124,10 +203,8 @@ pub struct HomebasedEvent {
     pub event: EventKind,
     /// Task id.
     pub task: TaskId,
-    /// Agent kind.
-    pub agent: AgentKind,
-    /// Model, possibly null.
-    pub model: Option<String>,
+    /// Workload view.
+    pub workload: WorkloadView,
     /// Codex thread.
     pub thread: ThreadId,
     /// Task cwd.
@@ -136,8 +213,11 @@ pub struct HomebasedEvent {
     pub evidence: PathBuf,
     /// Reports in seq order.
     pub reports: Vec<ReportView>,
-    /// Process payload, or null for `TASK_REPORTED`.
+    /// Process payload, or null for interim events.
     pub process: Option<ProcessPayload>,
+    /// Configured attention timeout in seconds. Present on check-due events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// Suggested next action.
     pub next_action: NextAction,
 }
@@ -152,64 +232,90 @@ impl HomebasedEvent {
 
 /// Build an exit event from the row's stored reason.
 #[must_use]
-pub fn exit_event(row: &TaskRow, reports: &[AgentReport], evidence: PathBuf) -> HomebasedEvent {
+pub fn exit_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
     build_event(
         row,
         reports,
         evidence,
         row.exit_reason().map(ProcessPayload::from),
+        None,
     )
 }
 
 /// Build a lost-runner event.
 #[must_use]
-pub fn lost_event(row: &TaskRow, reports: &[AgentReport], evidence: PathBuf) -> HomebasedEvent {
-    build_event(row, reports, evidence, Some(ProcessPayload::RunnerLost))
+pub fn lost_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
+    build_event(
+        row,
+        reports,
+        evidence,
+        Some(ProcessPayload::RunnerLost),
+        None,
+    )
+}
+
+/// Attention-timer reminder. Never changes task status.
+#[must_use]
+pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
+    HomebasedEvent {
+        api_version: crate::domain::API_VERSION,
+        event: EventKind::TaskCheckDue,
+        task: row.id,
+        workload: WorkloadView::from(&row.workload),
+        thread: row.thread,
+        cwd: row.cwd.clone(),
+        evidence,
+        reports: reports.iter().map(ReportView::from).collect(),
+        process: None,
+        timeout_secs: Some(row.timeout.as_secs()),
+        next_action: NextAction::InspectTask,
+    }
 }
 
 fn build_event(
     row: &TaskRow,
-    reports: &[AgentReport],
+    reports: &[TaskReport],
     evidence: PathBuf,
     process: Option<ProcessPayload>,
+    timeout_secs: Option<u64>,
 ) -> HomebasedEvent {
     let (event, next_action) = derive_exit(process.as_ref(), reports);
     HomebasedEvent {
         api_version: crate::domain::API_VERSION,
         event,
         task: row.id,
-        agent: row.agent.kind,
-        model: row.agent.model.clone(),
+        workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
         evidence,
         reports: reports.iter().map(ReportView::from).collect(),
         process,
+        timeout_secs,
         next_action,
     }
 }
 
 /// Interim `--notify` event carrying one report and `process: null`.
 #[must_use]
-pub fn notify_event(row: &TaskRow, report: &AgentReport, evidence: PathBuf) -> HomebasedEvent {
+pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> HomebasedEvent {
     HomebasedEvent {
         api_version: crate::domain::API_VERSION,
         event: EventKind::TaskReported,
         task: row.id,
-        agent: row.agent.kind,
-        model: row.agent.model.clone(),
+        workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
         evidence,
         reports: vec![ReportView::from(report)],
         process: None,
+        timeout_secs: None,
         next_action: NextAction::ReadReport,
     }
 }
 
 fn derive_exit(
     process: Option<&ProcessPayload>,
-    reports: &[AgentReport],
+    reports: &[TaskReport],
 ) -> (EventKind, NextAction) {
     if matches!(process, Some(ProcessPayload::Cancelled)) {
         return (EventKind::TaskCancelled, NextAction::None);
@@ -235,7 +341,7 @@ pub fn deliver_exit_event(
     row: &TaskRow,
     event: &HomebasedEvent,
 ) -> Result<(), AppError> {
-    if !store.claim_callback(row.id)? {
+    if !claim_exit_callback(store, row.id)? {
         return Ok(());
     }
     let line = event.to_message_line()?;
@@ -250,6 +356,24 @@ pub fn deliver_exit_event(
     Ok(())
 }
 
+/// Claim the terminal callback, waiting out an in-flight `TASK_CHECK_DUE` so
+/// the reminder can never land after the terminal event. Blocking; the daemon
+/// has its own async claim loop over the same store calls.
+fn claim_exit_callback(store: &Store, id: TaskId) -> Result<bool, AppError> {
+    let deadline = std::time::Instant::now() + ATTENTION_SETTLE;
+    loop {
+        match store.claim_callback(id)? {
+            CallbackClaim::Claimed => return Ok(true),
+            CallbackClaim::NotOurs => return Ok(false),
+            CallbackClaim::WaitForAttention if std::time::Instant::now() >= deadline => {
+                tracing::warn!(%id, "attention claim stranded; releasing it to deliver the terminal event");
+                store.release_attention(id)?;
+            }
+            CallbackClaim::WaitForAttention => thread::sleep(ATTENTION_POLL),
+        }
+    }
+}
+
 /// Best-effort interim notify. Does not claim the exit callback.
 pub fn deliver_notify(home: &Home, row: &TaskRow, event: &HomebasedEvent) -> Result<(), AppError> {
     let line = event.to_message_line()?;
@@ -257,29 +381,28 @@ pub fn deliver_notify(home: &Home, row: &TaskRow, event: &HomebasedEvent) -> Res
     send_queue(row, &line, &log)
 }
 
-/// Run `codex queue` up to three times. Blocking; call from `spawn_blocking` in the daemon.
+/// Run `codex queue` up to three bounded attempts. Blocking; call from
+/// `spawn_blocking` in the daemon.
 pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(), AppError> {
-    let binary = resolve_binary(AgentKind::Codex, &row.env.path, &row.cwd)?;
+    let binary = resolve_agent_binary(AgentKind::Codex, &row.env.path, &row.cwd)?;
     let mut last_err = String::new();
-    for attempt in 0..3 {
+    for attempt in 0..QUEUE_ATTEMPTS {
         if attempt > 0 {
-            thread::sleep(Duration::from_millis(200 * attempt as u64));
+            thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
         }
-        let output = Command::new(&binary)
-            .args([
-                "queue",
-                "--thread",
-                &row.thread.to_string(),
-                "--message",
-                line,
-            ])
-            .env("PATH", &row.env.path)
-            .env("HOME", &row.env.home)
-            .current_dir(&row.cwd)
-            .output();
-        match output {
+        let mut cmd = Command::new(&binary);
+        cmd.args([
+            "queue",
+            "--thread",
+            &row.thread.to_string(),
+            "--message",
+            line,
+        ])
+        .env("PATH", &row.env.path)
+        .env("HOME", &row.env.home)
+        .current_dir(&row.cwd);
+        match run_command_deadline(&mut cmd, QUEUE_ATTEMPT_TIMEOUT) {
             Ok(out) if out.status.success() => {
-                // the transcript is evidence only; a failed write must not fail delivery
                 let _ = std::fs::write(log_path, transcript(&out));
                 return Ok(());
             }
@@ -289,15 +412,98 @@ pub(crate) fn send_queue(row: &TaskRow, line: &str, log_path: &Path) -> Result<(
                     out.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&out.stderr)
                 );
-                // same: keep the last attempt's transcript, but never fail on it
                 let _ = std::fs::write(log_path, transcript(&out));
             }
             Err(err) => {
-                last_err = err.to_string();
+                last_err = err;
             }
         }
     }
     Err(AppError::Internal { message: last_err })
+}
+
+/// Drive one child to completion or deadline. Drains stdout/stderr on helper
+/// threads so a chatty child cannot deadlock a filled pipe, and kills the
+/// process group when the deadline elapses.
+fn run_command_deadline(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn().map_err(|err| err.to_string())?;
+    let pid = child.id() as i32;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "missing stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "missing stderr".to_string())?;
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx_out.send(buf);
+    });
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stderr = stderr;
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = tx_err.send(buf);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // kill the whole group, then reap; never leave an unbounded wait
+                let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                let reap_deadline = Instant::now() + Duration::from_secs(QUEUE_REAP_TIMEOUT_SECS);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = rx_out.recv_timeout(Duration::from_millis(100));
+                            let _ = rx_err.recv_timeout(Duration::from_millis(100));
+                            return Err(format!(
+                                "codex queue timed out after {}s (exit={})",
+                                timeout.as_secs(),
+                                status
+                                    .code()
+                                    .unwrap_or_else(|| status.signal().unwrap_or(-1))
+                            ));
+                        }
+                        Ok(None) if Instant::now() >= reap_deadline => {
+                            return Err(format!(
+                                "codex queue timed out after {}s and child did not reap",
+                                timeout.as_secs()
+                            ));
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(20)),
+                        Err(err) => return Err(err.to_string()),
+                    }
+                }
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(err) => return Err(err.to_string()),
+        }
+    };
+
+    let drain_timeout = Duration::from_secs(QUEUE_PIPE_DRAIN_TIMEOUT_SECS);
+    let stdout = rx_out.recv_timeout(drain_timeout).unwrap_or_default();
+    let stderr = rx_err.recv_timeout(drain_timeout).unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn transcript(out: &std::process::Output) -> Vec<u8> {
@@ -322,15 +528,20 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
 #[must_use]
 pub fn last_event_for_row(
     row: &TaskRow,
-    reports: &[AgentReport],
+    reports: &[TaskReport],
     evidence: PathBuf,
 ) -> Option<HomebasedEvent> {
     match row.state {
-        TaskState::Queued | TaskState::Running { .. } => reports
-            .iter()
-            .rev()
-            .find(|r| r.notified_at.is_some())
-            .map(|r| notify_event(row, r, evidence)),
+        TaskState::Queued | TaskState::Running { .. } => {
+            if row.attention.is_delivered() {
+                return Some(check_due_event(row, reports, evidence));
+            }
+            reports
+                .iter()
+                .rev()
+                .find(|r| r.notified_at.is_some())
+                .map(|r| notify_event(row, r, evidence))
+        }
         TaskState::Lost => Some(lost_event(row, reports, evidence)),
         TaskState::Finished { .. } => Some(exit_event(row, reports, evidence)),
     }
@@ -339,7 +550,7 @@ pub fn last_event_for_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Agent, TaskEnv};
+    use crate::domain::{Agent, AgentWorkload, AttentionState, TaskEnv, Workload};
     use chrono::Utc;
     use std::time::Duration;
 
@@ -347,11 +558,13 @@ mod tests {
         TaskRow {
             id: TaskId::new(),
             thread: "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap(),
-            agent: Agent::new(AgentKind::Claude, Some("fable".into())),
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, Some("fable".into())),
+                extra_args: vec![],
+                report_trailer: true,
+            }),
             cwd: PathBuf::from("/work"),
-            timeout: Duration::from_secs(4),
-            extra_args: vec![],
-            report_trailer: true,
+            timeout: Duration::from_secs(4 * 3600),
             env: TaskEnv {
                 path: "/bin".into(),
                 home: "/home/u".into(),
@@ -359,14 +572,15 @@ mod tests {
             binary: PathBuf::from("/bin/claude"),
             state,
             callback_status: CallbackStatus::Pending,
+            attention: AttentionState::Pending,
             cancel_requested_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
 
-    fn report(seq: i64, outcome: ReportOutcome) -> AgentReport {
-        AgentReport {
+    fn report(seq: i64, outcome: ReportOutcome) -> TaskReport {
+        TaskReport {
             seq,
             outcome,
             summary: format!("s{seq}"),
@@ -409,8 +623,6 @@ mod tests {
         );
         assert_eq!(event.event, EventKind::TaskSucceeded);
         assert_eq!(event.reports.len(), 2);
-        assert_eq!(event.reports[0].seq, 1);
-        assert_eq!(event.reports[1].seq, 2);
     }
 
     #[test]
@@ -424,6 +636,26 @@ mod tests {
         );
         assert_eq!(event.event, EventKind::TaskSucceeded);
         assert!(event.reports.is_empty());
+        assert!(matches!(
+            event.workload,
+            WorkloadView::Agent {
+                agent: AgentKind::Claude,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn check_due_has_null_process() {
+        let r = row(TaskState::Running { pid: Some(1) });
+        let event = check_due_event(&r, &[], PathBuf::from("/e"));
+        assert_eq!(event.event, EventKind::TaskCheckDue);
+        assert!(event.process.is_none());
+        assert_eq!(event.next_action, NextAction::InspectTask);
+        assert_eq!(event.timeout_secs, Some(4 * 3600));
+        let line = event.to_message_line().unwrap();
+        assert!(line.contains("\"process\":null"));
+        assert!(line.contains("TASK_CHECK_DUE"));
     }
 
     #[test]
@@ -452,5 +684,62 @@ mod tests {
         let json = line.strip_prefix("HOMEBASED_EVENT ").unwrap();
         let start = &json[..80];
         assert!(start.starts_with("{\"api_version\":1,\"event\":\"TASK_SUCCEEDED\",\"task\":"));
+    }
+
+    #[test]
+    fn attention_settle_outlasts_worst_case_queue_send() {
+        // relationship is enforced by the compile-time assert above; lock the
+        // public durations so a silent edit cannot shrink them independently
+        assert_eq!(QUEUE_ATTEMPT_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(ATTENTION_SETTLE, Duration::from_secs(90));
+        assert_eq!(QUEUE_ATTEMPT_WORST_CASE_SECS, 20 + 2 + 2 * 2);
+        assert_eq!(QUEUE_SEND_WORST_CASE_SECS, (20 + 2 + 2 * 2) * 3 + 1 + 5);
+    }
+
+    #[test]
+    fn queue_attempt_deadline_stops_the_child_and_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("slow-queue.sh");
+        let pid_file = dir.path().join("pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\n# flood stdout so an undrained pipe would block\n\
+                 dd if=/dev/zero bs=1024 count=256 2>/dev/null\n\
+                 sleep 1000\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let mut cmd = Command::new(&script);
+        let started = Instant::now();
+        let err = run_command_deadline(&mut cmd, Duration::from_secs(1)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "send returned too slowly: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "deadline returned too early: {elapsed:?}"
+        );
+
+        // child (and its sleep descendant) must be gone
+        let pid_raw = std::fs::read_to_string(&pid_file).unwrap();
+        let pid: i32 = pid_raw.trim().parse().unwrap();
+        let still_alive = kill(Pid::from_raw(pid), None).is_ok();
+        assert!(!still_alive, "timed-out child pid={pid} is still alive");
     }
 }

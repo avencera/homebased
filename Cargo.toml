@@ -5,7 +5,7 @@ members = ["xtask"]
 name = "homebased"
 version = "0.1.0"
 edition = "2024"
-description = "Supervise long-running agent tasks and report them to a Codex thread"
+description = "Supervise long-running agent and general task workloads and report them to a Codex thread"
 publish = false
 
 [dependencies]
@@ -37,6 +37,7 @@ which = "8.0.6"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+jsonschema = { version = "0.56.0", default-features = false }
 predicates = "3.1.4"
 tempfile = "3.27.0"
 

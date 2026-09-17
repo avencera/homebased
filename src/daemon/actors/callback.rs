@@ -2,10 +2,14 @@
 
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 
-use crate::callback::{HomebasedEvent, append_fallback, send_queue};
+use crate::callback::{
+    ATTENTION_POLL, ATTENTION_SETTLE, HomebasedEvent, append_fallback, send_queue,
+};
 use crate::daemon::actors::{StoreMsg, call_store};
-use crate::domain::{CallbackStatus, TaskRow};
+use crate::domain::{CallbackStatus, TaskId, TaskRow};
+use crate::error::AppError;
 use crate::home::Home;
+use crate::store::CallbackClaim;
 
 /// One-way deliver; concurrent across tasks via `spawn_blocking` inside `tokio::spawn`.
 pub enum CallbackMsg {
@@ -67,18 +71,31 @@ impl Actor for CallbackActor {
     }
 }
 
+/// Claim the terminal callback, waiting out an in-flight `TASK_CHECK_DUE` so
+/// the reminder can never land after the terminal event. The wait is async and
+/// off the store actor, so a slow reminder never blocks the daemon.
+async fn claim_exit_callback(store: &ActorRef<StoreMsg>, id: TaskId) -> Result<bool, AppError> {
+    let deadline = tokio::time::Instant::now() + ATTENTION_SETTLE;
+    loop {
+        match call_store(store, |reply| StoreMsg::ClaimCallback { id, reply }).await? {
+            CallbackClaim::Claimed => return Ok(true),
+            CallbackClaim::NotOurs => return Ok(false),
+            CallbackClaim::WaitForAttention if tokio::time::Instant::now() >= deadline => {
+                tracing::warn!(%id, "attention claim stranded; releasing it to deliver the terminal event");
+                call_store(store, |reply| StoreMsg::ReleaseAttention { id, reply }).await?;
+            }
+            CallbackClaim::WaitForAttention => tokio::time::sleep(ATTENTION_POLL).await,
+        }
+    }
+}
+
 async fn deliver(
     store: ActorRef<StoreMsg>,
     home: Home,
     row: TaskRow,
     event: HomebasedEvent,
-) -> Result<(), crate::error::AppError> {
-    let claimed = call_store(&store, |reply| StoreMsg::ClaimCallback {
-        id: row.id,
-        reply,
-    })
-    .await?;
-    if !claimed {
+) -> Result<(), AppError> {
+    if !claim_exit_callback(&store, row.id).await? {
         return Ok(());
     }
     let line = event.to_message_line()?;
@@ -88,7 +105,7 @@ async fn deliver(
     let result =
         tokio::task::spawn_blocking(move || send_queue(&row_clone, &line_clone, &log_path))
             .await
-            .map_err(|err| crate::error::AppError::Internal {
+            .map_err(|err| AppError::Internal {
                 message: format!("callback join: {err}"),
             })?;
     match result {

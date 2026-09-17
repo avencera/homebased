@@ -8,8 +8,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use homebased::domain::{
-    Agent, AgentKind, CallbackStatus, ExitReason, ProcessStatus, TaskEnv, TaskId,
+    Agent, AgentKind, AgentWorkload, CallbackStatus, ExitReason, ProcessStatus, TaskEnv, TaskId,
+    Workload,
 };
 use homebased::store::{NewTask, Store, new_queued_task};
 use serde_json::{Value, json};
@@ -207,17 +209,50 @@ impl Harness {
     fn spec(agent: &str, prompt: &str) -> Value {
         json!({
             "api_version": 1,
-            "agent": agent,
-            "model": "fable",
             "thread": THREAD,
             "cwd": std::env::temp_dir(),
-            "prompt": prompt,
-            "timeout": "15s"
+            "timeout": "2h",
+            "workload": {
+                "type": "agent",
+                "agent": agent,
+                "model": "fable",
+                "prompt": prompt,
+            }
         })
+    }
+
+    fn task_spec(command: &[&str]) -> Value {
+        json!({
+            "api_version": 1,
+            "thread": THREAD,
+            "cwd": std::env::temp_dir(),
+            "timeout": "2h",
+            "workload": {
+                "type": "task",
+                "command": command,
+            }
+        })
+    }
+
+    fn backdate_created_at(&self, id: &str, hours_ago: i64) {
+        let ts = (Utc::now() - ChronoDuration::hours(hours_ago))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let conn = rusqlite::Connection::open(self.home.join("homebased.sqlite")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![ts, id],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "backdate missed task {id}");
     }
 
     fn set_control(&self, name: &str, body: &str) {
         fs::write(self.record.join(name), body).unwrap();
+    }
+
+    fn clear_control(&self, name: &str) {
+        let _ = fs::remove_file(self.record.join(name));
     }
 
     fn clear_controls(&self) {
@@ -229,6 +264,8 @@ impl Harness {
             "exit",
             "queue-fails",
             "stdout",
+            "ignore-term",
+            "no-stdin",
         ] {
             let _ = fs::remove_file(self.record.join(name));
         }
@@ -278,6 +315,10 @@ fn submit_then_fake_codex_receives_event() {
     assert_eq!(ev["event"], "TASK_SUCCEEDED");
     assert_eq!(ev["task"], id);
     assert_eq!(ev["thread"], THREAD);
+    assert_eq!(
+        ev["workload"],
+        json!({"type": "agent", "agent": "claude", "model": "fable"})
+    );
     assert!(ev["reports"].as_array().unwrap().is_empty());
     assert_eq!(ev["process"]["kind"], "exit");
     assert_eq!(ev["process"]["code"], 0);
@@ -291,8 +332,7 @@ fn submit_then_fake_codex_receives_event() {
 #[test]
 fn daemon_restart_keeps_worker() {
     let mut h = Harness::new();
-    let mut spec = Harness::spec("claude", "sleeping");
-    spec["timeout"] = json!("20s");
+    let spec = Harness::spec("claude", "sleeping");
     h.set_control("sleep", "8");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -332,8 +372,7 @@ fn daemon_restart_keeps_worker() {
 #[test]
 fn kill9_worker_marks_lost() {
     let h = Harness::new();
-    let mut spec = Harness::spec("claude", "hold");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "hold");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "20");
@@ -377,50 +416,56 @@ fn kill9_worker_marks_lost() {
 }
 
 #[test]
-fn timeout_and_cancel() {
-    let h = Harness::new();
-    let mut spec = Harness::spec("claude", "timeout me");
-    spec["timeout"] = json!("1s");
-    let spec_path = h.home.join("spec.json");
-    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
-    h.set_control("sleep", "20");
-    let out = h
-        .cmd()
-        .args(["--json", "task", "submit", "--spec"])
-        .arg(&spec_path)
-        .output()
-        .unwrap();
+fn attention_reminder_and_cancel() {
+    let mut h = Harness::new();
+    h.set_control("sleep", "12");
+    let id = h.submit(&Harness::spec("claude", "attention me"));
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+    let before = h.queue_messages().len();
+    h.backdate_created_at(&id, 3);
+    // re-arm from persisted created_at; overdue deadline fires immediately
+    h.restart_daemon();
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        wait_until(Duration::from_secs(10), || {
+            h.queue_messages()
+                .iter()
+                .skip(before)
+                .any(|m| event_json(m)["event"] == "TASK_CHECK_DUE")
+        }),
+        "no TASK_CHECK_DUE after backdate+restart: {:?}",
+        h.queue_messages()
     );
-    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let show = h.wait_status(&id, "failed");
-    assert_eq!(show["exit_reason"]["kind"], "timeout");
-    assert_eq!(show["exit_reason"]["secs"], 1);
-    let ev = event_json(&h.queue_messages()[0]);
-    assert_eq!(ev["event"], "TASK_FAILED");
-    assert_eq!(ev["process"]["kind"], "timeout");
-
-    let spec_path = h.home.join("spec2.json");
-    let mut spec = Harness::spec("claude", "cancel me");
-    spec["timeout"] = json!("30s");
-    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
-    h.set_control("sleep", "20");
-    let out = h
-        .cmd()
-        .args(["--json", "task", "submit", "--spec"])
-        .arg(&spec_path)
-        .output()
+    let check = h
+        .queue_messages()
+        .iter()
+        .skip(before)
+        .map(|m| event_json(m))
+        .find(|ev| ev["event"] == "TASK_CHECK_DUE")
         .unwrap();
-    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert!(check["process"].is_null(), "{check}");
+    assert_eq!(check["next_action"], "inspect_task");
+    assert_eq!(check["timeout_secs"], 2 * 3600);
+    assert_eq!(
+        check["workload"],
+        json!({"type": "agent", "agent": "claude", "model": "fable"})
+    );
+    assert_eq!(h.show(&id)["status"], "running", "child must keep running");
+    assert_eq!(h.show(&id)["check_timeout"], "sent");
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(show["status"], "succeeded");
+    let terminal = h
+        .queue_messages()
+        .iter()
+        .skip(before)
+        .map(|m| event_json(m))
+        .find(|ev| ev["event"] == "TASK_SUCCEEDED")
+        .expect("terminal event after check due");
+    assert_eq!(terminal["task"], id);
+
+    h.clear_controls();
+    h.set_control("sleep", "20");
+    let id = h.submit(&Harness::spec("claude", "cancel me"));
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
         == "running"));
     let agent_pid = h.agent_pid(&id);
@@ -526,8 +571,7 @@ fn report_variants() {
 fn report_with_daemon_stopped_and_trailer_off() {
     let mut h = Harness::new();
     let mut spec = Harness::spec("claude", "keep running");
-    spec["timeout"] = json!("30s");
-    spec["report_trailer"] = json!(false);
+    spec["workload"]["report_trailer"] = json!(false);
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "8");
@@ -572,8 +616,7 @@ fn report_with_daemon_stopped_and_trailer_off() {
 #[test]
 fn stop_refusal_and_yes() {
     let h = Harness::new();
-    let mut spec = Harness::spec("claude", "hold");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "hold");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "20");
@@ -653,8 +696,7 @@ fn summary_too_long() {
     let id = h.submit(&Harness::spec("claude", "x"));
     h.wait_status(&id, "succeeded");
     // submit a running task to report against
-    let mut spec = Harness::spec("claude", "running");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "running");
     let spec_path = h.home.join("spec2.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "15");
@@ -728,12 +770,48 @@ fn submit_dry_run_and_schema() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v.get("argv").is_some(), "{v}");
+    assert_eq!(v["stdin"], "prompt_feed");
+    let argv = v["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|a| a.as_str() == Some("-p")));
     assert!(
-        v["argv"]
-            .as_array()
-            .unwrap()
+        !argv
             .iter()
-            .any(|a| a.as_str() == Some("-p"))
+            .any(|a| a.as_str().is_some_and(|s| s.contains("prompt.feed.txt"))),
+        "claude dry-run must not put the feed path in argv: {v}"
+    );
+
+    let grok = Harness::spec("grok", "preview");
+    let mut child = h
+        .cmd()
+        .args(["--json", "task", "submit", "--dry-run", "--spec", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(serde_json::to_vec(&grok).unwrap().as_slice())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["stdin"], "null");
+    let argv = v["argv"].as_array().unwrap();
+    assert!(
+        argv.iter().any(|a| a
+            .as_str()
+            .is_some_and(|s| s.contains("tasks/<task-id>/prompt.feed.txt"))),
+        "grok dry-run must include the deterministic feed placeholder: {v}"
     );
 
     let out = h.cmd().args(["task", "schema"]).output().unwrap();
@@ -788,6 +866,7 @@ fn install_dry_run_text() {
     let hb = assert_cmd::cargo::cargo_bin("homebased");
     let dir = TempDir::new().unwrap();
     let out = Command::new(&hb)
+        .env_remove("HOMEBASED_WEB_LISTEN")
         .args(["daemon", "install", "--dry-run", "--home"])
         .arg(dir.path())
         .output()
@@ -871,8 +950,7 @@ fn status_responds_while_callback_hangs() {
 #[test]
 fn sigterm_without_cancel_is_failed() {
     let h = Harness::new();
-    let mut spec = Harness::spec("claude", "hold");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "hold");
     h.set_control("sleep", "20");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -905,8 +983,7 @@ fn sigterm_without_cancel_is_failed() {
 #[test]
 fn cancel_immediately_after_submit() {
     let h = Harness::new();
-    let mut spec = Harness::spec("claude", "hold");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "hold");
     h.set_control("sleep", "20");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -942,8 +1019,7 @@ fn large_prompt_early_exit_keeps_code() {
     let h = Harness::new();
     h.set_control("no-stdin", "");
     h.set_control("exit", "3");
-    let mut spec = Harness::spec("claude", &"x".repeat(1024 * 1024));
-    spec["timeout"] = json!("15s");
+    let spec = Harness::spec("claude", &"x".repeat(1024 * 1024));
     let spec_path = h.home.join("spec-big.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     let out = h
@@ -970,37 +1046,56 @@ fn large_prompt_early_exit_keeps_code() {
 }
 
 #[test]
-fn stuck_agent_is_killed_after_grace() {
+fn process_group_cleaned_when_child_leaves_descendant() {
     let h = Harness::new();
-    h.set_control("ignore-term", "");
-    h.set_control("sleep", "30");
-    let mut spec = Harness::spec("claude", "trap");
-    spec["timeout"] = json!("1s");
-    let spec_path = h.home.join("spec.json");
-    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let pid_file = h.home.join("descendant.pid");
+    let script = h.home.join("leave-descendant.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n# nested sh so $$ is the descendant, not this script\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"{pid}\"; sleep 60' &\nwhile [ ! -f '{pid}' ]; do sleep 0.01; done\nexit 0\n",
+            pid = pid_file.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+    }
+    let script_s = script.to_string_lossy().into_owned();
     let start = Instant::now();
-    let out = h
-        .cmd()
-        .args(["--json", "task", "submit", "--spec"])
-        .arg(&spec_path)
-        .output()
-        .unwrap();
-    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let agent_pid = h.agent_pid(&id);
-    let show = h.wait_status(&id, "failed");
+    let id = h.submit(&Harness::task_spec(&[script_s.as_str()]));
     assert!(
-        start.elapsed() < Duration::from_secs(15),
-        "took {:?}",
+        wait_until(Duration::from_secs(5), || pid_file.exists()),
+        "descendant never recorded its pid"
+    );
+    let descendant: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(descendant), None).is_ok(),
+        "descendant {descendant} should be alive before group cleanup"
+    );
+    // direct child exited 0; runner must still reap the ignore-TERM descendant
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(show["exit_reason"]["kind"], "exit");
+    assert_eq!(show["exit_reason"]["code"], 0);
+    assert!(
+        start.elapsed() < Duration::from_secs(25),
+        "group cleanup took {:?}",
         start.elapsed()
     );
-    assert_eq!(show["exit_reason"]["kind"], "timeout");
     let gone = wait_until(Duration::from_secs(5), || {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(descendant), None).is_err()
     });
-    assert!(gone, "agent {agent_pid} survived the kill grace");
+    assert!(
+        gone,
+        "descendant {descendant} survived process-group cleanup"
+    );
 }
 
 #[test]
@@ -1162,7 +1257,6 @@ fn list_filters_by_status_and_thread() {
     h.wait_status(&done, "succeeded");
 
     let mut spec = Harness::spec("claude", "still running");
-    spec["timeout"] = json!("30s");
     spec["thread"] = json!(other_thread);
     let spec_path = h.home.join("spec-running.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -1277,7 +1371,12 @@ fn web_listener_serves_read_only_api() {
     let first = &body["tasks"][0];
     assert_eq!(first["id"], id, "{body}");
     assert!(first["created_at"].is_string(), "{body}");
-    assert_eq!(first["timeout_secs"], 15, "{body}");
+    assert_eq!(first["timeout_secs"], 2 * 3600, "{body}");
+    assert_eq!(
+        first["workload"],
+        json!({"type": "agent", "agent": "claude", "model": "fable"}),
+        "{body}"
+    );
 
     let log = http_get(&addr, &format!("/v1/tasks/{id}/log?tail=1"));
     assert_eq!(log.status, 200, "{log:?}");
@@ -1372,8 +1471,7 @@ fn http_request(addr: &str, method: &str, path: &str) -> HttpResponse {
 #[test]
 fn report_reads_summary_from_stdin() {
     let h = Harness::new();
-    let mut spec = Harness::spec("claude", "running");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "running");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "20");
@@ -1458,8 +1556,7 @@ fn report_without_id_or_env_is_usage_error() {
 #[test]
 fn daemon_exits_on_sigterm_with_a_live_worker() {
     let mut h = Harness::new();
-    let mut spec = Harness::spec("claude", "hold");
-    spec["timeout"] = json!("30s");
+    let spec = Harness::spec("claude", "hold");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "20");
@@ -1504,8 +1601,7 @@ fn sigterm_right_after_cas_is_cancelled_not_lost() {
     fs::write(&big, vec![b'x'; 512 * 1024 * 1024]).unwrap();
 
     let mut spec = Harness::spec("claude", "widen the window");
-    spec["timeout"] = json!("30s");
-    spec["report_trailer"] = json!(false);
+    spec["workload"]["report_trailer"] = json!(false);
     h.set_control("no-stdin", "");
     h.set_control("sleep", "20");
     let spec_path = h.home.join("spec.json");
@@ -1575,11 +1671,13 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
         .insert_task(&new_queued_task(NewTask {
             id,
             thread: THREAD.parse().unwrap(),
-            agent: Agent::new(AgentKind::Claude, None),
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, None),
+                extra_args: vec![],
+                report_trailer: false,
+            }),
             cwd: std::env::temp_dir(),
-            timeout: Duration::from_secs(30),
-            extra_args: vec![],
-            report_trailer: false,
+            timeout: Duration::from_secs(2 * 3600),
             env: TaskEnv {
                 path: h.path.clone(),
                 home: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
@@ -1608,4 +1706,252 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
         h.store().require_task(id).unwrap().callback_status,
         CallbackStatus::Sent
     );
+}
+
+#[test]
+fn task_workload_success() {
+    let h = Harness::new();
+    let id = h.submit(&Harness::task_spec(&["/bin/echo", "hello"]));
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(
+        show["workload"],
+        json!({"type": "task", "command": ["/bin/echo", "hello"]})
+    );
+    assert_eq!(show["exit_reason"]["kind"], "exit");
+    assert_eq!(show["exit_reason"]["code"], 0);
+    let ev = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(ev["event"], "TASK_SUCCEEDED");
+    assert_eq!(
+        ev["workload"],
+        json!({"type": "task", "command": ["/bin/echo", "hello"]})
+    );
+    let log = fs::read_to_string(h.home.join("tasks").join(&id).join("output.log")).unwrap();
+    assert!(log.contains("hello"), "{log}");
+    assert!(
+        !h.home.join("tasks").join(&id).join("prompt.txt").exists(),
+        "task workloads must not write prompt evidence"
+    );
+}
+
+#[test]
+fn task_workload_nonzero_exit() {
+    let h = Harness::new();
+    let id = h.submit(&Harness::task_spec(&["/bin/false"]));
+    let show = h.wait_status(&id, "failed");
+    assert_eq!(show["exit_reason"]["kind"], "exit");
+    assert_ne!(show["exit_reason"]["code"], 0);
+    let ev = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(ev["event"], "TASK_FAILED");
+    assert_eq!(ev["process"]["kind"], "exit");
+}
+
+#[test]
+fn task_argv_fidelity_empty_and_space_args() {
+    let h = Harness::new();
+    let script = h.home.join("argv-dump.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'argc=%s\\n' \"$#\"\ni=1\nfor a in \"$@\"; do\n  printf 'arg%s=%s\\n' \"$i\" \"$a\"\n  i=$((i+1))\ndone\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+    }
+    let script_s = script.to_string_lossy().into_owned();
+    let id = h.submit(&Harness::task_spec(&[script_s.as_str(), "", " ", "ok"]));
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(
+        show["workload"]["command"],
+        json!([script_s, "", " ", "ok"])
+    );
+    let log = fs::read_to_string(h.home.join("tasks").join(&id).join("output.log")).unwrap();
+    assert!(log.contains("argc=3"), "{log}");
+    assert!(log.contains("arg1=\n"), "{log}");
+    assert!(log.contains("arg2= \n") || log.contains("arg2= "), "{log}");
+    assert!(log.contains("arg3=ok"), "{log}");
+}
+
+#[test]
+fn timeout_below_two_hours_rejected() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "too short");
+    spec["timeout"] = json!("1h");
+    let spec_path = h.home.join("spec-short.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "invalid_spec");
+    assert_eq!(err["error"]["input"]["pointer"], "/timeout");
+    assert!(h.store().list_tasks(&[], None).unwrap().is_empty());
+}
+
+#[test]
+fn missing_executable_returns_executable_missing() {
+    let h = Harness::new();
+    let missing = h.home.join("no-such-bin");
+    let spec = Harness::task_spec(&[missing.to_str().unwrap(), "x"]);
+    let spec_path = h.home.join("spec-missing.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "executable_missing");
+    assert!(h.store().list_tasks(&[], None).unwrap().is_empty());
+}
+
+#[test]
+fn task_dry_run_returns_exact_argv_and_creates_no_row() {
+    let h = Harness::new();
+    let spec = Harness::task_spec(&["/bin/echo", "", " spaced ", "hi"]);
+    let mut child = h
+        .cmd()
+        .args(["--json", "task", "submit", "--dry-run", "--spec", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(serde_json::to_vec(&spec).unwrap().as_slice())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["argv"], json!(["/bin/echo", "", " spaced ", "hi"]), "{v}");
+    assert_eq!(v["stdin"], "null");
+    assert!(h.store().list_tasks(&[], None).unwrap().is_empty());
+    let tasks_dir = h.home.join("tasks");
+    assert!(!tasks_dir.exists() || fs::read_dir(&tasks_dir).unwrap().next().is_none());
+}
+
+/// A terminal event must never overtake a `TASK_CHECK_DUE` that is already on
+/// the wire. The gated fake queue makes `queue-messages.txt` record completion
+/// order, so the assertion is about real delivery order, not about timing.
+///
+/// Also covers the settlement boundary past the old 15s release valve without
+/// waiting the full 90s settle budget: the gate stays closed past 15s from
+/// queue entry, still under the 20s attempt deadline, and the terminal event
+/// must not leak.
+#[test]
+fn terminal_event_waits_for_an_in_flight_check_due() {
+    use homebased::callback::{ATTENTION_SETTLE, QUEUE_ATTEMPT_TIMEOUT};
+    assert!(
+        ATTENTION_SETTLE > QUEUE_ATTEMPT_TIMEOUT * 3,
+        "settle must outlast three bounded queue attempts"
+    );
+
+    let mut h = Harness::new();
+    h.set_control("sleep", "40");
+    let id = h.submit(&Harness::spec("claude", "race the terminal event"));
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+    let before = h.queue_messages().len();
+
+    // hold the check-due send open, then make the reminder overdue
+    h.set_control("queue-gate", "TASK_CHECK_DUE");
+    h.backdate_created_at(&id, 3);
+    h.restart_daemon();
+    let entered = h.record.join("queue-gate-entered");
+    assert!(
+        wait_until(Duration::from_secs(15), || entered.exists()),
+        "the check-due send never reached the queue: {:?}",
+        h.queue_messages()
+    );
+    let entered_at = Instant::now();
+    assert_eq!(h.show(&id)["check_timeout"], "pending", "not delivered yet");
+
+    // the child ends while the reminder is still in flight
+    let out = h.cmd().args(["task", "cancel", &id]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.wait_status(&id, "cancelled");
+
+    // hold past the old 15s valve, still under the 20s attempt deadline, and
+    // prove the terminal event cannot overtake the live claim
+    let hold_until = entered_at + Duration::from_secs(16);
+    while Instant::now() < hold_until {
+        assert_eq!(
+            h.queue_messages().len(),
+            before,
+            "a terminal event was delivered while TASK_CHECK_DUE was still sending: {:?}",
+            h.queue_messages()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    h.clear_control("queue-gate");
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let events: Vec<String> = h
+                .queue_messages()
+                .iter()
+                .skip(before)
+                .map(|m| {
+                    event_json(m)["event"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            events.iter().any(|e| e == "TASK_CANCELLED")
+        }),
+        "terminal event never arrived: {:?}",
+        h.queue_messages()
+    );
+    let events: Vec<String> = h
+        .queue_messages()
+        .iter()
+        .skip(before)
+        .map(|m| {
+            event_json(m)["event"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let check = events.iter().position(|e| e == "TASK_CHECK_DUE");
+    let terminal = events.iter().position(|e| e == "TASK_CANCELLED");
+    assert_eq!(check, Some(0), "check-due must land first: {events:?}");
+    assert!(
+        terminal > check,
+        "terminal event landed before the reminder: {events:?}"
+    );
+    assert_eq!(h.show(&id)["check_timeout"], "sent");
 }

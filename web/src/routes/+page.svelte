@@ -17,7 +17,7 @@
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { DaemonStore } from '$lib/daemon.svelte';
-	import { EM_DASH, agentLabel, formatTimestamp, shortId, shortenHome } from '$lib/format';
+	import { EM_DASH, formatTimestamp, shortId, shortenHome, workloadLabel } from '$lib/format';
 	import { cn } from '$lib/utils';
 
 	const statuses = $derived(parseStatuses(page.url.searchParams.get('status')));
@@ -162,7 +162,7 @@
 			>
 				<span>task</span>
 				<span>status</span>
-				<span>agent</span>
+				<span>workload</span>
 				<span>time</span>
 				<span>cwd</span>
 				<span>thread</span>
@@ -190,7 +190,7 @@
 							/>
 						{/if}
 					</span>
-					<span class="truncate font-mono" title={agentLabel(task)}>{agentLabel(task)}</span>
+					<span class="truncate font-mono" title={workloadLabel(task)}>{workloadLabel(task)}</span>
 					<Elapsed from={task.created_at} to={rowEnd(task)} class="text-muted-foreground" />
 					<span class="truncate font-mono text-muted-foreground" title={task.cwd}>
 						{shortenHome(task.cwd)}

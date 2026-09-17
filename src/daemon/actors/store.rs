@@ -6,10 +6,10 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
 use crate::daemon::actors::send_reply;
 use crate::domain::{
-    AgentReport, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskRow, ThreadId,
+    CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId,
 };
 use crate::error::AppError;
-use crate::store::{CancelResult, Store};
+use crate::store::{CallbackClaim, CancelResult, Store};
 
 /// Messages for daemon SQLite operations.
 pub enum StoreMsg {
@@ -70,7 +70,7 @@ pub enum StoreMsg {
     /// Claim the exit callback.
     ClaimCallback {
         id: TaskId,
-        reply: RpcReplyPort<Result<bool, AppError>>,
+        reply: RpcReplyPort<Result<CallbackClaim, AppError>>,
     },
     /// Finish the callback as sent or failed.
     FinishCallback {
@@ -78,10 +78,25 @@ pub enum StoreMsg {
         status: CallbackStatus,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Claim the attention reminder while the task is non-terminal.
+    ClaimAttention {
+        id: TaskId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Persist a delivered attention reminder.
+    MarkAttentionDelivered {
+        id: TaskId,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Drop an attention claim that did not deliver.
+    ReleaseAttention {
+        id: TaskId,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// Reports in seq order.
     Reports {
         id: TaskId,
-        reply: RpcReplyPort<Result<Vec<AgentReport>, AppError>>,
+        reply: RpcReplyPort<Result<Vec<TaskReport>, AppError>>,
     },
 }
 
@@ -135,6 +150,15 @@ impl Actor for StoreActor {
             StoreMsg::ClaimCallback { id, reply } => send_reply(reply, state.claim_callback(id)),
             StoreMsg::FinishCallback { id, status, reply } => {
                 send_reply(reply, state.finish_callback(id, status));
+            }
+            StoreMsg::ClaimAttention { id, reply } => {
+                send_reply(reply, state.claim_attention(id));
+            }
+            StoreMsg::MarkAttentionDelivered { id, reply } => {
+                send_reply(reply, state.mark_attention_delivered(id));
+            }
+            StoreMsg::ReleaseAttention { id, reply } => {
+                send_reply(reply, state.release_attention(id));
             }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
         }

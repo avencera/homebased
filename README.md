@@ -1,6 +1,15 @@
 # homebased
 
-Supervise long-running agent tasks and report them back to a Codex thread.
+Supervise long-running agent CLIs and general task commands, then report them back to a Codex thread.
+
+Homebasd runs two workload variants under the same detached lifecycle:
+
+- `agent` — Codex, Claude, or Grok with a prompt and optional reporting trailer
+- `task` — an arbitrary argv array such as `cargo build --release` or `gh pr checks --watch` (no shell)
+
+`timeout` is an attention timer (default 4h, minimum 2h). When it expires, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
+
+Submit specs use `api_version: 1` and a `workload` object. See `.agents/skills/homebased/references/submit.md` for the full contract.
 
 ## Install
 

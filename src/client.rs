@@ -154,17 +154,12 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default(),
         },
-        "agent_binary_missing" => AppError::AgentBinaryMissing {
-            agent: input
-                .get("agent")
+        "executable_missing" => AppError::ExecutableMissing {
+            program: input
+                .get("program")
                 .and_then(Value::as_str)
-                .and_then(|s| match s {
-                    "codex" => Some(crate::domain::AgentKind::Codex),
-                    "claude" => Some(crate::domain::AgentKind::Claude),
-                    "grok" => Some(crate::domain::AgentKind::Grok),
-                    _ => None,
-                })
-                .unwrap_or(crate::domain::AgentKind::Codex),
+                .unwrap_or("unknown")
+                .to_string(),
         },
         "invalid_spec" => AppError::InvalidSpec {
             pointer: input

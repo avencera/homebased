@@ -99,7 +99,7 @@ pub fn agent_paths() -> Vec<(&'static str, std::path::PathBuf)> {
     use crate::domain::AgentKind;
     let mut out = Vec::new();
     for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Grok] {
-        if let Ok(path) = crate::agents::resolve_binary(
+        if let Ok(path) = crate::invocation::resolve_agent_binary(
             kind,
             &std::env::var("PATH").unwrap_or_default(),
             std::path::Path::new("."),

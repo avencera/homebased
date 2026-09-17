@@ -9,20 +9,31 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::domain::{API_VERSION, Agent, AgentKind, ThreadId};
+use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, ThreadId};
 use crate::error::AppError;
+use crate::invocation::CommandLine;
 
-/// Default wall-clock timeout.
+/// Default attention timeout.
 #[must_use]
 pub fn default_timeout() -> Duration {
-    Duration::from_secs(4 * 3600)
+    DEFAULT_TIMEOUT
+}
+
+/// `api_version` is a constant, not just an integer: `check_api_version`
+/// rejects every other value, so the published schema says so too.
+fn api_version_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "const": API_VERSION,
+        "description": "Must be 1."
+    })
 }
 
 fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
         "default": "4h",
-        "description": "Humantime duration. Default 4h."
+        "description": "Attention timer as a humantime duration. Default 4h. Minimum 2h. Does not kill the child."
     })
 }
 
@@ -30,41 +41,114 @@ fn default_true() -> bool {
     true
 }
 
-/// Wire shape of `task submit --spec`. `prompt` and `prompt_file` are two keys
-/// here because that is the documented JSON; `SubmitSpec` collapses them into
-/// one `PromptSource`. `deny_unknown_fields` rules out `flatten`, so the raw
-/// keys stay on this struct.
+/// Wire agent workload. `prompt` and `prompt_file` stay as two keys because
+/// that is the documented JSON; validation collapses them into one source.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitAgentWorkload {
+    /// Agent CLI.
+    pub agent: AgentKind,
+    /// Optional model alias. Empty becomes unset.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Inline prompt. Mutually exclusive with `prompt_file`.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Prompt file. Relative paths resolve against `cwd`.
+    #[serde(default)]
+    pub prompt_file: Option<PathBuf>,
+    /// Extra argv appended after the unattended flags.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Append the reporting trailer to the child feed.
+    #[serde(default = "default_true")]
+    pub report_trailer: bool,
+}
+
+/// Wire task workload: argv only. Command is validated after deserialize so
+/// JSON pointers land on `/workload/command/N`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitTaskWorkload {
+    /// Argv array. Index 0 is the program.
+    pub command: Vec<String>,
+}
+
+/// Wire shape of `task submit --spec`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "SubmitSpec")]
 struct SubmitSpecWire {
     /// Must be 1.
+    #[schemars(schema_with = "api_version_schema")]
     api_version: u32,
-    /// Agent CLI.
-    agent: AgentKind,
-    /// Optional model alias. Empty becomes unset.
-    #[serde(default)]
-    model: Option<String>,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     thread: ThreadId,
     /// Working directory for the child.
     cwd: PathBuf,
-    /// Inline prompt. Mutually exclusive with `prompt_file`.
-    #[serde(default)]
-    prompt: Option<String>,
-    /// Prompt file. Relative paths resolve against `cwd`.
-    #[serde(default)]
-    prompt_file: Option<PathBuf>,
-    /// Wall-clock timeout.
+    /// Attention timer. Default 4h, minimum 2h.
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
-    /// Extra argv appended after the unattended flags.
-    #[serde(default)]
-    extra_args: Vec<String>,
-    /// Append the reporting trailer to the child feed.
-    #[serde(default = "default_true")]
-    report_trailer: bool,
+    /// Workload variant. Parsed from `Value` after the envelope so nested
+    /// JSON pointers stay accurate under the internally tagged enum.
+    #[schemars(schema_with = "workload_schema")]
+    workload: Value,
+}
+
+/// Version 1 workload schema, written out rather than derived.
+///
+/// A derived internally tagged enum emits optional `prompt`/`prompt_file` and
+/// an unbounded `command`, which would accept specs the parser rejects. The
+/// outer `oneOf` separates the variants (each branch closed, so cross-variant
+/// fields fail both), and the inner `oneOf` on the agent branch is what makes
+/// the two prompt keys exactly-one rather than either-or. The agent kind and
+/// the command shape are pulled from their owning types so they cannot drift.
+fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let agent_kind = subschema::<AgentKind>(generator);
+    let command = subschema::<CommandLine>(generator);
+    schemars::json_schema!({
+        "description": "Workload variant. Exactly one of agent or task.",
+        "oneOf": [
+            {
+                "title": "agent",
+                "description": "Agent CLI with exactly one prompt source.",
+                "type": "object",
+                "properties": {
+                    "type": { "const": "agent" },
+                    "agent": agent_kind,
+                    "model": { "type": ["string", "null"] },
+                    "prompt": { "type": "string" },
+                    "prompt_file": { "type": "string" },
+                    "extra_args": { "type": "array", "items": { "type": "string" } },
+                    "report_trailer": { "type": "boolean", "default": true }
+                },
+                "required": ["type", "agent"],
+                "additionalProperties": false,
+                "oneOf": [
+                    { "required": ["prompt"] },
+                    { "required": ["prompt_file"] }
+                ]
+            },
+            {
+                "title": "task",
+                "description": "Arbitrary non-interactive command. No shell, no quoting.",
+                "type": "object",
+                "properties": {
+                    "type": { "const": "task" },
+                    "command": command
+                },
+                "required": ["type", "command"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+/// Inline another type's schema as a plain value, so it can be embedded in a
+/// hand-written schema without a `$ref` into a definitions map.
+fn subschema<T: JsonSchema>(generator: &mut schemars::SchemaGenerator) -> Value {
+    <T as JsonSchema>::json_schema(generator).as_value().clone()
 }
 
 /// Where the prompt text comes from. Exactly one of the two wire keys.
@@ -81,13 +165,16 @@ impl PromptSource {
     fn from_wire(
         prompt: Option<String>,
         prompt_file: Option<PathBuf>,
-        raw: &Value,
+        raw_workload: &Value,
     ) -> Result<Self, AppError> {
         match (prompt, prompt_file) {
             (Some(text), None) => Ok(Self::Inline(text)),
             (None, Some(path)) => Ok(Self::File(path)),
             (Some(_), Some(_)) => Err(exactly_one_prompt(
-                raw.get("prompt").cloned().unwrap_or(Value::Null),
+                raw_workload
+                    .pointer("/prompt")
+                    .cloned()
+                    .unwrap_or(Value::Null),
             )),
             (None, None) => Err(exactly_one_prompt(Value::Null)),
         }
@@ -104,7 +191,7 @@ impl PromptSource {
                     cwd.join(path)
                 };
                 fs::read_to_string(&resolved).map_err(|err| AppError::InvalidSpec {
-                    pointer: "/prompt_file".into(),
+                    pointer: "/workload/prompt_file".into(),
                     value: json!(path),
                     message: format!("failed to read prompt_file {}: {err}", resolved.display()),
                 })
@@ -115,10 +202,37 @@ impl PromptSource {
 
 fn exactly_one_prompt(value: Value) -> AppError {
     AppError::InvalidSpec {
-        pointer: "/prompt".into(),
+        pointer: "/workload/prompt".into(),
         value,
         message: "exactly one of prompt or prompt_file is required".into(),
     }
+}
+
+/// Validated agent submit workload before prompt resolution.
+#[derive(Debug, Clone)]
+pub struct SubmitAgent {
+    /// Agent CLI.
+    pub agent: AgentKind,
+    /// Optional model alias.
+    pub model: Option<String>,
+    /// Prompt source.
+    pub prompt: PromptSource,
+    /// Extra argv.
+    pub extra_args: Vec<String>,
+    /// Trailer flag.
+    pub report_trailer: bool,
+}
+
+/// Validated submit workload before prompt resolution.
+#[derive(Debug, Clone)]
+pub enum SubmitWorkloadValidated {
+    /// Agent with unresolved prompt source.
+    Agent(SubmitAgent),
+    /// Task command.
+    Task {
+        /// Validated argv.
+        command: CommandLine,
+    },
 }
 
 /// Validated submit spec.
@@ -126,22 +240,50 @@ fn exactly_one_prompt(value: Value) -> AppError {
 pub struct SubmitSpec {
     /// Must be 1.
     pub api_version: u32,
-    /// Agent CLI.
-    pub agent: AgentKind,
-    /// Optional model alias. Empty becomes unset.
-    pub model: Option<String>,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     pub thread: ThreadId,
     /// Working directory for the child.
     pub cwd: PathBuf,
-    /// Where the prompt text comes from.
-    pub prompt: PromptSource,
-    /// Wall-clock timeout.
+    /// Attention timeout.
     pub timeout: Duration,
-    /// Extra argv appended after the unattended flags.
+    /// Workload variant.
+    pub workload: SubmitWorkloadValidated,
+}
+
+/// Normalized agent workload with inline prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedAgentWorkload {
+    /// Agent CLI.
+    pub agent: AgentKind,
+    /// Optional model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Prompt bytes as text.
+    pub prompt: String,
+    /// Extra argv.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    /// Append the reporting trailer to the child feed.
+    /// Trailer flag.
     pub report_trailer: bool,
+}
+
+/// Normalized task workload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedTaskWorkload {
+    /// Validated argv.
+    pub command: CommandLine,
+}
+
+/// Daemon-socket workload: agent prompt is always inline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NormalizedWorkload {
+    /// Agent with inline prompt.
+    Agent(NormalizedAgentWorkload),
+    /// Arbitrary command.
+    Task(NormalizedTaskWorkload),
 }
 
 /// Spec with prompt inlined and `prompt_file` removed. This is the only shape
@@ -151,33 +293,15 @@ pub struct SubmitSpec {
 pub struct NormalizedSpec {
     /// Schema version.
     pub api_version: u32,
-    /// Agent CLI.
-    pub agent: AgentKind,
-    /// Optional model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     /// Codex thread.
     pub thread: ThreadId,
     /// Working directory.
     pub cwd: PathBuf,
-    /// Prompt bytes as text.
-    pub prompt: String,
-    /// Wall-clock timeout.
+    /// Attention timeout.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
-    /// Extra argv.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_args: Vec<String>,
-    /// Trailer flag.
-    pub report_trailer: bool,
-}
-
-impl SubmitSpec {
-    /// Agent identity with blank model stripped.
-    #[must_use]
-    pub fn agent(&self) -> Agent {
-        Agent::new(self.agent, self.model.clone())
-    }
+    /// Workload variant.
+    pub workload: NormalizedWorkload,
 }
 
 /// Parse a spec from a file path or `-` for stdin.
@@ -222,10 +346,78 @@ pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
     validate_spec(wire, value)
 }
 
-/// Render a `serde_path_to_error` path as an RFC 6901 JSON pointer. The crate's
-/// `Display` writes array elements as `extra_args[0]`, which `Value::pointer`
-/// cannot resolve, so walk the segments instead.
-fn json_pointer(path: &serde_path_to_error::Path) -> String {
+/// Envelope used to parse common normalized fields before the workload enum.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalizedSpecEnvelope {
+    api_version: u32,
+    thread: ThreadId,
+    cwd: PathBuf,
+    #[serde(with = "humantime_serde")]
+    timeout: Duration,
+    workload: Value,
+}
+
+/// Parse a normalized socket body, attaching a JSON pointer on failure.
+pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError> {
+    let envelope: NormalizedSpecEnvelope =
+        serde_path_to_error::deserialize(value).map_err(|err| {
+            let pointer = json_pointer(err.path());
+            let field_value = value.pointer(&pointer).cloned().unwrap_or(Value::Null);
+            AppError::InvalidSpec {
+                pointer,
+                value: field_value,
+                message: err.to_string(),
+            }
+        })?;
+    check_api_version(envelope.api_version, "/api_version")?;
+    check_timeout(envelope.timeout, "/timeout")?;
+    let workload = parse_normalized_workload(&envelope.workload)?;
+    Ok(NormalizedSpec {
+        api_version: envelope.api_version,
+        thread: envelope.thread,
+        cwd: envelope.cwd,
+        timeout: envelope.timeout,
+        workload,
+    })
+}
+
+fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload, AppError> {
+    let kind = workload_raw
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::InvalidSpec {
+            pointer: "/workload/type".into(),
+            value: workload_raw.get("type").cloned().unwrap_or(Value::Null),
+            message: "workload.type must be \"agent\" or \"task\"".into(),
+        })?;
+    let content = workload_content(workload_raw);
+    match kind {
+        "agent" => {
+            let agent: NormalizedAgentWorkload = deserialize_under(&content, "/workload")?;
+            Ok(NormalizedWorkload::Agent(agent))
+        }
+        "task" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct TaskWire {
+                command: Vec<String>,
+            }
+            let task: TaskWire = deserialize_under(&content, "/workload")?;
+            let command = CommandLine::try_from_argv(task.command.clone())
+                .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
+            Ok(NormalizedWorkload::Task(NormalizedTaskWorkload { command }))
+        }
+        other => Err(AppError::InvalidSpec {
+            pointer: "/workload/type".into(),
+            value: json!(other),
+            message: "workload.type must be \"agent\" or \"task\"".into(),
+        }),
+    }
+}
+
+/// Render a `serde_path_to_error` path as an RFC 6901 JSON pointer.
+pub(crate) fn json_pointer(path: &serde_path_to_error::Path) -> String {
     use serde_path_to_error::Segment;
 
     let mut pointer = String::new();
@@ -235,7 +427,6 @@ fn json_pointer(path: &serde_path_to_error::Path) -> String {
             Segment::Seq { index } => pointer.push_str(&index.to_string()),
             Segment::Map { key } => pointer.push_str(&escape_token(key)),
             Segment::Enum { variant } => pointer.push_str(&escape_token(variant)),
-            // a non-string map key has no pointer form; keep the crate's marker
             Segment::Unknown => pointer.push('?'),
         }
     }
@@ -243,45 +434,142 @@ fn json_pointer(path: &serde_path_to_error::Path) -> String {
 }
 
 /// RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order.
-fn escape_token(token: &str) -> String {
+pub(crate) fn escape_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
-fn validate_spec(wire: SubmitSpecWire, raw: &Value) -> Result<SubmitSpec, AppError> {
-    if wire.api_version != API_VERSION {
-        return Err(AppError::InvalidSpec {
-            pointer: "/api_version".into(),
-            value: json!(wire.api_version),
+fn check_api_version(version: u32, pointer: &str) -> Result<(), AppError> {
+    if version == API_VERSION {
+        Ok(())
+    } else {
+        Err(AppError::InvalidSpec {
+            pointer: pointer.into(),
+            value: json!(version),
             message: format!("api_version must be {API_VERSION}"),
-        });
+        })
     }
-    let prompt = PromptSource::from_wire(wire.prompt, wire.prompt_file, raw)?;
+}
+
+fn check_timeout(timeout: Duration, pointer: &str) -> Result<(), AppError> {
+    if timeout >= MIN_TIMEOUT {
+        Ok(())
+    } else {
+        Err(AppError::InvalidSpec {
+            pointer: pointer.into(),
+            value: json!(humantime::format_duration(timeout).to_string()),
+            message: format!(
+                "timeout must be at least {}",
+                humantime::format_duration(MIN_TIMEOUT)
+            ),
+        })
+    }
+}
+
+fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppError> {
+    check_api_version(wire.api_version, "/api_version")?;
+    check_timeout(wire.timeout, "/timeout")?;
+    let workload = parse_submit_workload(&wire.workload)?;
     Ok(SubmitSpec {
         api_version: wire.api_version,
-        agent: wire.agent,
-        model: wire.model,
         thread: wire.thread,
         cwd: wire.cwd,
-        prompt,
         timeout: wire.timeout,
-        extra_args: wire.extra_args,
-        report_trailer: wire.report_trailer,
+        workload,
+    })
+}
+
+fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated, AppError> {
+    let kind = workload_raw
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::InvalidSpec {
+            pointer: "/workload/type".into(),
+            value: workload_raw.get("type").cloned().unwrap_or(Value::Null),
+            message: "workload.type must be \"agent\" or \"task\"".into(),
+        })?;
+    let content = workload_content(workload_raw);
+    match kind {
+        "agent" => {
+            let agent: SubmitAgentWorkload = deserialize_under(&content, "/workload")?;
+            let prompt = PromptSource::from_wire(agent.prompt, agent.prompt_file, workload_raw)?;
+            Ok(SubmitWorkloadValidated::Agent(SubmitAgent {
+                agent: agent.agent,
+                model: agent.model,
+                prompt,
+                extra_args: agent.extra_args,
+                report_trailer: agent.report_trailer,
+            }))
+        }
+        "task" => {
+            let task: SubmitTaskWorkload = deserialize_under(&content, "/workload")?;
+            let command = CommandLine::try_from_argv(task.command.clone())
+                .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
+            Ok(SubmitWorkloadValidated::Task { command })
+        }
+        other => Err(AppError::InvalidSpec {
+            pointer: "/workload/type".into(),
+            value: json!(other),
+            message: "workload.type must be \"agent\" or \"task\"".into(),
+        }),
+    }
+}
+
+/// Drop the discriminant so content structs with `deny_unknown_fields` accept the body.
+fn workload_content(workload_raw: &Value) -> Value {
+    match workload_raw {
+        Value::Object(map) => {
+            let mut content = map.clone();
+            content.remove("type");
+            Value::Object(content)
+        }
+        other => other.clone(),
+    }
+}
+
+fn deserialize_under<T: for<'de> Deserialize<'de>>(
+    value: &Value,
+    prefix: &str,
+) -> Result<T, AppError> {
+    serde_path_to_error::deserialize(value).map_err(|err| {
+        let pointer = format!("{prefix}{}", json_pointer(err.path()));
+        let field_value = value
+            .pointer(&json_pointer(err.path()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        AppError::InvalidSpec {
+            pointer,
+            value: field_value,
+            message: err.to_string(),
+        }
     })
 }
 
 /// Resolve prompt bytes and produce a normalized spec.
 pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
-    let prompt = spec.prompt.read(&spec.cwd)?;
+    let workload = match &spec.workload {
+        SubmitWorkloadValidated::Agent(agent) => {
+            let prompt = agent.prompt.read(&spec.cwd)?;
+            let model = crate::domain::Agent::new(agent.agent, agent.model.clone()).model;
+            NormalizedWorkload::Agent(NormalizedAgentWorkload {
+                agent: agent.agent,
+                model,
+                prompt,
+                extra_args: agent.extra_args.clone(),
+                report_trailer: agent.report_trailer,
+            })
+        }
+        SubmitWorkloadValidated::Task { command } => {
+            NormalizedWorkload::Task(NormalizedTaskWorkload {
+                command: command.clone(),
+            })
+        }
+    };
     Ok(NormalizedSpec {
         api_version: API_VERSION,
-        agent: spec.agent,
-        model: spec.agent().model,
         thread: spec.thread,
         cwd: spec.cwd.clone(),
-        prompt,
         timeout: spec.timeout,
-        extra_args: spec.extra_args.clone(),
-        report_trailer: spec.report_trailer,
+        workload,
     })
 }
 
@@ -302,16 +590,33 @@ pub fn check_cwd(cwd: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
-fn example_json() -> Value {
+fn example_agent_json() -> Value {
     json!({
         "api_version": 1,
-        "agent": "claude",
-        "model": "fable",
         "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
         "cwd": "/tmp",
-        "prompt": "do the work",
         "timeout": "4h",
-        "extra_args": ["--verbose"]
+        "workload": {
+            "type": "agent",
+            "agent": "claude",
+            "model": "fable",
+            "prompt": "do the work",
+            "extra_args": ["--verbose"]
+        }
+    })
+}
+
+#[cfg(test)]
+fn example_task_json() -> Value {
+    json!({
+        "api_version": 1,
+        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "cwd": "/tmp",
+        "timeout": "4h",
+        "workload": {
+            "type": "task",
+            "command": ["cargo", "build", "--release"]
+        }
     })
 }
 
@@ -320,19 +625,34 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn valid_spec() -> Value {
+    fn valid_agent() -> Value {
         json!({
             "api_version": 1,
-            "agent": "claude",
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
             "cwd": "/tmp",
-            "prompt": "hello"
+            "workload": {
+                "type": "agent",
+                "agent": "claude",
+                "prompt": "hello"
+            }
+        })
+    }
+
+    fn valid_task() -> Value {
+        json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "cwd": "/tmp",
+            "workload": {
+                "type": "task",
+                "command": ["echo", "hi"]
+            }
         })
     }
 
     #[test]
     fn unknown_field_rejected() {
-        let mut value = valid_spec();
+        let mut value = valid_agent();
         value["typo"] = json!(true);
         let err = parse_spec_value(&value).unwrap_err();
         match err {
@@ -343,30 +663,81 @@ mod tests {
 
     #[test]
     fn both_prompt_and_file_rejected() {
-        let mut value = valid_spec();
-        value["prompt_file"] = json!("/tmp/p.txt");
+        let mut value = valid_agent();
+        value["workload"]["prompt_file"] = json!("/tmp/p.txt");
         let err = parse_spec_value(&value).unwrap_err();
         match err {
-            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/prompt"),
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/workload/prompt"),
             other => panic!("unexpected {other:?}"),
         }
     }
 
     #[test]
     fn neither_prompt_rejected() {
-        let mut value = valid_spec();
-        value.as_object_mut().unwrap().remove("prompt");
+        let mut value = valid_agent();
+        value["workload"].as_object_mut().unwrap().remove("prompt");
         let err = parse_spec_value(&value).unwrap_err();
         match err {
-            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/prompt"),
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/workload/prompt"),
             other => panic!("unexpected {other:?}"),
         }
     }
 
     #[test]
+    fn cross_variant_agent_fields_on_task_rejected() {
+        let mut value = valid_task();
+        value["workload"]["agent"] = json!("claude");
+        let err = parse_spec_value(&value).unwrap_err();
+        assert!(matches!(err, AppError::InvalidSpec { .. }));
+    }
+
+    #[test]
+    fn empty_command_rejected() {
+        let mut value = valid_task();
+        value["workload"]["command"] = json!([]);
+        let err = parse_spec_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => {
+                assert!(pointer.starts_with("/workload/command"), "{pointer}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_program_rejected() {
+        let mut value = valid_task();
+        value["workload"]["command"] = json!([""]);
+        let err = parse_spec_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/workload/command/0"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeout_below_two_hours_rejected() {
+        let mut value = valid_task();
+        value["timeout"] = json!("1h");
+        let err = parse_spec_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/timeout"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeout_two_hours_accepted() {
+        let mut value = valid_task();
+        value["timeout"] = json!("2h");
+        let spec = parse_spec_value(&value).unwrap();
+        assert_eq!(spec.timeout, Duration::from_secs(2 * 3600));
+    }
+
+    #[test]
     fn pointer_on_bad_array_element() {
-        let mut value = valid_spec();
-        value["extra_args"] = json!([1]);
+        let mut value = valid_agent();
+        value["workload"]["extra_args"] = json!([1]);
         let err = parse_spec_value(&value).unwrap_err();
         match err {
             AppError::InvalidSpec {
@@ -374,20 +745,9 @@ mod tests {
                 value: field,
                 ..
             } => {
-                assert_eq!(pointer, "/extra_args/0");
+                assert_eq!(pointer, "/workload/extra_args/0");
                 assert_eq!(field, json!(1));
             }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pointer_on_bad_thread() {
-        let mut value = valid_spec();
-        value["thread"] = json!("not-a-uuid");
-        let err = parse_spec_value(&value).unwrap_err();
-        match err {
-            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/thread"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -399,40 +759,207 @@ mod tests {
         fs::write(&prompt_path, "from-file").unwrap();
         let spec = SubmitSpec {
             api_version: 1,
-            agent: AgentKind::Claude,
-            model: None,
             thread: ThreadId::from_str_ok(),
             cwd: dir.path().to_path_buf(),
-            prompt: PromptSource::File(PathBuf::from("p.txt")),
             timeout: default_timeout(),
-            extra_args: vec![],
-            report_trailer: true,
+            workload: SubmitWorkloadValidated::Agent(SubmitAgent {
+                agent: AgentKind::Claude,
+                model: None,
+                prompt: PromptSource::File(PathBuf::from("p.txt")),
+                extra_args: vec![],
+                report_trailer: true,
+            }),
         };
         let normalized = normalize(&spec).unwrap();
-        assert_eq!(normalized.prompt, "from-file");
+        match normalized.workload {
+            NormalizedWorkload::Agent(agent) => assert_eq!(agent.prompt, "from-file"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// One published schema, compiled once per assertion set.
+    fn validator() -> jsonschema::Validator {
+        jsonschema::validator_for(&schema_json().unwrap()).unwrap()
+    }
+
+    /// The schema and the parser must reach the same verdict on every spec.
+    /// Asserting both here is what stops the generated document from drifting
+    /// away from the runtime rules.
+    #[track_caller]
+    fn assert_verdict(value: &Value, accepted: bool, why: &str) {
+        let schema_ok = validator().is_valid(value);
+        assert_eq!(
+            schema_ok,
+            accepted,
+            "schema should {} {why}: {value}",
+            if accepted { "accept" } else { "reject" }
+        );
+        let parser = parse_spec_value(value);
+        assert_eq!(
+            parser.is_ok(),
+            accepted,
+            "parser should {} {why}: {parser:?}",
+            if accepted { "accept" } else { "reject" }
+        );
+    }
+
+    fn with_workload(workload: Value) -> Value {
+        json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "cwd": "/tmp",
+            "workload": workload
+        })
     }
 
     #[test]
-    fn schema_contains_example_fields() {
+    fn schema_accepts_both_documented_examples() {
+        assert_verdict(&example_agent_json(), true, "the agent example");
+        assert_verdict(&example_task_json(), true, "the task example");
+    }
+
+    #[test]
+    fn schema_pins_api_version_one() {
+        let mut value = valid_task();
+        value["api_version"] = json!(2);
+        assert_verdict(&value, false, "api_version 2");
         let schema = schema_json().unwrap();
-        let example = example_json();
-        parse_spec_value(&example).unwrap();
-        let props = schema
-            .get("properties")
-            .or_else(|| schema.pointer("/$defs/SubmitSpec/properties"))
-            .or_else(|| schema.pointer("/definitions/SubmitSpec/properties"))
-            .expect("schema properties");
-        for key in ["api_version", "agent", "thread", "cwd"] {
-            assert!(props.get(key).is_some(), "missing {key} in {schema}");
-        }
-        assert_eq!(example["api_version"], 1);
+        assert_eq!(schema["properties"]["api_version"]["const"], json!(1));
+    }
+
+    #[test]
+    fn schema_requires_exactly_one_agent_prompt_source() {
+        assert_verdict(
+            &with_workload(json!({"type": "agent", "agent": "claude", "prompt": "hi"})),
+            true,
+            "an inline prompt",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "agent", "agent": "claude", "prompt_file": "/tmp/p"})),
+            true,
+            "a prompt file",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "agent", "agent": "claude",
+                "prompt": "hi", "prompt_file": "/tmp/p"
+            })),
+            false,
+            "both prompt sources",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "agent", "agent": "claude"})),
+            false,
+            "no prompt source",
+        );
+    }
+
+    #[test]
+    fn schema_requires_a_non_empty_command() {
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": ["cargo", "build"]})),
+            true,
+            "a normal command",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": ["echo", "", " "]})),
+            true,
+            "empty and whitespace arguments after the program",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": []})),
+            false,
+            "an empty command array",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": [""]})),
+            false,
+            "an empty program",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": ["", "build"]})),
+            false,
+            "an empty program with arguments",
+        );
+    }
+
+    #[test]
+    fn schema_rejects_cross_variant_fields() {
+        assert_verdict(
+            &with_workload(json!({
+                "type": "task", "command": ["true"], "agent": "claude"
+            })),
+            false,
+            "an agent field on a task",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "task", "command": ["true"], "prompt": "hi"
+            })),
+            false,
+            "a prompt on a task",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "task", "command": ["true"], "report_trailer": true
+            })),
+            false,
+            "a trailer flag on a task",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "agent", "agent": "claude", "prompt": "hi", "command": ["true"]
+            })),
+            false,
+            "a command on an agent",
+        );
+    }
+
+    #[test]
+    fn schema_rejects_an_unknown_variant_and_unknown_keys() {
+        assert_verdict(
+            &with_workload(json!({"type": "shell", "command": ["true"]})),
+            false,
+            "an unknown workload type",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "agent", "agent": "claude", "prompt": "hi", "typo": 1
+            })),
+            false,
+            "an unknown agent key",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "agent", "agent": "gemini", "prompt": "hi"})),
+            false,
+            "an unsupported agent kind",
+        );
     }
 
     #[test]
     fn default_timeout_is_four_hours() {
-        let spec = parse_spec_value(&valid_spec()).unwrap();
+        let spec = parse_spec_value(&valid_agent()).unwrap();
         assert_eq!(spec.timeout, Duration::from_secs(4 * 3600));
-        assert!(spec.report_trailer);
+        match spec.workload {
+            SubmitWorkloadValidated::Agent(agent) => assert!(agent.report_trailer),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalized_rejects_short_timeout() {
+        let value = json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "cwd": "/tmp",
+            "timeout": "30m",
+            "workload": { "type": "task", "command": ["true"] }
+        });
+        let err = parse_normalized_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/timeout"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     impl ThreadId {

@@ -24,7 +24,7 @@ Exit codes:
   5  conflict
 ";
 
-/// Supervise long-running agent tasks and report them to a Codex thread.
+/// Supervise long-running agent and general task workloads and report them to a Codex thread.
 #[derive(Debug, Parser)]
 #[command(
     name = "homebased",

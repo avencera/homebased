@@ -190,7 +190,7 @@ async fn list(
                         "{}\t{}\t{}\t{}",
                         t.get("id").and_then(Value::as_str).unwrap_or("-"),
                         t.get("status").and_then(Value::as_str).unwrap_or("-"),
-                        t.get("agent").and_then(Value::as_str).unwrap_or("-"),
+                        workload_label(t),
                         t.get("thread").and_then(Value::as_str).unwrap_or("-"),
                     );
                 }
@@ -207,10 +207,15 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
         super::OutputMode::Quiet => println!("{id}"),
         super::OutputMode::Json => ctx.print_json(value)?,
         super::OutputMode::Human => {
+            let check = value
+                .get("check_timeout")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             println!(
-                "{id}  {}  {}",
+                "{id}  {}  {}  check timeout {}",
                 value.get("status").and_then(Value::as_str).unwrap_or("-"),
-                value.get("agent").and_then(Value::as_str).unwrap_or("-")
+                workload_label(&value),
+                check
             );
         }
     }
@@ -315,5 +320,32 @@ fn read_summary(path: &str) -> Result<String, AppError> {
         std::fs::read_to_string(path).map_err(|err| AppError::Internal {
             message: format!("read {path}: {err}"),
         })
+    }
+}
+
+fn workload_label(value: &Value) -> String {
+    let Some(workload) = value.get("workload") else {
+        return "-".into();
+    };
+    match workload.get("type").and_then(Value::as_str) {
+        Some("agent") => {
+            let agent = workload.get("agent").and_then(Value::as_str).unwrap_or("?");
+            match workload.get("model").and_then(Value::as_str) {
+                Some(model) => format!("{agent}/{model}"),
+                None => agent.to_string(),
+            }
+        }
+        Some("task") => {
+            let Some(command) = workload.get("command").and_then(Value::as_array) else {
+                return "task".into();
+            };
+            let parts: Vec<&str> = command.iter().take(3).filter_map(Value::as_str).collect();
+            if command.len() > 3 {
+                format!("{}…", parts.join(" "))
+            } else {
+                parts.join(" ")
+            }
+        }
+        _ => "-".into(),
     }
 }

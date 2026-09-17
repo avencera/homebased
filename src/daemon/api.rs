@@ -4,7 +4,7 @@ pub mod views;
 
 use std::path::PathBuf;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,14 +12,16 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::agents::{ArgvInputs, build_argv, resolve_binary};
 use crate::callback::last_event_for_row;
 use crate::daemon::actors::{CALL_TIMEOUT, StoreMsg, SupervisorMsg, call_store, flatten_call};
 use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
 use crate::daemon::{AppState, spawn_and_watch, web};
-use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId};
+use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload};
 use crate::error::AppError;
-use crate::spec::{self, NormalizedSpec};
+use crate::invocation::{
+    StdinPolicy, invocation_from_normalized, persist_workload, resolve_workload_binary,
+};
+use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::{self, CancelResult};
 
 impl IntoResponse for AppError {
@@ -64,11 +66,98 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppEr
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Validated socket request. Built only by `SpecBody`, which is where the
+/// envelope, the normalized spec, and the captured env are each checked.
+#[derive(Debug)]
 struct SubmitBody {
     spec: NormalizedSpec,
     env: TaskEnv,
+}
+
+/// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
+/// parsed with its own pointer prefix, but `deny_unknown_fields` here is what
+/// makes an unknown top-level key an `invalid_spec` instead of silent input.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitEnvelope {
+    #[serde(default)]
+    spec: Option<Value>,
+    #[serde(default)]
+    env: Option<Value>,
+}
+
+/// Application-owned JSON body extractor that maps failures to `AppError`.
+struct SpecBody(SubmitBody);
+
+impl<S> FromRequest<S> for SpecBody
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = bytes::Bytes::from_request(req, state)
+            .await
+            .map_err(|err| AppError::InvalidSpec {
+                pointer: String::new(),
+                value: Value::Null,
+                message: format!("invalid request body: {err}"),
+            })?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|err| AppError::InvalidSpec {
+            pointer: String::new(),
+            value: Value::Null,
+            message: format!("invalid JSON: {err}"),
+        })?;
+        let envelope: SubmitEnvelope =
+            serde_path_to_error::deserialize(&value).map_err(|err| invalid_at(&value, "", &err))?;
+        let env_value = envelope.env.ok_or_else(|| missing_field("/env", "env"))?;
+        let env = serde_path_to_error::deserialize(&env_value)
+            .map_err(|err| invalid_at(&env_value, "/env", &err))?;
+        let spec_value = envelope
+            .spec
+            .ok_or_else(|| missing_field("/spec", "spec"))?;
+        // parse_normalized_value already enforces api_version and min timeout
+        let spec = spec::parse_normalized_value(&spec_value).map_err(|err| prefix("/spec", err))?;
+        Ok(Self(SubmitBody { spec, env }))
+    }
+}
+
+fn missing_field(pointer: &str, name: &str) -> AppError {
+    AppError::InvalidSpec {
+        pointer: pointer.into(),
+        value: Value::Null,
+        message: format!("missing field `{name}`"),
+    }
+}
+
+/// Build an `invalid_spec` at the failing path, rooted at `prefix`.
+fn invalid_at(
+    root: &Value,
+    prefix: &str,
+    err: &serde_path_to_error::Error<serde_json::Error>,
+) -> AppError {
+    let pointer = spec::json_pointer(err.path());
+    AppError::InvalidSpec {
+        pointer: format!("{prefix}{pointer}"),
+        value: root.pointer(&pointer).cloned().unwrap_or(Value::Null),
+        message: err.to_string(),
+    }
+}
+
+/// Re-root an `invalid_spec` pointer under `prefix`.
+fn prefix(prefix: &str, err: AppError) -> AppError {
+    match err {
+        AppError::InvalidSpec {
+            pointer,
+            value,
+            message,
+        } => AppError::InvalidSpec {
+            pointer: format!("{prefix}{pointer}"),
+            value,
+            message,
+        },
+        other => other,
+    }
 }
 
 #[derive(Serialize)]
@@ -80,7 +169,7 @@ struct SubmitResponse {
 
 async fn submit(
     State(state): State<AppState>,
-    Json(body): Json<SubmitBody>,
+    SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
     let (id, status) = accept_task(&state, body).await?;
     Ok((
@@ -98,30 +187,41 @@ struct DryRunResponse {
     api_version: u32,
     spec: NormalizedSpec,
     argv: Vec<String>,
+    stdin: StdinPolicy,
 }
 
 async fn dry_run(
     State(state): State<AppState>,
-    Json(body): Json<SubmitBody>,
+    SpecBody(body): SpecBody,
 ) -> Result<Json<DryRunResponse>, AppError> {
     let spec = body.spec;
-    check_api_version(&spec)?;
     spec::check_cwd(&spec.cwd)?;
-    let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
-    let prompt_file = grok_placeholder(state.home.root(), &spec);
-    let argv = build_argv(&ArgvInputs::from(&spec), &binary, prompt_file.as_deref());
+    let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
+    let invocation = invocation_from_normalized(
+        &spec.workload,
+        &body.env.path,
+        &spec.cwd,
+        prompt_feed.as_deref(),
+    )?;
     Ok(Json(DryRunResponse {
         api_version: API_VERSION,
         spec,
-        argv: argv.to_vec(),
+        argv: invocation.to_vec(),
+        stdin: invocation.stdin,
     }))
 }
 
-fn grok_placeholder(root: &std::path::Path, spec: &NormalizedSpec) -> Option<PathBuf> {
-    if spec.agent == crate::domain::AgentKind::Grok {
-        Some(root.join("tasks").join("<task-id>").join("prompt.feed.txt"))
-    } else {
-        None
+/// Deterministic dry-run feed path for any agent. Only Grok puts it in argv;
+/// Codex and Claude keep it as the stdin evidence path.
+fn agent_feed_placeholder(
+    root: &std::path::Path,
+    workload: &NormalizedWorkload,
+) -> Option<PathBuf> {
+    match workload {
+        NormalizedWorkload::Agent(_) => {
+            Some(root.join("tasks").join("<task-id>").join("prompt.feed.txt"))
+        }
+        NormalizedWorkload::Task(_) => None,
     }
 }
 
@@ -195,8 +295,6 @@ async fn log(
     Path(id): Path<TaskId>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<LogTail>, AppError> {
-    // the row decides whether the task exists; `output.log` only appears once
-    // the worker has spawned the agent
     if call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .is_none()
@@ -248,36 +346,25 @@ async fn cancel(
     }
 }
 
-fn check_api_version(spec: &NormalizedSpec) -> Result<(), AppError> {
-    if spec.api_version == API_VERSION {
-        return Ok(());
-    }
-    Err(AppError::InvalidSpec {
-        pointer: "/spec/api_version".into(),
-        value: json!(spec.api_version),
-        message: format!("api_version must be {API_VERSION}"),
-    })
-}
-
 async fn accept_task(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, ProcessStatus), AppError> {
     let spec = body.spec;
-    check_api_version(&spec)?;
     spec::check_cwd(&spec.cwd)?;
-    let binary = resolve_binary(spec.agent, &body.env.path, &spec.cwd)?;
+    let binary = resolve_workload_binary(&spec.workload, &body.env.path, &spec.cwd)?;
     let id = TaskId::new();
     let paths = state.home.prepare_task(id)?;
-    crate::runner::write_task_files(&paths, &spec.prompt, spec.report_trailer)?;
+    if let NormalizedWorkload::Agent(agent) = &spec.workload {
+        crate::runner::write_task_files(&paths, &agent.prompt, agent.report_trailer)?;
+    }
+    let workload: Workload = persist_workload(&spec.workload);
     let row = store::new_queued_task(store::NewTask {
         id,
         thread: spec.thread,
-        agent: spec.agent(),
+        workload,
         cwd: spec.cwd.clone(),
         timeout: spec.timeout,
-        extra_args: spec.extra_args.clone(),
-        report_trailer: spec.report_trailer,
         env: body.env,
         binary,
     });
@@ -290,8 +377,121 @@ async fn accept_task(
     Ok((id, ProcessStatus::Queued))
 }
 
-impl NormalizedSpec {
-    fn agent(&self) -> crate::domain::Agent {
-        crate::domain::Agent::new(self.agent, self.model.clone())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+
+    fn body(value: &Value) -> Request {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(value).unwrap()))
+            .unwrap()
+    }
+
+    /// Run the socket extractor on its own: no actors, no database.
+    async fn extract(value: &Value) -> Result<SubmitBody, AppError> {
+        SpecBody::from_request(body(value), &()).await.map(|b| b.0)
+    }
+
+    fn valid() -> Value {
+        json!({
+            "spec": {
+                "api_version": 1,
+                "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+                "cwd": "/tmp",
+                "timeout": "4h",
+                "workload": { "type": "task", "command": ["true"] }
+            },
+            "env": { "path": "/bin", "home": "/home/u" }
+        })
+    }
+
+    #[track_caller]
+    fn invalid_spec(err: AppError) -> (String, Value) {
+        match err {
+            AppError::InvalidSpec { pointer, value, .. } => (pointer, value),
+            other => panic!("expected invalid_spec, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_envelope_is_accepted() {
+        let body = extract(&valid()).await.unwrap();
+        assert_eq!(body.env.path, "/bin");
+        assert_eq!(body.spec.api_version, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_top_level_key_is_rejected() {
+        let mut value = valid();
+        value["retries"] = json!(3);
+        let err = extract(&value).await.unwrap_err();
+        assert_eq!(err.code(), "invalid_spec");
+        let (pointer, _) = invalid_spec(err);
+        assert_eq!(pointer, "/retries");
+    }
+
+    #[tokio::test]
+    async fn unknown_key_pointer_is_rfc_6901_escaped() {
+        let mut value = valid();
+        value["a/b~c"] = json!(true);
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/a~1b~0c");
+    }
+
+    #[tokio::test]
+    async fn missing_spec_and_env_point_at_the_missing_key() {
+        let mut value = valid();
+        value.as_object_mut().unwrap().remove("env");
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/env");
+
+        let mut value = valid();
+        value.as_object_mut().unwrap().remove("spec");
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/spec");
+    }
+
+    #[tokio::test]
+    async fn nested_failures_keep_their_prefix_and_value() {
+        let mut value = valid();
+        value["env"]["path"] = json!(7);
+        let (pointer, found) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/env/path");
+        assert_eq!(found, json!(7));
+
+        let mut value = valid();
+        value["spec"]["workload"]["command"] = json!([""]);
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/spec/workload/command/0");
+
+        let mut value = valid();
+        value["spec"]["timeout"] = json!("1h");
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/spec/timeout");
+    }
+
+    #[tokio::test]
+    async fn unknown_env_key_is_rejected() {
+        let mut value = valid();
+        value["env"]["token"] = json!("secret");
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/env/token");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_an_invalid_spec_not_an_axum_rejection() {
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/tasks")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let err = SpecBody::from_request(req, &()).await.err().unwrap();
+        assert_eq!(err.code(), "invalid_spec");
+        assert_eq!(err.http_status(), http::StatusCode::BAD_REQUEST);
     }
 }
