@@ -1,121 +1,75 @@
 //! Host-unit generators.
 
+pub mod launchd;
+
 #[cfg(target_os = "linux")]
 pub mod systemd;
-#[cfg(not(target_os = "linux"))]
-pub mod systemd {
-    //! Stub for non-Linux hosts.
-    use crate::error::AppError;
-    use crate::home::Home;
-    use std::path::PathBuf;
-
-    /// Always fails: systemd units exist only on Linux.
-    pub fn render(_home: &Home) -> Result<String, AppError> {
-        Err(AppError::Internal {
-            message: "systemd install is Linux-only".into(),
-        })
-    }
-
-    /// Always fails with the same error as `render`.
-    pub fn install(home: &Home) -> Result<(), AppError> {
-        render(home).map(|_| ())
-    }
-
-    /// No-op: nothing can be installed on this host.
-    pub fn uninstall() -> Result<(), AppError> {
-        Ok(())
-    }
-
-    /// Unit file name, for messages only.
-    #[must_use]
-    pub fn unit_path() -> PathBuf {
-        PathBuf::from("homebased.service")
-    }
-
-    /// Always false.
-    #[must_use]
-    pub fn unit_installed() -> bool {
-        false
-    }
-
-    /// No-op.
-    pub fn host_stop() -> Result<(), AppError> {
-        Ok(())
-    }
-
-    /// No-op.
-    pub fn host_restart() -> Result<(), AppError> {
-        Ok(())
-    }
-}
-
-pub mod launchd;
 
 use crate::error::AppError;
 use crate::home::Home;
 
 /// Render the native host unit.
 pub fn render(home: &Home) -> Result<String, AppError> {
-    if cfg!(target_os = "macos") {
-        launchd::render(home)
-    } else {
-        systemd::render(home)
+    cfg_select! {
+        target_os = "macos" => launchd::render(home),
+        target_os = "linux" => systemd::render(home),
+        _ => Err(unsupported_host()),
     }
 }
 
 /// Install the native host unit.
 pub fn install(home: &Home) -> Result<(), AppError> {
-    if cfg!(target_os = "macos") {
-        launchd::install(home)
-    } else {
-        systemd::install(home)
+    cfg_select! {
+        target_os = "macos" => launchd::install(home),
+        target_os = "linux" => systemd::install(home),
+        _ => Err(unsupported_host()),
     }
 }
 
 /// Remove the native host unit. Does not delete the database.
 pub fn uninstall() -> Result<(), AppError> {
-    if cfg!(target_os = "macos") {
-        launchd::uninstall()
-    } else {
-        systemd::uninstall()
+    cfg_select! {
+        target_os = "macos" => launchd::uninstall(),
+        target_os = "linux" => systemd::uninstall(),
+        _ => Ok(()),
     }
 }
 
 /// Path of the unit or plist.
 #[must_use]
 pub fn unit_path() -> std::path::PathBuf {
-    if cfg!(target_os = "macos") {
-        launchd::plist_path()
-    } else {
-        systemd::unit_path()
+    cfg_select! {
+        target_os = "macos" => launchd::plist_path(),
+        target_os = "linux" => systemd::unit_path(),
+        _ => std::path::PathBuf::from("homebased.service"),
     }
 }
 
 /// Whether a host unit is present.
 #[must_use]
 pub fn unit_installed() -> bool {
-    if cfg!(target_os = "macos") {
-        launchd::plist_path().exists()
-    } else {
-        systemd::unit_installed()
+    cfg_select! {
+        target_os = "macos" => launchd::plist_path().exists(),
+        target_os = "linux" => systemd::unit_installed(),
+        _ => false,
     }
 }
 
 /// Stop via the host supervisor.
 pub fn host_stop() -> Result<(), AppError> {
-    if cfg!(target_os = "macos") {
-        launchd::host_stop()
-    } else {
-        systemd::host_stop()
+    cfg_select! {
+        target_os = "macos" => launchd::host_stop(),
+        target_os = "linux" => systemd::host_stop(),
+        _ => Ok(()),
     }
 }
 
 /// Restart via the host supervisor.
 pub fn host_restart() -> Result<(), AppError> {
-    if cfg!(target_os = "macos") {
-        launchd::host_restart()
-    } else {
-        systemd::host_restart()
+    cfg_select! {
+        target_os = "macos" => launchd::host_restart(),
+        target_os = "linux" => systemd::host_restart(),
+        _ => Ok(()),
     }
 }
 
@@ -125,10 +79,17 @@ pub const WEB_LISTEN_ENV: &str = "HOMEBASED_WEB_LISTEN";
 /// Kind name for JSON.
 #[must_use]
 pub fn kind_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "launchd"
-    } else {
-        "systemd"
+    cfg_select! {
+        target_os = "macos" => "launchd",
+        target_os = "linux" => "systemd",
+        _ => "none",
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported_host() -> AppError {
+    AppError::Internal {
+        message: "host unit install is Linux or macOS only".into(),
     }
 }
 
