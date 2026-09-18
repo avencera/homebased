@@ -11,7 +11,7 @@ Claude agent workloads use streaming JSON output by default, so `output.log` rec
 
 `timeout` is an output-inactivity timer (default 4h, minimum 30m). Homebasd resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
-Submit specs use `api_version: 1` and a `workload` object. An optional top-level `name` sets the dashboard label; unnamed tasks get a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
+Submit specs use `api_version: 1` and a `workload` object. A required top-level `name` is the dashboard label. Tasks stored before this field was required keep a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
 
 The dashboard (`127.0.0.1:7677` by default) includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Use loopback locally, or bind a Tailscale address with `--web-listen` / `HOMEBASED_WEB_LISTEN` for remote access on a trusted network. Text, raster images, and HTML open on a separate content origin; other files download.
 

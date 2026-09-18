@@ -84,10 +84,8 @@ struct SubmitSpecWire {
     api_version: u32,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     thread: ThreadId,
-    /// Optional human-readable name. Non-unique.
-    #[serde(default)]
-    #[schemars(default)]
-    name: Option<TaskName>,
+    /// Human-readable name. Non-unique.
+    name: TaskName,
     /// Working directory for the child.
     cwd: PathBuf,
     /// Output-inactivity timer. Default 4h, minimum 30m.
@@ -255,8 +253,8 @@ pub struct SubmitSpec {
     pub api_version: u32,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     pub thread: ThreadId,
-    /// Optional human-readable name.
-    pub name: Option<TaskName>,
+    /// Human-readable name.
+    pub name: TaskName,
     /// Working directory for the child.
     pub cwd: PathBuf,
     /// Output-inactivity timeout.
@@ -310,9 +308,8 @@ pub struct NormalizedSpec {
     pub api_version: u32,
     /// Codex thread.
     pub thread: ThreadId,
-    /// Optional human-readable name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<TaskName>,
+    /// Human-readable name.
+    pub name: TaskName,
     /// Working directory.
     pub cwd: PathBuf,
     /// Output-inactivity timeout.
@@ -352,15 +349,8 @@ pub fn parse_spec_bytes(bytes: &[u8]) -> Result<SubmitSpec, AppError> {
 
 /// Parse an already-decoded JSON value.
 pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
-    let wire: SubmitSpecWire = serde_path_to_error::deserialize(value).map_err(|err| {
-        let pointer = json_pointer(err.path());
-        let field_value = value.pointer(&pointer).cloned().unwrap_or(Value::Null);
-        AppError::InvalidSpec {
-            pointer,
-            value: field_value,
-            message: err.to_string(),
-        }
-    })?;
+    let wire: SubmitSpecWire =
+        serde_path_to_error::deserialize(value).map_err(|err| invalid_spec_from_de(value, &err))?;
     validate_spec(wire, value)
 }
 
@@ -370,8 +360,7 @@ pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
 struct NormalizedSpecEnvelope {
     api_version: u32,
     thread: ThreadId,
-    #[serde(default)]
-    name: Option<TaskName>,
+    name: TaskName,
     cwd: PathBuf,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
@@ -381,15 +370,7 @@ struct NormalizedSpecEnvelope {
 /// Parse a normalized socket body, attaching a JSON pointer on failure.
 pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError> {
     let envelope: NormalizedSpecEnvelope =
-        serde_path_to_error::deserialize(value).map_err(|err| {
-            let pointer = json_pointer(err.path());
-            let field_value = value.pointer(&pointer).cloned().unwrap_or(Value::Null);
-            AppError::InvalidSpec {
-                pointer,
-                value: field_value,
-                message: err.to_string(),
-            }
-        })?;
+        serde_path_to_error::deserialize(value).map_err(|err| invalid_spec_from_de(value, &err))?;
     check_api_version(envelope.api_version, "/api_version")?;
     check_timeout(envelope.timeout, "/timeout")?;
     let workload = parse_normalized_workload(&envelope.workload)?;
@@ -434,6 +415,39 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
             value: json!(other),
             message: "workload.type must be \"agent\" or \"task\"".into(),
         }),
+    }
+}
+
+/// Map a serde failure onto `invalid_spec`, including missing required fields.
+///
+/// `serde_path_to_error` leaves the path empty when a required field is
+/// absent, so the missing name is recovered from the inner serde message.
+fn invalid_spec_from_de(
+    value: &Value,
+    err: &serde_path_to_error::Error<serde_json::Error>,
+) -> AppError {
+    let mut pointer = json_pointer(err.path());
+    if pointer.is_empty()
+        && let Some(name) = missing_field_name(err.inner())
+    {
+        pointer = format!("/{}", escape_token(&name));
+    }
+    let field_value = value.pointer(&pointer).cloned().unwrap_or(Value::Null);
+    AppError::InvalidSpec {
+        pointer,
+        value: field_value,
+        message: err.to_string(),
+    }
+}
+
+fn missing_field_name(err: &serde_json::Error) -> Option<String> {
+    let message = err.to_string();
+    let rest = message.strip_prefix("missing field `")?;
+    let name = rest.split('`').next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -617,6 +631,7 @@ fn example_agent_json() -> Value {
     json!({
         "api_version": 1,
         "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "name": "implement file browser",
         "cwd": "/tmp",
         "timeout": "4h",
         "workload": {
@@ -634,6 +649,7 @@ fn example_task_json() -> Value {
     json!({
         "api_version": 1,
         "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "name": "cargo release build",
         "cwd": "/tmp",
         "timeout": "4h",
         "workload": {
@@ -652,6 +668,7 @@ mod tests {
         json!({
             "api_version": 1,
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "test agent",
             "cwd": "/tmp",
             "workload": {
                 "type": "agent",
@@ -665,6 +682,7 @@ mod tests {
         json!({
             "api_version": 1,
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "test task",
             "cwd": "/tmp",
             "workload": {
                 "type": "task",
@@ -783,7 +801,7 @@ mod tests {
         let spec = SubmitSpec {
             api_version: 1,
             thread: ThreadId::from_str_ok(),
-            name: None,
+            name: TaskName::parse("from file").unwrap(),
             cwd: dir.path().to_path_buf(),
             timeout: default_timeout(),
             workload: SubmitWorkloadValidated::Agent(SubmitAgent {
@@ -831,6 +849,7 @@ mod tests {
         json!({
             "api_version": 1,
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "test agent",
             "cwd": "/tmp",
             "workload": workload
         })
@@ -990,7 +1009,7 @@ mod tests {
     fn default_timeout_is_four_hours() {
         let spec = parse_spec_value(&valid_agent()).unwrap();
         assert_eq!(spec.timeout, Duration::from_secs(4 * 3600));
-        assert_eq!(spec.name, None);
+        assert_eq!(spec.name.as_str(), "test agent");
         match spec.workload {
             SubmitWorkloadValidated::Agent(agent) => assert!(agent.report_trailer),
             other => panic!("unexpected {other:?}"),
@@ -998,19 +1017,13 @@ mod tests {
     }
 
     #[test]
-    fn optional_name_is_parsed_and_normalized() {
+    fn required_name_is_parsed_and_normalized() {
         let mut value = valid_task();
         value["name"] = json!("  build release  ");
         let spec = parse_spec_value(&value).unwrap();
-        assert_eq!(
-            spec.name.as_ref().map(TaskName::as_str),
-            Some("build release")
-        );
+        assert_eq!(spec.name.as_str(), "build release");
         let normalized = normalize(&spec).unwrap();
-        assert_eq!(
-            normalized.name.as_ref().map(TaskName::as_str),
-            Some("build release")
-        );
+        assert_eq!(normalized.name.as_str(), "build release");
     }
 
     #[test]
@@ -1025,19 +1038,42 @@ mod tests {
     }
 
     #[test]
-    fn schema_documents_optional_name() {
+    fn schema_requires_name() {
         let schema = schema_json().unwrap();
         assert!(schema["properties"]["name"].is_object());
-        assert_verdict(&valid_task(), true, "a nameless task");
+        let required = schema["required"]
+            .as_array()
+            .expect("schema required array");
+        assert!(
+            required.iter().any(|value| value == "name"),
+            "schema required={required:?}"
+        );
+        assert_verdict(&valid_task(), true, "a named task");
+        let mut nameless = valid_task();
+        nameless.as_object_mut().unwrap().remove("name");
+        assert_verdict(&nameless, false, "a missing name");
         let mut named = valid_task();
         named["name"] = json!("ci watch");
-        assert_verdict(&named, true, "a named task");
+        assert_verdict(&named, true, "a renamed task");
         named["name"] = json!("");
         assert_verdict(&named, false, "an empty name");
         named["name"] = json!("name\n");
         assert_verdict(&named, false, "a name with a trailing line break");
         named["name"] = json!("\tname");
         assert_verdict(&named, false, "a name with a control character");
+
+        let err = parse_spec_value(&nameless).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/name"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let mut normalized = nameless.clone();
+        normalized["timeout"] = json!("4h");
+        let err = parse_normalized_value(&normalized).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/name"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -1045,6 +1081,7 @@ mod tests {
         let value = json!({
             "api_version": 1,
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "test task",
             "cwd": "/tmp",
             "timeout": "29m",
             "workload": { "type": "task", "command": ["true"] }

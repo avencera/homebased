@@ -75,7 +75,7 @@ export interface DaemonStatus {
 /** One row of `GET /v1/tasks`. */
 export interface TaskSummary {
 	id: string;
-	/** Submitted name when present. */
+	/** Submitted name. Omitted only for tasks stored before name was required. */
 	name?: string | null;
 	/** Non-empty server-derived label. */
 	display_name: string;

@@ -209,7 +209,7 @@ pub struct HomebasedEvent {
     pub event: EventKind,
     /// Task id.
     pub task: TaskId,
-    /// Submitted name when present.
+    /// Submitted name. Omitted only for rows stored before name was required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<TaskName>,
     /// Non-empty server-derived label.

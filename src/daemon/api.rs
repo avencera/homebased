@@ -386,7 +386,7 @@ async fn accept_task(
     let workload: Workload = persist_workload(&spec.workload);
     let row = store::new_queued_task(store::NewTask {
         id,
-        name: spec.name.clone(),
+        name: Some(spec.name.clone()),
         thread: spec.thread,
         workload,
         cwd: spec.cwd.clone(),
@@ -427,6 +427,7 @@ mod tests {
             "spec": {
                 "api_version": 1,
                 "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+                "name": "test task",
                 "cwd": "/tmp",
                 "timeout": "4h",
                 "workload": { "type": "task", "command": ["true"] }

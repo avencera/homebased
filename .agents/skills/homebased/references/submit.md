@@ -94,7 +94,7 @@ GitHub CI watcher as a normal task:
 | --- | --- | --- |
 | `api_version` | yes | Always `1`. |
 | `thread` | yes | Codex thread UUID from step 1. |
-| `name` | no | Short human-readable label for the dashboard and events. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. Prefer a useful default name when you submit. |
+| `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | Existing directory. The child runs there. |
 | `timeout` | no | Output-inactivity timer. Humantime string. Default `4h`. Minimum `30m`. Each non-empty write to `output.log` restarts it. When it expires, Homebased sends `TASK_CHECK_DUE` and does **not** kill the child. Use `30m` for bounded reviews and `1h` for large or tool-heavy reviews. |
 | `workload` | yes | Internally tagged enum: `type` is `agent` or `task`. |

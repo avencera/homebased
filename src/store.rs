@@ -592,7 +592,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
 pub struct NewTask {
     /// Task id.
     pub id: TaskId,
-    /// Optional submitted name.
+    /// Submitted name. `None` only for rows stored before name was required.
     pub name: Option<TaskName>,
     /// Submitting thread.
     pub thread: ThreadId,

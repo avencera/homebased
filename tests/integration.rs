@@ -219,6 +219,7 @@ impl Harness {
         json!({
             "api_version": 1,
             "thread": THREAD,
+            "name": "test agent",
             "cwd": std::env::temp_dir(),
             "timeout": "2h",
             "workload": {
@@ -234,6 +235,7 @@ impl Harness {
         json!({
             "api_version": 1,
             "thread": THREAD,
+            "name": "test task",
             "cwd": std::env::temp_dir(),
             "timeout": "2h",
             "workload": {
@@ -1886,12 +1888,11 @@ fn web_listener_serves_read_only_api() {
 }
 
 #[test]
-fn named_and_unnamed_tasks_expose_display_name() {
+fn named_task_exposes_display_name_and_missing_name_is_rejected() {
     let h = Harness::new();
     let mut named = Harness::task_spec(&["true"]);
     named["name"] = json!("named job");
     let named_id = h.submit(&named);
-    let unnamed_id = h.submit(&Harness::task_spec(&["echo", "hi", "there", "x"]));
 
     let named_show: Value = serde_json::from_slice(
         &h.cmd()
@@ -1904,16 +1905,25 @@ fn named_and_unnamed_tasks_expose_display_name() {
     assert_eq!(named_show["name"], "named job");
     assert_eq!(named_show["display_name"], "named job");
 
-    let unnamed_show: Value = serde_json::from_slice(
-        &h.cmd()
-            .args(["--json", "task", "show", &unnamed_id])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert!(unnamed_show.get("name").is_none() || unnamed_show["name"].is_null());
-    assert_eq!(unnamed_show["display_name"], "echo hi there…");
+    let mut nameless = Harness::task_spec(&["echo", "hi", "there", "x"]);
+    nameless.as_object_mut().unwrap().remove("name");
+    let spec_path = h.home.join("spec-nameless.json");
+    fs::write(&spec_path, serde_json::to_vec(&nameless).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "invalid_spec");
+    assert_eq!(err["error"]["input"]["pointer"], "/name");
 }
 
 #[test]

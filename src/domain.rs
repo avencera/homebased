@@ -32,7 +32,7 @@ pub const SUMMARY_MAX_BYTES: usize = 4096;
 /// Maximum number of reports on one task.
 pub const REPORTS_MAX: usize = 20;
 
-/// Optional human-readable task name from submit. Non-unique; `TaskId` is identity.
+/// Human-readable task name from submit. Non-unique; `TaskId` is identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TaskName(String);
@@ -98,7 +98,7 @@ impl schemars::JsonSchema for TaskName {
                 { "pattern": "\\S" },
                 { "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$" }
             ],
-            "description": "Optional human-readable task name. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique."
+            "description": "Human-readable task name. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique."
         })
     }
 }
@@ -699,7 +699,7 @@ impl TaskState {
 pub struct TaskRow {
     /// Task id.
     pub id: TaskId,
-    /// Optional submitted name. Null for unnamed and pre-migration rows.
+    /// Submitted name. `None` only for rows stored before name was required.
     pub name: Option<TaskName>,
     /// Submitting Codex thread.
     pub thread: ThreadId,
