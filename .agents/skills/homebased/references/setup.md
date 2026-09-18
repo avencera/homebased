@@ -6,7 +6,7 @@ The crate lives in this repository. `cargo install` puts the binary at `~/.cargo
 
 ```bash
 just web-build                        # build the dashboard assets
-cargo install --path /home/praveen/code/homebasd
+cargo install --path /home/praveen/code/homebased
 homebased --json version
 ```
 
@@ -60,7 +60,7 @@ After rebuilding from this repository:
 
 ```bash
 just web-build
-cargo install --path /home/praveen/code/homebasd
+cargo install --path /home/praveen/code/homebased
 homebased --json daemon restart
 ```
 
