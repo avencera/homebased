@@ -8,6 +8,7 @@ pub mod client;
 pub mod daemon;
 pub mod domain;
 pub mod error;
+pub mod files;
 pub mod home;
 pub mod install;
 pub mod invocation;

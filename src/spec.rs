@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, ThreadId};
+use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 
@@ -84,6 +84,10 @@ struct SubmitSpecWire {
     api_version: u32,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     thread: ThreadId,
+    /// Optional human-readable name. Non-unique.
+    #[serde(default)]
+    #[schemars(default)]
+    name: Option<TaskName>,
     /// Working directory for the child.
     cwd: PathBuf,
     /// Attention timer. Default 4h, minimum 2h.
@@ -167,6 +171,15 @@ impl PromptSource {
         prompt_file: Option<PathBuf>,
         raw_workload: &Value,
     ) -> Result<Self, AppError> {
+        for key in ["prompt", "prompt_file"] {
+            if raw_workload.get(key).is_some_and(Value::is_null) {
+                return Err(AppError::InvalidSpec {
+                    pointer: format!("/workload/{key}"),
+                    value: Value::Null,
+                    message: format!("{key} must be a string"),
+                });
+            }
+        }
         match (prompt, prompt_file) {
             (Some(text), None) => Ok(Self::Inline(text)),
             (None, Some(path)) => Ok(Self::File(path)),
@@ -242,6 +255,8 @@ pub struct SubmitSpec {
     pub api_version: u32,
     /// Codex thread that receives `HOMEBASED_EVENT`.
     pub thread: ThreadId,
+    /// Optional human-readable name.
+    pub name: Option<TaskName>,
     /// Working directory for the child.
     pub cwd: PathBuf,
     /// Attention timeout.
@@ -295,6 +310,9 @@ pub struct NormalizedSpec {
     pub api_version: u32,
     /// Codex thread.
     pub thread: ThreadId,
+    /// Optional human-readable name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<TaskName>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Attention timeout.
@@ -352,6 +370,8 @@ pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
 struct NormalizedSpecEnvelope {
     api_version: u32,
     thread: ThreadId,
+    #[serde(default)]
+    name: Option<TaskName>,
     cwd: PathBuf,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
@@ -376,6 +396,7 @@ pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError>
     Ok(NormalizedSpec {
         api_version: envelope.api_version,
         thread: envelope.thread,
+        name: envelope.name,
         cwd: envelope.cwd,
         timeout: envelope.timeout,
         workload,
@@ -472,6 +493,7 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
     Ok(SubmitSpec {
         api_version: wire.api_version,
         thread: wire.thread,
+        name: wire.name,
         cwd: wire.cwd,
         timeout: wire.timeout,
         workload,
@@ -567,6 +589,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
     Ok(NormalizedSpec {
         api_version: API_VERSION,
         thread: spec.thread,
+        name: spec.name.clone(),
         cwd: spec.cwd.clone(),
         timeout: spec.timeout,
         workload,
@@ -760,6 +783,7 @@ mod tests {
         let spec = SubmitSpec {
             api_version: 1,
             thread: ThreadId::from_str_ok(),
+            name: None,
             cwd: dir.path().to_path_buf(),
             timeout: default_timeout(),
             workload: SubmitWorkloadValidated::Agent(SubmitAgent {
@@ -852,6 +876,22 @@ mod tests {
             false,
             "no prompt source",
         );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "agent", "agent": "claude",
+                "prompt": "hi", "prompt_file": null
+            })),
+            false,
+            "a null prompt file beside an inline prompt",
+        );
+        assert_verdict(
+            &with_workload(json!({
+                "type": "agent", "agent": "claude",
+                "prompt": null, "prompt_file": "/tmp/p"
+            })),
+            false,
+            "a null inline prompt beside a prompt file",
+        );
     }
 
     #[test]
@@ -880,6 +920,16 @@ mod tests {
             &with_workload(json!({"type": "task", "command": ["", "build"]})),
             false,
             "an empty program with arguments",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": ["echo", "a\0b"]})),
+            false,
+            "a NUL byte in an argument",
+        );
+        assert_verdict(
+            &with_workload(json!({"type": "task", "command": ["car\0go"]})),
+            false,
+            "a NUL byte in the program",
         );
     }
 
@@ -940,10 +990,54 @@ mod tests {
     fn default_timeout_is_four_hours() {
         let spec = parse_spec_value(&valid_agent()).unwrap();
         assert_eq!(spec.timeout, Duration::from_secs(4 * 3600));
+        assert_eq!(spec.name, None);
         match spec.workload {
             SubmitWorkloadValidated::Agent(agent) => assert!(agent.report_trailer),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn optional_name_is_parsed_and_normalized() {
+        let mut value = valid_task();
+        value["name"] = json!("  build release  ");
+        let spec = parse_spec_value(&value).unwrap();
+        assert_eq!(
+            spec.name.as_ref().map(TaskName::as_str),
+            Some("build release")
+        );
+        let normalized = normalize(&spec).unwrap();
+        assert_eq!(
+            normalized.name.as_ref().map(TaskName::as_str),
+            Some("build release")
+        );
+    }
+
+    #[test]
+    fn blank_name_is_rejected_at_pointer() {
+        let mut value = valid_task();
+        value["name"] = json!("   ");
+        let err = parse_spec_value(&value).unwrap_err();
+        match err {
+            AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/name"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_documents_optional_name() {
+        let schema = schema_json().unwrap();
+        assert!(schema["properties"]["name"].is_object());
+        assert_verdict(&valid_task(), true, "a nameless task");
+        let mut named = valid_task();
+        named["name"] = json!("ci watch");
+        assert_verdict(&named, true, "a named task");
+        named["name"] = json!("");
+        assert_verdict(&named, false, "an empty name");
+        named["name"] = json!("name\n");
+        assert_verdict(&named, false, "a name with a trailing line break");
+        named["name"] = json!("\tname");
+        assert_verdict(&named, false, "a name with a control character");
     }
 
     #[test]

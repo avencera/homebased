@@ -110,6 +110,36 @@ pub enum AppError {
         /// Operation that was denied.
         message: String,
     },
+    /// Filesystem path is missing.
+    #[error("{message}")]
+    FileNotFound {
+        /// Human-readable failure.
+        message: String,
+    },
+    /// Path exists but is not a directory when one was required.
+    #[error("{message}")]
+    NotDirectory {
+        /// Human-readable failure.
+        message: String,
+    },
+    /// Directory or file changed while it was being read.
+    #[error("{message}")]
+    ChangedDuringRead {
+        /// Human-readable failure.
+        message: String,
+    },
+    /// Special file (device, socket, FIFO) is not browsable.
+    #[error("{message}")]
+    UnsupportedFile {
+        /// Human-readable failure.
+        message: String,
+    },
+    /// Too many concurrent content streams.
+    #[error("{message}")]
+    StreamLimit {
+        /// Human-readable failure.
+        message: String,
+    },
     /// Unexpected internal failure.
     #[error("{message}")]
     Internal {
@@ -138,6 +168,11 @@ impl AppError {
             Self::HostUnitHomeMismatch { .. } => "host_unit_home_mismatch",
             Self::Usage { .. } => "usage",
             Self::Permission { .. } => "permission",
+            Self::FileNotFound { .. } => "file_not_found",
+            Self::NotDirectory { .. } => "not_directory",
+            Self::ChangedDuringRead { .. } => "changed_during_read",
+            Self::UnsupportedFile { .. } => "unsupported_file",
+            Self::StreamLimit { .. } => "stream_limit",
             Self::Internal { .. } => "internal",
         }
     }
@@ -153,13 +188,18 @@ impl AppError {
             Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => 2,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
-            | Self::ExecutableMissing { .. } => 3,
+            | Self::ExecutableMissing { .. }
+            | Self::FileNotFound { .. }
+            | Self::NotDirectory { .. }
+            | Self::UnsupportedFile { .. } => 3,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
-            | Self::HostUnitHomeMismatch { .. } => 5,
+            | Self::HostUnitHomeMismatch { .. }
+            | Self::ChangedDuringRead { .. }
+            | Self::StreamLimit { .. } => 5,
         }
     }
 
@@ -167,18 +207,23 @@ impl AppError {
     #[must_use]
     pub fn http_status(&self) -> http::StatusCode {
         match self {
-            Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => {
-                http::StatusCode::BAD_REQUEST
-            }
+            Self::InvalidSpec { .. }
+            | Self::SummaryTooLong { .. }
+            | Self::Usage { .. }
+            | Self::NotDirectory { .. }
+            | Self::UnsupportedFile { .. } => http::StatusCode::BAD_REQUEST,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
-            | Self::ExecutableMissing { .. } => http::StatusCode::NOT_FOUND,
+            | Self::ExecutableMissing { .. }
+            | Self::FileNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
-            | Self::HostUnitHomeMismatch { .. } => http::StatusCode::CONFLICT,
+            | Self::HostUnitHomeMismatch { .. }
+            | Self::ChangedDuringRead { .. }
+            | Self::StreamLimit { .. } => http::StatusCode::CONFLICT,
             Self::DaemonUnavailable { .. }
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
@@ -208,6 +253,11 @@ impl AppError {
             Self::TasksInFlight { count } => json!({ "count": count }),
             Self::Usage { message } => json!({ "message": message }),
             Self::Permission { message } => json!({ "message": message }),
+            Self::FileNotFound { message }
+            | Self::NotDirectory { message }
+            | Self::ChangedDuringRead { message }
+            | Self::UnsupportedFile { message }
+            | Self::StreamLimit { message } => json!({ "message": message }),
             Self::UnitInvalid { message } => json!({ "message": message }),
             Self::HostUnitHomeMismatch {
                 selected,

@@ -63,18 +63,26 @@
 			<ArrowLeft class="size-3.5" />
 			all workers
 		</a>
-		<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 		{#if task}
+			<h1 class="text-base font-semibold tracking-tight" title={task.display_name}>
+				{task.display_name}
+			</h1>
+			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 			<StatusBadge status={task.status} />
+			<span class="text-muted-foreground">
+				updated {formatTimestamp(task.updated_at)}
+			</span>
 			{#if task.cancel_requested_at}
 				<span class="font-mono text-[11px] text-amber-600 dark:text-amber-400">
 					cancel requested {formatTimestamp(task.cancel_requested_at)}
 				</span>
 			{/if}
+		{:else}
+			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 		{/if}
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
-				updated <Elapsed from={store.lastFetched} suffix="ago" />
+				refreshed <Elapsed from={store.lastFetched} suffix="ago" />
 			{:else}
 				loading
 			{/if}
@@ -104,8 +112,15 @@
 			<dd class="font-mono">{task.pid ?? EM_DASH}</dd>
 
 			<dt class="text-muted-foreground">cwd</dt>
-			<dd class="min-w-0">
-				<CopyPath value={task.cwd} label={shortenHome(task.cwd)} class="-ml-1" />
+			<dd class="flex min-w-0 items-center gap-1">
+				<a
+					href={resolve(`/files?path=${encodeURIComponent(task.cwd)}`)}
+					class="truncate font-mono text-primary hover:underline"
+					title={task.cwd}
+				>
+					{shortenHome(task.cwd)}
+				</a>
+				<CopyPath value={task.cwd} iconOnly class="relative z-10" />
 			</dd>
 
 			<dt class="text-muted-foreground">thread</dt>
@@ -156,13 +171,29 @@
 			<dd><CallbackBadge callback={task.callback} /></dd>
 
 			<dt class="text-muted-foreground">evidence</dt>
-			<dd class="min-w-0">
-				<CopyPath value={task.evidence} label={shortenHome(task.evidence)} class="-ml-1" />
+			<dd class="flex min-w-0 items-center gap-1">
+				<a
+					href={resolve(`/files?path=${encodeURIComponent(task.evidence)}`)}
+					class="truncate font-mono text-primary hover:underline"
+					title={task.evidence}
+				>
+					{shortenHome(task.evidence)}
+				</a>
+				<CopyPath value={task.evidence} iconOnly class="relative z-10" />
 			</dd>
 
 			<dt class="text-muted-foreground">output log</dt>
-			<dd class="min-w-0 sm:col-span-3">
-				<CopyPath value={task.output_log} label={shortenHome(task.output_log)} class="-ml-1" />
+			<dd class="flex min-w-0 items-center gap-1 sm:col-span-3">
+				<a
+					href={resolve(`/files?path=${encodeURIComponent(task.output_log)}`)}
+					target="_blank"
+					rel="noopener noreferrer"
+					class="truncate font-mono text-primary hover:underline"
+					title={task.output_log}
+				>
+					{shortenHome(task.output_log)}
+				</a>
+				<CopyPath value={task.output_log} iconOnly class="relative z-10" />
 			</dd>
 		</dl>
 

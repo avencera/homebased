@@ -32,9 +32,11 @@ pub enum DaemonCommand {
     },
     /// Run the daemon in the foreground.
     Serve {
-        /// Dashboard listen address, or `off`. The API has no auth and exposes
-        /// prompts and logs, so bind a non-loopback address only on a trusted
-        /// network.
+        /// Dashboard listen address, or `off`. Default `127.0.0.1:7677`.
+        /// There is no application login or token: any peer that can reach the
+        /// dashboard can read task data and every regular file available to the
+        /// daemon user. Bind a Tailscale or LAN address only on a trusted
+        /// network (for example `100.x.y.z:7677`).
         #[arg(long, env = install::WEB_LISTEN_ENV, default_value_t)]
         web_listen: WebListen,
     },

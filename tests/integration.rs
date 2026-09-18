@@ -1755,8 +1755,8 @@ fn web_listener_serves_read_only_api() {
     assert_eq!(body["log"], "line three", "{body}");
     assert_eq!(body["truncated"], true, "{body}");
 
-    // mutations stay on the 0600 socket; the TCP router only knows GET here
-    let submit = http_request(&addr, "POST", "/v1/tasks");
+    // mutations stay on the 0600 socket; the TCP router rejects write methods here
+    let submit = http_request(&addr, "POST", "/v1/tasks", None, None);
     assert_eq!(submit.status, 405, "{submit:?}");
 
     let index = http_get(&addr, "/");
@@ -1770,6 +1770,146 @@ fn web_listener_serves_read_only_api() {
     assert_eq!(missing.status, 404, "{missing:?}");
     let body: Value = serde_json::from_str(&missing.body).unwrap();
     assert_eq!(body["error"]["code"], "not_found", "{body}");
+}
+
+#[test]
+fn named_and_unnamed_tasks_expose_display_name() {
+    let h = Harness::new();
+    let mut named = Harness::task_spec(&["true"]);
+    named["name"] = json!("named job");
+    let named_id = h.submit(&named);
+    let unnamed_id = h.submit(&Harness::task_spec(&["echo", "hi", "there", "x"]));
+
+    let named_show: Value = serde_json::from_slice(
+        &h.cmd()
+            .args(["--json", "task", "show", &named_id])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(named_show["name"], "named job");
+    assert_eq!(named_show["display_name"], "named job");
+
+    let unnamed_show: Value = serde_json::from_slice(
+        &h.cmd()
+            .args(["--json", "task", "show", &unnamed_id])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(unnamed_show.get("name").is_none() || unnamed_show["name"].is_null());
+    assert_eq!(unnamed_show["display_name"], "echo hi there…");
+}
+
+#[test]
+fn dashboard_file_browser_and_content_origin() {
+    let h = Harness::with_dashboard();
+    let addr = dashboard_addr(&h);
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    let text = nested.join("note.txt");
+    fs::write(&text, b"hello files").unwrap();
+    let html = nested.join("page.html");
+    fs::write(
+        &html,
+        b"<html><body><a href=\"note.txt\">n</a></body></html>",
+    )
+    .unwrap();
+    let bin = nested.join("blob.bin");
+    fs::write(&bin, b"\0\x01\x02\x03binary").unwrap();
+
+    let resolve = http_post_json(
+        &addr,
+        "/v1/files/resolve",
+        &json!({ "path": nested.to_string_lossy() }),
+    );
+    assert_eq!(resolve.status, 200, "{resolve:?}");
+    let resolved: Value = serde_json::from_str(&resolve.body).unwrap();
+    assert_eq!(resolved["kind"], "directory");
+    let token = resolved["token"].as_str().unwrap();
+
+    let listing = http_get(&addr, &format!("/v1/files/{token}"));
+    assert_eq!(listing.status, 200, "{listing:?}");
+    let listing_body: Value = serde_json::from_str(&listing.body).unwrap();
+    assert!(listing_body["entries"].as_array().unwrap().len() >= 3);
+
+    let origin = http_get(&addr, "/v1/files/origin");
+    assert_eq!(origin.status, 200, "{origin:?}");
+    let origin_body: Value = serde_json::from_str(&origin.body).unwrap();
+    let content_port = origin_body["port"].as_u64().unwrap() as u16;
+    let content_host = addr.split(':').next().unwrap();
+    let content_addr = format!("{content_host}:{content_port}");
+
+    let mirrored = format!("/raw{}", text.to_string_lossy());
+    let text_resp = http_get(&content_addr, &mirrored);
+    assert_eq!(text_resp.status, 200, "{text_resp:?}");
+    assert!(
+        text_resp.content_type_contains("text/plain"),
+        "{text_resp:?}"
+    );
+    assert!(
+        text_resp.head.contains("content-disposition: inline"),
+        "{text_resp:?}"
+    );
+    assert!(
+        text_resp.head.contains("x-content-type-options: nosniff"),
+        "{text_resp:?}"
+    );
+    assert!(
+        text_resp
+            .head
+            .contains("cross-origin-resource-policy: same-origin"),
+        "{text_resp:?}"
+    );
+    assert!(
+        text_resp.head.contains("referrer-policy: no-referrer"),
+        "{text_resp:?}"
+    );
+    assert_eq!(text_resp.body, "hello files");
+    assert!(
+        !text_resp.head.contains("access-control-allow-origin"),
+        "{text_resp:?}"
+    );
+
+    let html_resp = http_get(&content_addr, &format!("/raw{}", html.to_string_lossy()));
+    assert_eq!(html_resp.status, 200, "{html_resp:?}");
+    assert!(
+        html_resp.content_type_contains("text/html"),
+        "{html_resp:?}"
+    );
+    assert!(
+        html_resp.head.contains("content-disposition: inline"),
+        "{html_resp:?}"
+    );
+
+    let bin_resp = http_get(&content_addr, &format!("/raw{}", bin.to_string_lossy()));
+    assert_eq!(bin_resp.status, 200, "{bin_resp:?}");
+    assert!(
+        bin_resp.content_type_contains("application/octet-stream"),
+        "{bin_resp:?}"
+    );
+    assert!(
+        bin_resp.head.contains("content-disposition: attachment"),
+        "{bin_resp:?}"
+    );
+
+    // content origin has no dashboard API
+    let leaked = http_get(&content_addr, "/v1/tasks");
+    assert_eq!(leaked.status, 404, "{leaked:?}");
+
+    // unexpected Host is rejected on both origins
+    let bad_host = http_get_host(&addr, "/v1/status", "evil.example");
+    assert_eq!(bad_host.status, 400, "{bad_host:?}");
+    let bad_content = http_get_host(&content_addr, &mirrored, "evil.example");
+    assert_eq!(bad_content.status, 400, "{bad_content:?}");
+
+    assert!(
+        !origin.head.contains("access-control-allow-origin"),
+        "{origin:?}"
+    );
 }
 
 /// `host:port` of the running dashboard, from the daemon's own status body.
@@ -1809,19 +1949,39 @@ impl HttpResponse {
 }
 
 fn http_get(addr: &str, path: &str) -> HttpResponse {
-    http_request(addr, "GET", path)
+    http_request(addr, "GET", path, None, None)
+}
+
+fn http_get_host(addr: &str, path: &str, host: &str) -> HttpResponse {
+    http_request(addr, "GET", path, None, Some(host))
+}
+
+fn http_post_json(addr: &str, path: &str, body: &Value) -> HttpResponse {
+    http_request(addr, "POST", path, Some(body), None)
 }
 
 /// Hand-written HTTP/1.1 over a plain socket: the assertions are about what a
 /// browser sees, so no client crate sits in between.
-fn http_request(addr: &str, method: &str, path: &str) -> HttpResponse {
+fn http_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    json_body: Option<&Value>,
+    host: Option<&str>,
+) -> HttpResponse {
+    let host = host.unwrap_or(addr);
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    let body_bytes = json_body.map(|value| serde_json::to_vec(value).unwrap());
+    if let Some(bytes) = &body_bytes {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", bytes.len()));
+    }
+    request.push_str("\r\n");
     let mut stream = TcpStream::connect(addr).unwrap();
-    stream
-        .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    if let Some(bytes) = body_bytes {
+        stream.write_all(&bytes).unwrap();
+    }
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
     let text = String::from_utf8_lossy(&raw).into_owned();
@@ -2041,6 +2201,7 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
     store
         .insert_task(&new_queued_task(NewTask {
             id,
+            name: None,
             thread: THREAD.parse().unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, None),

@@ -4,13 +4,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::domain::{
     AttentionState, CallbackStatus, ExitReason, ProcessStatus, REPORTS_MAX, ReportOutcome,
-    SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskReport, TaskRow, TaskState, ThreadId,
-    Workload, check_callback_sent, check_report_allowed, check_status_transition,
+    SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskName, TaskReport, TaskRow, TaskState,
+    ThreadId, Workload, check_callback_sent, check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 
@@ -21,6 +21,7 @@ const SCHEMA: &str = r"
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
+    name TEXT,
     workload_json TEXT NOT NULL,
     cwd TEXT NOT NULL,
     timeout_secs TEXT NOT NULL,
@@ -53,10 +54,15 @@ CREATE TABLE reports (
 );
 ";
 
-const TASK_SELECT: &str = "SELECT id, thread_id, workload_json, cwd, timeout_secs,
+const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, callback_status,
     attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at
  FROM tasks";
+
+/// Schema version 1 had no `name` column.
+const MIGRATE_1_TO_2: &str = r"
+ALTER TABLE tasks ADD COLUMN name TEXT;
+";
 
 /// Open or create the database.
 pub struct Store {
@@ -69,15 +75,21 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
-                conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.execute_batch(SCHEMA)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            1 => {
+                transaction.execute_batch(MIGRATE_1_TO_2)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             v if v == SCHEMA_VERSION => {}
             other => {
@@ -86,6 +98,7 @@ impl Store {
                 });
             }
         }
+        transaction.commit()?;
         Ok(Self { conn })
     }
 
@@ -93,14 +106,15 @@ impl Store {
     pub fn insert_task(&self, row: &TaskRow) -> Result<(), AppError> {
         self.conn.execute(
             "INSERT INTO tasks (
-                id, thread_id, workload_json, cwd, timeout_secs,
+                id, thread_id, name, workload_json, cwd, timeout_secs,
                 env_path, env_home, binary, status, exit_reason,
                 callback_status, attention_state, timeout_notified_at,
                 pid, cancel_requested_at, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 row.id.to_string(),
                 row.thread.to_string(),
+                row.name.as_ref().map(TaskName::as_str),
                 serde_json::to_string(&row.workload)?,
                 row.cwd.to_string_lossy(),
                 fmt_timeout(row.timeout),
@@ -499,26 +513,35 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
 fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let id: String = row.get(0)?;
     let thread: String = row.get(1)?;
-    let workload_json: String = row.get(2)?;
-    let cwd: String = row.get(3)?;
-    let timeout_secs: String = row.get(4)?;
-    let env_path: String = row.get(5)?;
-    let env_home: String = row.get(6)?;
-    let binary: String = row.get(7)?;
-    let status: String = row.get(8)?;
-    let exit_reason: Option<String> = row.get(9)?;
-    let callback_status: String = row.get(10)?;
-    let attention_state: String = row.get(11)?;
-    let timeout_notified_at: Option<String> = row.get(12)?;
-    let pid: Option<i32> = row.get(13)?;
-    let cancel_requested_at: Option<String> = row.get(14)?;
-    let created_at: String = row.get(15)?;
-    let updated_at: String = row.get(16)?;
+    let name: Option<String> = row.get(2)?;
+    let workload_json: String = row.get(3)?;
+    let cwd: String = row.get(4)?;
+    let timeout_secs: String = row.get(5)?;
+    let env_path: String = row.get(6)?;
+    let env_home: String = row.get(7)?;
+    let binary: String = row.get(8)?;
+    let status: String = row.get(9)?;
+    let exit_reason: Option<String> = row.get(10)?;
+    let callback_status: String = row.get(11)?;
+    let attention_state: String = row.get(12)?;
+    let timeout_notified_at: Option<String> = row.get(13)?;
+    let pid: Option<i32> = row.get(14)?;
+    let cancel_requested_at: Option<String> = row.get(15)?;
+    let created_at: String = row.get(16)?;
+    let updated_at: String = row.get(17)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
     let id: TaskId = id.parse().map_err(parse_err)?;
     let thread: ThreadId = thread.parse().map_err(parse_err)?;
+    let name = match name {
+        Some(raw) => Some(TaskName::parse(&raw).map_err(|err| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
+                message: format!("stored task name: {err}"),
+            }))
+        })?),
+        None => None,
+    };
     let workload: Workload = serde_json::from_str(&workload_json).map_err(|err| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
             message: err.to_string(),
@@ -546,6 +569,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     };
     Ok(TaskRow {
         id,
+        name,
         thread,
         workload,
         cwd: Path::new(&cwd).to_path_buf(),
@@ -568,6 +592,8 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
 pub struct NewTask {
     /// Task id.
     pub id: TaskId,
+    /// Optional submitted name.
+    pub name: Option<TaskName>,
     /// Submitting thread.
     pub thread: ThreadId,
     /// Workload configuration.
@@ -588,6 +614,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
     let now = Utc::now();
     TaskRow {
         id: new.id,
+        name: new.name,
         thread: new.thread,
         workload: new.workload,
         cwd: new.cwd,
@@ -647,6 +674,7 @@ mod tests {
     fn agent_row(id: TaskId) -> TaskRow {
         new_queued_task(NewTask {
             id,
+            name: Some(TaskName::parse("agent job").unwrap()),
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),
@@ -666,6 +694,7 @@ mod tests {
     fn task_row(id: TaskId) -> TaskRow {
         new_queued_task(NewTask {
             id,
+            name: None,
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
             workload: Workload::Task(TaskWorkload {
                 command: CommandLine::try_from_argv(vec![
@@ -685,6 +714,41 @@ mod tests {
         })
     }
 
+    /// Schema version 1 layout used only to prove the 1→2 migration.
+    const SCHEMA_V1: &str = r"
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    workload_json TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    timeout_secs TEXT NOT NULL,
+    env_path TEXT NOT NULL,
+    env_home TEXT NOT NULL,
+    binary TEXT NOT NULL,
+    status TEXT NOT NULL,
+    exit_reason TEXT,
+    callback_status TEXT NOT NULL,
+    attention_state TEXT NOT NULL,
+    timeout_notified_at TEXT,
+    pid INTEGER,
+    cancel_requested_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX tasks_status ON tasks(status);
+CREATE INDEX tasks_thread ON tasks(thread_id);
+CREATE TABLE reports (
+    task_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    reported_at TEXT NOT NULL,
+    notified_at TEXT,
+    PRIMARY KEY (task_id, seq),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+";
+
     #[test]
     fn migrate_from_empty() {
         let dir = tempdir().unwrap();
@@ -697,6 +761,52 @@ mod tests {
     }
 
     #[test]
+    fn migrate_version_1_preserves_tasks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+            let id = TaskId::new();
+            conn.execute(
+                "INSERT INTO tasks (
+                    id, thread_id, workload_json, cwd, timeout_secs,
+                    env_path, env_home, binary, status, exit_reason,
+                    callback_status, attention_state, timeout_notified_at,
+                    pid, cancel_requested_at, created_at, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',NULL,'pending','pending',NULL,NULL,NULL,?9,?9)",
+                params![
+                    id.to_string(),
+                    "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+                    serde_json::to_string(&Workload::Task(TaskWorkload {
+                        command: CommandLine::try_from_argv(vec!["echo".into(), "hi".into()])
+                            .unwrap(),
+                    }))
+                    .unwrap(),
+                    "/tmp",
+                    "14400",
+                    "/bin",
+                    "/home/u",
+                    "/bin/echo",
+                    "2024-01-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let listed = store.list_tasks(&[], None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, None);
+        assert_eq!(listed[0].display_name(), "echo hi");
+    }
+
+    #[test]
     fn insert_list_get_agent_and_task() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
@@ -706,8 +816,12 @@ mod tests {
         store.insert_task(&task_row(task_id)).unwrap();
         let got = store.require_task(agent_id).unwrap();
         assert!(matches!(got.workload, Workload::Agent(_)));
+        assert_eq!(got.name.as_ref().map(TaskName::as_str), Some("agent job"));
+        assert_eq!(got.display_name(), "agent job");
         let got = store.require_task(task_id).unwrap();
         assert!(matches!(got.workload, Workload::Task(_)));
+        assert_eq!(got.name, None);
+        assert_eq!(got.display_name(), "cargo build --release");
         let listed = store.list_tasks(&[ProcessStatus::Queued], None).unwrap();
         assert_eq!(listed.len(), 2);
     }

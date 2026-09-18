@@ -34,12 +34,15 @@ State directory: `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebase
 ```bash
 homebased daemon serve --web-listen off              # socket only
 HOMEBASED_WEB_LISTEN=127.0.0.1:9000 homebased daemon serve
+HOMEBASED_WEB_LISTEN=100.x.y.z:7677 homebased daemon install   # Tailscale bind
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install   # bake a LAN bind into the host unit
 ```
 
 `daemon install` copies `HOMEBASED_WEB_LISTEN` from the installing shell into the unit, next to `PATH` and the agent paths, and rejects an invalid value. Re-run `install` to change it.
 
-The listener has no authentication and exposes cwd paths, prompts, and logs, so bind a non-loopback address only on a trusted network. A bind failure (busy port) is a warning: the daemon keeps serving the socket and `daemon status` reports `"web": null`.
+There is no application login or access token. Network reachability is the access boundary: any peer that can reach the dashboard can read task data and every regular file available to the daemon user through the device-wide file browser. A second content-origin port serves raw files (text, raster images, and fully active HTML inline; other types download). The dashboard and content origins do not grant CORS access to each other. Accepted `Host` values are `localhost`, numeric local and Tailscale addresses, the configured bind address, and Tailscale MagicDNS names (`*.ts.net`). Unexpected hosts are rejected.
+
+Bind a non-loopback address only on a trusted network. A bind failure (busy port) is a warning: the daemon keeps serving the socket and `daemon status` reports `"web": null`.
 
 ## Upgrade
 

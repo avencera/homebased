@@ -324,6 +324,11 @@ fn read_summary(path: &str) -> Result<String, AppError> {
 }
 
 fn workload_label(value: &Value) -> String {
+    if let Some(name) = value.get("display_name").and_then(Value::as_str)
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
     let Some(workload) = value.get("workload") else {
         return "-".into();
     };

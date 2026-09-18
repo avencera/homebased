@@ -17,7 +17,7 @@
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { DaemonStore } from '$lib/daemon.svelte';
-	import { EM_DASH, formatTimestamp, shortId, shortenHome, workloadLabel } from '$lib/format';
+	import { EM_DASH, formatTimestamp, shortId, shortenHome } from '$lib/format';
 	import { cn } from '$lib/utils';
 
 	const statuses = $derived(parseStatuses(page.url.searchParams.get('status')));
@@ -97,6 +97,7 @@
 				v{store.status.version} &middot; pid {store.status.pid}
 			</span>
 		{/if}
+		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
 				updated <Elapsed from={store.lastFetched} suffix="ago" />
@@ -156,13 +157,13 @@
 	</div>
 
 	<div class="mt-3 overflow-x-auto rounded border border-border bg-card">
-		<div class="min-w-[54rem]">
+		<div class="min-w-[62rem]">
 			<div
-				class="grid grid-cols-[6rem_6.5rem_9rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
+				class="grid grid-cols-[minmax(10rem,1.4fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
 			>
-				<span>task</span>
+				<span>name</span>
+				<span>id</span>
 				<span>status</span>
-				<span>workload</span>
 				<span>time</span>
 				<span>cwd</span>
 				<span>thread</span>
@@ -171,15 +172,16 @@
 
 			{#each store.tasks as task (task.id)}
 				<div
-					class="relative grid grid-cols-[6rem_6.5rem_9rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border/60 px-3 py-1.5 last:border-b-0 hover:bg-accent/60"
+					class="relative grid grid-cols-[minmax(10rem,1.4fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border/60 px-3 py-1.5 last:border-b-0 hover:bg-accent/60"
 				>
 					<a
 						href={resolve('/tasks/[id]', { id: task.id })}
-						class="font-mono text-primary after:absolute after:inset-0 after:content-['']"
-						title={task.id}
+						class="truncate font-mono text-primary after:absolute after:inset-0 after:content-['']"
+						title={task.display_name}
 					>
-						{shortId(task.id)}
+						{task.display_name}
 					</a>
+					<span class="font-mono text-muted-foreground" title={task.id}>{shortId(task.id)}</span>
 					<span class="flex items-center gap-1">
 						<StatusBadge status={task.status} />
 						{#if task.cancel_requested_at}
@@ -190,7 +192,6 @@
 							/>
 						{/if}
 					</span>
-					<span class="truncate font-mono" title={workloadLabel(task)}>{workloadLabel(task)}</span>
 					<Elapsed from={task.created_at} to={rowEnd(task)} class="text-muted-foreground" />
 					<span class="truncate font-mono text-muted-foreground" title={task.cwd}>
 						{shortenHome(task.cwd)}

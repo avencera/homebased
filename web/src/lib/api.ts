@@ -75,6 +75,10 @@ export interface DaemonStatus {
 /** One row of `GET /v1/tasks`. */
 export interface TaskSummary {
 	id: string;
+	/** Submitted name when present. */
+	name?: string | null;
+	/** Non-empty server-derived label. */
+	display_name: string;
 	status: ProcessStatus;
 	workload: WorkloadView;
 	/** Submitting Codex thread. */
@@ -92,6 +96,47 @@ export interface TaskSummary {
 	created_at: string;
 	/** For a terminal task this is the finish time. */
 	updated_at: string;
+}
+
+/** Directory entry kind from `GET /v1/files/{token}`. */
+export type FileEntryKind = 'directory' | 'file' | 'symlink' | 'other';
+
+/** One entry in a directory listing. */
+export interface FileEntry {
+	name: string;
+	kind: FileEntryKind;
+	target_kind?: FileEntryKind | null;
+	token: string;
+	content_path?: string | null;
+	size?: number | null;
+	modified?: string | null;
+}
+
+/** `POST /v1/files/resolve`. */
+export interface ResolvedPath {
+	api_version: number;
+	requested: string;
+	resolved?: string | null;
+	kind: FileEntryKind;
+	token: string;
+	content_path?: string | null;
+	size?: number | null;
+	modified?: string | null;
+}
+
+/** `GET /v1/files/{token}`. */
+export interface DirectoryListing {
+	api_version: number;
+	path: string;
+	token: string;
+	parent?: string | null;
+	entries: FileEntry[];
+}
+
+/** `GET /v1/files/origin`. */
+export interface ContentOrigin {
+	api_version: number;
+	port: number;
 }
 
 /** One append-only worker report. */
@@ -218,11 +263,60 @@ export function fetchLogTail(id: string, tail: number): Promise<LogTail> {
 	return getJson<LogTail>(`/tasks/${encodeURIComponent(id)}/log?tail=${tail}`);
 }
 
+/** `POST /v1/files/resolve`. */
+export async function resolvePath(path: string): Promise<ResolvedPath> {
+	return postJson<ResolvedPath>('/files/resolve', { path });
+}
+
+/** `GET /v1/files/{token}`. */
+export function fetchDirectory(token: string): Promise<DirectoryListing> {
+	return getJson<DirectoryListing>(`/files/${encodeURIComponent(token)}`);
+}
+
+/** `GET /v1/files/origin`. */
+export function fetchContentOrigin(): Promise<ContentOrigin> {
+	return getJson<ContentOrigin>('/files/origin');
+}
+
+/**
+ * Absolute URL on the content origin for a UTF-8 filesystem path. Uses the
+ * current browser hostname so loopback, LAN, and Tailscale clients match.
+ */
+export function contentUrlForPath(port: number, absolutePath: string): string {
+	const trimmed = absolutePath.startsWith('/') ? absolutePath.slice(1) : absolutePath;
+	const segments = trimmed.split('/').map(encodeURIComponent).join('/');
+	return `${contentOriginBase(port)}/raw/${segments}`;
+}
+
+/** Absolute URL on the content origin for an opaque path token. */
+export function contentUrlForToken(port: number, token: string): string {
+	return `${contentOriginBase(port)}/by-token/${encodeURIComponent(token)}`;
+}
+
+function contentOriginBase(port: number): string {
+	const { protocol, hostname } = window.location;
+	const host = hostname.includes(':') ? `[${hostname}]` : hostname;
+	return `${protocol}//${host}:${port}`;
+}
+
 async function getJson<T>(path: string): Promise<T> {
+	return requestJson<T>(path, { method: 'GET' });
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+	return requestJson<T>(path, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+}
+
+async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
 	let response: Response;
 	try {
 		response = await fetch(`${API_BASE}${path}`, {
-			headers: { accept: 'application/json' },
+			...init,
+			headers: { accept: 'application/json', ...init.headers },
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
 		});
 	} catch (cause) {

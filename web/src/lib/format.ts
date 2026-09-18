@@ -58,7 +58,7 @@ export function taskDurationMs(task: TaskSummary, now: number): number {
 	return end - start;
 }
 
-/** Dense workload label for list rows. */
+/** Dense workload label for list and detail metadata. */
 export function workloadLabel(task: Pick<TaskSummary, 'workload'>): string {
 	return formatWorkload(task.workload);
 }

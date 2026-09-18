@@ -131,10 +131,14 @@ impl schemars::JsonSchema for CommandLine {
                 {
                     "type": "string",
                     "minLength": 1,
+                    "pattern": "^[^\\u0000]*$",
                     "description": "Program to run. Must not be empty."
                 }
             ],
-            "items": { "type": "string" },
+            "items": {
+                "type": "string",
+                "pattern": "^[^\\u0000]*$"
+            },
             "description": "Argv array. Index 0 is a non-empty program. Later elements may be empty. No element may contain NUL."
         })
     }

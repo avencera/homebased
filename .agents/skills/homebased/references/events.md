@@ -7,6 +7,8 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `api_version` | Always `1`. |
 | `event` | One of the names in the table below. |
 | `task` | Task UUID. Use it for `task show`, `task log`, and de-duplication. |
+| `name` | Submitted task name when present. Omitted when unnamed. |
+| `display_name` | Non-empty server-derived label: the submitted name, or a workload fallback. |
 | `workload` | Discriminated union: `{"type":"agent","agent":"…","model":null\|string}` or `{"type":"task","command":[…]}`. |
 | `thread` | The thread the event was addressed to. |
 | `cwd` | The child's working directory. |

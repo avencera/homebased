@@ -532,6 +532,7 @@ mod tests {
         let id = TaskId::new();
         let row = new_queued_task(NewTask {
             id,
+            name: None,
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, None),

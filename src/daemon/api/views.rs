@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::domain::{
-    API_VERSION, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId,
+    API_VERSION, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskName, TaskReport, TaskRow,
+    ThreadId,
 };
 
 /// `GET /v1/status`.
@@ -43,6 +44,11 @@ pub enum CheckTimeoutStatus {
 pub struct TaskSummary {
     /// Task id.
     pub id: TaskId,
+    /// Submitted name when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<TaskName>,
+    /// Non-empty server-derived label for UI and CLI.
+    pub display_name: String,
     /// Process status.
     pub status: ProcessStatus,
     /// Workload view.
@@ -73,6 +79,8 @@ impl From<&TaskRow> for TaskSummary {
     fn from(row: &TaskRow) -> Self {
         Self {
             id: row.id,
+            name: row.name.clone(),
+            display_name: row.display_name(),
             status: row.status(),
             workload: WorkloadView::from(&row.workload),
             thread: row.thread,

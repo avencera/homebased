@@ -15,8 +15,8 @@ use nix::unistd::Pid;
 use serde::Serialize;
 
 use crate::domain::{
-    AgentKind, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskReport, TaskRow, TaskState,
-    ThreadId, Workload,
+    AgentKind, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow,
+    TaskState, ThreadId, Workload,
 };
 use crate::error::AppError;
 use crate::home::Home;
@@ -209,6 +209,11 @@ pub struct HomebasedEvent {
     pub event: EventKind,
     /// Task id.
     pub task: TaskId,
+    /// Submitted name when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<TaskName>,
+    /// Non-empty server-derived label.
+    pub display_name: String,
     /// Workload view.
     pub workload: WorkloadView,
     /// Codex thread.
@@ -267,6 +272,8 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         api_version: crate::domain::API_VERSION,
         event: EventKind::TaskCheckDue,
         task: row.id,
+        name: row.name.clone(),
+        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -290,6 +297,8 @@ fn build_event(
         api_version: crate::domain::API_VERSION,
         event,
         task: row.id,
+        name: row.name.clone(),
+        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -308,6 +317,8 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         api_version: crate::domain::API_VERSION,
         event: EventKind::TaskReported,
         task: row.id,
+        name: row.name.clone(),
+        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -630,6 +641,7 @@ mod tests {
     fn row(state: TaskState) -> TaskRow {
         TaskRow {
             id: TaskId::new(),
+            name: None,
             thread: "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),

@@ -18,6 +18,10 @@ use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskS
 use crate::daemon::{AppState, web};
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload};
 use crate::error::AppError;
+use crate::files::{
+    ContentOriginBody, DirectoryListing, PathToken, ResolveBody, ResolvedPath, list_directory,
+    resolve_absolute_path,
+};
 use crate::invocation::{
     StdinPolicy, invocation_from_normalized, persist_workload, resolve_workload_binary,
 };
@@ -38,6 +42,9 @@ pub fn read_routes() -> Router<AppState> {
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
         .route("/v1/tasks/{id}/log", get(log))
+        .route("/v1/files/resolve", post(files_resolve))
+        .route("/v1/files/origin", get(files_origin))
+        .route("/v1/files/{token}", get(files_list))
 }
 
 /// Routes that change state. Unix socket only: the socket is mode 0600, while a
@@ -314,6 +321,28 @@ async fn log(
     }))
 }
 
+async fn files_resolve(Json(body): Json<ResolveBody>) -> Result<Json<ResolvedPath>, AppError> {
+    Ok(Json(resolve_absolute_path(&body.path)?))
+}
+
+async fn files_list(Path(token): Path<String>) -> Result<Json<DirectoryListing>, AppError> {
+    let token = PathToken::from_encoded(token);
+    Ok(Json(list_directory(&token)?))
+}
+
+async fn files_origin(State(state): State<AppState>) -> Result<Json<ContentOriginBody>, AppError> {
+    let port = state
+        .content
+        .ok_or_else(|| AppError::Internal {
+            message: "content origin is not available".into(),
+        })?
+        .port();
+    Ok(Json(ContentOriginBody {
+        api_version: API_VERSION,
+        port,
+    }))
+}
+
 async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
@@ -357,6 +386,7 @@ async fn accept_task(
     let workload: Workload = persist_workload(&spec.workload);
     let row = store::new_queued_task(store::NewTask {
         id,
+        name: spec.name.clone(),
         thread: spec.thread,
         workload,
         cwd: spec.cwd.clone(),

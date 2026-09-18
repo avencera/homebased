@@ -14,9 +14,11 @@ use crate::error::AppError;
 /// Public JSON schema version.
 pub const API_VERSION: u32 = 1;
 
-/// SQLite `user_version` for the fresh unreleased schema. There is no migration
-/// path; development databases from an older layout must be removed.
-pub const SCHEMA_VERSION: i64 = 1;
+/// SQLite `user_version`. Version 1 databases migrate in place to version 2.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Maximum Unicode scalar values in a submitted task name.
+pub const TASK_NAME_MAX_CHARS: usize = 120;
 
 /// Minimum attention timeout. Values below this are rejected at submit.
 pub const MIN_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
@@ -29,6 +31,100 @@ pub const SUMMARY_MAX_BYTES: usize = 4096;
 
 /// Maximum number of reports on one task.
 pub const REPORTS_MAX: usize = 20;
+
+/// Optional human-readable task name from submit. Non-unique; `TaskId` is identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct TaskName(String);
+
+impl TaskName {
+    /// Trim and validate a submitted name.
+    pub fn parse(raw: &str) -> Result<Self, TaskNameError> {
+        for ch in raw.chars() {
+            if ch == '\n' || ch == '\r' {
+                return Err(TaskNameError::LineBreak);
+            }
+            if ch.is_control() {
+                return Err(TaskNameError::Control { ch });
+            }
+        }
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(TaskNameError::Blank);
+        }
+        if trimmed.chars().count() > TASK_NAME_MAX_CHARS {
+            return Err(TaskNameError::TooLong {
+                len: trimmed.chars().count(),
+            });
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    /// Borrow the validated name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TaskName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for TaskName {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskName".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": TASK_NAME_MAX_CHARS,
+            "allOf": [
+                { "pattern": "\\S" },
+                { "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$" }
+            ],
+            "description": "Optional human-readable task name. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique."
+        })
+    }
+}
+
+/// Why a submitted task name was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskNameError {
+    /// Empty after trim.
+    #[error("name must not be blank")]
+    Blank,
+    /// Contains a newline or carriage return.
+    #[error("name must not contain line breaks")]
+    LineBreak,
+    /// Contains a Unicode control character.
+    #[error("name must not contain control character U+{:04X}", *.ch as u32)]
+    Control {
+        /// Offending scalar value.
+        ch: char,
+    },
+    /// Longer than [`TASK_NAME_MAX_CHARS`] scalars after trim.
+    #[error("name must be at most {max} characters (got {len})", max = TASK_NAME_MAX_CHARS)]
+    TooLong {
+        /// Scalar count after trim.
+        len: usize,
+    },
+}
 
 /// Codex thread that submitted the task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -603,6 +699,8 @@ impl TaskState {
 pub struct TaskRow {
     /// Task id.
     pub id: TaskId,
+    /// Optional submitted name. Null for unnamed and pre-migration rows.
+    pub name: Option<TaskName>,
     /// Submitting Codex thread.
     pub thread: ThreadId,
     /// Workload configuration.
@@ -655,6 +753,43 @@ impl TaskRow {
             self.callback_status,
             CallbackStatus::Pending | CallbackStatus::Sending
         )
+    }
+
+    /// Non-empty label for UI and events: submitted name, else workload fallback.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        display_name(self.name.as_ref(), &self.workload)
+    }
+}
+
+/// Non-empty display label from an optional name and workload.
+#[must_use]
+pub fn display_name(name: Option<&TaskName>, workload: &Workload) -> String {
+    if let Some(name) = name {
+        return name.as_str().to_string();
+    }
+    workload_display_name(workload)
+}
+
+/// Workload-only fallback used when no submitted name is present.
+#[must_use]
+pub fn workload_display_name(workload: &Workload) -> String {
+    match workload {
+        Workload::Agent(agent) => match &agent.agent.model {
+            Some(model) => format!("{}/{}", agent.agent.kind, model),
+            None => agent.agent.kind.to_string(),
+        },
+        Workload::Task(task) => {
+            let argv = task.command.to_vec();
+            let parts: Vec<&str> = argv.iter().take(3).map(String::as_str).collect();
+            if argv.len() > 3 {
+                format!("{}…", parts.join(" "))
+            } else if parts.is_empty() {
+                "task".into()
+            } else {
+                parts.join(" ")
+            }
+        }
     }
 }
 
@@ -871,5 +1006,81 @@ mod tests {
         assert!(ProcessStatus::Failed.is_terminal());
         assert!(ProcessStatus::Cancelled.is_terminal());
         assert!(ProcessStatus::Lost.is_terminal());
+    }
+
+    #[test]
+    fn task_name_trims_and_rejects_invalid() {
+        assert_eq!(TaskName::parse("  hello  ").unwrap().as_str(), "hello");
+        assert_eq!(
+            TaskName::parse(&"a".repeat(120))
+                .unwrap()
+                .as_str()
+                .chars()
+                .count(),
+            120
+        );
+        assert!(matches!(TaskName::parse("   "), Err(TaskNameError::Blank)));
+        assert!(matches!(
+            TaskName::parse("a\nb"),
+            Err(TaskNameError::LineBreak)
+        ));
+        assert!(matches!(
+            TaskName::parse("a\rb"),
+            Err(TaskNameError::LineBreak)
+        ));
+        assert!(matches!(
+            TaskName::parse("a\u{0007}b"),
+            Err(TaskNameError::Control { .. })
+        ));
+        assert!(matches!(
+            TaskName::parse("name\n"),
+            Err(TaskNameError::LineBreak)
+        ));
+        assert!(matches!(
+            TaskName::parse("\tname"),
+            Err(TaskNameError::Control { .. })
+        ));
+        assert!(matches!(
+            TaskName::parse(&"a".repeat(121)),
+            Err(TaskNameError::TooLong { len: 121 })
+        ));
+    }
+
+    #[test]
+    fn task_name_serde_round_trips() {
+        let name = TaskName::parse("build release").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"build release\"");
+        let back: TaskName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, name);
+        assert!(serde_json::from_str::<TaskName>("\"  \"").is_err());
+    }
+
+    #[test]
+    fn display_name_prefers_submitted_then_workload() {
+        let name = TaskName::parse("my job").unwrap();
+        let agent = Workload::Agent(AgentWorkload {
+            agent: Agent::new(AgentKind::Claude, Some("fable".into())),
+            extra_args: vec![],
+            report_trailer: true,
+        });
+        assert_eq!(display_name(Some(&name), &agent), "my job");
+        assert_eq!(workload_display_name(&agent), "claude/fable");
+        let agent_bare = Workload::Agent(AgentWorkload {
+            agent: Agent::new(AgentKind::Grok, None),
+            extra_args: vec![],
+            report_trailer: true,
+        });
+        assert_eq!(workload_display_name(&agent_bare), "grok");
+        let task = Workload::Task(TaskWorkload {
+            command: crate::invocation::CommandLine::try_from_argv(vec![
+                "cargo".into(),
+                "build".into(),
+                "--release".into(),
+                "--locked".into(),
+            ])
+            .unwrap(),
+        });
+        assert_eq!(workload_display_name(&task), "cargo build --release…");
     }
 }

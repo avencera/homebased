@@ -2,6 +2,7 @@
 
 pub mod actors;
 pub mod api;
+pub mod content;
 pub mod web;
 
 use std::fs::File;
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorMsg, call};
 use crate::daemon::web::WebListen;
 use crate::error::AppError;
+use crate::files::StreamSlots;
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 
 /// Axum state: actor refs plus immutable path config.
@@ -30,6 +32,10 @@ pub struct AppState {
     /// Address the dashboard listener bound, or `None` when it is off or the
     /// bind failed.
     pub web: Option<SocketAddr>,
+    /// Content-origin port on the same host as the dashboard, when bound.
+    pub content: Option<SocketAddr>,
+    /// Concurrent raw-file stream permits.
+    pub stream_slots: StreamSlots,
 }
 
 /// Hold `daemon.lock`, bind the socket and the dashboard port, start actors,
@@ -48,6 +54,13 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
     // bind before the actors start so `/v1/status` can report the real port
     let web_listener = web::bind(web_listen).await;
     let web_addr = web_listener.as_ref().and_then(bound_addr);
+    let (content_listener, content_addr) = match web_addr {
+        Some(addr) => match content::bind(addr).await {
+            Some((listener, bound)) => (Some(listener), Some(bound)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
         .await
         .map_err(|err| AppError::Internal {
@@ -59,8 +72,10 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
         store,
         supervisor: supervisor.clone(),
         web: web_addr,
+        content: content_addr,
+        stream_slots: StreamSlots::new(),
     };
-    // both listeners share one shutdown: the signal task flips the flag once
+    // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -69,11 +84,13 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
     });
     let socket_serve = axum::serve(listener, api::socket_router(state.clone()))
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
-    let web_serve = serve_web(web_listener, state, shutdown_rx);
+    let web_serve = serve_web(web_listener, state.clone(), shutdown_rx.clone());
+    let content_serve = serve_content(content_listener, content_addr, state, shutdown_rx);
     let web_url = web_addr.map(web::url_for);
     info!(
         sock = %sock.display(),
         web = web_url.as_deref().unwrap_or("off"),
+        content = content_addr.map(|addr| addr.to_string()).as_deref().unwrap_or("off"),
         "homebased listening"
     );
     let mut handle = handle;
@@ -81,7 +98,7 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
     // there is no recovery, so stop serving and exit non-zero (DEC-20)
     let supervisor_died = tokio::select! {
         result = async {
-            let (socket_result, ()) = tokio::join!(socket_serve, web_serve);
+            let (socket_result, (), ()) = tokio::join!(socket_serve, web_serve, content_serve);
             socket_result
         } => {
             result.map_err(|err| AppError::Internal {
@@ -133,10 +150,36 @@ async fn serve_web(
     let Some(listener) = listener else {
         return;
     };
-    let serve = axum::serve(listener, web::router(state))
+    let Some(addr) = state.web else {
+        return;
+    };
+    let serve = axum::serve(listener, web::router(state, addr))
         .with_graceful_shutdown(wait_for_shutdown(shutdown));
     if let Err(err) = serve.await {
         warn!("dashboard listener stopped: {err}");
+    }
+}
+
+/// Serve raw file content on a separate origin. Failure is non-fatal.
+async fn serve_content(
+    listener: Option<TcpListener>,
+    addr: Option<SocketAddr>,
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+) {
+    let Some(listener) = listener else {
+        return;
+    };
+    let Some(addr) = addr else {
+        return;
+    };
+    let serve = axum::serve(
+        listener,
+        content::router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown));
+    if let Err(err) = serve.await {
+        warn!("content listener stopped: {err}");
     }
 }
 

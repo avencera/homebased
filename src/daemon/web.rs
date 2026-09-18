@@ -8,7 +8,9 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 
+use axum::extract::Request;
 use axum::http::{StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
@@ -19,6 +21,7 @@ use crate::daemon::AppState;
 use crate::daemon::api;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
+use crate::files::{HostPolicy, host_guard};
 use serde_json::json;
 
 /// Default dashboard bind.
@@ -87,8 +90,15 @@ pub fn url_for(addr: SocketAddr) -> String {
 }
 
 /// Read-only API plus the embedded single-page app.
-pub fn router(state: AppState) -> Router {
-    api::read_routes().fallback(asset).with_state(state)
+pub fn router(state: AppState, bind: SocketAddr) -> Router {
+    let policy = HostPolicy { bind };
+    api::read_routes()
+        .fallback(asset)
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let policy = policy.clone();
+            async move { host_guard(policy, request, next).await }
+        }))
+        .with_state(state)
 }
 
 /// Output of `npm run build` in `web/`. Empty until the dashboard is built;
