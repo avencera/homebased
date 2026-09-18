@@ -2,14 +2,14 @@
 # Install a homebased binary from GitHub Releases.
 #
 # One-liner (Linux and macOS):
-#   curl -LSfs https://github.com/avencera/homebasd/releases/latest/download/install.sh | sh
+#   curl -LSfs https://github.com/avencera/homebased/releases/latest/download/install.sh | sh
 #
 # Asset names match .github/workflows/release.yml:
 #   homebased-<tag>-<target>.tar.gz
 #
 # Heavily modified from https://github.com/japaric/trust and avencera/rustywind.
 
-DEFAULT_GIT="avencera/homebasd"
+DEFAULT_GIT="avencera/homebased"
 DEFAULT_CRATE="homebased"
 
 help() {
