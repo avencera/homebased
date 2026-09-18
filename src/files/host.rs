@@ -21,7 +21,7 @@ impl HostPolicy {
     /// Whether the `Host` header value is accepted for this bind.
     #[must_use]
     pub fn allows(&self, host_header: &str) -> bool {
-        let host = strip_port(host_header.trim());
+        let host = strip_port(host_header.trim()).trim_end_matches('.');
         if host.is_empty() {
             return false;
         }
@@ -31,12 +31,7 @@ impl HostPolicy {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return is_local_ip(ip) || is_tailscale_ip(ip) || ip == self.bind.ip();
         }
-        // Tailscale MagicDNS names end in .ts.net
-        if is_magic_dns(host) {
-            return true;
-        }
-        // configured literal hostname form of the bind address only when IP
-        false
+        is_magic_dns(host) || is_mdns(host) || is_single_label(host)
     }
 }
 
@@ -97,13 +92,34 @@ fn is_tailscale_ip(ip: IpAddr) -> bool {
 }
 
 fn is_magic_dns(host: &str) -> bool {
+    is_suffix_name(host, ".ts.net")
+}
+
+fn is_mdns(host: &str) -> bool {
+    is_suffix_name(host, ".local")
+}
+
+fn is_single_label(host: &str) -> bool {
+    is_dns_labels(host) && !host.contains('.')
+}
+
+fn is_suffix_name(host: &str, suffix: &str) -> bool {
     let lower = host.to_ascii_lowercase();
-    lower.ends_with(".ts.net")
+    lower.strip_suffix(suffix).is_some_and(is_dns_labels)
+}
+
+fn is_dns_labels(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    !lower.is_empty()
+        && !lower.starts_with('.')
+        && !lower.ends_with('.')
+        && !lower.contains("..")
         && lower
-            .trim_end_matches(".ts.net")
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
-        && !lower.starts_with('.')
+        && lower
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
 }
 
 #[cfg(test)]
@@ -130,9 +146,18 @@ mod tests {
         assert!(p.allows("100.127.0.1:9"));
         assert!(p.allows("my-box.tail1234.ts.net"));
         assert!(p.allows("127.0.0.1"));
+        assert!(p.allows("code"));
+        assert!(p.allows("code:7677"));
+        assert!(p.allows("main"));
+        assert!(p.allows("code.local"));
+        assert!(p.allows("code.local:7677"));
+        assert!(p.allows("Praveens-Mac-mini.local"));
         assert!(!p.allows("evil.example"));
         assert!(!p.allows(""));
         assert!(!p.allows("example.com"));
+        assert!(!p.allows(".local"));
+        assert!(!p.allows("-bad.local"));
+        assert!(!p.allows("foo.ts.nett"));
     }
 
     #[test]

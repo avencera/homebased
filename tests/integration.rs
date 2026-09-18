@@ -2013,7 +2013,11 @@ fn dashboard_file_browser_and_content_origin() {
     let leaked = http_get(&content_addr, "/v1/tasks");
     assert_eq!(leaked.status, 404, "{leaked:?}");
 
-    // unexpected Host is rejected on both origins
+    // LAN short names and mDNS reach both origins; public DNS names do not
+    let lan_host = http_get_host(&addr, "/v1/status", "code.local");
+    assert_eq!(lan_host.status, 200, "{lan_host:?}");
+    let short_host = http_get_host(&addr, "/v1/status", "main");
+    assert_eq!(short_host.status, 200, "{short_host:?}");
     let bad_host = http_get_host(&addr, "/v1/status", "evil.example");
     assert_eq!(bad_host.status, 400, "{bad_host:?}");
     let bad_content = http_get_host(&content_addr, &mirrored, "evil.example");
