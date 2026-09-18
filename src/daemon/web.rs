@@ -1,11 +1,12 @@
-//! Loopback TCP listener: dashboard assets plus the read-only API.
+//! Optional TCP listener: dashboard assets plus the read-only API.
 //!
-//! The Unix socket stays the only place that accepts mutations. A TCP port on
-//! loopback is reachable from any web page the user has open, so this router
-//! never exposes submit or cancel.
+//! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. The Unix
+//! socket stays the only place that accepts mutations. A TCP port is reachable
+//! from any web page the user has open, so this router never exposes submit or
+//! cancel.
 
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use axum::extract::Request;
@@ -24,22 +25,17 @@ use crate::error::AppError;
 use crate::files::{HostPolicy, host_guard};
 use serde_json::json;
 
-/// Default dashboard bind.
+/// Usual dashboard port when an operator opts in.
 pub const DEFAULT_PORT: u16 = 7677;
 
 /// Where the dashboard listens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WebListen {
     /// No TCP listener.
+    #[default]
     Off,
     /// Bind this address. Port `0` picks a free port.
     Addr(SocketAddr),
-}
-
-impl Default for WebListen {
-    fn default() -> Self {
-        Self::Addr(SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT)))
-    }
 }
 
 impl FromStr for WebListen {
@@ -176,6 +172,7 @@ fn not_built() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn parses_off_and_addresses() {
@@ -200,11 +197,14 @@ mod tests {
     }
 
     #[test]
-    fn default_is_loopback_and_round_trips() {
+    fn default_is_off_and_round_trips() {
         let listen = WebListen::default();
-        assert_eq!(listen.to_string(), "127.0.0.1:7677");
+        assert_eq!(listen, WebListen::Off);
+        assert_eq!(listen.to_string(), "off");
         assert_eq!(listen.to_string().parse::<WebListen>().unwrap(), listen);
-        assert_eq!(WebListen::Off.to_string(), "off");
+        let loopback = WebListen::Addr(SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT)));
+        assert_eq!(loopback.to_string(), "127.0.0.1:7677");
+        assert_eq!(loopback.to_string().parse::<WebListen>().unwrap(), loopback);
     }
 
     #[tokio::test]

@@ -38,8 +38,8 @@ pub struct AppState {
     pub stream_slots: StreamSlots,
 }
 
-/// Hold `daemon.lock`, bind the socket and the dashboard port, start actors,
-/// serve until SIGTERM.
+/// Hold `daemon.lock`, bind the socket and optional dashboard port, start
+/// actors, serve until SIGTERM.
 pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
     home.ensure()?;
     let _daemon_lock = acquire_daemon_lock(&home)?;

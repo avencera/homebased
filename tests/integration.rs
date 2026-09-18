@@ -19,8 +19,8 @@ use tempfile::TempDir;
 
 const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
 
-/// `HOMEBASED_WEB_LISTEN` for a harness daemon. Tests run in parallel, so the
-/// default port would be shared; only the dashboard test binds one, on port 0.
+/// `HOMEBASED_WEB_LISTEN` for a harness daemon. The dashboard is off unless a
+/// test opts in; dashboard tests bind `127.0.0.1:0` so they do not share a port.
 const WEB_OFF: &str = "off";
 const WEB_EPHEMERAL: &str = "127.0.0.1:0";
 
@@ -1506,7 +1506,8 @@ fn install_dry_run_text() {
     }
     assert!(!text.contains("HOMEBASED_WEB_LISTEN"), "{text}");
 
-    // the installing shell's bind is baked in, and a bad one fails install
+    // the installing shell's bind is baked in, and a bad one fails install.
+    // unset means the dashboard stays off; the unit does not invent a bind.
     let out = Command::new(&hb)
         .env("HOMEBASED_WEB_LISTEN", "0.0.0.0:7677")
         .args(["daemon", "install", "--dry-run", "--home"])
@@ -1971,6 +1972,53 @@ fn log_tail_returns_the_last_lines() {
         .unwrap();
     let tail = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(tail, "line two\nline three\n");
+}
+
+#[test]
+fn dashboard_off_when_web_listen_unset() {
+    let hb = assert_cmd::cargo::cargo_bin("homebased");
+    let dir = TempDir::new().unwrap();
+    let user_home = dir.path().join("user-home");
+    let home = dir.path().join("state");
+    fs::create_dir_all(&user_home).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new(&hb)
+        .env_remove("HOMEBASED_WEB_LISTEN")
+        .env("HOME", &user_home)
+        .args(["daemon", "serve", "--home"])
+        .arg(&home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = home.join("homebased.sock");
+    let appeared = wait_until(Duration::from_secs(5), || sock.exists());
+    let out = if appeared {
+        Some(
+            Command::new(&hb)
+                .env_remove("HOMEBASED_WEB_LISTEN")
+                .env("HOME", &user_home)
+                .args(["--json", "daemon", "status", "--home"])
+                .arg(&home)
+                .output()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(appeared, "socket did not appear");
+    let out = out.expect("status ran");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["socket"], "up", "{status}");
+    assert!(status["web"].is_null(), "{status}");
 }
 
 #[test]

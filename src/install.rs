@@ -141,8 +141,8 @@ pub fn agent_paths() -> Vec<(&'static str, PathBuf)> {
 }
 
 /// Dashboard bind baked into the unit, when the installing shell sets
-/// `HOMEBASED_WEB_LISTEN`. Validated here so a typo fails `install`, not the
-/// unit at boot.
+/// `HOMEBASED_WEB_LISTEN`. Unset leaves the dashboard off. Validated here so a
+/// typo fails `install`, not the unit at boot.
 pub fn web_listen_env() -> Result<Option<(&'static str, String)>, AppError> {
     let Ok(raw) = std::env::var(WEB_LISTEN_ENV) else {
         return Ok(None);

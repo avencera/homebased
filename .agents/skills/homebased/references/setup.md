@@ -18,6 +18,7 @@ The dashboard is embedded in the binary at compile time, so `just web-build` mus
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install --dry-run
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install
 homebased --json daemon status        # {"socket": "up", "in_flight": 0, "home": "...", "web": "http://0.0.0.0:7677"}
+# without HOMEBASED_WEB_LISTEN, "web" is null and the dashboard is off
 ```
 
 On Praveen's machines, always preserve `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` during install or reinstall. The `main:7677` dashboard depends on this LAN bind. Verify both `http://main:7677/` and `/v1/status` after installation.
@@ -31,16 +32,17 @@ State directory: `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebase
 
 ## Dashboard listener
 
-`daemon serve` binds a read-only HTTP listener for the dashboard, `127.0.0.1:7677` by default. Change it with `--web-listen <addr|off>` or `HOMEBASED_WEB_LISTEN`:
+`daemon serve` does not bind the dashboard unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port:
 
 ```bash
-homebased daemon serve --web-listen off              # socket only
+homebased daemon serve                               # socket only; dashboard off
+homebased daemon serve --web-listen 127.0.0.1:7677   # local dashboard
 HOMEBASED_WEB_LISTEN=127.0.0.1:9000 homebased daemon serve
 HOMEBASED_WEB_LISTEN=100.x.y.z:7677 homebased daemon install   # Tailscale bind
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install   # bake a LAN bind into the host unit
 ```
 
-`daemon install` copies `HOMEBASED_WEB_LISTEN` from the installing shell into the unit, next to `PATH` and the agent paths, and rejects an invalid value. Re-run `install` to change it.
+`daemon install` copies `HOMEBASED_WEB_LISTEN` from the installing shell into the unit, next to `PATH` and the agent paths, and rejects an invalid value. If the env is unset, the unit does not start a dashboard. Re-run `install` to change it.
 
 There is no application login or access token. Network reachability is the access boundary: any peer that can reach the dashboard can read task data and every regular file available to the daemon user through the device-wide file browser. A second content-origin port serves raw files (text, raster images, and fully active HTML inline; other types download). The dashboard and content origins do not grant CORS access to each other. Accepted `Host` values are `localhost`, single-label LAN names, mDNS names (`*.local`), numeric local and Tailscale addresses, the configured bind address, and Tailscale MagicDNS names (`*.ts.net`). Unexpected hosts are rejected.
 

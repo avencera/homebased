@@ -13,7 +13,7 @@ Claude agent workloads use streaming JSON output by default, so `output.log` rec
 
 Submit specs use `api_version: 1` and a `workload` object. A required top-level `name` is the dashboard label. Tasks stored before this field was required keep a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
 
-The dashboard (`127.0.0.1:7677` by default) includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Use loopback locally, or bind a Tailscale address with `--web-listen` / `HOMEBASED_WEB_LISTEN` for remote access on a trusted network. Text, raster images, and HTML open on a separate content origin; other files download.
+The dashboard is off unless you set `--web-listen` / `HOMEBASED_WEB_LISTEN` to a host:port. It includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Use loopback locally (`127.0.0.1:7677`), or bind a Tailscale or LAN address for remote access on a trusted network. Text, raster images, and HTML open on a separate content origin; other files download.
 
 ## For agents
 
@@ -92,7 +92,7 @@ homebased --json daemon status
 
 `daemon status` must report `"socket": "up"`. Linux writes `~/.config/systemd/user/homebased.service`. macOS writes `~/Library/LaunchAgents/dev.praveen.homebased.plist`. Run install from a shell where `codex`, `claude`, `grok`, and the project toolchains are on `PATH`. The unit stores that `PATH` and the absolute agent paths.
 
-The default dashboard bind is `127.0.0.1:7677`. Set `HOMEBASED_WEB_LISTEN` before install to change it, for example `0.0.0.0:7677` on a trusted LAN or a Tailscale address.
+The dashboard is off by default. Set `HOMEBASED_WEB_LISTEN` before install to enable it and bake the bind into the host unit, for example `127.0.0.1:7677` on loopback or `0.0.0.0:7677` on a trusted LAN.
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.
 
@@ -183,7 +183,7 @@ homebased task log <id> --tail 200
 homebased --json task cancel <id>
 ```
 
-Task ids are full UUIDs. Prefix matching does not exist. The dashboard at `http://127.0.0.1:7677` (or the URL in `daemon status`) shows the same data.
+Task ids are full UUIDs. Prefix matching does not exist. When the dashboard is enabled, `daemon status` reports its URL and that page shows the same data.
 
 ### Events
 
