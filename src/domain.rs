@@ -20,10 +20,10 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// Maximum Unicode scalar values in a submitted task name.
 pub const TASK_NAME_MAX_CHARS: usize = 120;
 
-/// Minimum attention timeout. Values below this are rejected at submit.
-pub const MIN_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
+/// Minimum output-inactivity timeout. Values below this are rejected at submit.
+pub const MIN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Default attention timeout when the submitter omits `timeout`.
+/// Default output-inactivity timeout when the submitter omits `timeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 
 /// Maximum length of one report summary.
@@ -707,7 +707,7 @@ pub struct TaskRow {
     pub workload: Workload,
     /// Working directory.
     pub cwd: PathBuf,
-    /// Attention timeout. Reminds the submitter; does not kill the child.
+    /// Output-inactivity timeout. Reminds the submitter; does not kill the child.
     pub timeout: Duration,
     /// Captured caller environment.
     pub env: TaskEnv,

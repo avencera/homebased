@@ -55,7 +55,7 @@ export type ExitReason =
 export type WorkloadView =
 	{ type: 'agent'; agent: AgentKind; model: string | null } | { type: 'task'; command: string[] };
 
-/** Attention-reminder state for the check timeout. */
+/** Inactivity-reminder state for the check timeout. */
 export type CheckTimeoutStatus = 'pending' | 'sent';
 
 /** `GET /v1/status`. */
@@ -87,9 +87,9 @@ export interface TaskSummary {
 	/** Worker pid while running. */
 	pid: number | null;
 	callback: CallbackStatus;
-	/** Attention timer in seconds. */
+	/** Output-inactivity timeout in seconds. */
 	timeout_secs: number;
-	/** Whether the attention reminder is pending or sent. */
+	/** Whether the inactivity reminder is pending or sent. */
 	check_timeout: CheckTimeoutStatus;
 	exit_reason: ExitReason | null;
 	cancel_requested_at: string | null;

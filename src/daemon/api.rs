@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(pointer, "/spec/workload/command/0");
 
         let mut value = valid();
-        value["spec"]["timeout"] = json!("1h");
+        value["spec"]["timeout"] = json!("29m");
         let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
         assert_eq!(pointer, "/spec/timeout");
     }

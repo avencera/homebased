@@ -256,6 +256,21 @@ impl Harness {
         assert_eq!(n, 1, "backdate missed task {id}");
     }
 
+    fn output_log(&self, id: &str) -> PathBuf {
+        self.home.join("tasks").join(id).join("output.log")
+    }
+
+    fn set_timeout_secs(&self, id: &str, secs: u64) {
+        let conn = rusqlite::Connection::open(self.home.join("homebased.sqlite")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET timeout_secs = ?1 WHERE id = ?2",
+                rusqlite::params![secs.to_string(), id],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "timeout update missed task {id}");
+    }
+
     fn set_control(&self, name: &str, body: &str) {
         fs::write(self.record.join(name), body).unwrap();
     }
@@ -492,6 +507,7 @@ fn daemon_restart_keeps_worker() {
     assert_eq!(msgs.len(), 1, "{msgs:?}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn kill9_worker_marks_lost() {
     let h = Harness::new();
@@ -529,19 +545,17 @@ fn kill9_worker_marks_lost() {
     let ev = event_json(&msgs[0]);
     assert_eq!(ev["event"], "TASK_LOST");
     assert_eq!(ev["process"]["kind"], "runner_lost");
-    #[cfg(target_os = "linux")]
-    {
-        let gone = wait_until(Duration::from_secs(5), || {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
-        });
-        assert!(gone, "fake agent {agent_pid} outlived the killed worker");
-    }
+    let gone = wait_until(Duration::from_secs(5), || {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
+    });
+    assert!(gone, "fake agent {agent_pid} outlived the killed worker");
 }
 
 #[test]
 fn attention_reminder_and_cancel() {
     let mut h = Harness::new();
     h.set_control("sleep", "12");
+    // empty output.log is not activity, so a backdated created_at is overdue
     let id = h.submit(&Harness::spec("claude", "attention me"));
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
         == "running"));
@@ -574,7 +588,12 @@ fn attention_reminder_and_cancel() {
         json!({"type": "agent", "agent": "claude", "model": "fable"})
     );
     assert_eq!(h.show(&id)["status"], "running", "child must keep running");
-    assert_eq!(h.show(&id)["check_timeout"], "sent");
+    assert!(
+        wait_until(Duration::from_secs(5), || h.show(&id)["check_timeout"]
+            == "sent"),
+        "check timeout stayed pending after TASK_CHECK_DUE: {}",
+        h.show(&id)
+    );
     let show = h.wait_status(&id, "succeeded");
     assert_eq!(show["status"], "succeeded");
     let terminal = h
@@ -606,6 +625,84 @@ fn attention_reminder_and_cancel() {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent_pid), None).is_err()
     });
     assert!(gone, "cancelled agent {agent_pid} still alive");
+}
+
+#[test]
+fn recent_output_defers_an_overdue_inactivity_check() {
+    let mut h = Harness::new();
+    h.set_control("sleep", "60");
+    h.set_control("stdout", "still working\n");
+    let id = h.submit(&Harness::spec("claude", "keep writing"));
+    assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
+        == "running"));
+    let output = h.output_log(&id);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fs::metadata(&output).map(|m| m.len() != 0).unwrap_or(false)
+        }),
+        "agent never wrote output.log"
+    );
+
+    // created_at is already overdue, but the initial output starts a fresh
+    // inactivity window when the daemon comes back
+    h.stop_daemon();
+    h.backdate_created_at(&id, 5);
+    h.set_timeout_secs(&id, 6);
+    h.start_daemon();
+    thread::sleep(Duration::from_secs(2));
+
+    // write while the timer is armed; this must move the deadline
+    {
+        let mut log = fs::OpenOptions::new().append(true).open(&output).unwrap();
+        log.write_all(b"later\n").unwrap();
+    }
+
+    let fired_while_fresh = wait_until(Duration::from_secs(5), || {
+        h.queue_messages()
+            .iter()
+            .any(|m| event_json(m)["event"] == "TASK_CHECK_DUE")
+    });
+    assert!(
+        !fired_while_fresh,
+        "recent non-empty output must defer TASK_CHECK_DUE: {:?}",
+        h.queue_messages()
+    );
+    assert_eq!(h.show(&id)["status"], "running");
+    assert_eq!(h.show(&id)["check_timeout"], "pending");
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            h.queue_messages()
+                .iter()
+                .any(|m| event_json(m)["event"] == "TASK_CHECK_DUE")
+        }),
+        "no TASK_CHECK_DUE after output went stale: {:?}",
+        h.queue_messages()
+    );
+    let check = h
+        .queue_messages()
+        .iter()
+        .map(|m| event_json(m))
+        .find(|ev| ev["event"] == "TASK_CHECK_DUE")
+        .unwrap();
+    assert!(check["process"].is_null(), "{check}");
+    assert_eq!(check["next_action"], "inspect_task");
+    assert_eq!(check["timeout_secs"], 6);
+    assert_eq!(h.show(&id)["status"], "running", "child must keep running");
+    assert!(
+        wait_until(Duration::from_secs(5), || h.show(&id)["check_timeout"]
+            == "sent"),
+        "check timeout stayed pending after TASK_CHECK_DUE: {}",
+        h.show(&id)
+    );
+
+    let out = h.cmd().args(["task", "cancel", &id]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.wait_status(&id, "cancelled");
 }
 
 #[test]
@@ -1248,10 +1345,19 @@ fn install_dry_run_text() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("KillMode=process"), "{text}");
-    assert!(!text.contains("ExecStop"), "{text}");
-    assert!(text.contains("ExecStart="), "{text}");
-    assert!(text.contains("Environment=PATH="), "{text}");
+    #[cfg(target_os = "linux")]
+    {
+        assert!(text.contains("KillMode=process"), "{text}");
+        assert!(!text.contains("ExecStop"), "{text}");
+        assert!(text.contains("ExecStart="), "{text}");
+        assert!(text.contains("Environment=PATH="), "{text}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(text.contains("<key>AbandonProcessGroup</key>"), "{text}");
+        assert!(text.contains("<key>ProgramArguments</key>"), "{text}");
+        assert!(text.contains("<key>PATH</key>"), "{text}");
+    }
     assert!(!text.contains("HOMEBASED_WEB_LISTEN"), "{text}");
 
     // the installing shell's bind is baked in, and a bad one fails install
@@ -1262,8 +1368,15 @@ fn install_dry_run_text() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
+    #[cfg(target_os = "linux")]
     assert!(
         text.contains("Environment=HOMEBASED_WEB_LISTEN=0.0.0.0:7677"),
+        "{text}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        text.contains("<key>HOMEBASED_WEB_LISTEN</key>")
+            && text.contains("<string>0.0.0.0:7677</string>"),
         "{text}"
     );
     let out = Command::new(&hb)
@@ -2268,7 +2381,7 @@ fn task_workload_success() {
 #[test]
 fn task_workload_nonzero_exit() {
     let h = Harness::new();
-    let id = h.submit(&Harness::task_spec(&["/bin/false"]));
+    let id = h.submit(&Harness::task_spec(&["false"]));
     let show = h.wait_status(&id, "failed");
     assert_eq!(show["exit_reason"]["kind"], "exit");
     assert_ne!(show["exit_reason"]["code"], 0);
@@ -2307,10 +2420,20 @@ fn task_argv_fidelity_empty_and_space_args() {
 }
 
 #[test]
-fn timeout_below_two_hours_rejected() {
+fn timeout_thirty_minutes_is_accepted() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "min timeout");
+    spec["timeout"] = json!("30m");
+    let id = h.submit(&spec);
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(show["timeout_secs"], 30 * 60);
+}
+
+#[test]
+fn timeout_below_thirty_minutes_rejected() {
     let h = Harness::new();
     let mut spec = Harness::spec("claude", "too short");
-    spec["timeout"] = json!("1h");
+    spec["timeout"] = json!("29m");
     let spec_path = h.home.join("spec-short.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     let out = h

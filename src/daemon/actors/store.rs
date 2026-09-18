@@ -78,7 +78,7 @@ pub enum StoreMsg {
         status: CallbackStatus,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Claim the attention reminder while the task is non-terminal.
+    /// Claim the attention reminder while the task is running.
     ClaimAttention {
         id: TaskId,
         reply: RpcReplyPort<Result<bool, AppError>>,

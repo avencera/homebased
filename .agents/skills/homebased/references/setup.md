@@ -15,10 +15,12 @@ The dashboard is embedded in the binary at compile time, so `just web-build` mus
 ## Install the daemon
 
 ```bash
-homebased daemon install --dry-run    # print the unit or plist
-homebased daemon install              # write, verify, enable, start
-homebased --json daemon status        # {"socket": "up", "in_flight": 0, "home": "...", "web": "http://127.0.0.1:7677"}
+HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install --dry-run
+HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install
+homebased --json daemon status        # {"socket": "up", "in_flight": 0, "home": "...", "web": "http://0.0.0.0:7677"}
 ```
+
+On Praveen's machines, always preserve `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` during install or reinstall. The `main:7677` dashboard depends on this LAN bind. Verify both `http://main:7677/` and `/v1/status` after installation.
 
 The unit's `ExecStart` points at the binary that ran `install`, so run it as the installed `homebased`, not `target/debug/homebased`. Install is an idempotent apply. Run it from a shell where `codex`, `claude`, `grok`, and the project toolchains are on `PATH`: the installer bakes that `PATH` and the absolute agent paths (`HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, `HOMEBASED_GROK`) into the unit. Re-run it after `PATH` changes. An agent that is not on `PATH` at install time is silently left out of the unit; only the unit's `PATH` is left to find it later.
 

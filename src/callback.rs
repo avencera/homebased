@@ -109,7 +109,7 @@ impl From<&Workload> for WorkloadView {
 pub enum EventKind {
     /// Interim `--notify` report.
     TaskReported,
-    /// Attention timer expired; child still running.
+    /// Output was inactive for the configured time; child still running.
     TaskCheckDue,
     /// Process cancelled.
     TaskCancelled,
@@ -129,7 +129,7 @@ pub enum EventKind {
 pub enum NextAction {
     /// Read the interim report.
     ReadReport,
-    /// Inspect status and recent logs after an attention reminder.
+    /// Inspect status and recent logs after an inactivity reminder.
     InspectTask,
     /// Nothing further.
     None,
@@ -226,7 +226,7 @@ pub struct HomebasedEvent {
     pub reports: Vec<ReportView>,
     /// Process payload, or null for interim events.
     pub process: Option<ProcessPayload>,
-    /// Configured attention timeout in seconds. Present on check-due events.
+    /// Configured output-inactivity timeout in seconds. Present on check-due events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Suggested next action.
@@ -265,7 +265,7 @@ pub fn lost_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> H
     )
 }
 
-/// Attention-timer reminder. Never changes task status.
+/// Output-inactivity reminder. Never changes task status.
 #[must_use]
 pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
     HomebasedEvent {

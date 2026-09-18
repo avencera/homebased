@@ -1,5 +1,6 @@
-//! One `TaskActor` per non-terminal task: flock watch, apply, attention timer.
+//! One `TaskActor` per non-terminal task: flock watch, apply, inactivity timer.
 
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -9,7 +10,7 @@ use tokio::task::AbortHandle;
 use crate::callback::{ATTENTION_SETTLE, HomebasedEvent, check_due_event, deliver_notify};
 use crate::daemon::actors::callback::CallbackMsg;
 use crate::daemon::actors::{StoreMsg, call};
-use crate::domain::{AttentionState, ExitReason, ProcessStatus, TaskId, TaskRow};
+use crate::domain::{AttentionState, ExitReason, ProcessStatus, TaskId, TaskRow, TaskState};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::store::{self, CancelResult};
@@ -17,9 +18,10 @@ use crate::store::{self, CancelResult};
 /// Retry interval when an attention reminder fails to send.
 const ATTENTION_RETRY: Duration = Duration::from_secs(30);
 
-/// Longest single sleep before the deadline is recomputed from the wall clock.
-/// The attention timer has no product maximum, so bounded hops re-check for
-/// wall-clock changes and keep each sleep within a practical timer limit.
+/// Longest single sleep before the deadline is recomputed from the wall clock
+/// and `output.log` mtime. The inactivity timer has no product maximum, so
+/// bounded hops re-check for wall-clock changes and new output, and keep each
+/// sleep within a practical timer limit.
 const ATTENTION_HOP_MAX: Duration = Duration::from_secs(3600);
 
 /// Per-task messages.
@@ -130,7 +132,11 @@ impl Actor for TaskActor {
             ),
             (AttentionState::Pending, false) => (
                 AttentionPhase::Armed,
-                Some(arm_attention_timer(myself.clone(), &row)),
+                Some(arm_attention_timer(
+                    myself.clone(),
+                    &row,
+                    self.home.task_paths(id).output,
+                )),
             ),
         };
         Ok(TaskWatch {
@@ -160,6 +166,9 @@ impl Actor for TaskActor {
                 }
                 match start_attention_reminder(self, myself.clone(), state.id).await {
                     Ok(AttentionStep::Sending) => state.attention = AttentionPhase::Sending,
+                    Ok(AttentionStep::Deferred(timer)) => {
+                        state.replace_attention_timer(timer);
+                    }
                     Ok(AttentionStep::Done) => state.attention = AttentionPhase::Done,
                     Err(err) => {
                         tracing::warn!(id = %state.id, "attention reminder: {err}");
@@ -193,22 +202,57 @@ impl Actor for TaskActor {
     }
 }
 
-/// Time left before the attention reminder is due, measured from the persisted
-/// creation time. Saturating throughout: neither a timeout near `u64::MAX` nor
-/// a clock that moved backwards can overflow or collapse the wait to zero.
-fn attention_wait(created_at: DateTime<Utc>, timeout: Duration, now: DateTime<Utc>) -> Duration {
-    let elapsed = (now - created_at).to_std().unwrap_or(Duration::ZERO);
+/// Time left before an inactivity reminder is due. Saturating throughout:
+/// neither a timeout near `u64::MAX` nor a clock that moved backwards can
+/// overflow or collapse the wait to zero.
+fn inactivity_wait(
+    created_at: DateTime<Utc>,
+    last_output_at: Option<DateTime<Utc>>,
+    timeout: Duration,
+    now: DateTime<Utc>,
+) -> Duration {
+    let activity_at = last_output_at
+        .filter(|at| *at > created_at)
+        .unwrap_or(created_at);
+    let elapsed = (now - activity_at).to_std().unwrap_or(Duration::ZERO);
     timeout.saturating_sub(elapsed)
 }
 
+/// Modification time of a non-empty `output.log`. An empty or missing file is
+/// not activity: the runner creates the log at spawn.
+fn last_output_at(output: &Path) -> Option<DateTime<Utc>> {
+    let metadata = match std::fs::metadata(output) {
+        Ok(metadata) if metadata.len() != 0 => metadata,
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(path = %output.display(), "output metadata: {err}");
+            return None;
+        }
+    };
+    match metadata.modified() {
+        Ok(modified) => Some(DateTime::<Utc>::from(modified)),
+        Err(err) => {
+            tracing::warn!(path = %output.display(), "output modified time: {err}");
+            None
+        }
+    }
+}
+
 /// Hand-rolled rather than `send_after`: the wait is re-derived from the wall
-/// clock on every hop so a long timeout survives clock changes and suspend.
-fn arm_attention_timer(myself: ActorRef<TaskMsg>, row: &TaskRow) -> AbortHandle {
+/// clock and `output.log` mtime on every hop so a long timeout survives clock
+/// changes, suspend, and new output.
+fn arm_attention_timer(
+    myself: ActorRef<TaskMsg>,
+    row: &TaskRow,
+    output: impl AsRef<Path>,
+) -> AbortHandle {
     let created_at = row.created_at;
     let timeout = row.timeout;
+    let output = output.as_ref().to_path_buf();
     tokio::spawn(async move {
         loop {
-            let wait = attention_wait(created_at, timeout, Utc::now());
+            let wait = inactivity_wait(created_at, last_output_at(&output), timeout, Utc::now());
             if wait.is_zero() {
                 break;
             }
@@ -237,6 +281,8 @@ fn schedule_attention_recovery(myself: &ActorRef<TaskMsg>) -> AbortHandle {
 enum AttentionStep {
     /// A send task now holds the claim and will report back.
     Sending,
+    /// The task has not started or output resumed, so another check is armed.
+    Deferred(AbortHandle),
     /// Nothing to send: already delivered, or the task is terminal.
     Done,
 }
@@ -245,7 +291,7 @@ enum AttentionStep {
 /// task.
 ///
 /// The claim is taken *before* the send. It only succeeds while the task is
-/// non-terminal, and while it is held the terminal callback waits, so a
+/// running, and while it is held the terminal callback waits, so a
 /// terminal transition can neither cancel a reminder already on the wire nor
 /// let its own event overtake one. The delivered timestamp is written only
 /// after the queue send succeeds, so a crash mid-send retries instead of
@@ -258,12 +304,67 @@ async fn start_attention_reminder(
     myself: ActorRef<TaskMsg>,
     id: TaskId,
 ) -> Result<AttentionStep, AppError> {
-    if !call(&actor.store, |reply| StoreMsg::ClaimAttention { id, reply }).await? {
-        return Ok(AttentionStep::Done);
-    }
     let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
         return Ok(AttentionStep::Done);
     };
+
+    match row.state {
+        TaskState::Queued => {
+            return Ok(AttentionStep::Deferred(schedule_attention_retry(&myself)));
+        }
+        TaskState::Running { .. } => {}
+        TaskState::Finished { .. } | TaskState::Lost => return Ok(AttentionStep::Done),
+    }
+
+    let output = actor.home.task_paths(id).output;
+    if !inactivity_wait(
+        row.created_at,
+        last_output_at(&output),
+        row.timeout,
+        Utc::now(),
+    )
+    .is_zero()
+    {
+        return Ok(AttentionStep::Deferred(arm_attention_timer(
+            myself, &row, output,
+        )));
+    }
+
+    if !call(&actor.store, |reply| StoreMsg::ClaimAttention { id, reply }).await? {
+        return Ok(AttentionStep::Done);
+    }
+
+    let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
+        return Ok(AttentionStep::Done);
+    };
+
+    if !matches!(row.state, TaskState::Running { .. }) {
+        call(&actor.store, |reply| StoreMsg::ReleaseAttention {
+            id,
+            reply,
+        })
+        .await?;
+        return Ok(AttentionStep::Done);
+    }
+
+    if !inactivity_wait(
+        row.created_at,
+        last_output_at(&output),
+        row.timeout,
+        Utc::now(),
+    )
+    .is_zero()
+    {
+        call(&actor.store, |reply| StoreMsg::ReleaseAttention {
+            id,
+            reply,
+        })
+        .await?;
+        return Ok(AttentionStep::Deferred(arm_attention_timer(
+            myself, &row, output,
+        )));
+    }
+
     let reports = call(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let event = check_due_event(&row, &reports, actor.home.task_dir(id));
     let home = actor.home.clone();
@@ -436,45 +537,111 @@ mod tests {
     use ractor::Actor;
     use tempfile::tempdir;
 
-    use super::{ATTENTION_HOP_MAX, AttentionPhase, TaskWatch, attention_wait, cancel_task};
+    use super::{
+        ATTENTION_HOP_MAX, AttentionPhase, TaskWatch, cancel_task, inactivity_wait, last_output_at,
+    };
 
     #[test]
-    fn attention_wait_counts_down_from_creation() {
+    fn inactivity_wait_counts_down_from_creation_without_output() {
         let created = Utc::now();
         let timeout = Duration::from_secs(4 * 3600);
-        assert_eq!(attention_wait(created, timeout, created), timeout);
+        assert_eq!(inactivity_wait(created, None, timeout, created), timeout);
         assert_eq!(
-            attention_wait(created, timeout, created + TimeDelta::hours(1)),
+            inactivity_wait(created, None, timeout, created + TimeDelta::hours(1)),
             Duration::from_secs(3 * 3600)
         );
     }
 
     #[test]
-    fn attention_wait_is_zero_once_overdue() {
+    fn inactivity_wait_is_zero_once_overdue() {
         let created = Utc::now();
         let timeout = Duration::from_secs(2 * 3600);
         assert_eq!(
-            attention_wait(created, timeout, created + TimeDelta::hours(3)),
+            inactivity_wait(created, None, timeout, created + TimeDelta::hours(3)),
             Duration::ZERO
         );
     }
 
     #[test]
-    fn attention_wait_survives_a_clock_that_moved_backwards() {
+    fn recent_output_restarts_the_inactivity_window() {
+        let created = Utc::now();
+        let output = created + TimeDelta::hours(2);
+        let now = created + TimeDelta::hours(3);
+        let timeout = Duration::from_secs(2 * 3600);
+        assert_eq!(
+            inactivity_wait(created, Some(output), timeout, now),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn inactivity_wait_is_zero_when_output_is_stale() {
+        let created = Utc::now();
+        let output = created + TimeDelta::hours(1);
+        let now = output + TimeDelta::hours(3);
+        let timeout = Duration::from_secs(2 * 3600);
+        assert_eq!(
+            inactivity_wait(created, Some(output), timeout, now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn inactivity_wait_ignores_output_older_than_creation() {
+        let created = Utc::now();
+        let output = created - TimeDelta::hours(1);
+        let timeout = Duration::from_secs(2 * 3600);
+        assert_eq!(
+            inactivity_wait(
+                created,
+                Some(output),
+                timeout,
+                created + TimeDelta::hours(1)
+            ),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn last_output_at_ignores_missing_and_empty_files() {
+        let dir = tempdir().unwrap();
+        assert_eq!(last_output_at(&dir.path().join("missing.log")), None);
+
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(last_output_at(&empty), None);
+    }
+
+    #[test]
+    fn last_output_at_reads_mtime_of_non_empty_output() {
+        use nix::sys::time::{TimeVal, TimeValLike};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("output.log");
+        std::fs::write(&path, b"bytes").unwrap();
+        let at = Utc::now() - TimeDelta::hours(2);
+        let tv = TimeVal::seconds(at.timestamp());
+        nix::sys::stat::utimes(&path, &tv, &tv).unwrap();
+        let got = last_output_at(&path).unwrap();
+        assert_eq!(got.timestamp(), at.timestamp());
+    }
+
+    #[test]
+    fn inactivity_wait_survives_a_clock_that_moved_backwards() {
         let created = Utc::now();
         let timeout = Duration::from_secs(2 * 3600);
         // a backwards clock must not shorten the wait, and must not panic
         assert_eq!(
-            attention_wait(created, timeout, created - TimeDelta::hours(5)),
+            inactivity_wait(created, None, timeout, created - TimeDelta::hours(5)),
             timeout
         );
     }
 
     #[test]
-    fn attention_wait_handles_a_timeout_wider_than_any_instant() {
+    fn inactivity_wait_handles_a_timeout_wider_than_any_instant() {
         let created = Utc::now();
         let huge = Duration::from_secs(u64::MAX);
-        let wait = attention_wait(created, huge, created + TimeDelta::hours(1));
+        let wait = inactivity_wait(created, None, huge, created + TimeDelta::hours(1));
         assert_eq!(wait, huge - Duration::from_secs(3600));
         // hops keep each sleep within a practical timer limit
         assert_eq!(wait.min(ATTENTION_HOP_MAX), ATTENTION_HOP_MAX);

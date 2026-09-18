@@ -53,6 +53,7 @@ pub fn build_agent_invocation(
             args.push("--permission-mode".into());
             args.push("auto".into());
             args.push("--no-session-persistence".into());
+            add_claude_output_defaults(&mut args, inputs.extra_args);
             (args, StdinPolicy::PromptFeed)
         }
         AgentKind::Grok => {
@@ -79,6 +80,44 @@ pub fn build_agent_invocation(
     }
 }
 
+/// Claude live output needs `stream-json` plus `--verbose`. Extra args are
+/// inspected here and appended later, so an explicit format is not duplicated.
+fn add_claude_output_defaults(args: &mut Vec<String>, extra_args: &[String]) {
+    let mut output_format = OutputFormatArg::Absent;
+    let mut index = 0;
+    while index < extra_args.len() {
+        let arg = &extra_args[index];
+        if let Some(value) = arg.strip_prefix("--output-format=") {
+            output_format = OutputFormatArg::Value(value);
+        } else if arg == "--output-format" {
+            output_format = match extra_args.get(index + 1) {
+                Some(value) => OutputFormatArg::Value(value),
+                None => OutputFormatArg::MissingValue,
+            };
+            index += 1;
+        }
+        index += 1;
+    }
+    if output_format == OutputFormatArg::Absent {
+        args.push("--output-format".into());
+        args.push("stream-json".into());
+    }
+    if matches!(
+        output_format,
+        OutputFormatArg::Absent | OutputFormatArg::Value("stream-json")
+    ) && !extra_args.iter().any(|arg| arg == "--verbose")
+    {
+        args.push("--verbose".into());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormatArg<'a> {
+    Absent,
+    MissingValue,
+    Value(&'a str),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +136,23 @@ mod tests {
         )
     }
 
+    fn claude_with_extra(extra: &[String]) -> ChildInvocation {
+        build_agent_invocation(
+            AgentArgvInputs {
+                kind: AgentKind::Claude,
+                model: None,
+                cwd: Path::new("/work"),
+                extra_args: extra,
+            },
+            Path::new("/bin/agent"),
+            Path::new("/state/tasks/id/prompt.feed.txt"),
+        )
+    }
+
+    fn count_arg(args: &[String], flag: &str) -> usize {
+        args.iter().filter(|arg| *arg == flag).count()
+    }
+
     #[test]
     fn claude_argv() {
         let argv = build(
@@ -113,10 +169,89 @@ mod tests {
                 "--permission-mode",
                 "auto",
                 "--no-session-persistence",
+                "--output-format",
+                "stream-json",
                 "--verbose",
             ]
         );
         assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
+    }
+
+    #[test]
+    fn claude_defaults_to_streaming_json_and_verbose() {
+        let args = claude_with_extra(&[]).to_vec();
+        assert_eq!(
+            args,
+            vec![
+                "/bin/agent",
+                "-p",
+                "--permission-mode",
+                "auto",
+                "--no-session-persistence",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_keeps_a_single_verbose_when_extra_args_already_has_it() {
+        let extra = vec!["--verbose".into()];
+        let args = claude_with_extra(&extra).to_vec();
+        assert_eq!(count_arg(&args, "--output-format"), 1);
+        assert_eq!(count_arg(&args, "stream-json"), 1);
+        assert_eq!(count_arg(&args, "--verbose"), 1);
+    }
+
+    #[test]
+    fn claude_explicit_output_format_replaces_streaming_default() {
+        let extra = vec!["--output-format=json".into()];
+        let args = claude_with_extra(&extra).to_vec();
+        assert!(args.contains(&"--output-format=json".to_string()));
+        assert!(!args.contains(&"stream-json".to_string()));
+        assert!(!args.contains(&"--verbose".to_string()));
+        assert_eq!(count_arg(&args, "--output-format"), 0);
+    }
+
+    #[test]
+    fn claude_explicit_space_separated_json_skips_streaming_defaults() {
+        let extra = vec!["--output-format".into(), "json".into()];
+        let args = claude_with_extra(&extra).to_vec();
+        assert_eq!(count_arg(&args, "--output-format"), 1);
+        assert!(!args.contains(&"stream-json".to_string()));
+        assert!(!args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn claude_explicit_streaming_format_gets_required_verbose_flag() {
+        let extra = vec!["--output-format".into(), "stream-json".into()];
+        let args = claude_with_extra(&extra).to_vec();
+        assert_eq!(count_arg(&args, "--output-format"), 1);
+        assert_eq!(count_arg(&args, "stream-json"), 1);
+        assert_eq!(count_arg(&args, "--verbose"), 1);
+    }
+
+    #[test]
+    fn claude_equals_streaming_format_gets_a_single_verbose_flag() {
+        let extra = vec!["--output-format=stream-json".into()];
+        let args = claude_with_extra(&extra).to_vec();
+        assert!(args.contains(&"--output-format=stream-json".to_string()));
+        assert_eq!(count_arg(&args, "--output-format"), 0);
+        assert_eq!(count_arg(&args, "--verbose"), 1);
+    }
+
+    #[test]
+    fn claude_uses_the_last_explicit_output_format() {
+        let extra = vec![
+            "--output-format=json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+        ];
+        let args = claude_with_extra(&extra).to_vec();
+        assert_eq!(count_arg(&args, "--verbose"), 1);
+        assert_eq!(count_arg(&args, "--output-format"), 1);
+        assert_eq!(count_arg(&args, "--output-format=json"), 1);
     }
 
     #[test]

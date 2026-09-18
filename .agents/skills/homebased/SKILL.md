@@ -5,7 +5,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 
 # Homebased
 
-`homebased` is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages back to the submitting Codex thread. A task is either an `agent` workload (Codex, Claude, or Grok with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, send a check reminder when the attention timeout expires, cancel only on explicit request, and deliver the terminal callback. The orchestrator submits a JSON spec, ends its turn, and acts when events arrive.
+`homebased` is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages back to the submitting Codex thread. A task is either an `agent` workload (Codex, Claude, or Grok with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, detect a live task that has stopped writing output, cancel only on explicit request, and deliver callbacks. The orchestrator submits a JSON spec, ends its turn, and acts when events arrive.
 
 ## Rules that hold everywhere
 
@@ -14,10 +14,13 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
 - Use `homebased daemon stop` or `homebased daemon restart`, never raw `systemctl` or `launchctl`, so in-flight tasks are protected.
+- On Praveen's machines, every daemon install or reinstall must set `HOMEBASED_WEB_LISTEN=0.0.0.0:7677`; do not replace the `main:7677` LAN listener with the loopback default.
 - Task ids are full UUIDs. Prefix matching does not exist.
 - Delivery is at-least-once. Treat a repeated event for the same task and event name as a duplicate, not a new result.
 - Prefer `workload.type: "task"` for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
-- `timeout` is an attention timer (default 4h, minimum 2h). It sends `TASK_CHECK_DUE` and never kills the child.
+- `timeout` measures output inactivity (default 4h, minimum 30m). Any non-empty write to `output.log` restarts the window. It sends `TASK_CHECK_DUE` and never kills the child.
+- Use `timeout: "30m"` for a bounded review. Use `timeout: "1h"` for a large or tool-heavy review. Do not leave the 4h default on a bounded review.
+- Claude streams JSON output by default. Set `--output-format` in `extra_args` only when the task needs another format.
 
 ## Route
 

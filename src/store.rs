@@ -14,7 +14,7 @@ use crate::domain::{
 };
 use crate::error::AppError;
 
-/// `timeout_secs` is decimal TEXT, not INTEGER: the attention timer has no
+/// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
 /// in SQLite's signed INTEGER without a lossy cast.
 const SCHEMA: &str = r"
@@ -346,16 +346,16 @@ impl Store {
         Ok(())
     }
 
-    /// Claim the attention reminder: `pending|sending` → `sending`, and only
-    /// while the task is non-terminal. A persisted `sending` owner must be
-    /// released only after its bounded delivery process can no longer exist.
+    /// Claim the attention reminder: `pending` → `sending`, and only while
+    /// the task is running. A persisted `sending` owner must be released
+    /// only after its bounded delivery process can no longer exist.
     /// `false` means the reminder must not be sent.
     pub fn claim_attention(&self, id: TaskId) -> Result<bool, AppError> {
         let n = self.conn.execute(
             "UPDATE tasks SET attention_state = 'sending', updated_at = ?1
              WHERE id = ?2
                AND attention_state = 'pending'
-               AND status IN ('queued', 'running')",
+               AND status = 'running'",
             params![fmt_time(Utc::now()), id.to_string()],
         )?;
         Ok(n == 1)
@@ -488,7 +488,7 @@ fn fmt_time(ts: DateTime<Utc>) -> String {
 }
 
 /// Whole seconds as decimal text. `u64` is wider than SQLite's INTEGER, and
-/// the attention timer has no product maximum.
+/// the inactivity timer has no product maximum.
 fn fmt_timeout(timeout: Duration) -> String {
     timeout.as_secs().to_string()
 }
@@ -600,7 +600,7 @@ pub struct NewTask {
     pub workload: Workload,
     /// Working directory.
     pub cwd: std::path::PathBuf,
-    /// Attention timeout.
+    /// Output-inactivity timeout.
     pub timeout: Duration,
     /// Captured env.
     pub env: TaskEnv,
@@ -886,6 +886,9 @@ CREATE TABLE reports (
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
         store.insert_task(&agent_row(id)).unwrap();
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap();
         assert_eq!(
             store.require_task(id).unwrap().attention,
             AttentionState::Pending
@@ -911,6 +914,9 @@ CREATE TABLE reports (
         let store = Store::open(&dir.path().join("db")).unwrap();
         let id = TaskId::new();
         store.insert_task(&agent_row(id)).unwrap();
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap();
         assert!(store.claim_attention(id).unwrap());
         store.release_attention(id).unwrap();
         assert_eq!(
@@ -920,6 +926,19 @@ CREATE TABLE reports (
         assert!(store.claim_attention(id).unwrap());
         // one live claim has one owner until delivery or explicit release
         assert!(!store.claim_attention(id).unwrap());
+    }
+
+    #[test]
+    fn attention_cannot_be_claimed_while_queued() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        store.insert_task(&agent_row(id)).unwrap();
+        assert!(!store.claim_attention(id).unwrap());
+        assert_eq!(
+            store.require_task(id).unwrap().attention,
+            AttentionState::Pending
+        );
     }
 
     #[test]

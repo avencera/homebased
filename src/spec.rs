@@ -13,7 +13,7 @@ use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskNa
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 
-/// Default attention timeout.
+/// Default output-inactivity timeout.
 #[must_use]
 pub fn default_timeout() -> Duration {
     DEFAULT_TIMEOUT
@@ -33,7 +33,7 @@ fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
         "default": "4h",
-        "description": "Attention timer as a humantime duration. Default 4h. Minimum 2h. Does not kill the child."
+        "description": "Output-inactivity timer as a humantime duration. Default 4h. Minimum 30m. Does not kill the child."
     })
 }
 
@@ -90,7 +90,7 @@ struct SubmitSpecWire {
     name: Option<TaskName>,
     /// Working directory for the child.
     cwd: PathBuf,
-    /// Attention timer. Default 4h, minimum 2h.
+    /// Output-inactivity timer. Default 4h, minimum 30m.
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
@@ -259,7 +259,7 @@ pub struct SubmitSpec {
     pub name: Option<TaskName>,
     /// Working directory for the child.
     pub cwd: PathBuf,
-    /// Attention timeout.
+    /// Output-inactivity timeout.
     pub timeout: Duration,
     /// Workload variant.
     pub workload: SubmitWorkloadValidated,
@@ -315,7 +315,7 @@ pub struct NormalizedSpec {
     pub name: Option<TaskName>,
     /// Working directory.
     pub cwd: PathBuf,
-    /// Attention timeout.
+    /// Output-inactivity timeout.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     /// Workload variant.
@@ -739,9 +739,9 @@ mod tests {
     }
 
     #[test]
-    fn timeout_below_two_hours_rejected() {
+    fn timeout_below_thirty_minutes_rejected() {
         let mut value = valid_task();
-        value["timeout"] = json!("1h");
+        value["timeout"] = json!("29m");
         let err = parse_spec_value(&value).unwrap_err();
         match err {
             AppError::InvalidSpec { pointer, .. } => assert_eq!(pointer, "/timeout"),
@@ -750,11 +750,11 @@ mod tests {
     }
 
     #[test]
-    fn timeout_two_hours_accepted() {
+    fn timeout_thirty_minutes_accepted() {
         let mut value = valid_task();
-        value["timeout"] = json!("2h");
+        value["timeout"] = json!("30m");
         let spec = parse_spec_value(&value).unwrap();
-        assert_eq!(spec.timeout, Duration::from_secs(2 * 3600));
+        assert_eq!(spec.timeout, Duration::from_secs(30 * 60));
     }
 
     #[test]
@@ -1046,7 +1046,7 @@ mod tests {
             "api_version": 1,
             "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
             "cwd": "/tmp",
-            "timeout": "30m",
+            "timeout": "29m",
             "workload": { "type": "task", "command": ["true"] }
         });
         let err = parse_normalized_value(&value).unwrap_err();

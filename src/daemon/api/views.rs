@@ -28,7 +28,7 @@ pub struct StatusBody {
     pub in_flight: usize,
 }
 
-/// Attention-reminder state for the check timeout. Public and two-valued: a
+/// Inactivity-reminder state for the check timeout. Public and two-valued: a
 /// send that is still in flight has not been delivered, so it reads `pending`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,9 +61,9 @@ pub struct TaskSummary {
     pub pid: Option<i32>,
     /// Callback delivery state.
     pub callback: CallbackStatus,
-    /// Attention timer in seconds.
+    /// Output-inactivity timeout in seconds.
     pub timeout_secs: u64,
-    /// Whether the attention reminder is pending or sent.
+    /// Whether the inactivity reminder is pending or sent.
     pub check_timeout: CheckTimeoutStatus,
     /// Why the process ended, once known.
     pub exit_reason: Option<ExitReason>,

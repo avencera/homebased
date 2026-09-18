@@ -7,7 +7,9 @@ Homebasd runs two workload variants under the same detached lifecycle:
 - `agent` — Codex, Claude, or Grok with a prompt and optional reporting trailer
 - `task` — an arbitrary argv array such as `cargo build --release` or `gh pr checks --watch` (no shell)
 
-`timeout` is an attention timer (default 4h, minimum 2h). When it expires, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
+Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`.
+
+`timeout` is an output-inactivity timer (default 4h, minimum 30m). Homebasd resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
 Submit specs use `api_version: 1` and a `workload` object. An optional top-level `name` sets the dashboard label; unnamed tasks get a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
 
