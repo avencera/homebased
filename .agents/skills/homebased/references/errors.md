@@ -33,7 +33,8 @@ Errors go to stderr. With `--json` they are one object:
 | `task_terminal` | 5 | Report or cancel target has already exited. | Nothing to do. Resubmit if more work is needed. |
 | `daemon_already_running` | 5 | `daemon serve` while another instance holds `daemon.lock`. | Use the existing daemon. |
 | `tasks_in_flight` | 5 | `daemon stop` or `uninstall` with queued or running tasks. | Wait for the events, or pass `--yes` to cancel every in-flight task first. Confirm with the user before `--yes`. |
-| `unit_invalid` | 1 | Generated systemd unit failed `systemd-analyze --user verify`. | Run `homebased daemon install --dry-run` and report the unit text to the user. |
+| `host_unit_home_mismatch` | 5 | `daemon uninstall` while the installed unit's `--home` is a different state directory. `input.selected` and `input.configured` name both homes. | Run uninstall with `--home` / `HOMEBASED_HOME` set to the configured home, or install over the unit from the home you intend to manage. |
+| `unit_invalid` | 1 | Generated unit failed `systemd-analyze --user verify` / `plutil`, or an existing unit's daemon invocation could not be parsed. | Run `homebased daemon install --dry-run` and report the unit text to the user. |
 
 ## Socket down while tasks run
 

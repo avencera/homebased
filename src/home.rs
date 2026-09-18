@@ -17,6 +17,8 @@ pub const DB_NAME: &str = "homebased.sqlite";
 pub const DAEMON_LOCK: &str = "daemon.lock";
 /// Log that records callbacks `codex queue` could not deliver.
 pub const FALLBACK_LOG: &str = "callback-fallback.log";
+/// Per-task process-shared lock that serializes callback delivery.
+pub const DELIVERY_LOCK: &str = "delivery.lock";
 
 /// Resolved state root plus helpers for the on-disk layout.
 #[derive(Debug, Clone)]
@@ -147,6 +149,8 @@ pub struct TaskPaths {
     pub exit_json: PathBuf,
     /// `codex queue` stdout/stderr.
     pub callback_log: PathBuf,
+    /// Process-shared callback delivery lock.
+    pub delivery_lock: PathBuf,
 }
 
 impl TaskPaths {
@@ -159,6 +163,7 @@ impl TaskPaths {
             runner_lock: dir.join("runner.lock"),
             exit_json: dir.join("exit.json"),
             callback_log: dir.join("callback.log"),
+            delivery_lock: dir.join(DELIVERY_LOCK),
             dir,
         }
     }
@@ -359,6 +364,7 @@ mod tests {
         assert!(paths.runner_lock.ends_with("runner.lock"));
         assert!(paths.exit_json.ends_with("exit.json"));
         assert!(paths.callback_log.ends_with("callback.log"));
+        assert!(paths.delivery_lock.ends_with("delivery.lock"));
     }
 
     #[test]

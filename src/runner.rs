@@ -27,6 +27,7 @@ use crate::report::REPORT_TRAILER;
 use crate::store::{self, Store};
 
 const KILL_GRACE: Duration = Duration::from_secs(10);
+const KILL_REAP_GRACE: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(50);
 
 /// Spawn `homebased task-run` with an inherited exclusive flock.
@@ -206,7 +207,7 @@ async fn run_child(
             let cancelled = store.require_task(id)?.cancel_requested_at.is_some();
             warn!(%id, cancelled, "SIGTERM: forwarding to child group");
             forward_sigterm(child_pgid);
-            wait_child_then_cleanup(&mut child, child_pgid).await;
+            cancel_child_group(&mut child, child_pgid).await;
             if cancelled {
                 Ok(ExitReason::Cancelled)
             } else {
@@ -237,11 +238,34 @@ fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<Exit
     })
 }
 
-async fn wait_child_then_cleanup(child: &mut tokio::process::Child, child_pgid: i32) {
-    let _ = time::timeout(KILL_GRACE, child.wait()).await;
-    cleanup_process_group(child_pgid).await;
-    if let Err(err) = child.wait().await {
-        warn!(child_pgid, "wait after group cleanup: {err}");
+/// Reap the direct child while giving the full group one shared TERM grace.
+async fn cancel_child_group(child: &mut tokio::process::Child, child_pgid: i32) {
+    let deadline = time::Instant::now() + KILL_GRACE;
+    let mut child_reaped = false;
+    loop {
+        if !child_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => child_reaped = true,
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(child_pgid, "reap cancelled child: {err}");
+                    child_reaped = true;
+                }
+            }
+        }
+        if !process_group_alive(child_pgid) || time::Instant::now() >= deadline {
+            break;
+        }
+        time::sleep(GROUP_POLL).await;
+    }
+
+    if process_group_alive(child_pgid)
+        && let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGKILL)
+    {
+        warn!(child_pgid, "SIGKILL child group: {err}");
+    }
+    if !child_reaped && let Err(err) = time::timeout(KILL_REAP_GRACE, child.wait()).await {
+        warn!(child_pgid, "reap cancelled child timed out: {err}");
     }
 }
 
@@ -259,7 +283,7 @@ async fn cleanup_process_group(child_pgid: i32) {
         if let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGKILL) {
             warn!(child_pgid, "SIGKILL child group: {err}");
         }
-        let deadline = time::Instant::now() + KILL_GRACE;
+        let deadline = time::Instant::now() + KILL_REAP_GRACE;
         while process_group_alive(child_pgid) && time::Instant::now() < deadline {
             time::sleep(GROUP_POLL).await;
         }
@@ -347,6 +371,7 @@ mod tests {
             runner_lock: dir.path().join("runner.lock"),
             exit_json: dir.path().join("exit.json"),
             callback_log: dir.path().join("callback.log"),
+            delivery_lock: dir.path().join("delivery.lock"),
             dir: dir.path().to_path_buf(),
         };
         std::fs::create_dir_all(&paths.dir).unwrap();

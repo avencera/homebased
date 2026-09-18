@@ -86,6 +86,18 @@ pub enum AppError {
         /// Validator output.
         message: String,
     },
+    /// Uninstall refused because the host unit belongs to another home.
+    #[error(
+        "host unit belongs to another home (selected {}, configured {})",
+        selected.display(),
+        configured.display()
+    )]
+    HostUnitHomeMismatch {
+        /// Home selected by this command.
+        selected: PathBuf,
+        /// Home recorded in the installed unit.
+        configured: PathBuf,
+    },
     /// Usage error (conflicting flags, bad UUID).
     #[error("{message}")]
     Usage {
@@ -123,6 +135,7 @@ impl AppError {
             Self::LockHeld { .. } => "lock_held",
             Self::TasksInFlight { .. } => "tasks_in_flight",
             Self::UnitInvalid { .. } => "unit_invalid",
+            Self::HostUnitHomeMismatch { .. } => "host_unit_home_mismatch",
             Self::Usage { .. } => "usage",
             Self::Permission { .. } => "permission",
             Self::Internal { .. } => "internal",
@@ -145,7 +158,8 @@ impl AppError {
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::DaemonAlreadyRunning
-            | Self::TasksInFlight { .. } => 5,
+            | Self::TasksInFlight { .. }
+            | Self::HostUnitHomeMismatch { .. } => 5,
         }
     }
 
@@ -163,7 +177,8 @@ impl AppError {
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::DaemonAlreadyRunning
-            | Self::TasksInFlight { .. } => http::StatusCode::CONFLICT,
+            | Self::TasksInFlight { .. }
+            | Self::HostUnitHomeMismatch { .. } => http::StatusCode::CONFLICT,
             Self::DaemonUnavailable { .. }
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
@@ -194,6 +209,10 @@ impl AppError {
             Self::Usage { message } => json!({ "message": message }),
             Self::Permission { message } => json!({ "message": message }),
             Self::UnitInvalid { message } => json!({ "message": message }),
+            Self::HostUnitHomeMismatch {
+                selected,
+                configured,
+            } => json!({ "selected": selected, "configured": configured }),
             Self::Internal { message } => json!({ "message": message }),
             Self::DaemonUnavailable { message } => json!({ "message": message }),
             Self::DaemonAlreadyRunning => json!({}),

@@ -1,14 +1,15 @@
-//! One `TaskActor` per non-terminal task: flock watch, apply, cancel, attention timer.
+//! One `TaskActor` per non-terminal task: flock watch, apply, attention timer.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use ractor::{Actor, ActorProcessingErr, ActorRef};
+use tokio::task::AbortHandle;
 
-use crate::callback::{HomebasedEvent, check_due_event, deliver_notify, exit_event, lost_event};
+use crate::callback::{ATTENTION_SETTLE, HomebasedEvent, check_due_event, deliver_notify};
 use crate::daemon::actors::callback::CallbackMsg;
-use crate::daemon::actors::{StoreMsg, call_store, send_reply};
-use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskRow, TaskState};
+use crate::daemon::actors::{StoreMsg, call};
+use crate::domain::{AttentionState, ExitReason, ProcessStatus, TaskId, TaskRow};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::store::{self, CancelResult};
@@ -25,12 +26,10 @@ const ATTENTION_HOP_MAX: Duration = Duration::from_secs(3600);
 pub enum TaskMsg {
     /// `runner.lock` is free; apply `exit.json` or Lost.
     LockReleased,
-    /// Cancel this task.
-    Cancel {
-        reply: RpcReplyPort<Result<CancelResult, AppError>>,
-    },
     /// Attention timer fired or a failed send should retry.
     AttentionDue,
+    /// A prior daemon's bounded attention sender can no longer be alive.
+    AttentionRecoveryDue,
     /// One attention send finished. Reported by the send task so the actor
     /// mailbox stays free while `codex queue` runs.
     AttentionSettled {
@@ -57,6 +56,8 @@ enum AttentionPhase {
     Armed,
     /// A send task holds the claim and will report back.
     Sending,
+    /// A prior daemon owns the persisted claim until its sender bound passes.
+    Recovering,
     /// Delivered, or the task went terminal; no further reminder.
     Done,
 }
@@ -65,6 +66,26 @@ enum AttentionPhase {
 pub struct TaskWatch {
     id: TaskId,
     attention: AttentionPhase,
+    attention_timer: Option<AbortHandle>,
+}
+
+impl TaskWatch {
+    fn replace_attention_timer(&mut self, timer: AbortHandle) {
+        self.cancel_attention_timer();
+        self.attention_timer = Some(timer);
+    }
+
+    fn cancel_attention_timer(&mut self) {
+        if let Some(timer) = self.attention_timer.take() {
+            timer.abort();
+        }
+    }
+}
+
+impl Drop for TaskWatch {
+    fn drop(&mut self) {
+        self.cancel_attention_timer();
+    }
 }
 
 impl Actor for TaskActor {
@@ -82,7 +103,7 @@ impl Actor for TaskActor {
         // uninterruptible and the tokio blocking pool waits for every thread on
         // runtime drop, which would hold `serve` open past SIGTERM until the
         // worker exits (REQ-23, DEC-21). This thread may outlive the runtime;
-        // the cast simply fails once the actor is gone.
+        // the cast simply fails once the actor is gone
         let watch = myself.clone();
         std::thread::Builder::new()
             .name(format!("hb-lock-{id}"))
@@ -98,16 +119,25 @@ impl Actor for TaskActor {
                 message: format!("spawn lock watch thread: {err}"),
             })?;
 
-        let row = call_store(&self.store, |reply| StoreMsg::GetTask { id, reply })
+        let row = call(&self.store, |reply| StoreMsg::GetTask { id, reply })
             .await?
             .ok_or(AppError::TaskNotFound { id })?;
-        let attention = if row.attention.is_delivered() || row.state.is_terminal() {
-            AttentionPhase::Done
-        } else {
-            arm_attention_timer(myself.clone(), &row);
-            AttentionPhase::Armed
+        let (attention, attention_timer) = match (&row.attention, row.state.is_terminal()) {
+            (_, true) | (AttentionState::Delivered { .. }, false) => (AttentionPhase::Done, None),
+            (AttentionState::Sending, false) => (
+                AttentionPhase::Recovering,
+                Some(schedule_attention_recovery(&myself)),
+            ),
+            (AttentionState::Pending, false) => (
+                AttentionPhase::Armed,
+                Some(arm_attention_timer(myself.clone(), &row)),
+            ),
         };
-        Ok(TaskWatch { id, attention })
+        Ok(TaskWatch {
+            id,
+            attention,
+            attention_timer,
+        })
     }
 
     async fn handle(
@@ -123,13 +153,8 @@ impl Actor for TaskActor {
                 }
                 myself.stop(None);
             }
-            TaskMsg::Cancel { reply } => {
-                send_reply(
-                    reply,
-                    cancel_task(&self.store, &self.callback, &self.home, state.id).await,
-                );
-            }
             TaskMsg::AttentionDue => {
+                state.cancel_attention_timer();
                 if state.attention != AttentionPhase::Armed {
                     return Ok(());
                 }
@@ -138,16 +163,29 @@ impl Actor for TaskActor {
                     Ok(AttentionStep::Done) => state.attention = AttentionPhase::Done,
                     Err(err) => {
                         tracing::warn!(id = %state.id, "attention reminder: {err}");
-                        schedule_attention_retry(myself.clone());
+                        state.replace_attention_timer(schedule_attention_retry(&myself));
                     }
                 }
+            }
+            TaskMsg::AttentionRecoveryDue => {
+                state.cancel_attention_timer();
+                if state.attention != AttentionPhase::Recovering {
+                    return Ok(());
+                }
+                call(&self.store, |reply| StoreMsg::ReleaseAttention {
+                    id: state.id,
+                    reply,
+                })
+                .await?;
+                state.attention = AttentionPhase::Armed;
+                myself.cast(TaskMsg::AttentionDue)?;
             }
             TaskMsg::AttentionSettled { delivered } => {
                 if delivered {
                     state.attention = AttentionPhase::Done;
                 } else {
                     state.attention = AttentionPhase::Armed;
-                    schedule_attention_retry(myself.clone());
+                    state.replace_attention_timer(schedule_attention_retry(&myself));
                 }
             }
         }
@@ -163,7 +201,9 @@ fn attention_wait(created_at: DateTime<Utc>, timeout: Duration, now: DateTime<Ut
     timeout.saturating_sub(elapsed)
 }
 
-fn arm_attention_timer(myself: ActorRef<TaskMsg>, row: &TaskRow) {
+/// Hand-rolled rather than `send_after`: the wait is re-derived from the wall
+/// clock on every hop so a long timeout survives clock changes and suspend.
+fn arm_attention_timer(myself: ActorRef<TaskMsg>, row: &TaskRow) -> AbortHandle {
     let created_at = row.created_at;
     let timeout = row.timeout;
     tokio::spawn(async move {
@@ -177,16 +217,20 @@ fn arm_attention_timer(myself: ActorRef<TaskMsg>, row: &TaskRow) {
         if let Err(err) = myself.cast(TaskMsg::AttentionDue) {
             tracing::debug!("attention timer cast: {err}");
         }
-    });
+    })
+    .abort_handle()
 }
 
-fn schedule_attention_retry(myself: ActorRef<TaskMsg>) {
-    tokio::spawn(async move {
-        tokio::time::sleep(ATTENTION_RETRY).await;
-        if let Err(err) = myself.cast(TaskMsg::AttentionDue) {
-            tracing::debug!("attention retry cast: {err}");
-        }
-    });
+fn schedule_attention_retry(myself: &ActorRef<TaskMsg>) -> AbortHandle {
+    myself
+        .send_after(ATTENTION_RETRY, || TaskMsg::AttentionDue)
+        .abort_handle()
+}
+
+fn schedule_attention_recovery(myself: &ActorRef<TaskMsg>) -> AbortHandle {
+    myself
+        .send_after(ATTENTION_SETTLE, || TaskMsg::AttentionRecoveryDue)
+        .abort_handle()
 }
 
 /// Outcome of starting one attention attempt.
@@ -207,20 +251,20 @@ enum AttentionStep {
 /// after the queue send succeeds, so a crash mid-send retries instead of
 /// silently swallowing the reminder.
 ///
-/// `codex queue` can take seconds; it runs off the actor so a cancel arriving
-/// mid-send is still answered.
+/// `codex queue` can take seconds; it runs off the actor so the mailbox stays
+/// responsive mid-send.
 async fn start_attention_reminder(
     actor: &TaskActor,
     myself: ActorRef<TaskMsg>,
     id: TaskId,
 ) -> Result<AttentionStep, AppError> {
-    if !call_store(&actor.store, |reply| StoreMsg::ClaimAttention { id, reply }).await? {
+    if !call(&actor.store, |reply| StoreMsg::ClaimAttention { id, reply }).await? {
         return Ok(AttentionStep::Done);
     }
-    let Some(row) = call_store(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
+    let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
         return Ok(AttentionStep::Done);
     };
-    let reports = call_store(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
+    let reports = call(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let event = check_due_event(&row, &reports, actor.home.task_dir(id));
     let home = actor.home.clone();
     let store = actor.store.clone();
@@ -252,7 +296,7 @@ async fn finish_attention_send(
     let outcome = match sent {
         Ok(()) => {
             tracing::info!(%id, "attention reminder sent");
-            call_store(store, |reply| StoreMsg::MarkAttentionDelivered {
+            call(store, |reply| StoreMsg::MarkAttentionDelivered {
                 id,
                 reply,
             })
@@ -260,7 +304,7 @@ async fn finish_attention_send(
         }
         Err(err) => {
             tracing::warn!(%id, "attention notify failed: {err}");
-            call_store(store, |reply| StoreMsg::ReleaseAttention { id, reply }).await
+            call(store, |reply| StoreMsg::ReleaseAttention { id, reply }).await
         }
     };
     if let Err(err) = outcome {
@@ -273,101 +317,89 @@ async fn finish_attention_send(
 }
 
 async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<(), AppError> {
-    let Some(row) = call_store(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
+    let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
         return Ok(());
     };
     if row.state.is_terminal() && !row.callback_outstanding() {
         return Ok(());
     }
     let paths = actor.home.task_paths(id);
-    match store::read_exit_json(&paths.exit_json)? {
-        Some(exit) => apply_exit(actor, row, &exit.reason).await,
-        None => apply_lost(actor, row).await,
-    }
+    let row = match store::read_exit_json(&paths.exit_json)? {
+        Some(exit) => apply_exit(actor, row, &exit.reason).await?,
+        None => apply_lost(actor, row).await?,
+    };
+    deliver_terminal(actor, row)
 }
 
 /// The worker released the lock without writing `exit.json`.
-async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<(), AppError> {
-    let id = row.id;
-    let row = match row.state {
-        TaskState::Queued | TaskState::Running { .. } => {
-            let from = row.status();
-            match call_store(&actor.store, |reply| StoreMsg::CasStatus {
-                id,
-                from,
-                to: ProcessStatus::Lost,
-                reply,
-            })
-            .await?
-            {
-                None => require_task(&actor.store, id).await?,
-                Some(row) => row,
-            }
-        }
-        TaskState::Finished { .. } | TaskState::Lost => row,
-    };
-    if !row.callback_outstanding() {
-        return Ok(());
+async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<TaskRow, AppError> {
+    if row.state.is_terminal() {
+        return Ok(row);
     }
-    let reports = call_store(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
-    let event = match &row.state {
-        TaskState::Lost | TaskState::Queued | TaskState::Running { .. } => {
+    let id = row.id;
+    let cas = call(&actor.store, |reply| StoreMsg::CasStatus {
+        id,
+        from: row.status(),
+        to: ProcessStatus::Lost,
+        reply,
+    })
+    .await?;
+    match cas {
+        Some(row) => {
             tracing::info!(%id, "runner lost");
-            lost_event(&row, &reports, actor.home.task_dir(id))
+            Ok(row)
         }
-        TaskState::Finished { .. } => exit_event(&row, &reports, actor.home.task_dir(id)),
-    };
-    actor.callback.cast(CallbackMsg::Deliver { row, event })?;
-    Ok(())
+        // a cancel or exit landed first; report whatever it stored
+        None => require_task(&actor.store, id).await,
+    }
 }
 
 /// The worker wrote `exit.json`; adopt its reason if the row is still live.
-async fn apply_exit(actor: &TaskActor, row: TaskRow, reason: &ExitReason) -> Result<(), AppError> {
+async fn apply_exit(
+    actor: &TaskActor,
+    row: TaskRow,
+    reason: &ExitReason,
+) -> Result<TaskRow, AppError> {
+    if row.state.is_terminal() {
+        return Ok(row);
+    }
     let id = row.id;
-    let row = if row.state.is_terminal() {
-        row
-    } else {
-        let from = row.status();
-        match call_store(&actor.store, |reply| StoreMsg::CasExit {
-            id,
-            from,
-            reason: reason.clone(),
-            reply,
-        })
-        .await?
-        {
-            None => require_task(&actor.store, id).await?,
-            Some(row) => row,
-        }
-    };
+    let cas = call(&actor.store, |reply| StoreMsg::CasExit {
+        id,
+        from: row.status(),
+        reason: reason.clone(),
+        reply,
+    })
+    .await?;
+    match cas {
+        Some(row) => Ok(row),
+        None => require_task(&actor.store, id).await,
+    }
+}
+
+/// Hand the row to the callback actor when its terminal event is still owed.
+fn deliver_terminal(actor: &TaskActor, row: TaskRow) -> Result<(), AppError> {
     if !row.callback_outstanding() {
         return Ok(());
     }
-    let reports = call_store(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
-    let event = exit_event(&row, &reports, actor.home.task_dir(id));
-    actor.callback.cast(CallbackMsg::Deliver { row, event })?;
+    actor.callback.cast(CallbackMsg::Deliver { row })?;
     Ok(())
 }
 
 /// Request cancel in the store, then act on the outcome: deliver the exit
-/// callback for a queued task, or SIGTERM a live worker. Shared by the task
-/// actor and the supervisor fallback when no task actor exists.
+/// callback for a queued task, or SIGTERM a live worker. Every state change is
+/// a store CAS, so this needs no per-task actor and the supervisor runs it
+/// directly.
 pub(crate) async fn cancel_task(
     store: &ActorRef<StoreMsg>,
     callback: &ActorRef<CallbackMsg>,
-    home: &Home,
     id: TaskId,
 ) -> Result<CancelResult, AppError> {
-    let result = call_store(store, |reply| StoreMsg::RequestCancel { id, reply }).await?;
+    let result = call(store, |reply| StoreMsg::RequestCancel { id, reply }).await?;
     match &result {
         CancelResult::AlreadyTerminal(_) => {}
         CancelResult::CancelledQueued(row) => {
-            let reports = call_store(store, |reply| StoreMsg::Reports { id, reply }).await?;
-            let event = exit_event(row, &reports, home.task_dir(id));
-            callback.cast(CallbackMsg::Deliver {
-                row: row.clone(),
-                event,
-            })?;
+            callback.cast(CallbackMsg::Deliver { row: row.clone() })?;
         }
         // signal the worker pid, not `-pid`: `task-run` forwards to the child's own process group
         CancelResult::SignalWorker(row) => {
@@ -385,30 +417,26 @@ pub(crate) async fn cancel_task(
 }
 
 async fn require_task(store: &ActorRef<StoreMsg>, id: TaskId) -> Result<TaskRow, AppError> {
-    call_store(store, |reply| StoreMsg::GetTask { id, reply })
+    call(store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })
-}
-
-impl From<ractor::MessagingErr<CallbackMsg>> for AppError {
-    fn from(err: ractor::MessagingErr<CallbackMsg>) -> Self {
-        Self::Internal {
-            message: format!("callback actor: {err}"),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
 
     use chrono::{TimeDelta, Utc};
     use ractor::Actor;
     use tempfile::tempdir;
 
-    use super::{ATTENTION_HOP_MAX, attention_wait, cancel_task};
+    use super::{ATTENTION_HOP_MAX, AttentionPhase, TaskWatch, attention_wait, cancel_task};
 
     #[test]
     fn attention_wait_counts_down_from_creation() {
@@ -453,8 +481,27 @@ mod tests {
         let _ = tokio::time::Instant::now() + wait.min(ATTENTION_HOP_MAX);
     }
 
+    #[tokio::test]
+    async fn dropping_a_watch_cancels_its_attention_timer() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_by_timer = fired.clone();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fired_by_timer.store(true, Ordering::SeqCst);
+        })
+        .abort_handle();
+        let watch = TaskWatch {
+            id: TaskId::new(),
+            attention: AttentionPhase::Armed,
+            attention_timer: Some(timer),
+        };
+        drop(watch);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
     use crate::daemon::actors::callback::{CallbackActor, CallbackArgs};
-    use crate::daemon::actors::{StoreActor, StoreMsg, call_store};
+    use crate::daemon::actors::{StoreActor, StoreMsg, call};
     use crate::domain::{
         Agent, AgentKind, AgentWorkload, CallbackStatus, ProcessStatus, TaskEnv, TaskId, ThreadId,
         Workload,
@@ -500,14 +547,14 @@ mod tests {
             },
             binary: Path::new("/bin/true").to_path_buf(),
         });
-        call_store(&store, |reply| StoreMsg::InsertTask {
+        call(&store, |reply| StoreMsg::InsertTask {
             row: Box::new(row),
             reply,
         })
         .await
         .unwrap();
 
-        let result = cancel_task(&store, &callback, &home, id).await.unwrap();
+        let result = cancel_task(&store, &callback, id).await.unwrap();
         assert!(matches!(result, CancelResult::CancelledQueued(_)));
 
         let final_row = wait_for_callback(&store, id).await;
@@ -526,7 +573,7 @@ mod tests {
         id: TaskId,
     ) -> crate::domain::TaskRow {
         for _ in 0..100 {
-            let row = call_store(store, |reply| StoreMsg::GetTask { id, reply })
+            let row = call(store, |reply| StoreMsg::GetTask { id, reply })
                 .await
                 .unwrap()
                 .unwrap();

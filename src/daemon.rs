@@ -13,12 +13,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::callback::exit_event;
-use crate::daemon::actors::{
-    CALL_TIMEOUT, CallbackMsg, StoreMsg, SupervisorActor, SupervisorMsg, call_store, flatten_call,
-};
+use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorMsg, call};
 use crate::daemon::web::WebListen;
-use crate::domain::{ExitReason, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 
@@ -27,11 +23,9 @@ use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 pub struct AppState {
     /// State directory (immutable layout).
     pub home: Home,
-    /// Store actor.
+    /// Store actor, for reads. Every write goes through the supervisor.
     pub store: ActorRef<StoreMsg>,
-    /// Callback actor.
-    pub callback: ActorRef<CallbackMsg>,
-    /// Supervisor.
+    /// Supervisor: owns the task lifecycle.
     pub supervisor: ActorRef<SupervisorMsg>,
     /// Address the dashboard listener bound, or `None` when it is off or the
     /// bind failed.
@@ -59,15 +53,10 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
         .map_err(|err| AppError::Internal {
             message: format!("spawn supervisor: {err}"),
         })?;
-    let refs = flatten_call(
-        supervisor
-            .call(|reply| SupervisorMsg::GetRefs { reply }, Some(CALL_TIMEOUT))
-            .await,
-    )?;
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply }).await?;
     let state = AppState {
         home: home.clone(),
-        store: refs.store,
-        callback: refs.callback,
+        store,
         supervisor: supervisor.clone(),
         web: web_addr,
     };
@@ -179,57 +168,6 @@ async fn shutdown_signal() {
             if let Err(err) = tokio::signal::ctrl_c().await {
                 warn!("ctrl_c handler unavailable: {err}");
             }
-        }
-    }
-}
-
-/// Spawn a worker after a successful insert, then ask the supervisor to watch.
-pub async fn spawn_and_watch(state: &AppState, id: TaskId) -> Result<(), AppError> {
-    let paths = state.home.task_paths(id);
-    let lock = crate::runner::lock_before_spawn(&paths)?;
-    match crate::runner::spawn_task_run(&state.home, id, lock) {
-        Ok(pid) => {
-            call_store(&state.store, |reply| StoreMsg::SetPid {
-                id,
-                pid: pid as i32,
-                reply,
-            })
-            .await?;
-            flatten_call(
-                state
-                    .supervisor
-                    .call(
-                        |reply| SupervisorMsg::SpawnTask { id, reply },
-                        Some(CALL_TIMEOUT),
-                    )
-                    .await,
-            )?;
-            Ok(())
-        }
-        Err(err) => {
-            let reason = ExitReason::SpawnFailed {
-                message: err.to_string(),
-            };
-            let row = match call_store(&state.store, |reply| StoreMsg::CasExit {
-                id,
-                from: ProcessStatus::Queued,
-                reason: reason.clone(),
-                reply,
-            })
-            .await?
-            {
-                Some(row) => row,
-                // another path already finished the row; report on what it stored
-                None => call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
-                    .await?
-                    .ok_or(AppError::TaskNotFound { id })?,
-            };
-            let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
-            let event = exit_event(&row, &reports, paths.dir);
-            if let Err(cast_err) = state.callback.cast(CallbackMsg::Deliver { row, event }) {
-                warn!(%id, "queue spawn-failure callback: {cast_err}");
-            }
-            Err(err)
         }
     }
 }

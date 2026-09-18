@@ -1,0 +1,13 @@
+#!/bin/sh
+# Records argv for lifecycle isolation tests. Never talks to the real supervisor.
+set -eu
+log="${HARNESS_SUPERVISOR_LOG:?HARNESS_SUPERVISOR_LOG is unset}"
+printf '%s\n' "$*" >>"$log"
+case " $* " in
+*" stop "*|*" bootout "*)
+  if [ -n "${HARNESS_DAEMON_PID:-}" ]; then
+    kill -TERM "$HARNESS_DAEMON_PID" 2>/dev/null || true
+  fi
+  ;;
+esac
+exit 0

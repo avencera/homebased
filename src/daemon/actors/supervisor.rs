@@ -4,43 +4,34 @@ use std::collections::HashMap;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
-use crate::callback::{exit_event, lost_event};
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
 use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
-use crate::daemon::actors::{CALL_TIMEOUT, StoreActor, StoreMsg, call_store, send_reply};
-use crate::domain::{TaskId, TaskState};
+use crate::daemon::actors::{StoreActor, StoreMsg, call, send_reply};
+use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskRow};
 use crate::error::AppError;
 use crate::home::Home;
+use crate::runner;
 use crate::store::CancelResult;
 
 const STORE_NAME: &str = "homebased.store";
 const CALLBACK_NAME: &str = "homebased.callback";
 
-/// Messages the HTTP layer and spawn path send here.
+/// Messages the HTTP layer sends here.
 pub enum SupervisorMsg {
-    /// Actor refs for `AppState`.
-    GetRefs {
-        reply: RpcReplyPort<Result<DaemonRefs, AppError>>,
+    /// Store ref for `AppState` reads.
+    GetStore {
+        reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
     },
-    /// Start a watch actor for a newly spawned worker.
-    SpawnTask {
-        id: TaskId,
+    /// Persist a queued row, spawn its worker, and watch it.
+    Launch {
+        row: Box<TaskRow>,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Forward cancel to the task actor, or run it here if none.
+    /// Cancel a task.
     Cancel {
         id: TaskId,
         reply: RpcReplyPort<Result<CancelResult, AppError>>,
     },
-}
-
-/// Refs handed to axum after startup.
-#[derive(Clone)]
-pub struct DaemonRefs {
-    /// Store actor.
-    pub store: ActorRef<StoreMsg>,
-    /// Callback actor.
-    pub callback: ActorRef<CallbackMsg>,
 }
 
 /// Supervisor state.
@@ -82,12 +73,12 @@ impl Actor for SupervisorActor {
         )
         .await?;
         let mut state = SupervisorState {
-            home: home.clone(),
-            store: store.clone(),
-            callback: callback.clone(),
+            home,
+            store,
+            callback,
             tasks: HashMap::new(),
         };
-        let rows = call_store(&store, |reply| StoreMsg::NonTerminal { reply }).await?;
+        let rows = call(&state.store, |reply| StoreMsg::NonTerminal { reply }).await?;
         for row in rows {
             spawn_task_actor(&myself, &mut state, row.id).await?;
         }
@@ -102,20 +93,12 @@ impl Actor for SupervisorActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            SupervisorMsg::GetRefs { reply } => {
-                send_reply(
-                    reply,
-                    Ok(DaemonRefs {
-                        store: state.store.clone(),
-                        callback: state.callback.clone(),
-                    }),
-                );
-            }
-            SupervisorMsg::SpawnTask { id, reply } => {
-                send_reply(reply, spawn_task_actor(&myself, state, id).await);
+            SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
+            SupervisorMsg::Launch { row, reply } => {
+                send_reply(reply, launch(&myself, state, *row).await);
             }
             SupervisorMsg::Cancel { id, reply } => {
-                send_reply(reply, cancel(state, id).await);
+                send_reply(reply, cancel_task(&state.store, &state.callback, id).await);
             }
         }
         Ok(())
@@ -165,6 +148,74 @@ fn task_id_from_name(name: Option<String>) -> Option<TaskId> {
     rest.parse().ok()
 }
 
+/// Insert the row, spawn the worker with the runner lock held, then watch it.
+/// Runs inside the supervisor so a task always has an in-process owner from
+/// the moment its worker exists, and so a client that disconnects mid-submit
+/// cannot strand a Queued row with no worker. The cost is that launches are
+/// serialized under one `CALL_TIMEOUT`; each is a few store calls and a
+/// fork, so that only bites when SQLite itself stalls. A failed spawn
+/// finishes the row as `SpawnFailed`, queues its exit callback, and returns
+/// the spawn error.
+async fn launch(
+    supervisor: &ActorRef<SupervisorMsg>,
+    state: &mut SupervisorState,
+    row: TaskRow,
+) -> Result<(), AppError> {
+    let id = row.id;
+    call(&state.store, |reply| StoreMsg::InsertTask {
+        row: Box::new(row),
+        reply,
+    })
+    .await?;
+    let paths = state.home.task_paths(id);
+    // uncontended: the lock file is new for this id, so the blocking flock
+    // never stalls the mailbox
+    let lock = runner::lock_before_spawn(&paths)?;
+    let pid = match runner::spawn_task_run(&state.home, id, lock) {
+        Ok(pid) => pid,
+        Err(err) => {
+            finish_spawn_failed(state, id, &err).await?;
+            return Err(err);
+        }
+    };
+    call(&state.store, |reply| StoreMsg::SetPid {
+        id,
+        pid: pid as i32,
+        reply,
+    })
+    .await?;
+    spawn_task_actor(supervisor, state, id).await
+}
+
+async fn finish_spawn_failed(
+    state: &SupervisorState,
+    id: TaskId,
+    err: &AppError,
+) -> Result<(), AppError> {
+    let reason = ExitReason::SpawnFailed {
+        message: err.to_string(),
+    };
+    let cas = call(&state.store, |reply| StoreMsg::CasExit {
+        id,
+        from: ProcessStatus::Queued,
+        reason,
+        reply,
+    })
+    .await?;
+    let row = match cas {
+        Some(row) => row,
+        // another path already finished the row; report on what it stored
+        None => call(&state.store, |reply| StoreMsg::GetTask { id, reply })
+            .await?
+            .ok_or(AppError::TaskNotFound { id })?,
+    };
+    // the spawn error is what the caller must see, so a failed cast is only logged
+    if let Err(cast_err) = state.callback.cast(CallbackMsg::Deliver { row }) {
+        tracing::warn!(%id, "queue spawn-failure callback: {cast_err}");
+    }
+    Ok(())
+}
+
 async fn spawn_task_actor(
     supervisor: &ActorRef<SupervisorMsg>,
     state: &mut SupervisorState,
@@ -188,31 +239,14 @@ async fn spawn_task_actor(
     Ok(())
 }
 
-async fn cancel(state: &SupervisorState, id: TaskId) -> Result<CancelResult, AppError> {
-    if let Some(task) = state.tasks.get(&id) {
-        return crate::daemon::actors::flatten_call(
-            task.call(|reply| TaskMsg::Cancel { reply }, Some(CALL_TIMEOUT))
-                .await,
-        );
-    }
-    cancel_task(&state.store, &state.callback, &state.home, id).await
-}
-
 /// Deliver exit callbacks stranded on terminal rows. A daemon that died between
 /// the exit CAS and `FinishCallback` leaves `callback_status` at
 /// `pending|sending` with no worker and no task actor left to retry.
 async fn deliver_pending_callbacks(state: &SupervisorState) -> Result<(), AppError> {
-    let rows = call_store(&state.store, |reply| StoreMsg::PendingCallbacks { reply }).await?;
+    let rows = call(&state.store, |reply| StoreMsg::PendingCallbacks { reply }).await?;
     for row in rows {
-        let id = row.id;
-        let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
-        let dir = state.home.task_dir(id);
-        let event = match &row.state {
-            TaskState::Lost => lost_event(&row, &reports, dir),
-            _ => exit_event(&row, &reports, dir),
-        };
-        tracing::info!(%id, "redelivering pending callback");
-        state.callback.cast(CallbackMsg::Deliver { row, event })?;
+        tracing::info!(id = %row.id, "redelivering pending callback");
+        state.callback.cast(CallbackMsg::Deliver { row })?;
     }
     Ok(())
 }

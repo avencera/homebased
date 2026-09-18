@@ -70,6 +70,7 @@ The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/tasks/<id>`, an
 | `output.log` | Child stdout and stderr. |
 | `exit.json` | Written by the worker parent at exit. Absent for `lost` tasks. |
 | `callback.log` | Output of the last `codex queue` attempt. |
+| `delivery.lock` | Serializes callback delivery across daemon restarts. |
 | `runner.lock` | Liveness lock. Held while the worker parent is alive. |
 
 `<home>` is `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebased`, else `~/.local/state/homebased`. The SQLite database is `<home>/homebased.sqlite` and is the source of truth; do not edit it.

@@ -51,7 +51,7 @@ cargo install --path /home/praveen/code/homebasd
 homebased --json daemon restart
 ```
 
-`restart` restarts only the daemon. Running workers are separate processes that hold their own lock; they keep running, and the restarted daemon reconciles them and delivers their events. Do not use raw `systemctl restart`; the CLI path works whether or not a host unit exists.
+`restart` restarts only the daemon. Running workers are separate processes that hold their own lock; they keep running, and the restarted daemon reconciles them and delivers their events. Do not use raw `systemctl restart`; the CLI path uses the host supervisor only when the installed unit's `--home` matches the selected state directory, and otherwise respawns the standalone daemon for that home.
 
 ## Stop and uninstall
 
@@ -61,6 +61,8 @@ homebased --json daemon stop --yes      # cancel in-flight tasks, wait for their
 homebased --json daemon uninstall       # same refusal rule; --yes cancels first
 ```
 
+`stop`, `restart`, and `uninstall` match the selected state directory to the installed unit's `--home` before they control the host supervisor. For `stop` and `restart`, a matching unit uses `systemctl`/`launchctl`; any other unit state leaves the host service alone and uses the selected socket or standalone daemon path. `uninstall` refuses with `host_unit_home_mismatch` when the unit belongs to another home, and with `unit_invalid` when the unit's daemon invocation cannot be parsed.
+
 `uninstall` removes the host unit only. The database and task directories stay. Confirm with the user before `--yes`; it cancels their tasks.
 
 ## Foreground run for debugging
@@ -69,4 +71,4 @@ homebased --json daemon uninstall       # same refusal rule; --yes cancels first
 homebased daemon serve --home /tmp/hb-test
 ```
 
-Only one `serve` per home; a second exits 5 `daemon_already_running`. Use a separate `--home` for experiments so the real state is untouched.
+Only one `serve` per home; a second exits 5 `daemon_already_running`. Use a separate `--home` for experiments so the real state is untouched. Lifecycle commands for that home do not stop or remove a host unit that points at a different home.

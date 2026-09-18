@@ -7,7 +7,7 @@ use crate::callback::{deliver_exit_event, exit_event};
 use crate::client::Client;
 use crate::daemon::web::WebListen;
 use crate::error::AppError;
-use crate::install;
+use crate::install::{self, HostUnitState};
 use crate::store::{CancelResult, Store};
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -48,6 +48,26 @@ pub enum DaemonCommand {
     },
     /// Socket state and in-flight count. Works with the socket down.
     Status,
+}
+
+/// How stop/restart reach the selected home's daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleRoute {
+    /// Installed unit matches this home; use systemctl/launchctl.
+    HostSupervisor,
+    /// No matching unit; signal or respawn through the selected socket.
+    Standalone,
+}
+
+impl LifecycleRoute {
+    fn from_unit_state(state: &HostUnitState) -> Self {
+        match state {
+            HostUnitState::SelectedHome => Self::HostSupervisor,
+            HostUnitState::Absent
+            | HostUnitState::OtherHome { .. }
+            | HostUnitState::Unrecognized => Self::Standalone,
+        }
+    }
 }
 
 /// Dispatch a daemon command.
@@ -94,8 +114,23 @@ fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
 }
 
 async fn uninstall(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
-    stop(ctx, yes).await?;
-    install::uninstall()?;
+    let state = install::inspect_host_unit(&ctx.home)?;
+    match &state {
+        HostUnitState::OtherHome { configured } => {
+            return Err(AppError::HostUnitHomeMismatch {
+                selected: ctx.home.root().to_path_buf(),
+                configured: configured.clone(),
+            });
+        }
+        HostUnitState::Unrecognized => {
+            return Err(AppError::UnitInvalid {
+                message: "host unit daemon invocation is unrecognized".into(),
+            });
+        }
+        HostUnitState::Absent | HostUnitState::SelectedHome => {}
+    }
+    stop_with_route(ctx, yes, &state).await?;
+    install::uninstall(&ctx.home)?;
     ctx.print_id(
         "uninstalled",
         "uninstalled host unit (database kept)",
@@ -145,24 +180,8 @@ async fn status(ctx: &Ctx) -> Result<ExitCode, AppError> {
 }
 
 async fn stop(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
-    let client = Client::new(ctx.home.sock_path());
-    let socket_up = client.get("/v1/status").await.ok();
-    ensure_idle_or_cancel(ctx, yes, socket_up.is_some()).await?;
-    if let Some(body) = socket_up
-        && let Some(pid) = body.get("pid").and_then(Value::as_u64)
-    {
-        // the daemon may already have exited between the status call and here
-        if let Err(err) = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        ) {
-            eprintln!("warning: SIGTERM daemon {pid}: {err}");
-        }
-    }
-    if install::unit_installed() {
-        install::host_stop()?;
-    }
-    wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
+    let state = install::inspect_host_unit(&ctx.home)?;
+    stop_with_route(ctx, yes, &state).await?;
     ctx.print_id(
         "stopped",
         "stopped",
@@ -171,13 +190,25 @@ async fn stop(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
-    if install::unit_installed() {
-        install::host_restart()?;
-    } else {
-        let client = Client::new(ctx.home.sock_path());
-        if let Ok(body) = client.get("/v1/status").await {
-            if let Some(pid) = body.get("pid").and_then(Value::as_u64) {
+async fn stop_with_route(ctx: &Ctx, yes: bool, state: &HostUnitState) -> Result<(), AppError> {
+    let client = Client::new(ctx.home.sock_path());
+    let socket_up = client.get("/v1/status").await.ok();
+    ensure_idle_or_cancel(ctx, yes, socket_up.is_some()).await?;
+    let route = match LifecycleRoute::from_unit_state(state) {
+        LifecycleRoute::HostSupervisor => {
+            let current = install::inspect_host_unit(&ctx.home)?;
+            LifecycleRoute::from_unit_state(&current)
+        }
+        LifecycleRoute::Standalone => LifecycleRoute::Standalone,
+    };
+    match route {
+        LifecycleRoute::HostSupervisor => {
+            install::host_stop()?;
+        }
+        LifecycleRoute::Standalone => {
+            if let Some(body) = socket_up
+                && let Some(pid) = body.get("pid").and_then(Value::as_u64)
+            {
                 // the daemon may already have exited between the status call and here
                 if let Err(err) = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid as i32),
@@ -186,31 +217,63 @@ async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
                     eprintln!("warning: SIGTERM daemon {pid}: {err}");
                 }
             }
-            wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
         }
-        let exe = std::env::current_exe().map_err(|err| AppError::Internal {
-            message: err.to_string(),
-        })?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("daemon")
-            .arg("serve")
-            .arg("--home")
-            .arg(ctx.home.root())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    nix::unistd::setsid().map_err(std::io::Error::from)?;
-                    Ok(())
-                });
+    }
+    wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
+    Ok(())
+}
+
+async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
+    let state = install::inspect_host_unit(&ctx.home)?;
+    let route = match LifecycleRoute::from_unit_state(&state) {
+        LifecycleRoute::HostSupervisor => {
+            let current = install::inspect_host_unit(&ctx.home)?;
+            LifecycleRoute::from_unit_state(&current)
+        }
+        LifecycleRoute::Standalone => LifecycleRoute::Standalone,
+    };
+    match route {
+        LifecycleRoute::HostSupervisor => {
+            install::host_restart()?;
+        }
+        LifecycleRoute::Standalone => {
+            let client = Client::new(ctx.home.sock_path());
+            if let Ok(body) = client.get("/v1/status").await {
+                if let Some(pid) = body.get("pid").and_then(Value::as_u64) {
+                    // the daemon may already have exited between the status call and here
+                    if let Err(err) = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    ) {
+                        eprintln!("warning: SIGTERM daemon {pid}: {err}");
+                    }
+                }
+                wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
             }
+            let exe = std::env::current_exe().map_err(|err| AppError::Internal {
+                message: err.to_string(),
+            })?;
+            let mut cmd = Command::new(exe);
+            cmd.arg("daemon")
+                .arg("serve")
+                .arg("--home")
+                .arg(ctx.home.root())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.pre_exec(|| {
+                        nix::unistd::setsid().map_err(std::io::Error::from)?;
+                        Ok(())
+                    });
+                }
+            }
+            cmd.spawn()?;
+            wait_socket_up(&ctx.home.sock_path(), Duration::from_secs(15))?;
         }
-        cmd.spawn()?;
-        wait_socket_up(&ctx.home.sock_path(), Duration::from_secs(15))?;
     }
     ctx.print_id(
         "restarted",

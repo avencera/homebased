@@ -25,12 +25,15 @@ const WEB_OFF: &str = "off";
 const WEB_EPHEMERAL: &str = "127.0.0.1:0";
 
 struct Harness {
-    _dir: TempDir,
+    dir: TempDir,
+    /// Private `$HOME` so unit paths never touch the developer's real home.
+    user_home: PathBuf,
     home: PathBuf,
     record: PathBuf,
     hb: PathBuf,
     path: String,
     web_listen: String,
+    supervisor_log: PathBuf,
     daemon: Option<Child>,
 }
 
@@ -46,8 +49,10 @@ impl Harness {
 
     fn with_web_listen(web_listen: &str) -> Self {
         let dir = TempDir::new().unwrap();
+        let user_home = dir.path().join("user-home");
         let home = dir.path().join("state");
         let record = dir.path().join("record");
+        fs::create_dir_all(&user_home).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&record).unwrap();
         let hb = assert_cmd::cargo::cargo_bin("homebased");
@@ -58,13 +63,16 @@ impl Harness {
             hb.parent().unwrap().display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        let supervisor_log = dir.path().join("supervisor.log");
         let mut h = Self {
-            _dir: dir,
+            dir,
+            user_home,
             home,
             record,
             hb,
             path,
             web_listen: web_listen.to_string(),
+            supervisor_log,
             daemon: None,
         };
         h.start_daemon();
@@ -80,11 +88,12 @@ impl Harness {
             .env("HOMEBASED_CLAUDE", fixture("fake-claude"))
             .env("HOMEBASED_GROK", fixture("fake-grok"))
             .env("FAKE_RECORD_DIR", &self.record)
-            .env(
-                "HOME",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-            )
+            .env("HOME", &self.user_home)
+            .env("HARNESS_SUPERVISOR_LOG", &self.supervisor_log)
             .current_dir(std::env::temp_dir());
+        if let Some(child) = &self.daemon {
+            cmd.env("HARNESS_DAEMON_PID", child.id().to_string());
+        }
         cmd
     }
 
@@ -270,6 +279,115 @@ impl Harness {
             let _ = fs::remove_file(self.record.join(name));
         }
     }
+
+    /// Put a fake `systemctl`/`launchctl` ahead of PATH and clear its log.
+    fn install_fake_supervisor(&mut self) {
+        let bin = self.dir.path().join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let name = if cfg!(target_os = "macos") {
+            "launchctl"
+        } else {
+            "systemctl"
+        };
+        let dest = bin.join(name);
+        let _ = fs::remove_file(&dest);
+        std::os::unix::fs::symlink(fixture(&format!("fake-{name}")), &dest).unwrap();
+        self.path = format!("{}:{}", bin.display(), self.path);
+        let _ = fs::remove_file(&self.supervisor_log);
+    }
+
+    fn supervisor_calls(&self) -> Vec<String> {
+        if !self.supervisor_log.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(&self.supervisor_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn clear_supervisor_log(&self) {
+        let _ = fs::remove_file(&self.supervisor_log);
+    }
+
+    /// Write a host unit under the harness private `$HOME`.
+    fn write_host_unit(&self, configured_home: &Path) {
+        #[cfg(target_os = "linux")]
+        {
+            let path = self
+                .user_home
+                .join(".config/systemd/user/homebased.service");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!(
+                "[Unit]\nDescription=homebased test\n[Service]\n\
+                 ExecStart=/usr/bin/homebased daemon serve --home {}\n\
+                 KillMode=process\nRestart=on-failure\n\
+                 [Install]\nWantedBy=default.target\n",
+                configured_home.display()
+            );
+            fs::write(path, text).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let path = self
+                .user_home
+                .join("Library/LaunchAgents/dev.praveen.homebased.plist");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.praveen.homebased</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/homebased</string>
+    <string>daemon</string>
+    <string>serve</string>
+    <string>--home</string>
+    <string>{}</string>
+  </array>
+</dict>
+</plist>
+"#,
+                configured_home.display()
+            );
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    fn host_unit_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            self.user_home
+                .join(".config/systemd/user/homebased.service")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.user_home
+                .join("Library/LaunchAgents/dev.praveen.homebased.plist")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            self.user_home.join("homebased.service")
+        }
+    }
+
+    fn socket_pid(&self) -> u64 {
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(self.home.join("homebased.sock")).unwrap();
+        stream
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).unwrap();
+        let body = buf.split("\r\n\r\n").nth(1).expect("http body missing");
+        let v: Value = serde_json::from_str(body).unwrap();
+        v["pid"].as_u64().expect("status pid")
+    }
 }
 
 impl Drop for Harness {
@@ -277,6 +395,11 @@ impl Drop for Harness {
         if let Some(mut child) = self.daemon.take() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = fs::remove_file(self.home.join("homebased.sock"));
+            return;
+        }
+        if self.home.join("homebased.sock").exists() {
+            let _ = self.cmd().args(["daemon", "stop", "--yes"]).status();
         }
     }
 }
@@ -654,6 +777,254 @@ fn stop_refusal_and_yes() {
     assert_eq!(last["task"], id);
     let row = h.store().require_task(id.parse().unwrap()).unwrap();
     assert_eq!(row.callback_status, CallbackStatus::Sent);
+}
+
+#[test]
+fn stop_ignores_other_home_unit() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    let other = h.dir.path().join("other-home");
+    fs::create_dir_all(&other).unwrap();
+    h.write_host_unit(&other);
+    h.clear_supervisor_log();
+
+    let before_pid = h.socket_pid();
+    let out = h.cmd().args(["daemon", "stop", "--yes"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!h.home.join("homebased.sock").exists());
+    assert!(
+        h.supervisor_calls().is_empty(),
+        "other-home stop must not call the host supervisor: {:?}",
+        h.supervisor_calls()
+    );
+    // reap before kill(0): a zombie still owned by the Child handle looks alive
+    if let Some(mut child) = h.daemon.take() {
+        assert_eq!(child.id() as u64, before_pid);
+        let status = child.wait().unwrap();
+        assert!(
+            status.success() || status.code().is_some(),
+            "standalone stop should have ended the selected daemon: {status}"
+        );
+    }
+}
+
+#[test]
+fn restart_ignores_other_home_unit() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    let other = h.dir.path().join("other-home");
+    fs::create_dir_all(&other).unwrap();
+    h.write_host_unit(&other);
+    h.clear_supervisor_log();
+
+    let before_pid = h.socket_pid();
+    let out = h.cmd().args(["daemon", "restart"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || h
+            .home
+            .join("homebased.sock")
+            .exists()),
+        "socket did not return after standalone restart"
+    );
+    let after_pid = h.socket_pid();
+    assert_ne!(
+        before_pid, after_pid,
+        "standalone restart must spawn a new daemon"
+    );
+    assert!(
+        h.supervisor_calls().is_empty(),
+        "other-home restart must not call the host supervisor: {:?}",
+        h.supervisor_calls()
+    );
+    if let Some(mut child) = h.daemon.take() {
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn uninstall_refuses_other_home_unit() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    let other = h.dir.path().join("other-home");
+    fs::create_dir_all(&other).unwrap();
+    h.write_host_unit(&other);
+    h.clear_supervisor_log();
+
+    let before_pid = h.socket_pid();
+    let unit_path = h.host_unit_path();
+    let unit_before = fs::read_to_string(&unit_path).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "daemon", "uninstall", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "host_unit_home_mismatch");
+    assert_eq!(
+        PathBuf::from(err["error"]["input"]["selected"].as_str().unwrap()),
+        h.home
+    );
+    assert_eq!(
+        PathBuf::from(err["error"]["input"]["configured"].as_str().unwrap()),
+        other
+    );
+    assert!(
+        h.supervisor_calls().is_empty(),
+        "refused uninstall must not call the host supervisor: {:?}",
+        h.supervisor_calls()
+    );
+    assert_eq!(fs::read_to_string(&unit_path).unwrap(), unit_before);
+    assert!(h.home.join("homebased.sock").exists());
+    assert_eq!(h.socket_pid(), before_pid);
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(before_pid as i32), None).is_ok(),
+        "selected daemon must keep running after refused uninstall"
+    );
+}
+
+#[test]
+fn uninstall_refuses_unrecognized_unit() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    let unit_path = h.host_unit_path();
+    fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+    fs::write(&unit_path, "not a host unit\n").unwrap();
+    h.clear_supervisor_log();
+
+    let before_pid = h.socket_pid();
+    let out = h
+        .cmd()
+        .args(["--json", "daemon", "uninstall", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "unit_invalid");
+    assert!(
+        h.supervisor_calls().is_empty(),
+        "{:?}",
+        h.supervisor_calls()
+    );
+    assert_eq!(fs::read_to_string(&unit_path).unwrap(), "not a host unit\n");
+    assert_eq!(h.socket_pid(), before_pid);
+}
+
+#[test]
+fn matching_home_stop_uses_supervisor() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    h.write_host_unit(&h.home);
+    h.clear_supervisor_log();
+
+    let out = h.cmd().args(["daemon", "stop", "--yes"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = h.supervisor_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    if cfg!(target_os = "linux") {
+        assert_eq!(calls[0], "--user stop homebased.service");
+    } else if cfg!(target_os = "macos") {
+        let uid = nix::unistd::getuid().as_raw();
+        assert_eq!(calls[0], format!("bootout gui/{uid}/dev.praveen.homebased"));
+    }
+    assert!(!h.home.join("homebased.sock").exists());
+    if let Some(mut child) = h.daemon.take() {
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn matching_home_uninstall_uses_supervisor_and_removes_unit() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    h.write_host_unit(&h.home);
+    h.clear_supervisor_log();
+    let unit_path = h.host_unit_path();
+
+    let out = h
+        .cmd()
+        .args(["daemon", "uninstall", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = h.supervisor_calls();
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            calls,
+            [
+                "--user stop homebased.service",
+                "--user disable --now homebased.service",
+                "--user daemon-reload",
+            ]
+        );
+    } else if cfg!(target_os = "macos") {
+        let uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            calls,
+            [
+                format!("bootout gui/{uid}/dev.praveen.homebased"),
+                format!("bootout gui/{uid} {}", unit_path.display()),
+            ]
+        );
+    }
+    assert!(!unit_path.exists());
+    assert!(!h.home.join("homebased.sock").exists());
+}
+
+#[test]
+fn matching_home_restart_uses_supervisor() {
+    let mut h = Harness::new();
+    h.install_fake_supervisor();
+    h.write_host_unit(&h.home);
+    h.clear_supervisor_log();
+
+    let before_pid = h.socket_pid();
+    let out = h.cmd().args(["daemon", "restart"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = h.supervisor_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    if cfg!(target_os = "linux") {
+        assert_eq!(calls[0], "--user restart homebased.service");
+    } else if cfg!(target_os = "macos") {
+        let uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            calls[0],
+            format!("kickstart -k gui/{uid}/dev.praveen.homebased")
+        );
+    }
+    // fake restart is a no-op, so the original daemon stays up
+    assert_eq!(h.socket_pid(), before_pid);
 }
 
 #[test]

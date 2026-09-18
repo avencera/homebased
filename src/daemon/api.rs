@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::callback::last_event_for_row;
-use crate::daemon::actors::{CALL_TIMEOUT, StoreMsg, SupervisorMsg, call_store, flatten_call};
+use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
-use crate::daemon::{AppState, spawn_and_watch, web};
+use crate::daemon::{AppState, web};
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload};
 use crate::error::AppError;
 use crate::invocation::{
@@ -55,7 +55,7 @@ pub fn socket_router(state: AppState) -> Router {
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {
-    let in_flight = call_store(&state.store, |reply| StoreMsg::InFlightCount { reply }).await?;
+    let in_flight = call(&state.store, |reply| StoreMsg::InFlightCount { reply }).await?;
     Ok(Json(StatusBody {
         api_version: API_VERSION,
         version: env!("CARGO_PKG_VERSION"),
@@ -255,7 +255,7 @@ async fn list(
         Some(s) => Some(s.parse::<ThreadId>()?),
         None => None,
     };
-    let rows = call_store(&state.store, |reply| StoreMsg::ListTasks {
+    let rows = call(&state.store, |reply| StoreMsg::ListTasks {
         statuses,
         thread,
         reply,
@@ -268,10 +268,10 @@ async fn show(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<TaskDetail>, AppError> {
-    let row = call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
+    let row = call(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
-    let reports = call_store(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
+    let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let last_event = last_event_for_row(&row, &reports, evidence.clone());
     Ok(Json(TaskDetail {
@@ -295,7 +295,7 @@ async fn log(
     Path(id): Path<TaskId>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<LogTail>, AppError> {
-    if call_store(&state.store, |reply| StoreMsg::GetTask { id, reply })
+    if call(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .is_none()
     {
@@ -318,15 +318,11 @@ async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Value>, AppError> {
-    let result = flatten_call(
-        state
-            .supervisor
-            .call(
-                |reply| SupervisorMsg::Cancel { id, reply },
-                Some(CALL_TIMEOUT),
-            )
-            .await,
-    )?;
+    let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
+        id,
+        reply,
+    })
+    .await?;
     match result {
         CancelResult::AlreadyTerminal(row) => Ok(Json(json!({
             "api_version": API_VERSION,
@@ -336,7 +332,7 @@ async fn cancel(
         CancelResult::CancelledQueued(_) => Ok(Json(json!({
             "api_version": API_VERSION,
             "id": id,
-            "status": crate::domain::ProcessStatus::Cancelled,
+            "status": ProcessStatus::Cancelled,
         }))),
         CancelResult::SignalWorker(row) => Ok(Json(json!({
             "api_version": API_VERSION,
@@ -368,12 +364,11 @@ async fn accept_task(
         env: body.env,
         binary,
     });
-    call_store(&state.store, |reply| StoreMsg::InsertTask {
+    call(&state.supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
         reply,
     })
     .await?;
-    spawn_and_watch(state, id).await?;
     Ok((id, ProcessStatus::Queued))
 }
 

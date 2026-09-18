@@ -333,14 +333,14 @@ impl Store {
     }
 
     /// Claim the attention reminder: `pending|sending` → `sending`, and only
-    /// while the task is non-terminal. Re-claiming `sending` is how a daemon
-    /// that died mid-send retries; at-least-once transport allows the
-    /// duplicate. `false` means the reminder must not be sent at all.
+    /// while the task is non-terminal. A persisted `sending` owner must be
+    /// released only after its bounded delivery process can no longer exist.
+    /// `false` means the reminder must not be sent.
     pub fn claim_attention(&self, id: TaskId) -> Result<bool, AppError> {
         let n = self.conn.execute(
             "UPDATE tasks SET attention_state = 'sending', updated_at = ?1
              WHERE id = ?2
-               AND attention_state IN ('pending', 'sending')
+               AND attention_state = 'pending'
                AND status IN ('queued', 'running')",
             params![fmt_time(Utc::now()), id.to_string()],
         )?;
@@ -804,8 +804,8 @@ mod tests {
             AttentionState::Pending
         );
         assert!(store.claim_attention(id).unwrap());
-        // a claim stranded by a dead daemon is re-claimable, not stuck
-        assert!(store.claim_attention(id).unwrap());
+        // one live claim has one owner until delivery or explicit release
+        assert!(!store.claim_attention(id).unwrap());
     }
 
     #[test]
