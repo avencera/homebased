@@ -16,5 +16,6 @@ pub mod report;
 pub mod runner;
 pub mod spec;
 pub mod store;
+pub mod update;
 
 pub use domain::API_VERSION;

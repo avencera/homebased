@@ -57,6 +57,22 @@ The script overwrites an existing `homebased` in the install directory.
 
 It supports Linux (`x86_64` and `aarch64`) and macOS (Intel and Apple silicon).
 
+## Update
+
+After the first install, replace the binary from GitHub and restart the daemon (the dashboard lives in the same process):
+
+```sh
+homebased --json update
+```
+
+A specific release:
+
+```sh
+homebased --json update --tag v0.2.0
+```
+
+`--dry-run` prints the tag, target, and destination without downloading or restarting. Running workers are separate processes; they keep running across the restart.
+
 ### From this repository
 
 ```sh

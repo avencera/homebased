@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -1297,6 +1297,7 @@ fn help_lists_tree_and_exit_codes() {
         vec!["--help"],
         vec!["task", "--help"],
         vec!["daemon", "--help"],
+        vec!["update", "--help"],
     ] {
         let out = Command::new(&hb).args(&args).output().unwrap();
         assert!(out.status.success());
@@ -1305,6 +1306,7 @@ fn help_lists_tree_and_exit_codes() {
         if args.len() == 1 {
             assert!(text.contains("daemon"), "{text}");
             assert!(text.contains("task"), "{text}");
+            assert!(text.contains("update"), "{text}");
         }
         if args[0] == "task" {
             assert!(text.contains("submit"), "{text}");
@@ -1329,6 +1331,148 @@ fn help_lists_tree_and_exit_codes() {
     let text = String::from_utf8_lossy(&list_help.stdout);
     assert!(text.contains("queued"), "{text}");
     assert!(text.contains("running"), "{text}");
+    let update_help = Command::new(&hb)
+        .args(["update", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&update_help.stdout);
+    assert!(text.contains("--tag"), "{text}");
+    assert!(text.contains("--dry-run"), "{text}");
+    assert!(text.contains("restart"), "{text}");
+}
+
+#[test]
+fn update_dry_run_json() {
+    let hb = assert_cmd::cargo::cargo_bin("homebased");
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("bin");
+    let state = dir.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let out = Command::new(&hb)
+        .args(["--json", "update", "--dry-run", "--tag", "v0.2.0", "--to"])
+        .arg(&dest)
+        .arg("--home")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["api_version"], 1);
+    assert_eq!(v["tag"], "v0.2.0");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["restarted"], false);
+    assert_eq!(
+        v["path"].as_str().unwrap(),
+        dest.join("homebased").to_str().unwrap()
+    );
+    assert!(
+        v["url"].as_str().unwrap().contains("homebased-v0.2.0-"),
+        "{v}"
+    );
+    assert!(
+        !dest.join("homebased").exists(),
+        "dry-run must not write the binary"
+    );
+}
+
+#[test]
+fn update_installs_archive_and_restarts_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hb = assert_cmd::cargo::cargo_bin("homebased");
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("bin");
+    let state = dir.path().join("state");
+    let user_home = dir.path().join("user-home");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&user_home).unwrap();
+
+    let payload = dir.path().join("payload");
+    fs::create_dir(&payload).unwrap();
+    let fake = payload.join("homebased");
+    fs::write(&fake, b"updated-binary\n").unwrap();
+    let mut perms = fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake, perms).unwrap();
+    let archive = dir.path().join("homebased.tar.gz");
+    let tar = Command::new("tar")
+        .args([
+            "-C",
+            payload.to_str().unwrap(),
+            "-czf",
+            archive.to_str().unwrap(),
+            "homebased",
+        ])
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    let body = fs::read(&archive).unwrap();
+    let (base, server) = serve_http_bytes(body);
+
+    let out = Command::new(&hb)
+        .env("HOME", &user_home)
+        .env("HOMEBASED_WEB_LISTEN", WEB_OFF)
+        .env("HOMEBASED_UPDATE_BASE_URL", &base)
+        .args(["--json", "update", "--tag", "v9.9.9", "--to"])
+        .arg(&dest)
+        .arg("--home")
+        .arg(&state)
+        .output()
+        .unwrap();
+    let _ = server.join();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["tag"], "v9.9.9");
+    assert_eq!(v["restarted"], true);
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(
+        fs::read(dest.join("homebased")).unwrap(),
+        b"updated-binary\n"
+    );
+    assert!(
+        state.join("homebased.sock").exists(),
+        "daemon did not restart"
+    );
+
+    let stop = Command::new(&hb)
+        .env("HOME", &user_home)
+        .env("HOMEBASED_WEB_LISTEN", WEB_OFF)
+        .args(["--json", "daemon", "stop", "--home"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+fn serve_http_bytes(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&body);
+    });
+    (format!("http://{addr}"), handle)
 }
 
 #[test]

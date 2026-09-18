@@ -48,7 +48,15 @@ Bind a non-loopback address only on a trusted network. A bind failure (busy port
 
 ## Upgrade
 
-After rebuilding the binary:
+From a GitHub release (replaces the installed binary, then restarts the daemon and dashboard):
+
+```bash
+homebased --json update
+homebased --json update --tag v0.2.0   # pin a tag
+homebased --json update --dry-run      # tag, target, and path only
+```
+
+After rebuilding from this repository:
 
 ```bash
 just web-build
@@ -56,7 +64,7 @@ cargo install --path /home/praveen/code/homebasd
 homebased --json daemon restart
 ```
 
-`restart` restarts only the daemon. Running workers are separate processes that hold their own lock; they keep running, and the restarted daemon reconciles them and delivers their events. Do not use raw `systemctl restart`; the CLI path uses the host supervisor only when the installed unit's `--home` matches the selected state directory, and otherwise respawns the standalone daemon for that home.
+`update` and `daemon restart` restart only `serve`. Running workers are separate processes that hold their own lock; they keep running, and the restarted daemon reconciles them and delivers their events. Do not use raw `systemctl restart`; the CLI path uses the host supervisor only when the installed unit's `--home` matches the selected state directory, and otherwise respawns the standalone daemon for that home.
 
 ## Stop and uninstall
 

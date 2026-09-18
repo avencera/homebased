@@ -226,6 +226,17 @@ async fn stop_with_route(ctx: &Ctx, yes: bool, state: &HostUnitState) -> Result<
 }
 
 async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
+    restart_daemon(ctx).await?;
+    ctx.print_id(
+        "restarted",
+        "restarted",
+        json!({"api_version": crate::domain::API_VERSION, "restarted": true}),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Restart serve for the selected home. Workers keep running.
+pub(crate) async fn restart_daemon(ctx: &Ctx) -> Result<(), AppError> {
     let state = install::inspect_host_unit(&ctx.home)?;
     let route = match LifecycleRoute::from_unit_state(&state) {
         LifecycleRoute::HostSupervisor => {
@@ -274,15 +285,10 @@ async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
                 }
             }
             cmd.spawn()?;
-            wait_socket_up(&ctx.home.sock_path(), Duration::from_secs(15))?;
         }
     }
-    ctx.print_id(
-        "restarted",
-        "restarted",
-        json!({"api_version": crate::domain::API_VERSION, "restarted": true}),
-    )?;
-    Ok(ExitCode::SUCCESS)
+    wait_socket_up(&ctx.home.sock_path(), Duration::from_secs(15))?;
+    Ok(())
 }
 
 async fn ensure_idle_or_cancel(ctx: &Ctx, yes: bool, socket_up: bool) -> Result<(), AppError> {

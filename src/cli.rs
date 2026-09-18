@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod task;
+pub mod update;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -63,6 +64,8 @@ pub enum Command {
         #[command(subcommand)]
         command: task::TaskCommand,
     },
+    /// Replace this binary from GitHub and restart the daemon and dashboard.
+    Update(update::UpdateArgs),
     /// Print the version.
     Version,
     /// Hidden worker parent of one agent.
@@ -208,6 +211,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
     match cli.command {
         Command::Daemon { command } => daemon::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
+        Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {
             version(&ctx)?;
             Ok(ExitCode::SUCCESS)
