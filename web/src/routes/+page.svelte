@@ -16,6 +16,7 @@
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import WorkloadCell from '$lib/components/WorkloadCell.svelte';
 	import { DaemonStore } from '$lib/daemon.svelte';
 	import { EM_DASH, formatTimestamp, shortId, shortenHome } from '$lib/format';
 	import { cn } from '$lib/utils';
@@ -157,11 +158,12 @@
 	</div>
 
 	<div class="mt-3 overflow-x-auto rounded border border-border bg-card">
-		<div class="min-w-[62rem]">
+		<div class="min-w-[72rem]">
 			<div
-				class="grid grid-cols-[minmax(10rem,1.4fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
+				class="grid grid-cols-[minmax(10rem,1.4fr)_minmax(9rem,0.8fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
 			>
 				<span>name</span>
+				<span>agent</span>
 				<span>id</span>
 				<span>status</span>
 				<span>time</span>
@@ -172,7 +174,7 @@
 
 			{#each store.tasks as task (task.id)}
 				<div
-					class="relative grid grid-cols-[minmax(10rem,1.4fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border/60 px-3 py-1.5 last:border-b-0 hover:bg-accent/60"
+					class="relative grid grid-cols-[minmax(10rem,1.4fr)_minmax(9rem,0.8fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border/60 px-3 py-1.5 last:border-b-0 hover:bg-accent/60"
 				>
 					<a
 						href={resolve('/tasks/[id]', { id: task.id })}
@@ -181,6 +183,8 @@
 					>
 						{task.display_name}
 					</a>
+					<!-- raised above the row link overlay so the full workload title shows on hover -->
+					<WorkloadCell workload={task.workload} class="relative z-10" />
 					<span class="font-mono text-muted-foreground" title={task.id}>{shortId(task.id)}</span>
 					<span class="flex items-center gap-1">
 						<StatusBadge status={task.status} />
