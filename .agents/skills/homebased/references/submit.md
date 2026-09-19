@@ -2,7 +2,7 @@
 
 ## 1. Find the Codex thread id
 
-The spec needs the UUID of the Codex thread that should receive the event. `homebased` accepts only a UUID, not a session name.
+The spec needs the UUID of the Codex thread that should receive the event. `homebased` accepts only a UUID, not a session name. Submit on this machine; another host cannot find this thread.
 
 1. Use the thread id if the user or the harness already gave one.
 2. Otherwise take the newest session file whose `cwd` matches this workspace and read `session_id` from its first line:
@@ -55,7 +55,7 @@ Agent example:
   "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "implement file browser",
   "cwd": "/home/praveen/code/project",
-  "timeout": "30m",
+  "timeout": "1h",
   "workload": {
     "type": "agent",
     "agent": "claude",
@@ -73,7 +73,7 @@ Task example:
   "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "cargo release build",
   "cwd": "/home/praveen/code/project",
-  "timeout": "4h",
+  "timeout": "2h",
   "workload": {
     "type": "task",
     "command": ["cargo", "build", "--release"]
@@ -96,7 +96,7 @@ GitHub CI watcher as a normal task:
 | `thread` | yes | Codex thread UUID from step 1. |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | Existing directory. The child runs there. |
-| `timeout` | no | Output-inactivity timer. Humantime string. Default `4h`. Minimum `30m`. Each non-empty write to `output.log` restarts it. When it expires, Homebased sends `TASK_CHECK_DUE` and does **not** kill the child. Use `30m` for bounded reviews and `1h` for large or tool-heavy reviews. |
+| `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `workload` | yes | Internally tagged enum: `type` is `agent` or `task`. |
 
 Agent-only fields under `workload`:

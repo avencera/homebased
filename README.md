@@ -9,7 +9,7 @@ Homebasd runs two workload variants under the same detached lifecycle:
 
 Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`.
 
-`timeout` is an output-inactivity timer (default 4h, minimum 30m). Homebasd resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
+`timeout` is an output-inactivity timer (default 1h, minimum 30m). Homebasd resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
 Submit specs use `api_version: 1` and a `workload` object. A required top-level `name` is the dashboard label. Tasks stored before this field was required keep a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
 
@@ -136,7 +136,7 @@ A `task` runs an argv array with no shell. A caller that needs shell syntax must
 
 ### Spec
 
-`name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread UUID that should receive events. `cwd` is the directory the child runs in. `timeout` is an output-inactivity timer (default `4h`, minimum `30m`). When it expires, Homebasd sends `TASK_CHECK_DUE` and does not kill the child.
+`name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread UUID that should receive events. `cwd` is the directory the child runs in. `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). When it expires, Homebasd sends `TASK_CHECK_DUE` and does not kill the child.
 
 Agent example:
 
@@ -164,7 +164,7 @@ Task example:
   "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "cargo release build",
   "cwd": "/path/to/project",
-  "timeout": "4h",
+  "timeout": "2h",
   "workload": {
     "type": "task",
     "command": ["cargo", "build", "--release"]

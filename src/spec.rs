@@ -32,8 +32,8 @@ fn api_version_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema 
 fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
-        "default": "4h",
-        "description": "Output-inactivity timer as a humantime duration. Default 4h. Minimum 30m. Does not kill the child."
+        "default": "1h",
+        "description": "Output-inactivity timer as a humantime duration. Default 1h. Minimum 30m. Does not kill the child."
     })
 }
 
@@ -88,7 +88,7 @@ struct SubmitSpecWire {
     name: TaskName,
     /// Working directory for the child.
     cwd: PathBuf,
-    /// Output-inactivity timer. Default 4h, minimum 30m.
+    /// Output-inactivity timer. Default 1h, minimum 30m.
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
@@ -1006,9 +1006,9 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_is_four_hours() {
+    fn default_timeout_is_one_hour() {
         let spec = parse_spec_value(&valid_agent()).unwrap();
-        assert_eq!(spec.timeout, Duration::from_secs(4 * 3600));
+        assert_eq!(spec.timeout, Duration::from_secs(3600));
         assert_eq!(spec.name.as_str(), "test agent");
         match spec.workload {
             SubmitWorkloadValidated::Agent(agent) => assert!(agent.report_trailer),

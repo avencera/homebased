@@ -1,15 +1,16 @@
 ---
 name: homebased
-description: Run long, unattended agent CLIs and general task commands through the homebased daemon and handle the HOMEBASED_EVENT callback that returns to this Codex thread. Use when work should run in the background and report back later, when a HOMEBASED_EVENT message arrives, when checking, cancelling, or resubmitting homebased tasks, or when this session is itself a homebased worker. Do not use for work that finishes inside the current turn.
+description: Run long, unattended agent CLIs and general task commands through the homebased daemon and handle the HOMEBASED_EVENT callback that returns to this Codex thread. Use when the user invokes $homebased or $hbd, when work should run in the background and report back later, when a HOMEBASED_EVENT message arrives, when checking, cancelling, or resubmitting homebased tasks, or when this session is itself a homebased worker. Do not use for work that finishes inside the current turn.
 ---
 
 # Homebased
 
-`homebased` is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages back to the submitting Codex thread. A task is either an `agent` workload (Codex, Claude, or Grok with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, detect a live task that has stopped writing output, cancel only on explicit request, and deliver callbacks. The orchestrator submits a JSON spec, ends its turn, and acts when events arrive.
+`homebased` (invoke as `$homebased` or `$hbd`) is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages back to the submitting Codex thread. A task is either an `agent` workload (Codex, Claude, or Grok with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, send a check reminder when output stays idle for the timeout, cancel only on explicit request, and deliver the terminal callback. The orchestrator submits a JSON spec, ends its turn, and acts when events arrive.
 
 ## Rules that hold everywhere
 
 - Never run `codex queue` yourself, and never tell a worker to run it. Delivery belongs to `homebased`.
+- Run `homebased` on this machine. Another host cannot find this thread, so the callback fails. To run work elsewhere, put `ssh` in the task command.
 - Submit only with `homebased task submit --spec <file|->`. There are no per-field submit flags.
 - Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
@@ -19,8 +20,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Task ids are full UUIDs. Prefix matching does not exist.
 - Delivery is at-least-once. Treat a repeated event for the same task and event name as a duplicate, not a new result.
 - Prefer `workload.type: "task"` for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
-- `timeout` measures output inactivity (default 4h, minimum 30m). Any non-empty write to `output.log` restarts the window. It sends `TASK_CHECK_DUE` and never kills the child.
-- Use `timeout: "30m"` for a bounded review. Use `timeout: "1h"` for a large or tool-heavy review. Do not leave the 4h default on a bounded review.
+- Set `timeout` to match the work (default 1h, min 30m). Quiet `output.log` for that long sends `TASK_CHECK_DUE`; it never kills the child.
 - Claude streams JSON output by default. Set `--output-format` in `extra_args` only when the task needs another format.
 
 ## Route

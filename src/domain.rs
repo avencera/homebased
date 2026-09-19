@@ -24,7 +24,7 @@ pub const TASK_NAME_MAX_CHARS: usize = 120;
 pub const MIN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Default output-inactivity timeout when the submitter omits `timeout`.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Maximum length of one report summary.
 pub const SUMMARY_MAX_BYTES: usize = 4096;
