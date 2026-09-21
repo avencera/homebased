@@ -15,13 +15,22 @@
 
 	let { from, to = null, suffix, class: className }: Props = $props();
 
-	// One timer per instance. The clock is read only while the interval is open
-	// ended, so a finished task pays nothing for the tick.
+	// one timer per instance. pause it once `to` is a real instant so a finished
+	// task does not keep ticking
 	let now = $state(Date.now());
-	useInterval(() => 1000, { callback: () => (now = Date.now()) });
+	const clock = useInterval(() => 1000, {
+		immediate: false,
+		callback: () => (now = Date.now())
+	});
+	const closedEnd = $derived(epochMs(to));
+
+	$effect(() => {
+		if (closedEnd === null) clock.resume();
+		else clock.pause();
+	});
 
 	const start = $derived(epochMs(from));
-	const end = $derived(epochMs(to) ?? now);
+	const end = $derived(closedEnd ?? now);
 	const text = $derived(start === null ? EM_DASH : formatDuration(end - start));
 </script>
 
