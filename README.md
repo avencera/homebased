@@ -1,19 +1,17 @@
 # homebased
 
-Supervise long-running agent CLIs and general task commands, then report them back to a Codex thread.
+A long build, test suite, or agent review can leave your Codex conversation waiting. Starting the work is only part of the job. You still need to check when it finishes and bring the result back.
 
-Homebasd runs two workload variants under the same detached lifecycle:
+**Homebased runs the work in the background and sends the result back to the same Codex thread.** Your agent submits a task and ends its turn. You can continue the conversation or leave while the work runs. When the task finishes, your agent can report the result in that thread.
 
-- `agent` — Codex, Claude, or Grok with a prompt and optional reporting trailer
-- `task` — an arbitrary argv array such as `cargo build --release` or `gh pr checks --watch` (no shell)
+Use it to:
 
-Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`.
+- Send a coding task or review to Codex, Claude, or Grok while you work on something else.
+- Run a build, test suite, or CI watcher and get the result without repeated status checks.
 
-`timeout` is an output-inactivity timer (default 1h, minimum 30m). Homebasd resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebasd sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
+Homebased keeps task status and logs. An optional web dashboard lets you inspect tasks and browse files. If a task stops producing output, Homebased asks the agent to check it and leaves the task running.
 
-Submit specs use `api_version: 1` and a `workload` object. A required top-level `name` is the dashboard label. Tasks stored before this field was required keep a server-derived `display_name` from the workload. See `.agents/skills/homebased/references/submit.md` for the full contract.
-
-The dashboard is off unless you set `--web-listen` / `HOMEBASED_WEB_LISTEN` to a host:port. It includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Use loopback locally (`127.0.0.1:7677`), or bind a Tailscale or LAN address for remote access on a trusted network. Text, raster images, and HTML open on a separate content origin; other files download.
+[Ask your agent to install it](#for-agents), or follow the [manual install steps](#install). Homebased runs on Linux and macOS.
 
 ## For agents
 
@@ -92,7 +90,9 @@ homebased --json daemon status
 
 `daemon status` must report `"socket": "up"`. Linux writes `~/.config/systemd/user/homebased.service`. macOS writes `~/Library/LaunchAgents/dev.praveen.homebased.plist`. Run install from a shell where `codex`, `claude`, `grok`, and the project toolchains are on `PATH`. The unit stores that `PATH` and the absolute agent paths.
 
-The dashboard is off by default. Set `HOMEBASED_WEB_LISTEN` before install to enable it and bake the bind into the host unit, for example `127.0.0.1:7677` on loopback or `0.0.0.0:7677` on a trusted LAN.
+The dashboard is off by default. It includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Text, raster images, and HTML open on a separate content origin; other files download.
+
+To enable the dashboard, set `HOMEBASED_WEB_LISTEN` to a host:port before install. The host unit stores this address. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly.
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.
 
@@ -134,9 +134,13 @@ Always pass `--json` on data commands. Every JSON object carries `api_version: 1
 
 A `task` runs an argv array with no shell. A caller that needs shell syntax must request it, for example `["sh", "-lc", "..."]`. An `agent` runs Codex, Claude, or Grok with a prompt file. Prefer `task` unless a model must reason.
 
+Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`.
+
 ### Spec
 
-`name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread UUID that should receive events. `cwd` is the directory the child runs in. `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). When it expires, Homebasd sends `TASK_CHECK_DUE` and does not kill the child.
+Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. Tasks stored before this field was required keep a server-derived `display_name` from the workload. `thread` is the Codex thread UUID that should receive events. `cwd` is the directory the child runs in.
+
+`timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
 Agent example:
 
