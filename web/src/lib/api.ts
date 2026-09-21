@@ -53,7 +53,14 @@ export type ExitReason =
 
 /** Public workload view. Omits private prompt and extra-arg fields. */
 export type WorkloadView =
-	{ type: 'agent'; agent: AgentKind; model: string | null } | { type: 'task'; command: string[] };
+	| {
+			type: 'agent';
+			agent: AgentKind;
+			model: string | null;
+			/** Reasoning effort from the agent argv, when the caller set one. */
+			reasoning?: string | null;
+	  }
+	| { type: 'task'; command: string[] };
 
 /** Inactivity-reminder state for the check timeout. */
 export type CheckTimeoutStatus = 'pending' | 'sent';

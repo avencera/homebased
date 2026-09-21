@@ -66,7 +66,8 @@ export function workloadLabel(task: Pick<TaskSummary, 'workload'>): string {
 /** Format a workload view for display. */
 export function formatWorkload(workload: WorkloadView): string {
 	if (workload.type === 'agent') {
-		return workload.model ? `${workload.agent}:${workload.model}` : workload.agent;
+		const name = workload.model ? `${workload.agent}:${workload.model}` : workload.agent;
+		return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
 	}
 	const [program, ...args] = workload.command;
 	if (!program) return 'task';

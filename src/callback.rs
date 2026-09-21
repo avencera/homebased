@@ -81,6 +81,12 @@ pub enum WorkloadView {
         agent: AgentKind,
         /// Model alias, or null.
         model: Option<String>,
+        /// Reasoning effort from the agent argv, when the caller set one.
+        ///
+        /// The public view omits `extra_args`. This keeps the level those args
+        /// named (`model_reasoning_effort`, `--effort`, or `--reasoning-effort`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     /// Task argv preview.
     Task {
@@ -95,12 +101,95 @@ impl From<&Workload> for WorkloadView {
             Workload::Agent(agent) => Self::Agent {
                 agent: agent.agent.kind,
                 model: agent.agent.model.clone(),
+                reasoning: reasoning_from_extra_args(&agent.extra_args),
             },
             Workload::Task(task) => Self::Task {
                 command: task.command.to_vec(),
             },
         }
     }
+}
+
+/// Last reasoning level named in agent argv.
+///
+/// Codex passes `model_reasoning_effort` through `-c` or `--config`. Claude
+/// passes `--effort`. Grok passes `--effort` or `--reasoning-effort`. A later
+/// flag replaces an earlier one. Other config keys stay private.
+fn reasoning_from_extra_args(extra_args: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < extra_args.len() {
+        let arg = &extra_args[index];
+        if let Some(level) = inline_config_reasoning(arg) {
+            found = Some(level);
+        } else if (arg == "--config" || arg == "-c")
+            && let Some(next) = extra_args.get(index + 1)
+        {
+            if let Some(level) = config_reasoning_value(next) {
+                found = Some(level);
+            }
+            index += 1;
+        } else if let Some(level) = inline_effort_flag(arg) {
+            found = Some(level);
+        } else if (arg == "--effort" || arg == "--reasoning-effort")
+            && let Some(next) = extra_args.get(index + 1)
+        {
+            if let Some(level) = reasoning_token(next) {
+                found = Some(level);
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    found
+}
+
+fn inline_config_reasoning(arg: &str) -> Option<String> {
+    let value = arg
+        .strip_prefix("--config=")
+        .or_else(|| arg.strip_prefix("-c="))?;
+    config_reasoning_value(value)
+}
+
+fn config_reasoning_value(value: &str) -> Option<String> {
+    let (key, raw) = value.split_once('=')?;
+    if key.trim() != "model_reasoning_effort" {
+        return None;
+    }
+    reasoning_token(raw)
+}
+
+fn inline_effort_flag(arg: &str) -> Option<String> {
+    let raw = arg
+        .strip_prefix("--reasoning-effort=")
+        .or_else(|| arg.strip_prefix("--effort="))?;
+    reasoning_token(raw)
+}
+
+/// One reasoning level token, with one or more wrapping quote layers removed.
+fn reasoning_token(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    loop {
+        let bytes = value.as_bytes();
+        if bytes.len() < 2 {
+            break;
+        }
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            value = &value[1..value.len() - 1];
+            continue;
+        }
+        break;
+    }
+    let value = value.trim();
+    let mut chars = value.chars();
+    if value.len() > 32 || !chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Derived event name.
@@ -675,6 +764,35 @@ mod tests {
     }
 
     #[test]
+    fn workload_view_publishes_reasoning_level() {
+        let workload = Workload::Agent(AgentWorkload {
+            agent: Agent::new(AgentKind::Codex, Some("gpt-5.6-luna".into())),
+            extra_args: vec!["--config".into(), "model_reasoning_effort=\"max\"".into()],
+            report_trailer: true,
+        });
+        let json = serde_json::to_value(WorkloadView::from(&workload)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "agent",
+                "agent": "codex",
+                "model": "gpt-5.6-luna",
+                "reasoning": "max"
+            })
+        );
+    }
+
+    #[test]
+    fn workload_view_omits_unset_reasoning() {
+        let json =
+            serde_json::to_value(WorkloadView::from(&row(TaskState::Queued).workload)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "agent", "agent": "claude", "model": "fable"})
+        );
+    }
+
+    #[test]
     fn cancelled_wins() {
         let event = exit_event(
             &row(TaskState::Finished {
@@ -708,6 +826,50 @@ mod tests {
         );
         assert_eq!(event.event, EventKind::TaskSucceeded);
         assert_eq!(event.reports.len(), 2);
+    }
+
+    fn codex_luna(extra_args: &[String]) -> Workload {
+        Workload::Agent(AgentWorkload {
+            agent: Agent::new(AgentKind::Codex, Some("gpt-5.6-luna".into())),
+            extra_args: extra_args.to_vec(),
+            report_trailer: true,
+        })
+    }
+
+    #[test]
+    fn reasoning_comes_from_agent_argv() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&[], None),
+            (&["--config", "model_reasoning_effort=\"max\""], Some("max")),
+            (&["-c", "model_reasoning_effort=max"], Some("max")),
+            (&["-c", "model_reasoning_effort=\"low\""], Some("low")),
+            (&["--config=model_reasoning_effort='xhigh'"], Some("xhigh")),
+            (&["--effort", "high"], Some("high")),
+            (&["--reasoning-effort", "high"], Some("high")),
+            (&["--effort=medium"], Some("medium")),
+            (
+                &[
+                    "-c",
+                    "model_reasoning_effort=\"low\"",
+                    "--config",
+                    "sandbox_mode=\"danger-full-access\"",
+                    "-c",
+                    "model_reasoning_effort=\"max\"",
+                ],
+                Some("max"),
+            ),
+            (&["--add-dir", "/tmp"], None),
+            (&["-c", "model=\"gpt-5.6-luna\""], None),
+            (&["--effort", "--add-dir"], None),
+        ];
+        for (args, expected) in cases {
+            let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+            let view = WorkloadView::from(&codex_luna(&owned));
+            let WorkloadView::Agent { reasoning, .. } = view else {
+                panic!("agent view");
+            };
+            assert_eq!(reasoning.as_deref(), *expected, "{args:?}");
+        }
     }
 
     #[test]

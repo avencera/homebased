@@ -11,16 +11,21 @@
 	let { workload, class: className }: Props = $props();
 
 	// the badge names the selected model because it is the useful agent identity
-	const label = $derived(workload.type === 'agent' ? (workload.model ?? workload.agent) : 'cmd');
+	const label = $derived.by(() => {
+		if (workload.type !== 'agent') return 'cmd';
+		const name = workload.model ?? workload.agent;
+		return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
+	});
 	const detail = $derived.by(() => {
 		if (workload.type === 'agent') return null;
 		return workload.command.length > 0 ? formatWorkload(workload) : null;
 	});
 	const title = $derived.by(() => {
 		if (workload.type === 'agent') {
-			return workload.model
+			const model = workload.model
 				? `agent ${workload.agent}, model ${workload.model}`
 				: `agent ${workload.agent}, default model`;
+			return workload.reasoning ? `${model}, reasoning ${workload.reasoning}` : model;
 		}
 		return `command: ${workload.command.join(' ')}`;
 	});
