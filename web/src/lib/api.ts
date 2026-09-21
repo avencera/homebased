@@ -32,7 +32,7 @@ export function isProcessStatus(value: string): value is ProcessStatus {
 
 /** Whether the worker can still change status on its own. */
 export function isInFlight(status: ProcessStatus): boolean {
-	return status === 'queued' || status === 'running';
+	return IN_FLIGHT_STATUSES.includes(status);
 }
 
 /** Agent CLI that runs the task. */
