@@ -28,6 +28,8 @@
 	let pathInput = $state('/');
 	let contentPort = $state<number | null>(null);
 	let loading = $state(false);
+	// a slow listing must not replace a newer navigation
+	let loadGeneration = 0;
 
 	const token = $derived(page.url.searchParams.get('token'));
 	const entryPath = $derived(page.url.searchParams.get('path'));
@@ -35,7 +37,8 @@
 	$effect(() => {
 		const currentToken = token;
 		const currentPath = entryPath;
-		void load(currentToken, currentPath);
+		const generation = ++loadGeneration;
+		void load(generation, currentToken, currentPath);
 	});
 
 	async function ensureOrigin(): Promise<number> {
@@ -45,18 +48,20 @@
 		return origin.port;
 	}
 
-	async function load(currentToken: string | null, currentPath: string | null) {
+	async function load(generation: number, currentToken: string | null, currentPath: string | null) {
 		loading = true;
 		error = null;
 		try {
 			if (currentToken) {
 				const dir = await fetchDirectory(currentToken);
+				if (generation !== loadGeneration) return;
 				listing = dir;
 				pathInput = dir.path;
 				return;
 			}
 			if (currentPath) {
 				const resolved = await resolvePath(currentPath);
+				if (generation !== loadGeneration) return;
 				pathInput = resolved.resolved ?? resolved.requested;
 				if (resolved.kind === 'directory') {
 					await goto(resolve(`/files?token=${encodeURIComponent(resolved.token)}`), {
@@ -67,6 +72,7 @@
 					return;
 				}
 				const port = await ensureOrigin();
+				if (generation !== loadGeneration) return;
 				const url = resolved.content_path
 					? contentUrlForPath(port, resolved.content_path)
 					: contentUrlForToken(port, resolved.token);
@@ -74,16 +80,18 @@
 				return;
 			}
 			const resolved = await resolvePath('/');
+			if (generation !== loadGeneration) return;
 			await goto(resolve(`/files?token=${encodeURIComponent(resolved.token)}`), {
 				replaceState: true,
 				keepFocus: true,
 				noScroll: true
 			});
 		} catch (cause) {
+			if (generation !== loadGeneration) return;
 			listing = null;
 			error = asApiError(cause);
 		} finally {
-			loading = false;
+			if (generation === loadGeneration) loading = false;
 		}
 	}
 
