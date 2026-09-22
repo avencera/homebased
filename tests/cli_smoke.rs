@@ -1,7 +1,8 @@
 //! Opt-in checks that the real agent CLIs still accept the unattended argv
 //! homebased builds. Ignored under `just test` / `just ci`; run with
 //! `just smoke-cli`. These invocations use `--help` (or a fake flag) so they
-//! do not start a model turn.
+//! do not start a model turn. OpenCode can be selected with
+//! `HOMEBASED_OPENCODE=/path/to/opencode` when it is not on `PATH`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -102,6 +103,20 @@ fn live_grok_accepts_unattended_argv() {
     assert_unattended_help(AgentKind::Grok, Some(prompt.as_path()));
 }
 
+#[test]
+#[ignore = "requires the real `opencode` binary on PATH; run with just smoke-cli"]
+fn live_opencode_accepts_unattended_argv() {
+    let help = assert_unattended_help(AgentKind::OpenCode, None);
+    assert!(
+        help.contains("standalone"),
+        "OpenCode help dropped --standalone:\n{help}"
+    );
+    assert!(
+        help.contains("agent"),
+        "OpenCode help dropped --agent:\n{help}"
+    );
+}
+
 fn assert_unattended_help(kind: AgentKind, prompt_file: Option<&Path>) -> String {
     let dir = TempDir::new().unwrap();
     let argv = unattended_argv(kind, dir.path(), prompt_file);
@@ -141,6 +156,11 @@ fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> C
 }
 
 fn live_binary(kind: AgentKind) -> PathBuf {
+    if let Ok(pinned) = std::env::var(kind.binary_env())
+        && !pinned.is_empty()
+    {
+        return PathBuf::from(pinned);
+    }
     which::which(kind.binary_name()).unwrap_or_else(|err| {
         panic!(
             "{} not found on PATH ({err}); install it before `just smoke-cli`",

@@ -6,7 +6,7 @@ A long build, test suite, or agent review can leave your Codex conversation wait
 
 Use it to:
 
-- Send a coding task or review to Codex, Claude, or Grok while you work on something else.
+- Send a coding task or review to Codex, Claude, Grok, or OpenCode while you work on something else.
 - Run a build, test suite, or CI watcher and get the result without repeated status checks.
 
 Homebased keeps task status and logs. An optional web dashboard lets you inspect tasks and browse files. If a task stops producing output, Homebased asks the agent to check it and leaves the task running.
@@ -88,7 +88,7 @@ homebased daemon install
 homebased --json daemon status
 ```
 
-`daemon status` must report `"socket": "up"`. Linux writes `~/.config/systemd/user/homebased.service`. macOS writes `~/Library/LaunchAgents/dev.praveen.homebased.plist`. Run install from a shell where `codex`, `claude`, `grok`, and the project toolchains are on `PATH`. The unit stores that `PATH` and the absolute agent paths.
+`daemon status` must report `"socket": "up"`. Linux writes `~/.config/systemd/user/homebased.service`. macOS writes `~/Library/LaunchAgents/dev.praveen.homebased.plist`. Run install from a shell where `codex`, `claude`, `grok`, `opencode`, and the project toolchains are on `PATH`. The unit stores that `PATH` and the absolute agent paths, including `HOMEBASED_OPENCODE` when OpenCode is installed.
 
 The dashboard is off by default. It includes a device-wide read-only file browser. There is no application token: any peer that can reach the dashboard can read every regular file available to the daemon user. Text, raster images, and HTML open on a separate content origin; other files download.
 
@@ -132,9 +132,11 @@ Always pass `--json` on data commands. Every JSON object carries `api_version: 1
 | Long commands: `cargo build`, test suites, CI watchers | `task` |
 | A model must reason and produce a report | `agent` |
 
-A `task` runs an argv array with no shell. A caller that needs shell syntax must request it, for example `["sh", "-lc", "..."]`. An `agent` runs Codex, Claude, or Grok with a prompt file. Prefer `task` unless a model must reason.
+A `task` runs an argv array with no shell. A caller that needs shell syntax must request it, for example `["sh", "-lc", "..."]`. An `agent` runs Codex, Claude, Grok, or OpenCode with a prompt file. Prefer `task` unless a model must reason.
 
 Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`; exact spellings of Homebased-managed standalone switches are reserved tokens there, so Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other extra arguments keep their order and spelling.
+
+OpenCode agent workloads use `opencode run --standalone` with JSON events and the prompt feed on stdin. `model` is optional and is passed as one provider-qualified value, such as `zai-coding-plan/glm-5.3-flash` or `provider/model#variant`. OpenCode gets full work-tool permissions for that child only. Homebased sets the child `PWD` to `cwd`, adds a generated primary agent, and leaves persistent OpenCode configuration unchanged. An inherited `OPENCODE_CONFIG_CONTENT` value may contain JSONC; Homebased preserves its unrelated settings and rejects malformed content or a generated-agent name collision. OpenCode extra arguments cannot replace the agent, working directory, model, prompt, session, server, or standalone mode.
 
 ### Spec
 

@@ -87,6 +87,7 @@ impl Harness {
             .env("HOMEBASED_CODEX", fixture("fake-codex"))
             .env("HOMEBASED_CLAUDE", fixture("fake-claude"))
             .env("HOMEBASED_GROK", fixture("fake-grok"))
+            .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
             .env("FAKE_RECORD_DIR", &self.record)
             .env("HOME", &self.user_home)
             .env("HARNESS_SUPERVISOR_LOG", &self.supervisor_log)
@@ -190,6 +191,24 @@ impl Harness {
         fs::read_to_string(self.record.join(format!("stdin-{id}.txt"))).unwrap()
     }
 
+    fn opencode_meta(&self, id: &str) -> String {
+        let path = self.record.join(format!("opencode-meta-{id}.txt"));
+        assert!(wait_until(Duration::from_secs(10), || path.exists()));
+        fs::read_to_string(path).unwrap()
+    }
+
+    fn opencode_stdin(&self, id: &str) -> String {
+        let path = self.record.join(format!("opencode-stdin-{id}.txt"));
+        assert!(wait_until(Duration::from_secs(10), || path.exists()));
+        fs::read_to_string(path).unwrap()
+    }
+
+    fn opencode_pid(&self, id: &str, kind: &str) -> i32 {
+        let path = self.record.join(format!("opencode-{kind}-pid-{id}.txt"));
+        assert!(wait_until(Duration::from_secs(10), || path.exists()));
+        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+    }
+
     fn store(&self) -> Store {
         Store::open(&self.home.join("homebased.sqlite")).unwrap()
     }
@@ -216,11 +235,15 @@ impl Harness {
     }
 
     fn spec(agent: &str, prompt: &str) -> Value {
+        Self::spec_with_cwd(agent, prompt, std::env::temp_dir())
+    }
+
+    fn spec_with_cwd(agent: &str, prompt: &str, cwd: impl AsRef<Path>) -> Value {
         json!({
             "api_version": 1,
             "thread": THREAD,
             "name": "test agent",
-            "cwd": std::env::temp_dir(),
+            "cwd": cwd.as_ref(),
             "timeout": "2h",
             "workload": {
                 "type": "agent",
@@ -292,6 +315,10 @@ impl Harness {
             "stdout",
             "ignore-term",
             "no-stdin",
+            "opencode-hold",
+            "opencode-ignore-term",
+            "opencode-tool-ignore-term",
+            "opencode-exit",
         ] {
             let _ = fs::remove_file(self.record.join(name));
         }
@@ -436,6 +463,20 @@ fn wait_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
         thread::sleep(Duration::from_millis(40));
     }
     pred()
+}
+
+fn process_is_live(pid: i32) -> bool {
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .split_whitespace()
+            .nth(2)
+            .is_some_and(|state| state != "Z");
+    }
+    true
 }
 
 fn event_json(line: &str) -> Value {
@@ -1212,6 +1253,130 @@ fn grok_gets_feed_file() {
 }
 
 #[test]
+fn opencode_success_receives_feed_environment_and_report() {
+    let h = Harness::new();
+    let cwd = h.dir.path().join("opencode-work");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut spec = Harness::spec_with_cwd("opencode", "opencode prompt", &cwd);
+    spec["workload"]["model"] = json!("zai-coding-plan/glm-5.3-flash");
+    let id = h.submit(&spec);
+    let show = h.wait_status(&id, "succeeded");
+    assert_eq!(show["workload"]["agent"], "opencode");
+    assert_eq!(show["workload"]["model"], "zai-coding-plan/glm-5.3-flash");
+    assert_eq!(show["callback"], "sent");
+
+    let meta = h.opencode_meta(&id);
+    assert!(
+        meta.contains(&format!(
+            "argv=run --standalone --agent homebased-{id} --format json --auto --model zai-coding-plan/glm-5.3-flash"
+        )),
+        "{meta}"
+    );
+    assert!(
+        meta.contains("--format json --auto --model zai-coding-plan/glm-5.3-flash"),
+        "{meta}"
+    );
+    assert!(meta.contains(&format!("cwd={}", cwd.display())), "{meta}");
+    assert!(meta.contains(&format!("PWD={}", cwd.display())), "{meta}");
+    assert!(meta.contains("permission=wildcard-allow"), "{meta}");
+    assert!(meta.contains("generated-agent=present"), "{meta}");
+    assert!(meta.contains("provider-content=absent"), "{meta}");
+    assert!(
+        !meta.contains("prompt"),
+        "prompt must not be in argv metadata: {meta}"
+    );
+
+    let stdin = h.opencode_stdin(&id);
+    assert!(stdin.starts_with("opencode prompt"), "{stdin}");
+    assert!(stdin.contains("--- homebased ---"), "{stdin}");
+    let output = fs::read_to_string(h.output_log(&id)).unwrap();
+    assert!(output.contains("fake opencode progress"), "{output}");
+    let terminal = event_json(h.queue_messages().last().unwrap());
+    assert_eq!(terminal["event"], "TASK_SUCCEEDED");
+    assert_eq!(terminal["task"], id);
+}
+
+#[test]
+fn opencode_nonzero_exit_is_reported() {
+    let h = Harness::new();
+    h.set_control("opencode-exit", "7");
+    let id = h.submit(&Harness::spec("opencode", "fail opencode"));
+    let show = h.wait_status(&id, "failed");
+    assert_eq!(show["exit_reason"]["kind"], "exit");
+    assert_eq!(show["exit_reason"]["code"], 7);
+    assert_eq!(
+        event_json(h.queue_messages().last().unwrap())["event"],
+        "TASK_FAILED"
+    );
+    assert!(
+        fs::read_to_string(h.output_log(&id))
+            .unwrap()
+            .contains("fake opencode progress")
+    );
+}
+
+#[test]
+fn opencode_cancellation_cleans_cli_server_and_tool() {
+    let h = Harness::new();
+    h.set_control("opencode-hold", "");
+    let graceful = h.submit(&Harness::spec("opencode", "graceful cancellation"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        || h.show(&graceful)["status"] == "running"
+    ));
+    let graceful_pids = [
+        h.opencode_pid(&graceful, "cli"),
+        h.opencode_pid(&graceful, "server"),
+        h.opencode_pid(&graceful, "tool"),
+    ];
+    let out = h
+        .cmd()
+        .args(["task", "cancel", &graceful])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.wait_status(&graceful, "cancelled");
+    assert!(wait_until(Duration::from_secs(10), || {
+        graceful_pids.iter().all(|pid| !process_is_live(*pid))
+    }));
+
+    h.set_control("opencode-ignore-term", "");
+    h.set_control("opencode-tool-ignore-term", "");
+    let forced = h.submit(&Harness::spec("opencode", "forced cancellation"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        || h.show(&forced)["status"] == "running"
+    ));
+    let forced_pids = [
+        h.opencode_pid(&forced, "cli"),
+        h.opencode_pid(&forced, "server"),
+        h.opencode_pid(&forced, "tool"),
+    ];
+    let out = h.cmd().args(["task", "cancel", &forced]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.wait_status(&forced, "cancelled");
+    assert!(wait_until(Duration::from_secs(15), || {
+        forced_pids.iter().all(|pid| !process_is_live(*pid))
+    }));
+    assert!(
+        h.queue_messages()
+            .iter()
+            .filter_map(|line| event_json(line)["event"].as_str().map(str::to_string))
+            .filter(|event| event == "TASK_CANCELLED")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
 fn submit_dry_run_and_schema() {
     let h = Harness::new();
     let spec = Harness::spec("claude", "preview");
@@ -1283,6 +1448,49 @@ fn submit_dry_run_and_schema() {
             .is_some_and(|s| s.contains("tasks/<task-id>/prompt.feed.txt"))),
         "grok dry-run must include the deterministic feed placeholder: {v}"
     );
+
+    let mut opencode = Harness::spec("opencode", "preview opencode");
+    opencode["workload"]["model"] = json!("zai-coding-plan/glm-5.3-flash");
+    let mut child = h
+        .cmd()
+        .args(["--json", "task", "submit", "--dry-run", "--spec", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(serde_json::to_vec(&opencode).unwrap().as_slice())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["stdin"], "prompt_feed");
+    assert_eq!(
+        v["managed_environment"]["policy"],
+        "open_code_full_work_permissions"
+    );
+    assert_eq!(v["managed_environment"]["wildcard_permission"], "allow");
+    assert_eq!(
+        v["managed_environment"]["generated_agent"]["name"],
+        "homebased-<task-id>"
+    );
+    let argv = v["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|arg| arg == "run"));
+    assert!(argv.iter().any(|arg| arg == "homebased-<task-id>"));
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "zai-coding-plan/glm-5.3-flash")
+    );
+    assert!(!v.to_string().contains("OPENCODE_CONFIG_CONTENT"));
+    assert!(h.store().list_tasks(&[], None).unwrap().is_empty());
 
     let out = h.cmd().args(["task", "schema"]).output().unwrap();
     assert!(out.status.success());
@@ -1481,6 +1689,7 @@ fn install_dry_run_text() {
     let dir = TempDir::new().unwrap();
     let out = Command::new(&hb)
         .env_remove("HOMEBASED_WEB_LISTEN")
+        .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])
         .arg(dir.path())
         .output()
@@ -1497,12 +1706,27 @@ fn install_dry_run_text() {
         assert!(!text.contains("ExecStop"), "{text}");
         assert!(text.contains("ExecStart="), "{text}");
         assert!(text.contains("Environment=PATH="), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Environment=HOMEBASED_OPENCODE={}",
+                fixture("fake-opencode").display()
+            )),
+            "{text}"
+        );
     }
     #[cfg(target_os = "macos")]
     {
         assert!(text.contains("<key>AbandonProcessGroup</key>"), "{text}");
         assert!(text.contains("<key>ProgramArguments</key>"), "{text}");
         assert!(text.contains("<key>PATH</key>"), "{text}");
+        assert!(
+            text.contains("<key>HOMEBASED_OPENCODE</key>")
+                && text.contains(&format!(
+                    "<string>{}</string>",
+                    fixture("fake-opencode").display()
+                )),
+            "{text}"
+        );
     }
     assert!(!text.contains("HOMEBASED_WEB_LISTEN"), "{text}");
 
@@ -1510,6 +1734,7 @@ fn install_dry_run_text() {
     // unset means the dashboard stays off; the unit does not invent a bind.
     let out = Command::new(&hb)
         .env("HOMEBASED_WEB_LISTEN", "0.0.0.0:7677")
+        .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])
         .arg(dir.path())
         .output()
@@ -1528,6 +1753,7 @@ fn install_dry_run_text() {
     );
     let out = Command::new(&hb)
         .env("HOMEBASED_WEB_LISTEN", "lan")
+        .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])
         .arg(dir.path())
         .output()

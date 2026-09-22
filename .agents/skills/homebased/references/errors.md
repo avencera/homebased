@@ -25,6 +25,7 @@ Errors go to stderr. With `--json` they are one object:
 | --- | --- | --- | --- |
 | `daemon_unavailable` | 1, retryable | Socket missing or refused. | `homebased --json daemon status`. If `socket` is `down`, read setup.md and start or restart the daemon. Tasks already running keep running and still report. |
 | `invalid_spec` | 2 | Bad JSON, unknown field, wrong `api_version`, bad UUID, both or neither of `prompt`/`prompt_file`, timeout below 30m, empty command, cross-variant fields, unreadable `prompt_file`. | Fix the field at `input.pointer`. `homebased task schema` prints the schema. |
+| `agent_configuration` | 1 | OpenCode inherited inline configuration is malformed, has the wrong shape, or already defines the generated task agent. | Fix `OPENCODE_CONFIG_CONTENT` without putting credentials in the task spec or logs, then submit again. |
 | `cwd_not_found` | 3 | `cwd` is not an existing directory. | Fix `cwd`. |
 | `executable_missing` | 3 | Requested program missing, not a file, or not executable. Agents also check `HOMEBASED_<AGENT>` overrides. | Submit from a shell where the program is on `PATH`, use an absolute path, or export `HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, or `HOMEBASED_GROK`. |
 | `task_not_found` | 3 | Unknown task id. Ids are full UUIDs. | Use `task list --json` to find the id. |

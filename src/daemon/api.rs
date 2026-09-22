@@ -16,14 +16,17 @@ use crate::callback::last_event_for_row;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
 use crate::daemon::{AppState, web};
-use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload};
+use crate::domain::{
+    API_VERSION, ProcessStatus, TaskEnv, TaskId, TaskIdentity, ThreadId, Workload,
+};
 use crate::error::AppError;
 use crate::files::{
     ContentOriginBody, DirectoryListing, PathToken, ResolveBody, ResolvedPath, list_directory,
     resolve_absolute_path,
 };
 use crate::invocation::{
-    StdinPolicy, invocation_from_normalized, persist_workload, resolve_workload_binary,
+    ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized_for_identity,
+    persist_workload, resolve_workload_binary,
 };
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::{self, CancelResult};
@@ -195,6 +198,8 @@ struct DryRunResponse {
     spec: NormalizedSpec,
     argv: Vec<String>,
     stdin: StdinPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_environment: Option<ManagedEnvironmentPreview>,
 }
 
 async fn dry_run(
@@ -204,17 +209,19 @@ async fn dry_run(
     let spec = body.spec;
     spec::check_cwd(&spec.cwd)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
-    let invocation = invocation_from_normalized(
+    let invocation = invocation_from_normalized_for_identity(
         &spec.workload,
         &body.env.path,
         &spec.cwd,
         prompt_feed.as_deref(),
+        TaskIdentity::Preview,
     )?;
     Ok(Json(DryRunResponse {
         api_version: API_VERSION,
         spec,
         argv: invocation.to_vec(),
         stdin: invocation.stdin,
+        managed_environment: invocation.managed_environment,
     }))
 }
 

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::domain::{ProcessStatus, TaskId};
+use crate::domain::{AgentKind, ProcessStatus, TaskId};
 
 /// Application error with a stable machine-readable code.
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +63,14 @@ pub enum AppError {
         /// Value found at `pointer`.
         value: Value,
         /// Why the value was rejected.
+        message: String,
+    },
+    /// Agent-specific child configuration could not be built safely.
+    #[error("{agent} child configuration: {message}")]
+    AgentConfiguration {
+        /// Agent whose child environment or command was invalid.
+        agent: AgentKind,
+        /// Safe configuration failure detail.
         message: String,
     },
     /// Another serve process holds `daemon.lock`.
@@ -161,6 +169,7 @@ impl AppError {
             Self::TooManyReports { .. } => "too_many_reports",
             Self::TaskTerminal { .. } => "task_terminal",
             Self::InvalidSpec { .. } => "invalid_spec",
+            Self::AgentConfiguration { .. } => "agent_configuration",
             Self::DaemonAlreadyRunning => "daemon_already_running",
             Self::LockHeld { .. } => "lock_held",
             Self::TasksInFlight { .. } => "tasks_in_flight",
@@ -186,6 +195,7 @@ impl AppError {
             | Self::LockHeld { .. }
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => 2,
+            Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
@@ -212,6 +222,7 @@ impl AppError {
             | Self::Usage { .. }
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. } => http::StatusCode::BAD_REQUEST,
+            Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
             | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
@@ -249,6 +260,9 @@ impl AppError {
             Self::TaskTerminal { id, status } => json!({ "id": id, "status": status }),
             Self::InvalidSpec { pointer, value, .. } => {
                 json!({ "pointer": pointer, "value": value })
+            }
+            Self::AgentConfiguration { agent, message } => {
+                json!({ "agent": agent, "message": message })
             }
             Self::TasksInFlight { count } => json!({ "count": count }),
             Self::Usage { message } => json!({ "message": message }),

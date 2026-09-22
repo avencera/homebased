@@ -186,6 +186,35 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// Identity available while constructing one child invocation.
+///
+/// Dry runs use [`Self::Preview`] because no task row exists. Workers use
+/// [`Self::Actual`] so agent-specific names cannot collide across tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskIdentity {
+    /// Deterministic placeholder used by dry-run output.
+    Preview,
+    /// Persisted task identity used by a worker.
+    Actual(TaskId),
+}
+
+impl TaskIdentity {
+    /// Build the OpenCode primary-agent name for this identity.
+    #[must_use]
+    pub fn opencode_agent_name(self) -> String {
+        format!("homebased-{self}")
+    }
+}
+
+impl fmt::Display for TaskIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preview => f.write_str("<task-id>"),
+            Self::Actual(id) => id.fmt(f),
+        }
+    }
+}
+
 impl FromStr for TaskId {
     type Err = AppError;
 
@@ -232,6 +261,8 @@ pub enum AgentKind {
     Claude,
     /// `grok` full agent.
     Grok,
+    /// `opencode run`.
+    OpenCode,
 }
 
 impl AgentKind {
@@ -242,6 +273,7 @@ impl AgentKind {
             Self::Codex => "HOMEBASED_CODEX",
             Self::Claude => "HOMEBASED_CLAUDE",
             Self::Grok => "HOMEBASED_GROK",
+            Self::OpenCode => "HOMEBASED_OPENCODE",
         }
     }
 
@@ -252,6 +284,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Grok => "grok",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -262,13 +295,13 @@ impl fmt::Display for AgentKind {
     }
 }
 
-/// Agent kind plus optional model alias.
+/// Agent kind plus an optional model id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     /// CLI kind. Serialized as `agent` to match the public workload shape.
     #[serde(rename = "agent")]
     pub kind: AgentKind,
-    /// Model alias such as `fable` or `grok-4.6`. Empty becomes `None`.
+    /// Model id such as `fable`, `grok-4.6`, or `provider/model#variant`. Empty becomes `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
@@ -915,6 +948,23 @@ mod tests {
         assert_eq!(agent.model, None);
         let agent = Agent::new(AgentKind::Claude, Some("fable".into()));
         assert_eq!(agent.model.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn opencode_identity_and_binary_contract() {
+        let id: TaskId = "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap();
+        assert_eq!(TaskIdentity::Preview.to_string(), "<task-id>");
+        assert_eq!(
+            TaskIdentity::Preview.opencode_agent_name(),
+            "homebased-<task-id>"
+        );
+        assert_eq!(
+            TaskIdentity::Actual(id).opencode_agent_name(),
+            "homebased-01a0ab97-a7aa-7463-a5b0-8d500e40e431"
+        );
+        assert_eq!(AgentKind::OpenCode.binary_env(), "HOMEBASED_OPENCODE");
+        assert_eq!(AgentKind::OpenCode.binary_name(), "opencode");
+        assert_eq!(AgentKind::OpenCode.to_string(), "opencode");
     }
 
     #[test]

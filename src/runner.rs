@@ -19,10 +19,10 @@ use tokio::time;
 use tracing::{info, warn};
 
 use crate::callback::{deliver_exit_event, exit_event};
-use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskRow};
+use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskIdentity, TaskRow};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
-use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
+use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
 use crate::report::REPORT_TRAILER;
 use crate::store::{self, Store};
 
@@ -102,20 +102,32 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     store.set_pid(id, pid)?;
     let row = store.require_task(id)?;
     let paths = home.task_paths(id);
-    let invocation = invocation_from_workload(&row.workload, &row.binary, &row.cwd, &paths.feed);
-    // only stdin-fed agents need the bytes; Grok reads the feed path from argv
-    let feed = if invocation.stdin == StdinPolicy::PromptFeed {
-        Some(std::fs::read(&paths.feed)?)
-    } else {
-        None
-    };
-
-    let reason = match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm).await
-    {
-        Ok(reason) => reason,
-        Err(err) => ExitReason::SpawnFailed {
-            message: err.to_string(),
-        },
+    let reason = match invocation_from_workload_for_identity(
+        &row.workload,
+        &row.binary,
+        &row.cwd,
+        &paths.feed,
+        TaskIdentity::Actual(id),
+    ) {
+        Ok(invocation) => {
+            // only stdin-fed agents need the bytes; Grok reads the feed path from argv
+            let feed = if invocation.stdin == StdinPolicy::PromptFeed {
+                Some(std::fs::read(&paths.feed)?)
+            } else {
+                None
+            };
+            match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm).await {
+                Ok(reason) => reason,
+                Err(err) => ExitReason::SpawnFailed {
+                    message: err.to_string(),
+                },
+            }
+        }
+        Err(err) => {
+            let message = err.to_string();
+            std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+            ExitReason::SpawnFailed { message }
+        }
     };
 
     store::write_exit_json(&paths.exit_json, &reason)?;
@@ -161,6 +173,9 @@ async fn run_child(
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true)
         .process_group(0);
+    for (key, value) in invocation.environment.iter() {
+        cmd.env(key, value);
+    }
     match invocation.stdin {
         StdinPolicy::PromptFeed => {
             cmd.stdin(Stdio::piped());

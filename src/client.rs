@@ -170,6 +170,16 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             value: input.get("value").cloned().unwrap_or(Value::Null),
             message,
         },
+        "agent_configuration" => {
+            let agent = input
+                .get("agent")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match agent {
+                Some(agent) => AppError::AgentConfiguration { agent, message },
+                None => AppError::Internal { message },
+            }
+        }
         "task_terminal" => {
             let id = input
                 .get("id")
@@ -198,5 +208,32 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         _ => AppError::Internal {
             message: format!("http {} {message}", status.as_u16()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::AgentKind;
+
+    #[test]
+    fn agent_configuration_error_keeps_its_public_code() {
+        let error = from_code(
+            "agent_configuration",
+            "opencode child configuration: invalid JSONC".into(),
+            &json!({"agent": "opencode"}),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+
+        assert!(matches!(
+            error,
+            AppError::AgentConfiguration {
+                agent: AgentKind::OpenCode,
+                ..
+            }
+        ));
+        assert_eq!(error.code(), "agent_configuration");
     }
 }

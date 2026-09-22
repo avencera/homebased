@@ -2,15 +2,22 @@
 
 use std::path::Path;
 
-use crate::domain::AgentKind;
-use crate::invocation::{ChildInvocation, StdinPolicy};
+use jsonc_parser::{ParseOptions, parse_to_serde_value};
+use serde_json::{Value, json};
+
+use crate::domain::{AgentKind, TaskIdentity};
+use crate::error::AppError;
+use crate::invocation::{
+    ChildEnvironment, ChildInvocation, GeneratedAgentOverlay, ManagedEnvironmentPolicy,
+    ManagedEnvironmentPreview, StdinPolicy,
+};
 
 /// Inputs for one agent argv build. Callers supply a real working directory.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentArgvInputs<'a> {
     /// Agent CLI.
     pub kind: AgentKind,
-    /// Model alias, if any.
+    /// Model id, if any.
     pub model: Option<&'a str>,
     /// Working directory for the child.
     pub cwd: &'a Path,
@@ -20,10 +27,57 @@ pub struct AgentArgvInputs<'a> {
 
 /// Build unattended argv for an agent workload.
 ///
-/// `prompt_feed` is always the evidence-path feed file. Codex and Claude read
-/// it from stdin; Grok takes it as `--prompt-file`.
+/// `prompt_feed` is always the evidence-path feed file. Codex, Claude, and
+/// OpenCode read it from stdin; Grok takes it as `--prompt-file`.
 #[must_use]
 pub fn build_agent_invocation(
+    inputs: AgentArgvInputs<'_>,
+    binary: &Path,
+    prompt_feed: &Path,
+) -> ChildInvocation {
+    if inputs.kind == AgentKind::OpenCode {
+        let identity = TaskIdentity::Preview;
+        return build_opencode_invocation_with_config(
+            inputs,
+            binary,
+            prompt_feed,
+            identity,
+            generated_opencode_config(&identity.opencode_agent_name()),
+        );
+    }
+    build_standard_agent_invocation(inputs, binary, prompt_feed)
+}
+
+/// Build an agent invocation with the identity and inherited child policy.
+pub fn build_agent_invocation_for_identity(
+    inputs: AgentArgvInputs<'_>,
+    binary: &Path,
+    prompt_feed: &Path,
+    identity: TaskIdentity,
+    inherited_opencode_config: Option<&str>,
+) -> Result<ChildInvocation, AppError> {
+    if inputs.kind != AgentKind::OpenCode {
+        return Ok(build_standard_agent_invocation(inputs, binary, prompt_feed));
+    }
+
+    let name = identity.opencode_agent_name();
+    validate_opencode_extra_args(inputs.extra_args).map_err(|err| {
+        AppError::AgentConfiguration {
+            agent: AgentKind::OpenCode,
+            message: err.to_string(),
+        }
+    })?;
+    let config = compose_opencode_config(inherited_opencode_config, &name)?;
+    Ok(build_opencode_invocation_with_config(
+        inputs,
+        binary,
+        prompt_feed,
+        identity,
+        config,
+    ))
+}
+
+fn build_standard_agent_invocation(
     inputs: AgentArgvInputs<'_>,
     binary: &Path,
     prompt_feed: &Path,
@@ -71,12 +125,62 @@ pub fn build_agent_invocation(
             }
             (args, StdinPolicy::Null)
         }
+        AgentKind::OpenCode => unreachable!("OpenCode uses its managed invocation builder"),
     };
     append_extra_args(&mut args, inputs.extra_args, inputs.kind);
     ChildInvocation {
         program: binary.to_path_buf(),
         args,
         stdin,
+        environment: ChildEnvironment::default(),
+        managed_environment: None,
+    }
+}
+
+fn build_opencode_invocation_with_config(
+    inputs: AgentArgvInputs<'_>,
+    binary: &Path,
+    _prompt_feed: &Path,
+    identity: TaskIdentity,
+    config: OpenCodeConfig,
+) -> ChildInvocation {
+    let name = identity.opencode_agent_name();
+    let mut args = vec![
+        "run".into(),
+        "--standalone".into(),
+        "--agent".into(),
+        name.clone(),
+    ];
+    add_opencode_output_defaults(&mut args, inputs.extra_args);
+    args.push("--auto".into());
+    if let Some(model) = inputs.model {
+        args.push("--model".into());
+        args.push(model.to_string());
+    }
+    append_extra_args(&mut args, inputs.extra_args, inputs.kind);
+
+    let config_content = config.serialized();
+    let environment = ChildEnvironment::from_pairs(vec![
+        ("PWD".into(), inputs.cwd.to_string_lossy().into_owned()),
+        ("OPENCODE_PERMISSION".into(), r#"{"*":"allow"}"#.into()),
+        ("OPENCODE_CONFIG_CONTENT".into(), config_content),
+    ]);
+    let managed_environment = ManagedEnvironmentPreview {
+        policy: ManagedEnvironmentPolicy::OpenCodeFullWorkPermissions,
+        working_directory: inputs.cwd.to_path_buf(),
+        wildcard_permission: "allow",
+        generated_agent: GeneratedAgentOverlay {
+            name,
+            mode: "primary",
+            permission: "allow",
+        },
+    };
+    ChildInvocation {
+        program: binary.to_path_buf(),
+        args,
+        stdin: StdinPolicy::PromptFeed,
+        environment,
+        managed_environment: Some(managed_environment),
     }
 }
 
@@ -96,7 +200,189 @@ fn managed_standalone_flags(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => &["--dangerously-bypass-approvals-and-sandbox"],
         AgentKind::Claude => &["-p", "--no-session-persistence", "--verbose"],
         AgentKind::Grok => &["--always-approve", "--verbatim"],
+        AgentKind::OpenCode => &["--standalone", "--auto"],
     }
+}
+
+/// Validate OpenCode extra arguments before a task row is created.
+pub(crate) fn validate_opencode_extra_args(
+    extra_args: &[String],
+) -> Result<(), OpenCodeExtraArgsError> {
+    let mut pending_value = false;
+    for (index, arg) in extra_args.iter().enumerate() {
+        if pending_value && !arg.starts_with('-') {
+            pending_value = false;
+            continue;
+        }
+        pending_value = false;
+
+        if arg == "--" {
+            return Err(OpenCodeExtraArgsError {
+                index,
+                message: "the prompt must be supplied through the prompt feed".into(),
+            });
+        }
+        if let Some(message) = forbidden_opencode_argument(arg) {
+            return Err(OpenCodeExtraArgsError { index, message });
+        }
+        if !arg.starts_with('-') {
+            return Err(OpenCodeExtraArgsError {
+                index,
+                message: "positional prompt arguments are controlled by the prompt feed".into(),
+            });
+        }
+        if is_opencode_value_flag(arg) {
+            pending_value = !arg.contains('=');
+        } else if !arg.contains('=') {
+            // Unknown flags may gain a separate value in a future OpenCode
+            // release, so preserve that form without allowing a bare prompt.
+            pending_value = true;
+        }
+    }
+    Ok(())
+}
+
+/// Validation failure for one OpenCode extra argument.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct OpenCodeExtraArgsError {
+    /// Index in `workload.extra_args`.
+    pub(crate) index: usize,
+    /// Safe contract failure detail.
+    pub(crate) message: String,
+}
+
+fn forbidden_opencode_argument(arg: &str) -> Option<String> {
+    let (flag, has_value) = arg
+        .split_once('=')
+        .map_or((arg, false), |(flag, _)| (flag, true));
+    let short_attached = arg.len() > 2
+        && !arg.starts_with("--")
+        && matches!(arg.as_bytes().get(1), Some(b'c' | b's' | b'm'));
+    let forbidden = matches!(
+        flag,
+        "--agent"
+            | "--cwd"
+            | "--dir"
+            | "--directory"
+            | "--server"
+            | "--continue"
+            | "--session"
+            | "--fork"
+            | "--model"
+            | "-c"
+            | "-s"
+            | "-m"
+    ) || short_attached
+        || (flag == "--standalone" && has_value)
+        || (flag == "--auto" && has_value);
+    forbidden.then(|| match flag {
+        "--agent" => "--agent is managed by homebased".into(),
+        "--cwd" | "--dir" | "--directory" => "working directory is managed by homebased".into(),
+        "--server" => "--server is not allowed; homebased requires --standalone".into(),
+        "--continue" | "-c" => "session continuation is not allowed".into(),
+        "--session" | "-s" => "session selection is not allowed".into(),
+        "--fork" => "session forking is not allowed".into(),
+        "--model" | "-m" => "--model is reserved for workload.model".into(),
+        "--standalone" => "--standalone cannot be replaced".into(),
+        "--auto" => "--auto cannot be disabled".into(),
+        _ => "controlled OpenCode argument is not allowed".into(),
+    })
+}
+
+fn is_opencode_value_flag(arg: &str) -> bool {
+    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+    matches!(
+        flag,
+        "--format" | "--file" | "-f" | "--title" | "--log-level" | "--completions"
+    )
+}
+
+fn add_opencode_output_defaults(args: &mut Vec<String>, extra_args: &[String]) {
+    let explicit = extra_args
+        .iter()
+        .any(|arg| arg == "--format" || arg.starts_with("--format="));
+    if !explicit {
+        args.push("--format".into());
+        args.push("json".into());
+    }
+}
+
+const OPENCODE_PARSE_OPTIONS: ParseOptions = ParseOptions {
+    allow_comments: true,
+    allow_loose_object_property_names: false,
+    allow_trailing_commas: true,
+    allow_missing_commas: false,
+    allow_single_quoted_strings: false,
+    allow_hexadecimal_numbers: false,
+    allow_unary_plus_numbers: false,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeConfig {
+    value: Value,
+}
+
+impl OpenCodeConfig {
+    fn serialized(self) -> String {
+        // `Value` can always be serialized. Keeping this method infallible
+        // prevents provider configuration errors from reaching the runner.
+        serde_json::to_string(&self.value).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+fn compose_opencode_config(
+    inherited: Option<&str>,
+    generated_agent: &str,
+) -> Result<OpenCodeConfig, AppError> {
+    let mut value = match inherited.filter(|content| !content.trim().is_empty()) {
+        None => json!({}),
+        Some(content) => {
+            let parsed: Result<Value, _> = parse_to_serde_value(content, &OPENCODE_PARSE_OPTIONS);
+            parsed.map_err(|err| AppError::AgentConfiguration {
+                agent: AgentKind::OpenCode,
+                message: format!("OPENCODE_CONFIG_CONTENT is invalid JSONC: {err}"),
+            })?
+        }
+    };
+    let Some(root) = value.as_object_mut() else {
+        return Err(AppError::AgentConfiguration {
+            agent: AgentKind::OpenCode,
+            message: "OPENCODE_CONFIG_CONTENT must contain a JSON object".into(),
+        });
+    };
+    let agents = root.entry("agent").or_insert_with(|| json!({}));
+    let Some(agents) = agents.as_object_mut() else {
+        return Err(AppError::AgentConfiguration {
+            agent: AgentKind::OpenCode,
+            message: "OPENCODE_CONFIG_CONTENT.agent must contain a JSON object".into(),
+        });
+    };
+    if agents.contains_key(generated_agent) {
+        return Err(AppError::AgentConfiguration {
+            agent: AgentKind::OpenCode,
+            message: format!("generated agent name already exists: {generated_agent}"),
+        });
+    }
+    agents.insert(generated_agent.to_string(), generated_agent_value());
+    Ok(OpenCodeConfig { value })
+}
+
+fn generated_opencode_config(generated_agent: &str) -> OpenCodeConfig {
+    let mut root = serde_json::Map::new();
+    let mut agents = serde_json::Map::new();
+    agents.insert(generated_agent.to_string(), generated_agent_value());
+    root.insert("agent".into(), Value::Object(agents));
+    OpenCodeConfig {
+        value: Value::Object(root),
+    }
+}
+
+fn generated_agent_value() -> Value {
+    json!({
+        "mode": "primary",
+        "permission": "allow"
+    })
 }
 
 /// Claude live output needs `stream-json` plus `--verbose`. Extra args are
@@ -140,6 +426,8 @@ enum OutputFormatArg<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn build(kind: AgentKind, feed: &Path) -> ChildInvocation {
@@ -176,6 +464,30 @@ mod tests {
 
     fn count_arg(args: &[String], flag: &str) -> usize {
         args.iter().filter(|arg| *arg == flag).count()
+    }
+
+    fn opencode_with(
+        model: Option<&str>,
+        extra_args: &[String],
+        identity: TaskIdentity,
+        inherited: Option<&str>,
+    ) -> Result<ChildInvocation, AppError> {
+        build_agent_invocation_for_identity(
+            AgentArgvInputs {
+                kind: AgentKind::OpenCode,
+                model,
+                cwd: Path::new("/work"),
+                extra_args,
+            },
+            Path::new("/bin/opencode"),
+            Path::new("/state/tasks/id/prompt.feed.txt"),
+            identity,
+            inherited,
+        )
+    }
+
+    fn environment_map(invocation: &ChildInvocation) -> BTreeMap<&str, &str> {
+        invocation.environment.iter().collect()
     }
 
     #[test]
@@ -455,9 +767,184 @@ mod tests {
     }
 
     #[test]
+    fn opencode_argv_uses_stdin_and_provider_qualified_model() {
+        let argv = opencode_with(
+            Some("zai-coding-plan/glm-5.3-flash"),
+            &[],
+            TaskIdentity::Actual(TaskIdentityTest::id()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            argv.to_vec(),
+            vec![
+                "/bin/opencode",
+                "run",
+                "--standalone",
+                "--agent",
+                "homebased-01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+                "--format",
+                "json",
+                "--auto",
+                "--model",
+                "zai-coding-plan/glm-5.3-flash",
+            ]
+        );
+        assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
+        assert!(!argv.to_vec().iter().any(|arg| arg.contains("prompt.feed")));
+    }
+
+    #[test]
+    fn opencode_accepts_variant_and_omits_model_when_unset() {
+        let with_variant = opencode_with(
+            Some("other/provider#fast"),
+            &[],
+            TaskIdentity::Preview,
+            None,
+        )
+        .unwrap();
+        assert!(
+            with_variant
+                .to_vec()
+                .windows(2)
+                .any(|pair| pair == ["--model", "other/provider#fast"])
+        );
+
+        let without_model = opencode_with(None, &[], TaskIdentity::Preview, None).unwrap();
+        assert!(!without_model.to_vec().iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn opencode_keeps_explicit_output_format_and_managed_flags_once() {
+        let extra = vec![
+            "--standalone".into(),
+            "--auto".into(),
+            "--format=json".into(),
+            "--future".into(),
+            "value".into(),
+        ];
+        let argv = opencode_with(Some("model"), &extra, TaskIdentity::Preview, None).unwrap();
+        let args = argv.to_vec();
+        assert_eq!(count_arg(&args, "--standalone"), 1);
+        assert_eq!(count_arg(&args, "--auto"), 1);
+        assert_eq!(count_arg(&args, "--format=json"), 1);
+        assert!(!args.contains(&"json".into()));
+        assert!(args.ends_with(&["--format=json".into(), "--future".into(), "value".into()]));
+    }
+
+    #[test]
+    fn opencode_explicit_space_separated_output_format_is_not_duplicated() {
+        let extra = vec!["--format".into(), "default".into()];
+        let args = opencode_with(None, &extra, TaskIdentity::Preview, None)
+            .unwrap()
+            .to_vec();
+        assert_eq!(count_arg(&args, "--format"), 1);
+        assert!(!args.contains(&"json".into()));
+    }
+
+    #[test]
+    fn opencode_managed_environment_is_scoped_and_redacted() {
+        let inherited = r#"{
+            // provider settings stay in the child config
+            "provider": {"zai": {"apiKey": "do-not-print", "model": "glm-5.3-flash"}},
+            "permission": "deny",
+            "agent": {"build": {"permission": {"shell": "deny"}}}
+        }"#;
+        let invocation = opencode_with(None, &[], TaskIdentity::Preview, Some(inherited)).unwrap();
+        let env = environment_map(&invocation);
+        assert_eq!(env.get("PWD"), Some(&"/work"));
+        assert_eq!(env.get("OPENCODE_PERMISSION"), Some(&r#"{"*":"allow"}"#));
+        let config: Value = serde_json::from_str(env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+        assert_eq!(config["provider"]["zai"]["apiKey"], "do-not-print");
+        assert_eq!(config["provider"]["zai"]["model"], "glm-5.3-flash");
+        assert_eq!(config["permission"], "deny");
+        assert_eq!(config["agent"]["build"]["permission"]["shell"], "deny");
+        assert_eq!(
+            config["agent"]["homebased-<task-id>"],
+            json!({"mode": "primary", "permission": "allow"})
+        );
+        let preview = invocation.managed_environment.as_ref().unwrap();
+        assert_eq!(preview.generated_agent.name, "homebased-<task-id>");
+        let debug = format!("{invocation:?}");
+        assert!(!debug.contains("do-not-print"), "{debug}");
+        let serialized = serde_json::to_string(&invocation).unwrap();
+        assert!(!serialized.contains("do-not-print"), "{serialized}");
+        assert!(
+            !serialized.contains("OPENCODE_CONFIG_CONTENT"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn opencode_config_rejects_malformed_and_colliding_content() {
+        let malformed = opencode_with(
+            None,
+            &[],
+            TaskIdentity::Preview,
+            Some(r#"{"provider":{"zai":{"apiKey":"never-print}}"#),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            malformed,
+            AppError::AgentConfiguration { ref message, .. }
+                if message.contains("invalid JSONC")
+        ));
+        assert!(!malformed.to_string().contains("never-print"));
+
+        let collision = opencode_with(
+            None,
+            &[],
+            TaskIdentity::Preview,
+            Some(r#"{"agent":{"homebased-<task-id>":{}}}"#),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            collision,
+            AppError::AgentConfiguration { ref message, .. }
+                if message.contains("already exists")
+        ));
+    }
+
+    #[test]
+    fn opencode_extra_args_reject_controlled_inputs() {
+        for arg in [
+            "--agent=other",
+            "--cwd=/other",
+            "--dir=/other",
+            "--server=http://localhost",
+            "--continue",
+            "-c",
+            "--session=ses_123",
+            "-s=ses_123",
+            "--fork",
+            "--model=other/model",
+            "-m=other/model",
+            "--standalone=false",
+            "--auto=false",
+            "prompt supplied in argv",
+        ] {
+            let args = vec![arg.to_string()];
+            assert!(validate_opencode_extra_args(&args).is_err(), "{arg}");
+        }
+    }
+
+    struct TaskIdentityTest;
+
+    impl TaskIdentityTest {
+        fn id() -> crate::domain::TaskId {
+            "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap()
+        }
+    }
+
+    #[test]
     fn feed_path_is_argv_only_for_grok() {
         let feed = Path::new("/state/tasks/id/prompt.feed.txt");
-        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Grok] {
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Grok,
+            AgentKind::OpenCode,
+        ] {
             let argv = build_agent_invocation(
                 AgentArgvInputs {
                     kind,
@@ -474,6 +961,10 @@ mod tests {
                     assert_eq!(argv.stdin, StdinPolicy::Null);
                 }
                 AgentKind::Codex | AgentKind::Claude => {
+                    assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
+                    assert!(!argv.to_vec().iter().any(|a| a.contains("prompt.feed")));
+                }
+                AgentKind::OpenCode => {
                     assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
                     assert!(!argv.to_vec().iter().any(|a| a.contains("prompt.feed")));
                 }

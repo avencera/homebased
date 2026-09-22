@@ -36,7 +36,7 @@ export function isInFlight(status: ProcessStatus): boolean {
 }
 
 /** Agent CLI that runs the task. */
-export type AgentKind = 'codex' | 'claude' | 'grok';
+export type AgentKind = 'codex' | 'claude' | 'grok' | 'opencode';
 
 /** Callback delivery state. Outlives the process state. */
 export type CallbackStatus = 'pending' | 'sending' | 'sent' | 'failed';

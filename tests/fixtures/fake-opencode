@@ -1,0 +1,79 @@
+#!/bin/sh
+set -eu
+
+record="${FAKE_RECORD_DIR:?}"
+mkdir -p "$record"
+task="${HOMEBASED_TASK_ID:-unknown}"
+
+printf '%s\n' "$$" > "$record/opencode-cli-pid-$task.txt"
+{
+  printf 'argv0=%s\n' "$0"
+  printf 'argv=%s\n' "$*"
+  printf 'cwd=%s\n' "$(pwd)"
+  printf 'PWD=%s\n' "${PWD:-}"
+  if [ "${OPENCODE_PERMISSION:-}" = '{"*":"allow"}' ]; then
+    printf 'permission=wildcard-allow\n'
+  else
+    printf 'permission=unexpected\n'
+  fi
+  config="${OPENCODE_CONFIG_CONTENT:-}"
+  case "$config" in
+    *"\"homebased-$task\":{\"mode\":\"primary\",\"permission\":\"allow\"}"*)
+      printf 'generated-agent=present\n' ;;
+    *) printf 'generated-agent=missing\n' ;;
+  esac
+  case "$config" in
+    *provider-secret*) printf 'provider-content=present\n' ;;
+    *) printf 'provider-content=absent\n' ;;
+  esac
+} > "$record/opencode-meta-$task.txt"
+
+cat > "$record/opencode-stdin-$task.txt" || true
+printf '{"type":"step_start","task":"%s"}\n' "$task"
+printf '{"type":"text","text":"fake opencode progress"}\n'
+
+if [ -f "$record/opencode-hold" ]; then
+  tool_pid_file="$record/opencode-tool-pid-$task.txt"
+  if [ -f "$record/opencode-tool-ignore-term" ]; then
+    (trap '' TERM; while :; do sleep 1; done) &
+  else
+    (while :; do sleep 1; done) &
+  fi
+  tool_pid=$!
+  printf '%s\n' "$tool_pid" > "$tool_pid_file"
+  server_pid_file="$record/opencode-server-pid-$task.txt"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c 'owner=$1; tool=$2; while kill -0 "$owner" 2>/dev/null; do sleep 1; done; kill -KILL "$tool" 2>/dev/null || true' \
+      sh "$$" "$tool_pid" &
+  else
+    sh -c 'owner=$1; tool=$2; while kill -0 "$owner" 2>/dev/null; do sleep 1; done; kill -KILL "$tool" 2>/dev/null || true' \
+      sh "$$" "$tool_pid" &
+  fi
+  server_pid=$!
+  printf '%s\n' "$server_pid" > "$server_pid_file"
+
+  cleanup() {
+    kill -TERM "$tool_pid" 2>/dev/null || true
+    kill -TERM "$server_pid" 2>/dev/null || true
+    wait "$tool_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    exit 143
+  }
+  trap cleanup TERM
+  if [ -f "$record/opencode-ignore-term" ]; then
+    trap '' TERM
+  fi
+  while :; do sleep 1; done
+fi
+
+if [ -n "${FAKE_REPORT:-}" ]; then
+  homebased task report \
+    --outcome "${FAKE_OUTCOME:-succeeded}" \
+    --summary "$FAKE_REPORT"
+fi
+
+exit_code="${FAKE_EXIT:-0}"
+if [ -f "$record/opencode-exit" ]; then
+  exit_code=$(cat "$record/opencode-exit")
+fi
+exit "$exit_code"

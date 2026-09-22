@@ -128,7 +128,12 @@ fn unsupported_host() -> AppError {
 pub fn agent_paths() -> Vec<(&'static str, PathBuf)> {
     use crate::domain::AgentKind;
     let mut out = Vec::new();
-    for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Grok] {
+    for kind in [
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Grok,
+        AgentKind::OpenCode,
+    ] {
         if let Ok(path) = crate::invocation::resolve_agent_binary(
             kind,
             &std::env::var("PATH").unwrap_or_default(),

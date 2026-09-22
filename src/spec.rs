@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::agents::{OpenCodeExtraArgsError, validate_opencode_extra_args};
 use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
@@ -48,7 +49,7 @@ fn default_true() -> bool {
 pub struct SubmitAgentWorkload {
     /// Agent CLI.
     pub agent: AgentKind,
-    /// Optional model alias. Empty becomes unset.
+    /// Optional model id. OpenCode accepts `provider/model#variant`; empty becomes unset.
     #[serde(default)]
     pub model: Option<String>,
     /// Inline prompt. Mutually exclusive with `prompt_file`.
@@ -224,7 +225,7 @@ fn exactly_one_prompt(value: Value) -> AppError {
 pub struct SubmitAgent {
     /// Agent CLI.
     pub agent: AgentKind,
-    /// Optional model alias.
+    /// Optional model id. OpenCode accepts `provider/model#variant`.
     pub model: Option<String>,
     /// Prompt source.
     pub prompt: PromptSource,
@@ -397,6 +398,10 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
     match kind {
         "agent" => {
             let agent: NormalizedAgentWorkload = deserialize_under(&content, "/workload")?;
+            if agent.agent == AgentKind::OpenCode {
+                validate_opencode_extra_args(&agent.extra_args)
+                    .map_err(|err| invalid_agent_extra_args(&content, err))?;
+            }
             Ok(NormalizedWorkload::Agent(agent))
         }
         "task" => {
@@ -527,6 +532,10 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
     match kind {
         "agent" => {
             let agent: SubmitAgentWorkload = deserialize_under(&content, "/workload")?;
+            if agent.agent == AgentKind::OpenCode {
+                validate_opencode_extra_args(&agent.extra_args)
+                    .map_err(|err| invalid_agent_extra_args(&content, err))?;
+            }
             let prompt = PromptSource::from_wire(agent.prompt, agent.prompt_file, workload_raw)?;
             Ok(SubmitWorkloadValidated::Agent(SubmitAgent {
                 agent: agent.agent,
@@ -547,6 +556,20 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
             value: json!(other),
             message: "workload.type must be \"agent\" or \"task\"".into(),
         }),
+    }
+}
+
+fn invalid_agent_extra_args(workload: &Value, error: OpenCodeExtraArgsError) -> AppError {
+    let value = workload
+        .get("extra_args")
+        .and_then(Value::as_array)
+        .and_then(|args| args.get(error.index))
+        .cloned()
+        .unwrap_or(Value::Null);
+    AppError::InvalidSpec {
+        pointer: format!("/workload/extra_args/{}", error.index),
+        value,
+        message: error.to_string(),
     }
 }
 
@@ -691,6 +714,17 @@ mod tests {
         })
     }
 
+    fn valid_opencode(model: Option<&str>) -> Value {
+        let mut value = valid_agent();
+        value["workload"]["agent"] = json!("opencode");
+        if let Some(model) = model {
+            value["workload"]["model"] = json!(model);
+        } else {
+            value["workload"].as_object_mut().unwrap().remove("model");
+        }
+        value
+    }
+
     #[test]
     fn unknown_field_rejected() {
         let mut value = valid_agent();
@@ -791,6 +825,58 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn opencode_accepts_provider_qualified_models_and_preserves_variants() {
+        for model in [
+            Some("zai-coding-plan/glm-5.3-flash"),
+            Some("other/provider#fast"),
+            None,
+        ] {
+            let value = valid_opencode(model);
+            let spec = parse_spec_value(&value).unwrap();
+            let normalized = normalize(&spec).unwrap();
+            let NormalizedWorkload::Agent(agent) = normalized.workload else {
+                panic!("expected agent workload");
+            };
+            assert_eq!(agent.agent, AgentKind::OpenCode);
+            assert_eq!(agent.model.as_deref(), model);
+        }
+    }
+
+    #[test]
+    fn opencode_forbidden_extra_args_report_their_array_pointer() {
+        for extra in [
+            "--agent=other",
+            "--dir=/other",
+            "--server=http://localhost",
+            "-c",
+            "--session=session",
+            "--fork",
+            "--model=other/provider",
+            "-m=other/provider",
+            "--standalone=false",
+            "prompt in argv",
+        ] {
+            let mut value = valid_opencode(None);
+            value["workload"]["extra_args"] = json!([extra]);
+            let err = parse_spec_value(&value).unwrap_err();
+            match err {
+                AppError::InvalidSpec { pointer, value, .. } => {
+                    assert_eq!(pointer, "/workload/extra_args/0");
+                    assert_eq!(value, json!(extra));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn existing_agent_extra_args_keep_their_previous_rules() {
+        let mut value = valid_agent();
+        value["workload"]["extra_args"] = json!(["free-form-value"]);
+        assert!(parse_spec_value(&value).is_ok());
     }
 
     #[test]

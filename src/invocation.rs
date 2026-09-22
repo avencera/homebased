@@ -1,6 +1,7 @@
 //! Validated command lines and resolved child invocations.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -8,8 +9,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::agents::{AgentArgvInputs, build_agent_invocation};
-use crate::domain::{AgentKind, AgentWorkload, TaskWorkload, Workload};
+use crate::agents::{AgentArgvInputs, build_agent_invocation, build_agent_invocation_for_identity};
+use crate::domain::{AgentKind, AgentWorkload, TaskIdentity, TaskWorkload, Workload};
 use crate::error::AppError;
 use crate::spec::{NormalizedAgentWorkload, NormalizedWorkload};
 
@@ -21,6 +22,72 @@ pub enum StdinPolicy {
     Null,
     /// Prompt feed bytes are written to a pipe.
     PromptFeed,
+}
+
+/// Environment assignments that a child policy adds to the worker environment.
+///
+/// Values are intentionally hidden from `Debug` output. An assignment may
+/// contain provider configuration that must never appear in logs or fixtures.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct ChildEnvironment {
+    assignments: Vec<(String, String)>,
+}
+
+impl fmt::Debug for ChildEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let keys: Vec<&str> = self
+            .assignments
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        f.debug_struct("ChildEnvironment")
+            .field("keys", &keys)
+            .finish()
+    }
+}
+
+impl ChildEnvironment {
+    pub(crate) fn from_pairs(assignments: Vec<(String, String)>) -> Self {
+        Self { assignments }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.assignments
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+}
+
+/// Safe dry-run description of a managed child environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedEnvironmentPreview {
+    /// Policy that owns the environment assignments.
+    pub policy: ManagedEnvironmentPolicy,
+    /// Child working directory also assigned to `PWD`.
+    pub working_directory: PathBuf,
+    /// Wildcard permission applied through `OPENCODE_PERMISSION`.
+    pub wildcard_permission: &'static str,
+    /// Agent overlay added to `OPENCODE_CONFIG_CONTENT`.
+    pub generated_agent: GeneratedAgentOverlay,
+}
+
+/// Managed child environment policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedEnvironmentPolicy {
+    /// OpenCode may use every work tool for this child only.
+    OpenCodeFullWorkPermissions,
+}
+
+/// Safe preview of the generated OpenCode agent configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GeneratedAgentOverlay {
+    /// Generated primary-agent name.
+    pub name: String,
+    /// OpenCode agent mode.
+    pub mode: &'static str,
+    /// OpenCode agent permission scalar.
+    pub permission: &'static str,
 }
 
 /// Validated argv: non-empty program, no NUL bytes, later args may be empty.
@@ -192,6 +259,12 @@ pub struct ChildInvocation {
     pub args: Vec<String>,
     /// Stdin policy.
     pub stdin: StdinPolicy,
+    /// Typed environment assignments owned by the agent policy.
+    #[serde(skip)]
+    pub environment: ChildEnvironment,
+    /// Safe description of managed environment behavior for dry runs.
+    #[serde(skip)]
+    pub managed_environment: Option<ManagedEnvironmentPreview>,
 }
 
 impl ChildInvocation {
@@ -275,13 +348,31 @@ pub fn invocation_from_normalized(
     cwd: &Path,
     prompt_feed: Option<&Path>,
 ) -> Result<ChildInvocation, AppError> {
+    invocation_from_normalized_for_identity(
+        workload,
+        env_path,
+        cwd,
+        prompt_feed,
+        TaskIdentity::Preview,
+    )
+}
+
+/// Build a normalized workload invocation for a specific task identity.
+pub fn invocation_from_normalized_for_identity(
+    workload: &NormalizedWorkload,
+    env_path: &str,
+    cwd: &Path,
+    prompt_feed: Option<&Path>,
+    identity: TaskIdentity,
+) -> Result<ChildInvocation, AppError> {
     match workload {
         NormalizedWorkload::Agent(agent) => {
             let binary = resolve_agent_binary(agent.agent, env_path, cwd)?;
             let feed = prompt_feed.ok_or_else(|| AppError::Internal {
                 message: "agent invocation requires a prompt feed path".into(),
             })?;
-            Ok(build_agent_invocation(
+            let inherited_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+            build_agent_invocation_for_identity(
                 AgentArgvInputs {
                     kind: agent.agent,
                     model: agent.model.as_deref(),
@@ -290,7 +381,9 @@ pub fn invocation_from_normalized(
                 },
                 &binary,
                 feed,
-            ))
+                identity,
+                inherited_config.as_deref(),
+            )
         }
         NormalizedWorkload::Task(task) => {
             let binary = resolve_executable(task.command.program(), env_path, cwd)?;
@@ -298,6 +391,8 @@ pub fn invocation_from_normalized(
                 program: binary,
                 args: task.command.args().to_vec(),
                 stdin: StdinPolicy::Null,
+                environment: ChildEnvironment::default(),
+                managed_environment: None,
             })
         }
     }
@@ -328,7 +423,43 @@ pub fn invocation_from_workload(
             program: binary.to_path_buf(),
             args: task.command.args().to_vec(),
             stdin: StdinPolicy::Null,
+            environment: ChildEnvironment::default(),
+            managed_environment: None,
         },
+    }
+}
+
+/// Build a persisted workload invocation for a worker task identity.
+pub fn invocation_from_workload_for_identity(
+    workload: &Workload,
+    binary: &Path,
+    cwd: &Path,
+    agent_prompt_feed: &Path,
+    identity: TaskIdentity,
+) -> Result<ChildInvocation, AppError> {
+    match workload {
+        Workload::Agent(agent) => {
+            let inherited_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+            build_agent_invocation_for_identity(
+                AgentArgvInputs {
+                    kind: agent.agent.kind,
+                    model: agent.agent.model.as_deref(),
+                    cwd,
+                    extra_args: &agent.extra_args,
+                },
+                binary,
+                agent_prompt_feed,
+                identity,
+                inherited_config.as_deref(),
+            )
+        }
+        Workload::Task(task) => Ok(ChildInvocation {
+            program: binary.to_path_buf(),
+            args: task.command.args().to_vec(),
+            stdin: StdinPolicy::Null,
+            environment: ChildEnvironment::default(),
+            managed_environment: None,
+        }),
     }
 }
 
@@ -511,6 +642,21 @@ mod tests {
         let path = dir.path().to_string_lossy().into_owned();
         let got = resolve_agent_binary_with(AgentKind::Codex, Some(""), &path, dir.path()).unwrap();
         assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn opencode_override_uses_the_pinned_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = dir.path().join("opencode");
+        std::fs::write(&pinned, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&pinned).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&pinned, perms).unwrap();
+        let pinned_s = pinned.to_string_lossy().into_owned();
+        let got =
+            resolve_agent_binary_with(AgentKind::OpenCode, Some(&pinned_s), "/nope", dir.path())
+                .unwrap();
+        assert_eq!(got, pinned);
     }
 
     #[test]

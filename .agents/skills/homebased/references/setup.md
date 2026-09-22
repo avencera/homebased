@@ -23,7 +23,13 @@ homebased --json daemon status        # {"socket": "up", "in_flight": 0, "home":
 
 On Praveen's machines, always preserve `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` during install or reinstall. The `main:7677` dashboard depends on this LAN bind. Verify both `http://main:7677/` and `/v1/status` after installation.
 
-The unit's `ExecStart` points at the binary that ran `install`, so run it as the installed `homebased`, not `target/debug/homebased`. Install is an idempotent apply. Run it from a shell where `codex`, `claude`, `grok`, and the project toolchains are on `PATH`: the installer bakes that `PATH` and the absolute agent paths (`HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, `HOMEBASED_GROK`) into the unit. Re-run it after `PATH` changes. An agent that is not on `PATH` at install time is silently left out of the unit; only the unit's `PATH` is left to find it later.
+The unit's `ExecStart` points at the binary that ran `install`, so run it as the installed `homebased`, not `target/debug/homebased`. Install is an idempotent apply. Run it from a shell where `codex`, `claude`, `grok`, `opencode`, and the project toolchains are on `PATH`: the installer bakes that `PATH` and the absolute agent paths (`HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, `HOMEBASED_GROK`, and `HOMEBASED_OPENCODE`) into the unit. Re-run it after `PATH` changes. An agent that is not on `PATH` at install time is silently left out of the unit; only the unit's `PATH` is left to find it later.
+
+OpenCode v2 uses `opencode run --standalone`. Keep its credentials in the OpenCode user environment and install from the same user shell. Homebased passes the selected `provider/model#variant` value to OpenCode and gives the child its managed work permissions. Run the ignored CLI smoke check after an OpenCode upgrade:
+
+```bash
+HOMEBASED_OPENCODE="$HOME/.opencode/bin/opencode" just smoke-cli
+```
 
 - Linux: user unit `~/.config/systemd/user/homebased.service`, `KillMode=process`, `Restart=on-failure`. If install warns that lingering is off, run `loginctl enable-linger $USER` so the daemon survives logout.
 - macOS: `~/Library/LaunchAgents/dev.praveen.homebased.plist` with `KeepAlive` and `AbandonProcessGroup`.

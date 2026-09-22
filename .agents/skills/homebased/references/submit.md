@@ -103,10 +103,10 @@ Agent-only fields under `workload`:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `agent` | yes | `codex`, `claude`, or `grok`. |
+| `agent` | yes | `codex`, `claude`, `grok`, or `opencode`. |
 | `prompt` or `prompt_file` | exactly one | Relative `prompt_file` resolves against `cwd`. Prefer `prompt_file`. |
-| `model` | no | Passed through unchanged: `-m` for codex and grok, `--model` for claude. |
-| `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. |
+| `model` | no | Passed through unchanged: `-m` for codex and grok, `--model` for claude and opencode. OpenCode accepts provider-qualified values such as `provider/model#variant`; Homebased does not maintain a model allowlist. |
+| `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. OpenCode defaults to `--format json` and allows an explicit format, but reserves the agent, `cwd`, model, prompt, session, server, and standalone controls. |
 | `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. |
 
 Task-only fields under `workload`:
@@ -117,7 +117,7 @@ Task-only fields under `workload`:
 
 Unknown fields and cross-variant fields fail with `invalid_spec` and a JSON pointer. Run `homebased task schema` to print the JSON Schema when in doubt.
 
-The child inherits the `task-run` worker environment. `homebased` then overrides `PATH` and `HOME` with values captured from the submitter and sets `HOMEBASED_TASK_ID` and `HOMEBASED_HOME`. Submit from a shell where the program and toolchain are on `PATH`. Local `gh` authentication remains available through `HOME`.
+The child inherits the `task-run` worker environment. `homebased` then overrides `PATH` and `HOME` with values captured from the submitter and sets `HOMEBASED_TASK_ID` and `HOMEBASED_HOME`. OpenCode also gets child-only `OPENCODE_PERMISSION={"*":"allow"}`, a generated primary agent through `OPENCODE_CONFIG_CONTENT`, and `PWD` equal to `cwd`. These values do not change persistent configuration or other workloads. Submit from a shell where the program and toolchain are on `PATH`. Local `gh` authentication remains available through `HOME`.
 
 ## 5. Dry run, then submit
 
@@ -126,7 +126,7 @@ homebased --json task submit --spec "$dir/spec.json" --dry-run
 homebased --json task submit --spec "$dir/spec.json"
 ```
 
-The dry run validates the spec, resolves the executable and `cwd`, and prints the normalized spec, the exact child argv, and the stdin policy. It spawns nothing and creates no database row. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. The real submit returns before the child finishes:
+The dry run validates the spec, resolves the executable and `cwd`, and prints the normalized spec, the exact child argv, and the stdin policy. It spawns nothing and creates no database row. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials. The real submit returns before the child finishes:
 
 ```json
 {"api_version": 1, "id": "01a0b06f-306c-749e-aa9e-9e1a619ee915", "status": "queued"}
