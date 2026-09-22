@@ -134,7 +134,7 @@ Always pass `--json` on data commands. Every JSON object carries `api_version: 1
 
 A `task` runs an argv array with no shell. A caller that needs shell syntax must request it, for example `["sh", "-lc", "..."]`. An `agent` runs Codex, Claude, or Grok with a prompt file. Prefer `task` unless a model must reason.
 
-Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`.
+Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`; exact spellings of Homebased-managed standalone switches are reserved tokens there, so Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other extra arguments keep their order and spelling.
 
 ### Spec
 
