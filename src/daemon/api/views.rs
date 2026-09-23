@@ -8,8 +8,10 @@ use serde::Serialize;
 use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::domain::{
     API_VERSION, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskName, TaskReport, TaskRow,
-    ThreadId,
+    TerminalCallbackProjection, ThreadId,
 };
+use crate::machine::MachineId;
+use crate::store::TaskPresentation;
 
 /// `GET /v1/status`.
 #[derive(Debug, Clone, Serialize)]
@@ -57,9 +59,19 @@ pub struct TaskSummary {
     pub thread: ThreadId,
     /// Working directory.
     pub cwd: PathBuf,
+    /// Git worktree root captured when the executor accepted the task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<PathBuf>,
+    /// Machine that owns callbacks. Present with `execution_machine`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_machine: Option<MachineId>,
+    /// Machine that runs the task. Present with `origin_machine`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_machine: Option<MachineId>,
     /// Worker pid while running. Display only.
     pub pid: Option<i32>,
-    /// Callback delivery state.
+    /// Terminal callback delivery state. The `pending` value is a compatibility
+    /// placeholder on executor-owned rows when the origin owns delivery.
     pub callback: CallbackStatus,
     /// Output-inactivity timeout in seconds.
     pub timeout_secs: u64,
@@ -75,8 +87,11 @@ pub struct TaskSummary {
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<&TaskRow> for TaskSummary {
-    fn from(row: &TaskRow) -> Self {
+impl TaskSummary {
+    /// Build an API view from one task row and its optional stored metadata.
+    #[must_use]
+    pub fn from_row(row: &TaskRow, presentation: Option<&TaskPresentation>) -> Self {
+        let owners = presentation.and_then(|presentation| presentation.owners);
         Self {
             id: row.id,
             name: row.name.clone(),
@@ -85,10 +100,21 @@ impl From<&TaskRow> for TaskSummary {
             workload: WorkloadView::from(&row.workload),
             thread: row.thread,
             cwd: row.cwd.clone(),
+            project_root: presentation.and_then(|presentation| presentation.project_root.clone()),
+            origin_machine: owners.map(|owners| owners.origin_machine),
+            execution_machine: owners.map(|owners| owners.execution_machine),
             pid: row.pid(),
-            callback: row.callback_status,
+            callback: match presentation.map(|presentation| presentation.terminal_callback) {
+                Some(TerminalCallbackProjection::Legacy(status))
+                | Some(TerminalCallbackProjection::OriginInbox(status)) => status,
+                Some(TerminalCallbackProjection::NotOwned) => CallbackStatus::Pending,
+                None => row.callback_status,
+            },
             timeout_secs: row.timeout.as_secs(),
-            check_timeout: if row.attention.is_delivered() {
+            check_timeout: if presentation.map_or_else(
+                || row.attention.is_delivered(),
+                |presentation| presentation.attention_delivered,
+            ) {
                 CheckTimeoutStatus::Sent
             } else {
                 CheckTimeoutStatus::Pending
@@ -111,12 +137,18 @@ pub struct TaskList {
 }
 
 impl TaskList {
-    /// Build from store rows.
+    /// Build from task rows and their store-owned metadata.
     #[must_use]
-    pub fn from_rows(rows: &[TaskRow]) -> Self {
+    pub fn from_rows(
+        rows: &[TaskRow],
+        presentations: &std::collections::HashMap<TaskId, TaskPresentation>,
+    ) -> Self {
         Self {
             api_version: API_VERSION,
-            tasks: rows.iter().map(TaskSummary::from).collect(),
+            tasks: rows
+                .iter()
+                .map(|row| TaskSummary::from_row(row, presentations.get(&row.id)))
+                .collect(),
         }
     }
 }

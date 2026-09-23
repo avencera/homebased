@@ -343,7 +343,9 @@ fn map_changed(path: &Path, err: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
     use std::ffi::OsString;
+    #[cfg(not(target_os = "macos"))]
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
@@ -381,7 +383,7 @@ mod tests {
         assert_eq!(resolved.kind, EntryKind::Directory);
         assert_eq!(
             resolved.resolved.as_deref(),
-            Some(path_display(&target).as_str())
+            Some(path_display(&fs::canonicalize(&target).unwrap()).as_str())
         );
 
         let parent = resolve_absolute_path(&path_display(dir.path())).unwrap();
@@ -418,23 +420,32 @@ mod tests {
     }
 
     #[test]
-    fn preserves_whitespace_and_non_utf8_path_identity() {
+    fn preserves_whitespace_path_identity() {
         let dir = tempdir().unwrap();
         let spaced = dir.path().join(" name with spaces ");
         fs::write(&spaced, b"spaces").unwrap();
         let resolved = resolve_absolute_path(spaced.to_str().unwrap()).unwrap();
         assert_eq!(resolved.requested, spaced.to_str().unwrap());
-        assert_eq!(decode_path(&resolved.token).unwrap(), spaced);
+        assert_eq!(
+            decode_path(&resolved.token).unwrap(),
+            fs::canonicalize(&spaced).unwrap()
+        );
+    }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn preserves_non_utf8_path_identity() {
+        let dir = tempdir().unwrap();
         let native_name = OsString::from_vec(b"native-\xff.txt".to_vec());
         let native_path = dir.path().join(&native_name);
         fs::write(&native_path, b"native").unwrap();
+        let canonical_native_path = fs::canonicalize(&native_path).unwrap();
         let root = resolve_absolute_path(dir.path().to_str().unwrap()).unwrap();
         let listing = list_directory(&root.token).unwrap();
         let entry = listing
             .entries
             .iter()
-            .find(|entry| decode_path(&entry.token).unwrap() == native_path)
+            .find(|entry| decode_path(&entry.token).unwrap() == canonical_native_path)
             .unwrap();
         assert_eq!(entry.kind, EntryKind::File);
         assert_eq!(entry.content_path, None);

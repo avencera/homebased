@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::TaskId;
 use crate::error::AppError;
+use crate::message::MessageId;
 
 /// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
@@ -19,6 +20,16 @@ pub const DAEMON_LOCK: &str = "daemon.lock";
 pub const FALLBACK_LOG: &str = "callback-fallback.log";
 /// Per-task process-shared lock that serializes callback delivery.
 pub const DELIVERY_LOCK: &str = "delivery.lock";
+/// Stable machine UUID for this installation.
+pub const MACHINE_ID: &str = "machine-id";
+/// Durable fleet peer directory: explicit additions and last-known machines.
+pub const FLEET_PEERS: &str = "fleet-peers.json";
+/// Directory for direct-message queue evidence.
+pub const MESSAGES_DIR: &str = "messages";
+/// Log written by one direct-message queue attempt.
+pub const MESSAGE_QUEUE_LOG: &str = "queue.log";
+/// Process-shared lock inherited by one direct-message queue child.
+pub const MESSAGE_DELIVERY_LOCK: &str = "delivery.lock";
 
 /// Resolved state root plus helpers for the on-disk layout.
 #[derive(Debug, Clone)]
@@ -90,6 +101,18 @@ impl Home {
         self.root.join(FALLBACK_LOG)
     }
 
+    /// Stable machine UUID file.
+    #[must_use]
+    pub fn machine_id_path(&self) -> PathBuf {
+        self.root.join(MACHINE_ID)
+    }
+
+    /// Durable fleet peer directory file.
+    #[must_use]
+    pub fn fleet_peers_path(&self) -> PathBuf {
+        self.root.join(FLEET_PEERS)
+    }
+
     /// `tasks/` directory.
     #[must_use]
     pub fn tasks_dir(&self) -> PathBuf {
@@ -113,6 +136,13 @@ impl Home {
     #[must_use]
     pub fn task_paths(&self, id: TaskId) -> TaskPaths {
         TaskPaths::new(self.task_dir(id))
+    }
+
+    /// Create the directory for one direct message and return its queue evidence paths.
+    pub fn prepare_message(&self, id: MessageId) -> Result<MessagePaths, AppError> {
+        let paths = MessagePaths::new(self.root.join(MESSAGES_DIR).join(id.to_string()));
+        fs::create_dir_all(&paths.dir)?;
+        Ok(paths)
     }
 }
 
@@ -151,6 +181,27 @@ pub struct TaskPaths {
     pub callback_log: PathBuf,
     /// Process-shared callback delivery lock.
     pub delivery_lock: PathBuf,
+}
+
+/// Files inside `messages/<id>/`.
+#[derive(Debug, Clone)]
+pub struct MessagePaths {
+    /// Message directory.
+    pub dir: PathBuf,
+    /// Combined stdout and stderr from the queue child.
+    pub queue_log: PathBuf,
+    /// Process-shared delivery lock for the queue child.
+    pub delivery_lock: PathBuf,
+}
+
+impl MessagePaths {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            queue_log: dir.join(MESSAGE_QUEUE_LOG),
+            delivery_lock: dir.join(MESSAGE_DELIVERY_LOCK),
+            dir,
+        }
+    }
 }
 
 impl TaskPaths {

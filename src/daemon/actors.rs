@@ -1,6 +1,7 @@
-//! Daemon ractor topology: store, callback, per-task watch, supervisor.
+//! Daemon ractor topology: store, callback, per-task watch, per-resource owner, supervisor.
 
 pub mod callback;
+pub mod resource;
 pub mod store;
 pub mod supervisor;
 pub mod task;
@@ -15,6 +16,7 @@ use crate::error::AppError;
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use callback::{CallbackActor, CallbackMsg};
+pub use resource::{ResourceActor, ResourceActorInspection, ResourceMsg};
 pub use store::{StoreActor, StoreMsg};
 pub use supervisor::{SupervisorActor, SupervisorMsg};
 pub use task::{TaskActor, TaskMsg};

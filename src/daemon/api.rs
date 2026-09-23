@@ -30,6 +30,7 @@ use crate::invocation::{
 };
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::{self, CancelResult};
+use crate::submission::RequestId;
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -41,6 +42,7 @@ impl IntoResponse for AppError {
 /// Routes that only read state. Safe to expose on the TCP listener.
 pub fn read_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::daemon::fleet_api::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
@@ -61,7 +63,10 @@ pub fn write_routes() -> Router<AppState> {
 
 /// Full API for the Unix socket.
 pub fn socket_router(state: AppState) -> Router {
-    read_routes().merge(write_routes()).with_state(state)
+    read_routes()
+        .merge(write_routes())
+        .merge(crate::daemon::fleet_api::socket_routes())
+        .with_state(state)
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {
@@ -79,9 +84,11 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppEr
 /// Validated socket request. Built only by `SpecBody`, which is where the
 /// envelope, the normalized spec, and the captured env are each checked.
 #[derive(Debug)]
-struct SubmitBody {
-    spec: NormalizedSpec,
-    env: TaskEnv,
+pub(super) struct SubmitBody {
+    pub(super) spec: NormalizedSpec,
+    pub(super) env: TaskEnv,
+    pub(super) request: Option<RequestId>,
+    pub(super) callback_cwd: Option<PathBuf>,
 }
 
 /// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
@@ -94,6 +101,10 @@ struct SubmitEnvelope {
     spec: Option<Value>,
     #[serde(default)]
     env: Option<Value>,
+    #[serde(default)]
+    request_id: Option<RequestId>,
+    #[serde(default)]
+    callback_cwd: Option<PathBuf>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`.
@@ -128,7 +139,24 @@ where
             .ok_or_else(|| missing_field("/spec", "spec"))?;
         // parse_normalized_value already enforces api_version and min timeout
         let spec = spec::parse_normalized_value(&spec_value).map_err(|err| prefix("/spec", err))?;
-        Ok(Self(SubmitBody { spec, env }))
+        let request = match (spec.machine.is_some(), envelope.request_id) {
+            (true, request_id) => Some(request_id.unwrap_or_default()),
+            (false, Some(request_id)) => {
+                return Err(AppError::InvalidSpec {
+                    pointer: "/request_id".into(),
+                    value: json!(request_id),
+                    message: "request_id is only valid for remote submissions with spec.machine"
+                        .into(),
+                });
+            }
+            (false, None) => None,
+        };
+        Ok(Self(SubmitBody {
+            spec,
+            env,
+            request,
+            callback_cwd: envelope.callback_cwd,
+        }))
     }
 }
 
@@ -174,6 +202,9 @@ fn prefix(prefix: &str, err: AppError) -> AppError {
 struct SubmitResponse {
     api_version: u32,
     id: TaskId,
+    task_id: TaskId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<RequestId>,
     status: ProcessStatus,
 }
 
@@ -181,25 +212,34 @@ async fn submit(
     State(state): State<AppState>,
     SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
-    let (id, status) = accept_task(&state, body).await?;
+    let (id, status, request_id) = if body.spec.machine.is_some() {
+        crate::daemon::origin_submit::submit(&state, body).await?
+    } else {
+        let (id, status) = accept_task(&state, body).await?;
+        (id, status, None)
+    };
     Ok((
         StatusCode::OK,
         Json(SubmitResponse {
             api_version: API_VERSION,
             id,
+            task_id: id,
+            request_id,
             status,
         }),
     ))
 }
 
 #[derive(Serialize)]
-struct DryRunResponse {
-    api_version: u32,
-    spec: NormalizedSpec,
-    argv: Vec<String>,
-    stdin: StdinPolicy,
+pub(super) struct DryRunResponse {
+    pub(super) api_version: u32,
+    pub(super) spec: NormalizedSpec,
+    pub(super) argv: Vec<String>,
+    pub(super) stdin: StdinPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
-    managed_environment: Option<ManagedEnvironmentPreview>,
+    pub(super) execution_cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) managed_environment: Option<ManagedEnvironmentPreview>,
 }
 
 async fn dry_run(
@@ -207,22 +247,36 @@ async fn dry_run(
     SpecBody(body): SpecBody,
 ) -> Result<Json<DryRunResponse>, AppError> {
     let spec = body.spec;
+    if spec.machine.is_some() {
+        return crate::daemon::origin_submit::dry_run(&state, spec, body.env)
+            .await
+            .map(Json);
+    }
+    local_dry_run(&state, spec, body.env).map(Json)
+}
+
+pub(super) fn local_dry_run(
+    state: &AppState,
+    spec: NormalizedSpec,
+    env: TaskEnv,
+) -> Result<DryRunResponse, AppError> {
     spec::check_cwd(&spec.cwd)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
     let invocation = invocation_from_normalized_for_identity(
         &spec.workload,
-        &body.env.path,
+        &env.path,
         &spec.cwd,
         prompt_feed.as_deref(),
         TaskIdentity::Preview,
     )?;
-    Ok(Json(DryRunResponse {
+    Ok(DryRunResponse {
         api_version: API_VERSION,
         spec,
         argv: invocation.to_vec(),
         stdin: invocation.stdin,
+        execution_cwd: None,
         managed_environment: invocation.managed_environment,
-    }))
+    })
 }
 
 /// Deterministic dry-run feed path for any agent. Only Grok puts it in argv;
@@ -275,27 +329,42 @@ async fn list(
         reply,
     })
     .await?;
-    Ok(Json(TaskList::from_rows(&rows)))
+    let ids = rows.iter().map(|row| row.id).collect();
+    let presentations = call(&state.store, |reply| StoreMsg::TaskPresentations {
+        ids,
+        reply,
+    })
+    .await?;
+    Ok(Json(TaskList::from_rows(&rows, &presentations)))
 }
 
 async fn show(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
-) -> Result<Json<TaskDetail>, AppError> {
+) -> Result<Json<Value>, AppError> {
+    crate::daemon::inspection::show(&state, id).await.map(Json)
+}
+
+pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDetail, AppError> {
     let row = call(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
+    let presentations = call(&state.store, |reply| StoreMsg::TaskPresentations {
+        ids: vec![id],
+        reply,
+    })
+    .await?;
     let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let last_event = last_event_for_row(&row, &reports, evidence.clone());
-    Ok(Json(TaskDetail {
+    Ok(TaskDetail {
         api_version: API_VERSION,
-        summary: TaskSummary::from(&row),
+        summary: TaskSummary::from_row(&row, presentations.get(&id)),
         reports,
         output_log: state.home.task_paths(id).output,
         evidence,
         last_event,
-    }))
+    })
 }
 
 #[derive(Deserialize)]
@@ -308,24 +377,34 @@ async fn log(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
     Query(query): Query<LogQuery>,
-) -> Result<Json<LogTail>, AppError> {
+) -> Result<Json<Value>, AppError> {
+    crate::daemon::inspection::log(&state, id, query.tail)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn local_log(
+    state: &AppState,
+    id: TaskId,
+    tail: Option<usize>,
+) -> Result<LogTail, AppError> {
     if call(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .is_none()
     {
         return Err(AppError::TaskNotFound { id });
     }
-    let tail = state.home.task_paths(id).read_output(query.tail)?;
+    let tail = state.home.task_paths(id).read_output(tail)?;
     let (log, truncated) = match tail {
         Some(output) => (output.text, output.truncated),
         None => (String::new(), false),
     };
-    Ok(Json(LogTail {
+    Ok(LogTail {
         api_version: API_VERSION,
         id,
         log,
         truncated,
-    }))
+    })
 }
 
 async fn files_resolve(Json(body): Json<ResolveBody>) -> Result<Json<ResolvedPath>, AppError> {
@@ -354,6 +433,25 @@ async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Value>, AppError> {
+    let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
+    if local.is_none() {
+        let (origin_machine, execution_machine) =
+            crate::daemon::inspection::cancellation_owner(&state, id).await?;
+        let request = crate::cancellation::CancellationRequest {
+            requester_machine: state.machine.identity.machine,
+            cancellation: uuid::Uuid::now_v7(),
+            task: id,
+            origin_machine,
+            execution_machine,
+            delivery: crate::cancellation::CancellationDelivery::Pending,
+        };
+        let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
+            request,
+            reply,
+        })
+        .await?;
+        return Ok(Json(crate::daemon::cancel_delivery::response(&saved)));
+    }
     let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
         id,
         reply,
@@ -378,11 +476,16 @@ async fn cancel(
     }
 }
 
-async fn accept_task(
+pub(super) async fn accept_task(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, ProcessStatus), AppError> {
     let spec = body.spec;
+    if spec.machine.is_some() {
+        return Err(AppError::Usage {
+            message: "local task acceptance received a remote machine selector".into(),
+        });
+    }
     spec::check_cwd(&spec.cwd)?;
     let binary = resolve_workload_binary(&spec.workload, &body.env.path, &spec.cwd)?;
     let id = TaskId::new();
@@ -403,6 +506,7 @@ async fn accept_task(
     });
     call(&state.supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
+        spec: Box::new(spec),
         reply,
     })
     .await?;
@@ -456,6 +560,56 @@ mod tests {
         let body = extract(&valid()).await.unwrap();
         assert_eq!(body.env.path, "/bin");
         assert_eq!(body.spec.api_version, 1);
+        assert_eq!(body.request, None);
+    }
+
+    #[tokio::test]
+    async fn local_request_id_is_rejected() {
+        let mut value = valid();
+        value["request_id"] = json!("01a0ab97-a7aa-7463-a5b0-8d500e40e431");
+        let (pointer, found) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/request_id");
+        assert_eq!(found, value["request_id"]);
+    }
+
+    #[tokio::test]
+    async fn remote_request_id_is_generated_or_preserved() {
+        let mut value = valid();
+        value["spec"]["machine"] = json!("code");
+        let generated = extract(&value).await.unwrap().request.unwrap();
+        assert_ne!(generated.0, uuid::Uuid::nil());
+
+        let explicit = uuid::Uuid::parse_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
+        value["request_id"] = json!(explicit);
+        assert_eq!(
+            extract(&value).await.unwrap().request,
+            Some(RequestId(explicit))
+        );
+    }
+
+    #[test]
+    fn local_submit_response_omits_request_id() {
+        let id = TaskId::new();
+        let response = SubmitResponse {
+            api_version: API_VERSION,
+            id,
+            task_id: id,
+            request_id: None,
+            status: ProcessStatus::Queued,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value.get("request_id").is_none());
+
+        let request_id = RequestId(uuid::Uuid::now_v7());
+        let response = SubmitResponse {
+            api_version: API_VERSION,
+            id,
+            task_id: id,
+            request_id: Some(request_id),
+            status: ProcessStatus::Queued,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["request_id"], json!(request_id));
     }
 
     #[tokio::test]

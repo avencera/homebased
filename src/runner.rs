@@ -1,4 +1,4 @@
-//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, callback.
+//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,7 +18,6 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::callback::{deliver_exit_event, exit_event};
 use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskIdentity, TaskRow};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
@@ -78,7 +77,7 @@ fn prepare_worker(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Worker entry: hold the inherited lock until exit.json and callback complete.
+/// Worker entry: hold the inherited lock until exit.json and event commit.
 pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     let _lock = unsafe { File::from_raw_fd(lock_fd) };
     // install the SIGTERM handler before any other work. Everything below (the
@@ -131,17 +130,13 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     };
 
     store::write_exit_json(&paths.exit_json, &reason)?;
-    let row = match store.cas_exit(id, ProcessStatus::Running, &reason)? {
-        Some(row) => row,
+    match store.cas_exit(id, ProcessStatus::Running, &reason)? {
+        Some(_) => {}
         None => {
             let current = store.require_task(id)?;
             warn!(%id, status = %current.status(), "cas_exit failed");
-            current
         }
-    };
-    let reports = store.reports(id)?;
-    let event = exit_event(&row, &reports, paths.dir.clone());
-    deliver_exit_event(&store, &home, &row, &event)?;
+    }
     Ok(())
 }
 

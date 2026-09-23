@@ -8,7 +8,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::net::UnixStream;
 
@@ -35,6 +35,19 @@ impl Client {
     /// POST JSON.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, AppError> {
         self.request("POST", path, Some(body)).await
+    }
+
+    /// POST a typed JSON request and decode a typed response.
+    pub async fn post_json<T, R>(&self, path: &str, body: &T) -> Result<R, AppError>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let value = serde_json::to_value(body)?;
+        let response = self.post(path, &value).await?;
+        serde_json::from_value(response).map_err(|err| AppError::Internal {
+            message: format!("invalid daemon response: {err}"),
+        })
     }
 
     /// Typed GET.
@@ -109,7 +122,7 @@ impl Client {
     }
 }
 
-fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
+pub(crate) fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes)
         && let Some(error) = value.get("error")
     {
@@ -137,6 +150,156 @@ fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
 fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> AppError {
     match code {
         "daemon_unavailable" => AppError::DaemonUnavailable { message },
+        "cluster_lookup_incomplete" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let unchecked = input
+                .get("unchecked")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            match (task, unchecked) {
+                (Some(task), Some(unchecked)) => {
+                    AppError::ClusterLookupIncomplete { task, unchecked }
+                }
+                _ => AppError::Internal { message },
+            }
+        }
+        "task_unavailable" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let machine = input
+                .get("machine")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            match (task, machine) {
+                (Some(task), Some(machine)) => AppError::TaskUnavailable { task, machine },
+                _ => AppError::Internal { message },
+            }
+        }
+        "task_not_started" => input
+            .get("task")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .map_or(AppError::Internal { message }, |task| {
+                AppError::TaskNotStarted { task }
+            }),
+        "cluster_task_conflict" => input
+            .get("task")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .map_or(AppError::Internal { message }, |task| {
+                AppError::ClusterTaskConflict { task }
+            }),
+        "machine_unavailable" => {
+            let machine = input
+                .get("machine")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match machine {
+                Some(machine) => AppError::MachineUnavailable { machine, message },
+                None => AppError::Internal { message },
+            }
+        }
+        "remote_submission_unavailable" => AppError::RemoteSubmissionUnavailable { message },
+        "machine_not_found" => AppError::MachineNotFound {
+            machine: input
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        },
+        "machine_identity_mismatch" => {
+            let expected = input
+                .get("expected")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let found = input
+                .get("found")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match expected {
+                Some(expected) => AppError::MachineIdentityMismatch { expected, found },
+                None => AppError::Internal { message },
+            }
+        }
+        "duplicate_machine_name" => {
+            let name = input
+                .get("name")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let machines = input
+                .get("machines")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (name, machines) {
+                (Some(name), Some(machines)) => AppError::DuplicateMachineName { name, machines },
+                _ => AppError::Internal { message },
+            }
+        }
+        "cluster_protocol_incompatible" => {
+            let machine = input
+                .get("machine")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let local = input
+                .get("local")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let remote = input
+                .get("remote")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (machine, local, remote) {
+                (Some(machine), Some(local), Some(remote)) => {
+                    AppError::ClusterProtocolIncompatible {
+                        machine,
+                        local,
+                        remote,
+                    }
+                }
+                _ => AppError::Internal { message },
+            }
+        }
+        "submission_outcome_unknown" | "submission_rejected" | "submission_conflict" => {
+            let request = input
+                .get("request_id")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let task = input
+                .get("task_id")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok());
+            match (request, task) {
+                (Some(request), Some(task)) if code == "submission_outcome_unknown" => {
+                    AppError::SubmissionOutcomeUnknown {
+                        request,
+                        task,
+                        message,
+                    }
+                }
+                (Some(request), Some(task)) if code == "submission_rejected" => {
+                    AppError::SubmissionRejected {
+                        request,
+                        task,
+                        reason: input
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&message)
+                            .to_string(),
+                    }
+                }
+                (Some(request), Some(task)) => AppError::SubmissionConflict {
+                    request,
+                    task,
+                    message,
+                },
+                _ => AppError::Internal { message },
+            }
+        }
         "task_not_found" => {
             let id = input
                 .get("id")
@@ -147,6 +310,63 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 None => AppError::Internal { message },
             }
         }
+        "route_not_found" => input
+            .get("task")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map_or(AppError::Internal { message }, |task| {
+                AppError::RouteNotFound { task }
+            }),
+        "message_invalid" => AppError::MessageInvalid {
+            message: input
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or(&message)
+                .to_string(),
+        },
+        "agent_thread_not_found" => AppError::AgentThreadNotFound {
+            selector: input
+                .get("selector")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        },
+        "message_conflict" => input
+            .get("message_id")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map_or(AppError::Internal { message }, |id| {
+                AppError::MessageConflict { id }
+            }),
+        "message_delivery_failed" => input
+            .get("message_id")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map_or(
+                AppError::Internal {
+                    message: message.clone(),
+                },
+                |id| AppError::MessageDeliveryFailed { id, message },
+            ),
+        "message_outcome_unknown" => {
+            let id = input
+                .get("message_id")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let machine = input
+                .get("machine")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (id, machine) {
+                (Some(id), Some(machine)) => AppError::MessageOutcomeUnknown {
+                    id,
+                    machine,
+                    message,
+                },
+                _ => AppError::Internal { message },
+            }
+        }
+        "message_receiver_unavailable" => AppError::MessageUnavailable { message },
         "cwd_not_found" => AppError::CwdNotFound {
             path: input
                 .get("cwd")
@@ -235,5 +455,30 @@ mod tests {
             }
         ));
         assert_eq!(error.code(), "agent_configuration");
+    }
+
+    #[test]
+    fn remote_submit_errors_keep_retry_identity_and_retryability() {
+        let request = crate::submission::RequestId::new();
+        let task = crate::domain::TaskId::new();
+        let unknown = from_code(
+            "submission_outcome_unknown",
+            "response lost".into(),
+            &json!({"request_id": request, "task_id": task}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert!(unknown.retryable());
+        assert_eq!(unknown.input()["task_id"], task.to_string());
+        assert_eq!(unknown.input()["request_id"], request.0.to_string());
+
+        let machine = crate::machine::MachineId::new();
+        let unavailable = from_code(
+            "machine_unavailable",
+            "probe failed".into(),
+            &json!({"machine": machine}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert_eq!(unavailable.code(), "machine_unavailable");
+        assert!(unavailable.retryable());
     }
 }

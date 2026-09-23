@@ -7,15 +7,14 @@ use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::AbortHandle;
 
-use crate::callback::{ATTENTION_SETTLE, HomebasedEvent, check_due_event, deliver_notify};
-use crate::daemon::actors::callback::CallbackMsg;
+use crate::callback::ATTENTION_SETTLE;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{AttentionState, ExitReason, ProcessStatus, TaskId, TaskRow, TaskState};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::store::{self, CancelResult};
 
-/// Retry interval when an attention reminder fails to send.
+/// Retry interval when an attention event cannot be committed.
 const ATTENTION_RETRY: Duration = Duration::from_secs(30);
 
 /// Longest single sleep before the deadline is recomputed from the wall clock
@@ -28,16 +27,10 @@ const ATTENTION_HOP_MAX: Duration = Duration::from_secs(3600);
 pub enum TaskMsg {
     /// `runner.lock` is free; apply `exit.json` or Lost.
     LockReleased,
-    /// Attention timer fired or a failed send should retry.
+    /// Output-inactivity timer fired.
     AttentionDue,
-    /// A prior daemon's bounded attention sender can no longer be alive.
+    /// A legacy attention sender can no longer be alive.
     AttentionRecoveryDue,
-    /// One attention send finished. Reported by the send task so the actor
-    /// mailbox stays free while `codex queue` runs.
-    AttentionSettled {
-        /// Whether the queue send succeeded.
-        delivered: bool,
-    },
 }
 
 /// Holds refs; `Arguments` is the `TaskId`.
@@ -46,19 +39,15 @@ pub struct TaskActor {
     pub home: Home,
     /// Store actor.
     pub store: ActorRef<StoreMsg>,
-    /// Callback actor.
-    pub callback: ActorRef<CallbackMsg>,
 }
 
-/// In-memory attention phase for one watch actor. Done and sending cannot
+/// In-memory attention phase for one watch actor. Armed and recovering cannot
 /// overlap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttentionPhase {
     /// Timer may still fire; no send is in flight.
     Armed,
-    /// A send task holds the claim and will report back.
-    Sending,
-    /// A prior daemon owns the persisted claim until its sender bound passes.
+    /// A legacy sender may still own the old persisted claim until its bound passes.
     Recovering,
     /// Delivered, or the task went terminal; no further reminder.
     Done,
@@ -165,7 +154,6 @@ impl Actor for TaskActor {
                     return Ok(());
                 }
                 match start_attention_reminder(self, myself.clone(), state.id).await {
-                    Ok(AttentionStep::Sending) => state.attention = AttentionPhase::Sending,
                     Ok(AttentionStep::Deferred(timer)) => {
                         state.replace_attention_timer(timer);
                     }
@@ -188,14 +176,6 @@ impl Actor for TaskActor {
                 .await?;
                 state.attention = AttentionPhase::Armed;
                 myself.cast(TaskMsg::AttentionDue)?;
-            }
-            TaskMsg::AttentionSettled { delivered } => {
-                if delivered {
-                    state.attention = AttentionPhase::Done;
-                } else {
-                    state.attention = AttentionPhase::Armed;
-                    state.replace_attention_timer(schedule_attention_retry(&myself));
-                }
             }
         }
         Ok(())
@@ -279,26 +259,13 @@ fn schedule_attention_recovery(myself: &ActorRef<TaskMsg>) -> AbortHandle {
 
 /// Outcome of starting one attention attempt.
 enum AttentionStep {
-    /// A send task now holds the claim and will report back.
-    Sending,
     /// The task has not started or output resumed, so another check is armed.
     Deferred(AbortHandle),
-    /// Nothing to send: already delivered, or the task is terminal.
+    /// Nothing to produce: already recorded, or the task is terminal.
     Done,
 }
 
-/// Claim the attention reminder, then send `TASK_CHECK_DUE` from a detached
-/// task.
-///
-/// The claim is taken *before* the send. It only succeeds while the task is
-/// running, and while it is held the terminal callback waits, so a
-/// terminal transition can neither cancel a reminder already on the wire nor
-/// let its own event overtake one. The delivered timestamp is written only
-/// after the queue send succeeds, so a crash mid-send retries instead of
-/// silently swallowing the reminder.
-///
-/// `codex queue` can take seconds; it runs off the actor so the mailbox stays
-/// responsive mid-send.
+/// Append one inactivity event before any later terminal event can be produced
 async fn start_attention_reminder(
     actor: &TaskActor,
     myself: ActorRef<TaskMsg>,
@@ -330,106 +297,32 @@ async fn start_attention_reminder(
         )));
     }
 
-    if !call(&actor.store, |reply| StoreMsg::ClaimAttention { id, reply }).await? {
-        return Ok(AttentionStep::Done);
+    if !call(&actor.store, |reply| StoreMsg::IsEventTask { id, reply }).await? {
+        return Err(AppError::Internal {
+            message: format!("task {id} has no durable event identity"),
+        });
     }
-
-    let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
-        return Ok(AttentionStep::Done);
-    };
-
-    if !matches!(row.state, TaskState::Running { .. }) {
-        call(&actor.store, |reply| StoreMsg::ReleaseAttention {
-            id,
-            reply,
-        })
-        .await?;
-        return Ok(AttentionStep::Done);
-    }
-
-    if !inactivity_wait(
-        row.created_at,
-        last_output_at(&output),
-        row.timeout,
-        Utc::now(),
-    )
-    .is_zero()
-    {
-        call(&actor.store, |reply| StoreMsg::ReleaseAttention {
-            id,
-            reply,
-        })
-        .await?;
-        return Ok(AttentionStep::Deferred(arm_attention_timer(
-            myself, &row, output,
-        )));
-    }
-
-    let reports = call(&actor.store, |reply| StoreMsg::Reports { id, reply }).await?;
-    let event = check_due_event(&row, &reports, actor.home.task_dir(id));
-    let home = actor.home.clone();
-    let store = actor.store.clone();
-    tokio::spawn(async move {
-        let delivered = finish_attention_send(&store, &home, row, event).await;
-        if let Err(err) = myself.cast(TaskMsg::AttentionSettled { delivered }) {
-            tracing::debug!(%id, "attention settled cast: {err}");
-        }
-    });
-    Ok(AttentionStep::Sending)
-}
-
-/// Run the blocking queue send, then record or release the claim.
-async fn finish_attention_send(
-    store: &ActorRef<StoreMsg>,
-    home: &Home,
-    row: TaskRow,
-    event: HomebasedEvent,
-) -> bool {
-    let id = row.id;
-    let home_for_send = home.clone();
-    let sent = tokio::task::spawn_blocking(move || deliver_notify(&home_for_send, &row, &event))
-        .await
-        .map_err(|err| AppError::Internal {
-            message: format!("attention notify join: {err}"),
-        })
-        .and_then(|result| result);
-    let delivered = sent.is_ok();
-    let outcome = match sent {
-        Ok(()) => {
-            tracing::info!(%id, "attention reminder sent");
-            call(store, |reply| StoreMsg::MarkAttentionDelivered {
-                id,
-                reply,
-            })
-            .await
-        }
-        Err(err) => {
-            tracing::warn!(%id, "attention notify failed: {err}");
-            call(store, |reply| StoreMsg::ReleaseAttention { id, reply }).await
-        }
-    };
-    if let Err(err) = outcome {
-        // the claim stays `sending`; the terminal callback releases it and the
-        // next timer wake-up re-claims it
-        tracing::warn!(%id, "recording attention outcome: {err}");
-        return false;
-    }
-    delivered
+    call(&actor.store, |reply| StoreMsg::ProduceAttentionEvent {
+        id,
+        reply,
+    })
+    .await?;
+    Ok(AttentionStep::Done)
 }
 
 async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<(), AppError> {
     let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
         return Ok(());
     };
-    if row.state.is_terminal() && !row.callback_outstanding() {
+    if row.state.is_terminal() {
         return Ok(());
     }
     let paths = actor.home.task_paths(id);
-    let row = match store::read_exit_json(&paths.exit_json)? {
+    match store::read_exit_json(&paths.exit_json)? {
         Some(exit) => apply_exit(actor, row, &exit.reason).await?,
         None => apply_lost(actor, row).await?,
     };
-    deliver_terminal(actor, row)
+    Ok(())
 }
 
 /// The worker released the lock without writing `exit.json`.
@@ -478,30 +371,17 @@ async fn apply_exit(
     }
 }
 
-/// Hand the row to the callback actor when its terminal event is still owed.
-fn deliver_terminal(actor: &TaskActor, row: TaskRow) -> Result<(), AppError> {
-    if !row.callback_outstanding() {
-        return Ok(());
-    }
-    actor.callback.cast(CallbackMsg::Deliver { row })?;
-    Ok(())
-}
-
-/// Request cancel in the store, then act on the outcome: deliver the exit
-/// callback for a queued task, or SIGTERM a live worker. Every state change is
+/// Request cancel in the store, then signal a live worker when needed. Every state change is
 /// a store CAS, so this needs no per-task actor and the supervisor runs it
 /// directly.
 pub(crate) async fn cancel_task(
     store: &ActorRef<StoreMsg>,
-    callback: &ActorRef<CallbackMsg>,
     id: TaskId,
 ) -> Result<CancelResult, AppError> {
     let result = call(store, |reply| StoreMsg::RequestCancel { id, reply }).await?;
     match &result {
         CancelResult::AlreadyTerminal(_) => {}
-        CancelResult::CancelledQueued(row) => {
-            callback.cast(CallbackMsg::Deliver { row: row.clone() })?;
-        }
+        CancelResult::CancelledQueued(_) => {}
         // signal the worker pid, not `-pid`: `task-run` forwards to the child's own process group
         CancelResult::SignalWorker(row) => {
             if let Some(pid) = row.pid()
@@ -667,17 +547,15 @@ mod tests {
         assert!(!fired.load(Ordering::SeqCst));
     }
 
-    use crate::daemon::actors::callback::{CallbackActor, CallbackArgs};
     use crate::daemon::actors::{StoreActor, StoreMsg, call};
     use crate::domain::{
-        Agent, AgentKind, AgentWorkload, CallbackStatus, ProcessStatus, TaskEnv, TaskId, ThreadId,
-        Workload,
+        Agent, AgentKind, AgentWorkload, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload,
     };
     use crate::home::Home;
     use crate::store::{CancelResult, NewTask, new_queued_task};
 
     #[tokio::test]
-    async fn cancel_task_without_actor_cancels_queued_row_and_delivers_callback() {
+    async fn queued_cancel_persists_a_terminal_event_without_direct_delivery() {
         let dir = tempdir().unwrap();
         let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
         home.ensure().unwrap();
@@ -685,16 +563,6 @@ mod tests {
         let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
             .await
             .unwrap();
-        let (callback, callback_handle) = CallbackActor::spawn(
-            None,
-            CallbackActor,
-            CallbackArgs {
-                store: store.clone(),
-                home: home.clone(),
-            },
-        )
-        .await
-        .unwrap();
 
         let id = TaskId::new();
         let row = new_queued_task(NewTask {
@@ -709,7 +577,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             timeout: Duration::from_secs(4 * 3600),
             env: TaskEnv {
-                // empty PATH so no `codex` resolves: the callback must still finish, as Failed
+                // empty PATH so migration keeps an unavailable callback context
                 path: dir.path().join("empty-bin").display().to_string(),
                 home: dir.path().display().to_string(),
             },
@@ -722,34 +590,43 @@ mod tests {
         .await
         .unwrap();
 
-        let result = cancel_task(&store, &callback, id).await.unwrap();
+        call(&store, |reply| StoreMsg::MigrateLegacyLocal {
+            machine: crate::machine::MachineId::new(),
+            reply,
+        })
+        .await
+        .unwrap();
+
+        let result = cancel_task(&store, id).await.unwrap();
         assert!(matches!(result, CancelResult::CancelledQueued(_)));
 
-        let final_row = wait_for_callback(&store, id).await;
+        let final_row = call(&store, |reply| StoreMsg::GetTask { id, reply })
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(final_row.status(), ProcessStatus::Cancelled);
-        assert_ne!(final_row.callback_status, CallbackStatus::Pending);
+        assert_eq!(
+            final_row.callback_status,
+            crate::domain::CallbackStatus::Pending
+        );
+        let event = call(&store, |reply| StoreMsg::FirstPendingOutbound { id, reply })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event.seq.get(), 1);
+        assert!(matches!(
+            event.event.payload,
+            crate::events::EventPayload::Callback {
+                state: Some(ProcessStatus::Cancelled),
+                ..
+            }
+        ));
+        let pending_inbox = call(&store, |reply| StoreMsg::PendingInboxTasks { reply })
+            .await
+            .unwrap();
+        assert!(pending_inbox.is_empty());
 
         store.stop(None);
-        callback.stop(None);
         let _ = store_handle.await;
-        let _ = callback_handle.await;
-    }
-
-    /// Poll until the callback actor leaves `pending`, since `Deliver` is fire-and-forget.
-    async fn wait_for_callback(
-        store: &ractor::ActorRef<StoreMsg>,
-        id: TaskId,
-    ) -> crate::domain::TaskRow {
-        for _ in 0..100 {
-            let row = call(store, |reply| StoreMsg::GetTask { id, reply })
-                .await
-                .unwrap()
-                .unwrap();
-            if row.callback_status != CallbackStatus::Pending {
-                return row;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("callback stayed pending");
     }
 }

@@ -1,9 +1,10 @@
-//! Optional TCP listener: dashboard assets plus the read-only API.
+//! Optional TCP listener: dashboard assets, the read-only API, and, when the
+//! fleet is enabled, the `/v1/cluster/*` routes.
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. The Unix
-//! socket stays the only place that accepts mutations. A TCP port is reachable
-//! from any web page the user has open, so this router never exposes submit or
-//! cancel.
+//! socket stays the only place that accepts local mutations. A TCP port is
+//! reachable from any web page the user has open, so this router never exposes
+//! local submit or cancel.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -19,7 +20,7 @@ use tokio::net::TcpListener;
 use tracing::warn;
 
 use crate::daemon::AppState;
-use crate::daemon::api;
+use crate::daemon::{api, cluster};
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::files::{HostPolicy, host_guard};
@@ -88,7 +89,11 @@ pub fn url_for(addr: SocketAddr) -> String {
 /// Read-only API plus the embedded single-page app.
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
-    api::read_routes()
+    let routes = match state.fleet.handle() {
+        Some(fleet) => api::read_routes().merge(cluster::routes(fleet.clone())),
+        None => api::read_routes(),
+    };
+    routes
         .fallback(asset)
         .layer(middleware::from_fn(move |request: Request, next: Next| {
             let policy = policy.clone();

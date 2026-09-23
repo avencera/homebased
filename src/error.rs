@@ -7,6 +7,9 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 use crate::domain::{AgentKind, ProcessStatus, TaskId};
+use crate::fleet::protocol::ProtocolRange;
+use crate::machine::{MachineId, MachineName};
+use crate::submission::RequestId;
 
 /// Application error with a stable machine-readable code.
 #[derive(Debug, thiserror::Error)]
@@ -23,7 +26,29 @@ pub enum AppError {
         /// Id that had no row.
         id: TaskId,
     },
-    /// Spec `cwd` is missing or not a directory.
+    /// Known peers could not all be checked for this task
+    #[error("cluster lookup incomplete for {task}")]
+    ClusterLookupIncomplete {
+        /// Task being inspected
+        task: TaskId,
+        /// Machine UUIDs without a definitive local-record answer
+        unchecked: Vec<MachineId>,
+    },
+    /// Task evidence is not available from its execution owner
+    #[error("task {task} detail or log unavailable on {machine}")]
+    TaskUnavailable {
+        /// Task being inspected
+        task: TaskId,
+        /// Execution owner
+        machine: MachineId,
+    },
+    /// This task UUID was rejected before a child started
+    #[error("task not started: {task}")]
+    TaskNotStarted {
+        /// Task that did not start
+        task: TaskId,
+    },
+    /// Spec `cwd` is missing or not a directory
     #[error("cwd not found: {}", path.display())]
     CwdNotFound {
         /// Directory the spec asked for.
@@ -148,6 +173,161 @@ pub enum AppError {
         /// Human-readable failure.
         message: String,
     },
+    /// `config.toml` is missing, unreadable, or fails validation.
+    #[error("invalid config {}: {message}", path.display())]
+    ConfigInvalid {
+        /// Config file path.
+        path: PathBuf,
+        /// Why the file was rejected.
+        message: String,
+    },
+    /// No known machine matches this name or UUID.
+    #[error("machine not found: {machine}")]
+    MachineNotFound {
+        /// Name or UUID the caller gave.
+        machine: String,
+    },
+    /// An address answered for another installation than the request named.
+    #[error(
+        "machine identity mismatch: expected {expected}, found {}",
+        found.map_or_else(|| "no machine".to_string(), |id| id.to_string())
+    )]
+    MachineIdentityMismatch {
+        /// Destination machine UUID the request carried.
+        expected: MachineId,
+        /// Machine UUID that answered, when known.
+        found: Option<MachineId>,
+    },
+    /// Distinct live daemons claim one machine UUID.
+    #[error("duplicate machine identity: {machine}")]
+    DuplicateMachineIdentity {
+        /// Conflicting machine UUID.
+        machine: MachineId,
+    },
+    /// More than one machine uses one name.
+    #[error("duplicate machine name: {name}")]
+    DuplicateMachineName {
+        /// Conflicting name.
+        name: MachineName,
+        /// Machines that claim it.
+        machines: Vec<MachineId>,
+    },
+    /// Known machine that did not answer.
+    #[error("machine {machine} unavailable: {message}")]
+    MachineUnavailable {
+        /// Machine that did not answer.
+        machine: MachineId,
+        /// Last failure.
+        message: String,
+    },
+    /// Remote execution cannot start until its event route is available.
+    #[error("remote submission is unavailable: {message}")]
+    RemoteSubmissionUnavailable {
+        /// Why this daemon cannot start the task now.
+        message: String,
+    },
+    /// The executor may have accepted this task; retry the same request UUID
+    #[error("submission outcome unknown for request {} task {task}: {message}", request.0)]
+    SubmissionOutcomeUnknown {
+        /// Caller retry identity
+        request: RequestId,
+        /// Allocated global task identity
+        task: TaskId,
+        /// Why a definitive identity could not be obtained
+        message: String,
+    },
+    /// The executor durably refused this identity
+    #[error("submission rejected for request {} task {task}: {reason}", request.0)]
+    SubmissionRejected {
+        /// Caller retry identity
+        request: RequestId,
+        /// Allocated global task identity
+        task: TaskId,
+        /// Retained tombstone reason
+        reason: String,
+    },
+    /// A caller reused one request UUID for changed content or ownership
+    #[error("submission conflict for request {} task {task}: {message}", request.0)]
+    SubmissionConflict {
+        /// Caller retry identity
+        request: RequestId,
+        /// Original global task identity
+        task: TaskId,
+        /// Conflict detail
+        message: String,
+    },
+    /// A verified origin machine has no saved route for this task
+    #[error("origin route not found: {task}")]
+    RouteNotFound {
+        /// Task with no origin route
+        task: TaskId,
+    },
+    /// An event names the wrong task owner
+    #[error("cluster task conflict: {task}")]
+    ClusterTaskConflict {
+        /// Task with conflicting ownership
+        task: TaskId,
+    },
+    /// A previously accepted event sequence has different content
+    #[error("event content conflict: {task} sequence {seq}")]
+    EventContentConflict {
+        /// Task with conflicting event content
+        task: TaskId,
+        /// Conflicting sequence
+        seq: u64,
+    },
+    /// Direct-message request failed input validation
+    #[error("invalid message request: {message}")]
+    MessageInvalid {
+        /// Why the message request is invalid
+        message: String,
+    },
+    /// No local Codex session matches the requested destination
+    #[error("agent thread not found for {selector}")]
+    AgentThreadNotFound {
+        /// Exact thread UUID or resolved cwd that was requested
+        selector: String,
+    },
+    /// A message UUID was reused for different request content
+    #[error("message conflict: {id}")]
+    MessageConflict {
+        /// Message UUID that already has a different saved request
+        id: crate::message::MessageId,
+    },
+    /// The receiver could not complete one explicit queue attempt
+    #[error("message delivery failed: {id}")]
+    MessageDeliveryFailed {
+        /// Message UUID that remains available for an explicit retry
+        id: crate::message::MessageId,
+        /// Safe summary of the queue failure
+        message: String,
+    },
+    /// The receiver may have queued the message but did not return a valid acknowledgement
+    #[error("message outcome unknown for {id} on machine {machine}: {message}")]
+    MessageOutcomeUnknown {
+        /// Message UUID to reuse for an explicit retry
+        id: crate::message::MessageId,
+        /// Fixed receiver identity for the retry
+        machine: MachineId,
+        /// Why the acknowledgement is unknown
+        message: String,
+    },
+    /// The receiver could not inspect local Codex session metadata
+    #[error("message receiver unavailable: {message}")]
+    MessageUnavailable {
+        /// Safe failure summary
+        message: String,
+    },
+    /// Machines share no cluster protocol version.
+    #[error("machine {machine} speaks cluster protocol {remote}, this daemon accepts {local}")]
+    ClusterProtocolIncompatible {
+        /// Remote machine.
+        machine: MachineId,
+        /// Local accepted range.
+        local: ProtocolRange,
+        /// Remote accepted range.
+        remote: ProtocolRange,
+    },
     /// Unexpected internal failure.
     #[error("{message}")]
     Internal {
@@ -163,6 +343,9 @@ impl AppError {
         match self {
             Self::DaemonUnavailable { .. } => "daemon_unavailable",
             Self::TaskNotFound { .. } => "task_not_found",
+            Self::ClusterLookupIncomplete { .. } => "cluster_lookup_incomplete",
+            Self::TaskUnavailable { .. } => "task_unavailable",
+            Self::TaskNotStarted { .. } => "task_not_started",
             Self::CwdNotFound { .. } => "cwd_not_found",
             Self::ExecutableMissing { .. } => "executable_missing",
             Self::SummaryTooLong { .. } => "summary_too_long",
@@ -182,6 +365,26 @@ impl AppError {
             Self::ChangedDuringRead { .. } => "changed_during_read",
             Self::UnsupportedFile { .. } => "unsupported_file",
             Self::StreamLimit { .. } => "stream_limit",
+            Self::ConfigInvalid { .. } => "config_invalid",
+            Self::MachineNotFound { .. } => "machine_not_found",
+            Self::MachineIdentityMismatch { .. } => "machine_identity_mismatch",
+            Self::DuplicateMachineIdentity { .. } => "duplicate_machine_identity",
+            Self::DuplicateMachineName { .. } => "duplicate_machine_name",
+            Self::MachineUnavailable { .. } => "machine_unavailable",
+            Self::RemoteSubmissionUnavailable { .. } => "remote_submission_unavailable",
+            Self::SubmissionOutcomeUnknown { .. } => "submission_outcome_unknown",
+            Self::SubmissionRejected { .. } => "submission_rejected",
+            Self::SubmissionConflict { .. } => "submission_conflict",
+            Self::RouteNotFound { .. } => "route_not_found",
+            Self::ClusterTaskConflict { .. } => "cluster_task_conflict",
+            Self::EventContentConflict { .. } => "event_content_conflict",
+            Self::MessageInvalid { .. } => "message_invalid",
+            Self::AgentThreadNotFound { .. } => "agent_thread_not_found",
+            Self::MessageConflict { .. } => "message_conflict",
+            Self::MessageDeliveryFailed { .. } => "message_delivery_failed",
+            Self::MessageOutcomeUnknown { .. } => "message_outcome_unknown",
+            Self::MessageUnavailable { .. } => "message_receiver_unavailable",
+            Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::Internal { .. } => "internal",
         }
     }
@@ -193,15 +396,28 @@ impl AppError {
             Self::DaemonUnavailable { .. }
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
+            | Self::MachineUnavailable { .. }
+            | Self::RemoteSubmissionUnavailable { .. }
+            | Self::SubmissionOutcomeUnknown { .. }
+            | Self::ClusterLookupIncomplete { .. }
+            | Self::TaskUnavailable { .. }
             | Self::Internal { .. } => 1,
-            Self::InvalidSpec { .. } | Self::SummaryTooLong { .. } | Self::Usage { .. } => 2,
+            Self::InvalidSpec { .. }
+            | Self::SummaryTooLong { .. }
+            | Self::MessageInvalid { .. }
+            | Self::Usage { .. }
+            | Self::ConfigInvalid { .. } => 2,
             Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
+            | Self::TaskNotStarted { .. }
+            | Self::RouteNotFound { .. }
             | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::NotDirectory { .. }
-            | Self::UnsupportedFile { .. } => 3,
+            | Self::UnsupportedFile { .. }
+            | Self::MachineNotFound { .. } => 3,
+            Self::AgentThreadNotFound { .. } => 3,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -209,7 +425,19 @@ impl AppError {
             | Self::TasksInFlight { .. }
             | Self::HostUnitHomeMismatch { .. }
             | Self::ChangedDuringRead { .. }
-            | Self::StreamLimit { .. } => 5,
+            | Self::StreamLimit { .. }
+            | Self::MachineIdentityMismatch { .. }
+            | Self::ClusterTaskConflict { .. }
+            | Self::EventContentConflict { .. }
+            | Self::DuplicateMachineIdentity { .. }
+            | Self::DuplicateMachineName { .. }
+            | Self::ClusterProtocolIncompatible { .. } => 5,
+            Self::SubmissionRejected { .. }
+            | Self::SubmissionConflict { .. }
+            | Self::MessageConflict { .. } => 5,
+            Self::MessageDeliveryFailed { .. }
+            | Self::MessageOutcomeUnknown { .. }
+            | Self::MessageUnavailable { .. } => 1,
         }
     }
 
@@ -219,14 +447,19 @@ impl AppError {
         match self {
             Self::InvalidSpec { .. }
             | Self::SummaryTooLong { .. }
+            | Self::MessageInvalid { .. }
             | Self::Usage { .. }
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. } => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
+            | Self::TaskNotStarted { .. }
+            | Self::RouteNotFound { .. }
             | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
-            | Self::FileNotFound { .. } => http::StatusCode::NOT_FOUND,
+            | Self::FileNotFound { .. }
+            | Self::MachineNotFound { .. } => http::StatusCode::NOT_FOUND,
+            Self::AgentThreadNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -234,8 +467,26 @@ impl AppError {
             | Self::TasksInFlight { .. }
             | Self::HostUnitHomeMismatch { .. }
             | Self::ChangedDuringRead { .. }
-            | Self::StreamLimit { .. } => http::StatusCode::CONFLICT,
+            | Self::StreamLimit { .. }
+            | Self::MachineIdentityMismatch { .. }
+            | Self::ClusterTaskConflict { .. }
+            | Self::EventContentConflict { .. }
+            | Self::DuplicateMachineIdentity { .. }
+            | Self::DuplicateMachineName { .. }
+            | Self::ClusterProtocolIncompatible { .. } => http::StatusCode::CONFLICT,
+            Self::SubmissionRejected { .. }
+            | Self::SubmissionConflict { .. }
+            | Self::MessageConflict { .. } => http::StatusCode::CONFLICT,
+            Self::MachineUnavailable { .. }
+            | Self::RemoteSubmissionUnavailable { .. }
+            | Self::ClusterLookupIncomplete { .. }
+            | Self::TaskUnavailable { .. }
+            | Self::MessageDeliveryFailed { .. }
+            | Self::MessageOutcomeUnknown { .. }
+            | Self::MessageUnavailable { .. }
+            | Self::SubmissionOutcomeUnknown { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             Self::DaemonUnavailable { .. }
+            | Self::ConfigInvalid { .. }
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -245,7 +496,18 @@ impl AppError {
     /// Whether a caller should retry the same request.
     #[must_use]
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::DaemonUnavailable { .. })
+        matches!(
+            self,
+            Self::DaemonUnavailable { .. }
+                | Self::MachineUnavailable { .. }
+                | Self::RemoteSubmissionUnavailable { .. }
+                | Self::SubmissionOutcomeUnknown { .. }
+                | Self::ClusterLookupIncomplete { .. }
+                | Self::TaskUnavailable { .. }
+                | Self::MessageDeliveryFailed { .. }
+                | Self::MessageOutcomeUnknown { .. }
+                | Self::MessageUnavailable { .. }
+        )
     }
 
     /// Structured `input` object for the error envelope.
@@ -253,6 +515,31 @@ impl AppError {
     pub fn input(&self) -> Value {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
+            Self::ClusterLookupIncomplete { task, unchecked } => {
+                json!({ "task": task, "unchecked": unchecked })
+            }
+            Self::TaskUnavailable { task, machine } => {
+                json!({ "task": task, "machine": machine })
+            }
+            Self::TaskNotStarted { task } => json!({ "task": task }),
+            Self::RouteNotFound { task } | Self::ClusterTaskConflict { task } => {
+                json!({ "task": task })
+            }
+            Self::EventContentConflict { task, seq } => json!({ "task": task, "seq": seq }),
+            Self::MessageInvalid { message } => json!({ "message": message }),
+            Self::AgentThreadNotFound { selector } => json!({ "selector": selector }),
+            Self::MessageConflict { id } => json!({ "message_id": id }),
+            Self::MessageDeliveryFailed { id, message } => {
+                json!({ "message_id": id, "message": message })
+            }
+            Self::MessageOutcomeUnknown {
+                id,
+                machine,
+                message,
+            } => {
+                json!({ "message_id": id, "machine": machine, "message": message })
+            }
+            Self::MessageUnavailable { message } => json!({ "message": message }),
             Self::CwdNotFound { path } => json!({ "cwd": path }),
             Self::ExecutableMissing { program } => json!({ "program": program }),
             Self::SummaryTooLong { len } => json!({ "len": len }),
@@ -278,6 +565,39 @@ impl AppError {
                 configured,
             } => json!({ "selected": selected, "configured": configured }),
             Self::Internal { message } => json!({ "message": message }),
+            Self::ConfigInvalid { path, .. } => json!({ "path": path }),
+            Self::MachineNotFound { machine } => json!({ "machine": machine }),
+            Self::MachineIdentityMismatch { expected, found } => {
+                json!({ "expected": expected, "found": found })
+            }
+            Self::DuplicateMachineIdentity { machine } => json!({ "machine": machine }),
+            Self::DuplicateMachineName { name, machines } => {
+                json!({ "name": name, "machines": machines })
+            }
+            Self::MachineUnavailable { machine, message } => {
+                json!({ "machine": machine, "message": message })
+            }
+            Self::RemoteSubmissionUnavailable { message } => json!({ "message": message }),
+            Self::SubmissionOutcomeUnknown {
+                request,
+                task,
+                message,
+            } => json!({ "request_id": request, "task_id": task, "message": message }),
+            Self::SubmissionRejected {
+                request,
+                task,
+                reason,
+            } => json!({ "request_id": request, "task_id": task, "reason": reason }),
+            Self::SubmissionConflict {
+                request,
+                task,
+                message,
+            } => json!({ "request_id": request, "task_id": task, "message": message }),
+            Self::ClusterProtocolIncompatible {
+                machine,
+                local,
+                remote,
+            } => json!({ "machine": machine, "local": local, "remote": remote }),
             Self::DaemonUnavailable { message } => json!({ "message": message }),
             Self::DaemonAlreadyRunning => json!({}),
             Self::LockHeld { path } => json!({ "path": path }),

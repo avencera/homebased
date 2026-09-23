@@ -2,7 +2,22 @@
 
 pub mod actors;
 pub mod api;
+mod cancel_delivery;
+pub mod cluster;
 pub mod content;
+pub mod event_sender;
+pub mod fleet_api;
+mod inspection;
+pub(crate) mod message_receiver;
+pub(crate) mod message_sender;
+mod origin_submit;
+mod resource_notice_delivery;
+pub(crate) mod resource_notice_sender;
+#[expect(
+    dead_code,
+    reason = "resource submission awaits its scheduler consumer"
+)]
+mod resource_submit;
 pub mod web;
 
 use std::fs::File;
@@ -14,18 +29,24 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::config::Config;
 use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorMsg, call};
 use crate::daemon::web::WebListen;
 use crate::error::AppError;
 use crate::files::StreamSlots;
+use crate::fleet::FleetState;
+use crate::fleet::directory::LocalMachine;
+use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
+use crate::machine::LocalIdentity;
 
 /// Axum state: actor refs plus immutable path config.
 #[derive(Clone)]
 pub struct AppState {
     /// State directory (immutable layout).
     pub home: Home,
-    /// Store actor, for reads. Every write goes through the supervisor.
+    /// Store actor for durable reads and writes
     pub store: ActorRef<StoreMsg>,
     /// Supervisor: owns the task lifecycle.
     pub supervisor: ActorRef<SupervisorMsg>,
@@ -36,13 +57,25 @@ pub struct AppState {
     pub content: Option<SocketAddr>,
     /// Concurrent raw-file stream permits.
     pub stream_slots: StreamSlots,
+    /// Stable machine UUID, this boot's UUID, name, and protocol range.
+    pub machine: LocalMachine,
+    /// Fleet runtime handle when `fleet.enabled` is true.
+    pub fleet: FleetState,
+    /// Daemon-owned serializer for direct-message queue attempts.
+    pub(crate) message_receiver: message_receiver::MessageReceiver,
 }
 
 /// Hold `daemon.lock`, bind the socket and optional dashboard port, start
-/// actors, serve until SIGTERM.
-pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
+/// actors, start fleet discovery when enabled, serve until SIGTERM.
+pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<(), AppError> {
     home.ensure()?;
     let _daemon_lock = acquire_daemon_lock(&home)?;
+    // the lock is held, so no earlier boot of this installation is still serving
+    let machine = LocalMachine {
+        identity: LocalIdentity::start(&home)?,
+        name: config.machine_name().0,
+        protocol: SUPPORTED_PROTOCOLS,
+    };
     let sock = home.sock_path();
     if sock.exists() {
         std::fs::remove_file(&sock)?;
@@ -67,6 +100,12 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
             message: format!("spawn supervisor: {err}"),
         })?;
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply }).await?;
+    let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
+    let fleet = fleet_runtime
+        .as_ref()
+        .map_or(FleetState::Disabled, |runtime| {
+            FleetState::Enabled(runtime.handle())
+        });
     let state = AppState {
         home: home.clone(),
         store,
@@ -74,7 +113,19 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
         web: web_addr,
         content: content_addr,
         stream_slots: StreamSlots::new(),
+        machine,
+        fleet,
+        message_receiver: message_receiver::MessageReceiver::default(),
     };
+    let sender = tokio::spawn(event_sender::run(
+        state.store.clone(),
+        state.supervisor.clone(),
+        state.machine.identity.machine,
+        state.fleet.clone(),
+    ));
+    let recovery = tokio::spawn(origin_submit::recover(state.clone()));
+    let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
+    let notice_delivery = tokio::spawn(resource_notice_delivery::run(state.clone()));
     // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -108,6 +159,13 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
         }
         _ = &mut handle => true,
     };
+    if let Some(runtime) = fleet_runtime {
+        runtime.shutdown().await;
+    }
+    sender.abort();
+    recovery.abort();
+    cancellation.abort();
+    notice_delivery.abort();
     if !supervisor_died {
         supervisor.stop(None);
         if let Err(err) = handle.await {
@@ -126,6 +184,32 @@ pub async fn serve(home: Home, web_listen: WebListen) -> Result<(), AppError> {
     }
     info!("serve stopped");
     Ok(())
+}
+
+/// Start fleet discovery in the background when the config enables it. A
+/// fleet failure never stops the daemon: local tasks keep working and the
+/// cluster routes stay absent.
+fn start_fleet(
+    home: &Home,
+    config: &Config,
+    machine: &LocalMachine,
+    listener: Option<SocketAddr>,
+) -> Option<FleetRuntime> {
+    let settings = config.fleet_settings()?;
+    if listener.is_none() {
+        warn!("fleet is enabled but the TCP listener is off; peers cannot reach this machine");
+    }
+    crate::fleet::runtime::log_start(machine, listener);
+    let start = FleetStart {
+        local: machine.clone(),
+        settings: settings.clone(),
+        listener,
+        peers_path: home.fleet_peers_path(),
+        timings: RuntimeTimings::default(),
+    };
+    FleetRuntime::start(start)
+        .map_err(|err| warn!("fleet disabled for this run: {err}"))
+        .ok()
 }
 
 /// Address a bound listener is reachable on. A listener with no readable

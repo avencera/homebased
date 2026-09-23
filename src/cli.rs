@@ -1,6 +1,9 @@
 //! Clap tree, `--json`/`--quiet` output, error shape.
 
+pub mod config;
 pub mod daemon;
+pub mod fleet;
+pub mod message;
 pub mod task;
 pub mod update;
 
@@ -11,6 +14,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+use crate::config::{CONFIG_ENV, ConfigLocation};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::home::Home;
@@ -44,6 +48,10 @@ pub struct Cli {
     /// State directory. Overrides `HOMEBASED_HOME`.
     #[arg(long, global = true, env = "HOMEBASED_HOME")]
     pub home: Option<PathBuf>,
+    /// Config file. Overrides `HOMEBASED_CONFIG`. Default
+    /// `~/.config/homebased/config.toml`.
+    #[arg(long, global = true, env = CONFIG_ENV)]
+    pub config: Option<PathBuf>,
     /// Subcommand to run.
     #[command(subcommand)]
     pub command: Command,
@@ -57,6 +65,24 @@ pub enum Command {
         /// Daemon subcommand.
         #[command(subcommand)]
         command: daemon::DaemonCommand,
+    },
+    /// Inspect and validate `config.toml`.
+    Config {
+        /// Config subcommand.
+        #[command(subcommand)]
+        command: config::ConfigCommand,
+    },
+    /// Discover and manage fleet machines.
+    Fleet {
+        /// Fleet subcommand.
+        #[command(subcommand)]
+        command: fleet::FleetCommand,
+    },
+    /// Send a message to a Codex thread on this or another machine.
+    Message {
+        /// Message subcommand.
+        #[command(subcommand)]
+        command: message::MessageCommand,
     },
     /// Submit, inspect, cancel, and report tasks.
     Task {
@@ -126,6 +152,9 @@ pub struct Ctx {
     pub output: OutputMode,
     /// State dir.
     pub home: Home,
+    /// `--config` / `HOMEBASED_CONFIG` value, resolved on demand so commands
+    /// that never read the config do not depend on it.
+    config: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -133,7 +162,13 @@ impl Ctx {
         Ok(Self {
             output: OutputMode::from_flags(cli.json, cli.quiet),
             home: Home::resolve(cli.home.clone())?,
+            config: cli.config.clone(),
         })
+    }
+
+    /// Config file location for this invocation.
+    pub fn config_location(&self) -> Result<ConfigLocation, AppError> {
+        ConfigLocation::resolve(self.config.clone())
     }
 
     /// Print a JSON object (adds `api_version` if missing).
@@ -210,6 +245,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
     let ctx = Ctx::new(&cli)?;
     match cli.command {
         Command::Daemon { command } => daemon::run(&ctx, command).await,
+        Command::Config { command } => config::run(&ctx, command),
+        Command::Fleet { command } => fleet::run(&ctx, command).await,
+        Command::Message { command } => message::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {

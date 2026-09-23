@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::CONFIG_ENV;
 use crate::error::AppError;
 use crate::home::Home;
 use crate::install::{
@@ -53,6 +54,11 @@ pub(crate) fn parse_plist_home(text: &str) -> Option<PathBuf> {
 
 /// Render the plist.
 pub fn render(home: &Home) -> Result<String, AppError> {
+    render_with_config(home, None)
+}
+
+/// Render the plist with an optional explicit config file.
+pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env = String::new();
@@ -72,6 +78,13 @@ pub fn render(home: &Home) -> Result<String, AppError> {
             "    <key>{}</key>\n    <string>{}</string>\n",
             xml_escape(key),
             xml_escape(&value)
+        ));
+    }
+    if let Some(path) = config {
+        env.push_str(&format!(
+            "    <key>{}</key>\n    <string>{}</string>\n",
+            xml_escape(CONFIG_ENV),
+            xml_escape(&path.display().to_string())
         ));
     }
     Ok(format!(
@@ -108,7 +121,12 @@ pub fn render(home: &Home) -> Result<String, AppError> {
 
 /// Write, lint, and bootstrap.
 pub fn install(home: &Home) -> Result<(), AppError> {
-    let text = render(home)?;
+    install_with_config(home, None)
+}
+
+/// Write, lint, and bootstrap with an optional explicit config file.
+pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
+    let text = render_with_config(home, config)?;
     let path = plist_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -339,9 +357,31 @@ mod tests {
         assert!(text.contains("daemon"), "{text}");
         assert!(text.contains("serve"), "{text}");
         assert!(text.contains("/tmp/hb-state"), "{text}");
+        assert_eq!(parse_string_value(&text, CONFIG_ENV), None);
         assert!(
             text.contains(&format!("<key>Label</key>\n  <string>{LABEL}</string>")),
             "plist must carry the reverse-DNS label: {text}"
+        );
+    }
+
+    #[test]
+    fn plist_preserves_explicit_config_with_xml_escaping() {
+        let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
+        let config = Path::new("/tmp/config & <quoted\".toml>");
+
+        let text = render_with_config(&home, Some(config)).unwrap();
+
+        assert_eq!(
+            parse_string_value(&text, CONFIG_ENV),
+            Some(config.display().to_string())
+        );
+        assert_eq!(
+            parse_plist_home(&text),
+            Some(PathBuf::from("/tmp/hb-state"))
+        );
+        assert!(
+            text.contains("/tmp/config &amp; &lt;quoted&quot;.toml&gt;"),
+            "{text}"
         );
     }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use homebased::domain::{
     Agent, AgentKind, AgentWorkload, CallbackStatus, ExitReason, ProcessStatus, TaskEnv, TaskId,
-    Workload,
+    TerminalCallbackProjection, Workload,
 };
 use homebased::store::{NewTask, Store, new_queued_task};
 use serde_json::{Value, json};
@@ -232,6 +232,21 @@ impl Harness {
             .map(str::to_string)
             .filter(|l| !l.is_empty())
             .collect()
+    }
+
+    fn wait_for_event(&self, id: &str, event: &str) -> Vec<String> {
+        assert!(
+            wait_until(Duration::from_secs(10), || self
+                .queue_messages()
+                .iter()
+                .any(|message| {
+                    let payload = event_json(message);
+                    payload["task"] == id && payload["event"] == event
+                })),
+            "callback {event} for task {id} was not delivered: {:?}",
+            self.queue_messages()
+        );
+        self.queue_messages()
     }
 
     fn spec(agent: &str, prompt: &str) -> Value {
@@ -490,7 +505,7 @@ fn submit_then_fake_codex_receives_event() {
     let id = h.submit(&Harness::spec("claude", "do the work"));
     let show = h.wait_status(&id, "succeeded");
     assert_eq!(show["thread"], THREAD);
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     let ev = event_json(&msgs[0]);
     assert_eq!(ev["event"], "TASK_SUCCEEDED");
@@ -546,7 +561,7 @@ fn daemon_restart_keeps_worker() {
         "worker should survive serve restart"
     );
     h.wait_status(&id, "succeeded");
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
 }
 
@@ -583,7 +598,7 @@ fn kill9_worker_marks_lost() {
     )
     .unwrap();
     h.wait_status(&id, "lost");
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_LOST");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     let ev = event_json(&msgs[0]);
     assert_eq!(ev["event"], "TASK_LOST");
@@ -639,8 +654,8 @@ fn attention_reminder_and_cancel() {
     );
     let show = h.wait_status(&id, "succeeded");
     assert_eq!(show["status"], "succeeded");
-    let terminal = h
-        .queue_messages()
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let terminal = msgs
         .iter()
         .skip(before)
         .map(|m| event_json(m))
@@ -661,7 +676,7 @@ fn attention_reminder_and_cancel() {
         String::from_utf8_lossy(&out.stderr)
     );
     h.wait_status(&id, "cancelled");
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_CANCELLED");
     let last = event_json(msgs.last().unwrap());
     assert_eq!(last["event"], "TASK_CANCELLED");
     let gone = wait_until(Duration::from_secs(5), || {
@@ -754,7 +769,8 @@ fn report_variants() {
 
     let id = h.submit(&Harness::spec("claude", "no report"));
     h.wait_status(&id, "succeeded");
-    let ev = event_json(&h.queue_messages()[0]);
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let ev = event_json(&msgs[0]);
     assert_eq!(ev["reports"], json!([]));
 
     let spec_path = h.home.join("spec-r.json");
@@ -774,7 +790,8 @@ fn report_variants() {
         .to_string();
     let show = h.wait_status(&id, "succeeded");
     assert_eq!(show["reports"].as_array().unwrap().len(), 2);
-    let ev = event_json(h.queue_messages().last().unwrap());
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let ev = event_json(msgs.last().unwrap());
     assert_eq!(ev["event"], "TASK_SUCCEEDED");
     assert_eq!(ev["reports"].as_array().unwrap().len(), 2);
 
@@ -799,7 +816,7 @@ fn report_variants() {
         .unwrap()
         .to_string();
     h.wait_status(&id, "succeeded");
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_BLOCKED");
     let new: Vec<_> = msgs.iter().skip(before).cloned().collect();
     assert_eq!(new.len(), 2, "{new:?}");
     let first = event_json(&new[0]);
@@ -915,8 +932,11 @@ fn stop_refusal_and_yes() {
     let last = event_json(msgs.last().unwrap());
     assert_eq!(last["event"], "TASK_CANCELLED", "{msgs:?}");
     assert_eq!(last["task"], id);
-    let row = h.store().require_task(id.parse().unwrap()).unwrap();
-    assert_eq!(row.callback_status, CallbackStatus::Sent);
+    let task = id.parse::<TaskId>().unwrap();
+    assert_eq!(
+        h.store().task_presentations(&[task]).unwrap()[&task].terminal_callback,
+        TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+    );
 }
 
 #[test]
@@ -1260,7 +1280,12 @@ fn opencode_success_receives_feed_environment_and_report() {
     let mut spec = Harness::spec_with_cwd("opencode", "opencode prompt", &cwd);
     spec["workload"]["model"] = json!("zai-coding-plan/glm-5.3-flash");
     let id = h.submit(&spec);
-    let show = h.wait_status(&id, "succeeded");
+    h.wait_status(&id, "succeeded");
+    let _ = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    assert!(wait_until(Duration::from_secs(10), || {
+        h.show(&id)["callback"] == "sent"
+    }));
+    let show = h.show(&id);
     assert_eq!(show["workload"]["agent"], "opencode");
     assert_eq!(show["workload"]["model"], "zai-coding-plan/glm-5.3-flash");
     assert_eq!(show["callback"], "sent");
@@ -1304,10 +1329,8 @@ fn opencode_nonzero_exit_is_reported() {
     let show = h.wait_status(&id, "failed");
     assert_eq!(show["exit_reason"]["kind"], "exit");
     assert_eq!(show["exit_reason"]["code"], 7);
-    assert_eq!(
-        event_json(h.queue_messages().last().unwrap())["event"],
-        "TASK_FAILED"
-    );
+    let msgs = h.wait_for_event(&id, "TASK_FAILED");
+    assert_eq!(event_json(msgs.last().unwrap())["event"], "TASK_FAILED");
     assert!(
         fs::read_to_string(h.output_log(&id))
             .unwrap()
@@ -1343,6 +1366,7 @@ fn opencode_cancellation_cleans_cli_server_and_tool() {
     assert!(wait_until(Duration::from_secs(10), || {
         graceful_pids.iter().all(|pid| !process_is_live(*pid))
     }));
+    h.wait_for_event(&graceful, "TASK_CANCELLED");
 
     h.set_control("opencode-ignore-term", "");
     h.set_control("opencode-tool-ignore-term", "");
@@ -1366,6 +1390,7 @@ fn opencode_cancellation_cleans_cli_server_and_tool() {
     assert!(wait_until(Duration::from_secs(15), || {
         forced_pids.iter().all(|pid| !process_is_live(*pid))
     }));
+    h.wait_for_event(&forced, "TASK_CANCELLED");
     assert!(
         h.queue_messages()
             .iter()
@@ -1833,7 +1858,8 @@ fn sigterm_without_cancel_is_failed() {
     assert_eq!(show["exit_reason"]["kind"], "signal");
     assert_eq!(show["exit_reason"]["signal"], 15);
     assert!(show["cancel_requested_at"].is_null(), "{show}");
-    let ev = event_json(h.queue_messages().last().unwrap());
+    let msgs = h.wait_for_event(&id, "TASK_FAILED");
+    let ev = event_json(msgs.last().unwrap());
     assert_eq!(ev["event"], "TASK_FAILED");
 }
 
@@ -1859,7 +1885,7 @@ fn cancel_immediately_after_submit() {
     }
     let show = h.wait_status(&id, "cancelled");
     assert_eq!(show["status"], "cancelled");
-    let msgs = h.queue_messages();
+    let msgs = h.wait_for_event(&id, "TASK_CANCELLED");
     assert!(
         msgs.iter()
             .any(|m| event_json(m)["event"] == "TASK_CANCELLED"),
@@ -1897,7 +1923,8 @@ fn large_prompt_early_exit_keeps_code() {
     let show = h.wait_status(&id, "failed");
     assert_eq!(show["exit_reason"]["kind"], "exit");
     assert_eq!(show["exit_reason"]["code"], 3);
-    let ev = event_json(h.queue_messages().last().unwrap());
+    let msgs = h.wait_for_event(&id, "TASK_FAILED");
+    let ev = event_json(msgs.last().unwrap());
     assert_eq!(ev["event"], "TASK_FAILED");
     assert_ne!(ev["process"]["kind"], "spawn_failed");
 }
@@ -2007,7 +2034,7 @@ fn grep_daemon_except_store(daemon: &Path, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// Plain substring scan over `.rs` files under `path`.
+/// Scan production sections of `.rs` files under `path`.
 fn grep_src(path: &Path, needle: &str) -> Vec<String> {
     let mut matches = Vec::new();
     let files = if path.is_file() {
@@ -2020,7 +2047,12 @@ fn grep_src(path: &Path, needle: &str) -> Vec<String> {
             continue;
         }
         if let Ok(text) = fs::read_to_string(&file) {
-            for (i, line) in text.lines().enumerate() {
+            // test modules may open stores and use synchronization to build fixtures
+            for (i, line) in text
+                .lines()
+                .take_while(|line| line.trim() != "#[cfg(test)]")
+                .enumerate()
+            {
                 if line.contains(needle) {
                     matches.push(format!("{}:{}:{line}", file.display(), i + 1));
                 }
@@ -2779,10 +2811,7 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
             .any(|m| event_json(m)["task"] == id.to_string())
     });
     assert!(delivered, "reconcile never delivered the pending callback");
-    assert_eq!(
-        h.store().require_task(id).unwrap().callback_status,
-        CallbackStatus::Sent
-    );
+    assert_eq!(h.show(&id.to_string())["callback"], "sent");
 }
 
 #[test]
@@ -2796,7 +2825,8 @@ fn task_workload_success() {
     );
     assert_eq!(show["exit_reason"]["kind"], "exit");
     assert_eq!(show["exit_reason"]["code"], 0);
-    let ev = event_json(h.queue_messages().last().unwrap());
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let ev = event_json(msgs.last().unwrap());
     assert_eq!(ev["event"], "TASK_SUCCEEDED");
     assert_eq!(
         ev["workload"],
@@ -2817,7 +2847,8 @@ fn task_workload_nonzero_exit() {
     let show = h.wait_status(&id, "failed");
     assert_eq!(show["exit_reason"]["kind"], "exit");
     assert_ne!(show["exit_reason"]["code"], 0);
-    let ev = event_json(h.queue_messages().last().unwrap());
+    let msgs = h.wait_for_event(&id, "TASK_FAILED");
+    let ev = event_json(msgs.last().unwrap());
     assert_eq!(ev["event"], "TASK_FAILED");
     assert_eq!(ev["process"]["kind"], "exit");
 }

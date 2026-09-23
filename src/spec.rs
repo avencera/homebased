@@ -13,6 +13,7 @@ use crate::agents::{OpenCodeExtraArgsError, validate_opencode_extra_args};
 use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
+use crate::machine::MachineName;
 
 /// Default output-inactivity timeout.
 #[must_use]
@@ -89,6 +90,9 @@ struct SubmitSpecWire {
     name: TaskName,
     /// Working directory for the child.
     cwd: PathBuf,
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    machine: Option<MachineName>,
     /// Output-inactivity timer. Default 1h, minimum 30m.
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
@@ -258,6 +262,8 @@ pub struct SubmitSpec {
     pub name: TaskName,
     /// Working directory for the child.
     pub cwd: PathBuf,
+    /// Execution machine name, or local when absent.
+    pub machine: Option<MachineName>,
     /// Output-inactivity timeout.
     pub timeout: Duration,
     /// Workload variant.
@@ -313,6 +319,9 @@ pub struct NormalizedSpec {
     pub name: TaskName,
     /// Working directory.
     pub cwd: PathBuf,
+    /// Execution machine name, or local when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineName>,
     /// Output-inactivity timeout.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
@@ -363,6 +372,8 @@ struct NormalizedSpecEnvelope {
     thread: ThreadId,
     name: TaskName,
     cwd: PathBuf,
+    #[serde(default)]
+    machine: Option<MachineName>,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
     workload: Value,
@@ -380,6 +391,7 @@ pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError>
         thread: envelope.thread,
         name: envelope.name,
         cwd: envelope.cwd,
+        machine: envelope.machine,
         timeout: envelope.timeout,
         workload,
     })
@@ -514,6 +526,7 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         thread: wire.thread,
         name: wire.name,
         cwd: wire.cwd,
+        machine: wire.machine,
         timeout: wire.timeout,
         workload,
     })
@@ -605,6 +618,17 @@ fn deserialize_under<T: for<'de> Deserialize<'de>>(
 
 /// Resolve prompt bytes and produce a normalized spec.
 pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
+    if spec.machine.is_some()
+        && let SubmitWorkloadValidated::Agent(agent) = &spec.workload
+        && let PromptSource::File(path) = &agent.prompt
+        && !path.is_absolute()
+    {
+        return Err(AppError::InvalidSpec {
+            pointer: "/workload/prompt_file".into(),
+            value: json!(path),
+            message: "remote prompt_file must be an absolute origin path".into(),
+        });
+    }
     let workload = match &spec.workload {
         SubmitWorkloadValidated::Agent(agent) => {
             let prompt = agent.prompt.read(&spec.cwd)?;
@@ -628,6 +652,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
         thread: spec.thread,
         name: spec.name.clone(),
         cwd: spec.cwd.clone(),
+        machine: spec.machine.clone(),
         timeout: spec.timeout,
         workload,
     })
@@ -686,6 +711,26 @@ fn example_task_json() -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn absent_machine_keeps_local_spec_valid() {
+        let spec = parse_spec_value(&valid_task()).unwrap();
+        assert!(spec.machine.is_none());
+        assert!(normalize(&spec).unwrap().machine.is_none());
+    }
+
+    #[test]
+    fn remote_prompt_file_must_be_absolute_on_origin() {
+        let mut value = valid_agent();
+        value["machine"] = json!("code");
+        value["workload"].as_object_mut().unwrap().remove("prompt");
+        value["workload"]["prompt_file"] = json!("prompt.txt");
+        let spec = parse_spec_value(&value).unwrap();
+        assert!(matches!(
+            normalize(&spec),
+            Err(AppError::InvalidSpec { pointer, .. }) if pointer == "/workload/prompt_file"
+        ));
+    }
 
     fn valid_agent() -> Value {
         json!({
@@ -885,6 +930,7 @@ mod tests {
         let prompt_path = dir.path().join("p.txt");
         fs::write(&prompt_path, "from-file").unwrap();
         let spec = SubmitSpec {
+            machine: None,
             api_version: 1,
             thread: ThreadId::from_str_ok(),
             name: TaskName::parse("from file").unwrap(),

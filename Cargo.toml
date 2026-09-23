@@ -22,9 +22,11 @@ humantime = "2.4.0"
 humantime-serde = "1.1.1"
 hyper = { version = "1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+if-addrs = "0.15.0"
 jsonc-parser = { version = "0.33.2", features = ["serde"] }
+mdns-sd = "0.21.4"
 mime_guess = "2"
-nix = { version = "0.31.3", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.31.3", features = ["fs", "hostname", "process", "signal", "user"] }
 ractor = "0.16.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = { version = "8.12.0", features = ["mime-guess"] }
@@ -32,6 +34,7 @@ schemars = { version = "1.2.2", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_path_to_error = "0.1.20"
+sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = [
     "fs",
@@ -44,6 +47,7 @@ tokio = { version = "1.53.1", features = [
     "sync",
     "time",
 ] }
+toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.26.1", features = ["serde", "v7"] }

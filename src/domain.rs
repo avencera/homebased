@@ -14,8 +14,8 @@ use crate::error::AppError;
 /// Public JSON schema version.
 pub const API_VERSION: u32 = 1;
 
-/// SQLite `user_version`. Version 1 databases migrate in place to version 2.
-pub const SCHEMA_VERSION: i64 = 2;
+/// SQLite `user_version`. Earlier databases migrate in place to this version.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Maximum Unicode scalar values in a submitted task name.
 pub const TASK_NAME_MAX_CHARS: usize = 120;
@@ -266,6 +266,9 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    /// Every supported agent, in declaration order.
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Grok, Self::OpenCode];
+
     /// Environment override that pins this agent's binary.
     #[must_use]
     pub fn binary_env(self) -> &'static str {
@@ -421,17 +424,17 @@ pub enum ExitReason {
     },
 }
 
-/// Callback delivery state.
+/// Compatibility projection of the terminal event's origin-inbox result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallbackStatus {
-    /// Not yet claimed.
+    /// No queue attempt is in flight and the terminal event is unsettled.
     Pending,
-    /// A sender has claimed the row.
+    /// A queue attempt has been reserved for the terminal event.
     Sending,
     /// `codex queue` succeeded.
     Sent,
-    /// All attempts failed.
+    /// The terminal event settled without queue success.
     Failed,
 }
 
@@ -465,6 +468,17 @@ impl fmt::Display for CallbackStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Origin-inbox status exposed beside a task row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCallbackProjection {
+    /// Status retained by a row that predates typed event ownership.
+    Legacy(CallbackStatus),
+    /// Status read from this machine's origin inbox.
+    OriginInbox(CallbackStatus),
+    /// The origin machine owns delivery, so this executor cannot report it.
+    NotOwned,
 }
 
 /// Attention-reminder delivery state. A third axis, independent of the process
@@ -779,15 +793,6 @@ impl TaskRow {
         self.state.pid()
     }
 
-    /// Whether the callback still has to be delivered.
-    #[must_use]
-    pub fn callback_outstanding(&self) -> bool {
-        matches!(
-            self.callback_status,
-            CallbackStatus::Pending | CallbackStatus::Sending
-        )
-    }
-
     /// Non-empty label for UI and events: submitted name, else workload fallback.
     #[must_use]
     pub fn display_name(&self) -> String {
@@ -832,9 +837,6 @@ pub enum TransitionError {
     /// `Lost → Running` is forbidden.
     #[error("cannot move Lost to Running")]
     LostToRunning,
-    /// Callback cannot be `Sent` while the task is still `Queued`.
-    #[error("cannot mark callback Sent while Queued")]
-    CallbackSentWhileQueued,
     /// Reports cannot be appended after the process is terminal.
     #[error("cannot report on terminal task ({status})")]
     ReportOnTerminal {
@@ -879,15 +881,6 @@ pub fn check_status_transition(
         Ok(())
     } else {
         Err(TransitionError::IllegalStatus { from, to })
-    }
-}
-
-/// Reject callback `Sent` while still `Queued`.
-pub fn check_callback_sent(status: ProcessStatus) -> Result<(), TransitionError> {
-    if status == ProcessStatus::Queued {
-        Err(TransitionError::CallbackSentWhileQueued)
-    } else {
-        Ok(())
     }
 }
 
@@ -981,13 +974,6 @@ mod tests {
     #[test]
     fn succeeded_to_running_rejected() {
         assert!(check_status_transition(ProcessStatus::Succeeded, ProcessStatus::Running).is_err());
-    }
-
-    #[test]
-    fn callback_sent_while_queued_rejected() {
-        let err = check_callback_sent(ProcessStatus::Queued).unwrap_err();
-        assert_eq!(err, TransitionError::CallbackSentWhileQueued);
-        check_callback_sent(ProcessStatus::Running).unwrap();
     }
 
     #[test]

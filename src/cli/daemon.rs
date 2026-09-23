@@ -3,7 +3,6 @@
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use crate::callback::{deliver_exit_event, exit_event};
 use crate::client::Client;
 use crate::daemon::web::WebListen;
 use crate::error::AppError;
@@ -79,7 +78,8 @@ pub async fn run(ctx: &Ctx, command: DaemonCommand) -> Result<ExitCode, AppError
         DaemonCommand::Install { dry_run } => install(ctx, dry_run),
         DaemonCommand::Uninstall { yes } => uninstall(ctx, yes).await,
         DaemonCommand::Serve { web_listen } => {
-            crate::daemon::serve(ctx.home.clone(), web_listen).await?;
+            let config = ctx.config_location()?.load()?;
+            crate::daemon::serve(ctx.home.clone(), web_listen, config).await?;
             Ok(ExitCode::SUCCESS)
         }
         DaemonCommand::Restart => restart(ctx).await,
@@ -89,7 +89,8 @@ pub async fn run(ctx: &Ctx, command: DaemonCommand) -> Result<ExitCode, AppError
 }
 
 fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
-    let text = install::render(&ctx.home)?;
+    let config = ctx.config_location()?.validated_host_unit_override()?;
+    let text = install::render_with_config(&ctx.home, config.as_deref())?;
     if dry_run {
         match ctx.output {
             super::OutputMode::Json => {
@@ -103,7 +104,7 @@ fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    install::install(&ctx.home)?;
+    install::install_with_config(&ctx.home, config.as_deref())?;
     ctx.print_id(
         "installed",
         &format!("installed {}", install::unit_path().display()),
@@ -302,7 +303,7 @@ async fn ensure_idle_or_cancel(ctx: &Ctx, yes: bool, socket_up: bool) -> Result<
         return Err(AppError::TasksInFlight { count: in_flight });
     }
     cancel_in_flight(ctx, &store, socket_up).await?;
-    wait_terminal_and_callback(&store, Duration::from_secs(60))?;
+    wait_terminal_and_callback(&store, Duration::from_secs(60), socket_up)?;
     Ok(())
 }
 
@@ -324,11 +325,7 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
     for row in tasks {
         match store.request_cancel(row.id)? {
             CancelResult::AlreadyTerminal(_) => {}
-            CancelResult::CancelledQueued(row) => {
-                let reports = store.reports(row.id)?;
-                let event = exit_event(&row, &reports, ctx.home.task_dir(row.id));
-                deliver_exit_event(store, &ctx.home, &row, &event)?;
-            }
+            CancelResult::CancelledQueued(_) => {}
             CancelResult::SignalWorker(row) => {
                 if let Some(pid) = row.pid()
                     && let Err(err) = nix::sys::signal::kill(
@@ -344,14 +341,15 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
     Ok(())
 }
 
-fn wait_terminal_and_callback(store: &Store, budget: Duration) -> Result<(), AppError> {
+fn wait_terminal_and_callback(
+    store: &Store,
+    budget: Duration,
+    wait_for_callbacks: bool,
+) -> Result<(), AppError> {
     let start = std::time::Instant::now();
     loop {
         let busy = store.in_flight_count()? > 0
-            || store
-                .list_tasks(&[], None)?
-                .iter()
-                .any(|row| row.state.is_terminal() && row.callback_outstanding());
+            || (wait_for_callbacks && store.has_pending_terminal_callbacks()?);
         if !busy {
             return Ok(());
         }
@@ -386,4 +384,54 @@ fn wait_socket_up(path: &std::path::Path, budget: Duration) -> Result<(), AppErr
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::wait_terminal_and_callback;
+    use crate::domain::{
+        Agent, AgentKind, AgentWorkload, ExitReason, TaskEnv, TaskId, TaskRow, TaskState, ThreadId,
+        Workload,
+    };
+    use crate::machine::MachineId;
+    use crate::store::{NewTask, Store, new_queued_task};
+
+    #[test]
+    fn stop_without_socket_waits_for_process_exit_but_not_callback_delivery() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("db");
+        let id = TaskId::new();
+        let mut row: TaskRow = new_queued_task(NewTask {
+            id,
+            name: None,
+            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, None),
+                extra_args: Vec::new(),
+                report_trailer: false,
+            }),
+            cwd: directory.path().to_path_buf(),
+            timeout: Duration::from_secs(4 * 3600),
+            env: TaskEnv {
+                path: String::new(),
+                home: directory.path().display().to_string(),
+            },
+            binary: std::path::PathBuf::from("/bin/true"),
+        });
+        row.state = TaskState::Finished {
+            reason: ExitReason::Cancelled,
+        };
+        let mut store = Store::open(&db_path).unwrap();
+        store.insert_task(&row).unwrap();
+        store.migrate_legacy_local(MachineId::new()).unwrap();
+        assert!(store.has_pending_terminal_callbacks().unwrap());
+
+        wait_terminal_and_callback(&store, Duration::ZERO, false).unwrap();
+        assert!(wait_terminal_and_callback(&store, Duration::ZERO, true).is_err());
+    }
 }

@@ -6,13 +6,13 @@ use std::process::ExitCode;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
-use crate::callback::{deliver_notify, last_event_for_row, notify_event};
+use crate::callback::{last_event_for_row, notify_event};
 use crate::client::Client;
 use crate::domain::{ProcessStatus, ReportOutcome, TaskId, ThreadId};
 use crate::error::AppError;
-use crate::home::OutputTail;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
+use crate::submission::RequestId;
 
 use super::Ctx;
 
@@ -28,6 +28,9 @@ pub enum TaskCommand {
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Stable UUID for retry after a lost remote submission response
+        #[arg(long)]
+        request_id: Option<uuid::Uuid>,
     },
     /// Print the JSON Schema for the submit spec.
     Schema,
@@ -81,11 +84,15 @@ pub enum TaskCommand {
 /// Dispatch a task command.
 pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> {
     match command {
-        TaskCommand::Submit { spec, dry_run } => submit(ctx, &spec, dry_run).await,
+        TaskCommand::Submit {
+            spec,
+            dry_run,
+            request_id,
+        } => submit(ctx, &spec, dry_run, request_id).await,
         TaskCommand::Schema => schema(ctx),
         TaskCommand::List { status, thread } => list(ctx, status, thread).await,
         TaskCommand::Show { id } => show(ctx, id).await,
-        TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail),
+        TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,
@@ -97,15 +104,27 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
     }
 }
 
-async fn submit(ctx: &Ctx, spec_path: &str, dry_run: bool) -> Result<ExitCode, AppError> {
+async fn submit(
+    ctx: &Ctx,
+    spec_path: &str,
+    dry_run: bool,
+    request_id: Option<uuid::Uuid>,
+) -> Result<ExitCode, AppError> {
     let spec = load_spec(spec_path)?;
     let normalized = spec::normalize(&spec)?;
-    spec::check_cwd(&normalized.cwd)?;
+    if normalized.machine.is_none() {
+        spec::check_cwd(&normalized.cwd)?;
+    }
     let env = crate::domain::TaskEnv::capture();
-    let body = json!({
+    let callback_cwd = std::env::current_dir()?;
+    let request_id = submission_request_id(normalized.machine.is_some(), request_id)?;
+    let mut body = json!({
         "spec": normalized,
         "env": env,
+        "callback_cwd": callback_cwd,
     });
+    include_request_id(&mut body, request_id);
+
     let client = Client::new(ctx.home.sock_path());
     if dry_run {
         let value = client.post("/v1/tasks/dry-run", &body).await?;
@@ -131,6 +150,25 @@ async fn submit(ctx: &Ctx, spec_path: &str, dry_run: bool) -> Result<ExitCode, A
         .to_string();
     ctx.print_id(&id, &format!("submitted {id}"), value)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn submission_request_id(
+    remote: bool,
+    request_id: Option<uuid::Uuid>,
+) -> Result<Option<RequestId>, AppError> {
+    if !remote && request_id.is_some() {
+        return Err(AppError::Usage {
+            message: "--request-id is only valid for a remote submission; set machine in the spec or omit --request-id".into(),
+        });
+    }
+
+    Ok(remote.then(|| request_id.map(RequestId).unwrap_or_default()))
+}
+
+fn include_request_id(body: &mut Value, request_id: Option<RequestId>) {
+    if let Some(request_id) = request_id {
+        body["request_id"] = json!(request_id);
+    }
 }
 
 fn schema(ctx: &Ctx) -> Result<ExitCode, AppError> {
@@ -222,21 +260,21 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn log_cmd(ctx: &Ctx, id: TaskId, tail: Option<usize>) -> Result<ExitCode, AppError> {
-    // this command reads the disk, not the socket, so a missing log is the only
-    // signal it has that the id is unknown
-    let OutputTail { text, truncated } = ctx
-        .home
-        .task_paths(id)
-        .read_output(tail)?
-        .ok_or(AppError::TaskNotFound { id })?;
+async fn log_cmd(ctx: &Ctx, id: TaskId, tail: Option<usize>) -> Result<ExitCode, AppError> {
+    let path = match tail {
+        Some(tail) => format!("/v1/tasks/{id}/log?tail={tail}"),
+        None => format!("/v1/tasks/{id}/log"),
+    };
+    let value = Client::new(ctx.home.sock_path()).get(&path).await?;
+    let text = value
+        .get("log")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal {
+            message: "daemon returned no task log".into(),
+        })?
+        .to_string();
     match ctx.output {
-        super::OutputMode::Json => ctx.print_json(json!({
-            "api_version": crate::domain::API_VERSION,
-            "id": id,
-            "log": text,
-            "truncated": truncated,
-        }))?,
+        super::OutputMode::Json => ctx.print_json(value)?,
         _ => print!("{text}"),
     }
     if !text.ends_with('\n') && ctx.output != super::OutputMode::Json {
@@ -250,7 +288,12 @@ async fn cancel(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
     let value = client
         .post(&format!("/v1/tasks/{id}/cancel"), &json!({}))
         .await?;
-    ctx.print_id(&id.to_string(), &format!("cancelled {id}"), value)?;
+    let message = if value.get("delivery").is_some() {
+        format!("cancellation accepted for {id}")
+    } else {
+        format!("cancelled {id}")
+    };
+    ctx.print_id(&id.to_string(), &message, value)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -280,19 +323,13 @@ fn report(
         }
     };
     let store = Store::open(&ctx.home.db_path())?;
-    let reports = store.append_report(id, outcome, &summary)?;
-    if notify {
-        let row = store.require_task(id)?;
-        if let Some(report) = reports.last() {
-            let event = notify_event(&row, report, ctx.home.task_dir(id));
-            match deliver_notify(&ctx.home, &row, &event) {
-                Ok(()) => store.mark_notified(id, report.seq)?,
-                // an interim notify is best-effort: the exit callback still carries the report
-                Err(err) => eprintln!("warning: notify failed: {err}"),
-            }
-        }
-    }
+    let reports = store.append_report_with_notification(id, outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
+    let row = store.require_task(id)?;
+    let last_event = match (notify, reports.last()) {
+        (true, Some(report)) => Some(notify_event(&row, report, ctx.home.task_dir(id))),
+        _ => last_event_for_row(&row, &reports, ctx.home.task_dir(id)),
+    };
     ctx.print_id(
         &seq.to_string(),
         &format!("reported seq={seq}"),
@@ -301,11 +338,7 @@ fn report(
             "id": id,
             "seq": seq,
             "reports": reports,
-            "last_event": last_event_for_row(
-                &store.require_task(id)?,
-                &reports,
-                ctx.home.task_dir(id),
-            ),
+            "last_event": last_event,
         }),
     )?;
     Ok(ExitCode::SUCCESS)
@@ -352,5 +385,132 @@ fn workload_label(value: &Value) -> String {
             }
         }
         _ => "-".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{include_request_id, report, submission_request_id};
+    use crate::cli::{Ctx, OutputMode};
+    use crate::domain::{
+        Agent, AgentKind, AgentWorkload, ReportOutcome, TaskEnv, TaskId, ThreadId, Workload,
+    };
+    use crate::home::Home;
+    use crate::machine::MachineId;
+    use crate::store::{NewTask, Store, new_queued_task};
+
+    #[test]
+    fn local_submission_has_no_request_id() {
+        let mut body = serde_json::json!({});
+        include_request_id(&mut body, submission_request_id(false, None).unwrap());
+        assert!(body.get("request_id").is_none());
+    }
+
+    #[test]
+    fn remote_submission_generates_or_preserves_request_id() {
+        let generated = submission_request_id(true, None).unwrap().unwrap();
+        assert_ne!(generated.0, uuid::Uuid::nil());
+        let mut body = serde_json::json!({});
+        include_request_id(&mut body, Some(generated));
+        assert_eq!(body["request_id"], json!(generated));
+
+        let explicit = uuid::Uuid::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
+        assert_eq!(
+            submission_request_id(true, Some(explicit)).unwrap(),
+            Some(crate::submission::RequestId(explicit))
+        );
+    }
+
+    #[test]
+    fn explicit_request_id_is_rejected_for_local_submission() {
+        let explicit = uuid::Uuid::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
+        assert!(matches!(
+            submission_request_id(false, Some(explicit)),
+            Err(crate::error::AppError::Usage { .. })
+        ));
+    }
+
+    #[test]
+    fn notify_report_while_daemon_is_down_is_migrated_once() {
+        let directory = tempdir().unwrap();
+        let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+        home.ensure().unwrap();
+        let id = TaskId::new();
+        let row = new_queued_task(NewTask {
+            id,
+            name: None,
+            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, None),
+                extra_args: Vec::new(),
+                report_trailer: false,
+            }),
+            cwd: directory.path().to_path_buf(),
+            timeout: Duration::from_secs(4 * 3600),
+            env: TaskEnv {
+                path: "/bin".into(),
+                home: directory.path().display().to_string(),
+            },
+            binary: std::path::PathBuf::from("/bin/true"),
+        });
+        {
+            let store = Store::open(&home.db_path()).unwrap();
+            store.insert_task(&row).unwrap();
+            store
+                .cas_status(
+                    id,
+                    crate::domain::ProcessStatus::Queued,
+                    crate::domain::ProcessStatus::Running,
+                )
+                .unwrap();
+        }
+
+        let context = Ctx {
+            output: OutputMode::Quiet,
+            home,
+            config: None,
+        };
+        report(
+            &context,
+            Some(id),
+            ReportOutcome::Blocked,
+            Some("notification requested offline".into()),
+            None,
+            true,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(context.home.db_path()).unwrap();
+        let intent_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM report_notification_intents WHERE task_id=?1",
+                [id.to_string()],
+                |entry| entry.get(0),
+            )
+            .unwrap();
+        assert_eq!(intent_count, 1);
+
+        let mut store = Store::open(&context.home.db_path()).unwrap();
+        assert!(!store.is_event_task(id).unwrap());
+
+        store.migrate_legacy_local(MachineId::new()).unwrap();
+        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .origin_route_by_task(id)
+                .unwrap()
+                .unwrap()
+                .last_accepted_seq,
+            1
+        );
+        store.migrate_legacy_local(MachineId::new()).unwrap();
+        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
+        assert!(store.pending_outbound_events(id).unwrap().is_empty());
     }
 }

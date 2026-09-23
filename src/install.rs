@@ -28,18 +28,28 @@ pub enum HostUnitState {
 
 /// Render the native host unit.
 pub fn render(home: &Home) -> Result<String, AppError> {
+    render_with_config(home, None)
+}
+
+/// Render the native host unit with an optional explicit config file.
+pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     cfg_select! {
-        target_os = "macos" => launchd::render(home),
-        target_os = "linux" => systemd::render(home),
+        target_os = "macos" => launchd::render_with_config(home, config),
+        target_os = "linux" => systemd::render_with_config(home, config),
         _ => Err(unsupported_host()),
     }
 }
 
 /// Install the native host unit.
 pub fn install(home: &Home) -> Result<(), AppError> {
+    install_with_config(home, None)
+}
+
+/// Install the native host unit with an optional explicit config file.
+pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
     cfg_select! {
-        target_os = "macos" => launchd::install(home),
-        target_os = "linux" => systemd::install(home),
+        target_os = "macos" => launchd::install_with_config(home, config),
+        target_os = "linux" => systemd::install_with_config(home, config),
         _ => Err(unsupported_host()),
     }
 }

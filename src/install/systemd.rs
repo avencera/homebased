@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::CONFIG_ENV;
 use crate::error::AppError;
 use crate::home::Home;
 use crate::install::{
@@ -65,6 +66,11 @@ pub(crate) fn parse_unit_home(text: &str) -> Option<PathBuf> {
 
 /// Render the unit text.
 pub fn render(home: &Home) -> Result<String, AppError> {
+    render_with_config(home, None)
+}
+
+/// Render the unit with an optional explicit config file.
+pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env_lines = String::new();
@@ -74,6 +80,12 @@ pub fn render(home: &Home) -> Result<String, AppError> {
     }
     if let Some((key, value)) = web_listen_env()? {
         env_lines.push_str(&format!("Environment={key}={value}\n"));
+    }
+    if let Some(path) = config {
+        env_lines.push_str(&format!(
+            "Environment={}\n",
+            quote_systemd_environment(CONFIG_ENV, &path.display().to_string())?
+        ));
     }
     Ok(format!(
         "[Unit]\n\
@@ -96,7 +108,12 @@ pub fn render(home: &Home) -> Result<String, AppError> {
 
 /// Write, verify, enable, and start the unit.
 pub fn install(home: &Home) -> Result<(), AppError> {
-    let text = render(home)?;
+    install_with_config(home, None)
+}
+
+/// Write, verify, enable, and start with an optional explicit config file.
+pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
+    let text = render_with_config(home, config)?;
     let path = unit_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -179,6 +196,27 @@ fn warn_linger() {
     }
 }
 
+fn quote_systemd_environment(key: &str, value: &str) -> Result<String, AppError> {
+    if value.chars().any(char::is_control) {
+        return Err(AppError::UnitInvalid {
+            message: "systemd cannot store a config path with control characters".into(),
+        });
+    }
+
+    let mut quoted = format!("{key}=\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            // systemd expands percent specifiers in unit-file values
+            '%' => quoted.push_str("%%"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
 /// Split an `ExecStart=` value on whitespace. Generated units do not quote
 /// paths; quoting support is deferred.
 fn split_exec_args(rest: &str) -> Vec<&str> {
@@ -234,11 +272,38 @@ mod tests {
         assert!(text.contains("ExecStart="), "{text}");
         assert!(text.contains("daemon serve --home /tmp/hb-state"), "{text}");
         assert!(text.contains("Environment=PATH="), "{text}");
+        assert!(
+            !text.contains(&format!("Environment={CONFIG_ENV}=")),
+            "{text}"
+        );
         assert!(text.contains("WantedBy=default.target"), "{text}");
         assert!(text.contains("Restart=on-failure"), "{text}");
         assert!(text.contains("TimeoutStopSec=15"), "{text}");
         let exec = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(exec.contains("/homebased") || exec.starts_with("ExecStart=/"));
+    }
+
+    #[test]
+    fn unit_quotes_explicit_config_path_in_environment() {
+        let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
+        let config = Path::new("/tmp/config with \"quotes\" \\ and $value %specifier.toml");
+
+        let text = render_with_config(&home, Some(config)).unwrap();
+
+        assert!(
+            text.lines().any(|line| line
+                == format!(
+                    "Environment={}",
+                    quote_systemd_environment(CONFIG_ENV, &config.display().to_string()).unwrap()
+                )),
+            "{text}"
+        );
+        assert_eq!(parse_unit_home(&text), Some(PathBuf::from("/tmp/hb-state")));
+        assert_eq!(
+            quote_systemd_environment(CONFIG_ENV, "/tmp/a \"b\" \\ $HOME %i").unwrap(),
+            r#"HOMEBASED_CONFIG="/tmp/a \"b\" \\ $HOME %%i""#
+        );
+        assert!(quote_systemd_environment(CONFIG_ENV, "/tmp/config\n.toml").is_err());
     }
 
     #[test]

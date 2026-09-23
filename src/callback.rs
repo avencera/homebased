@@ -12,16 +12,14 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    AgentKind, CallbackStatus, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow,
-    TaskState, ThreadId, Workload,
+    AgentKind, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow, TaskState,
+    ThreadId, Workload,
 };
 use crate::error::AppError;
-use crate::home::Home;
-use crate::invocation::resolve_agent_binary;
-use crate::store::{CallbackClaim, Store};
+use crate::submission::CallbackContext;
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
@@ -56,9 +54,8 @@ const QUEUE_SEND_WORST_CASE_SECS: u64 = QUEUE_ATTEMPT_WORST_CASE_SECS * QUEUE_AT
     + QUEUE_STALE_OWNER_MAX_SECS
     + QUEUE_SETTLEMENT_SLACK_SECS;
 
-/// How long a terminal callback waits for an in-flight attention reminder
-/// before it releases a claim stranded by a dead daemon. Must exceed the
-/// worst-case live `codex queue` send.
+/// How long recovery waits for a legacy attention sender before releasing its
+/// persisted claim. Must exceed the worst-case live `codex queue` send.
 pub const ATTENTION_SETTLE_SECS: u64 = 120;
 /// [`ATTENTION_SETTLE_SECS`] as a [`Duration`].
 pub const ATTENTION_SETTLE: Duration = Duration::from_secs(ATTENTION_SETTLE_SECS);
@@ -68,12 +65,9 @@ const _: () = assert!(
     "attention settlement must outlast the worst-case queue send"
 );
 
-/// Poll interval while waiting for that claim to settle.
-pub const ATTENTION_POLL: Duration = Duration::from_millis(100);
-
 /// Public workload view. Omits private prompt and extra-arg fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkloadView {
     /// Agent CLI identity.
     Agent {
@@ -193,7 +187,7 @@ fn reasoning_token(raw: &str) -> Option<String> {
 }
 
 /// Derived event name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventKind {
     /// Interim `--notify` report.
@@ -213,7 +207,7 @@ pub enum EventKind {
 }
 
 /// Suggested orchestrator next step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextAction {
     /// Read the interim report.
@@ -231,8 +225,8 @@ pub enum NextAction {
 }
 
 /// Tagged process payload in the event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessPayload {
     /// Process exited.
     Exit {
@@ -269,7 +263,8 @@ impl From<&ExitReason> for ProcessPayload {
 }
 
 /// One report in the event payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportView {
     /// Sequence number.
     pub seq: i64,
@@ -290,7 +285,8 @@ impl From<&TaskReport> for ReportView {
 }
 
 /// Event object shared by `codex queue` and `task show --json` `last_event`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HomebasedEvent {
     /// Schema version. First key.
     pub api_version: u32,
@@ -440,98 +436,91 @@ fn derive_exit(
     (EventKind::TaskSucceeded, NextAction::ReviewOutput)
 }
 
-/// Claim, send via `codex queue` (3 attempts), record Sent/Failed.
-pub fn deliver_exit_event(
-    store: &Store,
-    home: &Home,
-    row: &TaskRow,
-    event: &HomebasedEvent,
-) -> Result<(), AppError> {
-    if !claim_exit_callback(store, row.id)? {
-        return Ok(());
+/// Check immutable origin context before reserving a command attempt
+pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if !context.cwd.is_absolute() || !context.cwd.is_dir() {
+        return Err(format!(
+            "saved callback directory is unavailable: {}",
+            context.cwd.display()
+        ));
     }
-    let line = event.to_message_line()?;
-    let paths = home.task_paths(row.id);
-    let result = send_queue(row, &line, &paths.callback_log, &paths.delivery_lock);
-    match result {
-        Ok(()) => store.finish_callback(row.id, CallbackStatus::Sent)?,
-        Err(err) => {
-            store.finish_callback(row.id, CallbackStatus::Failed)?;
-            append_fallback(&home.fallback_log_path(), &line, &err.to_string())?;
-        }
+    let binary = context.codex.path().ok_or_else(|| {
+        context
+            .codex
+            .unavailable_reason()
+            .unwrap_or("saved Codex executable is unavailable")
+            .to_owned()
+    })?;
+    if !binary.is_absolute() {
+        return Err("saved Codex executable path is not absolute".into());
+    }
+    let metadata = std::fs::metadata(binary)
+        .map_err(|error| format!("saved Codex executable is unavailable: {error}"))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "saved Codex executable is not executable: {}",
+            binary.display()
+        ));
     }
     Ok(())
 }
 
-/// Claim the terminal callback, waiting out an in-flight `TASK_CHECK_DUE` so
-/// the reminder can never land after the terminal event. Blocking; the daemon
-/// has its own async claim loop over the same store calls.
-fn claim_exit_callback(store: &Store, id: TaskId) -> Result<bool, AppError> {
-    let deadline = std::time::Instant::now() + ATTENTION_SETTLE;
-    loop {
-        match store.claim_callback(id)? {
-            CallbackClaim::Claimed => return Ok(true),
-            CallbackClaim::NotOurs => return Ok(false),
-            CallbackClaim::WaitForAttention if std::time::Instant::now() >= deadline => {
-                tracing::warn!(%id, "attention claim stranded; releasing it to deliver the terminal event");
-                store.release_attention(id)?;
-            }
-            CallbackClaim::WaitForAttention => thread::sleep(ATTENTION_POLL),
-        }
-    }
-}
-
-/// Best-effort interim notify. Does not claim the exit callback.
-pub fn deliver_notify(home: &Home, row: &TaskRow, event: &HomebasedEvent) -> Result<(), AppError> {
-    let line = event.to_message_line()?;
-    let paths = home.task_paths(row.id);
-    send_queue(row, &line, &paths.callback_log, &paths.delivery_lock)
-}
-
-/// Run `codex queue` up to three bounded attempts. Blocking; call from
-/// `spawn_blocking` in the daemon.
-pub(crate) fn send_queue(
-    row: &TaskRow,
+/// Make exactly one bounded queue-command attempt using the saved origin context
+pub(crate) fn send_saved_queue_attempt(
+    context: &CallbackContext,
+    thread: ThreadId,
     line: &str,
     log_path: &Path,
     delivery_lock: &Path,
-) -> Result<(), AppError> {
-    let binary = resolve_agent_binary(AgentKind::Codex, &row.env.path, &row.cwd)?;
-    let mut last_err = String::new();
-    for attempt in 0..QUEUE_ATTEMPTS {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
-        }
-        let mut cmd = Command::new(&binary);
-        cmd.args([
-            "queue",
-            "--thread",
-            &row.thread.to_string(),
-            "--message",
-            line,
-        ])
-        .env("PATH", &row.env.path)
-        .env("HOME", &row.env.home)
-        .current_dir(&row.cwd);
-        match run_command_deadline(&mut cmd, QUEUE_ATTEMPT_TIMEOUT, delivery_lock) {
-            Ok(out) if out.status.success() => {
-                let _ = std::fs::write(log_path, transcript(&out));
-                return Ok(());
-            }
-            Ok(out) => {
-                last_err = format!(
+) -> Result<(), String> {
+    let binary = context.codex.path().ok_or_else(|| {
+        context
+            .codex
+            .unavailable_reason()
+            .unwrap_or("saved Codex executable is unavailable")
+            .to_owned()
+    })?;
+    queue_command_once(
+        binary,
+        thread,
+        &context.env,
+        &context.cwd,
+        line,
+        log_path,
+        delivery_lock,
+    )
+}
+
+fn queue_command_once(
+    binary: &Path,
+    thread: ThreadId,
+    env: &crate::domain::TaskEnv,
+    cwd: &Path,
+    line: &str,
+    log_path: &Path,
+    delivery_lock: &Path,
+) -> Result<(), String> {
+    let mut cmd = Command::new(binary);
+    cmd.args(["queue", "--thread", &thread.to_string(), "--message", line])
+        .env("PATH", &env.path)
+        .env("HOME", &env.home)
+        .current_dir(cwd);
+    match run_command_deadline(&mut cmd, QUEUE_ATTEMPT_TIMEOUT, delivery_lock) {
+        Ok(out) => {
+            let _ = std::fs::write(log_path, transcript(&out));
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
                     "codex queue exit={} stderr={}",
                     out.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&out.stderr)
-                );
-                let _ = std::fs::write(log_path, transcript(&out));
-            }
-            Err(err) => {
-                last_err = err;
+                ))
             }
         }
+        Err(error) => Err(error),
     }
-    Err(AppError::Internal { message: last_err })
 }
 
 /// Drive one child to completion or deadline. Drains stdout/stderr on helper
@@ -723,7 +712,7 @@ pub fn last_event_for_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Agent, AgentWorkload, AttentionState, TaskEnv, Workload};
+    use crate::domain::{Agent, AgentWorkload, AttentionState, CallbackStatus, TaskEnv, Workload};
     use chrono::Utc;
     use std::time::Duration;
 
