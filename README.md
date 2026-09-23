@@ -37,7 +37,8 @@ Install homebased from https://github.com/avencera/homebased.
    Then read ~/.agents/skills/homebased/SKILL.md and follow the route table there.
 ```
 
-The install script puts the binary on disk. It does not start the daemon or install the skill.
+The install script puts the binary on disk and restarts a daemon that is already
+running. It does not start a daemon on first install or install the skill.
 
 ## Install
 
@@ -75,13 +76,16 @@ curl -LSfs https://github.com/avencera/homebased/releases/latest/download/instal
 | `--tag` | latest GitHub release | Release tag, for example `v0.1.0` |
 | `--git` | `avencera/homebased` | GitHub repository that hosts the release |
 
-The script overwrites an existing `homebased` in the install directory.
+The script overwrites an existing `homebased` in the install directory. If the
+daemon is running, the script restarts it with the new binary.
 
 It supports Linux (`x86_64` and `aarch64`) and macOS (Intel and Apple silicon).
 
 ### Daemon
 
-The install script does not start the daemon. After `homebased` is on `PATH`:
+The install script does not start the daemon on first install. If the daemon is
+already running, the script restarts it with the new binary. After `homebased`
+is on `PATH`:
 
 ```sh
 homebased daemon install
@@ -356,4 +360,4 @@ homebased --json update --tag v0.2.0
 just release local
 ```
 
-That build installs `homebased` to `~/.local/bin`.
+The build installs `homebased` to `~/.local/bin` and restarts a running daemon.

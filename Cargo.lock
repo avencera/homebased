@@ -2477,6 +2477,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "serde_json",
  "toml_edit",
 ]
 

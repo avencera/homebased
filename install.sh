@@ -214,6 +214,22 @@ if [ "$installed" = false ]; then
     err "archive did not contain an executable $crate binary"
 fi
 
+if [ "$crate" = homebased ]; then
+    daemon_status=$("$dest/$crate" --json daemon status) \
+        || err "installed $crate but could not check daemon status"
+    case "$daemon_status" in
+        *'"socket": "up"'* | *'"socket":"up"'*)
+            "$dest/$crate" --json daemon restart \
+                || err "installed $crate but could not restart the daemon"
+            ;;
+        *'"socket": "down"'* | *'"socket":"down"'*)
+            ;;
+        *)
+            err "installed $crate but could not read the daemon socket state"
+            ;;
+    esac
+fi
+
 case ":$PATH:" in
     *:"$dest":*) ;;
     *)

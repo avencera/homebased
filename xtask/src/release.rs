@@ -5,6 +5,19 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail};
+use serde_json::Value;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonSocket {
+    Up,
+    Down,
+}
+
+impl DaemonSocket {
+    fn needs_restart(&self) -> bool {
+        matches!(self, Self::Up)
+    }
+}
 
 pub(crate) fn local() -> Result<()> {
     let workspace_root = crate::workspace_root()?;
@@ -33,7 +46,81 @@ pub(crate) fn local() -> Result<()> {
     let _ = fs::remove_file(&dest);
     fs::copy(&src, &dest)?;
 
-    println!("Installed homebased to {dest}");
+    let installed_binary =
+        fs::canonicalize(&dest).wrap_err("failed to resolve installed binary path")?;
+
+    // check after replacement so status and restart use the installed executable
+    let daemon_socket = daemon_socket(&installed_binary).wrap_err_with(|| {
+        format!(
+            "installed homebased to {}, but failed to check daemon status",
+            installed_binary.display()
+        )
+    })?;
+
+    if daemon_socket.needs_restart() {
+        restart_daemon(&installed_binary).wrap_err_with(|| {
+            format!(
+                "installed homebased to {}, but failed to restart the running daemon",
+                installed_binary.display()
+            )
+        })?;
+        println!(
+            "Installed homebased to {} and restarted the running daemon",
+            installed_binary.display()
+        );
+    } else {
+        println!("Installed homebased to {}", installed_binary.display());
+    }
+
+    Ok(())
+}
+
+fn daemon_socket(binary: &Path) -> Result<DaemonSocket> {
+    let output = Command::new(binary)
+        .args(["--json", "daemon", "status"])
+        .output()
+        .wrap_err_with(|| format!("failed to run {} --json daemon status", binary.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} --json daemon status exited with {}: {}",
+            binary.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    parse_daemon_socket(&output.stdout)
+}
+
+fn parse_daemon_socket(stdout: &[u8]) -> Result<DaemonSocket> {
+    let status: Value =
+        serde_json::from_slice(stdout).wrap_err("failed to parse daemon status JSON")?;
+    match status.get("socket").and_then(Value::as_str) {
+        Some("up") => Ok(DaemonSocket::Up),
+        Some("down") => Ok(DaemonSocket::Down),
+        Some(value) => bail!("daemon status returned unknown socket state {value:?}"),
+        None => bail!("daemon status JSON has no string `socket` field"),
+    }
+}
+
+fn restart_daemon(binary: &Path) -> Result<()> {
+    let output = Command::new(binary)
+        .args(["--json", "daemon", "restart"])
+        .output()
+        .wrap_err_with(|| format!("failed to run {} --json daemon restart", binary.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} --json daemon restart exited with {}: {}",
+            binary.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+
     Ok(())
 }
 
@@ -158,7 +245,25 @@ fn github_repo_slug(origin: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::github_repo_slug;
+    use super::{DaemonSocket, github_repo_slug, parse_daemon_socket};
+
+    #[test]
+    fn daemon_status_restarts_only_when_the_socket_is_up() {
+        let up = parse_daemon_socket(br#"{"socket":"up"}"#);
+        let down = parse_daemon_socket(br#"{"socket":"down"}"#);
+
+        assert!(matches!(up, Ok(DaemonSocket::Up)));
+        assert!(matches!(down, Ok(DaemonSocket::Down)));
+        assert!(DaemonSocket::Up.needs_restart());
+        assert!(!DaemonSocket::Down.needs_restart());
+    }
+
+    #[test]
+    fn daemon_status_rejects_unknown_or_missing_socket_states() {
+        assert!(parse_daemon_socket(br#"{"socket":"starting"}"#).is_err());
+        assert!(parse_daemon_socket(br#"{"other":"up"}"#).is_err());
+        assert!(parse_daemon_socket(b"not json").is_err());
+    }
 
     #[test]
     fn parses_github_remote_urls() {
