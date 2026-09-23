@@ -7,9 +7,10 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tracing::warn;
 
 use super::AppState;
-use super::actors::{StoreMsg, call};
+use super::actors::{StoreMsg, SupervisorMsg, call};
 use crate::domain::{API_VERSION, AgentKind, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
@@ -117,8 +118,8 @@ async fn submit_route(
     state: &AppState,
     route: &OriginRoute,
 ) -> Result<ResourceSubmitOutcome, AppError> {
-    if !route_acceptance_is_unknown(&route) {
-        return outcome_from_route(&route);
+    if !route_acceptance_is_unknown(route) {
+        return outcome_from_route(route);
     }
 
     let receipt = if route.execution_machine == state.machine.identity.machine {
@@ -133,7 +134,7 @@ async fn submit_route(
     .await
     .map_err(|error| {
         unknown(
-            &route,
+            route,
             format!("cannot save resource authority result: {error}"),
         )
     })?;
@@ -178,8 +179,8 @@ fn ensure_same_recovery_identity(
 
 /// Retry origin routes whose authority acceptance was unknown at daemon startup
 pub(super) async fn recover(state: AppState) {
-    let routes = match call(&state.store, |reply| StoreMsg::UnknownResourceOriginRoutes {
-        reply,
+    let routes = match call(&state.store, |reply| {
+        StoreMsg::UnknownResourceOriginRoutes { reply }
     })
     .await
     {
@@ -300,7 +301,10 @@ async fn submit_local(
     })
     .await;
     match result {
-        Ok(stored) => local_receipt(route, &stored),
+        Ok(stored) => {
+            reconcile_local_request_if_waiting(state, route, &stored).await?;
+            local_receipt(route, &stored)
+        }
         Err(AppError::SubmissionRejected {
             request,
             task,
@@ -313,6 +317,35 @@ async fn submit_local(
             format!("local resource authority did not return a definitive queue result: {error}"),
         )),
     }
+}
+
+async fn reconcile_local_request_if_waiting(
+    state: &AppState,
+    route: &OriginRoute,
+    request: &ResourceRequest,
+) -> Result<(), AppError> {
+    if !matches!(
+        &request.state,
+        ResourceRequestState::Queued | ResourceRequestState::Assigned { .. }
+    ) {
+        return Ok(());
+    }
+
+    call(&state.supervisor, |reply| {
+        SupervisorMsg::ReconcileResource {
+            id: request.resource_id,
+            reply,
+        }
+    })
+    .await
+    .map_err(|error| {
+        unknown(
+            route,
+            format!(
+                "local resource queue accepted the request but could not reconcile it: {error}"
+            ),
+        )
+    })
 }
 
 fn local_receipt(
@@ -538,10 +571,23 @@ mod tests {
 
     use axum::http::StatusCode;
     use bytes::Bytes;
+    use ractor::Actor;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::daemon::actors::call;
+    use crate::daemon::actors::{SupervisorActor, SupervisorMsg};
+    use crate::files::StreamSlots;
+    use crate::fleet::FleetState;
+    use crate::fleet::directory::LocalMachine;
+    use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+    use crate::home::Home;
     use crate::machine::MachineId;
-    use crate::resource::ResourceId;
+    use crate::machine::{LocalIdentity, MachineName};
+    use crate::resource::{
+        AssignmentRevision, Resource, ResourceId, ResourceQueueAttentionReason,
+        ResourceQueueReconcileOutcome, ResourceRevision, SupervisorAddress,
+    };
     use crate::submission::{CallbackExecutable, ResourceQueueOutcome};
 
     fn spec() -> NormalizedSpec {
@@ -578,6 +624,28 @@ mod tests {
         .unwrap()
     }
 
+    fn local_route(authority: MachineId, resource: ResourceId) -> OriginRoute {
+        let spec = spec();
+        OriginRoute::new_resource_waiting(NewResourceRoute {
+            request: RequestId::new(),
+            task: TaskId::new(),
+            origin_machine: authority,
+            authority_machine: authority,
+            thread: spec.thread,
+            callback: CallbackContext {
+                env: TaskEnv {
+                    path: "/bin".into(),
+                    home: "/tmp".into(),
+                },
+                cwd: Path::new("/tmp").to_path_buf(),
+                codex: CallbackExecutable::available(Path::new("/bin/echo").to_path_buf()),
+            },
+            spec,
+            resource,
+        })
+        .unwrap()
+    }
+
     fn response(route: &OriginRoute, protocol_version: u32) -> ClusterResponse {
         let receipt = ResourceQueueReceipt {
             request: route.request,
@@ -607,6 +675,96 @@ mod tests {
             },
             callback_cwd: Path::new("/different/callback").to_path_buf(),
         }
+    }
+
+    #[tokio::test]
+    async fn local_acceptance_and_exact_retry_wake_the_resource_actor() {
+        let _guard = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
+            .lock()
+            .await;
+        let directory = tempdir().unwrap();
+        let home = Home::resolve(Some(directory.path().join("state"))).unwrap();
+        home.ensure().unwrap();
+        let (supervisor, supervisor_handle) =
+            SupervisorActor::spawn(None, SupervisorActor, home.clone())
+                .await
+                .unwrap();
+        let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+            .await
+            .unwrap();
+        let machine = LocalMachine {
+            identity: LocalIdentity::start(&home).unwrap(),
+            name: MachineName::fallback(),
+            protocol: SUPPORTED_PROTOCOLS,
+        };
+        let authority = machine.identity.machine;
+        let resource_id = ResourceId::new();
+        let resource = Resource::new(
+            resource_id,
+            "gpu-test".into(),
+            authority,
+            SupervisorAddress {
+                machine: authority,
+                thread: spec().thread,
+            },
+            AssignmentRevision::new(0),
+            ResourceRevision::new(0),
+            None,
+        );
+        call(&supervisor, |reply| SupervisorMsg::RegisterResource {
+            resource: Box::new(resource),
+            reply,
+        })
+        .await
+        .unwrap();
+        let route = local_route(authority, resource_id);
+        call(&store, |reply| StoreMsg::InsertOriginRoute {
+            route: Box::new(route.clone()),
+            reply,
+        })
+        .await
+        .unwrap();
+        let state = AppState {
+            home: home.clone(),
+            store: store.clone(),
+            supervisor: supervisor.clone(),
+            web: None,
+            content: None,
+            stream_slots: StreamSlots::new(),
+            machine,
+            fleet: FleetState::Disabled,
+            message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
+        };
+
+        let first = submit_local(&state, &route).await.unwrap();
+        assert_eq!(first.outcome, ResourceQueueOutcome::Waiting);
+        let inspection = call(&supervisor, |reply| SupervisorMsg::InspectResource {
+            id: resource_id,
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            inspection.reconcile_outcome,
+            Some(ResourceQueueReconcileOutcome::AttentionRequired {
+                request,
+                reason: ResourceQueueAttentionReason::IdleNotProven,
+            }) if request.request_id == route.request
+        ));
+
+        assert_eq!(submit_local(&state, &route).await.unwrap(), first);
+        let requests = call(&store, |reply| StoreMsg::ResourceRequests {
+            authority_machine: authority,
+            resource_id,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests.len(), 1);
+
+        supervisor.stop(None);
+        let _ = supervisor_handle.await;
     }
 
     #[test]
@@ -691,6 +849,101 @@ mod tests {
             ResourceSubmitOutcome::Rejected {
                 task: route.task,
                 reason: "unavailable".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_retry_requires_exact_saved_identity_and_skips_later_phases() {
+        let expected = route();
+        let saved = expected.clone();
+
+        assert!(ensure_same_recovery_identity(&expected, &saved).is_ok());
+        assert_eq!(saved.request, expected.request);
+        assert_eq!(saved.task, expected.task);
+        assert_eq!(resource_from_route(&saved), resource_from_route(&expected));
+        assert_eq!(saved.execution_machine, expected.execution_machine);
+        assert_eq!(saved.callback, expected.callback);
+        assert_eq!(
+            serde_json::to_value(saved.current_spec()).unwrap(),
+            serde_json::to_value(expected.current_spec()).unwrap()
+        );
+
+        let mut changed_request = saved.clone();
+        changed_request.request = RequestId::new();
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_request),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let mut changed_task = saved.clone();
+        changed_task.task = TaskId::new();
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_task),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let mut changed_authority = saved.clone();
+        changed_authority.execution_machine = MachineId::new();
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_authority),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let mut changed_resource = saved.clone();
+        let SubmissionState::Resource { phase, .. } = &saved.submission else {
+            unreachable!();
+        };
+        changed_resource.submission = SubmissionState::Resource {
+            resource: ResourceId::new(),
+            phase: phase.clone(),
+        };
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_resource),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let mut changed_spec = saved.clone();
+        changed_spec.spec.current_mut().unwrap().name =
+            serde_json::from_value(serde_json::json!("changed")).unwrap();
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_spec),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let mut changed_callback = saved.clone();
+        changed_callback.callback.cwd = Path::new("/changed/callback").to_path_buf();
+        assert!(matches!(
+            ensure_same_recovery_identity(&expected, &changed_callback),
+            Err(AppError::SubmissionConflict { .. })
+        ));
+
+        let resource = resource_from_route(&saved).unwrap();
+        let mut activated = saved.clone();
+        activated.submission = SubmissionState::Resource {
+            resource,
+            phase: ResourceRoutePhase::Activated,
+        };
+        assert!(ensure_same_recovery_identity(&expected, &activated).is_ok());
+        assert!(!route_acceptance_is_unknown(&activated));
+        assert_eq!(
+            outcome_from_route(&activated).unwrap(),
+            ResourceSubmitOutcome::Activated {
+                task: expected.task,
+            }
+        );
+
+        let mut cancelled = saved.clone();
+        cancelled.submission = SubmissionState::Resource {
+            resource,
+            phase: ResourceRoutePhase::CancelledBeforeLaunch,
+        };
+        assert!(ensure_same_recovery_identity(&expected, &cancelled).is_ok());
+        assert!(!route_acceptance_is_unknown(&cancelled));
+        assert_eq!(
+            outcome_from_route(&cancelled).unwrap(),
+            ResourceSubmitOutcome::CancelledBeforeLaunch {
+                task: expected.task,
             }
         );
     }

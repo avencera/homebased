@@ -712,7 +712,10 @@ pub fn last_event_for_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Agent, AgentWorkload, AttentionState, CallbackStatus, TaskEnv, Workload};
+    use crate::domain::{
+        Agent, AgentWorkload, AttentionState, CallbackStatus, ProcessGroupExitEvidence, TaskEnv,
+        Workload,
+    };
     use chrono::Utc;
     use std::time::Duration;
 
@@ -734,6 +737,7 @@ mod tests {
             },
             binary: PathBuf::from("/bin/claude"),
             state,
+            process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
             callback_status: CallbackStatus::Pending,
             attention: AttentionState::Pending,
             cancel_requested_at: None,

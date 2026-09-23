@@ -2,7 +2,10 @@
 
 pub mod views;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -11,6 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::callback::last_event_for_row;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
@@ -31,6 +35,27 @@ use crate::invocation::{
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::{self, CancelResult};
 use crate::submission::RequestId;
+
+const CANCELLATION_INTENT_SHARDS: usize = 64;
+static CANCELLATION_INTENT_PERMITS: OnceLock<[Semaphore; CANCELLATION_INTENT_SHARDS]> =
+    OnceLock::new();
+
+/// Serialize cancellation-intent creation for one task on its origin daemon.
+pub(super) async fn lock_cancellation_intent(
+    task: TaskId,
+) -> Result<SemaphorePermit<'static>, AppError> {
+    let permits =
+        CANCELLATION_INTENT_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
+    let mut hasher = DefaultHasher::new();
+    task.hash(&mut hasher);
+    let shard = (hasher.finish() as usize) % CANCELLATION_INTENT_SHARDS;
+    permits[shard]
+        .acquire()
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("cancellation intent permit unavailable: {error}"),
+        })
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -66,6 +91,7 @@ pub fn socket_router(state: AppState) -> Router {
     read_routes()
         .merge(write_routes())
         .merge(crate::daemon::fleet_api::socket_routes())
+        .merge(crate::daemon::release_watcher_api::socket_routes())
         .with_state(state)
 }
 
@@ -433,24 +459,56 @@ async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Value>, AppError> {
-    let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
-    if local.is_none() {
-        let (origin_machine, execution_machine) =
-            crate::daemon::inspection::cancellation_owner(&state, id).await?;
-        let request = crate::cancellation::CancellationRequest {
-            requester_machine: state.machine.identity.machine,
-            cancellation: uuid::Uuid::now_v7(),
-            task: id,
-            origin_machine,
-            execution_machine,
-            delivery: crate::cancellation::CancellationDelivery::Pending,
-        };
-        let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
-            request,
-            reply,
-        })
-        .await?;
+    let _intent_guard = lock_cancellation_intent(id).await?;
+    let saved = call(&state.store, |reply| StoreMsg::GetCancellationRequest {
+        task: id,
+        reply,
+    })
+    .await?;
+    if let Some(saved) = saved {
         return Ok(Json(crate::daemon::cancel_delivery::response(&saved)));
+    }
+
+    let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
+    if local.is_some() && local_task_already_cancelled(&state, id).await? {
+        return Ok(Json(json!({
+            "api_version": API_VERSION,
+            "id": id,
+            "status": ProcessStatus::Cancelled,
+        })));
+    }
+
+    if local.is_none() {
+        let owner = crate::daemon::inspection::cancellation_owner(&state, id).await?;
+        let action = cancellation_action(
+            owner,
+            state.machine.identity.machine,
+            id,
+            uuid::Uuid::now_v7(),
+        )?;
+        match action {
+            CancellationAction::AlreadyCancelled => {
+                return Ok(Json(json!({
+                    "api_version": API_VERSION,
+                    "id": id,
+                    "status": ProcessStatus::Cancelled,
+                })));
+            }
+            CancellationAction::Execution(request) | CancellationAction::Resource(request) => {
+                let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
+                    request: *request,
+                    reply,
+                })
+                .await?;
+                return Ok(Json(crate::daemon::cancel_delivery::response(&saved)));
+            }
+            CancellationAction::ForwardResource(target) => {
+                let response =
+                    crate::daemon::cluster::forward_resource_cancellation_intent(&state, &target)
+                        .await?;
+                return Ok(Json(response));
+            }
+        }
     }
     let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
         id,
@@ -473,6 +531,142 @@ async fn cancel(
             "id": id,
             "status": row.status(),
         }))),
+    }
+}
+
+async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bool, AppError> {
+    let machine = state.machine.identity.machine;
+    let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply }).await?;
+    let owner = if let Some(route) = route {
+        if route.task != id || route.origin_machine != machine {
+            return Err(AppError::ClusterTaskConflict { task: id });
+        }
+        match route.submission {
+            crate::submission::SubmissionState::Rejected { .. } => {
+                return Err(AppError::ClusterTaskConflict { task: id });
+            }
+            crate::submission::SubmissionState::Resource { resource, phase } => {
+                crate::cancellation::CancellationOwner::Resource(
+                    crate::cancellation::ResourceCancellationTarget {
+                        request_id: route.request,
+                        task_id: route.task,
+                        resource_id: resource,
+                        origin_machine: route.origin_machine,
+                        authority_machine: route.execution_machine,
+                        phase,
+                    },
+                )
+            }
+            crate::submission::SubmissionState::AcceptanceUnknown
+            | crate::submission::SubmissionState::Accepted => {
+                crate::cancellation::CancellationOwner::Execution(
+                    crate::cancellation::ExecutionCancellationTarget {
+                        request_id: Some(route.request),
+                        task: route.task,
+                        origin_machine: route.origin_machine,
+                        execution_machine: route.execution_machine,
+                    },
+                )
+            }
+        }
+    } else {
+        let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {
+            id,
+            reply,
+        })
+        .await?;
+        if identity.is_none() {
+            return Ok(false);
+        }
+        crate::daemon::inspection::cancellation_owner(state, id).await?
+    };
+
+    let action = cancellation_action(owner, machine, id, uuid::Uuid::now_v7())?;
+    match action {
+        CancellationAction::AlreadyCancelled => Ok(true),
+        CancellationAction::Execution(request) if request.execution_machine == machine => Ok(false),
+        CancellationAction::Execution(_) => Err(AppError::ClusterTaskConflict { task: id }),
+        CancellationAction::Resource(_) => Err(AppError::ClusterTaskConflict { task: id }),
+        CancellationAction::ForwardResource(_) => Err(AppError::ClusterTaskConflict { task: id }),
+    }
+}
+
+enum CancellationAction {
+    Execution(Box<crate::cancellation::CancellationRequest>),
+    Resource(Box<crate::cancellation::CancellationRequest>),
+    ForwardResource(crate::cancellation::ResourceCancellationTarget),
+    AlreadyCancelled,
+}
+
+fn cancellation_action(
+    owner: crate::cancellation::CancellationOwner,
+    requester_machine: crate::machine::MachineId,
+    task: TaskId,
+    cancellation: uuid::Uuid,
+) -> Result<CancellationAction, AppError> {
+    match owner {
+        crate::cancellation::CancellationOwner::Execution(target) => {
+            if target.task != task {
+                return Err(AppError::ClusterTaskConflict { task });
+            }
+            Ok(CancellationAction::Execution(Box::new(
+                crate::cancellation::CancellationRequest {
+                    requester_machine,
+                    cancellation,
+                    task,
+                    origin_machine: target.origin_machine,
+                    execution_machine: target.execution_machine,
+                    target: crate::cancellation::CancellationTarget::Execution {
+                        request_id: target.request_id,
+                    },
+                    delivery: crate::cancellation::CancellationDelivery::Pending,
+                },
+            )))
+        }
+        crate::cancellation::CancellationOwner::Resource(target) => {
+            if target.task_id != task {
+                return Err(AppError::ClusterTaskConflict { task });
+            }
+            if target.origin_machine != requester_machine {
+                return Ok(CancellationAction::ForwardResource(target));
+            }
+            match &target.phase {
+                crate::submission::ResourceRoutePhase::CancelledBeforeLaunch => {
+                    return Ok(CancellationAction::AlreadyCancelled);
+                }
+                crate::submission::ResourceRoutePhase::Rejected { .. } => {
+                    return Err(AppError::TaskNotStarted { task });
+                }
+                crate::submission::ResourceRoutePhase::Activated => {
+                    return Ok(CancellationAction::Execution(Box::new(
+                        crate::cancellation::CancellationRequest {
+                            requester_machine,
+                            cancellation,
+                            task,
+                            origin_machine: target.origin_machine,
+                            execution_machine: target.authority_machine,
+                            target: crate::cancellation::CancellationTarget::Execution {
+                                request_id: Some(target.request_id),
+                            },
+                            delivery: crate::cancellation::CancellationDelivery::Pending,
+                        },
+                    )));
+                }
+                crate::submission::ResourceRoutePhase::AcceptanceUnknown
+                | crate::submission::ResourceRoutePhase::Waiting => {}
+            }
+            Ok(CancellationAction::Resource(Box::new(
+                crate::cancellation::CancellationRequest {
+                    requester_machine,
+                    cancellation,
+                    task,
+                    origin_machine: target.origin_machine,
+                    execution_machine: target.authority_machine,
+                    target: crate::cancellation::CancellationTarget::Resource(target),
+                    delivery: crate::cancellation::CancellationDelivery::Pending,
+                },
+            )))
+        }
     }
 }
 
@@ -545,6 +739,174 @@ mod tests {
             },
             "env": { "path": "/bin", "home": "/home/u" }
         })
+    }
+
+    #[test]
+    fn resource_cancellation_uses_the_typed_path_before_activation() {
+        let task = TaskId::new();
+        for phase in [
+            crate::submission::ResourceRoutePhase::AcceptanceUnknown,
+            crate::submission::ResourceRoutePhase::Waiting,
+        ] {
+            let origin_machine = crate::machine::MachineId::new();
+            let owner = crate::cancellation::CancellationOwner::Resource(
+                crate::cancellation::ResourceCancellationTarget {
+                    request_id: RequestId::new(),
+                    task_id: task,
+                    resource_id: crate::resource::ResourceId::new(),
+                    origin_machine,
+                    authority_machine: crate::machine::MachineId::new(),
+                    phase,
+                },
+            );
+
+            let CancellationAction::Resource(request) =
+                cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7()).unwrap()
+            else {
+                panic!("a pre-activation resource request needs resource cancellation");
+            };
+            assert!(matches!(
+                request.target,
+                crate::cancellation::CancellationTarget::Resource(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn activated_resource_cancellation_uses_the_executor_task_path() {
+        let task = TaskId::new();
+        let request_id = RequestId::new();
+        let origin_machine = crate::machine::MachineId::new();
+        let authority_machine = crate::machine::MachineId::new();
+        let owner = crate::cancellation::CancellationOwner::Resource(
+            crate::cancellation::ResourceCancellationTarget {
+                request_id,
+                task_id: task,
+                resource_id: crate::resource::ResourceId::new(),
+                origin_machine,
+                authority_machine,
+                phase: crate::submission::ResourceRoutePhase::Activated,
+            },
+        );
+        let CancellationAction::Execution(request) =
+            cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7()).unwrap()
+        else {
+            panic!("activated resource work must use ordinary execution cancellation");
+        };
+        assert_eq!(request.execution_machine, authority_machine);
+        assert_eq!(
+            request.target,
+            crate::cancellation::CancellationTarget::Execution {
+                request_id: Some(request_id)
+            }
+        );
+    }
+
+    #[test]
+    fn rejected_resource_route_does_not_build_a_cancellation_request() {
+        let task = TaskId::new();
+        let origin_machine = crate::machine::MachineId::new();
+        let owner = crate::cancellation::CancellationOwner::Resource(
+            crate::cancellation::ResourceCancellationTarget {
+                request_id: RequestId::new(),
+                task_id: task,
+                resource_id: crate::resource::ResourceId::new(),
+                origin_machine,
+                authority_machine: crate::machine::MachineId::new(),
+                phase: crate::submission::ResourceRoutePhase::Rejected {
+                    reason: "resource request rejected".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            cancellation_action(
+                owner,
+                origin_machine,
+                task,
+                uuid::Uuid::now_v7(),
+            ),
+            Err(AppError::TaskNotStarted { task: found }) if found == task
+        ));
+    }
+
+    #[test]
+    fn cancelled_resource_route_returns_its_retained_result_without_executor_request() {
+        let task = TaskId::new();
+        let origin_machine = crate::machine::MachineId::new();
+        let owner = crate::cancellation::CancellationOwner::Resource(
+            crate::cancellation::ResourceCancellationTarget {
+                request_id: RequestId::new(),
+                task_id: task,
+                resource_id: crate::resource::ResourceId::new(),
+                origin_machine,
+                authority_machine: crate::machine::MachineId::new(),
+                phase: crate::submission::ResourceRoutePhase::CancelledBeforeLaunch,
+            },
+        );
+
+        assert!(matches!(
+            cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7(),),
+            Ok(CancellationAction::AlreadyCancelled)
+        ));
+    }
+
+    #[test]
+    fn cancellation_owner_task_mismatch_is_a_conflict() {
+        let task = TaskId::new();
+        let owner = crate::cancellation::CancellationOwner::Resource(
+            crate::cancellation::ResourceCancellationTarget {
+                request_id: RequestId::new(),
+                task_id: task,
+                resource_id: crate::resource::ResourceId::new(),
+                origin_machine: crate::machine::MachineId::new(),
+                authority_machine: crate::machine::MachineId::new(),
+                phase: crate::submission::ResourceRoutePhase::Waiting,
+            },
+        );
+
+        assert!(matches!(
+            cancellation_action(
+                owner,
+                crate::machine::MachineId::new(),
+                TaskId::new(),
+                uuid::Uuid::now_v7(),
+            ),
+            Err(AppError::ClusterTaskConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn ordinary_execution_cancellation_keeps_the_generic_path() {
+        let task = TaskId::new();
+        let request_id = RequestId::new();
+        let origin_machine = crate::machine::MachineId::new();
+        let execution_machine = crate::machine::MachineId::new();
+        let cancellation = uuid::Uuid::now_v7();
+        let owner = crate::cancellation::CancellationOwner::Execution(
+            crate::cancellation::ExecutionCancellationTarget {
+                request_id: Some(request_id),
+                task,
+                origin_machine,
+                execution_machine,
+            },
+        );
+
+        let CancellationAction::Execution(request) =
+            cancellation_action(owner, crate::machine::MachineId::new(), task, cancellation)
+                .unwrap()
+        else {
+            panic!("ordinary execution must use its generic cancellation intent");
+        };
+        assert_eq!(request.task, task);
+        assert_eq!(request.origin_machine, origin_machine);
+        assert_eq!(request.execution_machine, execution_machine);
+        assert_eq!(request.cancellation, cancellation);
+        assert_eq!(
+            request.target,
+            crate::cancellation::CancellationTarget::Execution {
+                request_id: Some(request_id),
+            }
+        );
     }
 
     #[track_caller]

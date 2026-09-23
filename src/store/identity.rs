@@ -54,6 +54,59 @@ fn decode_identity(value: &str) -> Result<ExecutorIdentity, IdentityError> {
     Ok(identity)
 }
 
+pub(super) fn origin_route_by_request_on(
+    conn: &rusqlite::Connection,
+    request: RequestId,
+) -> Result<Option<OriginRoute>, IdentityError> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT route_json FROM origin_routes WHERE request_id=?1",
+            [request.0.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let route = data.as_deref().map(decode_route).transpose()?;
+    if route.as_ref().is_some_and(|route| route.request != request) {
+        return Err(IdentityError::Conflict);
+    }
+    Ok(route)
+}
+
+pub(super) fn origin_route_by_task_on(
+    conn: &rusqlite::Connection,
+    task: TaskId,
+) -> Result<Option<OriginRoute>, IdentityError> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT route_json FROM origin_routes WHERE task_id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let route = data.as_deref().map(decode_route).transpose()?;
+    if route.as_ref().is_some_and(|route| route.task != task) {
+        return Err(IdentityError::Conflict);
+    }
+    Ok(route)
+}
+
+pub(super) fn executor_identity_on(
+    conn: &rusqlite::Connection,
+    task: TaskId,
+) -> Result<Option<ExecutorIdentity>, IdentityError> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT identity_json FROM executor_identities WHERE task_id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    data.as_deref().map(decode_identity).transpose()
+}
+
 fn validate_route(route: &OriginRoute) -> Result<(), IdentityError> {
     route.validate().map_err(|error| {
         IdentityError::Storage(AppError::Internal {
@@ -259,7 +312,14 @@ impl Store {
     pub fn unknown_resource_origin_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
         let mut statement = self
             .conn
-            .prepare("SELECT request_id,task_id,route_json FROM origin_routes ORDER BY request_id")
+            .prepare(
+                "SELECT request_id,task_id,route_json FROM origin_routes
+                 WHERE CASE WHEN json_valid(route_json) THEN
+                    json_extract(route_json, '$.submission.type') = 'resource'
+                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
+                 ELSE 0 END
+                 ORDER BY request_id",
+            )
             .map_err(storage)?;
         let rows = statement
             .query_map([], |row| {
@@ -277,15 +337,16 @@ impl Store {
             if route.request.0.to_string() != request || route.task.to_string() != task {
                 return Err(IdentityError::Conflict);
             }
-            if matches!(
+            if !matches!(
                 route.submission,
                 SubmissionState::Resource {
                     phase: ResourceRoutePhase::AcceptanceUnknown,
                     ..
                 }
             ) {
-                routes.push(route);
+                return Err(IdentityError::Conflict);
             }
+            routes.push(route);
         }
         Ok(routes)
     }
@@ -401,6 +462,15 @@ impl Store {
         &mut self,
         receipt: &ResourceCancellationReceipt,
     ) -> Result<OriginRoute, IdentityError> {
+        if receipt.requester_machine != receipt.origin_machine
+            || !matches!(
+                &receipt.outcome,
+                ResourceCancellationOutcome::PreventedBeforeAcceptance
+                    | ResourceCancellationOutcome::CancelledBeforeLaunch
+            )
+        {
+            return Err(IdentityError::Conflict);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -425,7 +495,7 @@ impl Store {
         let SubmissionState::Resource { resource, phase } = &route.submission else {
             return Err(IdentityError::Conflict);
         };
-        let next = match (phase, receipt.outcome) {
+        let next = match (phase, &receipt.outcome) {
             (
                 ResourceRoutePhase::AcceptanceUnknown,
                 ResourceCancellationOutcome::PreventedBeforeAcceptance
@@ -830,7 +900,8 @@ mod tests {
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].request, saved.request);
         let unknown_resource = store.unknown_resource_origin_routes().unwrap();
-        assert!(unknown_resource.is_empty());
+        assert_eq!(unknown_resource.len(), 1);
+        assert_eq!(unknown_resource[0].request, resource.request);
     }
 
     #[test]
@@ -859,6 +930,20 @@ mod tests {
             })
             .unwrap();
 
+        let activated = resource_route();
+        store.insert_origin_route(&activated).unwrap();
+        store
+            .accept_inbound_event(&crate::events::TaskEvent {
+                task: activated.task,
+                seq: std::num::NonZeroU64::new(1).unwrap(),
+                origin_machine: activated.origin_machine,
+                execution_machine: activated.execution_machine,
+                payload: crate::events::EventPayload::State {
+                    status: ProcessStatus::Queued,
+                },
+            })
+            .unwrap();
+
         let cancelled = resource_route();
         store.insert_origin_route(&cancelled).unwrap();
         let SubmissionState::Resource { resource, .. } = &cancelled.submission else {
@@ -866,11 +951,14 @@ mod tests {
         };
         store
             .cancel_resource_route_before_launch(&ResourceCancellationReceipt {
+                cancellation: uuid::Uuid::now_v7(),
+                requester_machine: cancelled.origin_machine,
                 request: cancelled.request,
                 task: cancelled.task,
                 origin_machine: cancelled.origin_machine,
                 authority_machine: cancelled.execution_machine,
                 resource: *resource,
+                target_phase: ResourceRoutePhase::AcceptanceUnknown,
                 outcome: ResourceCancellationOutcome::CancelledBeforeLaunch,
             })
             .unwrap();
@@ -901,6 +989,22 @@ mod tests {
         let direct_unknown = store.unknown_origin_routes().unwrap();
         assert_eq!(direct_unknown.len(), 1);
         assert_eq!(direct_unknown[0].request, direct.request);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    RequestId::new().0.to_string(),
+                    TaskId::new().to_string(),
+                    MachineId::new().as_uuid().to_string(),
+                    encode(&spec()).unwrap(),
+                    "{malformed route JSON",
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.unknown_resource_origin_routes().unwrap().len(), 1);
     }
 
     #[test]
@@ -1024,11 +1128,14 @@ mod tests {
             Err(IdentityError::Conflict)
         ));
         let late_cancellation = ResourceCancellationReceipt {
+            cancellation: uuid::Uuid::now_v7(),
+            requester_machine: route.origin_machine,
             request: route.request,
             task: route.task,
             origin_machine: route.origin_machine,
             authority_machine: route.execution_machine,
             resource,
+            target_phase: ResourceRoutePhase::AcceptanceUnknown,
             outcome: ResourceCancellationOutcome::CancelledBeforeLaunch,
         };
         assert!(matches!(
@@ -1049,11 +1156,14 @@ mod tests {
             unreachable!();
         };
         let identity = ResourceCancellationReceipt {
+            cancellation: uuid::Uuid::now_v7(),
+            requester_machine: route.origin_machine,
             request: route.request,
             task: route.task,
             origin_machine: route.origin_machine,
             authority_machine: route.execution_machine,
             resource,
+            target_phase: ResourceRoutePhase::AcceptanceUnknown,
             outcome: ResourceCancellationOutcome::CancelledBeforeLaunch,
         };
         let waiting = ResourceQueueReceipt {

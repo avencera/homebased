@@ -13,19 +13,20 @@ use crate::callback::{
     EventKind, ReportView, check_due_event, exit_event, lost_event, notify_event, terminal_event,
 };
 use crate::domain::{
-    AttentionState, CallbackStatus, ExitReason, ProcessStatus, REPORTS_MAX, ReportOutcome,
-    SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskName, TaskReport, TaskRow, TaskState,
-    TerminalCallbackProjection, ThreadId, Workload, check_report_allowed, check_status_transition,
+    AttentionState, CallbackStatus, ExitReason, ProcessGroupExitEvidence, ProcessStatus,
+    REPORTS_MAX, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskName,
+    TaskReport, TaskRow, TaskState, TerminalCallbackProjection, ThreadId, Workload,
+    check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
-use crate::events::{DeliveryState, TaskEvent};
+use crate::events::{DeliveryState, EventError, TaskEvent};
 use crate::machine::MachineId;
 use crate::resource::store::RESOURCE_SCHEMA;
 use crate::spec::NormalizedSpec;
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutionRecord, ExecutorIdentity, OriginRoute,
-    PersistedSpec, RequestId, SubmissionState,
+    PersistedSpec, RequestId, ResourceRoutePhase, SubmissionState,
 };
 
 mod cancellation;
@@ -35,6 +36,7 @@ mod message;
 mod resource;
 pub(crate) use events::EventRetentionBatch;
 pub use identity::IdentityError;
+pub(crate) use resource::VerifiedReleaseProof;
 
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -59,7 +61,8 @@ CREATE TABLE tasks (
     cancel_requested_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    project_root TEXT
+    project_root TEXT,
+    process_group_exit_evidence TEXT
 );
 
 CREATE INDEX tasks_status ON tasks(status);
@@ -170,8 +173,79 @@ CREATE INDEX executor_cancellations_task ON executor_cancellations(task_id);
 
 const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, callback_status,
-    attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at
+    attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at,
+    process_group_exit_evidence
  FROM tasks";
+
+const MIGRATE_16_TO_17: &str = r"
+ALTER TABLE tasks ADD COLUMN process_group_exit_evidence TEXT;
+";
+
+fn migrate_16_to_17(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let column_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('tasks')
+            WHERE name = 'process_group_exit_evidence'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !column_exists {
+        conn.execute_batch(MIGRATE_16_TO_17)?;
+    }
+    Ok(())
+}
+
+const MIGRATE_18_TO_19: &str = r"
+CREATE TABLE trainer_attempt_associations_v19 (
+    task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id),
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    authority_machine TEXT NOT NULL,
+    association_json TEXT NOT NULL CHECK (
+        json_valid(association_json)
+        AND COALESCE(json_type(association_json) = 'object', 0)
+        AND COALESCE(json_extract(association_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(association_json, '$.authority_machine') = authority_machine, 0)
+        AND COALESCE(json_extract(association_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_type(association_json, '$.canonical_runtime_root') = 'text', 0)
+        AND COALESCE(json_type(association_json, '$.attempt_binding') = 'object', 0)
+        AND COALESCE(json_type(association_json, '$.request_sha256') = 'text', 0)
+        AND COALESCE(json_type(association_json, '$.ownership_lock_identity') = 'object', 0)
+        AND COALESCE(json_type(association_json, '$.normalized_spec_sha256') = 'text', 0)
+    )
+);
+INSERT INTO trainer_attempt_associations_v19 (
+    task_id, resource_id, authority_machine, association_json
+)
+SELECT task_id, resource_id, authority_machine, association_json
+FROM trainer_attempt_associations;
+DROP TABLE trainer_attempt_associations;
+ALTER TABLE trainer_attempt_associations_v19 RENAME TO trainer_attempt_associations;
+";
+
+const MIGRATE_20_TO_21: &str = r"
+CREATE TABLE resource_release_checkpoint_states_v21 (
+    action_id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    state_json TEXT NOT NULL CHECK (
+        json_valid(state_json)
+        AND COALESCE(json_type(state_json) = 'object', 0)
+        AND COALESCE(json_type(state_json, '$.action') = 'object', 0)
+        AND COALESCE(json_type(state_json, '$.phase') = 'object', 0)
+        AND COALESCE(json_extract(state_json, '$.action.action_id') = action_id, 0)
+        AND COALESCE(json_extract(state_json, '$.action.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(state_json, '$.phase.type') IN (
+            'watcher_binding_pending', 'baseline_captured', 'stop_reserved', 'cancellation_committed'
+        ), 0)
+    )
+);
+INSERT INTO resource_release_checkpoint_states_v21 (action_id, resource_id, state_json)
+SELECT action_id, resource_id, state_json FROM resource_release_checkpoint_states;
+DROP TABLE resource_release_checkpoint_states;
+ALTER TABLE resource_release_checkpoint_states_v21 RENAME TO resource_release_checkpoint_states;
+CREATE INDEX resource_release_checkpoint_states_resource
+    ON resource_release_checkpoint_states(resource_id, action_id);
+";
 
 /// Schema version 1 had no `name` column.
 const MIGRATE_1_TO_2: &str = r"
@@ -342,6 +416,16 @@ pub struct Store {
 }
 
 fn resource_task_id_is_reserved(conn: &Connection, task: TaskId) -> Result<bool, rusqlite::Error> {
+    if resource_request_task_id_is_reserved(conn, task)? {
+        return Ok(true);
+    }
+    release_watcher_task_id_is_reserved(conn, task)
+}
+
+fn resource_request_task_id_is_reserved(
+    conn: &Connection,
+    task: TaskId,
+) -> Result<bool, rusqlite::Error> {
     conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM resource_requests WHERE task_id = ?1
@@ -351,6 +435,168 @@ fn resource_task_id_is_reserved(conn: &Connection, task: TaskId) -> Result<bool,
         [task.to_string()],
         |row| row.get(0),
     )
+}
+
+fn release_watcher_task_id_is_reserved(
+    conn: &Connection,
+    task: TaskId,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM loans
+            WHERE json_extract(state_json, '$.phase.watcher_intent.watcher_task_id') = ?1
+               OR json_extract(state_json, '$.last_safe_phase.watcher_intent.watcher_task_id') = ?1
+        )",
+        [task.to_string()],
+        |row| row.get(0),
+    )
+}
+
+fn insert_task_with_project_root_on(
+    conn: &Connection,
+    row: &TaskRow,
+    project_root: Option<&Path>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO tasks (
+            id, thread_id, name, workload_json, cwd, timeout_secs,
+            env_path, env_home, binary, status, exit_reason,
+            callback_status, attention_state, timeout_notified_at,
+            pid, cancel_requested_at, created_at, updated_at, project_root,
+            process_group_exit_evidence
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        params![
+            row.id.to_string(),
+            row.thread.to_string(),
+            row.name.as_ref().map(TaskName::as_str),
+            serde_json::to_string(&row.workload)?,
+            row.cwd.to_string_lossy(),
+            fmt_timeout(row.timeout),
+            row.env.path,
+            row.env.home,
+            row.binary.to_string_lossy(),
+            row.status().as_str(),
+            row.exit_reason().map(serde_json::to_string).transpose()?,
+            row.callback_status.as_str(),
+            row.attention.as_str(),
+            row.attention.delivered_at().map(fmt_time),
+            row.pid(),
+            row.cancel_requested_at.map(fmt_time),
+            fmt_time(row.created_at),
+            fmt_time(row.updated_at),
+            project_root.map(|root| root.to_string_lossy().into_owned()),
+            row.process_group_exit_evidence.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn task_by_id_on(conn: &Connection, id: TaskId) -> Result<Option<TaskRow>, AppError> {
+    let mut statement = conn.prepare(&format!("{TASK_SELECT} WHERE id = ?1"))?;
+    Ok(statement
+        .query_row(params![id.to_string()], parse_task_row)
+        .optional()?)
+}
+
+pub(crate) fn executor_identity_for_resource_task_on(
+    conn: &Connection,
+    task: TaskId,
+) -> Result<Option<ExecutorIdentity>, IdentityError> {
+    identity::executor_identity_on(conn, task)
+}
+
+pub(crate) fn initial_queued_event_matches_on(
+    conn: &Connection,
+    task: TaskId,
+    origin_machine: MachineId,
+    execution_machine: MachineId,
+) -> Result<bool, EventError> {
+    events::initial_queued_event_matches_on(conn, task, origin_machine, execution_machine)
+}
+
+pub(super) fn validate_local_task_acceptance(
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    callback: &CallbackContext,
+) -> Result<(), AppError> {
+    if spec.machine.is_some()
+        || row.status() != ProcessStatus::Queued
+        || row.name.as_ref() != Some(&spec.name)
+        || row.thread != spec.thread
+        || row.cwd != spec.cwd
+        || row.timeout != spec.timeout
+        || callback.env != row.env
+        || callback.cwd != row.cwd
+        || !row.cwd.is_absolute()
+        || callback.codex.path().is_none_or(|path| !path.is_absolute())
+    {
+        return Err(AppError::Internal {
+            message: "local task and accepted origin spec do not match".into(),
+        });
+    }
+    Ok(())
+}
+
+fn insert_local_task_records_on(
+    conn: &Connection,
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    machine: MachineId,
+    request: RequestId,
+    callback: &CallbackContext,
+    allowed_watcher_task: Option<TaskId>,
+) -> Result<(), AppError> {
+    validate_local_task_acceptance(row, spec, callback)?;
+    if resource_request_task_id_is_reserved(conn, row.id)?
+        || (allowed_watcher_task != Some(row.id)
+            && release_watcher_task_id_is_reserved(conn, row.id)?)
+    {
+        return Err(AppError::ClusterTaskConflict { task: row.id });
+    }
+
+    let project_root = find_project_root(&row.cwd);
+    insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
+    let route = OriginRoute {
+        request,
+        task: row.id,
+        origin_machine: machine,
+        execution_machine: machine,
+        thread: row.thread,
+        callback: callback.clone(),
+        spec: spec.clone().into(),
+        submission: SubmissionState::Accepted,
+        last_execution_state: Some(ProcessStatus::Queued),
+        last_updated_at: Some(chrono::Utc::now()),
+        last_accepted_seq: 0,
+        last_settled_seq: 0,
+    };
+    let identity = ExecutorIdentity::Accepted(ExecutionRecord {
+        task: row.id,
+        origin_machine: machine,
+        execution_machine: machine,
+        spec: spec.clone().into(),
+        state: ProcessStatus::Queued,
+    });
+    conn.execute(
+        "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json) VALUES (?1,?2,?3,?4,?5)",
+        params![request.0.to_string(), row.id.to_string(), machine.to_string(), serde_json::to_string(&route.spec)?, serde_json::to_string(&route)?],
+    )?;
+    conn.execute(
+        "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
+        params![
+            row.id.to_string(),
+            machine.to_string(),
+            serde_json::to_string(&identity)?
+        ],
+    )?;
+    events::append_produced_event_on(
+        conn,
+        row.id,
+        EventPayload::State {
+            status: ProcessStatus::Queued,
+        },
+    )?;
+    Ok(())
 }
 
 /// Both machine owners of one accepted execution.
@@ -449,7 +695,21 @@ impl Store {
                 migrate_13_to_14(&transaction)?;
             }
             14 => {
-                // resource schema hook below installs the v15 receipt table
+                // resource schema hook below installs the v16 receipt table
+            }
+            15 => {
+                // resource schema hook below installs the v16 cancellation receipt table
+            }
+            16 => {}
+            17 => {
+                // resource schema hook below installs durable trainer associations
+            }
+            18 => {
+                transaction.execute_batch(MIGRATE_18_TO_19)?;
+            }
+            19 => {}
+            20 => {
+                transaction.execute_batch(MIGRATE_20_TO_21)?;
             }
             v if v == SCHEMA_VERSION => {}
             other => {
@@ -459,6 +719,9 @@ impl Store {
             }
         }
         if version < SCHEMA_VERSION {
+            if version > 0 {
+                migrate_16_to_17(&transaction)?;
+            }
             transaction.execute_batch(RESOURCE_SCHEMA)?;
             transaction.execute_batch(MESSAGE_SCHEMA)?;
             if version < 12 {
@@ -484,36 +747,7 @@ impl Store {
         row: &TaskRow,
         project_root: Option<&Path>,
     ) -> Result<(), AppError> {
-        self.conn.execute(
-            "INSERT INTO tasks (
-                id, thread_id, name, workload_json, cwd, timeout_secs,
-                env_path, env_home, binary, status, exit_reason,
-                callback_status, attention_state, timeout_notified_at,
-                pid, cancel_requested_at, created_at, updated_at, project_root
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            params![
-                row.id.to_string(),
-                row.thread.to_string(),
-                row.name.as_ref().map(TaskName::as_str),
-                serde_json::to_string(&row.workload)?,
-                row.cwd.to_string_lossy(),
-                fmt_timeout(row.timeout),
-                row.env.path,
-                row.env.home,
-                row.binary.to_string_lossy(),
-                row.status().as_str(),
-                row.exit_reason().map(serde_json::to_string).transpose()?,
-                row.callback_status.as_str(),
-                row.attention.as_str(),
-                row.attention.delivered_at().map(fmt_time),
-                row.pid(),
-                row.cancel_requested_at.map(fmt_time),
-                fmt_time(row.created_at),
-                fmt_time(row.updated_at),
-                project_root.map(|root| root.to_string_lossy().into_owned()),
-            ],
-        )?;
-        Ok(())
+        insert_task_with_project_root_on(&self.conn, row, project_root)
     }
 
     /// Insert a new local task with both owners and its initial state event
@@ -524,53 +758,21 @@ impl Store {
         machine: MachineId,
         codex: std::path::PathBuf,
     ) -> Result<(), AppError> {
-        if spec.machine.is_some()
-            || row.status() != ProcessStatus::Queued
-            || row.name.as_ref() != Some(&spec.name)
-            || row.thread != spec.thread
-            || row.cwd != spec.cwd
-            || row.timeout != spec.timeout
-            || !row.cwd.is_absolute()
-            || !codex.is_absolute()
-        {
-            return Err(AppError::Internal {
-                message: "local task and accepted origin spec do not match".into(),
-            });
-        }
+        let callback = CallbackContext {
+            env: row.env.clone(),
+            cwd: row.cwd.clone(),
+            codex: CallbackExecutable::available(codex),
+        };
         self.immediate(|| {
-            if resource_task_id_is_reserved(&self.conn, row.id)? {
-                return Err(AppError::ClusterTaskConflict { task: row.id });
-            }
-
-            let project_root = find_project_root(&row.cwd);
-            self.insert_task_with_project_root(row, project_root.as_deref())?;
-            let route = OriginRoute {
-                request: RequestId::new(), task: row.id, origin_machine: machine,
-                execution_machine: machine, thread: row.thread,
-                callback: CallbackContext {
-                    env: row.env.clone(),
-                    cwd: row.cwd.clone(),
-                    codex: codex.into(),
-                },
-                spec: spec.clone().into(), submission: SubmissionState::Accepted,
-                last_execution_state: Some(ProcessStatus::Queued),
-                last_updated_at: Some(chrono::Utc::now()),
-                last_accepted_seq: 0, last_settled_seq: 0,
-            };
-            let identity = ExecutorIdentity::Accepted(ExecutionRecord {
-                task: row.id, origin_machine: machine, execution_machine: machine,
-                spec: spec.clone().into(), state: ProcessStatus::Queued,
-            });
-            self.conn.execute(
-                "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json) VALUES (?1,?2,?3,?4,?5)",
-                params![route.request.0.to_string(), row.id.to_string(), machine.to_string(), serde_json::to_string(&route.spec)?, serde_json::to_string(&route)?],
-            )?;
-            self.conn.execute(
-                "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
-                params![row.id.to_string(), machine.to_string(), serde_json::to_string(&identity)?],
-            )?;
-            self.append_produced_event(row.id, EventPayload::State { status: ProcessStatus::Queued })?;
-            Ok(())
+            insert_local_task_records_on(
+                &self.conn,
+                row,
+                spec,
+                machine,
+                RequestId::new(),
+                &callback,
+                None,
+            )
         })
     }
 
@@ -920,6 +1122,16 @@ impl Store {
                 route.validate().map_err(|error| AppError::Internal {
                     message: format!("invalid saved origin route: {error}"),
                 })?;
+                let accepted_submission = match &route.submission {
+                    SubmissionState::Accepted => true,
+                    SubmissionState::Resource { phase, .. } => matches!(
+                        phase,
+                        ResourceRoutePhase::AcceptanceUnknown
+                            | ResourceRoutePhase::Waiting
+                            | ResourceRoutePhase::Activated
+                    ),
+                    _ => false,
+                };
                 record.task == id
                     && route.task == id
                     && route.origin_machine == route.execution_machine
@@ -927,7 +1139,7 @@ impl Store {
                     && record.execution_machine == route.execution_machine
                     && record.has_valid_spec_owners()
                     && serde_json::to_value(&record.spec)? == serde_json::to_value(&route.spec)?
-                    && matches!(route.submission, SubmissionState::Accepted)
+                    && accepted_submission
             }
             (ExecutorIdentity::Accepted(record), None) => {
                 record.task == id
@@ -955,6 +1167,16 @@ impl Store {
     /// Require a task row.
     pub fn require_task(&self, id: TaskId) -> Result<TaskRow, AppError> {
         self.get_task(id)?.ok_or(AppError::TaskNotFound { id })
+    }
+
+    /// Read process-group evidence for one exact task identity.
+    pub(crate) fn process_group_exit_evidence(
+        &self,
+        id: TaskId,
+    ) -> Result<Option<ProcessGroupExitEvidence>, AppError> {
+        Ok(self
+            .get_task(id)?
+            .map(|row| row.process_group_exit_evidence()))
     }
 
     /// List tasks, optionally filtered.
@@ -1389,9 +1611,40 @@ impl Store {
         from: ProcessStatus,
         reason: &ExitReason,
     ) -> Result<Option<TaskRow>, AppError> {
+        let evidence = if from == ProcessStatus::Queued {
+            ProcessGroupExitEvidence::NoChildSpawned
+        } else {
+            ProcessGroupExitEvidence::Unconfirmed
+        };
+        self.cas_exit_with_evidence(id, from, reason, evidence)
+    }
+
+    /// CAS terminal state and persist evidence from the task-run worker or its exit-file recovery.
+    pub(crate) fn cas_exit_with_evidence(
+        &self,
+        id: TaskId,
+        from: ProcessStatus,
+        reason: &ExitReason,
+        evidence: ProcessGroupExitEvidence,
+    ) -> Result<Option<TaskRow>, AppError> {
+        if evidence == ProcessGroupExitEvidence::ConfirmedExited && from != ProcessStatus::Running {
+            return Err(AppError::Internal {
+                message: "confirmed process-group exit requires a running task worker".into(),
+            });
+        }
+        // a worker that won Queued->Running may already have spawned, so only its
+        // own pre-spawn failure can claim that no child exists
+        if evidence == ProcessGroupExitEvidence::NoChildSpawned
+            && from != ProcessStatus::Queued
+            && !matches!(reason, ExitReason::SpawnFailed { .. })
+        {
+            return Err(AppError::Internal {
+                message: "no-child evidence after start requires a spawn failure".into(),
+            });
+        }
         let to = ProcessStatus::from(reason);
         check_status_transition(from, to)?;
-        self.immediate(|| self.cas_exit_inner(id, from, reason))
+        self.immediate(|| self.cas_exit_inner(id, from, reason, evidence))
     }
 
     fn cas_exit_inner(
@@ -1399,14 +1652,23 @@ impl Store {
         id: TaskId,
         from: ProcessStatus,
         reason: &ExitReason,
+        evidence: ProcessGroupExitEvidence,
     ) -> Result<Option<TaskRow>, AppError> {
         let to = ProcessStatus::from(reason);
         let now = fmt_time(Utc::now());
         let reason_json = serde_json::to_string(reason)?;
         let n = self.conn.execute(
-            "UPDATE tasks SET status = ?1, exit_reason = ?2, updated_at = ?3
-             WHERE id = ?4 AND status = ?5",
-            params![to.as_str(), reason_json, now, id.to_string(), from.as_str()],
+            "UPDATE tasks SET status = ?1, exit_reason = ?2,
+                process_group_exit_evidence = ?3, updated_at = ?4
+             WHERE id = ?5 AND status = ?6",
+            params![
+                to.as_str(),
+                reason_json,
+                evidence.as_str(),
+                now,
+                id.to_string(),
+                from.as_str()
+            ],
         )?;
         let row = self.row_after_cas(id, n)?;
         if let Some(row) = &row {
@@ -1480,9 +1742,12 @@ impl Store {
                  WHERE id = ?2 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')",
                 params![fmt_time(Utc::now()), id.to_string()],
             )?;
-            if let Some(row) =
-                self.cas_exit_inner(id, ProcessStatus::Queued, &ExitReason::Cancelled)?
-            {
+            if let Some(row) = self.cas_exit_inner(
+                id,
+                ProcessStatus::Queued,
+                &ExitReason::Cancelled,
+                ProcessGroupExitEvidence::NoChildSpawned,
+            )? {
                 return Ok(CancelResult::CancelledQueued(row));
             }
             let row = self.require_task(id)?;
@@ -1775,6 +2040,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let cancel_requested_at: Option<String> = row.get(15)?;
     let created_at: String = row.get(16)?;
     let updated_at: String = row.get(17)?;
+    let process_group_exit_evidence: Option<String> = row.get(18)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
@@ -1802,6 +2068,14 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         None => None,
     };
     let status = ProcessStatus::from_storage(&status).map_err(parse_err)?;
+    let process_group_exit_evidence = match status {
+        ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled => {
+            ProcessGroupExitEvidence::from_storage(process_group_exit_evidence.as_deref())
+        }
+        ProcessStatus::Queued | ProcessStatus::Running | ProcessStatus::Lost => {
+            ProcessGroupExitEvidence::Unconfirmed
+        }
+    };
     let callback_status = CallbackStatus::from_storage(&callback_status).map_err(parse_err)?;
     let timeout_notified_at = match timeout_notified_at {
         Some(raw) => Some(parse_time(&raw).map_err(parse_err)?),
@@ -1826,6 +2100,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         },
         binary: Path::new(&binary).to_path_buf(),
         state: TaskState::from_storage(status, exit_reason, pid).map_err(parse_err)?,
+        process_group_exit_evidence,
         callback_status,
         attention,
         cancel_requested_at,
@@ -1868,6 +2143,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         env: new.env,
         binary: new.binary,
         state: TaskState::Queued,
+        process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         callback_status: CallbackStatus::Pending,
         attention: AttentionState::Pending,
         cancel_requested_at: None,
@@ -1881,6 +2157,9 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
 pub struct ExitJson {
     /// Exit reason.
     pub reason: ExitReason,
+    /// Evidence for the task-run worker's child process group.
+    #[serde(default)]
+    pub process_group_exit_evidence: ProcessGroupExitEvidence,
 }
 
 /// Parse `exit.json` if present.
@@ -1898,9 +2177,18 @@ pub fn read_exit_json(path: &Path) -> Result<Option<ExitJson>, AppError> {
 
 /// Write `exit.json` via temp + rename.
 pub fn write_exit_json(path: &Path, reason: &ExitReason) -> Result<(), AppError> {
+    write_exit_json_with_evidence(path, reason, ProcessGroupExitEvidence::Unconfirmed)
+}
+
+pub(crate) fn write_exit_json_with_evidence(
+    path: &Path,
+    reason: &ExitReason,
+    process_group_exit_evidence: ProcessGroupExitEvidence,
+) -> Result<(), AppError> {
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(&ExitJson {
         reason: reason.clone(),
+        process_group_exit_evidence,
     })?;
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)?;
@@ -1981,6 +2269,188 @@ mod tests {
         store
             .insert_local_task(&row, &spec, MachineId::new(), Path::new("/bin/true").into())
             .unwrap();
+    }
+
+    #[test]
+    fn terminal_process_group_evidence_survives_restart_with_its_event() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            store
+                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+                .unwrap();
+            store
+                .cas_exit_with_evidence(
+                    id,
+                    ProcessStatus::Running,
+                    &ExitReason::Exit { code: 0 },
+                    ProcessGroupExitEvidence::ConfirmedExited,
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let row = store.require_task(id).unwrap();
+        assert_eq!(row.status(), ProcessStatus::Succeeded);
+        assert_eq!(
+            row.process_group_exit_evidence(),
+            ProcessGroupExitEvidence::ConfirmedExited
+        );
+        assert_eq!(
+            store.process_group_exit_evidence(id).unwrap(),
+            Some(ProcessGroupExitEvidence::ConfirmedExited)
+        );
+        let terminal_events = store
+            .pending_outbound_events(id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.event.payload,
+                    EventPayload::Callback {
+                        state: Some(ProcessStatus::Succeeded),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(terminal_events, 1);
+    }
+
+    #[test]
+    fn terminal_evidence_rolls_back_when_its_event_cannot_commit() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("db")).unwrap();
+        let id = TaskId::new();
+        insert_local(&store, id);
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_terminal_event BEFORE INSERT ON executor_outbox
+                 WHEN NEW.seq = 3
+                 BEGIN SELECT RAISE(ABORT, 'terminal event unavailable'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .cas_exit_with_evidence(
+                    id,
+                    ProcessStatus::Running,
+                    &ExitReason::Exit { code: 0 },
+                    ProcessGroupExitEvidence::ConfirmedExited,
+                )
+                .is_err()
+        );
+
+        let row = store.require_task(id).unwrap();
+        assert_eq!(row.status(), ProcessStatus::Running);
+        assert_eq!(row.exit_reason(), None);
+        assert_eq!(
+            row.process_group_exit_evidence(),
+            ProcessGroupExitEvidence::Unconfirmed
+        );
+        assert_eq!(store.pending_outbound_events(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn queued_cancel_records_that_no_child_was_spawned() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_task(&agent_row(id)).unwrap();
+            let CancelResult::CancelledQueued(row) = store.request_cancel(id).unwrap() else {
+                panic!("queued task should cancel before a worker can spawn its child");
+            };
+            assert_eq!(
+                row.process_group_exit_evidence(),
+                ProcessGroupExitEvidence::NoChildSpawned
+            );
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.process_group_exit_evidence(id).unwrap(),
+            Some(ProcessGroupExitEvidence::NoChildSpawned)
+        );
+    }
+
+    #[test]
+    fn old_exit_json_and_database_rows_remain_unconfirmed() {
+        let directory = tempdir().unwrap();
+        let exit_path = directory.path().join("exit.json");
+        std::fs::write(&exit_path, r#"{"reason":{"kind":"exit","code":0}}"#).unwrap();
+        let old_exit = read_exit_json(&exit_path).unwrap().unwrap();
+        assert_eq!(old_exit.reason, ExitReason::Exit { code: 0 });
+        assert_eq!(
+            old_exit.process_group_exit_evidence,
+            ProcessGroupExitEvidence::Unconfirmed
+        );
+
+        let path = directory.path().join("old-db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_task(&agent_row(id)).unwrap();
+            store
+                .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE tasks SET process_group_exit_evidence = NULL WHERE id = ?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE tasks DROP COLUMN process_group_exit_evidence;
+                     PRAGMA user_version = 16;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let row = store.require_task(id).unwrap();
+        assert_eq!(row.status(), ProcessStatus::Cancelled);
+        assert_eq!(row.exit_reason(), Some(&ExitReason::Cancelled));
+        assert_eq!(
+            row.process_group_exit_evidence(),
+            ProcessGroupExitEvidence::Unconfirmed
+        );
+        assert_eq!(
+            store.process_group_exit_evidence(id).unwrap(),
+            Some(ProcessGroupExitEvidence::Unconfirmed)
+        );
+    }
+
+    #[test]
+    fn exit_json_round_trips_typed_process_group_evidence() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("exit.json");
+        write_exit_json_with_evidence(
+            &path,
+            &ExitReason::Cancelled,
+            ProcessGroupExitEvidence::ConfirmedExited,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_exit_json(&path)
+                .unwrap()
+                .unwrap()
+                .process_group_exit_evidence,
+            ProcessGroupExitEvidence::ConfirmedExited
+        );
     }
 
     fn deliver_outbound_events(
@@ -3006,14 +3476,95 @@ CREATE TABLE reports (
         assert_foreign_keys_enabled(&store);
     }
 
+    #[test]
+    fn migrate_schema_20_checkpoint_phase_constraint_for_cancellation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP INDEX resource_release_checkpoint_states_resource;
+                     ALTER TABLE resource_release_checkpoint_states
+                         RENAME TO resource_release_checkpoint_states_v21;
+                     CREATE TABLE resource_release_checkpoint_states (
+                         action_id TEXT PRIMARY KEY,
+                         resource_id TEXT NOT NULL REFERENCES resources(id),
+                         state_json TEXT NOT NULL CHECK (
+                             json_valid(state_json)
+                             AND COALESCE(json_type(state_json) = 'object', 0)
+                             AND COALESCE(json_type(state_json, '$.action') = 'object', 0)
+                             AND COALESCE(json_type(state_json, '$.phase') = 'object', 0)
+                             AND COALESCE(json_extract(state_json, '$.action.action_id') = action_id, 0)
+                             AND COALESCE(json_extract(state_json, '$.action.resource_id') = resource_id, 0)
+                             AND COALESCE(json_extract(state_json, '$.phase.type') IN (
+                                 'watcher_binding_pending', 'baseline_captured', 'stop_reserved'
+                             ), 0)
+                         )
+                     );
+                     INSERT INTO resource_release_checkpoint_states
+                         (action_id, resource_id, state_json)
+                     SELECT action_id, resource_id, state_json
+                     FROM resource_release_checkpoint_states_v21;
+                     DROP TABLE resource_release_checkpoint_states_v21;
+                     CREATE INDEX resource_release_checkpoint_states_resource
+                         ON resource_release_checkpoint_states(resource_id, action_id);
+                     PRAGMA user_version = 20;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let resource = uuid::Uuid::now_v7().to_string();
+        let machine = uuid::Uuid::now_v7().to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO resources (
+                    id, display_name, authority_machine, supervisor_machine,
+                    supervisor_thread, assignment_revision, state_revision,
+                    registered_background_task
+                 ) VALUES (?1, 'gpu-migration', ?2, ?2, ?3, 0, 0, NULL)",
+                params![resource, machine, uuid::Uuid::now_v7().to_string()],
+            )
+            .unwrap();
+        let action = "checkpoint-cancellation-migration";
+        store
+            .conn
+            .execute(
+                "INSERT INTO resource_release_checkpoint_states
+                    (action_id, resource_id, state_json)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    action,
+                    resource,
+                    serde_json::json!({
+                        "action": { "action_id": action, "resource_id": resource },
+                        "phase": { "type": "cancellation_committed" }
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+    }
+
     fn assert_resource_tables_installed(store: &Store) {
         for table in [
             "resources",
+            "trainer_attempt_associations",
             "resource_requests",
             "resource_request_preventions",
+            "resource_cancellation_receipts",
             "loans",
             "resource_supervisor_notices",
             "resource_release_completions",
+            "resource_release_checkpoint_states",
         ] {
             let exists: bool = store
                 .conn
@@ -3025,6 +3576,27 @@ CREATE TABLE reports (
                 .unwrap();
             assert!(exists, "resource table {table} was not installed");
         }
+
+        let resource_primary_key: i64 = store
+            .conn
+            .query_row(
+                "SELECT pk FROM pragma_table_info('trainer_attempt_associations')
+                 WHERE name='resource_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let task_primary_key: i64 = store
+            .conn
+            .query_row(
+                "SELECT pk FROM pragma_table_info('trainer_attempt_associations')
+                 WHERE name='task_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resource_primary_key, 0);
+        assert_eq!(task_primary_key, 1);
     }
 
     #[test]
@@ -3077,6 +3649,58 @@ CREATE TABLE reports (
             )
             .unwrap();
         assert_eq!(preserved, ("gpu-preserved".into(), 4, 9));
+    }
+
+    #[test]
+    fn migrate_version_15_installs_resource_cancellation_receipts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let resource_id = uuid::Uuid::now_v7();
+        let authority = uuid::Uuid::now_v7();
+        let supervisor_thread = uuid::Uuid::now_v7();
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO resources (
+                        id, display_name, authority_machine, supervisor_machine,
+                        supervisor_thread, assignment_revision, state_revision,
+                        registered_background_task
+                    ) VALUES (?1, 'gpu-before-migration', ?2, ?2, ?3, 2, 5, NULL)",
+                    params![
+                        resource_id.to_string(),
+                        authority.to_string(),
+                        supervisor_thread.to_string(),
+                    ],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE resource_cancellation_receipts;
+                     PRAGMA user_version = 15;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_resource_tables_installed(&store);
+        let preserved: (String, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT display_name, assignment_revision, state_revision
+                 FROM resources WHERE id = ?1",
+                [resource_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, ("gpu-before-migration".into(), 2, 5));
     }
 
     #[test]

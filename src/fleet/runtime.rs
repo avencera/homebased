@@ -97,6 +97,7 @@ struct Shared {
     advertisement: MachineAdvertisement,
     directory: RwLock<PeerDirectory>,
     local_status: RwLock<LocalIdentityStatus>,
+    local_recovery: Mutex<identity::LocalDuplicateRecovery>,
     client: ClusterClient,
     peers_path: PathBuf,
     timings: RuntimeTimings,
@@ -149,6 +150,7 @@ impl FleetRuntime {
             advertisement,
             directory: RwLock::new(directory),
             local_status: RwLock::new(LocalIdentityStatus::Consistent),
+            local_recovery: Mutex::new(identity::LocalDuplicateRecovery::default()),
             client: ClusterClient::default(),
             peers_path,
             timings,
@@ -458,6 +460,10 @@ impl FleetHandle {
 
     async fn run_round(&self) -> RoundReport {
         let _round = self.shared.round.lock().await;
+        let local_duplicate = matches!(
+            *self.shared.local_status.read().await,
+            LocalIdentityStatus::DuplicateMachineIdentity { .. }
+        );
         let candidates = self
             .shared
             .directory
@@ -471,13 +477,31 @@ impl FleetHandle {
             ..RoundReport::default()
         };
         let duplicates = self.shared.directory.read().await.duplicates();
-        let suspects = identity::suspects(&first, &self.shared.local.identity, &duplicates);
+        let mut known_duplicates = duplicates;
+        if local_duplicate {
+            known_duplicates.insert(self.shared.local.identity.machine);
+        }
+        let suspects = identity::suspects(&first, &self.shared.local.identity, &known_duplicates);
         if !suspects.is_empty() {
             report.suspects = suspects.iter().copied().collect();
             tokio::time::sleep(self.shared.timings.recheck_delay).await;
-            let recheck = identity::recheck_addresses(&first, &suspects);
-            let second = self.probe_all(recheck.into_iter().collect()).await;
-            report.duplicates = self.decide(&suspects, &first, &second).await;
+            let recheck = if local_duplicate {
+                candidates.clone()
+            } else {
+                identity::recheck_addresses(&first, &suspects)
+                    .into_iter()
+                    .collect()
+            };
+            let second = self.probe_all(recheck).await;
+            report.duplicates = self
+                .decide(
+                    &suspects,
+                    &first,
+                    &second,
+                    local_duplicate,
+                    candidates.len(),
+                )
+                .await;
         }
         self.shared.directory.write().await.prune(Utc::now());
         self.persist().await;
@@ -489,6 +513,8 @@ impl FleetHandle {
         suspects: &BTreeSet<MachineId>,
         first: &[ProbeObservation],
         second: &[ProbeObservation],
+        local_duplicate: bool,
+        candidate_count: usize,
     ) -> Vec<MachineId> {
         let local = self.shared.local.identity;
         let now = Utc::now();
@@ -500,7 +526,12 @@ impl FleetHandle {
                 warn!(%machine, ?boots, "duplicate live machine identity");
             }
             if *machine == local.machine {
-                self.apply_local_verdict(verdict, now).await;
+                if local_duplicate {
+                    self.apply_local_recovery(first, second, candidate_count, now)
+                        .await;
+                } else {
+                    self.apply_local_verdict(verdict, now).await;
+                }
                 continue;
             }
             self.shared
@@ -516,6 +547,7 @@ impl FleetHandle {
         let IdentityVerdict::Duplicate { boots } = verdict else {
             return;
         };
+        self.shared.local_recovery.lock().await.reset();
         error!(
             machine = %self.shared.local.identity.machine,
             "another live daemon claims this machine UUID; give the copied installation a fresh state directory"
@@ -524,6 +556,35 @@ impl FleetHandle {
             boots,
             detected_at: now,
         };
+    }
+
+    async fn apply_local_recovery(
+        &self,
+        first: &[ProbeObservation],
+        second: &[ProbeObservation],
+        candidate_count: usize,
+        now: DateTime<Utc>,
+    ) {
+        let verdict = self.shared.local_recovery.lock().await.observe(
+            first,
+            second,
+            &self.shared.local.identity,
+            candidate_count,
+        );
+        match verdict {
+            identity::LocalRecoveryVerdict::Duplicate { boots } => {
+                self.apply_local_verdict(IdentityVerdict::Duplicate { boots }, now)
+                    .await;
+            }
+            identity::LocalRecoveryVerdict::Inconclusive => {}
+            identity::LocalRecoveryVerdict::Recovered => {
+                *self.shared.local_status.write().await = LocalIdentityStatus::Consistent;
+                info!(
+                    machine = %self.shared.local.identity.machine,
+                    "duplicate local machine identity cleared after repeated probe absence"
+                );
+            }
+        }
     }
 
     /// Probe addresses concurrently, record every result, and return the
@@ -590,4 +651,142 @@ pub fn log_start(local: &LocalMachine, listener: Option<SocketAddr>) {
         listener = listener.map(|addr| addr.to_string()).as_deref().unwrap_or("off"),
         "fleet enabled"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::advertisement::MachineHeader;
+    use crate::fleet::directory::PeerDirectory;
+    use crate::fleet::identity::LocalRecoveryVerdict;
+    use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+
+    fn local() -> LocalMachine {
+        LocalMachine {
+            identity: crate::machine::LocalIdentity {
+                machine: MachineId::new(),
+                boot: BootId::new(),
+            },
+            name: MachineName::parse("main").unwrap(),
+            protocol: SUPPORTED_PROTOCOLS,
+        }
+    }
+
+    fn handle(local: LocalMachine) -> FleetHandle {
+        let directory = PeerDirectory::new(local.clone());
+        let advertisement = MachineAdvertisement {
+            api_version: crate::domain::API_VERSION,
+            machine: local.identity.machine,
+            boot: local.identity.boot,
+            name: local.name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: local.protocol,
+            capabilities: Capabilities {
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                agents: Vec::new(),
+            },
+            addresses: Vec::new(),
+        };
+        FleetHandle {
+            shared: Arc::new(Shared {
+                local,
+                advertisement,
+                directory: RwLock::new(directory),
+                local_status: RwLock::new(LocalIdentityStatus::Consistent),
+                local_recovery: Mutex::new(identity::LocalDuplicateRecovery::default()),
+                client: ClusterClient::default(),
+                peers_path: PathBuf::new(),
+                timings: RuntimeTimings::default(),
+                wake: Notify::new(),
+                round: Mutex::new(()),
+            }),
+        }
+    }
+
+    fn observation(local: &LocalMachine, boot: BootId, address: &str) -> ProbeObservation {
+        ProbeObservation {
+            address: address.parse().unwrap(),
+            header: MachineHeader {
+                machine: local.identity.machine,
+                boot,
+                name: local.name.clone(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol: local.protocol,
+            },
+            observed_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_duplicate_recovers_and_blocks_again_on_reappearance() {
+        let local = local();
+        let handle = handle(local.clone());
+        let foreign = BootId::new();
+        let duplicate = identity::confirm(
+            local.identity.machine,
+            &[
+                observation(&local, local.identity.boot, "http://10.0.0.1:7677"),
+                observation(&local, foreign, "http://10.0.0.9:7677"),
+            ],
+            &[
+                observation(&local, local.identity.boot, "http://10.0.0.1:7677"),
+                observation(&local, foreign, "http://10.0.0.9:7677"),
+            ],
+            &local.identity,
+        );
+        assert_eq!(
+            duplicate,
+            IdentityVerdict::Duplicate {
+                boots: BTreeSet::from([foreign])
+            }
+        );
+        handle.apply_local_verdict(duplicate, Utc::now()).await;
+        assert!(matches!(
+            handle.local_identity_status().await,
+            LocalIdentityStatus::DuplicateMachineIdentity { .. }
+        ));
+
+        let absent = &[];
+        let now = Utc::now();
+        handle.apply_local_recovery(absent, absent, 1, now).await;
+        assert!(matches!(
+            handle.local_identity_status().await,
+            LocalIdentityStatus::DuplicateMachineIdentity { .. }
+        ));
+
+        handle.apply_local_recovery(absent, absent, 1, now).await;
+        assert_eq!(
+            handle.local_identity_status().await,
+            LocalIdentityStatus::Consistent
+        );
+
+        let clone = observation(&local, foreign, "http://10.0.0.9:7677");
+        let reappeared = identity::confirm(
+            local.identity.machine,
+            std::slice::from_ref(&clone),
+            std::slice::from_ref(&clone),
+            &local.identity,
+        );
+        let IdentityVerdict::Duplicate { boots } = reappeared else {
+            panic!("a reappearing live clone must remain blocked");
+        };
+        assert_eq!(boots, BTreeSet::from([foreign]));
+        handle
+            .apply_local_verdict(IdentityVerdict::Duplicate { boots }, now)
+            .await;
+        assert!(matches!(
+            handle.local_identity_status().await,
+            LocalIdentityStatus::DuplicateMachineIdentity { .. }
+        ));
+        assert_eq!(
+            handle
+                .shared
+                .local_recovery
+                .lock()
+                .await
+                .observe(absent, absent, &local.identity, 1),
+            LocalRecoveryVerdict::Inconclusive
+        );
+    }
 }

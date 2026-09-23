@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod fleet;
 pub mod message;
+pub mod release_watcher;
 pub mod task;
 pub mod update;
 
@@ -94,6 +95,9 @@ pub enum Command {
     Update(update::UpdateArgs),
     /// Print the version.
     Version,
+    /// Hidden authority-bound resource release watcher run as one task.
+    #[command(name = "resource-release-watcher", hide = true)]
+    ResourceReleaseWatcher(release_watcher::ReleaseWatcherArgs),
     /// Hidden worker parent of one agent.
     #[command(name = "task-run", hide = true)]
     TaskRun {
@@ -250,6 +254,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Message { command } => message::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
+        Command::ResourceReleaseWatcher(args) => release_watcher::run(&ctx, args).await,
         Command::Version => {
             version(&ctx)?;
             Ok(ExitCode::SUCCESS)

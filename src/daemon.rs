@@ -11,6 +11,7 @@ mod inspection;
 pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
+mod release_watcher_api;
 mod resource_notice_delivery;
 pub(crate) mod resource_notice_sender;
 #[expect(
@@ -124,6 +125,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         state.fleet.clone(),
     ));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
+    let resource_recovery = tokio::spawn(resource_submit::recover(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let notice_delivery = tokio::spawn(resource_notice_delivery::run(state.clone()));
     // listeners share one shutdown: the signal task flips the flag once
@@ -164,6 +166,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     }
     sender.abort();
     recovery.abort();
+    resource_recovery.abort();
     cancellation.abort();
     notice_delivery.abort();
     if !supervisor_died {

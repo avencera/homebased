@@ -718,30 +718,85 @@ impl Store {
         task: TaskId,
         payload: EventPayload,
     ) -> Result<(), AppError> {
-        let identity: String = self.conn.query_row(
-            "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-            [task.to_string()],
-            |row| row.get(0),
-        )?;
-        let ExecutorIdentity::Accepted(record) = serde_json::from_str(&identity)? else {
-            return Err(AppError::ClusterTaskConflict { task });
-        };
-        append_outbound_event_on(
-            &self.conn,
-            task,
-            record.origin_machine,
-            record.execution_machine,
-            payload,
-        )
-        .map_err(|error| match error {
-            EventError::Storage(error) => error,
-            EventError::OwnerConflict { task } => AppError::ClusterTaskConflict { task },
-            other => AppError::Internal {
-                message: other.to_string(),
-            },
-        })?;
-        Ok(())
+        append_produced_event_on(&self.conn, task, payload)
     }
+}
+
+pub(super) fn append_produced_event_on(
+    conn: &Connection,
+    task: TaskId,
+    payload: EventPayload,
+) -> Result<(), AppError> {
+    let identity: String = conn.query_row(
+        "SELECT identity_json FROM executor_identities WHERE task_id=?1",
+        [task.to_string()],
+        |row| row.get(0),
+    )?;
+    let ExecutorIdentity::Accepted(record) = serde_json::from_str(&identity)? else {
+        return Err(AppError::ClusterTaskConflict { task });
+    };
+    append_outbound_event_on(
+        conn,
+        task,
+        record.origin_machine,
+        record.execution_machine,
+        payload,
+    )
+    .map_err(|error| match error {
+        EventError::Storage(error) => error,
+        EventError::OwnerConflict { task } => AppError::ClusterTaskConflict { task },
+        other => AppError::Internal {
+            message: other.to_string(),
+        },
+    })?;
+    Ok(())
+}
+
+pub(super) fn initial_queued_event_matches_on(
+    conn: &Connection,
+    task: TaskId,
+    origin_machine: MachineId,
+    execution_machine: MachineId,
+) -> Result<bool, EventError> {
+    let expected = TaskEvent {
+        task,
+        seq: NonZeroU64::MIN,
+        origin_machine,
+        execution_machine,
+        payload: EventPayload::State {
+            status: crate::domain::ProcessStatus::Queued,
+        },
+    };
+
+    let outbox: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT event_json, notification_required FROM executor_outbox
+             WHERE task_id=?1 AND seq=1",
+            [task.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some((event_json, notification_required)) = outbox {
+        let event: TaskEvent = decode(&event_json)?;
+        validate(&event)?;
+        return Ok(event == expected && !notification_required);
+    }
+
+    let receipt: Option<(String, String)> = conn
+        .query_row(
+            "SELECT event_digest, result_json FROM executor_event_receipts
+             WHERE task_id=?1 AND seq=1",
+            [task.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some((saved_digest, result_json)) = receipt else {
+        return Ok(false);
+    };
+    Ok(saved_digest == event_digest(&expected)?
+        && result_json == encode(&OutboxState::Acknowledged)?)
 }
 
 fn append_outbound_event_on(

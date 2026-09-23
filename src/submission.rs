@@ -349,20 +349,44 @@ pub fn normalized_spec_sha256(
     Ok(NormalizedSpecSha256(Sha256::digest(encoded).into()))
 }
 
-/// A definitive authority result that prevents activation of a resource task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Why a resource request is no longer eligible for pre-activation cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceCancellationIneligibleReason {
+    /// The authority accepted the execution task before cancellation won.
+    Activated,
+    /// The authority rejected the resource request before activation.
+    Rejected {
+        /// Durable authority rejection reason.
+        reason: String,
+    },
+    /// The resource request reached a terminal state before cancellation won.
+    Terminal,
+}
+
+/// A definitive authority result for one resource cancellation attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceCancellationOutcome {
     /// The authority retained a prevention record before queue acceptance.
     PreventedBeforeAcceptance,
     /// The authority cancelled the queued request before task activation.
     CancelledBeforeLaunch,
+    /// The request no longer supports a claim that cancellation prevented launch.
+    NotEligible {
+        /// Exact authority-side reason that prevented pre-activation cancellation.
+        reason: ResourceCancellationIneligibleReason,
+    },
 }
 
 /// Definitive cancellation response bound to the exact resource route identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceCancellationReceipt {
+    /// Origin-owned cancellation identity.
+    pub cancellation: Uuid,
+    /// Machine that persisted the cancellation intent.
+    pub requester_machine: MachineId,
     /// Caller retry UUID.
     pub request: RequestId,
     /// Preallocated global task UUID.
@@ -373,6 +397,8 @@ pub struct ResourceCancellationReceipt {
     pub authority_machine: MachineId,
     /// Resource that owns the waiting request.
     pub resource: ResourceId,
+    /// Resource route phase captured when the origin persisted the intent.
+    pub target_phase: ResourceRoutePhase,
     /// Definitive pre-activation result.
     pub outcome: ResourceCancellationOutcome,
 }

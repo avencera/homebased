@@ -362,7 +362,7 @@ pub struct MessageSendResponse {
 pub struct MessageRequest {
     /// Public API schema version.
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version used for this wire attempt.
     pub protocol_version: u32,
     /// Stable identity reused for every explicit retry.
     pub message_id: MessageId,
@@ -380,7 +380,33 @@ pub struct MessageRequest {
     pub conversation_id: Uuid,
 }
 
+/// Semantic request identity, excluding only the negotiated wire protocol version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessageIdentity {
+    api_version: u32,
+    message_id: MessageId,
+    destination_machine: MachineId,
+    source: MessageSource,
+    recipient: Recipient,
+    body: String,
+    reply_to: Option<MessageId>,
+    conversation_id: Uuid,
+}
+
 impl MessageRequest {
+    pub(crate) fn identity(&self) -> MessageIdentity {
+        MessageIdentity {
+            api_version: self.api_version,
+            message_id: self.message_id,
+            destination_machine: self.destination_machine,
+            source: self.source.clone(),
+            recipient: self.recipient.clone(),
+            body: semantic_body(&self.source, &self.body),
+            reply_to: self.reply_to,
+            conversation_id: self.conversation_id,
+        }
+    }
+
     /// Reject invalid body text and unsupported receiver-side cwd forms.
     pub fn validate(&self) -> Result<(), AppError> {
         if self.api_version != crate::domain::API_VERSION {
@@ -429,6 +455,21 @@ impl MessageRequest {
         }
         Ok(())
     }
+}
+
+fn semantic_body(source: &MessageSource, body: &str) -> String {
+    if !matches!(source, MessageSource::ResourceNotice { .. }) {
+        return body.to_string();
+    }
+
+    // Supervisor notices embed the wire version in their serialized backing body
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.remove("protocol_version");
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
 }
 
 fn validate_body(body: &str) -> Result<(), AppError> {
@@ -504,13 +545,41 @@ mod tests {
             Err(AppError::MessageInvalid { .. })
         ));
     }
+
+    #[test]
+    fn semantic_identity_ignores_the_notice_wire_version_only() {
+        let mut request = MessageRequest {
+            api_version: API_VERSION,
+            protocol_version: 1,
+            message_id: MessageId::new(),
+            destination_machine: MachineId::new(),
+            source: MessageSource::ResourceNotice {
+                machine: MachineId::new(),
+                notice_id: NoticeId::new(),
+            },
+            recipient: Recipient::Thread {
+                thread: ThreadId(Uuid::now_v7()),
+            },
+            body: serde_json::json!({"protocol_version": 1, "reason": "review"}).to_string(),
+            reply_to: None,
+            conversation_id: Uuid::now_v7(),
+        };
+        let identity = request.identity();
+
+        request.protocol_version = 2;
+        request.body = serde_json::json!({"protocol_version": 2, "reason": "review"}).to_string();
+        assert_eq!(request.identity(), identity);
+
+        request.body = serde_json::json!({"protocol_version": 2, "reason": "changed"}).to_string();
+        assert_ne!(request.identity(), identity);
+    }
 }
 
 /// Durable binding between a message request and its resolved local destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageAttempt {
-    /// Immutable request content used for conflict checks.
+    /// Immutable semantic content with the latest accepted wire protocol version.
     pub request: MessageRequest,
     /// Resolved local destination thread.
     pub destination_thread: ThreadId,
@@ -537,6 +606,15 @@ pub struct MessageReceipt {
     pub destination_cwd: PathBuf,
     /// Time when the receiver committed this receipt.
     pub delivered_at: DateTime<Utc>,
+}
+
+impl MessageReceipt {
+    pub(crate) fn for_protocol_version(&self, protocol_version: u32) -> Self {
+        Self {
+            protocol_version,
+            ..self.clone()
+        }
+    }
 }
 
 /// Persisted attempt and optional receipt for one message UUID.

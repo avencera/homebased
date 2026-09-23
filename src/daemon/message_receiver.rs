@@ -1,14 +1,15 @@
 //! Fleet endpoint work for durable direct-message and supervisor-notice delivery.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::callback::{check_saved_callback, send_saved_queue_attempt};
@@ -28,16 +29,16 @@ const SESSION_META_MAX_BYTES: usize = 64 * 1024;
 const MESSAGE_PREFIX: &str = "HOMEBASED_MESSAGE ";
 const RESOURCE_NOTICE_PREFIX: &str = "HOMEBASED_RESOURCE_NOTICE ";
 
-/// One daemon-wide delivery permit prevents concurrent retries from queueing one UUID twice
+/// Per-message delivery permits prevent concurrent retries from queueing one UUID twice
 #[derive(Clone)]
 pub(crate) struct MessageReceiver {
-    attempts: Arc<Semaphore>,
+    attempts: Arc<Mutex<HashMap<MessageId, Weak<Mutex<()>>>>>,
 }
 
 impl Default for MessageReceiver {
     fn default() -> Self {
         Self {
-            attempts: Arc::new(Semaphore::new(1)),
+            attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -50,23 +51,32 @@ impl MessageReceiver {
         request: MessageRequest,
     ) -> Result<MessageReceipt, AppError> {
         request.validate()?;
-        let _attempt_permit = self.permit().await?;
+        let (_attempt_permit, attempt_was_contended) =
+            self.attempt_permit(request.message_id).await;
         let saved = call(&state.store, |reply| StoreMsg::MessageDelivery {
             id: request.message_id,
             reply,
         })
         .await?;
         let attempt = match saved.attempt {
-            Some(attempt) => {
-                if attempt.request != request {
+            Some(mut attempt) => {
+                if attempt.request.identity() != request.identity() {
                     return Err(AppError::MessageConflict {
                         id: request.message_id,
                     });
                 }
                 if let Some(receipt) = saved.receipt {
-                    return Ok(receipt);
+                    return Ok(receipt.for_protocol_version(request.protocol_version));
                 }
-                attempt
+                if attempt_was_contended {
+                    return Err(attempt_wait_failed(request.message_id));
+                }
+                attempt.request.protocol_version = request.protocol_version;
+                call(&state.store, |reply| StoreMsg::BindMessageAttempt {
+                    attempt,
+                    reply,
+                })
+                .await?
             }
             None => {
                 if saved.receipt.is_some() {
@@ -102,17 +112,17 @@ impl MessageReceiver {
             .machine
             .identity
             .check_destination(request.destination.machine)?;
-        let _attempt_permit = self.permit().await?;
         let backing_request = notice_backing_request(&request)?;
         let message_id = backing_request.message_id;
+        let (_attempt_permit, attempt_was_contended) = self.attempt_permit(message_id).await;
         let saved = call(&state.store, |reply| StoreMsg::MessageDelivery {
             id: message_id,
             reply,
         })
         .await?;
         let attempt = match saved.attempt {
-            Some(attempt) => {
-                if attempt.request != backing_request {
+            Some(mut attempt) => {
+                if attempt.request.identity() != backing_request.identity() {
                     return Err(AppError::MessageConflict { id: message_id });
                 }
                 if attempt.destination_thread != request.destination.thread {
@@ -121,9 +131,20 @@ impl MessageReceiver {
                     });
                 }
                 if let Some(receipt) = saved.receipt {
-                    return supervisor_notice_receipt(&request, receipt);
+                    return supervisor_notice_receipt(
+                        &request,
+                        receipt.for_protocol_version(request.protocol_version),
+                    );
                 }
-                attempt
+                if attempt_was_contended {
+                    return Err(attempt_wait_failed(message_id));
+                }
+                attempt.request = backing_request.clone();
+                call(&state.store, |reply| StoreMsg::BindMessageAttempt {
+                    attempt,
+                    reply,
+                })
+                .await?
             }
             None => {
                 if saved.receipt.is_some() {
@@ -182,13 +203,24 @@ impl MessageReceiver {
         supervisor_notice_receipt(&request, receipt)
     }
 
-    async fn permit(&self) -> Result<SemaphorePermit<'_>, AppError> {
-        self.attempts
-            .acquire()
-            .await
-            .map_err(|_| AppError::Internal {
-                message: "message delivery permit is closed".into(),
-            })
+    async fn attempt_permit(&self, id: MessageId) -> (OwnedMutexGuard<()>, bool) {
+        let lock = {
+            let mut attempts = self.attempts.lock().await;
+            attempts.retain(|_, lock| lock.strong_count() > 0);
+            attempts
+                .get(&id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lock = Arc::new(Mutex::new(()));
+                    attempts.insert(id, Arc::downgrade(&lock));
+                    lock
+                })
+        };
+
+        match lock.clone().try_lock_owned() {
+            Ok(permit) => (permit, false),
+            Err(_) => (lock.lock_owned().await, true),
+        }
     }
 
     async fn deliver(
@@ -347,6 +379,14 @@ fn delivery_failed(message_id: MessageId, error: impl std::fmt::Display) -> AppE
     AppError::MessageDeliveryFailed {
         id: message_id,
         message: "Codex queue attempt failed; retry the same message UUID explicitly".into(),
+    }
+}
+
+fn attempt_wait_failed(message_id: MessageId) -> AppError {
+    AppError::MessageDeliveryFailed {
+        id: message_id,
+        message: "another attempt completed without a receipt; retry the same UUID explicitly"
+            .into(),
     }
 }
 
@@ -545,11 +585,45 @@ fn session_unavailable(error: impl std::fmt::Display) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::domain::TaskId;
     use crate::machine::MachineId;
     use crate::message::MessageSource;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn different_message_ids_do_not_queue_behind_one_delivery_permit() {
+        let receiver = MessageReceiver::default();
+        let first_id = MessageId::new();
+        let second_id = MessageId::new();
+        let (first_permit, first_was_contended) = receiver.attempt_permit(first_id).await;
+        assert!(!first_was_contended);
+
+        let (second_permit, second_was_contended) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.attempt_permit(second_id))
+                .await
+                .unwrap();
+        assert!(!second_was_contended);
+        drop(second_permit);
+
+        let waiting_receiver = receiver.clone();
+        let (complete_tx, mut complete_rx) = tokio::sync::oneshot::channel();
+        let waiting_attempt = tokio::spawn(async move {
+            let (_permit, was_contended) = waiting_receiver.attempt_permit(first_id).await;
+            let _ = complete_tx.send(was_contended);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut complete_rx)
+                .await
+                .is_err()
+        );
+
+        drop(first_permit);
+        assert!(complete_rx.await.unwrap());
+        waiting_attempt.await.unwrap();
+    }
 
     #[test]
     fn queued_line_carries_the_message_route_and_body() {

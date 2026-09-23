@@ -9,7 +9,9 @@ use tokio::task::AbortHandle;
 
 use crate::callback::ATTENTION_SETTLE;
 use crate::daemon::actors::{StoreMsg, call};
-use crate::domain::{AttentionState, ExitReason, ProcessStatus, TaskId, TaskRow, TaskState};
+use crate::domain::{
+    AttentionState, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskState,
+};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::store::{self, CancelResult};
@@ -319,7 +321,9 @@ async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<(), AppError>
     }
     let paths = actor.home.task_paths(id);
     match store::read_exit_json(&paths.exit_json)? {
-        Some(exit) => apply_exit(actor, row, &exit.reason).await?,
+        Some(exit) => {
+            apply_exit(actor, row, &exit.reason, exit.process_group_exit_evidence).await?
+        }
         None => apply_lost(actor, row).await?,
     };
     Ok(())
@@ -353,6 +357,7 @@ async fn apply_exit(
     actor: &TaskActor,
     row: TaskRow,
     reason: &ExitReason,
+    process_group_exit_evidence: ProcessGroupExitEvidence,
 ) -> Result<TaskRow, AppError> {
     if row.state.is_terminal() {
         return Ok(row);
@@ -362,6 +367,7 @@ async fn apply_exit(
         id,
         from: row.status(),
         reason: reason.clone(),
+        process_group_exit_evidence,
         reply,
     })
     .await?;

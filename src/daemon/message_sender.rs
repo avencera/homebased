@@ -1,5 +1,7 @@
 //! Local message-send routing to the receiver on the selected Fleet machine.
 
+use std::time::Duration;
+
 use axum::http::StatusCode;
 
 use crate::daemon::AppState;
@@ -7,7 +9,7 @@ use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
-use crate::fleet::http::ClusterClient;
+use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
 use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 use crate::machine::{MachineId, MachineName};
 use crate::message::{
@@ -16,6 +18,8 @@ use crate::message::{
 };
 
 const MESSAGE_PATH: &str = "/v1/cluster/messages";
+// The receiver's queue retries, cleanup, and settlement take at most 104 seconds
+const MESSAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Resolve and deliver one message without changing its selected machine or message identity.
 pub(crate) async fn send(
@@ -73,7 +77,7 @@ pub(crate) async fn send(
         let verified = fleet.connect(destination).await?;
         protocol_version = verified.protocol.0;
         let wire = receiver_request(&request, destination, source, &recipient, protocol_version);
-        let response = ClusterClient::default()
+        let response = ClusterClient::new(MESSAGE_REQUEST_TIMEOUT, DEFAULT_MAX_BODY)
             .post_json(&verified.address, MESSAGE_PATH, &wire)
             .await
             .map_err(|error| AppError::MessageOutcomeUnknown {

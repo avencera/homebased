@@ -7,6 +7,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 #[cfg(target_os = "linux")]
 use nix::sys::prctl;
@@ -18,7 +19,9 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskIdentity, TaskRow};
+use crate::domain::{
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity, TaskRow,
+};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
 use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
@@ -28,12 +31,45 @@ use crate::store::{self, Store};
 const KILL_GRACE: Duration = Duration::from_secs(10);
 const KILL_REAP_GRACE: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(50);
+const CANCELLATION_POLL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy)]
+enum ChildCancellationCause {
+    PersistedMarker,
+    Signal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskRunExit {
+    reason: ExitReason,
+    process_group_exit_evidence: ProcessGroupExitEvidence,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupTiming {
+    term_grace: Duration,
+    kill_grace: Duration,
+    poll: Duration,
+}
+
+const CLEANUP_TIMING: CleanupTiming = CleanupTiming {
+    term_grace: KILL_GRACE,
+    kill_grace: KILL_REAP_GRACE,
+    poll: GROUP_POLL,
+};
+
+#[cfg(test)]
+static TASK_RUN_EXECUTABLE_FOR_TESTS: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_task_run_executable_for_tests(executable: std::path::PathBuf) {
+    *TASK_RUN_EXECUTABLE_FOR_TESTS.lock().unwrap() = Some(executable);
+}
 
 /// Spawn `homebased task-run` with an inherited exclusive flock.
 pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppError> {
-    let exe = std::env::current_exe().map_err(|err| AppError::Internal {
-        message: format!("current_exe: {err}"),
-    })?;
+    let exe = task_run_executable()?;
     let fd = lock.as_raw_fd();
     let mut cmd = StdCommand::new(&exe);
     cmd.arg("task-run")
@@ -65,6 +101,21 @@ pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppErr
         }
     });
     Ok(pid)
+}
+
+pub(crate) fn task_run_executable() -> Result<std::path::PathBuf, AppError> {
+    #[cfg(test)]
+    if let Some(executable) = TASK_RUN_EXECUTABLE_FOR_TESTS
+        .lock()
+        .ok()
+        .and_then(|executable| executable.clone())
+    {
+        return Ok(executable);
+    }
+
+    std::env::current_exe().map_err(|err| AppError::Internal {
+        message: format!("current_exe: {err}"),
+    })
 }
 
 fn prepare_worker(fd: RawFd) -> io::Result<()> {
@@ -101,7 +152,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     store.set_pid(id, pid)?;
     let row = store.require_task(id)?;
     let paths = home.task_paths(id);
-    let reason = match invocation_from_workload_for_identity(
+    let exit = match invocation_from_workload_for_identity(
         &row.workload,
         &row.binary,
         &row.cwd,
@@ -110,27 +161,58 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     ) {
         Ok(invocation) => {
             // only stdin-fed agents need the bytes; Grok reads the feed path from argv
-            let feed = if invocation.stdin == StdinPolicy::PromptFeed {
-                Some(std::fs::read(&paths.feed)?)
-            } else {
-                None
-            };
-            match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm).await {
-                Ok(reason) => reason,
-                Err(err) => ExitReason::SpawnFailed {
-                    message: err.to_string(),
+            let feed = match invocation.stdin {
+                StdinPolicy::PromptFeed => match std::fs::read(&paths.feed) {
+                    Ok(feed) => Ok(Some(feed)),
+                    Err(err) => {
+                        let message = format!("read prompt feed: {err}");
+                        std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+                        Err(TaskRunExit {
+                            reason: ExitReason::SpawnFailed { message },
+                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+                        })
+                    }
                 },
+                StdinPolicy::Null => Ok(None),
+            };
+            match feed {
+                Ok(feed) => {
+                    match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm)
+                        .await
+                    {
+                        Ok(exit) => exit,
+                        Err(err) => TaskRunExit {
+                            reason: ExitReason::SpawnFailed {
+                                message: err.to_string(),
+                            },
+                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+                        },
+                    }
+                }
+                Err(exit) => exit,
             }
         }
         Err(err) => {
             let message = err.to_string();
             std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
-            ExitReason::SpawnFailed { message }
+            TaskRunExit {
+                reason: ExitReason::SpawnFailed { message },
+                process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+            }
         }
     };
 
-    store::write_exit_json(&paths.exit_json, &reason)?;
-    match store.cas_exit(id, ProcessStatus::Running, &reason)? {
+    store::write_exit_json_with_evidence(
+        &paths.exit_json,
+        &exit.reason,
+        exit.process_group_exit_evidence,
+    )?;
+    match store.cas_exit_with_evidence(
+        id,
+        ProcessStatus::Running,
+        &exit.reason,
+        exit.process_group_exit_evidence,
+    )? {
         Some(_) => {}
         None => {
             let current = store.require_task(id)?;
@@ -148,7 +230,7 @@ async fn run_child(
     feed: Option<Vec<u8>>,
     store: &Store,
     sigterm: &mut SignalStream,
-) -> Result<ExitReason, AppError> {
+) -> Result<TaskRunExit, AppError> {
     let id = row.id;
     let log = OpenOptions::new()
         .create(true)
@@ -190,9 +272,16 @@ async fn run_child(
     let mut child = cmd.spawn().map_err(|err| AppError::Internal {
         message: format!("spawn child: {err}"),
     })?;
-    let child_pgid = child.id().ok_or_else(|| AppError::Internal {
-        message: "child pid missing after spawn".into(),
-    })? as i32;
+    let Some(child_pgid) = child.id().map(|pid| pid as i32) else {
+        let reason =
+            status_to_reason(child.wait().await).unwrap_or_else(|err| ExitReason::SpawnFailed {
+                message: err.to_string(),
+            });
+        return Ok(TaskRunExit {
+            reason,
+            process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
+        });
+    };
     if invocation.stdin == StdinPolicy::PromptFeed
         && let Some(feed) = feed
         && let Some(mut stdin) = child.stdin.take()
@@ -206,25 +295,59 @@ async fn run_child(
         });
     }
 
-    tokio::select! {
-        status = child.wait() => {
-            let reason = status_to_reason(status)?;
-            // direct-child exit is not proof the process group is empty
-            cleanup_process_group(child_pgid).await;
-            Ok(reason)
-        }
-        _ = sigterm.recv() => {
-            let cancelled = store.require_task(id)?.cancel_requested_at.is_some();
-            warn!(%id, cancelled, "SIGTERM: forwarding to child group");
-            forward_sigterm(child_pgid);
-            cancel_child_group(&mut child, child_pgid).await;
-            if cancelled {
-                Ok(ExitReason::Cancelled)
-            } else {
-                Ok(ExitReason::Signal { signal: 15 })
+    let mut cancellation_poll = time::interval(CANCELLATION_POLL);
+    cancellation_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let cause = loop {
+        tokio::select! {
+            status = child.wait() => {
+                let reason = status_to_reason(status).unwrap_or_else(|err| {
+                    ExitReason::SpawnFailed {
+                        message: err.to_string(),
+                    }
+                });
+                // direct-child exit is not proof the process group is empty
+                let process_group_exit_evidence = cleanup_process_group(child_pgid).await;
+                return Ok(TaskRunExit { reason, process_group_exit_evidence });
+            }
+            _ = sigterm.recv() => break ChildCancellationCause::Signal,
+            _ = cancellation_poll.tick() => match store.require_task(id) {
+                Ok(row) if row.cancel_requested_at.is_some() => {
+                    break ChildCancellationCause::PersistedMarker;
+                }
+                Ok(_) => {}
+                Err(err) => warn!(%id, "read cancellation state: {err}"),
             }
         }
+    };
+
+    let cancelled = match cause {
+        ChildCancellationCause::PersistedMarker => true,
+        ChildCancellationCause::Signal => match store.require_task(id) {
+            Ok(row) => row.cancel_requested_at.is_some(),
+            Err(err) => {
+                warn!(%id, "read cancellation state: {err}");
+                false
+            }
+        },
+    };
+    match cause {
+        ChildCancellationCause::PersistedMarker => {
+            warn!(%id, "persisted cancellation marker: forwarding to child group")
+        }
+        ChildCancellationCause::Signal => {
+            warn!(%id, cancelled, "SIGTERM: forwarding to child group")
+        }
     }
+    let process_group_exit_evidence = cancel_child_group(&mut child, child_pgid).await;
+    let reason = if cancelled {
+        ExitReason::Cancelled
+    } else {
+        ExitReason::Signal { signal: 15 }
+    };
+    Ok(TaskRunExit {
+        reason,
+        process_group_exit_evidence,
+    })
 }
 
 /// A Unix wait status is either an exit code or a terminating signal.
@@ -248,12 +371,39 @@ fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<Exit
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessGroupProbe {
+    Alive,
+    Exited,
+    Unknown,
+}
+
+/// Probe one process group without treating unexpected errors as evidence of exit.
+fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
+    match kill(Pid::from_raw(-pgid), None) {
+        Ok(()) => ProcessGroupProbe::Alive,
+        Err(Errno::ESRCH) => ProcessGroupProbe::Exited,
+        Err(err) => {
+            warn!(pgid, "process group probe: {err}");
+            ProcessGroupProbe::Unknown
+        }
+    }
+}
+
 /// Reap the direct child while giving the full group one shared TERM grace.
-async fn cancel_child_group(child: &mut tokio::process::Child, child_pgid: i32) {
-    let deadline = time::Instant::now() + KILL_GRACE;
+async fn cancel_child_group(
+    child: &mut tokio::process::Child,
+    child_pgid: i32,
+) -> ProcessGroupExitEvidence {
     let mut child_reaped = false;
-    loop {
-        if !child_reaped {
+    let evidence = cleanup_process_group_with(
+        child_pgid,
+        || process_group_probe(child_pgid),
+        |signal| kill(Pid::from_raw(-child_pgid), signal),
+        || {
+            if child_reaped {
+                return;
+            }
             match child.try_wait() {
                 Ok(Some(_)) => child_reaped = true,
                 Ok(None) => {}
@@ -262,58 +412,93 @@ async fn cancel_child_group(child: &mut tokio::process::Child, child_pgid: i32) 
                     child_reaped = true;
                 }
             }
-        }
-        if !process_group_alive(child_pgid) || time::Instant::now() >= deadline {
-            break;
-        }
-        time::sleep(GROUP_POLL).await;
-    }
-
-    if process_group_alive(child_pgid)
-        && let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGKILL)
-    {
-        warn!(child_pgid, "SIGKILL child group: {err}");
-    }
+        },
+        CLEANUP_TIMING,
+    )
+    .await;
     if !child_reaped && let Err(err) = time::timeout(KILL_REAP_GRACE, child.wait()).await {
         warn!(child_pgid, "reap cancelled child timed out: {err}");
     }
+    evidence
 }
 
-/// Terminate remaining members of the child process group.
-async fn cleanup_process_group(child_pgid: i32) {
-    if !process_group_alive(child_pgid) {
-        return;
+/// Terminate remaining members of the child process group and confirm the result.
+async fn cleanup_process_group(child_pgid: i32) -> ProcessGroupExitEvidence {
+    cleanup_process_group_with(
+        child_pgid,
+        || process_group_probe(child_pgid),
+        |signal| kill(Pid::from_raw(-child_pgid), signal),
+        || {},
+        CLEANUP_TIMING,
+    )
+    .await
+}
+
+async fn cleanup_process_group_with(
+    child_pgid: i32,
+    mut probe: impl FnMut() -> ProcessGroupProbe,
+    mut send_signal: impl FnMut(Signal) -> Result<(), Errno>,
+    mut reap_child: impl FnMut(),
+    timing: CleanupTiming,
+) -> ProcessGroupExitEvidence {
+    reap_child();
+    if probe() == ProcessGroupProbe::Exited {
+        return ProcessGroupExitEvidence::ConfirmedExited;
     }
-    forward_sigterm(child_pgid);
-    let deadline = time::Instant::now() + KILL_GRACE;
-    while process_group_alive(child_pgid) && time::Instant::now() < deadline {
-        time::sleep(GROUP_POLL).await;
+
+    if let Err(err) = send_signal(Signal::SIGTERM) {
+        warn!(child_pgid, "SIGTERM child group: {err}");
     }
-    if process_group_alive(child_pgid) {
-        if let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGKILL) {
+    let term_deadline = time::Instant::now() + timing.term_grace;
+    while time::Instant::now() < term_deadline {
+        reap_child();
+        if probe() == ProcessGroupProbe::Exited {
+            return ProcessGroupExitEvidence::ConfirmedExited;
+        }
+        time::sleep(
+            timing
+                .poll
+                .min(term_deadline.saturating_duration_since(time::Instant::now())),
+        )
+        .await;
+    }
+
+    reap_child();
+    let mut killed_group = false;
+    if probe() != ProcessGroupProbe::Exited {
+        killed_group = true;
+        if let Err(err) = send_signal(Signal::SIGKILL) {
             warn!(child_pgid, "SIGKILL child group: {err}");
         }
-        let deadline = time::Instant::now() + KILL_REAP_GRACE;
-        while process_group_alive(child_pgid) && time::Instant::now() < deadline {
-            time::sleep(GROUP_POLL).await;
+        let kill_deadline = time::Instant::now() + timing.kill_grace;
+        while time::Instant::now() < kill_deadline {
+            reap_child();
+            if probe() == ProcessGroupProbe::Exited {
+                return ProcessGroupExitEvidence::ConfirmedExited;
+            }
+            time::sleep(
+                timing
+                    .poll
+                    .min(kill_deadline.saturating_duration_since(time::Instant::now())),
+            )
+            .await;
         }
     }
-}
 
-fn process_group_alive(pgid: i32) -> bool {
-    match kill(Pid::from_raw(-pgid), None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::ESRCH) => false,
-        Err(err) => {
-            warn!(pgid, "process group probe: {err}");
-            false
+    reap_child();
+    match probe() {
+        ProcessGroupProbe::Exited if !killed_group => ProcessGroupExitEvidence::ConfirmedExited,
+        ProcessGroupProbe::Exited => {
+            warn!(
+                child_pgid,
+                "child process group exit was not confirmed within the kill grace"
+            );
+            ProcessGroupExitEvidence::Unconfirmed
         }
-    }
-}
-
-fn forward_sigterm(child_pgid: i32) {
-    if let Err(err) = kill(Pid::from_raw(-child_pgid), Signal::SIGTERM) {
-        warn!(child_pgid, "SIGTERM child group: {err}");
+        ProcessGroupProbe::Alive | ProcessGroupProbe::Unknown => {
+            warn!(child_pgid, "child process group exit remains unconfirmed");
+            ProcessGroupExitEvidence::Unconfirmed
+        }
     }
 }
 
@@ -395,5 +580,160 @@ mod tests {
         let feed = std::fs::read_to_string(&paths.feed).unwrap();
         assert!(feed.starts_with("hello"));
         assert!(feed.contains("--- homebased ---"));
+    }
+
+    #[tokio::test]
+    async fn foreground_child_exit_is_confirmed_by_process_group_probe() {
+        let mut cmd = TokioCommand::new("/usr/bin/true");
+        cmd.process_group(0).kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let child_pgid = child.id().unwrap() as i32;
+        assert!(child.wait().await.unwrap().success());
+        let mut sent_signals = Vec::new();
+
+        assert_eq!(
+            cleanup_process_group_with(
+                child_pgid,
+                || ProcessGroupProbe::Exited,
+                |signal| {
+                    sent_signals.push(signal);
+                    Ok(())
+                },
+                || {},
+                CleanupTiming {
+                    term_grace: Duration::ZERO,
+                    kill_grace: Duration::ZERO,
+                    poll: Duration::ZERO,
+                },
+            )
+            .await,
+            ProcessGroupExitEvidence::ConfirmedExited
+        );
+        assert!(sent_signals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_cleanup_reaps_and_confirms_its_owned_group() {
+        let mut cmd = TokioCommand::new("/bin/sleep");
+        cmd.arg("30").process_group(0).kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let child_pgid = child.id().unwrap() as i32;
+
+        assert_eq!(
+            cancel_child_group(&mut child, child_pgid).await,
+            ProcessGroupExitEvidence::ConfirmedExited
+        );
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_self_cancels_from_its_persisted_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+        home.ensure().unwrap();
+        let id = TaskId::new();
+        let paths = home.prepare_task(id).unwrap();
+        let store = Store::open(&home.db_path()).unwrap();
+        let mut row = store::new_queued_task(crate::store::NewTask {
+            id,
+            name: Some(crate::domain::TaskName::parse("self-cancel test").unwrap()),
+            thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
+            workload: crate::domain::Workload::Task(crate::domain::TaskWorkload {
+                command: crate::invocation::CommandLine::try_from_argv(vec![
+                    "/bin/sleep".into(),
+                    "30".into(),
+                ])
+                .unwrap(),
+            }),
+            cwd: "/tmp".into(),
+            timeout: Duration::from_secs(30),
+            env: crate::domain::TaskEnv {
+                path: "/bin".into(),
+                home: "/tmp".into(),
+            },
+            binary: "/bin/sleep".into(),
+        });
+        row.state = crate::domain::TaskState::Running {
+            pid: Some(std::process::id() as i32),
+        };
+        store.insert_task(&row).unwrap();
+        let _runner_lock = home::flock_exclusive(&paths.runner_lock, LockMode::Blocking).unwrap();
+        let invocation = ChildInvocation {
+            program: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            stdin: StdinPolicy::Null,
+            environment: Default::default(),
+            managed_environment: None,
+        };
+
+        let database = home.db_path();
+        let cancellation = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(50)).await;
+            let cancellation_store = Store::open(&database).unwrap();
+            assert!(matches!(
+                cancellation_store.request_cancel(id).unwrap(),
+                store::CancelResult::SignalWorker(_)
+            ));
+        });
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let exit = time::timeout(
+            Duration::from_secs(5),
+            run_child(&invocation, &row, &home, &paths, None, &store, &mut sigterm),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cancellation.await.unwrap();
+
+        assert_eq!(exit.reason, ExitReason::Cancelled);
+        assert_eq!(
+            exit.process_group_exit_evidence,
+            ProcessGroupExitEvidence::ConfirmedExited
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_surviving_group_is_not_confirmed_by_signal_success() {
+        let timing = CleanupTiming {
+            term_grace: Duration::ZERO,
+            kill_grace: Duration::ZERO,
+            poll: Duration::ZERO,
+        };
+        for probe_result in [ProcessGroupProbe::Unknown, ProcessGroupProbe::Alive] {
+            let mut sent_signals = Vec::new();
+            let evidence = cleanup_process_group_with(
+                999_999,
+                || probe_result,
+                |signal| {
+                    sent_signals.push(signal);
+                    Ok(())
+                },
+                || {},
+                timing,
+            )
+            .await;
+
+            assert_eq!(evidence, ProcessGroupExitEvidence::Unconfirmed);
+            assert_eq!(sent_signals, [Signal::SIGTERM, Signal::SIGKILL]);
+        }
+
+        let mut probes = [
+            ProcessGroupProbe::Alive,
+            ProcessGroupProbe::Alive,
+            ProcessGroupProbe::Exited,
+        ]
+        .into_iter();
+        assert_eq!(
+            cleanup_process_group_with(
+                999_999,
+                || probes.next().unwrap_or(ProcessGroupProbe::Exited),
+                |_| Ok(()),
+                || {},
+                timing,
+            )
+            .await,
+            ProcessGroupExitEvidence::Unconfirmed,
+            "an exit probe after the kill grace must not hide the grace timeout"
+        );
     }
 }

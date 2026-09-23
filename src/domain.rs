@@ -15,7 +15,7 @@ use crate::error::AppError;
 pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`. Earlier databases migrate in place to this version.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// Maximum Unicode scalar values in a submitted task name.
 pub const TASK_NAME_MAX_CHARS: usize = 120;
@@ -424,6 +424,45 @@ pub enum ExitReason {
     },
 }
 
+/// Evidence about the child process group owned by one live task-run worker.
+/// This is separate from `ExitReason`: a terminal task can still have an
+/// unconfirmed process group. It does not cover detached containers or
+/// processes in another session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessGroupExitEvidence {
+    /// The worker did not confirm that its child process group exited.
+    #[default]
+    Unconfirmed,
+    /// The worker's post-cleanup probe confirmed that its owned process group was gone.
+    ConfirmedExited,
+    /// The task-run worker did not spawn a child process.
+    NoChildSpawned,
+}
+
+impl ProcessGroupExitEvidence {
+    /// SQLite storage tag.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => "unconfirmed",
+            Self::ConfirmedExited => "confirmed_exited",
+            Self::NoChildSpawned => "no_child_spawned",
+        }
+    }
+
+    /// Parse a storage tag. Unknown values remain conservative.
+    #[must_use]
+    pub fn from_storage(value: Option<&str>) -> Self {
+        match value {
+            Some("confirmed_exited") => Self::ConfirmedExited,
+            Some("no_child_spawned") => Self::NoChildSpawned,
+            Some("unconfirmed") | None => Self::Unconfirmed,
+            Some(_) => Self::Unconfirmed,
+        }
+    }
+}
+
 /// Compatibility projection of the terminal event's origin-inbox result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -762,6 +801,8 @@ pub struct TaskRow {
     pub binary: PathBuf,
     /// Process lifecycle.
     pub state: TaskState,
+    /// Durable evidence for the task-run worker's child process group.
+    pub process_group_exit_evidence: ProcessGroupExitEvidence,
     /// Terminal callback delivery. A second axis: it outlives the process state.
     pub callback_status: CallbackStatus,
     /// Attention-reminder delivery state.
@@ -785,6 +826,17 @@ impl TaskRow {
     #[must_use]
     pub fn exit_reason(&self) -> Option<&ExitReason> {
         self.state.exit_reason()
+    }
+
+    /// Child process-group evidence, unknown until the task reaches a terminal state.
+    #[must_use]
+    pub fn process_group_exit_evidence(&self) -> ProcessGroupExitEvidence {
+        match &self.state {
+            TaskState::Finished { .. } => self.process_group_exit_evidence,
+            TaskState::Queued | TaskState::Running { .. } | TaskState::Lost => {
+                ProcessGroupExitEvidence::Unconfirmed
+            }
+        }
     }
 
     /// Worker pid while running.

@@ -299,7 +299,10 @@ mod tests {
             info.get_property_val_str(TXT_BOOT),
             Some(announcement.header.boot.to_string().as_str())
         );
-        assert_eq!(info.get_property_val_str(TXT_PROTOCOL), Some("1"));
+        assert_eq!(
+            info.get_property_val_str(TXT_PROTOCOL),
+            Some(SUPPORTED_PROTOCOLS.to_string().as_str())
+        );
     }
 
     #[test]

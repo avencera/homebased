@@ -168,12 +168,22 @@ impl Store {
             )
             .optional()?;
         if let Some(saved) = saved {
-            let existing: MessageAttempt = decode(&saved)?;
-            if existing.request != attempt.request {
+            let mut existing: MessageAttempt = decode(&saved)?;
+            if existing.request.identity() != attempt.request.identity() {
                 return Err(AppError::MessageConflict {
                     id: attempt.request.message_id,
                 });
             }
+            if existing.request.protocol_version == attempt.request.protocol_version {
+                return Ok(existing);
+            }
+
+            existing.request = attempt.request.clone();
+            tx.execute(
+                "UPDATE message_attempts SET attempt_json=?2 WHERE message_id=?1",
+                params![attempt.request.message_id.to_string(), encode(&existing)?,],
+            )?;
+            tx.commit()?;
             return Ok(existing);
         }
         tx.execute(
@@ -245,6 +255,7 @@ fn validate_saved_binding(binding: &OutboundMessageBinding, id: MessageId) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -254,7 +265,7 @@ mod tests {
     use super::*;
     use crate::domain::{API_VERSION, ThreadId};
     use crate::machine::MachineId;
-    use crate::message::{MessageSourceSelector, MessageTarget};
+    use crate::message::{MessageRequest, MessageSource, MessageSourceSelector, MessageTarget};
 
     fn request() -> MessageSendRequest {
         let message_id = MessageId::new();
@@ -280,6 +291,26 @@ mod tests {
         match &request.target {
             MessageTarget::Machine { recipient, .. } => recipient.clone(),
             MessageTarget::Task { .. } => unreachable!(),
+        }
+    }
+
+    fn receiver_request(protocol_version: u32) -> MessageRequest {
+        let message_id = MessageId::new();
+        MessageRequest {
+            api_version: API_VERSION,
+            protocol_version,
+            message_id,
+            destination_machine: MachineId::new(),
+            source: MessageSource::Thread {
+                machine: MachineId::new(),
+                thread: ThreadId(Uuid::now_v7()),
+            },
+            recipient: Recipient::Thread {
+                thread: ThreadId(Uuid::now_v7()),
+            },
+            body: "Review the message protocol retry".into(),
+            reply_to: None,
+            conversation_id: message_id.as_uuid(),
         }
     }
 
@@ -327,6 +358,62 @@ mod tests {
         changed.body.push_str(" changed");
         assert!(matches!(
             store.begin_outbound_message(&changed),
+            Err(AppError::MessageConflict { id }) if id == request.message_id
+        ));
+    }
+
+    #[test]
+    fn protocol_retry_updates_attempt_and_returns_the_current_receipt_version() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("homebased.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let request = receiver_request(1);
+        let attempt = MessageAttempt {
+            request: request.clone(),
+            destination_thread: match &request.recipient {
+                Recipient::Thread { thread } => *thread,
+                Recipient::Cwd { .. } => unreachable!(),
+            },
+            destination_cwd: PathBuf::from("/tmp"),
+        };
+        store.bind_message_attempt(&attempt).unwrap();
+
+        let mut retry = attempt.clone();
+        retry.request.protocol_version = 2;
+        let updated = store.bind_message_attempt(&retry).unwrap();
+        assert_eq!(updated.request.identity(), attempt.request.identity());
+        assert_eq!(updated.request.protocol_version, 2);
+
+        let committed = store
+            .commit_message_receipt(&MessageReceipt {
+                api_version: API_VERSION,
+                protocol_version: 2,
+                message_id: request.message_id,
+                destination_thread: attempt.destination_thread,
+                destination_cwd: attempt.destination_cwd.clone(),
+                delivered_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert_eq!(committed.protocol_version, 2);
+
+        let saved = store.message_delivery(request.message_id).unwrap();
+        let saved_receipt = saved.receipt.unwrap();
+        assert_eq!(saved_receipt.protocol_version, 2);
+        let response_receipt = saved_receipt.for_protocol_version(3);
+        assert_eq!(response_receipt.protocol_version, 3);
+        assert_eq!(
+            store
+                .message_delivery(request.message_id)
+                .unwrap()
+                .receipt
+                .unwrap(),
+            saved_receipt
+        );
+
+        let mut changed = retry;
+        changed.request.body.push_str(" changed");
+        assert!(matches!(
+            store.bind_message_attempt(&changed),
             Err(AppError::MessageConflict { id }) if id == request.message_id
         ));
     }

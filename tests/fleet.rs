@@ -22,10 +22,13 @@ use homebased::fleet::probe::{ProbeError, probe};
 use homebased::fleet::protocol::SUPPORTED_PROTOCOLS;
 use homebased::fleet::runtime::{FleetHandle, FleetRuntime, FleetStart, RuntimeTimings};
 use homebased::machine::{BootId, LocalIdentity, MachineId, MachineName};
+use homebased::message::MessageId;
+use homebased::resource::{CommandSpec, ResourceId, ResourceQueueRequest};
 use homebased::spec::NormalizedSpec;
 use homebased::store::{NewTask, Store, new_queued_task};
 use homebased::submission::{
-    CallbackContext, ExecutionRecord, OriginRoute, RequestId, SubmissionState,
+    CallbackContext, ExecutionRecord, NewResourceRoute, OriginRoute, RequestId,
+    ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -84,6 +87,7 @@ impl Daemon {
         cmd.env("HOMEBASED_HOME", &self.home)
             .env("HOMEBASED_CONFIG", &self.config)
             .env("HOME", &self.user_home)
+            .env_remove("CODEX_HOME")
             .env_remove("HOMEBASED_WEB_LISTEN");
         if let Some(codex) = &self.codex_override {
             cmd.env("HOMEBASED_CODEX", codex);
@@ -285,6 +289,17 @@ async fn post_execution(
     (status, body)
 }
 
+async fn post_message(executor: &Daemon, request: &Value) -> (u16, Value) {
+    let response = ClusterClient::default()
+        .post_json(&executor.address(), "/v1/cluster/messages", request)
+        .await
+        .unwrap();
+    (
+        response.status.as_u16(),
+        serde_json::from_slice(&response.body).unwrap(),
+    )
+}
+
 fn seed_origin_route(
     origin: &Daemon,
     executor: &Daemon,
@@ -317,6 +332,112 @@ fn seed_origin_route(
         })
         .unwrap();
     request
+}
+
+fn seed_resource_route(
+    origin: &Daemon,
+    authority: &Daemon,
+    resource: ResourceId,
+    request: RequestId,
+    task: TaskId,
+    spec: &NormalizedSpec,
+) -> OriginRoute {
+    let route = OriginRoute::new_resource_waiting(NewResourceRoute {
+        request,
+        task,
+        origin_machine: origin.machine_id(),
+        authority_machine: authority.machine_id(),
+        thread: spec.thread,
+        callback: CallbackContext {
+            env: TaskEnv {
+                path: "/bin:/usr/bin".into(),
+                home: origin.user_home.to_string_lossy().into_owned(),
+            },
+            cwd: origin.user_home.clone(),
+            codex: PathBuf::from("/bin/true").into(),
+        },
+        spec: spec.clone(),
+        resource,
+    })
+    .unwrap();
+    Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .insert_origin_route(&route)
+        .unwrap();
+    route
+}
+
+fn seed_authority_resource(authority: &Daemon, resource: ResourceId) {
+    let supervisor_thread = ThreadId(uuid::Uuid::now_v7());
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO resources (
+                id, display_name, authority_machine, supervisor_machine, supervisor_thread,
+                assignment_revision, state_revision, registered_background_task
+             ) VALUES (?1, 'test-gpu', ?2, ?2, ?3, 0, 0, NULL)",
+            rusqlite::params![
+                resource.as_uuid().to_string(),
+                authority.machine_id().as_uuid().to_string(),
+                supervisor_thread.to_string(),
+            ],
+        )
+        .unwrap();
+}
+
+async fn post_resource_queue(
+    authority: &Daemon,
+    origin: &Daemon,
+    route: &OriginRoute,
+) -> (u16, Value) {
+    let spec = CommandSpec::try_from(route.current_spec().unwrap().clone()).unwrap();
+    let request = ResourceQueueRequest::new(
+        homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+        authority.machine_id(),
+        origin.machine_id(),
+        route.request,
+        route.task,
+        match &route.submission {
+            SubmissionState::Resource { resource, .. } => *resource,
+            _ => panic!("resource fixture must retain resource identity"),
+        },
+        spec,
+    );
+    let response = ClusterClient::default()
+        .post_json(
+            &authority.address(),
+            "/v1/cluster/resource-requests",
+            &request,
+        )
+        .await
+        .unwrap();
+    (
+        response.status.as_u16(),
+        serde_json::from_slice(&response.body).unwrap(),
+    )
+}
+
+async fn post_resource_cancel_wire(
+    authority: &Daemon,
+    identity: &homebased::cancellation::ResourceCancellationRequestIdentity,
+) -> (u16, Value) {
+    let response = ClusterClient::default()
+        .post_json(
+            &authority.address(),
+            "/v1/cluster/resource-requests/cancel",
+            &serde_json::json!({
+                "api_version": 1,
+                "protocol_version": homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+                "destination_machine": authority.machine_id(),
+                "request": identity,
+            }),
+        )
+        .await
+        .unwrap();
+    (
+        response.status.as_u16(),
+        serde_json::from_slice(&response.body).unwrap(),
+    )
 }
 
 fn submit_file(daemon: &Daemon, spec: &NormalizedSpec, request: RequestId) -> std::process::Output {
@@ -1942,12 +2063,376 @@ async fn await_cancel_delivery(daemon: &Daemon, task: TaskId) -> Value {
     }
 }
 
+async fn await_resource_cancel_delivery(daemon: &Daemon, task: TaskId) -> Value {
+    let start = Instant::now();
+    loop {
+        let body = cancel_socket(daemon, task).await;
+        if body["delivery"]["state"] == "resource_delivered" {
+            return body;
+        }
+        assert!(start.elapsed() < Duration::from_secs(12), "{body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn resource_cancel_identity(
+    route: &OriginRoute,
+    cancellation: uuid::Uuid,
+    target_phase: ResourceRoutePhase,
+) -> homebased::cancellation::ResourceCancellationRequestIdentity {
+    let SubmissionState::Resource { resource, .. } = &route.submission else {
+        panic!("resource fixture must retain resource identity");
+    };
+    homebased::cancellation::ResourceCancellationRequestIdentity {
+        requester_machine: route.origin_machine,
+        cancellation,
+        request: route.request,
+        task: route.task,
+        origin_machine: route.origin_machine,
+        authority_machine: route.execution_machine,
+        resource: *resource,
+        target_phase,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_cancellation_before_acceptance_fences_delayed_queue_acceptance() {
+    let origin = Daemon::start("resource-cancel-origin", true);
+    let authority = Daemon::start("resource-cancel-authority", true);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "must-not-start"]);
+    let route = seed_resource_route(&origin, &authority, resource, request, task, &spec);
+
+    let delivered = await_resource_cancel_delivery(&origin, task).await;
+    assert_eq!(
+        delivered["delivery"]["resource"]["outcome"]["type"],
+        "prevented_before_acceptance"
+    );
+    let saved = Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .origin_route_by_task(task)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        saved.submission,
+        SubmissionState::Resource {
+            phase: ResourceRoutePhase::CancelledBeforeLaunch,
+            ..
+        }
+    ));
+
+    let (status, delayed) = post_resource_queue(&authority, &origin, &route).await;
+    assert_eq!(status, 200, "{delayed}");
+    assert_eq!(delayed["receipt"]["outcome"]["type"], "rejected");
+    assert_eq!(
+        delayed["receipt"]["outcome"]["reason"],
+        "cancelled_before_launch"
+    );
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    let prevented: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_request_preventions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let queued: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_requests WHERE task_id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prevented, 1);
+    assert_eq!(queued, 0);
+    assert_eq!(cancel_socket(&origin, task).await, delivered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_cancellation_of_queued_request_uses_the_authority_route() {
+    let origin = Daemon::start("resource-queued-cancel-origin", true);
+    let authority = Daemon::start("resource-queued-cancel-authority", true);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "queued-not-started"]);
+    let route = seed_resource_route(&origin, &authority, resource, request, task, &spec);
+    let (status, accepted) = post_resource_queue(&authority, &origin, &route).await;
+    assert_eq!(status, 200, "{accepted}");
+    let receipt: ResourceQueueReceipt =
+        serde_json::from_value(accepted["receipt"].clone()).unwrap();
+    assert_eq!(
+        Store::open(&origin.home.join("homebased.sqlite"))
+            .unwrap()
+            .resolve_resource_route(&receipt)
+            .unwrap()
+            .submission,
+        SubmissionState::Resource {
+            resource,
+            phase: ResourceRoutePhase::Waiting,
+        }
+    );
+
+    let delivered = await_resource_cancel_delivery(&origin, task).await;
+    assert_eq!(
+        delivered["delivery"]["resource"]["outcome"]["type"],
+        "cancelled_before_launch"
+    );
+    let route = Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .origin_route_by_task(task)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        route.submission,
+        SubmissionState::Resource {
+            phase: ResourceRoutePhase::CancelledBeforeLaunch,
+            ..
+        }
+    ));
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    let state: String = connection
+        .query_row(
+            "SELECT json_extract(state_json, '$.type') FROM resource_requests WHERE request_id=?1",
+            [request.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "cancelled_before_launch");
+    let receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_cancellation_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_resource_cancellation_persists_intent_at_the_origin() {
+    let viewer = Daemon::start("resource-remote-cancel-viewer", true);
+    let origin = Daemon::start("resource-remote-cancel-origin", true);
+    let authority = Daemon::start("resource-remote-cancel-authority", true);
+    add_peer(&viewer, &origin);
+    add_peer(&viewer, &authority);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "remote-resource-cancel"]);
+    seed_resource_route(&origin, &authority, resource, request, task, &spec);
+
+    let delivered = await_resource_cancel_delivery(&viewer, task).await;
+    assert_eq!(
+        delivered["delivery"]["resource"]["outcome"]["type"],
+        "prevented_before_acceptance"
+    );
+
+    let origin_store = Store::open(&origin.home.join("homebased.sqlite")).unwrap();
+    let saved = origin_store
+        .cancellation_request(task)
+        .unwrap()
+        .expect("origin must own the durable cancellation intent");
+    assert_eq!(saved.requester_machine, origin.machine_id());
+    assert!(matches!(
+        saved.target,
+        homebased::cancellation::CancellationTarget::Resource(_)
+    ));
+    assert!(
+        Store::open(&viewer.home.join("homebased.sqlite"))
+            .unwrap()
+            .cancellation_request(task)
+            .unwrap()
+            .is_none(),
+        "viewer must not persist a second cancellation identity"
+    );
+    assert_eq!(cancel_socket(&viewer, task).await, delivered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_cancellation_receipt_replays_after_restart_and_conflicts_on_reuse() {
+    let origin = Daemon::start("resource-receipt-origin", true);
+    let mut authority = Daemon::start("resource-receipt-authority", true);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "receipt-replay"]);
+    let route = seed_resource_route(&origin, &authority, resource, request, task, &spec);
+    let (status, accepted) = post_resource_queue(&authority, &origin, &route).await;
+    assert_eq!(status, 200, "{accepted}");
+    let queue_receipt: ResourceQueueReceipt =
+        serde_json::from_value(accepted["receipt"].clone()).unwrap();
+    Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .resolve_resource_route(&queue_receipt)
+        .unwrap();
+    let identity =
+        resource_cancel_identity(&route, uuid::Uuid::now_v7(), ResourceRoutePhase::Waiting);
+
+    let (status, first) = post_resource_cancel_wire(&authority, &identity).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(
+        first["receipt"]["outcome"]["type"],
+        "cancelled_before_launch"
+    );
+    authority.restart();
+    let (status, replay) = post_resource_cancel_wire(&authority, &identity).await;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(first, replay);
+
+    let mut changed = identity.clone();
+    changed.resource = ResourceId::new();
+    let (status, conflict) = post_resource_cancel_wire(&authority, &changed).await;
+    assert_eq!(status, 409, "{conflict}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_cancellation_origin_restart_replays_a_lost_authority_reply() {
+    let mut origin = Daemon::start("resource-origin-restart-cancel-origin", true);
+    let authority = Daemon::start("resource-origin-restart-cancel-authority", true);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "restart-resource-cancel"]);
+    let route = seed_resource_route(&origin, &authority, resource, request, task, &spec);
+    let (status, queued) = post_resource_queue(&authority, &origin, &route).await;
+    assert_eq!(status, 200, "{queued}");
+    assert_eq!(queued["receipt"]["outcome"]["type"], "waiting");
+
+    let pending = cancel_socket(&origin, task).await;
+    assert_eq!(pending["delivery"]["state"], "pending");
+    let saved = Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .cancellation_request(task)
+        .unwrap()
+        .expect("origin must save cancellation before delivery");
+    let identity = saved
+        .resource_identity()
+        .expect("resource route must retain its typed identity");
+
+    let (status, authority_reply) = post_resource_cancel_wire(&authority, &identity).await;
+    assert_eq!(status, 200, "{authority_reply}");
+    assert_eq!(
+        authority_reply["receipt"]["outcome"]["type"],
+        "cancelled_before_launch"
+    );
+
+    origin.restart();
+    add_peer(&origin, &authority);
+    let delivered = await_resource_cancel_delivery(&origin, task).await;
+    assert_eq!(delivered["cancellation"], pending["cancellation"]);
+    assert_eq!(
+        delivered["delivery"]["resource"],
+        authority_reply["receipt"]
+    );
+    let route = Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .origin_route_by_task(task)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        route.submission,
+        SubmissionState::Resource {
+            phase: ResourceRoutePhase::CancelledBeforeLaunch,
+            ..
+        }
+    ));
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    let receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_cancellation_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_cancellation_rejects_wrong_owner_and_origin_proof() {
+    let origin = Daemon::start("resource-proof-origin", true);
+    let authority = Daemon::start("resource-proof-authority", true);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let request = RequestId::new();
+    let task = TaskId::new();
+    let spec = remote_spec(&authority, vec!["/bin/echo", "proof-check"]);
+    let route = seed_resource_route(&origin, &authority, resource, request, task, &spec);
+    let identity = resource_cancel_identity(
+        &route,
+        uuid::Uuid::now_v7(),
+        ResourceRoutePhase::AcceptanceUnknown,
+    );
+
+    let wrong_destination = ClusterClient::default()
+        .post_json(
+            &authority.address(),
+            "/v1/cluster/resource-requests/cancel",
+            &serde_json::json!({
+                "api_version": 1,
+                "protocol_version": homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+                "destination_machine": origin.machine_id(),
+                "request": identity,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_destination.status.as_u16(), 409);
+
+    let mut wrong_owner = identity.clone();
+    wrong_owner.authority_machine = origin.machine_id();
+    let (status, owner_conflict) = post_resource_cancel_wire(&authority, &wrong_owner).await;
+    assert_eq!(status, 409, "{owner_conflict}");
+
+    let mut wrong_proof = identity.clone();
+    wrong_proof.request = RequestId::new();
+    let (status, proof_conflict) = post_resource_cancel_wire(&authority, &wrong_proof).await;
+    assert_eq!(status, 409, "{proof_conflict}");
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    let prevented: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_request_preventions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_cancellation_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prevented, 0);
+    assert_eq!(receipts, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_before_acceptance_prevents_delayed_submit() {
     let origin = Daemon::start("cancel-origin", true);
     let executor = Daemon::start("cancel-executor", true);
     let second = Daemon::start("cancel-second-requester", true);
     add_peer(&origin, &executor);
+    add_peer(&second, &origin);
     add_peer(&second, &executor);
     let task = TaskId::new();
     let spec = remote_spec(&executor, vec!["/bin/echo", "must-not-run"]);
@@ -2028,12 +2513,13 @@ async fn cancellation_keeps_a_terminal_execution_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn third_machine_cancels_accepted_task_with_origin_offline() {
+async fn third_machine_refuses_to_cancel_without_the_origin_route() {
     let viewer = Daemon::start("cancel-viewer", true);
     let mut origin = Daemon::start("cancel-offline-origin", true);
     let executor = Daemon::start("cancel-running-executor", true);
     add_peer(&viewer, &origin);
     add_peer(&viewer, &executor);
+    add_peer(&executor, &origin);
     let task = TaskId::new();
     let spec = remote_spec(&executor, vec!["/bin/sh", "-c", "sleep 30"]);
     seed_origin_route(&origin, &executor, task, &spec);
@@ -2045,25 +2531,43 @@ async fn third_machine_cancels_accepted_task_with_origin_offline() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    origin.stop();
-
-    let pending = cancel_socket(&viewer, task).await;
-    assert_eq!(pending["delivery"]["state"], "pending");
-    assert_eq!(
-        pending["requester_machine"],
-        viewer.machine_id().to_string()
-    );
-    let delivered = await_cancel_delivery(&viewer, task).await;
-    assert!(matches!(
-        delivered["delivery"]["executor"]["state"].as_str(),
-        Some("pending_application" | "applied" | "already_terminal")
-    ));
-    assert!(wait_until(Duration::from_secs(10), || {
+    assert!(wait_until(Duration::from_secs(5), || {
         Store::open(&executor.home.join("homebased.sqlite"))
             .unwrap()
             .get_task(task)
             .unwrap()
-            .is_some_and(|row| row.status() == ProcessStatus::Cancelled)
+            .is_some_and(|row| row.status() == ProcessStatus::Running)
+    }));
+    origin.stop();
+
+    let (status, legacy) = post_legacy_cancel_wire(
+        &executor,
+        cancel_identity(&viewer, &origin, &executor, task),
+    )
+    .await;
+    assert_ne!(status, 200, "{legacy}");
+    assert_eq!(legacy["error"]["code"], "cluster_lookup_incomplete");
+
+    let (ok, local_body) = inspect_cli(&executor, "cancel", task);
+    assert!(!ok, "{local_body}");
+    assert_eq!(local_body["error"]["code"], "cluster_lookup_incomplete");
+
+    let (ok, body) = inspect_cli(&viewer, "cancel", task);
+    assert!(!ok, "{body}");
+    assert_eq!(body["error"]["code"], "cluster_lookup_incomplete");
+    assert!(
+        Store::open(&viewer.home.join("homebased.sqlite"))
+            .unwrap()
+            .pending_cancellation_requests()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(wait_until(Duration::from_secs(2), || {
+        Store::open(&executor.home.join("homebased.sqlite"))
+            .unwrap()
+            .get_task(task)
+            .unwrap()
+            .is_some_and(|row| row.status() == ProcessStatus::Running)
     }));
 }
 
@@ -2087,6 +2591,32 @@ async fn cancellation_lookup_offline_gap_does_not_claim_acceptance() {
 }
 
 async fn post_cancel_wire(executor: &Daemon, request: CancellationRequestIdentity) -> (u16, Value) {
+    let response = ClusterClient::default()
+        .post_json(
+            &executor.address(),
+            "/v1/cluster/executions/cancel",
+            &serde_json::json!({
+                "api_version": 1,
+                "protocol_version": 2,
+                "request": request,
+                "target": {"type": "execution", "request_id": null},
+            }),
+        )
+        .await
+        .unwrap();
+    let status = response.status.as_u16();
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    if status == 200 {
+        assert_eq!(body["api_version"], 1);
+        assert_eq!(body["protocol_version"], 2);
+    }
+    (status, body)
+}
+
+async fn post_legacy_cancel_wire(
+    executor: &Daemon,
+    request: CancellationRequestIdentity,
+) -> (u16, Value) {
     let response = ClusterClient::default()
         .post_json(
             &executor.address(),
@@ -2591,4 +3121,175 @@ async fn task_log_never_reads_a_guessed_directory_without_the_socket() {
     let (ok, response) = inspect_cli(&daemon, "log", task);
     assert!(!ok);
     assert_eq!(response["error"]["code"], "daemon_unavailable");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_message_retry_accepts_protocol_change_and_reuses_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut receiver = Daemon::start("message-protocol-receiver", true);
+    let codex = receiver._dir.path().join("fake-codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOMEBASED_HOME/message-queue.log\"\nif [ -e \"$HOMEBASED_HOME/message-queue.fail\" ]; then exit 9; fi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    receiver.codex_override = Some(codex);
+    receiver.restart();
+
+    let cwd = receiver.user_home.join("message-workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let thread = ThreadId(uuid::Uuid::now_v7());
+    let session = receiver
+        .user_home
+        .join(".codex/sessions/2026/09/22/rollout-message-protocol.jsonl");
+    fs::create_dir_all(session.parent().unwrap()).unwrap();
+    fs::write(
+        &session,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": thread.to_string(), "cwd": cwd},
+            })
+        ),
+    )
+    .unwrap();
+
+    let message_id = MessageId::new();
+    let mut request = serde_json::json!({
+        "api_version": 1,
+        "protocol_version": 1,
+        "message_id": message_id,
+        "destination_machine": receiver.machine_id(),
+        "source": {
+            "kind": "thread",
+            "machine": MachineId::new(),
+            "thread": uuid::Uuid::now_v7(),
+        },
+        "recipient": {"kind": "thread", "thread": thread},
+        "body": "Review the protocol retry",
+        "reply_to": null,
+        "conversation_id": message_id.as_uuid(),
+    });
+    let fail_marker = receiver.home.join("message-queue.fail");
+    fs::write(&fail_marker, "fail").unwrap();
+
+    let (status, failed) = post_message(&receiver, &request).await;
+    assert_eq!(status, 503, "{failed}");
+    assert_eq!(failed["error"]["code"], "message_delivery_failed");
+    let first_attempt = Store::open(&receiver.home.join("homebased.sqlite"))
+        .unwrap()
+        .message_delivery(message_id)
+        .unwrap();
+    assert_eq!(first_attempt.attempt.unwrap().request.protocol_version, 1);
+    assert!(first_attempt.receipt.is_none());
+
+    fs::remove_file(fail_marker).unwrap();
+    request["protocol_version"] = serde_json::json!(2);
+    let (status, delivered) = post_message(&receiver, &request).await;
+    assert_eq!(status, 200, "{delivered}");
+    assert_eq!(delivered["protocol_version"], 2);
+    assert_eq!(delivered["receipt"]["protocol_version"], 2);
+    let delivery = Store::open(&receiver.home.join("homebased.sqlite"))
+        .unwrap()
+        .message_delivery(message_id)
+        .unwrap();
+    assert_eq!(delivery.attempt.unwrap().request.protocol_version, 2);
+    assert_eq!(delivery.receipt.unwrap().protocol_version, 2);
+
+    request["protocol_version"] = serde_json::json!(1);
+    let (status, retried) = post_message(&receiver, &request).await;
+    assert_eq!(status, 200, "{retried}");
+    assert_eq!(retried["protocol_version"], 1);
+    assert_eq!(retried["receipt"]["protocol_version"], 1);
+    let saved = Store::open(&receiver.home.join("homebased.sqlite"))
+        .unwrap()
+        .message_delivery(message_id)
+        .unwrap();
+    assert_eq!(saved.receipt.unwrap().protocol_version, 2);
+    assert_eq!(
+        fs::read_to_string(receiver.home.join("message-queue.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+
+    let unsupported_id = MessageId::new();
+    let mut unsupported = request;
+    unsupported["protocol_version"] = serde_json::json!(99);
+    unsupported["message_id"] = serde_json::json!(unsupported_id);
+    unsupported["conversation_id"] = serde_json::json!(unsupported_id.as_uuid());
+    let (status, incompatible) = post_message(&receiver, &unsupported).await;
+    assert_eq!(status, 409, "{incompatible}");
+    assert_eq!(
+        incompatible["error"]["code"],
+        "cluster_protocol_incompatible"
+    );
+    assert!(
+        Store::open(&receiver.home.join("homebased.sqlite"))
+            .unwrap()
+            .message_delivery(unsupported_id)
+            .unwrap()
+            .attempt
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_duplicate_identity_recovers_after_the_clone_goes_offline() {
+    use std::io::Write;
+
+    let original = Daemon::start("identity-original", true);
+    let mut clone = Daemon::start("identity-clone", true);
+    clone.stop();
+    fs::copy(
+        original.home.join("machine-id"),
+        clone.home.join("machine-id"),
+    )
+    .unwrap();
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(&clone.config)
+        .unwrap();
+    writeln!(
+        config,
+        "[[fleet.machines]]\naddress = \"{}\"",
+        original.address()
+    )
+    .unwrap();
+    clone.spawn();
+    assert_eq!(clone.machine_id(), original.machine_id());
+
+    assert!(wait_until(Duration::from_secs(10), || {
+        clone
+            .cmd()
+            .args(["--json", "fleet", "machines"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && serde_json::from_slice::<Value>(&output.stdout).is_ok_and(|inventory| {
+                        inventory["local"]["identity"]["state"] == "duplicate_machine_identity"
+                    })
+            })
+    }));
+
+    let mut original = original;
+    original.stop();
+    for expected in ["duplicate_machine_identity", "consistent"] {
+        let output = clone
+            .cmd()
+            .args(["--json", "fleet", "discover"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(inventory["local"]["identity"]["state"], expected);
+    }
 }

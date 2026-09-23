@@ -268,6 +268,12 @@ pub enum AppError {
         /// Task with conflicting ownership
         task: TaskId,
     },
+    /// Resource-owned work needs an authority-specific cancellation route
+    #[error("resource cancellation is unavailable for task {task}")]
+    ResourceCancellationUnavailable {
+        /// Task whose resource authority must own cancellation
+        task: TaskId,
+    },
     /// A previously accepted event sequence has different content
     #[error("event content conflict: {task} sequence {seq}")]
     EventContentConflict {
@@ -377,6 +383,7 @@ impl AppError {
             Self::SubmissionConflict { .. } => "submission_conflict",
             Self::RouteNotFound { .. } => "route_not_found",
             Self::ClusterTaskConflict { .. } => "cluster_task_conflict",
+            Self::ResourceCancellationUnavailable { .. } => "resource_cancellation_unavailable",
             Self::EventContentConflict { .. } => "event_content_conflict",
             Self::MessageInvalid { .. } => "message_invalid",
             Self::AgentThreadNotFound { .. } => "agent_thread_not_found",
@@ -428,6 +435,7 @@ impl AppError {
             | Self::StreamLimit { .. }
             | Self::MachineIdentityMismatch { .. }
             | Self::ClusterTaskConflict { .. }
+            | Self::ResourceCancellationUnavailable { .. }
             | Self::EventContentConflict { .. }
             | Self::DuplicateMachineIdentity { .. }
             | Self::DuplicateMachineName { .. }
@@ -470,6 +478,7 @@ impl AppError {
             | Self::StreamLimit { .. }
             | Self::MachineIdentityMismatch { .. }
             | Self::ClusterTaskConflict { .. }
+            | Self::ResourceCancellationUnavailable { .. }
             | Self::EventContentConflict { .. }
             | Self::DuplicateMachineIdentity { .. }
             | Self::DuplicateMachineName { .. }
@@ -522,7 +531,9 @@ impl AppError {
                 json!({ "task": task, "machine": machine })
             }
             Self::TaskNotStarted { task } => json!({ "task": task }),
-            Self::RouteNotFound { task } | Self::ClusterTaskConflict { task } => {
+            Self::RouteNotFound { task }
+            | Self::ClusterTaskConflict { task }
+            | Self::ResourceCancellationUnavailable { task } => {
                 json!({ "task": task })
             }
             Self::EventContentConflict { task, seq } => json!({ "task": task, "seq": seq }),

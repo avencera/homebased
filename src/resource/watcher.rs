@@ -6,6 +6,7 @@ use std::io::{self, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::domain::{ExitReason, TaskState};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 use sha2::{Digest, Sha256};
@@ -45,7 +46,7 @@ pub struct AttemptBinding {
 }
 
 impl AttemptBinding {
-    fn validate(&self) -> Result<(), WatcherError> {
+    pub(crate) fn validate(&self) -> Result<(), WatcherError> {
         for identifier in [
             &self.campaign_id,
             &self.campaign_revision_id,
@@ -72,6 +73,16 @@ impl AttemptBinding {
 pub struct RecoverySnapshot {
     binding: AttemptBinding,
     generation_ids: BTreeSet<String>,
+}
+
+impl RecoverySnapshot {
+    pub(crate) fn is_for(&self, binding: &AttemptBinding) -> bool {
+        self.binding == *binding
+    }
+
+    pub(crate) fn contains_generation(&self, generation_id: &str) -> bool {
+        self.generation_ids.contains(generation_id)
+    }
 }
 
 impl Serialize for RecoverySnapshot {
@@ -137,6 +148,28 @@ pub struct PublishedRecoveryGeneration {
     pub committed_update_count: u64,
 }
 
+/// Content identity for one complete checkpoint publication
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerifiedCheckpointPublication {
+    pub(crate) binding: AttemptBinding,
+    pub(crate) path: PathBuf,
+    pub(crate) generation_id: String,
+    pub(crate) committed_update_count: u64,
+    pub(crate) record_sha256: String,
+    pub(crate) inventory_sha256: String,
+}
+
+impl VerifiedCheckpointPublication {
+    fn observed_generation(&self) -> PublishedRecoveryGeneration {
+        PublishedRecoveryGeneration {
+            path: self.path.clone(),
+            generation_id: self.generation_id.clone(),
+            committed_update_count: self.committed_update_count,
+        }
+    }
+}
+
 /// One fully verified final result publication for an exact trainer attempt
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedTerminalResult {
@@ -148,6 +181,87 @@ pub struct PublishedTerminalResult {
     pub binding: AttemptBinding,
     /// Output paths bound by the result receipt
     pub output_paths: Vec<String>,
+    /// SHA-256 digest of the exact request bytes validated for this result
+    pub request_sha256: String,
+    /// SHA-256 digest of the terminal record, request, and verified output inventory
+    pub publication_sha256: String,
+}
+
+/// Complete publication evidence observed during one release-watch decision
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPublications {
+    /// New complete checkpoint not present in the persisted baseline
+    pub new_checkpoint: Option<PublishedRecoveryGeneration>,
+    /// Complete matching final result, if it has been published
+    pub completed_result: Option<PublishedTerminalResult>,
+}
+
+/// Read-only conclusion from publication evidence and one exact Homebased task state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchObservation {
+    /// The task is queued and has not published attempt evidence yet
+    WaitingForTaskStart,
+    /// The task is running and has not published a new checkpoint or final result
+    WaitingForCheckpoint,
+    /// A matching checkpoint is available while the task is running
+    ///
+    /// This only permits a caller to consider requesting a stop. It does not
+    /// mean that a stop was requested, that the process exited, or that the GPU
+    /// was released
+    StopRequestCandidate {
+        /// New complete checkpoint that prompted this candidate
+        checkpoint: PublishedRecoveryGeneration,
+    },
+    /// A final result is published, but Homebased still reports the task as running
+    ///
+    /// Wait for the exact task to end. Do not request a stop based on a checkpoint
+    /// observed at the same time as this result
+    CompletedResultAwaitingTaskExit {
+        /// Verified final result for the exact trainer attempt
+        result: PublishedTerminalResult,
+        /// New checkpoint observed with the result, if any
+        new_checkpoint: Option<PublishedRecoveryGeneration>,
+    },
+    /// The exact task ended successfully and a matching final result is published
+    ///
+    /// This is only a candidate for the resource workflow's `AlreadyCompleted`
+    /// path. The caller must still prove that the GPU-owning process or container
+    /// has exited. This observation never confirms GPU release
+    AlreadyCompletedCandidate {
+        /// Verified final result for the exact trainer attempt
+        result: PublishedTerminalResult,
+        /// New checkpoint observed with the result, if any
+        new_checkpoint: Option<PublishedRecoveryGeneration>,
+    },
+    /// The task state or its relation to the publications needs caller attention
+    Attention(WatcherAttention),
+}
+
+/// Task or publication state that cannot safely advance a release watch
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatcherAttention {
+    /// Homebased lost the exact task, so process state is unknown
+    LostTask {
+        /// Publications observed before process state became unknown
+        publications: ObservedPublications,
+    },
+    /// The exact task ended without a successful zero exit
+    FailedTask {
+        /// Recorded reason for the task exit
+        reason: ExitReason,
+        /// Publications observed before the task ended
+        publications: ObservedPublications,
+    },
+    /// Attempt evidence appeared before Homebased reported the task as running
+    PublicationBeforeTaskStart {
+        /// Publications inconsistent with the queued task state
+        publications: ObservedPublications,
+    },
+    /// The task exited successfully but did not publish a matching final result
+    SuccessfulTaskWithoutFinalResult {
+        /// New checkpoint observed before the successful task exit, if any
+        new_checkpoint: Option<PublishedRecoveryGeneration>,
+    },
 }
 
 /// Read-only publication detection errors that need caller attention
@@ -225,6 +339,17 @@ pub fn find_new(
     expected_binding: &AttemptBinding,
     baseline: &RecoverySnapshot,
 ) -> Result<Option<PublishedRecoveryGeneration>, WatcherError> {
+    Ok(
+        find_new_publication(runtime_root, expected_binding, baseline)?
+            .map(|generation| generation.observed_generation()),
+    )
+}
+
+fn find_new_publication(
+    runtime_root: &Path,
+    expected_binding: &AttemptBinding,
+    baseline: &RecoverySnapshot,
+) -> Result<Option<VerifiedCheckpointPublication>, WatcherError> {
     expected_binding.validate()?;
     if baseline.binding != *expected_binding {
         return Err(WatcherError::SnapshotBindingMismatch);
@@ -233,6 +358,22 @@ pub fn find_new(
     Ok(read_matching_generations(runtime_root, expected_binding)?
         .into_iter()
         .find(|generation| !baseline.generation_ids.contains(&generation.generation_id)))
+}
+
+/// Revalidate the exact complete publication selected for a stop reservation
+pub(crate) fn revalidate_checkpoint_publication(
+    runtime_root: &Path,
+    expected_binding: &AttemptBinding,
+    expected: &VerifiedCheckpointPublication,
+) -> Result<bool, WatcherError> {
+    if expected.binding != *expected_binding {
+        return Err(WatcherError::SnapshotBindingMismatch);
+    }
+
+    Ok(read_matching_generations(runtime_root, expected_binding)?
+        .into_iter()
+        .find(|generation| generation.generation_id == expected.generation_id)
+        .is_some_and(|generation| generation == *expected))
 }
 
 /// Find a complete successful result and matching terminal evidence for one attempt
@@ -348,6 +489,14 @@ pub fn find_completed_result(
     )?;
     validate_result_files(&result_path, &terminal.terminal.outcome.result.outputs)?;
 
+    let request_sha256 = hex_digest(&Sha256::digest(&request_bytes));
+    let publication_sha256 = completed_publication_sha256(
+        &result_path,
+        &request_bytes,
+        &publication_bytes,
+        &terminal.terminal.outcome.result.outputs,
+    );
+
     Ok(Some(PublishedTerminalResult {
         publication_path: result_path,
         terminal_path,
@@ -360,7 +509,109 @@ pub fn find_completed_result(
             .into_iter()
             .map(|output| output.path)
             .collect(),
+        request_sha256,
+        publication_sha256,
     }))
+}
+
+/// Observe one release watch from its exact attempt, baseline, and Homebased task state
+///
+/// The task state must belong to the Homebased task that launched `expected_binding`
+/// A checkpoint can only produce a stop-request candidate while that task is running
+/// A final result takes precedence over a checkpoint and waits for task exit. Even a
+/// successful task exit plus a final result is only an `AlreadyCompletedCandidate`;
+/// the caller must independently prove that the GPU-owning process or container has
+/// exited before it completes resource release. No observation confirms GPU release
+///
+/// Strict publication errors are returned unchanged so the caller can retain the
+/// resource and request attention
+pub fn observe_release(
+    runtime_root: &Path,
+    expected_binding: &AttemptBinding,
+    baseline: &RecoverySnapshot,
+    task_state: &TaskState,
+) -> Result<WatchObservation, WatcherError> {
+    observe_release_with_checkpoint_evidence(runtime_root, expected_binding, baseline, task_state)
+        .map(|(observation, _)| observation)
+}
+
+pub(crate) fn observe_release_with_checkpoint_evidence(
+    runtime_root: &Path,
+    expected_binding: &AttemptBinding,
+    baseline: &RecoverySnapshot,
+    task_state: &TaskState,
+) -> Result<(WatchObservation, Option<VerifiedCheckpointPublication>), WatcherError> {
+    let verified_checkpoint = find_new_publication(runtime_root, expected_binding, baseline)?;
+    let publications = ObservedPublications {
+        new_checkpoint: verified_checkpoint
+            .as_ref()
+            .map(VerifiedCheckpointPublication::observed_generation),
+        completed_result: find_completed_result(runtime_root, expected_binding)?,
+    };
+
+    let observation = match task_state {
+        TaskState::Queued
+            if publications.new_checkpoint.is_none() && publications.completed_result.is_none() =>
+        {
+            WatchObservation::WaitingForTaskStart
+        }
+        TaskState::Queued => {
+            WatchObservation::Attention(WatcherAttention::PublicationBeforeTaskStart {
+                publications,
+            })
+        }
+        TaskState::Running { .. } => {
+            let ObservedPublications {
+                new_checkpoint,
+                completed_result,
+            } = publications;
+
+            if let Some(result) = completed_result {
+                WatchObservation::CompletedResultAwaitingTaskExit {
+                    result,
+                    new_checkpoint,
+                }
+            } else if let Some(checkpoint) = new_checkpoint {
+                WatchObservation::StopRequestCandidate { checkpoint }
+            } else {
+                WatchObservation::WaitingForCheckpoint
+            }
+        }
+        TaskState::Finished {
+            reason: ExitReason::Exit { code: 0 },
+        } => {
+            let ObservedPublications {
+                new_checkpoint,
+                completed_result,
+            } = publications;
+
+            if let Some(result) = completed_result {
+                WatchObservation::AlreadyCompletedCandidate {
+                    result,
+                    new_checkpoint,
+                }
+            } else {
+                WatchObservation::Attention(WatcherAttention::SuccessfulTaskWithoutFinalResult {
+                    new_checkpoint,
+                })
+            }
+        }
+        TaskState::Finished { reason } => {
+            WatchObservation::Attention(WatcherAttention::FailedTask {
+                reason: reason.clone(),
+                publications,
+            })
+        }
+        TaskState::Lost => WatchObservation::Attention(WatcherAttention::LostTask { publications }),
+    };
+    let selected_checkpoint =
+        if matches!(observation, WatchObservation::StopRequestCandidate { .. }) {
+            verified_checkpoint
+        } else {
+            None
+        };
+
+    Ok((observation, selected_checkpoint))
 }
 
 fn read_terminal_header(
@@ -583,6 +834,53 @@ fn validate_request_projection(request: &WorkerRequestProjection) -> Result<(), 
     validate_output_declarations(&request.expected_outputs)
 }
 
+/// Failure while checking one persisted direct-segment attempt request
+#[derive(Debug)]
+pub(crate) enum AttemptRequestValidationError {
+    /// The expected binding supplied by the caller is invalid
+    InvalidExpectedBinding(&'static str),
+    /// The request does not match the maintained trainer request projection
+    Malformed(String),
+    /// The request is valid but binds a different trainer attempt
+    BindingMismatch(Box<AttemptBinding>),
+}
+
+/// Validate a request with the same strict projection used for terminal results
+///
+/// This also runs the request configuration scanner used by completed-result
+/// validation. That scanner rejects duplicate top-level and input-view fields.
+pub(crate) fn validate_attempt_request(
+    request_bytes: &[u8],
+    expected_binding: &AttemptBinding,
+) -> Result<(), AttemptRequestValidationError> {
+    expected_binding.validate().map_err(|error| match error {
+        WatcherError::InvalidAttemptBinding { reason } => {
+            AttemptRequestValidationError::InvalidExpectedBinding(reason)
+        }
+        _ => AttemptRequestValidationError::InvalidExpectedBinding(
+            "trainer attempt binding is invalid",
+        ),
+    })?;
+
+    let request: WorkerRequestProjection = serde_json::from_slice(request_bytes)
+        .map_err(|error| AttemptRequestValidationError::Malformed(error.to_string()))?;
+    if request.schema_version != PROTOCOL_SCHEMA_VERSION {
+        return Err(AttemptRequestValidationError::Malformed(
+            "unsupported request protocol schema".into(),
+        ));
+    }
+    validate_request_projection(&request).map_err(AttemptRequestValidationError::Malformed)?;
+    configuration_digest(request_bytes).map_err(AttemptRequestValidationError::Malformed)?;
+
+    if request.binding != *expected_binding {
+        return Err(AttemptRequestValidationError::BindingMismatch(Box::new(
+            request.binding,
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_metric_unit(unit: &serde_json::Value) -> Result<(), String> {
     match unit {
         serde_json::Value::String(value)
@@ -728,6 +1026,36 @@ fn validate_result_files(
     }
 
     Ok(())
+}
+
+fn completed_publication_sha256(
+    result_path: &Path,
+    request_bytes: &[u8],
+    terminal_bytes: &[u8],
+    inventory: &ArtifactInventoryProjection,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"trainer-completed-publication-v1\0");
+
+    let publication_path = result_path.to_string_lossy();
+    for value in [publication_path.as_bytes(), request_bytes, terminal_bytes] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    for entry in &inventory.entries {
+        for value in [
+            entry.path.as_bytes(),
+            entry.kind.as_bytes(),
+            entry.digest.as_bytes(),
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        digest.update(entry.size.to_be_bytes());
+    }
+
+    hex_digest(&digest.finalize())
 }
 
 fn verify_output_file(
@@ -1059,7 +1387,7 @@ fn hex_digest(digest: &[u8]) -> String {
 fn read_matching_generations(
     runtime_root: &Path,
     expected_binding: &AttemptBinding,
-) -> Result<Vec<PublishedRecoveryGeneration>, WatcherError> {
+) -> Result<Vec<VerifiedCheckpointPublication>, WatcherError> {
     expected_binding.validate()?;
     let Some(publications_root) = publication_root(runtime_root)? else {
         return Ok(Vec::new());
@@ -1105,16 +1433,34 @@ fn read_matching_generations(
             ));
         }
 
-        let record = fs::read(&record_path).map_err(|source| WatcherError::Io {
-            path: record_path.clone(),
-            source,
-        })?;
+        let record = read_regular_file(&record_path, &record_metadata)?;
         let bindings: BindingProjection = serde_json::from_slice(&record)
             .map_err(|error| malformed_publication(&path, error.to_string()))?;
         if bindings.request.binding != *expected_binding
             || bindings.recovery.binding != *expected_binding
         {
             continue;
+        }
+
+        let attempt_request_path = runtime_root
+            .join("attempts")
+            .join(&expected_binding.attempt_id)
+            .join(REQUEST_FILE);
+        let attempt_request_metadata = optional_file(&attempt_request_path)?.ok_or_else(|| {
+            malformed_publication(&path, "checkpoint has no matching attempt request")
+        })?;
+        let attempt_request = read_regular_file(&attempt_request_path, &attempt_request_metadata)?;
+        let publication_request =
+            request_document(&record).map_err(|reason| malformed_publication(&path, reason))?;
+        let saved_request: serde_json::Value = serde_json::from_slice(&attempt_request)
+            .map_err(|error| malformed_publication(&attempt_request_path, error.to_string()))?;
+        let published_request: serde_json::Value = serde_json::from_slice(publication_request)
+            .map_err(|error| malformed_publication(&path, error.to_string()))?;
+        if saved_request != published_request {
+            return Err(malformed_publication(
+                &path,
+                "checkpoint request differs from the exact trainer attempt request",
+            ));
         }
 
         let publication: RecoveryPublicationProjection = serde_json::from_slice(&record)
@@ -1130,6 +1476,40 @@ fn read_matching_generations(
         {
             continue;
         }
+        if publication.request.schema_version != PROTOCOL_SCHEMA_VERSION
+            || publication.recovery.schema_version != PROTOCOL_SCHEMA_VERSION
+            || publication.recovery.inventory.schema_version != PROTOCOL_SCHEMA_VERSION
+            || publication.recovery.inventory.binding != *expected_binding
+            || !matches!(
+                publication.recovery.cause.as_str(),
+                "periodic_checkpoint" | "stop_requested" | "non_finite_training"
+            )
+        {
+            return Err(malformed_publication(
+                &path,
+                "recovery publication has an unsupported schema or inventory binding",
+            ));
+        }
+        validate_request_projection(&publication.request)
+            .map_err(|reason| malformed_publication(&path, reason))?;
+        validate_worker_identity(&publication.recovery.worker)
+            .map_err(|reason| malformed_publication(&path, reason))?;
+        if publication.request.worker != publication.recovery.worker
+            || publication.recovery.compatibility.schema_id != "speakrs-long-run-train-v1"
+            || publication.recovery.compatibility.source_digest
+                != publication.request.worker.source_digest
+            || publication.recovery.compatibility.config_digest
+                != configuration_digest(
+                    request_document(&record)
+                        .map_err(|reason| malformed_publication(&path, reason))?,
+                )
+                .map_err(|reason| malformed_publication(&path, reason))?
+        {
+            return Err(malformed_publication(
+                &path,
+                "recovery compatibility differs from the persisted request",
+            ));
+        }
         validate_identifier(&publication.recovery.generation_id)
             .map_err(|reason| malformed_publication(&path, reason))?;
         if name != publication.recovery.generation_id {
@@ -1138,16 +1518,90 @@ fn read_matching_generations(
                 "directory name differs from recovery.generation_id",
             ));
         }
+        validate_checkpoint_inventory(
+            &path,
+            &publication.recovery.inventory,
+            expected_binding,
+            &publication.recovery.state_digest,
+        )?;
 
-        generations.push(PublishedRecoveryGeneration {
+        let final_record_metadata = metadata(&record_path)?;
+        let final_record = read_regular_file(&record_path, &final_record_metadata)?;
+        if final_record != record {
+            return Err(malformed_publication(
+                &record_path,
+                "recovery record changed during publication verification",
+            ));
+        }
+
+        let inventory_bytes = serde_json::to_vec(&publication.recovery.inventory)
+            .map_err(|error| malformed_publication(&path, error.to_string()))?;
+
+        generations.push(VerifiedCheckpointPublication {
+            binding: expected_binding.clone(),
             path,
             generation_id: publication.recovery.generation_id,
             committed_update_count: publication.recovery.position.update_count,
+            record_sha256: hex_digest(&Sha256::digest(&record)),
+            inventory_sha256: hex_digest(&Sha256::digest(&inventory_bytes)),
         });
     }
 
     generations.sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
     Ok(generations)
+}
+
+fn request_document(record: &[u8]) -> Result<&[u8], String> {
+    let fields = json_object_ranges(record, 0)?;
+    let request = fields
+        .get("request")
+        .ok_or_else(|| "recovery publication has no request".to_owned())?;
+    Ok(&record[request.clone()])
+}
+
+fn validate_checkpoint_inventory(
+    path: &Path,
+    inventory: &ArtifactInventoryProjection,
+    expected_binding: &AttemptBinding,
+    state_digest: &str,
+) -> Result<(), WatcherError> {
+    let mut previous_path: Option<&str> = None;
+    let mut paths = BTreeSet::new();
+    for entry in &inventory.entries {
+        validate_artifact_path(&entry.path)
+            .map_err(|reason| malformed_publication(path, reason))?;
+        validate_digest(&entry.digest).map_err(|reason| malformed_publication(path, reason))?;
+        if entry.kind != "file"
+            || previous_path.is_some_and(|previous| previous >= entry.path.as_str())
+            || !paths.insert(entry.path.as_str())
+        {
+            return Err(malformed_publication(
+                path,
+                "recovery inventory must contain sorted unique regular files",
+            ));
+        }
+        previous_path = Some(&entry.path);
+    }
+
+    let recovery_state = inventory
+        .entries
+        .iter()
+        .find(|entry| entry.path == "recovery.json")
+        .ok_or_else(|| malformed_publication(path, "recovery inventory omits recovery.json"))?;
+    if recovery_state.digest != state_digest {
+        return Err(malformed_publication(
+            path,
+            "recovery state digest differs from its inventory",
+        ));
+    }
+    if inventory.binding != *expected_binding {
+        return Err(malformed_publication(
+            path,
+            "recovery inventory belongs to a different trainer attempt",
+        ));
+    }
+
+    validate_result_files(path, inventory)
 }
 
 fn publication_root(runtime_root: &Path) -> Result<Option<PathBuf>, WatcherError> {
@@ -1277,15 +1731,30 @@ struct RecoveryBindingProjection {
 #[serde(deny_unknown_fields)]
 struct RecoveryPublicationProjection {
     schema: String,
-    request: RequestBindingProjection,
+    request: WorkerRequestProjection,
     recovery: RecoveryMetadataProjection,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryMetadataProjection {
+    schema_version: u64,
     binding: AttemptBinding,
     generation_id: String,
+    compatibility: RecoveryCompatibilityProjection,
+    worker: WorkerIdentityProjection,
+    inventory: ArtifactInventoryProjection,
+    state_digest: String,
     position: RecoveryPositionProjection,
+    cause: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCompatibilityProjection {
+    schema_id: String,
+    config_digest: String,
+    source_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1400,7 +1869,7 @@ struct OutputDeclarationProjection {
     kind: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactInventoryProjection {
     schema_version: u64,
@@ -1408,7 +1877,7 @@ struct ArtifactInventoryProjection {
     entries: Vec<InventoryEntryProjection>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryEntryProjection {
     path: String,
@@ -1473,17 +1942,18 @@ struct ValidationReceiptProjection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use crate::domain::{ExitReason, TaskState};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::{
-        AttemptBinding, PublishedRecoveryGeneration, WatcherError, find_completed_result, find_new,
-        snapshot,
+        AttemptBinding, PublishedRecoveryGeneration, WatchObservation, WatcherAttention,
+        WatcherError, find_completed_result, find_new, observe_release, snapshot,
     };
 
     fn expected_binding() -> AttemptBinding {
@@ -1524,13 +1994,51 @@ mod tests {
         generation_id: &str,
         update_count: Value,
     ) -> Value {
+        const CHECKPOINT_BYTES: &[u8] = b"checkpoint bytes";
+        const RECOVERY_BYTES: &[u8] = b"recovery state";
+        let request = request_value(request_binding);
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+        let worker = worker_identity();
+
         json!({
             "schema": "trainer-direct-recovery-v1",
-            "request": { "binding": request_binding },
+            "request": request,
             "recovery": {
+                "schema_version": 1,
                 "binding": recovery_binding,
                 "generation_id": generation_id,
-                "position": { "update_count": update_count },
+                "compatibility": {
+                    "schema_id": "speakrs-long-run-train-v1",
+                    "config_digest": super::configuration_digest(&request_bytes).unwrap(),
+                    "source_digest": "b".repeat(64),
+                },
+                "worker": worker,
+                "inventory": {
+                    "schema_version": 1,
+                    "binding": recovery_binding,
+                    "entries": [
+                        {
+                            "path": "checkpoint.bin",
+                            "kind": "file",
+                            "size": CHECKPOINT_BYTES.len(),
+                            "digest": digest(CHECKPOINT_BYTES),
+                        },
+                        {
+                            "path": "recovery.json",
+                            "kind": "file",
+                            "size": RECOVERY_BYTES.len(),
+                            "digest": digest(RECOVERY_BYTES),
+                        },
+                    ],
+                },
+                "state_digest": digest(RECOVERY_BYTES),
+                "position": {
+                    "update_count": update_count,
+                    "exposure_count": 0,
+                    "sample_cursor_digest": "1".repeat(64),
+                    "random_state_digest": "2".repeat(64),
+                },
+                "cause": "periodic_checkpoint",
             },
         })
     }
@@ -1558,6 +2066,22 @@ mod tests {
     fn write_record(published_root: &Path, directory_name: &str, record: &Value) -> PathBuf {
         let directory = published_root.join(directory_name);
         fs::create_dir(&directory).unwrap();
+        let request = record.get("request").unwrap();
+        let binding: AttemptBinding =
+            serde_json::from_value(request.get("binding").unwrap().clone()).unwrap();
+        let attempt_path = published_root
+            .parent()
+            .unwrap()
+            .join("attempts")
+            .join(&binding.attempt_id);
+        fs::create_dir_all(&attempt_path).unwrap();
+        fs::write(
+            attempt_path.join(super::REQUEST_FILE),
+            serde_json::to_vec(request).unwrap(),
+        )
+        .unwrap();
+        fs::write(directory.join("checkpoint.bin"), b"checkpoint bytes").unwrap();
+        fs::write(directory.join("recovery.json"), b"recovery state").unwrap();
         fs::write(
             directory.join("segment-record.json"),
             serde_json::to_vec(record).unwrap(),
@@ -1665,7 +2189,38 @@ mod tests {
         })
     }
 
-    fn write_completed_result(runtime_root: &Path, binding: &AttemptBinding) -> PathBuf {
+    pub(crate) fn write_request_for_test(runtime_root: &Path, binding: &AttemptBinding) -> PathBuf {
+        let attempt_path = runtime_root.join("attempts").join(&binding.attempt_id);
+        fs::create_dir_all(&attempt_path).unwrap();
+        let request_path = attempt_path.join("request.json");
+        fs::write(
+            &request_path,
+            serde_json::to_vec(&request_value(binding)).unwrap(),
+        )
+        .unwrap();
+        request_path
+    }
+
+    pub(crate) fn write_generation_for_test(
+        runtime_root: &Path,
+        binding: &AttemptBinding,
+        generation_id: &str,
+        update_count: u64,
+    ) -> PathBuf {
+        write_generation(
+            &published_root(runtime_root),
+            generation_id,
+            generation_id,
+            update_count,
+            binding,
+            binding,
+        )
+    }
+
+    pub(crate) fn write_completed_result_for_test(
+        runtime_root: &Path,
+        binding: &AttemptBinding,
+    ) -> PathBuf {
         let published_root = published_root(runtime_root);
         let publication_path = published_root.join(format!("result-{}", binding.attempt_id));
         fs::create_dir(&publication_path).unwrap();
@@ -1674,8 +2229,16 @@ mod tests {
 
         let attempt_path = runtime_root.join("attempts").join(&binding.attempt_id);
         fs::create_dir_all(&attempt_path).unwrap();
+        let request_path = attempt_path.join("request.json");
+        if !request_path.exists() {
+            fs::write(
+                &request_path,
+                serde_json::to_vec(&request_value(binding)).unwrap(),
+            )
+            .unwrap();
+        }
         fs::write(
-            attempt_path.join("request.json"),
+            &request_path,
             serde_json::to_vec(&request_value(binding)).unwrap(),
         )
         .unwrap();
@@ -1683,6 +2246,270 @@ mod tests {
         fs::write(attempt_path.join("terminal.json"), &terminal).unwrap();
         fs::write(publication_path.join("segment-record.json"), terminal).unwrap();
         publication_path
+    }
+
+    fn write_completed_result(runtime_root: &Path, binding: &AttemptBinding) -> PathBuf {
+        write_completed_result_for_test(runtime_root, binding)
+    }
+
+    #[test]
+    fn a_final_result_wins_when_a_new_checkpoint_appears_at_the_same_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        let published_root = published_root(&runtime_root);
+        write_generation(
+            &published_root,
+            "generation-a",
+            "generation-a",
+            41,
+            &expected,
+            &expected,
+        );
+        let result_path = write_completed_result(&runtime_root, &expected);
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Running { pid: Some(42) },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::CompletedResultAwaitingTaskExit {
+                result,
+                new_checkpoint: Some(PublishedRecoveryGeneration {
+                    generation_id,
+                    ..
+                }),
+            } if result.publication_path == result_path && generation_id == "generation-a"
+        ));
+    }
+
+    #[test]
+    fn a_final_result_before_task_exit_waits_without_requesting_a_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        let result_path = write_completed_result(&runtime_root, &expected);
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Running { pid: Some(42) },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::CompletedResultAwaitingTaskExit {
+                result,
+                new_checkpoint: None,
+            } if result.publication_path == result_path
+        ));
+    }
+
+    #[test]
+    fn a_lost_task_needs_attention_even_without_publications() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+
+        let observation =
+            observe_release(&runtime_root, &expected, &baseline, &TaskState::Lost).unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::Attention(WatcherAttention::LostTask { publications })
+                if publications.new_checkpoint.is_none()
+                    && publications.completed_result.is_none()
+        ));
+    }
+
+    #[test]
+    fn a_failed_task_needs_attention_even_without_publications() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Finished {
+                reason: ExitReason::Exit { code: 7 },
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::Attention(WatcherAttention::FailedTask {
+                reason: ExitReason::Exit { code: 7 },
+                publications,
+            }) if publications.new_checkpoint.is_none()
+                && publications.completed_result.is_none()
+        ));
+    }
+
+    #[test]
+    fn foreign_and_baseline_checkpoints_do_not_stop_the_running_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let published_root = published_root(&runtime_root);
+        let expected = expected_binding();
+        write_generation(
+            &published_root,
+            "generation-baseline",
+            "generation-baseline",
+            40,
+            &expected,
+            &expected,
+        );
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        let foreign = foreign_binding();
+        write_generation(
+            &published_root,
+            "generation-foreign",
+            "generation-foreign",
+            41,
+            &foreign,
+            &foreign,
+        );
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Running { pid: Some(42) },
+        )
+        .unwrap();
+
+        assert_eq!(observation, WatchObservation::WaitingForCheckpoint);
+    }
+
+    #[test]
+    fn a_new_checkpoint_while_running_is_only_a_stop_request_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        let path = write_generation(
+            &published_root(&runtime_root),
+            "generation-a",
+            "generation-a",
+            41,
+            &expected,
+            &expected,
+        );
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Running { pid: Some(42) },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::StopRequestCandidate { checkpoint }
+                if checkpoint.path == path
+        ));
+    }
+
+    #[test]
+    fn a_successful_task_and_final_result_are_only_an_already_completed_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        let result_path = write_completed_result(&runtime_root, &expected);
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Finished {
+                reason: ExitReason::Exit { code: 0 },
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::AlreadyCompletedCandidate {
+                result,
+                new_checkpoint: None,
+            } if result.publication_path == result_path
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_before_the_task_starts_needs_attention() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        write_generation(
+            &published_root(&runtime_root),
+            "generation-a",
+            "generation-a",
+            41,
+            &expected,
+            &expected,
+        );
+
+        let observation =
+            observe_release(&runtime_root, &expected, &baseline, &TaskState::Queued).unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::Attention(WatcherAttention::PublicationBeforeTaskStart {
+                publications,
+            }) if publications.new_checkpoint.is_some()
+                && publications.completed_result.is_none()
+        ));
+    }
+
+    #[test]
+    fn a_successful_task_and_checkpoint_without_a_result_need_attention() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_root(&temp);
+        let expected = expected_binding();
+        let baseline = snapshot(&runtime_root, &expected).unwrap();
+        write_generation(
+            &published_root(&runtime_root),
+            "generation-a",
+            "generation-a",
+            41,
+            &expected,
+            &expected,
+        );
+
+        let observation = observe_release(
+            &runtime_root,
+            &expected,
+            &baseline,
+            &TaskState::Finished {
+                reason: ExitReason::Exit { code: 0 },
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observation,
+            WatchObservation::Attention(WatcherAttention::SuccessfulTaskWithoutFinalResult {
+                new_checkpoint: Some(PublishedRecoveryGeneration { .. }),
+            })
+        ));
     }
 
     #[test]

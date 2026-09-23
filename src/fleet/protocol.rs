@@ -21,12 +21,12 @@ impl fmt::Display for ClusterProtocolVersion {
 }
 
 /// Version this build speaks by default.
-pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(1);
+pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(2);
 
-/// Range this build accepts. Widen `min` below the current version only while
-/// a rolling update needs the older shape.
+/// Range this build accepts. Version 1 keeps the old cancellation wire shape
+/// available during rolling updates
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {
-    min: CLUSTER_PROTOCOL_VERSION,
+    min: ClusterProtocolVersion(1),
     max: CLUSTER_PROTOCOL_VERSION,
 };
 

@@ -1,13 +1,19 @@
 //! Typed resource, request, loan, and supervisor-notice domain models
 
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{API_VERSION, ExitReason, TaskId, ThreadId};
+use crate::domain::{API_VERSION, ExitReason, ProcessStatus, TaskId, ThreadId};
 use crate::machine::MachineId;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
-use crate::submission::{RequestId, ResourceQueueReceipt};
+use crate::submission::{NormalizedSpecSha256, RequestId, ResourceQueueReceipt};
 
+pub mod command_shape;
+pub mod ownership_lock;
+pub mod release_watcher;
 #[expect(
     dead_code,
     reason = "StoreActor migration integration is outside this module's scope"
@@ -286,6 +292,77 @@ impl Resource {
     }
 }
 
+/// Durable association between one authority-owned resource and one trainer task
+///
+/// This immutable record keeps exact point-in-time trainer request and lock evidence
+/// with the normalized spec digest from the accepted Homebased task identity
+/// The Store checks the direct-segment command shape before its first insert
+/// This record does not prove that the live process used the lock or that the GPU worker exited
+/// It cannot permit release completion or `Serving`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainerAttemptAssociation {
+    resource_id: ResourceId,
+    authority_machine: MachineId,
+    task_id: TaskId,
+    verified_attempt: ownership_lock::VerifiedTrainerAttempt,
+    normalized_spec_sha256: NormalizedSpecSha256,
+}
+
+impl TrainerAttemptAssociation {
+    /// Return the associated authority-owned resource
+    #[must_use]
+    pub const fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    /// Return the machine that owns the associated resource
+    #[must_use]
+    pub const fn authority_machine(&self) -> MachineId {
+        self.authority_machine
+    }
+
+    /// Return the exact registered Homebased background task
+    #[must_use]
+    pub const fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    /// Return the exact trainer attempt evidence captured at registration time
+    #[must_use]
+    pub const fn verified_attempt(&self) -> &ownership_lock::VerifiedTrainerAttempt {
+        &self.verified_attempt
+    }
+
+    /// Return the digest derived from the accepted executor identity's normalized spec
+    #[must_use]
+    pub const fn normalized_spec_sha256(&self) -> NormalizedSpecSha256 {
+        self.normalized_spec_sha256
+    }
+
+    pub(crate) fn from_components(
+        resource_id: ResourceId,
+        authority_machine: MachineId,
+        task_id: TaskId,
+        verified_attempt: ownership_lock::VerifiedTrainerAttempt,
+        normalized_spec_sha256: NormalizedSpecSha256,
+    ) -> Result<Self, &'static str> {
+        if resource_id.as_uuid().is_nil()
+            || authority_machine.as_uuid().is_nil()
+            || task_id.0.is_nil()
+        {
+            return Err("trainer attempt association identities must not be nil");
+        }
+
+        Ok(Self {
+            resource_id,
+            authority_machine,
+            task_id,
+            verified_attempt,
+            normalized_spec_sha256,
+        })
+    }
+}
+
 /// A normalized specification restricted to finite command workloads
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
@@ -507,6 +584,358 @@ pub enum ReturnContext {
     Idle,
 }
 
+/// Stable Homebased task identity reserved for one release watcher
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReleaseWatcherTaskId(TaskId);
+
+impl ReleaseWatcherTaskId {
+    /// Wrap a preallocated Homebased task identity
+    #[must_use]
+    pub const fn new(task_id: TaskId) -> Self {
+        Self(task_id)
+    }
+
+    /// Return the underlying Homebased task identity
+    #[must_use]
+    pub const fn as_task_id(self) -> TaskId {
+        self.0
+    }
+}
+
+/// Durable identity intent linking one watcher task to one release action
+///
+/// This record reserves the exact task identity before launch. It does not
+/// establish that the Homebased task is running or that the resource is free
+/// Every launch identity field is required so older partial bindings fail as stored-data errors
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseWatcherIntent {
+    /// Stable release decision identity
+    pub action_id: ActionId,
+    /// Resource revision associated with the release action
+    pub state_revision: ResourceRevision,
+    /// Exact background task observed when release was requested
+    pub observed_background_task: TaskId,
+    /// Preallocated identity of the Homebased release watcher task
+    pub watcher_task_id: ReleaseWatcherTaskId,
+    /// Stable request identity distinct from the preallocated task identity
+    pub request_id: RequestId,
+    /// Digest of the watcher's immutable normalized command specification
+    pub normalized_spec_sha256: NormalizedSpecSha256,
+}
+
+/// Persisted watcher identity that keeps older partial records readable
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SavedReleaseWatcherIntent {
+    /// Complete identity that can bind a new watcher action
+    Complete(ReleaseWatcherIntent),
+    /// Legacy identity retained for inspection but not trusted as release evidence
+    LegacyUnproven(serde_json::Value),
+}
+
+impl SavedReleaseWatcherIntent {
+    pub(crate) fn complete(&self) -> Option<&ReleaseWatcherIntent> {
+        match self {
+            Self::Complete(intent) => Some(intent),
+            Self::LegacyUnproven(_) => None,
+        }
+    }
+}
+
+/// Durable release identity captured before the watcher task can act
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointAction {
+    pub(crate) resource_id: ResourceId,
+    pub(crate) action_id: ActionId,
+    pub(crate) state_revision: ResourceRevision,
+    pub(crate) observed_background_task: TaskId,
+}
+
+/// Immutable identity of the saved trainer-attempt association
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrainerAttemptAssociationProof {
+    pub(crate) resource_id: ResourceId,
+    pub(crate) authority_machine: MachineId,
+    pub(crate) task_id: TaskId,
+    pub(crate) canonical_runtime_root: PathBuf,
+    pub(crate) attempt_binding: watcher::AttemptBinding,
+    pub(crate) request_sha256: String,
+    pub(crate) ownership_lock_identity: OwnershipLockProof,
+    pub(crate) normalized_spec_sha256: NormalizedSpecSha256,
+}
+
+impl From<&TrainerAttemptAssociation> for TrainerAttemptAssociationProof {
+    fn from(association: &TrainerAttemptAssociation) -> Self {
+        let evidence = association.verified_attempt();
+        let lock = evidence.ownership_lock_identity();
+        Self {
+            resource_id: association.resource_id(),
+            authority_machine: association.authority_machine(),
+            task_id: association.task_id(),
+            canonical_runtime_root: evidence.canonical_runtime_root().to_path_buf(),
+            attempt_binding: evidence.binding().clone(),
+            request_sha256: evidence.request_digest().to_hex(),
+            ownership_lock_identity: OwnershipLockProof {
+                device: lock.device(),
+                inode: lock.inode(),
+            },
+            normalized_spec_sha256: association.normalized_spec_sha256(),
+        }
+    }
+}
+
+/// Saved device and inode of the trainer ownership lock
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnershipLockProof {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+/// Full authority-owned identity that scopes one checkpoint baseline and stop decision
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointBinding {
+    pub(crate) action: ReleaseCheckpointAction,
+    pub(crate) association: TrainerAttemptAssociationProof,
+    pub(crate) attempt_binding: watcher::AttemptBinding,
+    pub(crate) watcher_intent: ReleaseWatcherIntent,
+}
+
+impl ReleaseCheckpointBinding {
+    pub(crate) fn validate_for(
+        &self,
+        action: &ReleaseCheckpointAction,
+    ) -> Result<(), &'static str> {
+        validate_release_checkpoint_binding(action, self)
+    }
+}
+
+/// Checkpoint baseline captured from the saved trainer association
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointBaseline {
+    pub(crate) binding: ReleaseCheckpointBinding,
+    pub(crate) snapshot: watcher::RecoverySnapshot,
+}
+
+/// Stable identity of one reserved exact-task stop request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ReleaseStopReservationId(Uuid);
+
+impl ReleaseStopReservationId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+/// Stop decision reserved after the authority verified its exact checkpoint
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointStopDecision {
+    pub(crate) binding: ReleaseCheckpointBinding,
+    pub(crate) reservation_id: ReleaseStopReservationId,
+    pub(crate) selected_checkpoint: watcher::VerifiedCheckpointPublication,
+}
+
+/// Exact trainer task cancellation committed with its saved stop decision
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointCancellation {
+    pub(crate) task_id: TaskId,
+    pub(crate) cancel_requested_at: DateTime<Utc>,
+}
+
+/// Durable checkpoint-evidence phase stored beside the resource loan
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ReleaseCheckpointPhase {
+    /// New release action with no watcher identity yet
+    WatcherBindingPending,
+    /// Exact watcher identity is bound to a persisted pre-action baseline
+    BaselineCaptured {
+        /// Saved baseline and all immutable owner identities
+        baseline: ReleaseCheckpointBaseline,
+    },
+    /// Exact-task stop request is durably reserved after checkpoint verification
+    StopReserved {
+        /// Baseline used to reject pre-existing publications
+        baseline: ReleaseCheckpointBaseline,
+        /// Fixed checkpoint selected by the authority
+        decision: Box<ReleaseCheckpointStopDecision>,
+    },
+    /// Exact trainer cancellation committed with the saved stop decision
+    CancellationCommitted {
+        /// Baseline used to reject pre-existing publications
+        baseline: ReleaseCheckpointBaseline,
+        /// Fixed checkpoint selected by the authority
+        decision: Box<ReleaseCheckpointStopDecision>,
+        /// Exact task cancellation marker committed in the same transaction
+        cancellation: ReleaseCheckpointCancellation,
+    },
+}
+
+/// Durable evidence state for one exact AwaitingRelease action
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCheckpointState {
+    pub(crate) action: ReleaseCheckpointAction,
+    pub(crate) phase: ReleaseCheckpointPhase,
+}
+
+impl ReleaseCheckpointState {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.action.resource_id.as_uuid().is_nil()
+            || self.action.action_id.as_uuid().is_nil()
+            || self.action.observed_background_task.0.is_nil()
+            || self.action.state_revision.get() == 0
+        {
+            return Err("release checkpoint action identity is invalid");
+        }
+
+        let baseline = match &self.phase {
+            ReleaseCheckpointPhase::WatcherBindingPending => return Ok(()),
+            ReleaseCheckpointPhase::BaselineCaptured { baseline }
+            | ReleaseCheckpointPhase::StopReserved { baseline, .. }
+            | ReleaseCheckpointPhase::CancellationCommitted { baseline, .. } => baseline,
+        };
+        validate_release_checkpoint_binding(&self.action, &baseline.binding)?;
+        if !baseline.snapshot.is_for(&baseline.binding.attempt_binding) {
+            return Err("checkpoint baseline belongs to a different trainer attempt");
+        }
+
+        let decision = match &self.phase {
+            ReleaseCheckpointPhase::StopReserved { decision, .. }
+            | ReleaseCheckpointPhase::CancellationCommitted { decision, .. } => decision,
+            ReleaseCheckpointPhase::WatcherBindingPending
+            | ReleaseCheckpointPhase::BaselineCaptured { .. } => return Ok(()),
+        };
+        if let ReleaseCheckpointPhase::CancellationCommitted { cancellation, .. } = &self.phase
+            && cancellation.task_id != self.action.observed_background_task
+        {
+            return Err("checkpoint cancellation differs from its observed trainer task");
+        }
+        {
+            validate_release_checkpoint_binding(&self.action, &decision.binding)?;
+            if decision.binding != baseline.binding
+                || decision.reservation_id.0.is_nil()
+                || decision.selected_checkpoint.binding != baseline.binding.attempt_binding
+                || baseline
+                    .snapshot
+                    .contains_generation(&decision.selected_checkpoint.generation_id)
+                || !is_sha256(&decision.selected_checkpoint.record_sha256)
+                || !is_sha256(&decision.selected_checkpoint.inventory_sha256)
+                || decision.selected_checkpoint.path
+                    != baseline
+                        .binding
+                        .association
+                        .canonical_runtime_root
+                        .join("published")
+                        .join(&decision.selected_checkpoint.generation_id)
+            {
+                return Err("checkpoint stop decision differs from its verified baseline");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_release_checkpoint_binding(
+    action: &ReleaseCheckpointAction,
+    binding: &ReleaseCheckpointBinding,
+) -> Result<(), &'static str> {
+    let intent = &binding.watcher_intent;
+    let association = &binding.association;
+    if binding.action != *action
+        || association.resource_id != action.resource_id
+        || association.task_id != action.observed_background_task
+        || association.authority_machine.as_uuid().is_nil()
+        || association.attempt_binding != binding.attempt_binding
+        || !association.canonical_runtime_root.is_absolute()
+        || !is_sha256(&association.request_sha256)
+        || intent.action_id != action.action_id
+        || intent.state_revision != action.state_revision
+        || intent.observed_background_task != action.observed_background_task
+        || intent.watcher_task_id.as_task_id().0.is_nil()
+        || intent.watcher_task_id.as_task_id() == action.observed_background_task
+        || intent.request_id.0.is_nil()
+        || intent.request_id.0 == intent.watcher_task_id.as_task_id().0
+    {
+        return Err("release checkpoint binding does not match the saved action");
+    }
+
+    binding
+        .attempt_binding
+        .validate()
+        .map_err(|_| "release checkpoint attempt binding is invalid")
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Typed result of checking whether an exact-task stop can be reserved
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseCheckpointStopOutcome {
+    /// A new stop decision and checkpoint identity were persisted
+    Reserved(ReleaseCheckpointStopDecision),
+    /// An exact retry returned the previously persisted decision
+    AlreadyReserved(ReleaseCheckpointStopDecision),
+    /// The exact task has not started yet
+    WaitingForTaskStart,
+    /// No complete new checkpoint is available yet
+    WaitingForCheckpoint,
+    /// A complete final result takes precedence over a checkpoint stop
+    CompletedResultAwaitingTaskExit,
+    /// The task already published its successful final result
+    AlreadyCompleted,
+    /// The saved task or publication state needs attention
+    Attention(watcher::WatcherAttention),
+}
+
+/// Proof provenance for the trainer release that opened a serving loan
+///
+/// The unverified value is the safe default for serving rows written before
+/// release-proof provenance was stored
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ServingReleaseProvenance {
+    /// No verified release proof is recorded
+    #[default]
+    Unverified,
+    /// The authority verified the exact trainer's completed-result publication
+    CompletedTrainerResult {
+        /// Release action whose authority-built proof was accepted
+        action_id: ActionId,
+        /// Exact registered trainer task in the proof
+        task_id: TaskId,
+        /// SHA-256 digest of the published completed result
+        publication_sha256: String,
+    },
+    /// The authority verified a stopped trainer's exact checkpoint publication
+    StoppedTrainerCheckpoint {
+        /// Release action whose committed stop decision was proved
+        action_id: ActionId,
+        /// Exact registered trainer task in the proof
+        task_id: TaskId,
+        /// Generation accepted by the trainer's `--resume` contract
+        generation_id: String,
+        /// SHA-256 digest of the selected checkpoint record
+        record_sha256: String,
+        /// SHA-256 digest of the selected checkpoint inventory
+        inventory_sha256: String,
+    },
+}
+
 /// Phase-specific identities and return data for every active loan phase
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -517,6 +946,9 @@ pub enum LoanPhase {
         action_id: ActionId,
         /// Exact background task observed when release was requested
         observed_background_task: TaskId,
+        /// Optional durable watcher task identity reserved for this action
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watcher_intent: Option<SavedReleaseWatcherIntent>,
     },
     /// One selected request is using the resource
     Serving {
@@ -524,6 +956,9 @@ pub enum LoanPhase {
         return_context: ReturnContext,
         /// Selected request identity
         current_request_id: RequestId,
+        /// Durable proof that permits activation, if release was verified
+        #[serde(default)]
+        release_provenance: ServingReleaseProvenance,
     },
     /// The queue is drained and the supervisor must decide what runs next
     AwaitingReturn {
@@ -690,6 +1125,154 @@ pub struct SupervisorNotice {
     pub delivery: SupervisorNoticeDelivery,
 }
 
+/// Authority-owned result of reconciling queued work for one resource
+#[derive(Debug, Clone)]
+pub enum ResourceQueueReconcileOutcome {
+    /// No request is ready for selection
+    NoQueuedRequest,
+    /// A non-closed loan already reserves the resource
+    LoanAlreadyActive {
+        /// Existing loan that prevents a second loan from opening
+        loan: Loan,
+    },
+    /// A running registered task now has one durable release action
+    ReleaseRequired {
+        /// Loan created for the resource interruption
+        loan: Loan,
+        /// Notice saved in the same transaction as the loan
+        notice: SupervisorNotice,
+    },
+    /// Work needs owner attention because assignment or resource safety is uncertain
+    AttentionRequired {
+        /// Request that remains reserved or queued
+        request: ResourceRequest,
+        /// Authoritative reason why the resource cannot be assigned
+        reason: ResourceQueueAttentionReason,
+    },
+    /// The exact registered trainer remains reserved because its release proof failed
+    ReleaseProofUnavailable {
+        /// Loan that remains in its existing AwaitingRelease phase
+        loan: Loan,
+        /// Exact release action that still needs proof
+        action_id: ActionId,
+        /// Exact registered trainer task that still owns the release obligation
+        task_id: TaskId,
+        /// Authority-classified reason why the proof did not pass
+        reason: ReleaseProofAttentionReason,
+    },
+}
+
+/// Why an authority cannot safely select a queued request
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceQueueAttentionReason {
+    /// No registered task exists, and the store has no proof that the GPU is idle
+    IdleNotProven,
+    /// A registered background task has no authority-owned task row
+    BackgroundTaskMissing {
+        /// Exact task registered on the resource
+        task_id: TaskId,
+    },
+    /// A registered background task is not verifiably running
+    BackgroundTaskNotRunning {
+        /// Exact task registered on the resource
+        task_id: TaskId,
+        /// Durable process state observed by the authority
+        state: String,
+    },
+    /// A resource task was accepted, but startup cannot prove its worker started
+    AcceptedTaskLaunchUncertain {
+        /// Exact accepted command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned command task terminated with a failure outcome
+    AssignedTaskFailed {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+        /// Durable terminal state observed by the authority
+        state: ProcessStatus,
+    },
+    /// The saved Serving loan came from a legacy or otherwise unverified release
+    UnverifiedServingRelease,
+    /// The exact trainer release proof is missing or did not pass validation
+    ReleaseProofUnavailable {
+        /// Exact release action retained by the active loan
+        action_id: ActionId,
+        /// Exact registered trainer task retained by the active loan
+        task_id: TaskId,
+        /// Authority-classified reason why the proof is not sufficient
+        reason: ReleaseProofAttentionReason,
+    },
+    /// Task acceptance may have committed, but its launch result is uncertain
+    AssignedTaskLaunchUncertain {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned command task is lost and cannot prove that its work stopped
+    AssignedTaskLost {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned command task is terminal but its process-group exit is unconfirmed
+    AssignedTaskExitUnconfirmed {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned task, request, executor, loan, or route identity does not match
+    AssignedTaskIdentityMismatch {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned task could not prove that no child was spawned for its terminal result
+    AssignedTaskNoChildSpawnProofInvalid {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+    /// The assigned command may outlive its task-run process group
+    AssignedTaskOwnershipUncertain {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+        /// Recognized command shape that can outlive its local process group
+        risk: ResourceTaskOwnershipRisk,
+    },
+    /// The resource revision changed before the task completion transition committed
+    AssignedTaskStaleRevision {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
+}
+
+/// Recognized command shapes whose ownership can outlive the local task-run process group
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTaskOwnershipRisk {
+    /// An SSH client can exit while a remote command continues
+    RemoteShell,
+    /// A container client can exit while a container process continues
+    ContainerClient,
+    /// A shell wrapper can start work outside its foreground process group
+    ShellWrapper,
+    /// A command explicitly starts or manages detached work
+    DetachedLauncher,
+}
+
+/// Safe, inspectable classification for a failed release proof
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseProofAttentionReason {
+    /// The registered trainer has not reached a successful terminal state
+    TrainerNotCompleted,
+    /// The registered trainer is lost
+    TrainerLost,
+    /// Homebased has not confirmed that the trainer worker exited
+    WorkerExitUnconfirmed,
+    /// No exact completed-result publication is available
+    CompletedResultUnavailable,
+    /// No exact stopped-checkpoint publication is available
+    StoppedCheckpointUnavailable,
+    /// The saved ownership lock is held or cannot be verified
+    OwnershipLockUnverified,
+    /// Saved task, authority, route, or proof identities do not match
+    SavedEvidenceMismatch,
+}
+
 /// Strict Fleet request for one exact supervisor-notice delivery attempt
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -816,8 +1399,8 @@ mod tests {
         AcceptanceSequence, ActionId, AssignmentRevision, CommandSpec, CommandSpecError,
         DeliveryAttemptId, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
         ResourceQueueRequest, ResourceQueueResponse, ResourceRequest, ResourceRequestState,
-        ResourceRevision, ReturnContext, SupervisorAddress, SupervisorNoticePayload,
-        SupervisorNoticeRequest,
+        ResourceRevision, ReturnContext, ServingReleaseProvenance, SupervisorAddress,
+        SupervisorNoticePayload, SupervisorNoticeRequest,
     };
 
     fn task_spec() -> NormalizedSpec {
@@ -832,6 +1415,30 @@ mod tests {
                 command: CommandLine::try_from_argv(vec!["echo".into(), "gpu".into()]).unwrap(),
             }),
         }
+    }
+
+    #[test]
+    fn serving_phase_without_release_provenance_decodes_as_unverified() {
+        let mut saved = serde_json::to_value(LoanPhase::Serving {
+            return_context: ReturnContext::Stopped {
+                task_id: TaskId::new(),
+                checkpoint_ref: "legacy-checkpoint".into(),
+                recovery_ref: "legacy-recovery".into(),
+            },
+            current_request_id: RequestId::new(),
+            release_provenance: ServingReleaseProvenance::Unverified,
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("release_provenance");
+
+        let decoded: LoanPhase = serde_json::from_value(saved).unwrap();
+        assert!(matches!(
+            decoded,
+            LoanPhase::Serving {
+                release_provenance: ServingReleaseProvenance::Unverified,
+                ..
+            }
+        ));
     }
 
     fn agent_spec() -> NormalizedSpec {
@@ -1017,6 +1624,7 @@ mod tests {
             last_safe_phase: LoanPhase::AwaitingRelease {
                 action_id: ActionId::new(),
                 observed_background_task: TaskId::new(),
+                watcher_intent: None,
             },
             reason: "watcher could not establish process exit".into(),
         };
@@ -1025,6 +1633,31 @@ mod tests {
         assert_eq!(encoded["type"], "needs_attention");
         assert_eq!(encoded["last_safe_phase"]["type"], "awaiting_release");
         assert_eq!(serde_json::from_value::<LoanState>(encoded).unwrap(), state);
+    }
+
+    #[test]
+    fn awaiting_release_without_watcher_intent_remains_compatible() {
+        let action_id = ActionId::new();
+        let background_task = TaskId::new();
+        let legacy = json!({
+            "type": "active",
+            "phase": {
+                "type": "awaiting_release",
+                "action_id": action_id,
+                "observed_background_task": background_task,
+            },
+        });
+
+        assert!(matches!(
+            serde_json::from_value::<LoanState>(legacy).unwrap(),
+            LoanState::Active {
+                phase: LoanPhase::AwaitingRelease {
+                    action_id: saved_action,
+                    observed_background_task: saved_task,
+                    watcher_intent: None,
+                }
+            } if saved_action == action_id && saved_task == background_task
+        ));
     }
 
     #[test]

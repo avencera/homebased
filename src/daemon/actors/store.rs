@@ -7,9 +7,12 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
 use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
+    ResourceCancellationRequestIdentity,
 };
 use crate::daemon::actors::send_reply;
-use crate::domain::{ExitReason, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId};
+use crate::domain::{
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId,
+};
 use crate::error::AppError;
 use std::num::NonZeroU64;
 
@@ -22,13 +25,21 @@ use crate::message::{
     MessageAttempt, MessageDelivery, MessageId, MessageReceipt, MessageSendRequest,
     OutboundMessageBinding, Recipient,
 };
+use crate::resource::ownership_lock::VerifiedTrainerAttempt;
+use crate::resource::release_watcher::{ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest};
 use crate::resource::store::{
+    AcceptedResourceTask, AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome,
     CompleteReleaseError, OpenReleaseLoanError, OpenReleaseLoanResult, QueueCancellationResult,
-    ReleaseCompletionResult, ResourceSnapshot, ResourceStoreError, SupervisorNoticeStoreError,
+    ReleaseCheckpointCancellationOutcome, ReleaseCheckpointError, ReleaseCompletionResult,
+    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ReleaseWatcherAcceptanceInput,
+    ResourceQueueReconcileError, ResourceSnapshot, ResourceStoreError, ResourceTaskAcceptance,
+    ResourceTaskAcceptanceInput, SupervisorNoticeStoreError, TrainerAttemptAssociationStoreError,
 };
 use crate::resource::{
-    ActionId, AssignmentRevision, DeliveryAttemptId, NoticeId, Resource, ResourceId,
-    ResourceRequest, ResourceRevision, ReturnContext, SupervisorAddress, SupervisorNotice,
+    ActionId, AssignmentRevision, DeliveryAttemptId, NoticeId, ReleaseCheckpointBaseline,
+    ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome, ReleaseWatcherIntent, Resource,
+    ResourceId, ResourceQueueReconcileOutcome, ResourceRequest, ResourceRevision,
+    SupervisorAddress, SupervisorNotice, TrainerAttemptAssociation,
 };
 use crate::spec::NormalizedSpec;
 use crate::store::IdentityError;
@@ -62,6 +73,9 @@ fn resource_error(
             },
             |task| AppError::ClusterTaskConflict { task },
         ),
+        ResourceStoreError::LegacyWatcherIntentUnproven => AppError::Usage {
+            message: "legacy release watcher identity is unproven".into(),
+        },
         ResourceStoreError::Prevented => match (request, task) {
             (Some(request), Some(task)) => AppError::SubmissionRejected {
                 request,
@@ -81,6 +95,7 @@ fn resource_error(
                 found: Some(found),
             }
         }
+        ResourceStoreError::OriginRouteNotFound { task } => AppError::RouteNotFound { task },
         ResourceStoreError::ExecutorAlreadyAccepted { task } => {
             AppError::ClusterTaskConflict { task }
         }
@@ -97,7 +112,23 @@ fn resource_error(
         ResourceStoreError::InvalidCommandSpec(error) => AppError::Usage {
             message: error.to_string(),
         },
+        ResourceStoreError::TaskPreparation(error) => error,
+        ResourceStoreError::TaskRow(error) => error,
+        ResourceStoreError::Event(error) => event_error(error),
         ResourceStoreError::Storage(error) => error.into(),
+    }
+}
+
+fn resource_queue_reconcile_error(error: ResourceQueueReconcileError) -> AppError {
+    match error {
+        ResourceQueueReconcileError::Resource(error)
+        | ResourceQueueReconcileError::Release(OpenReleaseLoanError::Resource(error)) => {
+            resource_error(error, None, None)
+        }
+        ResourceQueueReconcileError::Storage(error) => error.into(),
+        ResourceQueueReconcileError::Release(error) => AppError::Internal {
+            message: format!("resource queue reconciliation failed: {error}"),
+        },
     }
 }
 
@@ -133,6 +164,57 @@ pub enum StoreMsg {
         authority_machine: MachineId,
         reply: RpcReplyPort<Result<Vec<ResourceSnapshot>, AppError>>,
     },
+    /// Bind verified trainer attempt evidence to an authority-owned registered task.
+    BindTrainerAttemptAssociationForAuthority {
+        /// Fixed authority recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource that registered the trainer task.
+        resource_id: ResourceId,
+        /// Exact registered Homebased background task.
+        task_id: TaskId,
+        /// Point-in-time trainer request and held-lock evidence.
+        verified_attempt: Box<VerifiedTrainerAttempt>,
+        /// Typed durable association result.
+        reply: RpcReplyPort<
+            Result<
+                Result<TrainerAttemptAssociation, TrainerAttemptAssociationStoreError>,
+                AppError,
+            >,
+        >,
+    },
+    /// Read the saved trainer attempt association for one authority-owned resource.
+    TrainerAttemptAssociationForAuthority {
+        /// Fixed authority recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource whose association is read.
+        resource_id: ResourceId,
+        /// Typed durable association result, if one exists.
+        reply: RpcReplyPort<
+            Result<
+                Result<Option<TrainerAttemptAssociation>, TrainerAttemptAssociationStoreError>,
+                AppError,
+            >,
+        >,
+    },
+    /// Read a historical trainer association by its exact task identity.
+    TrainerAttemptAssociationForTaskForAuthority {
+        /// Fixed authority recorded on the associated resource.
+        authority_machine: MachineId,
+        /// Exact historical task identity.
+        task_id: TaskId,
+        /// Typed durable association result, if one exists.
+        reply: RpcReplyPort<
+            Result<
+                Result<Option<TrainerAttemptAssociation>, TrainerAttemptAssociationStoreError>,
+                AppError,
+            >,
+        >,
+    },
+    /// Read exact accepted task identities from authority-owned resource assignments.
+    AcceptedResourceTasksForAuthority {
+        authority_machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<AcceptedResourceTask>, AppError>>,
+    },
     /// Accept a command request and allocate its authority FIFO position
     AcceptResourceRequest {
         authority_machine: MachineId,
@@ -142,6 +224,22 @@ pub enum StoreMsg {
         origin_machine: MachineId,
         normalized_spec: Box<NormalizedSpec>,
         reply: RpcReplyPort<Result<ResourceRequest, AppError>>,
+    },
+    /// Atomically accept the exact request selected by a Serving loan as a queued task.
+    AcceptAssignedResourceTask {
+        /// Selection identity, immutable spec, and executor runtime environment.
+        input: Box<ResourceTaskAcceptanceInput>,
+        /// Typed task-layer result inside actor and transport errors.
+        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
+    },
+    /// Reconcile one exact assigned task and atomically advance only after its exit proof
+    AssignedResourceTaskReconcile {
+        /// Exact resource, loan, request, task, and expected revision to reconcile
+        input: AssignedResourceTaskReconcileInput,
+        /// Typed evidence result inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<Result<AssignedResourceTaskReconcileOutcome, ResourceStoreError>, AppError>,
+        >,
     },
     /// Read all requests for one resource in authority acceptance order
     ResourceRequests {
@@ -155,6 +253,15 @@ pub enum StoreMsg {
         resource_id: ResourceId,
         reply: RpcReplyPort<Result<Option<ResourceRequest>, AppError>>,
     },
+    /// Reconcile one resource queue from current authority-owned state.
+    ReconcileResourceQueue {
+        /// Fixed authority machine recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource queue to reconcile.
+        resource_id: ResourceId,
+        /// Typed durable-state result, including fail-closed attention reasons.
+        reply: RpcReplyPort<Result<ResourceQueueReconcileOutcome, AppError>>,
+    },
     /// Fence cancellation before executor activation
     CancelResourceRequestBeforeActivation {
         authority_machine: MachineId,
@@ -163,6 +270,25 @@ pub enum StoreMsg {
         resource_id: ResourceId,
         origin_machine: MachineId,
         reply: RpcReplyPort<Result<QueueCancellationResult, AppError>>,
+    },
+    /// Read a durable resource cancellation receipt, checking its full identity.
+    ResourceCancellationReceipt {
+        /// Stable resource cancellation identity.
+        identity: ResourceCancellationRequestIdentity,
+        /// Saved authority result, if this identity was already handled.
+        reply:
+            RpcReplyPort<Result<Option<crate::submission::ResourceCancellationReceipt>, AppError>>,
+    },
+    /// Cancel a queued or assigned resource request and retain its exact authority result.
+    CancelResourceRequestWithReceipt {
+        /// Fixed authority that owns the resource queue.
+        authority_machine: MachineId,
+        /// Stable resource cancellation identity.
+        identity: ResourceCancellationRequestIdentity,
+        /// Exact validated origin-route proof.
+        proof: crate::submission::ResourceRouteProof,
+        /// Durable resource cancellation result.
+        reply: RpcReplyPort<Result<crate::submission::ResourceCancellationReceipt, AppError>>,
     },
     /// Open or reuse a release loan and keep the storage result typed
     OpenReleaseLoanForAuthority {
@@ -175,6 +301,99 @@ pub enum StoreMsg {
         /// Storage result inside actor and transport errors
         reply: RpcReplyPort<Result<Result<OpenReleaseLoanResult, OpenReleaseLoanError>, AppError>>,
     },
+    /// Bind a preallocated watcher launch identity to the saved release action
+    BindReleaseWatcherForAuthority {
+        /// Authority machine recorded on the resource
+        authority_machine: MachineId,
+        /// Resource whose release action owns this watcher
+        resource_id: ResourceId,
+        /// Exact action, revision, observed task, watcher task, request, and spec digest
+        intent: ReleaseWatcherIntent,
+        /// Storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReleaseWatcherIntent, ResourceStoreError>, AppError>>,
+    },
+    /// Capture the exact trainer checkpoint baseline before the watcher is accepted.
+    CaptureReleaseCheckpointBaselineForAuthority {
+        /// Authority machine recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource whose release action owns the baseline.
+        resource_id: ResourceId,
+        /// Stable release action identity.
+        action_id: ActionId,
+        /// Resource revision observed with the release notice.
+        expected_state_revision: ResourceRevision,
+        /// Typed checkpoint baseline or attention result.
+        reply: RpcReplyPort<
+            Result<Result<ReleaseCheckpointBaseline, ReleaseCheckpointError>, AppError>,
+        >,
+    },
+    /// Reserve a stop decision only after the exact trainer checkpoint verifies.
+    ReserveReleaseCheckpointStopForAuthority {
+        /// Authority machine recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource whose release action owns the stop decision.
+        resource_id: ResourceId,
+        /// Stable release action identity.
+        action_id: ActionId,
+        /// Resource revision observed with the release notice.
+        expected_state_revision: ResourceRevision,
+        /// Typed reservation result or attention result.
+        reply: RpcReplyPort<
+            Result<Result<ReleaseCheckpointStopOutcome, ReleaseCheckpointError>, AppError>,
+        >,
+    },
+    /// Revalidate the one saved checkpoint without selecting a replacement.
+    RevalidateReleaseCheckpointStopForAuthority {
+        /// Authority machine recorded on the resource.
+        authority_machine: MachineId,
+        /// Resource whose release action owns the stop decision.
+        resource_id: ResourceId,
+        /// Stable release action identity.
+        action_id: ActionId,
+        /// Resource revision observed with the release notice.
+        expected_state_revision: ResourceRevision,
+        /// The exact saved decision, or a changed-publication attention result.
+        reply: RpcReplyPort<
+            Result<Result<ReleaseCheckpointStopDecision, ReleaseCheckpointError>, AppError>,
+        >,
+    },
+    /// Commit cancellation for the exact reserved trainer task and saved checkpoint
+    CommitReleaseCheckpointCancellationForAuthority {
+        /// Authority machine recorded on the resource
+        authority_machine: MachineId,
+        /// Resource whose release action owns the stop decision
+        resource_id: ResourceId,
+        /// Stable release action identity
+        action_id: ActionId,
+        /// Resource revision observed with the release notice
+        expected_state_revision: ResourceRevision,
+        /// Exact decision returned by the authority reservation operation
+        decision: Box<ReleaseCheckpointStopDecision>,
+        /// Typed commit, retry, or watcher-not-ready outcome
+        reply: RpcReplyPort<
+            Result<Result<ReleaseCheckpointCancellationOutcome, ReleaseCheckpointError>, AppError>,
+        >,
+    },
+    /// Atomically bind and persist the one co-located fixed-ID watcher acceptance
+    AcceptReleaseWatcherForAuthority {
+        /// Fixed task, callback, action, and owner data to accept
+        input: Box<ReleaseWatcherAcceptanceInput>,
+        /// Typed storage outcome inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<Result<ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError>, AppError>,
+        >,
+    },
+    /// Validate one co-located watcher poll and advance its saved stop decision
+    PollReleaseWatcherForAuthority {
+        /// Machine that must own the polled resource
+        authority_machine: MachineId,
+        /// Exact identities sent by the watcher command
+        request: ReleaseWatcherPollRequest,
+        /// Typed poll decision; errors are storage failures the watcher may retry
+        reply: RpcReplyPort<
+            Result<Result<ReleaseWatcherPollOutcome, ReleaseCheckpointError>, AppError>,
+        >,
+    },
     /// Complete a saved release action and keep the storage result typed
     CompleteReleaseForAuthority {
         /// Authority machine recorded on the resource
@@ -185,8 +404,6 @@ pub enum StoreMsg {
         action_id: ActionId,
         /// Resource revision observed with the release notice
         expected_state_revision: ResourceRevision,
-        /// Evidence for the background task's return obligation
-        return_context: ReturnContext,
         /// Storage result inside actor and transport errors
         reply:
             RpcReplyPort<Result<Result<ReleaseCompletionResult, CompleteReleaseError>, AppError>>,
@@ -252,6 +469,11 @@ pub enum StoreMsg {
         request: CancellationRequest,
         reply: RpcReplyPort<Result<(CancellationRequest, bool), AppError>>,
     },
+    /// Read the retained caller-owned request for one task
+    GetCancellationRequest {
+        task: TaskId,
+        reply: RpcReplyPort<Result<Option<CancellationRequest>, AppError>>,
+    },
     /// Resume caller-owned requests after restart
     PendingCancellationRequests {
         reply: RpcReplyPort<Result<Vec<CancellationRequest>, AppError>>,
@@ -259,6 +481,11 @@ pub enum StoreMsg {
     /// Set delivery complete after a validated executor receipt
     AcknowledgeCancellation {
         receipt: CancellationReceipt,
+        reply: RpcReplyPort<Result<CancellationRequest, AppError>>,
+    },
+    /// Settle one resource cancellation intent with its authority receipt.
+    AcknowledgeResourceCancellation {
+        receipt: crate::submission::ResourceCancellationReceipt,
         reply: RpcReplyPort<Result<CancellationRequest, AppError>>,
     },
     /// Store executor receipt and a possible pre-acceptance tombstone
@@ -465,6 +692,11 @@ pub enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
+    /// Read child process-group evidence for one exact task identity.
+    GetProcessGroupExitEvidence {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<ProcessGroupExitEvidence>, AppError>>,
+    },
     /// List with optional filters.
     ListTasks {
         statuses: Vec<ProcessStatus>,
@@ -497,6 +729,7 @@ pub enum StoreMsg {
         id: TaskId,
         from: ProcessStatus,
         reason: ExitReason,
+        process_group_exit_evidence: ProcessGroupExitEvidence,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
     /// Record the worker pid.
@@ -572,6 +805,49 @@ impl Actor for StoreActor {
                     .resource_snapshots_for_authority(authority_machine)
                     .map_err(|error| resource_error(error, None, None)),
             ),
+            StoreMsg::BindTrainerAttemptAssociationForAuthority {
+                authority_machine,
+                resource_id,
+                task_id,
+                verified_attempt,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.bind_trainer_attempt_association(
+                    authority_machine,
+                    resource_id,
+                    task_id,
+                    *verified_attempt,
+                )),
+            ),
+            StoreMsg::TrainerAttemptAssociationForAuthority {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.trainer_attempt_association_for_authority(authority_machine, resource_id)),
+            ),
+            StoreMsg::TrainerAttemptAssociationForTaskForAuthority {
+                authority_machine,
+                task_id,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.trainer_attempt_association_for_task_for_authority(
+                    authority_machine,
+                    task_id,
+                )),
+            ),
+            StoreMsg::AcceptedResourceTasksForAuthority {
+                authority_machine,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .accepted_resource_tasks_for_authority(authority_machine)
+                    .map_err(|error| resource_error(error, None, None)),
+            ),
             StoreMsg::AcceptResourceRequest {
                 authority_machine,
                 request_id,
@@ -593,6 +869,15 @@ impl Actor for StoreActor {
                     )
                     .map_err(|error| resource_error(error, Some(task_id), Some(request_id))),
             ),
+            StoreMsg::AcceptAssignedResourceTask { input, reply } => {
+                send_reply(reply, Ok(state.accept_assigned_resource_task(*input)));
+            }
+            StoreMsg::AssignedResourceTaskReconcile { input, reply } => {
+                send_reply(
+                    reply,
+                    Ok(state.reconcile_assigned_resource_task_for_authority(input)),
+                );
+            }
             StoreMsg::ResourceRequests {
                 authority_machine,
                 resource_id,
@@ -613,6 +898,16 @@ impl Actor for StoreActor {
                     .oldest_queued_resource_request(authority_machine, resource_id)
                     .map_err(|error| resource_error(error, None, None)),
             ),
+            StoreMsg::ReconcileResourceQueue {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .reconcile_resource_queue_for_authority(authority_machine, resource_id)
+                    .map_err(resource_queue_reconcile_error),
+            ),
             StoreMsg::CancelResourceRequestBeforeActivation {
                 authority_machine,
                 request_id,
@@ -632,6 +927,31 @@ impl Actor for StoreActor {
                     )
                     .map_err(|error| resource_error(error, Some(task_id), Some(request_id))),
             ),
+            StoreMsg::ResourceCancellationReceipt { identity, reply } => {
+                let task = identity.task;
+                let request = identity.request;
+                send_reply(
+                    reply,
+                    state
+                        .resource_cancellation_receipt(&identity)
+                        .map_err(|error| resource_error(error, Some(task), Some(request))),
+                );
+            }
+            StoreMsg::CancelResourceRequestWithReceipt {
+                authority_machine,
+                identity,
+                proof,
+                reply,
+            } => {
+                let task = identity.task;
+                let request = identity.request;
+                send_reply(
+                    reply,
+                    state
+                        .cancel_resource_request_with_receipt(authority_machine, identity, proof)
+                        .map_err(|error| resource_error(error, Some(task), Some(request))),
+                );
+            }
             StoreMsg::OpenReleaseLoanForAuthority {
                 authority_machine,
                 resource_id,
@@ -645,12 +965,98 @@ impl Actor for StoreActor {
                     expected_state_revision,
                 )),
             ),
+            StoreMsg::BindReleaseWatcherForAuthority {
+                authority_machine,
+                resource_id,
+                intent,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.bind_release_watcher_for_authority(
+                    authority_machine,
+                    resource_id,
+                    intent,
+                )),
+            ),
+            StoreMsg::CaptureReleaseCheckpointBaselineForAuthority {
+                authority_machine,
+                resource_id,
+                action_id,
+                expected_state_revision,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.capture_release_checkpoint_baseline_for_authority(
+                    authority_machine,
+                    resource_id,
+                    action_id,
+                    expected_state_revision,
+                )),
+            ),
+            StoreMsg::ReserveReleaseCheckpointStopForAuthority {
+                authority_machine,
+                resource_id,
+                action_id,
+                expected_state_revision,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.reserve_release_checkpoint_stop_for_authority(
+                    authority_machine,
+                    resource_id,
+                    action_id,
+                    expected_state_revision,
+                )),
+            ),
+            StoreMsg::RevalidateReleaseCheckpointStopForAuthority {
+                authority_machine,
+                resource_id,
+                action_id,
+                expected_state_revision,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.revalidate_release_checkpoint_stop_for_authority(
+                    authority_machine,
+                    resource_id,
+                    action_id,
+                    expected_state_revision,
+                )),
+            ),
+            StoreMsg::CommitReleaseCheckpointCancellationForAuthority {
+                authority_machine,
+                resource_id,
+                action_id,
+                expected_state_revision,
+                decision,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.commit_release_checkpoint_cancellation_for_authority(
+                    authority_machine,
+                    resource_id,
+                    action_id,
+                    expected_state_revision,
+                    &decision,
+                )),
+            ),
+            StoreMsg::AcceptReleaseWatcherForAuthority { input, reply } => send_reply(
+                reply,
+                Ok(state.accept_release_watcher_for_authority(*input)),
+            ),
+            StoreMsg::PollReleaseWatcherForAuthority {
+                authority_machine,
+                request,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.poll_release_watcher_for_authority(authority_machine, request)),
+            ),
             StoreMsg::CompleteReleaseForAuthority {
                 authority_machine,
                 resource_id,
                 action_id,
                 expected_state_revision,
-                return_context,
                 reply,
             } => send_reply(
                 reply,
@@ -659,7 +1065,6 @@ impl Actor for StoreActor {
                     resource_id,
                     action_id,
                     expected_state_revision,
-                    return_context,
                 )),
             ),
             StoreMsg::SupervisorNotice { notice_id, reply } => {
@@ -706,11 +1111,17 @@ impl Actor for StoreActor {
             StoreMsg::InsertCancellationRequest { request, reply } => {
                 send_reply(reply, state.insert_cancellation_request(request));
             }
+            StoreMsg::GetCancellationRequest { task, reply } => {
+                send_reply(reply, state.cancellation_request(task));
+            }
             StoreMsg::PendingCancellationRequests { reply } => {
                 send_reply(reply, state.pending_cancellation_requests());
             }
             StoreMsg::AcknowledgeCancellation { receipt, reply } => {
                 send_reply(reply, state.acknowledge_cancellation(&receipt));
+            }
+            StoreMsg::AcknowledgeResourceCancellation { receipt, reply } => {
+                send_reply(reply, state.acknowledge_resource_cancellation(&receipt));
             }
             StoreMsg::ReceiveCancellation { request, reply } => {
                 send_reply(reply, state.receive_cancellation(request));
@@ -923,6 +1334,9 @@ impl Actor for StoreActor {
             }
             StoreMsg::IsEventTask { id, reply } => send_reply(reply, state.is_event_task(id)),
             StoreMsg::GetTask { id, reply } => send_reply(reply, state.get_task(id)),
+            StoreMsg::GetProcessGroupExitEvidence { id, reply } => {
+                send_reply(reply, state.process_group_exit_evidence(id));
+            }
             StoreMsg::ListTasks {
                 statuses,
                 thread,
@@ -943,8 +1357,12 @@ impl Actor for StoreActor {
                 id,
                 from,
                 reason,
+                process_group_exit_evidence,
                 reply,
-            } => send_reply(reply, state.cas_exit(id, from, &reason)),
+            } => send_reply(
+                reply,
+                state.cas_exit_with_evidence(id, from, &reason, process_group_exit_evidence),
+            ),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
             StoreMsg::RequestCancel { id, reply } => send_reply(reply, state.request_cancel(id)),
             StoreMsg::ProduceAttentionEvent { id, reply } => {
