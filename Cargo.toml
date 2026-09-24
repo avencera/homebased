@@ -3,7 +3,7 @@ members = ["xtask"]
 
 [package]
 name = "homebased"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "Supervise long-running agent and general task workloads and report them to a Codex thread or Claude Code session"
 publish = false
