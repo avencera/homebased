@@ -6,6 +6,35 @@
 //! message line written to that socket queue the message as the session's next
 //! user turn. The protocol is internal to Claude Code, so the sender accepts
 //! only the peer protocol version it knows
+//!
+//! # Claude Code internals this depends on
+//!
+//! This is not a public Claude Code API. It was read from the bundled CLI
+//! JavaScript of Claude Code 2.1.281, where the sender and receiver log with the
+//! `[uds-client]` and `[uds-messaging]` tags. A Claude Code update can change
+//! any of these without notice:
+//!
+//! - Registry location: `~/.claude/sessions/<pid>.json`. A custom
+//!   `CLAUDE_CONFIG_DIR` moves it, and this sender does not follow that
+//! - Registry fields: `pid`, `sessionId`, `messagingSocketPath`,
+//!   `peerProtocol` (currently 1), and `updatedAt`
+//! - Key file name: `<pid>.<sha256 of the socket path as written>.key`, not of
+//!   its realpath, with JSON field `peerToken`
+//! - Frame: an auth line `{"type":"auth","token":...}`, then one message line
+//!   with `type: "user"`, `message.content` as a string, `msgV`, a UUID
+//!   `msg_id`, `priority`, and `session_id`. The receiver drops a message
+//!   whose `session_id` is not its own
+//! - Frame size limit of 1 MiB, and the macOS close delay of 150 ms
+//! - Transcript location `~/.claude/projects/<cwd key>/<session id>.jsonl`,
+//!   used only to tell a stopped Claude session from a Codex thread
+//!
+//! A change can fail quietly: the socket accepts the bytes and the receiver
+//! drops them, so the task still shows the event as sent. After a Claude Code
+//! update, check that a `HOMEBASED_EVENT` still reaches a live Claude session.
+//! Submit a short `task` workload whose `thread` is `$CLAUDE_CODE_SESSION_ID`
+//! and wait for the event. If it does not arrive, extract the bundle with
+//! `strings -n 8 ~/.local/share/claude/versions/<version>` and search for
+//! `uds-messaging`, `peerToken`, and `session_id mismatch`
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};

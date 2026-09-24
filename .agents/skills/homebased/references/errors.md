@@ -61,6 +61,10 @@ This happens after a raw `systemctl stop`, a crash, or an upgrade in progress. W
 
 For a legacy task row, `callback: "failed"` means its terminal `codex queue` delivery failed; the message text is appended to `<home>/callback-fallback.log`. New sequenced events keep a result for each callback. `task show` lists failed event sequences in `failed_events`; callback delivery failure does not change process status. The origin machine uses the saved callback directory, environment, and resolved Codex path. See [events.md](events.md) for retry limits and origin/executor roles.
 
+### Claude Code session events missing
+
+Claude Code delivery uses an internal Claude Code socket protocol, not a public API. A Claude Code update can change it. Then the task can show an event as sent, but the event does not arrive in the session. If this happens after a Claude Code update, tell the user. Do not write to the socket yourself. The list of internal parts that homebased depends on, and the steps to check them, are in the module comment of `src/callback/claude_inbox.rs` in the homebased repository.
+
 ## Direct-message errors
 
 | `code` | Exit | Cause | Recovery |
