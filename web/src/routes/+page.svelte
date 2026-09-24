@@ -102,25 +102,28 @@
 	}
 </script>
 
-<div class="mx-auto flex h-dvh max-w-7xl flex-col overflow-hidden px-4 py-4">
-	<header class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+<!-- phones keep room at the bottom for the floating browser toolbar -->
+<div class="mx-auto flex h-dvh max-w-7xl flex-col overflow-hidden px-3 pt-3 pb-20 sm:px-4 sm:py-4">
+	<header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 sm:gap-x-4">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
-		<span class="flex items-center gap-1.5">
+		<span class="flex items-center gap-1.5" title={store.online ? 'socket up' : 'socket down'}>
 			<span
 				class={cn(
 					'size-2 rounded-full',
 					store.online ? 'bg-emerald-500' : 'animate-pulse bg-red-500'
 				)}
 			></span>
-			<span class="text-muted-foreground">
+			<span class="hidden text-muted-foreground sm:inline">
 				{store.online ? 'socket up' : 'socket down'}
 			</span>
 		</span>
 		<span class="text-muted-foreground">
-			{store.status?.in_flight ?? 0} in flight{localName ? ` on ${localName}` : ''}
+			{store.status?.in_flight ?? 0} in flight{#if localName}<span class="hidden sm:inline">
+					on {localName}</span
+				>{/if}
 		</span>
 		{#if store.status}
-			<span class="font-mono text-muted-foreground" title={store.status.socket}>
+			<span class="hidden font-mono text-muted-foreground sm:inline" title={store.status.socket}>
 				v{store.status.version} &middot; pid {store.status.pid}
 			</span>
 		{/if}
@@ -128,7 +131,8 @@
 		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
-				updated <Elapsed from={store.lastFetched} suffix="ago" />
+				<span class="hidden sm:inline">updated</span>
+				<Elapsed from={store.lastFetched} suffix="ago" />
 			{:else}
 				loading
 			{/if}
@@ -174,7 +178,10 @@
 		</p>
 	{/if}
 
-	<div class="mt-3 flex flex-wrap items-center gap-1.5">
+	<!-- one swipeable row on phones, wrapped on wider screens -->
+	<div
+		class="-mx-3 mt-3 scrollbar-none flex shrink-0 items-center gap-1.5 overflow-x-auto px-3 sm:mx-0 sm:flex-wrap sm:px-0 [&>*]:shrink-0"
+	>
 		{#each PROCESS_STATUSES as status (status)}
 			{@const selected = statuses.includes(status)}
 			<button
@@ -248,7 +255,7 @@
 			<ResourceQueuePanel
 				queues={busyQueues}
 				machines={store.machines}
-				class="scrollbar-none min-h-0 flex-1 basis-0 overflow-y-auto"
+				class="scrollbar-none min-h-0 flex-none overflow-y-auto max-lg:max-h-[40%] lg:flex-1 lg:basis-0"
 			/>
 		{/if}
 	</div>

@@ -130,7 +130,7 @@
 					<Elapsed
 						from={task.created_at}
 						to={isInFlight(task.status) ? null : task.updated_at}
-						class="text-muted-foreground [grid-area:time]"
+						class="justify-self-end text-muted-foreground [grid-area:time] lg:justify-self-start"
 					/>
 
 					<span class="flex min-w-0 items-center gap-1.5 [grid-area:cwd]">
@@ -146,7 +146,10 @@
 						>
 							<Capsule hue={hueFor(project)}>{project}</Capsule>
 						</button>
-						<span class="truncate font-mono text-[11px] text-muted-foreground" title={task.cwd}>
+						<span
+							class="hidden truncate font-mono text-[11px] text-muted-foreground sm:inline"
+							title={task.cwd}
+						>
 							{shortenHome(task.cwd)}
 						</span>
 					</span>
@@ -155,7 +158,7 @@
 						type="button"
 						onclick={() => onThread(task.thread)}
 						class={cn(
-							'relative z-10 inline-flex items-center gap-1 justify-self-end rounded px-1 py-0.5 font-mono text-[11px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:justify-self-start',
+							'relative z-10 hidden items-center gap-1 justify-self-start rounded px-1 py-0.5 font-mono text-[11px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:inline-flex',
 							activeThread === task.thread && 'text-primary'
 						)}
 						title={`Show only tasks from thread ${task.thread}`}
@@ -166,7 +169,7 @@
 
 					<CallbackBadge
 						callback={task.callback}
-						class="justify-self-end [grid-area:callback] lg:justify-self-start"
+						class="hidden justify-self-start [grid-area:callback] lg:inline-flex"
 					/>
 				</li>
 			{/each}
@@ -175,14 +178,14 @@
 </div>
 
 <style>
-	/* narrow screens stack each task into three short lines; wide screens use
-	   one aligned row per task under a shared header */
+	/* narrow screens show each task in two lines, name then pills, and leave
+	   the thread and callback to the detail page; wide screens use one aligned
+	   row per task under a shared header */
 	.task-grid {
 		grid-template-columns: auto minmax(0, 1fr) auto;
 		grid-template-areas:
 			'name name status'
-			'machine time callback'
-			'cwd cwd thread';
+			'machine cwd time';
 	}
 
 	@media (width >= 64rem) {
