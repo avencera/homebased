@@ -17,6 +17,7 @@ pub mod bound_action;
 pub mod command_shape;
 pub mod foreground;
 mod id;
+pub mod initial_idle;
 pub mod operator_release;
 pub mod ownership_lock;
 mod release_checkpoint;
@@ -577,6 +578,15 @@ pub enum IdleBoundaryProof {
         request_id: RequestId,
         /// Launch task that recorded no child spawn
         task_id: TaskId,
+    },
+    /// An operator attested that a resource with no history started with a free GPU
+    ///
+    /// The resource had no registered task, loan, or first background launch
+    /// when the attestation committed, and still has none. This is a human
+    /// trust decision saved with its receipt, not a process or lock proof
+    OperatorAttestedInitialIdle {
+        /// Attestation whose receipt holds the observation
+        operation_id: operator_release::OperatorAttestationId,
     },
     /// An operator attested that an ended trainer no longer holds the GPU
     ///

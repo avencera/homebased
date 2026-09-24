@@ -1010,6 +1010,12 @@ pub(crate) fn idle_boundary_decision_on(
             }
         });
     }
+    // an initial attestation counts only before any loan or launch exists
+    if let Some(operation_id) = super::initial_idle::initial_idle_boundary_on(conn, resource)? {
+        return Ok(Proven(IdleBoundaryProof::OperatorAttestedInitialIdle {
+            operation_id,
+        }));
+    }
 
     loan_idle_decision(conn, resource)
 }

@@ -72,6 +72,12 @@ See the [operator procedure](../../../../docs/resource-loans.md#resolve-an-unpro
 Keep the document and operation ID unchanged after an unknown outcome, and
 retry on the same authority. The command refuses a queued or running task.
 
+A new resource with no background run, loan, or release record has no idle
+evidence, so its queued requests wait. Do not work around it with a background
+launch or an ordinary task. After an operator inspects the authority GPU, the
+operator can run `resource initial-idle --spec <saved-document>` once on the
+authority machine. See the [runbook step](../../../../docs/resource-loans.md#mark-a-new-resource-idle).
+
 Use `resource release-watch` only for a remote supervisor action. A co-located
 authority starts its watcher. Do not start another watcher. `resource return`
 and `resource resolve` work for remote and co-located supervisors. Keep the

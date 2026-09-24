@@ -163,6 +163,52 @@ the accepted task, reads the trainer attempt, and checks the held lock itself.
 Do not invent the binding or call it before the task is confirmed running. An
 exact saved binding can be retried. A different binding for that task conflicts.
 
+## Mark a new resource idle
+
+A queued request serves an unregistered resource only from saved evidence that
+the GPU is free: a closed loan, a first background launch that never started a
+process, or an operator attestation about an ended task. A new resource that
+never had a background run has none of these. `resource show` then reports the
+attention code for no idle evidence, and queued requests wait.
+
+For such a resource, an operator can record one initial idle attestation. Use
+it only when all of these are true:
+
+- `resource show` shows no `registered_background_task`, no `loan`, and no
+  `background_launch`.
+- The operator inspected the GPU on the authority machine and found no work on
+  it, for example with `nvidia-smi`.
+
+Save the document with the exact resource, authority, and `state_revision` from
+`resource show`, and a new operation UUID:
+
+```json
+{
+  "operation_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+  "resource_id": "11111111-1111-4111-8111-111111111111",
+  "authority_machine": "22222222-2222-4222-8222-222222222222",
+  "expected_state_revision": 0,
+  "observation": "Describe the authority GPU checks and why no work holds the GPU",
+  "confirmation": "operator_confirmed_gpu_free"
+}
+```
+
+Run it on the GPU authority machine:
+
+```sh
+homebased --json resource initial-idle --spec initial-idle.json
+homebased --json resource show 11111111-1111-4111-8111-111111111111
+```
+
+The authority refuses the attestation if the resource has a registered task, a
+loan, a first background launch, or an operator attestation, because that
+history decides the idle state. It accepts one initial attestation per
+resource. The receipt is a human confirmation, not proof that a process
+exited. It counts as the idle boundary only until the first loan or background
+launch; after that, the normal history applies. After an unknown result, retry
+with the exact same file. The same operation UUID with changed content is a
+conflict.
+
 ## Queue and cancel work
 
 Background and queued command inputs use the same strict `ResourceTaskSubmitSpec`

@@ -18,18 +18,19 @@ use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::api::{
-    BrowserResourceAction, OperatorReleaseBody, OperatorReleaseResponse, PendingActionList,
-    PendingActionPhase, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody,
-    ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
-    ResourceDetail, ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
-    ResourceRequestSubmitResponse, SupervisorReplacementBody, TrainerAttemptBody,
-    TrainerAttemptResponse, UnavailableAuthority,
+    BrowserResourceAction, InitialIdleBody, InitialIdleResponse, OperatorReleaseBody,
+    OperatorReleaseResponse, PendingActionList, PendingActionPhase, RESOURCE_PENDING_PATH,
+    RESOURCE_REGISTER_PATH, RequestCancelBody, ResourceActionBody, ResourceBackgroundSubmitOutcome,
+    ResourceBackgroundSubmitResponse, ResourceDetail, ResourceRegisterBody, ResourceRegistration,
+    ResourceRequestSubmitOutcome, ResourceRequestSubmitResponse, SupervisorReplacementBody,
+    TrainerAttemptBody, TrainerAttemptResponse, UnavailableAuthority,
 };
 use crate::resource::bound_action::{
     LocalReturnAcceptance, RESOURCE_ACTION_SUBMIT_PATH, ResourceActionChoice, ResourceActionKind,
     ResourceActionRejection, ResourceActionSubmitOutcome, ResourceActionSubmitRequest,
     ResourceActionSubmitResponse,
 };
+use crate::resource::initial_idle::InitialIdleAttestation;
 use crate::resource::operator_release::OperatorGpuFreeAttestation;
 use crate::resource::{
     ActionId, CommandSpec, ResourceId, ResourceRevision, ReturnContext, ReturnDecision,
@@ -51,6 +52,17 @@ pub enum ResourceCommand {
     Register {
         /// Registration spec file, or `-` for stdin
         #[arg(long)]
+        spec: String,
+    },
+    /// Record that a resource with no history starts with a free GPU
+    ///
+    /// Use it once, on the authority machine, for a newly registered resource
+    /// that has no background run, loan, or release record, after you inspected
+    /// its GPU. Queued requests then serve. This is a human confirmation, not
+    /// automatic proof. Reuse the exact same document after an unknown result
+    InitialIdle {
+        /// Complete InitialIdleAttestation JSON file, or `-` for stdin
+        #[arg(long, required = true, value_name = "FILE")]
         spec: String,
     },
     /// Record a human GPU-free confirmation on the local authority machine
@@ -293,6 +305,7 @@ pub async fn run(ctx: &Ctx, command: ResourceCommand) -> Result<ExitCode, AppErr
         ResourceCommand::Schema => schema(ctx),
         ResourceCommand::Register { spec } => register(ctx, &spec).await,
         ResourceCommand::OperatorRelease { spec } => operator_release(ctx, &spec).await,
+        ResourceCommand::InitialIdle { spec } => initial_idle(ctx, &spec).await,
         ResourceCommand::Show { resource_id } => show(ctx, resource_id).await,
         ResourceCommand::Supervisor { command } => supervisor(ctx, command).await,
         ResourceCommand::Background { command } => background(ctx, command).await,
@@ -340,13 +353,14 @@ fn schema(ctx: &Ctx) -> Result<ExitCode, AppError> {
     let value = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Homebased resource CLI inputs",
-        "description": "ResourceRegistrationSpec is used by resource register. ResourceTaskSubmitSpec is used by resource background submit and resource request submit. ResourceReturnWorkSpec is used by resource return --resume-spec. ResourceTrainerAttemptBinding is used by resource background bind-attempt. OperatorGpuFreeAttestation is a human confirmation after inspecting the authority GPU, not automatic proof.",
+        "description": "ResourceRegistrationSpec is used by resource register. ResourceTaskSubmitSpec is used by resource background submit and resource request submit. ResourceReturnWorkSpec is used by resource return --resume-spec. ResourceTrainerAttemptBinding is used by resource background bind-attempt. OperatorGpuFreeAttestation is a human confirmation after inspecting the authority GPU, not automatic proof. InitialIdleAttestation is used by resource initial-idle for a resource with no history; it is also a human confirmation.",
         "$defs": {
             "ResourceRegistrationSpec": resource_registration_schema(),
             "ResourceTaskSubmitSpec": resource_task_schema()?,
             "ResourceReturnWorkSpec": resource_return_work_schema()?,
             "ResourceTrainerAttemptBinding": resource_trainer_attempt_binding_schema(),
             "OperatorGpuFreeAttestation": operator_gpu_free_attestation_schema(),
+            "InitialIdleAttestation": initial_idle_attestation_schema(),
         },
     });
     emit(ctx, value, None, None)?;
@@ -702,6 +716,90 @@ fn check_operator_release_response(
         retry_identity,
         "the authority returned a different attestation identity or API version".into(),
     ))
+}
+
+fn initial_idle_attestation_schema() -> Value {
+    let uuid = json!({ "type": "string", "format": "uuid" });
+    json!({
+        "title": "InitialIdleAttestation",
+        "description": "Complete document for resource initial-idle. Use it once for a registered resource with no registered background task, loan, first background launch, or operator attestation, after inspecting the authority GPU. It records a human confirmation, not automatic proof. Keep operation_id and observation unchanged on retry.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "operation_id",
+            "resource_id",
+            "authority_machine",
+            "expected_state_revision",
+            "observation",
+            "confirmation"
+        ],
+        "properties": {
+            "operation_id": uuid,
+            "resource_id": uuid,
+            "authority_machine": uuid,
+            "expected_state_revision": { "type": "integer", "minimum": 0 },
+            "observation": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Human account of what was inspected and why no work holds the GPU"
+            },
+            "confirmation": { "const": "operator_confirmed_gpu_free" }
+        }
+    })
+}
+
+async fn initial_idle(ctx: &Ctx, path: &str) -> Result<ExitCode, AppError> {
+    let attestation: InitialIdleAttestation = load_json(path)?;
+    attestation
+        .validate()
+        .map_err(|error| invalid_resource_spec("", &error.to_string()))?;
+    let resource = attestation.resource_id;
+    let operation = attestation.operation_id.as_uuid();
+    let retry_identity = format!(
+        "retry with the exact same document and operation_id {operation} using `homebased resource initial-idle --spec {path}`"
+    );
+    let body = InitialIdleBody {
+        api_version: API_VERSION,
+        attestation: attestation.clone(),
+    };
+    let client = Client::new(ctx.home.sock_path());
+    let value = client
+        .post(
+            &format!("/v1/resources/{}/initial-idle", resource.as_uuid()),
+            &serde_json::to_value(&body)?,
+        )
+        .await
+        .map_err(|error| {
+            operator_release_mutation_error(resource, operation, &retry_identity, error)
+        })?;
+    check_version(&value).map_err(|error| {
+        operator_release_unknown(resource, operation, &retry_identity, error.to_string())
+    })?;
+    let response: InitialIdleResponse = serde_json::from_value(value).map_err(|error| {
+        operator_release_unknown(
+            resource,
+            operation,
+            &retry_identity,
+            format!("the authority returned an invalid receipt: {error}"),
+        )
+    })?;
+    if response.api_version != API_VERSION || response.receipt.attestation != attestation {
+        return Err(operator_release_unknown(
+            resource,
+            operation,
+            &retry_identity,
+            "the authority returned a different attestation identity or API version".into(),
+        ));
+    }
+
+    let human = if response.replayed {
+        format!("saved initial idle receipt {operation} was replayed")
+    } else {
+        format!("initial idle receipt {operation} was saved")
+    };
+    let value = serde_json::to_value(response)?;
+    emit(ctx, value, Some(&operation.to_string()), Some(&human))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn register(ctx: &Ctx, path: &str) -> Result<ExitCode, AppError> {

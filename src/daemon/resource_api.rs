@@ -44,14 +44,15 @@ use crate::resource::api::{
     AttentionCode, AttentionView, BackgroundLaunchReservation, BackgroundLaunchReservationStatus,
     BrowserResourceAction, CLUSTER_RESOURCE_PENDING_PATH, CLUSTER_RESOURCES_PATH,
     ClusterPendingActions, ClusterResourceControl, ClusterResourceDetail, ClusterResourceList,
-    OperatorReleaseBody, OperatorReleaseResponse, PendingActionList, PendingActionPhase,
-    PendingActionView, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody,
-    ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
-    ResourceControl, ResourceDetail, ResourceList, ResourceOverview, ResourceRegisterBody,
-    ResourceRegistration, ResourceRequestSubmitOutcome, ResourceRequestSubmitResponse,
-    ResourceRequestView, ResourceTaskSummary, SupervisorReplacementBody, TrainerAttemptBody,
-    TrainerAttemptResponse, UnavailableAuthority,
+    InitialIdleBody, InitialIdleResponse, OperatorReleaseBody, OperatorReleaseResponse,
+    PendingActionList, PendingActionPhase, PendingActionView, RESOURCE_PENDING_PATH,
+    RESOURCE_REGISTER_PATH, RequestCancelBody, ResourceActionBody, ResourceBackgroundSubmitOutcome,
+    ResourceBackgroundSubmitResponse, ResourceControl, ResourceDetail, ResourceList,
+    ResourceOverview, ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
+    ResourceRequestSubmitResponse, ResourceRequestView, ResourceTaskSummary,
+    SupervisorReplacementBody, TrainerAttemptBody, TrainerAttemptResponse, UnavailableAuthority,
 };
+use crate::resource::initial_idle::InitialIdleRefusal;
 use crate::resource::operator_release::OperatorGpuFreeRefusal;
 use crate::resource::{
     AssignmentRevision, DeliveryAttemptId, IdleProofGap, Loan, LoanPhase, LoanState, Resource,
@@ -61,8 +62,9 @@ use crate::resource::{
 };
 use crate::spec::{self, NormalizedSpec};
 use crate::store::{
-    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchPhase, OperatorGpuFreeError,
-    ResourceControlEffect, ResourceControlRequest, ResourceReadModel, open_action_id,
+    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchPhase, InitialIdleError,
+    OperatorGpuFreeError, ResourceControlEffect, ResourceControlRequest, ResourceReadModel,
+    open_action_id,
 };
 use crate::submission::{RequestId, ResourceRoutePhase, SubmissionState};
 
@@ -110,6 +112,7 @@ pub(crate) fn socket_routes() -> Router<AppState> {
             "/v1/resources/{id}/operator-release",
             post(operator_release),
         )
+        .route("/v1/resources/{id}/initial-idle", post(initial_idle))
         .merge(action_routes())
 }
 
@@ -708,6 +711,114 @@ async fn operator_release(
         receipt: resolution.receipt,
         replayed: resolution.replayed,
     }))
+}
+
+/// Save one authority-local initial idle attestation, then wake its resource owner
+async fn initial_idle(
+    State(state): State<AppState>,
+    path: Result<Path<ResourceId>, PathRejection>,
+    StrictJson(body): StrictJson<InitialIdleBody>,
+) -> Result<Json<InitialIdleResponse>, AppError> {
+    let resource = path_value(path)?;
+    check_version(body.api_version)?;
+    let operation = body.attestation.operation_id.as_uuid();
+    if body.attestation.resource_id != resource {
+        return Err(AppError::Usage {
+            message: "path resource id does not match the attestation".into(),
+        });
+    }
+    let authority = state.machine.identity.machine;
+    if body.attestation.authority_machine != authority {
+        return Err(AppError::ResourceActionNotAllowed {
+            resource,
+            message: format!(
+                "initial idle attestation names authority {}, but this daemon is {authority}",
+                body.attestation.authority_machine
+            ),
+        });
+    }
+    body.attestation
+        .validate()
+        .map_err(|error| initial_idle_refusal(resource, operation, error))?;
+
+    let resolution = call(&state.store, |reply| {
+        StoreMsg::AttestInitialIdleForAuthority {
+            authority_machine: authority,
+            attestation: Box::new(body.attestation),
+            reply,
+        }
+    })
+    .await
+    .map_err(|error| {
+        operator_release_unknown(
+            resource,
+            operation,
+            format!("the store actor did not answer: {error}"),
+        )
+    })?
+    .map_err(|error| match error {
+        InitialIdleError::Refused(refusal) => initial_idle_refusal(resource, operation, refusal),
+        error => operator_release_unknown(
+            resource,
+            operation,
+            format!("the authority could not confirm the transaction result: {error}"),
+        ),
+    })?;
+
+    // queued work serves from the new idle boundary through the normal reconciliation
+    call(&state.supervisor, |reply| {
+        SupervisorMsg::ReconcileResource {
+            id: resource,
+            reply,
+        }
+    })
+    .await
+    .map_err(|error| {
+        operator_release_unknown(
+            resource,
+            operation,
+            format!("the receipt is saved, but resource reconciliation did not complete: {error}"),
+        )
+    })?;
+
+    Ok(Json(InitialIdleResponse {
+        api_version: API_VERSION,
+        receipt: resolution.receipt,
+        replayed: resolution.replayed,
+    }))
+}
+
+fn initial_idle_refusal(
+    resource: ResourceId,
+    operation: Uuid,
+    refusal: InitialIdleRefusal,
+) -> AppError {
+    use InitialIdleRefusal as Refusal;
+
+    match refusal {
+        Refusal::InvalidIdentity | Refusal::EmptyObservation => AppError::Usage {
+            message: refusal.to_string(),
+        },
+        Refusal::ResourceNotFound => AppError::ResourceNotFound { resource },
+        Refusal::StaleRevision { expected, actual } => AppError::ResourceStaleRevision {
+            resource,
+            expected: expected.get(),
+            current: actual.get(),
+        },
+        Refusal::ConflictingRetry { .. } | Refusal::RevisionExhausted { .. } => {
+            AppError::ResourceOperationConflict {
+                resource,
+                operation: Some(operation),
+                message: refusal.to_string(),
+            }
+        }
+        Refusal::WrongAuthority { .. }
+        | Refusal::HistoryExists { .. }
+        | Refusal::AlreadyAttested { .. } => AppError::ResourceActionNotAllowed {
+            resource,
+            message: refusal.to_string(),
+        },
+    }
 }
 
 fn operator_release_refusal(
@@ -2100,7 +2211,8 @@ fn idle_gap_attention(gap: IdleProofGap) -> (String, Option<TaskId>) {
     match gap {
         IdleProofGap::NoIdleEvidence => (
             "no registered background task, and no saved no-resume decision or background \
-             launch result proves the GPU is idle"
+             launch result proves the GPU is idle; for a resource with no history, an operator \
+             who inspected the authority GPU can run resource initial-idle"
                 .into(),
             None,
         ),

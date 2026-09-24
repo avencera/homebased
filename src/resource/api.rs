@@ -442,6 +442,31 @@ pub struct TrainerAttemptResponse {
     pub attempt_binding: AttemptBinding,
 }
 
+/// `POST /v1/resources/{id}/initial-idle`
+///
+/// The attestation is a human confirmation after inspecting the authority GPU
+/// It is not an automatic proof that GPU work stopped
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialIdleBody {
+    /// Public API version
+    pub api_version: u32,
+    /// Complete, immutable initial idle attestation
+    pub attestation: crate::resource::initial_idle::InitialIdleAttestation,
+}
+
+/// Saved receipt from `POST /v1/resources/{id}/initial-idle`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialIdleResponse {
+    /// Public API version
+    pub api_version: u32,
+    /// Durable receipt saved by the authority
+    pub receipt: crate::resource::initial_idle::InitialIdleReceipt,
+    /// Whether the authority returned an exact earlier receipt
+    pub replayed: bool,
+}
+
 /// `POST /v1/resources/{id}/operator-release`
 ///
 /// The attestation is a human confirmation after inspecting the authority GPU

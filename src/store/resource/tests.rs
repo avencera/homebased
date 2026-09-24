@@ -10,6 +10,7 @@ mod container;
 mod docker;
 mod ended_trainer;
 mod foreground;
+mod initial_idle;
 mod operator_release;
 mod queue_authority;
 mod registration;

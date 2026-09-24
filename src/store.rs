@@ -55,7 +55,9 @@ pub(crate) use resource::{
     idle_boundary_decision_on, idle_opening_matches_on, open_idle_serving_loan_on,
     pending_background_launch_on, promote_started_background_launch_on,
 };
-pub(crate) use resource::{OperatorGpuFreeError, operator_serving_release_matches_on};
+pub(crate) use resource::{
+    InitialIdleError, OperatorGpuFreeError, operator_serving_release_matches_on,
+};
 pub(crate) use resource::{
     ResourceControlEffect, ResourceControlError, ResourceControlRequest, ResourceControlStart,
     ResourceReadModel, SupervisorReplacement, open_action_id,
@@ -386,6 +388,17 @@ fn migrate_27_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn migrate_28_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
     conn.execute_batch(MIGRATE_28_TO_29_RESOURCES)?;
+    conn.execute_batch(RESOURCE_SCHEMA)
+}
+
+/// Schema version of the v0.5.1 release
+const RELEASED_V0_5_1_SCHEMA_VERSION: i64 = 29;
+
+/// Move a v0.5.1 database to the current schema
+///
+/// Version 30 adds only the initial idle attestation table, which
+/// `RESOURCE_SCHEMA` creates
+fn migrate_29_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(RESOURCE_SCHEMA)
 }
 
@@ -766,6 +779,7 @@ impl Store {
                 2 => migrate_2_to_current(&transaction)?,
                 RELEASED_V0_4_SCHEMA_VERSION => migrate_27_to_current(&transaction)?,
                 RELEASED_V0_5_SCHEMA_VERSION => migrate_28_to_current(&transaction)?,
+                RELEASED_V0_5_1_SCHEMA_VERSION => migrate_29_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2293,8 +2307,8 @@ pub(crate) fn write_exit_json_with_evidence(
 mod tests {
     use super::{
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
-        RELEASED_V0_5_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
-        write_exit_json_with_evidence,
+        RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, Store, new_queued_task,
+        read_exit_json, write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -3756,6 +3770,33 @@ CREATE TABLE reports (
         schema_sql(&store, "resource_requests_queued_fifo");
         assert_resource_tables_installed(&store);
         assert_foreign_keys_enabled(&store);
+    }
+
+    #[test]
+    fn released_v0_5_1_database_gains_the_initial_idle_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            store
+                .conn
+                .execute_batch(&format!(
+                    "DROP TABLE resource_initial_idle_attestations;
+                     PRAGMA user_version = {RELEASED_V0_5_1_SCHEMA_VERSION};"
+                ))
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(schema_sql(&store, "resource_initial_idle_attestations").contains("resource_id"));
+        store.require_task(id).unwrap();
     }
 
     #[test]

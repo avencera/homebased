@@ -1661,3 +1661,58 @@ async fn background_route_launches_one_co_located_trainer_and_refuses_remote_sup
     std::fs::write(&trainer.gate, b"").unwrap();
     fixture.stop().await;
 }
+
+#[tokio::test]
+async fn initial_idle_saves_one_receipt_for_a_resource_with_no_history() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let (status, detail) = fixture
+        .socket_get(&format!("/v1/resources/{}", fixture.resource.as_uuid()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let revision = detail["resource"]["state_revision"].clone();
+    let attestation = json!({
+        "operation_id": OperatorAttestationId::new(),
+        "resource_id": fixture.resource,
+        "authority_machine": fixture.local(),
+        "expected_state_revision": revision,
+        "observation": "nvidia-smi on the authority shows no compute processes",
+        "confirmation": "operator_confirmed_gpu_free"
+    });
+    let body = json!({ "api_version": 1, "attestation": attestation });
+    let path = format!("/v1/resources/{}/initial-idle", fixture.resource.as_uuid());
+
+    // the browser dashboard cannot record a human attestation
+    let (status, response) = send(
+        fixture.dashboard,
+        "POST",
+        &path,
+        &[
+            ("host", fixture.dashboard.to_string()),
+            ("origin", fixture.origin()),
+            ("content-type", "application/json".into()),
+        ],
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+
+    let (status, first) = fixture.socket_post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["replayed"], false);
+    assert_eq!(first["receipt"]["attestation"], attestation);
+    let (status, retry) = fixture.socket_post(&path, body).await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["replayed"], true);
+    assert_eq!(retry["receipt"], first["receipt"]);
+
+    let mut second = attestation.clone();
+    second["operation_id"] = json!(OperatorAttestationId::new());
+    second["expected_state_revision"] = first["receipt"]["state_revision"].clone();
+    let (status, response) = fixture
+        .socket_post(&path, json!({ "api_version": 1, "attestation": second }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(error_code(&response), "resource_action_not_allowed");
+    fixture.stop().await;
+}

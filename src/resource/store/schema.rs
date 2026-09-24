@@ -303,6 +303,23 @@ CREATE TABLE IF NOT EXISTS resource_operator_attestations (
 CREATE INDEX IF NOT EXISTS resource_operator_attestations_resource
     ON resource_operator_attestations(resource_id);
 
+CREATE TABLE IF NOT EXISTS resource_initial_idle_attestations (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    resource_id TEXT NOT NULL UNIQUE REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.operation_id') = operation_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.resource_id') = resource_id, 0)
+        AND COALESCE(
+            json_extract(receipt_json, '$.attestation.confirmation') = 'operator_confirmed_gpu_free',
+            0
+        )
+        AND COALESCE(length(trim(json_extract(receipt_json, '$.attestation.observation'))) > 0, 0)
+        AND COALESCE(json_type(receipt_json, '$.state_revision') = 'integer', 0)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS resource_registration_receipts (
     resource_id TEXT PRIMARY KEY NOT NULL REFERENCES resources(id),
     receipt_json TEXT NOT NULL CHECK (

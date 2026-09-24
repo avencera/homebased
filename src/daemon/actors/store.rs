@@ -447,6 +447,23 @@ pub(crate) enum StoreMsg {
         /// Typed storage result inside actor and transport errors
         reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
     },
+    /// Save one operator attestation that a resource with no history starts idle
+    AttestInitialIdleForAuthority {
+        /// Local daemon machine, which must be the resource authority
+        authority_machine: MachineId,
+        /// Exact operator attestation
+        attestation: Box<crate::resource::initial_idle::InitialIdleAttestation>,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<
+                Result<
+                    crate::resource::initial_idle::InitialIdleResolution,
+                    crate::store::InitialIdleError,
+                >,
+                AppError,
+            >,
+        >,
+    },
     /// Commit one operator attestation that an ended registered trainer no longer holds its GPU
     ///
     /// The store saves the receipt and the queue or loan transition in one
@@ -1146,6 +1163,14 @@ impl Actor for StoreActor {
             StoreMsg::ResolveEndedRestoreForAuthority { resolution, reply } => send_reply(
                 reply,
                 Ok(state.resolve_ended_restore_for_authority(*resolution)),
+            ),
+            StoreMsg::AttestInitialIdleForAuthority {
+                authority_machine,
+                attestation,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.attest_initial_idle_for_authority(authority_machine, *attestation)),
             ),
             StoreMsg::AttestTrainerGpuFreeForAuthority {
                 authority_machine,

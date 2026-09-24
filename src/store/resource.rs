@@ -5,6 +5,7 @@ mod assigned_task;
 mod background;
 mod cancellation;
 mod controls;
+mod initial_idle;
 mod operator_release;
 mod release_checkpoint;
 mod release_completion;
@@ -31,6 +32,7 @@ pub(crate) use controls::{
     ResourceControlEffect, ResourceControlError, ResourceControlRequest, ResourceControlStart,
     ResourceReadModel, SupervisorReplacement, open_action_id,
 };
+pub(crate) use initial_idle::InitialIdleError;
 pub(crate) use operator_release::{OperatorGpuFreeError, operator_serving_release_matches_on};
 pub(crate) use release_proof::VerifiedReleaseProof;
 pub(crate) use restore::{
