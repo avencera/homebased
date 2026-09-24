@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::client::Client;
 use crate::daemon::fleet_api::MachinesBody;
-use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
+use crate::domain::{API_VERSION, THREAD_ENV_VARS, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::api::{
@@ -1616,11 +1616,11 @@ fn unavailable_authority(authority: &UnavailableAuthority) -> AppError {
 }
 
 async fn current_supervisor_address(client: &Client) -> Result<(MachineId, ThreadId), AppError> {
-    let thread = ["CODEX_THREAD_ID", "CODEX_SESSION_ID"]
+    let thread = THREAD_ENV_VARS
         .into_iter()
         .find_map(|name| std::env::var(name).ok())
         .ok_or_else(|| AppError::Usage {
-            message: "set CODEX_THREAD_ID or CODEX_SESSION_ID to use a pending resource action"
+            message: "set CODEX_THREAD_ID, CODEX_SESSION_ID, or CLAUDE_CODE_SESSION_ID to use a pending resource action"
                 .into(),
         })?;
     let thread = ThreadId::from_str(&thread)?;

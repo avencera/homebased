@@ -1,8 +1,12 @@
 # Submit a task
 
-## 1. Find the Codex thread id
+## 1. Find the thread id
 
-The spec needs the UUID of the Codex thread that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the Codex thread.
+The spec needs the UUID of the Codex thread or Claude Code session that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the thread.
+
+In Claude Code, use `$CLAUDE_CODE_SESSION_ID`. The session must be running when an event is sent; events for a stopped session fail and go to the fallback log.
+
+In Codex:
 
 1. Use the thread id if the user or the harness already gave one.
 2. Otherwise take the newest session file whose `cwd` matches this workspace and read `session_id` from its first line:
@@ -121,7 +125,7 @@ GitHub CI watcher as a normal task:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `api_version` | yes | Always `1`. |
-| `thread` | yes | Codex thread UUID from step 1. |
+| `thread` | yes | Codex thread or Claude Code session UUID from step 1. |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | For local tasks, an existing directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |

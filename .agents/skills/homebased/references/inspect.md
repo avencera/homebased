@@ -79,7 +79,7 @@ The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/tasks/<id>`, an
 | `prompt.feed.txt` | Agent only: what the agent actually received. |
 | `output.log` | Child stdout and stderr. |
 | `exit.json` | Written by the worker parent at exit. Absent for `lost` tasks. |
-| `callback.log` | Output of the last `codex queue` attempt. |
+| `callback.log` | Output of the last `codex queue` attempt, or the Claude Code session socket of the last attempt. |
 | `delivery.lock` | Serializes callback delivery across daemon restarts. |
 | `runner.lock` | Liveness lock. Held while the worker parent is alive. |
 

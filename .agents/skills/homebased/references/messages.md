@@ -47,7 +47,7 @@ exists.
 ## Choose the source and conversation
 
 By default, the CLI uses `HOMEBASED_TASK_ID` as the source task. Otherwise, it
-uses `CODEX_THREAD_ID`, then `CODEX_SESSION_ID`, as the source thread. Pass one
+uses `CODEX_THREAD_ID`, then `CODEX_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`, as the source thread. Pass one
 explicit source when these values are not set or when you need a different
 reply route:
 

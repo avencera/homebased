@@ -129,7 +129,16 @@ pub enum TaskNameError {
     },
 }
 
-/// Codex thread that submitted the task
+/// Environment variables that name the calling agent's own thread, in
+/// precedence order. A Claude Code session id is a thread id: delivery sends to
+/// its session inbox instead of `codex queue`
+pub const THREAD_ENV_VARS: [&str; 3] = [
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+];
+
+/// Codex thread or Claude Code session that submitted the task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ThreadId(pub Uuid);

@@ -210,6 +210,7 @@ impl Daemon {
             .env_remove("HOMEBASED_TASK_ID")
             .env_remove("CODEX_THREAD_ID")
             .env_remove("CODEX_SESSION_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("CODEX_HOME")
             .env_remove("HOMEBASED_WEB_LISTEN")
             .stdin(Stdio::null());

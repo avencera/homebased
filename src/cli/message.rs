@@ -7,7 +7,7 @@ use clap::Subcommand;
 use uuid::Uuid;
 
 use crate::client::Client;
-use crate::domain::{API_VERSION, TaskId, ThreadId};
+use crate::domain::{API_VERSION, THREAD_ENV_VARS, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::message::{
@@ -185,7 +185,7 @@ fn source(
         return Ok(MessageSourceSelector::Task { task });
     }
 
-    for key in ["CODEX_THREAD_ID", "CODEX_SESSION_ID"] {
+    for key in THREAD_ENV_VARS {
         let Some(value) = std::env::var_os(key) else {
             continue;
         };
@@ -199,7 +199,7 @@ fn source(
     }
 
     Err(AppError::Usage {
-        message: "set HOMEBASED_TASK_ID, CODEX_THREAD_ID, or CODEX_SESSION_ID, or pass an explicit source flag".into(),
+        message: "set HOMEBASED_TASK_ID, CODEX_THREAD_ID, CODEX_SESSION_ID, or CLAUDE_CODE_SESSION_ID, or pass an explicit source flag".into(),
     })
 }
 

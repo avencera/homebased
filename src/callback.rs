@@ -1,4 +1,7 @@
-//! `HOMEBASED_EVENT` formatting and `codex queue` invocation.
+//! `HOMEBASED_EVENT` formatting and origin inbox delivery: `codex queue` for a
+//! Codex thread, or the session socket for a Claude Code session.
+
+mod claude_inbox;
 
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -21,6 +24,8 @@ use crate::domain::{
 };
 use crate::error::AppError;
 use crate::submission::CallbackContext;
+
+use claude_inbox::ClaudeInbox;
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
@@ -489,7 +494,10 @@ pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), Stri
     Ok(())
 }
 
-/// Make exactly one bounded queue-command attempt using the saved origin context
+/// Make exactly one bounded delivery attempt using the saved origin context
+///
+/// A thread id owned by a live Claude Code session goes to that session's
+/// inbox. Any other thread id goes to `codex queue`
 pub(crate) fn send_saved_queue_attempt(
     context: &CallbackContext,
     thread: ThreadId,
@@ -497,6 +505,9 @@ pub(crate) fn send_saved_queue_attempt(
     log_path: &Path,
     delivery_lock: &Path,
 ) -> Result<(), String> {
+    if let Some(inbox) = ClaudeInbox::find(Path::new(&context.env.home), thread)? {
+        return inbox.send(thread, line, log_path, delivery_lock);
+    }
     let binary = context.codex.path().ok_or_else(|| {
         context
             .codex

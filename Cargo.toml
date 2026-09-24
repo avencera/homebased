@@ -5,7 +5,7 @@ members = ["xtask"]
 name = "homebased"
 version = "0.5.2"
 edition = "2024"
-description = "Supervise long-running agent and general task workloads and report them to a Codex thread"
+description = "Supervise long-running agent and general task workloads and report them to a Codex thread or Claude Code session"
 publish = false
 
 [dependencies]

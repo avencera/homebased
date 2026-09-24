@@ -43,7 +43,7 @@ Older events do not have `seq`. For those messages, use `(task, event)` as the f
 
 ## Origin and execution machines
 
-The execution machine owns the child process, reports, logs, and event outbox. The origin machine owns the task route, the Codex thread, and callback delivery. Only the origin machine runs `codex queue`. It uses the `PATH`, `HOME`, current directory, and resolved Codex path saved at submission. It does not use the executor's environment or `cwd`.
+The execution machine owns the child process, reports, logs, and event outbox. The origin machine owns the task route, the Codex thread, and callback delivery. Only the origin machine delivers events. When the thread id is a live Claude Code session on the origin, it writes the event to that session's messaging socket. Otherwise it runs `codex queue`. It uses the `PATH`, `HOME`, current directory, and resolved Codex path saved at submission. It does not use the executor's environment or `cwd`.
 
 The executor keeps an event until the origin confirms that it stored the event. It retries when the origin is not reachable. A transport outage does not change process status or stop the child. The origin also saves each callback before it tries `codex queue`, and resumes pending delivery after restart.
 
