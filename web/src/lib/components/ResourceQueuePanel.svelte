@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import { resolve } from '$app/paths';
 	import Gpu from '@lucide/svelte/icons/gpu';
 	import { isProcessStatus, peerTaskHref, type FleetMachine } from '$lib/api';
@@ -13,10 +14,12 @@
 	interface Props {
 		queues: readonly ResourceQueue[];
 		machines: readonly FleetMachine[];
+		/** Controls shown at the end of each card header. */
+		actions?: Snippet;
 		class?: string;
 	}
 
-	let { queues, machines, class: className }: Props = $props();
+	let { queues, machines, actions, class: className }: Props = $props();
 
 	const machineById = $derived(new Map(machines.map((machine) => [machine.machine, machine])));
 
@@ -97,6 +100,7 @@
 				>
 					{item.status.label}
 				</span>
+				{@render actions?.()}
 			</header>
 
 			<!-- phones leave room to scroll the last item above the floating browser toolbar -->

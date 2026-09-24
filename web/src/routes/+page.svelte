@@ -12,6 +12,7 @@
 		type ProcessStatus
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
+	import ExpandToggle from '$lib/components/ExpandToggle.svelte';
 	import ResourceQueuePanel from '$lib/components/ResourceQueuePanel.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
 	import { DaemonStore, ResourceQueueStore } from '$lib/daemon.svelte';
@@ -45,6 +46,20 @@
 	const busyQueues = $derived(resourceStore.queues.filter(isBusy));
 	// while a resource runs or waits on work, tasks and its queue share the screen
 	const split = $derived(busyQueues.length > 0);
+
+	/** Box that fills the whole content area, hiding the other one. */
+	type ExpandedBox = 'tasks' | 'gpu';
+	let expandedChoice = $state<ExpandedBox | null>(null);
+	// only a split can expand; when the GPU work ends, the tasks fill the screen anyway
+	const expanded = $derived(split ? expandedChoice : null);
+
+	function toggleExpanded(box: ExpandedBox) {
+		expandedChoice = expanded === box ? null : box;
+	}
+
+	function onKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape' && expanded) expandedChoice = null;
+	}
 
 	interface Filters {
 		status: string | null;
@@ -101,6 +116,16 @@
 		return names.join(', ');
 	}
 </script>
+
+<svelte:window onkeydown={onKeydown} />
+
+{#snippet tasksExpand()}
+	<ExpandToggle
+		expanded={expanded === 'tasks'}
+		label="tasks"
+		onToggle={() => toggleExpanded('tasks')}
+	/>
+{/snippet}
 
 <!-- pinned to the viewport so the document never scrolls; only the boxes do -->
 <div class="fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden p-3 sm:p-4">
@@ -229,35 +254,51 @@
 	</div>
 
 	<!-- the page fits the screen and each box scrolls on its own. The task box is as tall as its
-	     rows, up to half the screen while a GPU has work; the GPU box takes the rest -->
+	     rows, up to half the screen while a GPU has work; the GPU box takes the rest. An expanded
+	     box takes the whole area -->
 	<div class="mt-3 flex min-h-0 flex-1 flex-col gap-3">
-		<TaskList
-			tasks={visibleTasks}
-			machines={store.machines}
-			activeThread={thread}
-			activeProject={project}
-			onThread={(next) => navigate({ ...currentFilters, thread: next })}
-			onProject={(next) => navigate({ ...currentFilters, project: next })}
-			class={cn('min-h-0 flex-initial', split && 'max-h-[50%]')}
-		>
-			{#snippet empty()}
-				<p class="px-3 py-6 text-center text-muted-foreground">
-					{#if store.lastFetched === null}
-						{EM_DASH}
-					{:else if inFlightOnly && !project}
-						No workers in flight
-					{:else}
-						No tasks match this filter
-					{/if}
-				</p>
-			{/snippet}
-		</TaskList>
-		{#if split}
+		{#if expanded !== 'gpu'}
+			<TaskList
+				tasks={visibleTasks}
+				machines={store.machines}
+				activeThread={thread}
+				activeProject={project}
+				onThread={(next) => navigate({ ...currentFilters, thread: next })}
+				onProject={(next) => navigate({ ...currentFilters, project: next })}
+				class={cn(
+					'min-h-0 flex-initial',
+					expanded === 'tasks' && 'flex-1',
+					split && !expanded && 'max-h-[50%]'
+				)}
+				actions={split ? tasksExpand : undefined}
+			>
+				{#snippet empty()}
+					<p class="px-3 py-6 text-center text-muted-foreground">
+						{#if store.lastFetched === null}
+							{EM_DASH}
+						{:else if inFlightOnly && !project}
+							No workers in flight
+						{:else}
+							No tasks match this filter
+						{/if}
+					</p>
+				{/snippet}
+			</TaskList>
+		{/if}
+		{#if split && expanded !== 'tasks'}
 			<ResourceQueuePanel
 				queues={busyQueues}
 				machines={store.machines}
 				class="scrollbar-none min-h-0 flex-1 overflow-y-auto"
-			/>
+			>
+				{#snippet actions()}
+					<ExpandToggle
+						expanded={expanded === 'gpu'}
+						label="GPU queue"
+						onToggle={() => toggleExpanded('gpu')}
+					/>
+				{/snippet}
+			</ResourceQueuePanel>
 		{/if}
 	</div>
 </div>
