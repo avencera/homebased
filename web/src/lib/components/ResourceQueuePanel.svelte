@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import { resolve } from '$app/paths';
 	import ArrowDown from '@lucide/svelte/icons/arrow-down';
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
@@ -20,10 +21,20 @@
 		machines: readonly FleetMachine[];
 		resourceStore: ResourceQueueStore;
 		refreshDashboard: () => Promise<void>;
+		/** Controls shown at the end of each card header. */
+		actions?: Snippet;
 		class?: string;
 	}
 
-	let { queues, machines, resourceStore, refreshDashboard, class: className }: Props = $props();
+	let {
+		queues,
+		machines,
+		resourceStore,
+		refreshDashboard,
+		actions,
+		class: className
+	}: Props = $props();
+
 	const machineById = $derived(new Map(machines.map((machine) => [machine.machine, machine])));
 	const operationManager = new ResourceOperationManager();
 	/** The one queued request whose cancel waits for a second click. */
@@ -150,8 +161,8 @@
 		{@const operationState = operationManager.stateFor(item.resource.id)}
 		{@const resourceActionDisabled =
 			resourceStore.error !== null || operationState.operation !== null || operationState.busy}
-		<!-- cards fill the box when short and grow with a long queue, which the box scrolls -->
-		<article class="flex shrink-0 grow flex-col rounded border border-border bg-card">
+		<!-- cards are as tall as their queue; the box scrolls a long one -->
+		<article class="flex shrink-0 flex-col rounded border border-border bg-card">
 			<header
 				class="flex items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px]"
 			>
@@ -171,10 +182,10 @@
 				>
 					{item.status.label}
 				</span>
+				{@render actions?.()}
 			</header>
 
-			<!-- phones leave room to scroll the last item above the floating browser toolbar -->
-			<div class="flex flex-1 flex-col gap-3 px-3 pt-2.5 pb-2.5 max-sm:pb-20">
+			<div class="flex flex-col gap-3 px-3 py-2.5">
 				{#if operationState.operation || operationState.error || operationState.message}
 					<div
 						class={cn(

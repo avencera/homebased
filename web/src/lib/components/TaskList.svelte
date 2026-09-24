@@ -23,6 +23,8 @@
 		onProject: (project: string) => void;
 		/** Rendered in place of rows when the list is empty. */
 		empty: Snippet;
+		/** Controls for a title bar; the bar shows only when there are some. */
+		actions?: Snippet;
 		class?: string;
 	}
 
@@ -34,6 +36,7 @@
 		onThread,
 		onProject,
 		empty,
+		actions,
 		class: className
 	}: Props = $props();
 
@@ -49,6 +52,14 @@
 </script>
 
 <div class={cn('flex flex-col overflow-hidden rounded-lg border border-border bg-card', className)}>
+	{#if actions}
+		<div
+			class="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1 pl-4 text-[11px] tracking-wide text-muted-foreground uppercase"
+		>
+			<span>Tasks <span class="tabular-nums">{tasks.length}</span></span>
+			<span class="ml-auto flex items-center">{@render actions()}</span>
+		</div>
+	{/if}
 	<div
 		class="task-grid hidden shrink-0 gap-x-3 border-b border-border bg-muted px-3 py-1.5 pl-4 text-[11px] tracking-wide text-muted-foreground uppercase lg:grid"
 		aria-hidden="true"
