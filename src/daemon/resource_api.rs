@@ -33,12 +33,12 @@ use super::actors::supervisor::BackgroundLaunch;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::views::TaskSummary;
 use super::cluster::{OriginResourceCancellationOutcome, ReadQuery};
+use super::peer_read::{READ_MAX_BODY, read_peer};
 use super::resource_submit::{ResourceSubmitInput, ResourceSubmitOutcome};
 use crate::cancellation::ResourceCancellationTarget;
 use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
-use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
 use crate::resource::api::{
     AttentionCode, AttentionView, BackgroundLaunchReservation, BackgroundLaunchReservationStatus,
@@ -77,8 +77,6 @@ const SETTLE_POLL: Duration = Duration::from_millis(100);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Forwarded controls include the authority's settle wait and one notice attempt
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Read routes shared by the Unix socket and the dashboard
 pub(crate) fn read_routes() -> Router<AppState> {
@@ -1528,30 +1526,6 @@ where
         }
     }
     results
-}
-
-async fn read_peer<T: DeserializeOwned>(
-    fleet: &FleetHandle,
-    machine: MachineId,
-    path: &str,
-) -> Result<T, String> {
-    let destination = fleet
-        .connect(machine)
-        .await
-        .map_err(|error| error.to_string())?;
-    let response = ClusterClient::new(READ_TIMEOUT, READ_MAX_BODY)
-        .get(&destination.address, path)
-        .await
-        .map_err(|error| error.to_string())?;
-    if response.status != StatusCode::OK {
-        return Err(format!("peer returned HTTP {}", response.status));
-    }
-    let value: Value = serde_json::from_slice(&response.body)
-        .map_err(|error| format!("invalid peer response: {error}"))?;
-    if value.get("api_version").and_then(Value::as_u64) != Some(u64::from(API_VERSION)) {
-        return Err("peer response uses an unsupported API version".into());
-    }
-    serde_json::from_value(value).map_err(|error| format!("invalid peer response: {error}"))
 }
 
 /// Read one resource from the peer that owns it

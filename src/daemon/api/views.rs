@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::domain::{
@@ -32,7 +32,7 @@ pub struct StatusBody {
 
 /// Inactivity-reminder state for the check timeout. Public and two-valued: a
 /// send that is still in flight has not been delivered, so it reads `pending`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckTimeoutStatus {
     /// Reminder not yet delivered.
@@ -41,8 +41,9 @@ pub enum CheckTimeoutStatus {
     Sent,
 }
 
-/// One task in `GET /v1/tasks` and the head of `GET /v1/tasks/{id}`.
-#[derive(Debug, Clone, Serialize)]
+/// One task in `GET /v1/tasks` and the head of `GET /v1/tasks/{id}`. Also read
+/// back from peers for the fleet task list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     /// Task id.
     pub id: TaskId,

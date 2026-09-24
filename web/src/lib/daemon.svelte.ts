@@ -5,17 +5,19 @@ import { IsDocumentVisible, useInterval } from 'runed';
 import {
 	asApiError,
 	fetchLogTail,
+	fetchFleetTasks,
 	fetchStatus,
 	fetchTask,
-	fetchTasks,
 	isInFlight,
 	type ApiError,
 	type DaemonStatus,
+	type FleetMachine,
+	type FleetTask,
 	type LogTail,
 	type TaskDetail,
-	type TaskQuery,
-	type TaskSummary
+	type TaskQuery
 } from './api';
+import { resourceQueue, type ResourceQueue } from './resource-state';
 import {
 	fetchPendingActions,
 	fetchResourceDetail,
@@ -61,12 +63,14 @@ function startPolling(options: PollingOptions): void {
 	});
 }
 
-/** Dashboard list: daemon status plus the filtered task table. */
+/** Dashboard list: daemon status plus the filtered fleet task table. */
 export class DaemonStore {
 	/** Last successful `GET /v1/status`. */
 	status = $state<DaemonStatus | null>(null);
-	/** Filtered tasks, newest first. */
-	tasks = $state<TaskSummary[]>([]);
+	/** This machine first, then every known peer and whether it answered. */
+	machines = $state<readonly FleetMachine[]>([]);
+	/** Filtered tasks from every machine that answered, newest first. */
+	tasks = $state<readonly FleetTask[]>([]);
 	/** Error from the last attempt, cleared by the next success. */
 	error = $state<ApiError | null>(null);
 	/** Epoch milliseconds of the last settled attempt. */
@@ -95,10 +99,11 @@ export class DaemonStore {
 		const generation = ++this.#generation;
 		const query = this.#query();
 		try {
-			const [status, tasks] = await Promise.all([fetchStatus(), fetchTasks(query)]);
+			const [status, fleet] = await Promise.all([fetchStatus(), fetchFleetTasks(query)]);
 			if (generation !== this.#generation) return;
 			this.status = status;
-			this.tasks = tasks;
+			this.machines = fleet.machines;
+			this.tasks = fleet.tasks;
 			this.error = null;
 		} catch (cause) {
 			if (generation !== this.#generation) return;
@@ -197,6 +202,42 @@ export class ResourceOverviewStore {
 			this.error = asApiError(cause);
 		}
 		this.lastFetched = Date.now();
+	}
+}
+
+/** Holder and queue of every resource, for the task list's side panel. */
+export class ResourceQueueStore {
+	/** Resources in overview order. */
+	queues = $state<readonly ResourceQueue[]>([]);
+	/** Error from the last attempt, cleared by the next success. */
+	error = $state<ApiError | null>(null);
+
+	#visible = new IsDocumentVisible();
+	#generation = 0;
+
+	constructor() {
+		startPolling({
+			key: () => 'resource-queues',
+			active: () => this.#visible.current,
+			run: () => void this.refresh()
+		});
+	}
+
+	/** Fetch the overview, then each detail, because only detail carries the queue. */
+	async refresh(): Promise<void> {
+		const generation = ++this.#generation;
+		try {
+			const overview = await fetchResourceOverview();
+			const details = await Promise.all(
+				overview.resources.map((item) => fetchResourceDetail(item.resource.id))
+			);
+			if (generation !== this.#generation) return;
+			this.queues = details.map(resourceQueue);
+			this.error = null;
+		} catch (cause) {
+			if (generation !== this.#generation) return;
+			this.error = asApiError(cause);
+		}
 	}
 }
 

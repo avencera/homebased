@@ -50,6 +50,7 @@ pub fn read_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::daemon::fleet_api::read_routes())
         .merge(crate::daemon::resource_api::read_routes())
+        .merge(crate::daemon::fleet_tasks::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
@@ -304,21 +305,27 @@ fn agent_feed_placeholder(
     }
 }
 
-#[derive(Deserialize)]
-struct ListQuery {
+/// `?status=a,b&thread=<uuid>` filter shared by the local and fleet task lists
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ListQuery {
     #[serde(default)]
-    status: Option<String>,
+    pub(super) status: Option<String>,
     #[serde(default)]
-    thread: Option<String>,
+    pub(super) thread: Option<String>,
 }
 
-async fn list(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Result<Json<TaskList>, AppError> {
-    let mut statuses = Vec::new();
-    if let Some(raw) = query.status {
-        for part in raw.split(',') {
+/// Parsed task-list filter. An empty status list matches every status
+#[derive(Debug, Clone, Default)]
+pub(super) struct TaskFilter {
+    pub(super) statuses: Vec<ProcessStatus>,
+    pub(super) thread: Option<ThreadId>,
+}
+
+impl TaskFilter {
+    /// Parse the query form. An unknown status or a malformed thread is a usage error
+    pub(super) fn parse(query: ListQuery) -> Result<Self, AppError> {
+        let mut statuses = Vec::new();
+        for part in query.status.as_deref().unwrap_or_default().split(',') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -329,14 +336,35 @@ async fn list(
                 })?,
             );
         }
+        let thread = query
+            .thread
+            .map(|raw| raw.parse::<ThreadId>())
+            .transpose()?;
+        Ok(Self { statuses, thread })
     }
-    let thread = match query.thread {
-        Some(s) => Some(s.parse::<ThreadId>()?),
-        None => None,
-    };
+
+    /// Query pairs that parse back into this filter, `&`-terminated when non-empty
+    pub(super) fn query_prefix(&self) -> String {
+        let mut prefix = String::new();
+        if !self.statuses.is_empty() {
+            let statuses: Vec<&str> = self.statuses.iter().map(ProcessStatus::as_str).collect();
+            prefix.push_str(&format!("status={}&", statuses.join(",")));
+        }
+        if let Some(thread) = self.thread {
+            prefix.push_str(&format!("thread={thread}&"));
+        }
+        prefix
+    }
+}
+
+/// Public summaries of the tasks this daemon stores, in id order
+pub(super) async fn local_task_summaries(
+    state: &AppState,
+    filter: TaskFilter,
+) -> Result<Vec<TaskSummary>, AppError> {
     let rows = call(&state.store, |reply| StoreMsg::ListTasks {
-        statuses,
-        thread,
+        statuses: filter.statuses,
+        thread: filter.thread,
         reply,
     })
     .await?;
@@ -346,7 +374,18 @@ async fn list(
         reply,
     })
     .await?;
-    Ok(Json(TaskList::from_rows(&rows, &presentations)))
+    Ok(TaskList::from_rows(&rows, &presentations).tasks)
+}
+
+async fn list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<TaskList>, AppError> {
+    let tasks = local_task_summaries(&state, TaskFilter::parse(query)?).await?;
+    Ok(Json(TaskList {
+        api_version: API_VERSION,
+        tasks,
+    }))
 }
 
 async fn show(

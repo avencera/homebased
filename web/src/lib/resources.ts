@@ -25,6 +25,7 @@ const ResourceTaskSchema = Schema.Struct({
 	id: Schema.String,
 	display_name: Schema.String,
 	status: Schema.String,
+	execution_machine: Schema.optional(Schema.NullOr(Schema.String)),
 	created_at: Schema.optional(Schema.String),
 	updated_at: Schema.optional(Schema.String),
 	cancel_requested_at: Schema.optional(Schema.NullOr(Schema.String)),

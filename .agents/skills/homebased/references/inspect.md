@@ -58,15 +58,16 @@ The local daemon reads `output.log` on the execution machine. For a remote task,
 
 ## Dashboard
 
-The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see every task, its status, and its log tail without an agent turn.
+The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn. When a GPU runs or queues work, the task list shows its current task and queue at the side.
 
 ```bash
 homebased --json daemon status       # "web" holds the URL, or null when the dashboard is off or the socket is down
 curl -s http://main:7677/v1/tasks
+curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine and whether it answered, and `tasks` has one entry per task with the machine that runs it. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
 
 ## Task directory
 

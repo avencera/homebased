@@ -114,6 +114,36 @@ export function detailStatus(detail: ResourceDetail): ResourceStatus {
 	);
 }
 
+/** What holds one resource now and what waits for it. */
+export interface ResourceQueue {
+	resource: ResourceDetail['resource'];
+	status: ResourceStatus;
+	/** Task of the serving loan. */
+	current: ResourceTaskSummary | null;
+	/** Registered background task that holds the resource while no loan serves it. */
+	background: ResourceTaskSummary | null;
+	/** Queued requests in authority FIFO order. */
+	queue: ResourceDetail['requests'];
+}
+
+/** Reduce a resource detail to its holder and waiting queue. */
+export function resourceQueue(detail: ResourceDetail): ResourceQueue {
+	return {
+		resource: detail.resource,
+		status: detailStatus(detail),
+		current: detail.current_task,
+		background: detail.background_task,
+		queue: detail.requests
+			.filter((request) => tagOf(request.state) === 'queued')
+			.toSorted((left, right) => left.acceptance_sequence - right.acceptance_sequence)
+	};
+}
+
+/** Whether a resource runs or waits on work, so it earns space next to the task list. */
+export function isBusy(queue: ResourceQueue): boolean {
+	return queue.current !== null || queue.background !== null || queue.queue.length > 0;
+}
+
 /** Explain why a first background launch still reserves the resource. */
 export function backgroundLaunchText(
 	launch: BackgroundLaunchReservation | undefined

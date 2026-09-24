@@ -137,6 +137,37 @@ export interface TaskSummary {
 	updated_at: string;
 }
 
+/** Where a browser opens one machine's dashboard. */
+export type MachineLocation =
+	| { type: 'local' }
+	/** A peer at its best-ranked address, when the daemon knows one. */
+	| { type: 'peer'; address: string | null };
+
+/** Result of reading one machine's tasks for the fleet list. */
+export type MachineRead = { state: 'online' } | { state: 'unavailable'; message: string };
+
+/** One machine of `GET /v1/fleet/tasks`. */
+export interface FleetMachine {
+	machine: string;
+	name: string;
+	location: MachineLocation;
+	read: MachineRead;
+}
+
+/** One task of `GET /v1/fleet/tasks` and the machine that runs it. */
+export interface FleetTask {
+	machine: string;
+	task: TaskSummary;
+}
+
+/** `GET /v1/fleet/tasks`. The serving machine comes first. */
+export interface FleetTaskList {
+	api_version: number;
+	machines: readonly FleetMachine[];
+	/** Newest first. */
+	tasks: readonly FleetTask[];
+}
+
 /** Directory entry kind from `GET /v1/files/{token}`. */
 export type FileEntryKind = 'directory' | 'file' | 'symlink' | 'other';
 
@@ -313,7 +344,24 @@ const TaskDetailSchema = Schema.Struct({
 	last_event: Schema.NullOr(TaskEventSchema),
 	container: Schema.optional(ContainerDetailSchema)
 });
-const TaskListSchema = Schema.Struct({ tasks: Schema.Array(TaskSummarySchema) });
+const FleetTaskListSchema = Schema.Struct({
+	api_version: Schema.Literal(API_VERSION),
+	machines: Schema.Array(
+		Schema.Struct({
+			machine: Schema.String,
+			name: Schema.String,
+			location: Schema.Union(
+				Schema.Struct({ type: Schema.Literal('local') }),
+				Schema.Struct({ type: Schema.Literal('peer'), address: Schema.NullOr(Schema.String) })
+			),
+			read: Schema.Union(
+				Schema.Struct({ state: Schema.Literal('online') }),
+				Schema.Struct({ state: Schema.Literal('unavailable'), message: Schema.String })
+			)
+		})
+	),
+	tasks: Schema.Array(Schema.Struct({ machine: Schema.String, task: TaskSummarySchema }))
+});
 const LogTailSchema = Schema.Struct({
 	api_version: Schema.Literal(API_VERSION),
 	id: Schema.String,
@@ -434,23 +482,28 @@ export function fetchStatus(): Promise<DaemonStatus> {
 	return getJson('/status', DaemonStatusSchema);
 }
 
-/** Filter for `GET /v1/tasks`. */
+/** Filter for `GET /v1/fleet/tasks`. */
 export interface TaskQuery {
 	statuses?: readonly ProcessStatus[];
 	thread?: string | null;
 }
 
-/**
- * `GET /v1/tasks`, newest first. The daemon answers in id order and ids are
- * UUID v7, so reversing is a time sort.
- */
-export async function fetchTasks(query: TaskQuery = {}): Promise<TaskSummary[]> {
+/** `GET /v1/fleet/tasks`: tasks from this machine and every reachable peer. */
+export function fetchFleetTasks(query: TaskQuery = {}): Promise<FleetTaskList> {
 	const params = new URLSearchParams();
 	if (query.statuses?.length) params.set('status', query.statuses.join(','));
 	if (query.thread) params.set('thread', query.thread);
 	const search = params.size > 0 ? `?${params}` : '';
-	const body = await getJson(`/tasks${search}`, TaskListSchema);
-	return [...body.tasks].reverse();
+	return getJson(`/fleet/tasks${search}`, FleetTaskListSchema);
+}
+
+/**
+ * Dashboard URL of a task that runs on a peer. Task detail and logs stay on the
+ * executor, so the link opens the peer's own dashboard.
+ */
+export function peerTaskHref(machine: FleetMachine | undefined, id: string): string | null {
+	if (machine?.location.type !== 'peer' || !machine.location.address) return null;
+	return `${machine.location.address.replace(/\/+$/, '')}/tasks/${encodeURIComponent(id)}`;
 }
 
 /** `GET /v1/tasks/{id}`. */
