@@ -100,6 +100,10 @@
 	function machineList(names: readonly string[]): string {
 		return names.join(', ');
 	}
+
+	async function refreshDashboard(): Promise<void> {
+		await Promise.all([store.refresh(), resourceStore.refresh()]);
+	}
 </script>
 
 <!-- pinned to the viewport so the document never scrolls; only the boxes do -->
@@ -256,6 +260,8 @@
 			<ResourceQueuePanel
 				queues={busyQueues}
 				machines={store.machines}
+				{resourceStore}
+				{refreshDashboard}
 				class="scrollbar-none min-h-0 flex-1 overflow-y-auto"
 			/>
 		{/if}

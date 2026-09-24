@@ -165,7 +165,7 @@
 							<span>
 								{item.queued_count} waiting
 								{#if item.queued_count > 0}
-									<span class="text-muted-foreground">&middot; authority FIFO</span>
+									<span class="text-muted-foreground">&middot; serving order</span>
 								{/if}
 							</span>
 

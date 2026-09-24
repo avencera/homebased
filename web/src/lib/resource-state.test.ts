@@ -105,12 +105,22 @@ test('resource queues keep the server serving order', () => {
 	assert.deepEqual(resourceQueue(detail).queue, [first, second]);
 });
 
-test('one-place queue moves target the adjacent request', () => {
-	const queue = [queuedRequest('first', 1), queuedRequest('second', 2), queuedRequest('third', 3)];
+test('one-place queue moves use front and back at the ends', () => {
+	const two = [queuedRequest('first', 1), queuedRequest('second', 2)];
+	const four = [
+		queuedRequest('first', 1),
+		queuedRequest('second', 2),
+		queuedRequest('third', 3),
+		queuedRequest('fourth', 4)
+	];
 
-	assert.deepEqual(queueMovePlacement(queue, 1, 'up'), { type: 'before', request_id: 'first' });
-	assert.deepEqual(queueMovePlacement(queue, 1, 'down'), { type: 'after', request_id: 'third' });
-	assert.equal(queueMovePlacement(queue, 0, 'up'), null);
-	assert.equal(queueMovePlacement(queue, queue.length - 1, 'down'), null);
-	assert.equal(queueMovePlacement(queue, -1, 'down'), null);
+	assert.deepEqual(queueMovePlacement(two, 1, 'up'), { type: 'front' });
+	assert.deepEqual(queueMovePlacement(two, 0, 'down'), { type: 'back' });
+	assert.deepEqual(queueMovePlacement(four, 1, 'up'), { type: 'front' });
+	assert.deepEqual(queueMovePlacement(four, 2, 'down'), { type: 'back' });
+	assert.deepEqual(queueMovePlacement(four, 2, 'up'), { type: 'before', request_id: 'second' });
+	assert.deepEqual(queueMovePlacement(four, 1, 'down'), { type: 'after', request_id: 'third' });
+	assert.equal(queueMovePlacement(four, 0, 'up'), null);
+	assert.equal(queueMovePlacement(four, 3, 'down'), null);
+	assert.equal(queueMovePlacement(four, -1, 'down'), null);
 });

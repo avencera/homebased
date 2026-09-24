@@ -239,6 +239,15 @@ export class ResourceQueueStore {
 			this.error = asApiError(cause);
 		}
 	}
+
+	/** Keep the exact detail returned by an acknowledged mutation on screen. */
+	showAuthoritative(detail: ResourceDetail): void {
+		this.#generation += 1;
+		this.queues = this.queues.map((queue) =>
+			queue.resource.id === detail.resource.id ? resourceQueue(detail) : queue
+		);
+		this.error = null;
+	}
 }
 
 /** One resource detail, including actions assigned to its exact supervisor. */

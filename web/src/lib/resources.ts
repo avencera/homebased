@@ -3,6 +3,9 @@
 
 import { Schema } from 'effect';
 import { API_VERSION, ApiError, getJsonBody, postJsonBody } from './api';
+import type { BrowserResourceAction } from './resource-actions';
+
+export type { BrowserResourceAction, QueuePlacement } from './resource-actions';
 
 const JsonObjectSchema = Schema.Record({ key: Schema.String, value: Schema.Unknown });
 
@@ -147,20 +150,6 @@ export type PendingAction = Schema.Schema.Type<typeof PendingActionSchema>;
 
 /** Pending actions and authority failures returned for one supervisor. */
 export type PendingActionResult = Schema.Schema.Type<typeof PendingActionsSchema>;
-
-/** Place for a queued request relative to the other queued requests. */
-export type QueuePlacement =
-	| { type: 'front' }
-	| { type: 'back' }
-	| { type: 'before'; request_id: string }
-	| { type: 'after'; request_id: string };
-
-/** The operations permitted from the browser dashboard. */
-export type BrowserResourceAction =
-	| { type: 'cancel_queued'; request_id: string }
-	| { type: 'move_queued'; request_id: string; placement: QueuePlacement }
-	| { type: 'stop_active'; task_id: string }
-	| { type: 'renotify'; notice_id: string };
 
 /** Versioned resource list with authority failures kept separate from resources. */
 export type ResourceOverview = Schema.Schema.Type<typeof ResourceOverviewSchema>;

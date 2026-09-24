@@ -27,6 +27,7 @@
 	import {
 		type BrowserResourceAction,
 		type PendingAction,
+		type QueuePlacement,
 		type ResourceDetail,
 		type ResourceTaskSummary
 	} from '$lib/resources';
@@ -82,6 +83,7 @@
 			['queued', 'running'].includes(stoppableTask.status) &&
 			stoppableTask.cancel_requested_at == null
 	);
+	const actionsLocked = $derived(store.error !== null || operation !== null || operationBusy);
 
 	interface OperatorReleaseDetails {
 		operationId: string | null;
@@ -90,7 +92,9 @@
 		idleBoundary: boolean;
 	}
 
-	$effect(() => operationManager.load(currentResourceId));
+	$effect(() => {
+		if (currentResourceId) operationManager.load(currentResourceId);
+	});
 
 	async function openTaskLogs(event: MouseEvent, taskId: string) {
 		if (
@@ -119,8 +123,22 @@
 	}
 
 	async function retryOperation() {
-		if (!detail || !operation) return;
+		if (!detail || !operation || operationBusy) return;
+		if (operation.resourceId !== detail.resource.id) return;
 		await operationManager.retry(detail.resource.id, operationEffects);
+	}
+
+	function moveQueued(
+		requestId: string,
+		index: number,
+		direction: 'up' | 'down' | 'front' | 'back'
+	): void {
+		let placement: QueuePlacement | null;
+		if (direction === 'front') placement = { type: 'front' };
+		else if (direction === 'back') placement = { type: 'back' };
+		else placement = queueMovePlacement(queuedRequests, index, direction);
+		if (!placement) return;
+		void beginAction({ type: 'move_queued', request_id: requestId, placement });
 	}
 
 	function statusToneClass(tone: 'green' | 'blue' | 'amber' | 'red' | 'neutral'): string {
@@ -236,11 +254,11 @@
 						? 'Blocked until the resource attention is resolved.'
 						: detail?.background_task?.status === 'running'
 							? 'Waiting for supervised training to release the GPU.'
-							: 'Waiting for the resource authority to serve this queued request.';
+							: 'Waiting for the resource authority to open this request.';
 		}
 		return index === 0
 			? reason
-			: `After ${index} earlier queued request${index === 1 ? '' : 's'}; ${reason}`;
+			: `After ${index} earlier queued ${index === 1 ? 'request' : 'requests'}; ${reason}`;
 	}
 
 	function trainerStateText(current: ResourceDetail): string {
@@ -477,24 +495,15 @@
 						expected revision {operation.expectedRevision} · operation {operation.operationId}
 					</p>
 				</div>
-				{#if detail?.resource.id === operation.resourceId}
-					<button
-						type="button"
-						onclick={retryOperation}
-						disabled={operationBusy || !detail}
-						class="inline-flex items-center gap-1 rounded border border-amber-700/30 px-2 py-1 font-medium hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-50"
-					>
-						<RefreshCw class="size-3.5" />
-						{operationBusy ? 'Sending…' : 'Retry same operation'}
-					</button>
-				{:else}
-					<a
-						href={resolve('/resources/[id]', { id: operation.resourceId })}
-						class="rounded border border-amber-700/30 px-2 py-1 hover:bg-amber-500/10"
-					>
-						Open affected resource
-					</a>
-				{/if}
+				<button
+					type="button"
+					onclick={retryOperation}
+					disabled={operationBusy || !detail}
+					class="inline-flex items-center gap-1 rounded border border-amber-700/30 px-2 py-1 font-medium hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					<RefreshCw class="size-3.5" />
+					{operationBusy ? 'Sending…' : 'Retry same operation'}
+				</button>
 			</div>
 		</aside>
 	{/if}
@@ -567,10 +576,7 @@
 						<button
 							type="button"
 							onclick={() => void beginAction({ type: 'stop_active', task_id: stoppableTask.id })}
-							disabled={!stopPermitted ||
-								store.error !== null ||
-								operation !== null ||
-								operationBusy}
+							disabled={!stopPermitted || actionsLocked}
 							class="rounded border border-red-500/40 px-2 py-1 text-red-700 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50 dark:text-red-300"
 							title={stoppableTask.cancel_requested_at
 								? 'Stop already requested'
@@ -918,20 +924,8 @@
 							<div class="flex shrink-0 flex-wrap justify-end gap-1">
 								<button
 									type="button"
-									onclick={() => {
-										const placement = queueMovePlacement(queuedRequests, index, 'up');
-										if (placement) {
-											void beginAction({
-												type: 'move_queued',
-												request_id: request.request_id,
-												placement
-											});
-										}
-									}}
-									disabled={index === 0 ||
-										store.error !== null ||
-										operation !== null ||
-										operationBusy}
+									onclick={() => moveQueued(request.request_id, index, 'up')}
+									disabled={index === 0 || actionsLocked}
 									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Move before the previous queued request"
 								>
@@ -939,20 +933,8 @@
 								</button>
 								<button
 									type="button"
-									onclick={() => {
-										const placement = queueMovePlacement(queuedRequests, index, 'down');
-										if (placement) {
-											void beginAction({
-												type: 'move_queued',
-												request_id: request.request_id,
-												placement
-											});
-										}
-									}}
-									disabled={index === queuedRequests.length - 1 ||
-										store.error !== null ||
-										operation !== null ||
-										operationBusy}
+									onclick={() => moveQueued(request.request_id, index, 'down')}
+									disabled={index === queuedRequests.length - 1 || actionsLocked}
 									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Move after the next queued request"
 								>
@@ -960,16 +942,8 @@
 								</button>
 								<button
 									type="button"
-									onclick={() =>
-										void beginAction({
-											type: 'move_queued',
-											request_id: request.request_id,
-											placement: { type: 'front' }
-										})}
-									disabled={index === 0 ||
-										store.error !== null ||
-										operation !== null ||
-										operationBusy}
+									onclick={() => moveQueued(request.request_id, index, 'front')}
+									disabled={index === 0 || actionsLocked}
 									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Move to the front of the queue"
 								>
@@ -977,16 +951,8 @@
 								</button>
 								<button
 									type="button"
-									onclick={() =>
-										void beginAction({
-											type: 'move_queued',
-											request_id: request.request_id,
-											placement: { type: 'back' }
-										})}
-									disabled={index === queuedRequests.length - 1 ||
-										store.error !== null ||
-										operation !== null ||
-										operationBusy}
+									onclick={() => moveQueued(request.request_id, index, 'back')}
+									disabled={index === queuedRequests.length - 1 || actionsLocked}
 									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Move to the back of the queue"
 								>
@@ -996,7 +962,7 @@
 									type="button"
 									onclick={() =>
 										void beginAction({ type: 'cancel_queued', request_id: request.request_id })}
-									disabled={store.error !== null || operation !== null || operationBusy}
+									disabled={actionsLocked}
 									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Cancel only this queued request; keep any active return obligation"
 								>
@@ -1045,7 +1011,7 @@
 								<button
 									type="button"
 									onclick={() => void beginAction({ type: 'renotify', notice_id: notice.id })}
-									disabled={store.error !== null || operation !== null || operationBusy}
+									disabled={actionsLocked}
 									class="shrink-0 rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
 									title="Retry this failed notice for its still-pending action"
 								>

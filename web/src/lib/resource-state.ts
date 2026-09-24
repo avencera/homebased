@@ -138,7 +138,7 @@ export function resourceQueue(detail: ResourceDetail): ResourceQueue {
 	};
 }
 
-/** Return the anchor placement for moving a queued request one place. */
+/** Return the placement for moving a queued request one place in serving order. */
 export function queueMovePlacement(
 	queue: readonly ResourceDetail['requests'][number][],
 	index: number,
@@ -147,10 +147,16 @@ export function queueMovePlacement(
 	if (!Number.isInteger(index) || index < 0 || index >= queue.length) return null;
 
 	if (direction === 'up') {
+		if (index === 0) return null;
+		// the head request may leave the queue before the click lands
+		if (index === 1) return { type: 'front' };
 		const previous = queue[index - 1];
 		return previous ? { type: 'before', request_id: previous.request_id } : null;
 	}
 
+	if (index === queue.length - 1) return null;
+	// the tail request may leave the queue before the click lands
+	if (index === queue.length - 2) return { type: 'back' };
 	const next = queue[index + 1];
 	return next ? { type: 'after', request_id: next.request_id } : null;
 }
