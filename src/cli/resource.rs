@@ -1130,11 +1130,6 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
             let id = resource_id_arg(resource_id)?;
             validate_uuid("REQUEST_ID", request_id)?;
             validate_uuid("--operation-id", operation_id)?;
-            if expected_revision == 0 {
-                return Err(AppError::Usage {
-                    message: "--expected-revision must be greater than zero".into(),
-                });
-            }
             let body = RequestCancelBody {
                 api_version: API_VERSION,
                 operation_id,
