@@ -1,5 +1,7 @@
 //! Minimal HTTP/1 client for daemon-to-daemon requests over TCP
 
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,6 +19,10 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default upper bound on a JSON response body
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
+
+/// Time limit for each connect attempt except the last, so an address that
+/// silently drops packets cannot use the whole request budget
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Client for `/v1/cluster/*` routes on peer daemons
 #[derive(Debug, Clone, Copy)]
@@ -152,17 +158,15 @@ impl ClusterClient {
             message,
         };
         let authority = address.authority();
-        let stream = TcpStream::connect(&authority)
-            .await
-            .map_err(|err| match err.kind() {
-                std::io::ErrorKind::ConnectionRefused => TransportError::Refused {
-                    address: address.clone(),
-                },
-                _ => TransportError::Connect {
-                    address: address.clone(),
-                    message: err.to_string(),
-                },
-            })?;
+        let stream = connect(&authority).await.map_err(|err| match err.kind() {
+            std::io::ErrorKind::ConnectionRefused => TransportError::Refused {
+                address: address.clone(),
+            },
+            _ => TransportError::Connect {
+                address: address.clone(),
+                message: err.to_string(),
+            },
+        })?;
         let (mut sender, conn) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|err| http_err(format!("handshake: {err}")))?;
@@ -200,5 +204,93 @@ impl ClusterClient {
             })?
             .to_bytes();
         Ok(ClusterResponse { status, body })
+    }
+}
+
+/// Connect to the first answering address of `authority`
+///
+/// A `.local` name can resolve to several link-local IPv6 addresses before its
+/// IPv4 address, and daemons listen on IPv4 by default, so IPv4 is tried first
+/// and link-local IPv6 last
+async fn connect(authority: &str) -> io::Result<TcpStream> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(authority).await?.collect();
+    addrs.sort_by_key(|addr| connect_rank(addr.ip()));
+    connect_any(&addrs).await
+}
+
+fn connect_rank(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 2,
+        IpAddr::V6(_) => 1,
+    }
+}
+
+/// Try `addrs` in order. The last attempt is bounded only by the request timeout
+///
+/// The result is `ConnectionRefused` only when every address refused, because
+/// callers read a refusal as "reachable, but nothing listens"
+async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut first_other_error = None;
+    let mut refused = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        let attempt = TcpStream::connect(addr);
+        let result = if index + 1 == addrs.len() {
+            attempt.await
+        } else {
+            tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, attempt)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("connect {addr} timed out"),
+                    ))
+                })
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => refused = Some(err),
+            Err(err) => {
+                first_other_error.get_or_insert(err);
+            }
+        }
+    }
+    Err(first_other_error
+        .or(refused)
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address resolved")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::net::SocketAddr;
+
+    use tokio::net::TcpListener;
+
+    use super::connect_any;
+
+    async fn closed_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_moves_past_a_refusing_address() {
+        let refused = closed_addr().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open = listener.local_addr().unwrap();
+
+        let stream = connect_any(&[refused, open]).await.unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), open);
+    }
+
+    #[tokio::test]
+    async fn connect_reports_refused_only_when_every_address_refuses() {
+        let error = connect_any(&[closed_addr().await, closed_addr().await])
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
