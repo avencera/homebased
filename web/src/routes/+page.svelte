@@ -102,7 +102,7 @@
 	}
 </script>
 
-<div class="mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-4">
+<div class="mx-auto flex h-dvh max-w-7xl flex-col overflow-hidden px-4 py-4">
 	<header class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
 		<span class="flex items-center gap-1.5">
@@ -221,8 +221,8 @@
 		{/if}
 	</div>
 
-	<!-- with GPU work, tasks and the GPU queue split the rest of the screen evenly and grow past it -->
-	<div class="mt-3 flex flex-1 flex-col gap-3">
+	<!-- the page fits the screen; each box scrolls on its own, and with GPU work tasks and the queue split it evenly -->
+	<div class="mt-3 flex min-h-0 flex-1 flex-col gap-3">
 		<TaskList
 			tasks={visibleTasks}
 			machines={store.machines}
@@ -230,7 +230,7 @@
 			activeProject={project}
 			onThread={(next) => navigate({ ...currentFilters, thread: next })}
 			onProject={(next) => navigate({ ...currentFilters, project: next })}
-			class={cn(split && 'min-h-fit flex-1 basis-0')}
+			class="min-h-0 flex-1 basis-0"
 		>
 			{#snippet empty()}
 				<p class="px-3 py-6 text-center text-muted-foreground">
@@ -245,7 +245,11 @@
 			{/snippet}
 		</TaskList>
 		{#if split}
-			<ResourceQueuePanel queues={busyQueues} machines={store.machines} class="flex-1 basis-0" />
+			<ResourceQueuePanel
+				queues={busyQueues}
+				machines={store.machines}
+				class="scrollbar-none min-h-0 flex-1 basis-0 overflow-y-auto"
+			/>
 		{/if}
 	</div>
 </div>

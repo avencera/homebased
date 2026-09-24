@@ -75,7 +75,10 @@
 
 <section
 	aria-label="Resource queues"
-	class={cn('grid grid-cols-[repeat(auto-fit,minmax(20rem,1fr))] gap-3', className)}
+	class={cn(
+		'grid auto-rows-[minmax(100%,auto)] grid-cols-[repeat(auto-fit,minmax(20rem,1fr))] gap-3',
+		className
+	)}
 >
 	{#each queues as item (item.resource.id)}
 		{@const authority = machineName(item.resource.authority_machine)}

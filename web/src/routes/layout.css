@@ -40,6 +40,15 @@
 	--color-primary-foreground: var(--primary-foreground);
 }
 
+/* scrolls with wheel, touch, and keys, without a visible bar */
+@utility scrollbar-none {
+	scrollbar-width: none;
+
+	&::-webkit-scrollbar {
+		display: none;
+	}
+}
+
 @layer base {
 	html {
 		color-scheme: light dark;

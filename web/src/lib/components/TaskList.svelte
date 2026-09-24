@@ -48,9 +48,9 @@
 	}
 </script>
 
-<div class={cn('overflow-hidden rounded-lg border border-border bg-card', className)}>
+<div class={cn('flex flex-col overflow-hidden rounded-lg border border-border bg-card', className)}>
 	<div
-		class="task-grid hidden gap-x-3 border-b border-border bg-muted px-3 py-1.5 pl-4 text-[11px] tracking-wide text-muted-foreground uppercase lg:grid"
+		class="task-grid hidden shrink-0 gap-x-3 border-b border-border bg-muted px-3 py-1.5 pl-4 text-[11px] tracking-wide text-muted-foreground uppercase lg:grid"
 		aria-hidden="true"
 	>
 		<span class="[grid-area:machine]">Machine</span>
@@ -65,7 +65,10 @@
 	{#if tasks.length === 0}
 		{@render empty()}
 	{:else}
-		<ul class="divide-y divide-border/70" aria-label="Tasks">
+		<ul
+			class="scrollbar-none min-h-0 flex-1 divide-y divide-border/70 overflow-y-auto"
+			aria-label="Tasks"
+		>
 			{#each tasks as entry (entry.task.id)}
 				{@const task = entry.task}
 				{@const machine = machineName(entry.machine)}
