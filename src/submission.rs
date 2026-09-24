@@ -9,7 +9,11 @@ use uuid::Uuid;
 
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, ThreadId};
 use crate::machine::MachineId;
-use crate::resource::ResourceId;
+use crate::resource::background_launch::{BackgroundLaunchBinding, ResourceBackgroundRejection};
+use crate::resource::bound_action::{
+    ResourceActionKind, ResourceActionLaunch, ResourceActionRejection,
+};
+use crate::resource::{ResourceId, SupervisorActionAuthority};
 use crate::spec::NormalizedSpec;
 
 /// The executable saved for callbacks owned by the origin.
@@ -237,6 +241,46 @@ pub enum ResourceRoutePhase {
     },
 }
 
+/// Durable phase of one origin route bound to a resource action
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceActionRoutePhase {
+    /// The launch may have reached the resource authority
+    AcceptanceUnknown,
+    /// The authority accepted the exact action-bound task
+    Accepted,
+    /// The authority refused the launch and wrote no task records
+    Rejected {
+        /// Definitive authority reason
+        reason: ResourceActionRejection,
+    },
+}
+
+/// Durable phase of one origin route for a remote first background launch
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceBackgroundRoutePhase {
+    /// The launch may have reached the resource authority
+    AcceptanceUnknown,
+    /// The authority accepted the exact launch, by its receipt or its first queued event
+    Accepted,
+    /// The authority refused the launch and wrote no task records
+    Rejected {
+        /// Definitive authority reason
+        reason: ResourceBackgroundRejection,
+    },
+}
+
+/// Resource action that owns one action-bound origin route
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceActionRouteBinding {
+    /// Kind of task that the action binds
+    pub kind: ResourceActionKind,
+    /// Exact authority, resource, loan, action, revision, and supervisor assignment
+    pub authority: SupervisorActionAuthority,
+}
+
 /// Outcome in a definitive response to a resource queue request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -421,6 +465,9 @@ pub enum ResourceRouteError {
     /// Only an executor event can establish resource task activation.
     #[error("resource route phase does not agree with its event cursor")]
     InvalidEventCursor,
+    /// An action-bound route must be owned by the assigned supervisor and executed by the authority
+    #[error("resource action route owners do not match its action authority")]
+    ActionOwnerMismatch,
     /// A migrated local identity names different origin and execution machines.
     #[error("migrated local identity must have the same origin and execution machine")]
     InvalidMigratedIdentity,
@@ -445,6 +492,29 @@ pub enum SubmissionState {
         resource: ResourceId,
         /// Resource-specific acceptance and activation phase.
         phase: ResourceRoutePhase,
+    },
+    /// This task identity is bound to one resource action on a remote authority
+    ///
+    /// Recovery retries the same identities; the generic abandon path never
+    /// resolves it, because abandoning could strand the action
+    ResourceAction {
+        /// Exact action that owns the task
+        binding: ResourceActionRouteBinding,
+        /// Supervisor choice that the route launches
+        launch: Box<ResourceActionLaunch>,
+        /// Action-specific acceptance phase
+        phase: ResourceActionRoutePhase,
+    },
+    /// This task identity is the first background launch of a remote authority
+    ///
+    /// It has no loan or action. Recovery retries the same identities, and the
+    /// generic abandon path never resolves it, so a lost reply cannot start a
+    /// second trainer
+    ResourceBackground {
+        /// Supervisor assignment and resource revision that chose the launch
+        binding: BackgroundLaunchBinding,
+        /// Launch-specific acceptance phase
+        phase: ResourceBackgroundRoutePhase,
     },
 }
 
@@ -545,6 +615,38 @@ pub struct NewResourceRoute {
     pub resource: ResourceId,
 }
 
+/// Exact identity and origin-owned context used to create an action-bound route
+#[derive(Debug, Clone)]
+pub struct NewResourceActionRoute {
+    /// Stable retry identity prepared by the authority or chosen by the supervisor
+    pub request: RequestId,
+    /// Preallocated global task identity
+    pub task: TaskId,
+    /// Supervisor-machine callback context
+    pub callback: CallbackContext,
+    /// Canonical normalized spec prepared by the authority
+    pub spec: NormalizedSpec,
+    /// Action that owns the task
+    pub binding: ResourceActionRouteBinding,
+    /// Supervisor choice that the route launches
+    pub launch: ResourceActionLaunch,
+}
+
+/// Exact identity and supervisor-machine context used to create a background launch route
+#[derive(Debug, Clone)]
+pub struct NewResourceBackgroundRoute {
+    /// Caller retry identity
+    pub request: RequestId,
+    /// Global task identity allocated before the first authority request
+    pub task: TaskId,
+    /// Supervisor-machine callback context
+    pub callback: CallbackContext,
+    /// Full normalized trainer spec
+    pub spec: NormalizedSpec,
+    /// Supervisor assignment and resource revision that chose the launch
+    pub binding: BackgroundLaunchBinding,
+}
+
 impl OriginRoute {
     /// Borrow normalized request content when this route came from a submit request.
     #[must_use]
@@ -588,6 +690,74 @@ impl OriginRoute {
         Ok(route)
     }
 
+    /// Create the initial route for one action-bound task before its launch is sent
+    ///
+    /// The supervisor machine owns callbacks and the authority executes the task
+    pub fn new_resource_action(input: NewResourceActionRoute) -> Result<Self, ResourceRouteError> {
+        let NewResourceActionRoute {
+            request,
+            task,
+            callback,
+            spec,
+            binding,
+            launch,
+        } = input;
+        let route = Self {
+            request,
+            task,
+            origin_machine: binding.authority.supervisor.machine,
+            execution_machine: binding.authority.authority_machine,
+            thread: binding.authority.supervisor.thread,
+            callback,
+            spec: spec.into(),
+            submission: SubmissionState::ResourceAction {
+                binding,
+                launch: Box::new(launch),
+                phase: ResourceActionRoutePhase::AcceptanceUnknown,
+            },
+            last_execution_state: None,
+            last_updated_at: Some(Utc::now()),
+            last_accepted_seq: 0,
+            last_settled_seq: 0,
+        };
+        route.validate()?;
+        Ok(route)
+    }
+
+    /// Create the initial route for one remote first background launch before it is sent
+    ///
+    /// The supervisor machine owns callbacks and the authority executes the task
+    pub fn new_resource_background(
+        input: NewResourceBackgroundRoute,
+    ) -> Result<Self, ResourceRouteError> {
+        let NewResourceBackgroundRoute {
+            request,
+            task,
+            callback,
+            spec,
+            binding,
+        } = input;
+        let route = Self {
+            request,
+            task,
+            origin_machine: binding.origin_machine(),
+            execution_machine: binding.execution_machine(),
+            thread: binding.assignment.supervisor.thread,
+            callback,
+            spec: spec.into(),
+            submission: SubmissionState::ResourceBackground {
+                binding,
+                phase: ResourceBackgroundRoutePhase::AcceptanceUnknown,
+            },
+            last_execution_state: None,
+            last_updated_at: Some(Utc::now()),
+            last_accepted_seq: 0,
+            last_settled_seq: 0,
+        };
+        route.validate()?;
+        Ok(route)
+    }
+
     /// Validate resource-route invariants while leaving direct routes unchanged.
     pub fn validate(&self) -> Result<(), ResourceRouteError> {
         if !self
@@ -601,9 +771,112 @@ impl OriginRoute {
         {
             return Err(ResourceRouteError::InvalidMigratedRouteState);
         }
-        let SubmissionState::Resource { phase, .. } = &self.submission else {
-            return Ok(());
+        let phase = match &self.submission {
+            SubmissionState::Resource { phase, .. } => phase,
+            SubmissionState::ResourceAction {
+                binding,
+                launch,
+                phase,
+            } => {
+                return self.validate_action_route(binding, launch, phase);
+            }
+            SubmissionState::ResourceBackground { binding, phase } => {
+                return self.validate_background_route(binding, phase);
+            }
+            SubmissionState::AcceptanceUnknown
+            | SubmissionState::Accepted
+            | SubmissionState::Rejected { .. } => return Ok(()),
         };
+        self.validate_command_route()?;
+        match phase {
+            ResourceRoutePhase::Activated
+                if self.last_accepted_seq == 0 || self.last_execution_state.is_none() =>
+            {
+                Err(ResourceRouteError::InvalidEventCursor)
+            }
+            ResourceRoutePhase::AcceptanceUnknown
+            | ResourceRoutePhase::Waiting
+            | ResourceRoutePhase::CancelledBeforeLaunch
+            | ResourceRoutePhase::Rejected { .. }
+                if self.last_accepted_seq != 0 || self.last_execution_state.is_some() =>
+            {
+                Err(ResourceRouteError::InvalidEventCursor)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_action_route(
+        &self,
+        binding: &ResourceActionRouteBinding,
+        launch: &ResourceActionLaunch,
+        phase: &ResourceActionRoutePhase,
+    ) -> Result<(), ResourceRouteError> {
+        let authority = &binding.authority;
+        if self.origin_machine != authority.supervisor.machine
+            || self.execution_machine != authority.authority_machine
+            || self.origin_machine == self.execution_machine
+            || self.thread != authority.supervisor.thread
+        {
+            return Err(ResourceRouteError::ActionOwnerMismatch);
+        }
+        self.validate_command_route()?;
+        // a supervisor-supplied return command is the route content itself
+        let chosen = match launch {
+            ResourceActionLaunch::Return { work } => work
+                .supervisor_spec()
+                .map(crate::resource::CommandSpec::as_normalized),
+            ResourceActionLaunch::ReleaseWatcher { .. } => None,
+        };
+        let same_content = chosen.is_none_or(|chosen| {
+            let saved = self.spec.current().map(serde_json::to_value);
+            matches!(
+                (serde_json::to_value(chosen), saved),
+                (Ok(chosen), Some(Ok(saved))) if chosen == saved
+            )
+        });
+        if launch.kind() != binding.kind || !same_content {
+            return Err(ResourceRouteError::ActionOwnerMismatch);
+        }
+        match phase {
+            // only the first queued executor event or an authority receipt accepts the route
+            ResourceActionRoutePhase::AcceptanceUnknown
+            | ResourceActionRoutePhase::Rejected { .. }
+                if self.last_accepted_seq != 0 || self.last_execution_state.is_some() =>
+            {
+                Err(ResourceRouteError::InvalidEventCursor)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_background_route(
+        &self,
+        binding: &BackgroundLaunchBinding,
+        phase: &ResourceBackgroundRoutePhase,
+    ) -> Result<(), ResourceRouteError> {
+        if self.origin_machine != binding.origin_machine()
+            || self.execution_machine != binding.execution_machine()
+            || self.origin_machine == self.execution_machine
+            || self.thread != binding.assignment.supervisor.thread
+        {
+            return Err(ResourceRouteError::ActionOwnerMismatch);
+        }
+        self.validate_command_route()?;
+        match phase {
+            // only the first queued executor event or an authority receipt accepts the route
+            ResourceBackgroundRoutePhase::AcceptanceUnknown
+            | ResourceBackgroundRoutePhase::Rejected { .. }
+                if self.last_accepted_seq != 0 || self.last_execution_state.is_some() =>
+            {
+                Err(ResourceRouteError::InvalidEventCursor)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Shared checks for routes that carry one bounded command without a spec machine
+    fn validate_command_route(&self) -> Result<(), ResourceRouteError> {
         let Some(spec) = self.spec.current() else {
             return Err(ResourceRouteError::NonCommandWorkload);
         };
@@ -628,22 +901,7 @@ impl OriginRoute {
         if self.last_settled_seq > self.last_accepted_seq {
             return Err(ResourceRouteError::InvalidEventCursor);
         }
-        match phase {
-            ResourceRoutePhase::Activated
-                if self.last_accepted_seq == 0 || self.last_execution_state.is_none() =>
-            {
-                Err(ResourceRouteError::InvalidEventCursor)
-            }
-            ResourceRoutePhase::AcceptanceUnknown
-            | ResourceRoutePhase::Waiting
-            | ResourceRoutePhase::CancelledBeforeLaunch
-            | ResourceRoutePhase::Rejected { .. }
-                if self.last_accepted_seq != 0 || self.last_execution_state.is_some() =>
-            {
-                Err(ResourceRouteError::InvalidEventCursor)
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -687,6 +945,82 @@ impl ResourceRouteProof {
             resource: *resource,
             thread: route.thread,
             normalized_spec_sha256: normalized_spec_sha256(spec).ok()?,
+            phase: phase.clone(),
+        })
+    }
+}
+
+/// Safe proof of one action-bound route saved by the supervisor machine
+///
+/// The authority reads it before accepting a launch, so a request cannot claim
+/// a callback route that the supervisor machine never saved
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceActionRouteProof {
+    /// Stable retry identity
+    pub request: RequestId,
+    /// Preallocated global task identity
+    pub task: TaskId,
+    /// Action that owns the route, with its owners and thread
+    pub binding: ResourceActionRouteBinding,
+    /// SHA-256 digest of the normalized spec saved in the route
+    pub normalized_spec_sha256: NormalizedSpecSha256,
+    /// Durable action route phase
+    pub phase: ResourceActionRoutePhase,
+}
+
+impl ResourceActionRouteProof {
+    /// Derive a safe proof from a valid saved action-bound route
+    #[must_use]
+    pub fn from_route(route: &OriginRoute) -> Option<Self> {
+        let SubmissionState::ResourceAction { binding, phase, .. } = &route.submission else {
+            return None;
+        };
+        route.validate().ok()?;
+
+        Some(Self {
+            request: route.request,
+            task: route.task,
+            binding: *binding,
+            normalized_spec_sha256: normalized_spec_sha256(route.current_spec()?).ok()?,
+            phase: phase.clone(),
+        })
+    }
+}
+
+/// Safe proof of one remote first background launch route saved by the supervisor machine
+///
+/// The authority reads it before accepting a launch, so a request cannot claim a
+/// callback route that the supervisor machine never saved
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceBackgroundRouteProof {
+    /// Stable retry identity
+    pub request: RequestId,
+    /// Preallocated global task identity
+    pub task: TaskId,
+    /// Supervisor assignment and resource revision saved with the route
+    pub binding: BackgroundLaunchBinding,
+    /// SHA-256 digest of the normalized spec saved in the route
+    pub normalized_spec_sha256: NormalizedSpecSha256,
+    /// Durable background route phase
+    pub phase: ResourceBackgroundRoutePhase,
+}
+
+impl ResourceBackgroundRouteProof {
+    /// Derive a safe proof from a valid saved background launch route
+    #[must_use]
+    pub fn from_route(route: &OriginRoute) -> Option<Self> {
+        let SubmissionState::ResourceBackground { binding, phase } = &route.submission else {
+            return None;
+        };
+        route.validate().ok()?;
+
+        Some(Self {
+            request: route.request,
+            task: route.task,
+            binding: *binding,
+            normalized_spec_sha256: normalized_spec_sha256(route.current_spec()?).ok()?,
             phase: phase.clone(),
         })
     }
@@ -1024,5 +1358,93 @@ mod tests {
             route.validate(),
             Err(ResourceRouteError::InvalidMigratedIdentity)
         ));
+    }
+
+    fn action_input(
+        launch: crate::resource::bound_action::ResourceActionLaunch,
+    ) -> NewResourceActionRoute {
+        let spec = spec();
+        NewResourceActionRoute {
+            request: RequestId::new(),
+            task: TaskId::new(),
+            callback: CallbackContext {
+                env: crate::domain::TaskEnv {
+                    path: "/bin".into(),
+                    home: "/tmp".into(),
+                },
+                cwd: PathBuf::from("/tmp"),
+                codex: CallbackExecutable::available(PathBuf::from("/bin/codex")),
+            },
+            binding: ResourceActionRouteBinding {
+                kind: launch.kind(),
+                authority: crate::resource::SupervisorActionAuthority {
+                    authority_machine: MachineId::new(),
+                    resource_id: ResourceId::new(),
+                    loan_id: crate::resource::LoanId::new(),
+                    action_id: crate::resource::ActionId::new(),
+                    expected_state_revision: crate::resource::ResourceRevision::new(2),
+                    supervisor: crate::resource::SupervisorAddress {
+                        machine: MachineId::new(),
+                        thread: spec.thread,
+                    },
+                    assignment_revision: crate::resource::AssignmentRevision::new(0),
+                },
+            },
+            spec,
+            launch,
+        }
+    }
+
+    #[test]
+    fn action_route_is_owned_by_the_supervisor_and_proves_its_exact_content() {
+        use crate::resource::bound_action::ResourceActionLaunch;
+        use crate::resource::{CommandSpec, ReturnWork};
+
+        let input = action_input(ResourceActionLaunch::Return {
+            work: ReturnWork::NewBackgroundWork {
+                spec: CommandSpec::try_from(spec()).unwrap(),
+            },
+        });
+        let route = OriginRoute::new_resource_action(input.clone()).unwrap();
+        assert_eq!(
+            route.origin_machine,
+            input.binding.authority.supervisor.machine
+        );
+        assert_eq!(
+            route.execution_machine,
+            input.binding.authority.authority_machine
+        );
+        let proof = ResourceActionRouteProof::from_route(&route).unwrap();
+        assert_eq!(proof.binding, input.binding);
+        assert_eq!(
+            proof.normalized_spec_sha256,
+            normalized_spec_sha256(&spec()).unwrap()
+        );
+        assert_eq!(proof.phase, ResourceActionRoutePhase::AcceptanceUnknown);
+        let wire = serde_json::to_value(&proof).unwrap();
+        assert!(wire.get("callback").is_none());
+
+        // the authority never owns a callback route for its own supervisor thread
+        let mut co_located = input.clone();
+        co_located.binding.authority.supervisor.machine =
+            co_located.binding.authority.authority_machine;
+        assert!(matches!(
+            OriginRoute::new_resource_action(co_located),
+            Err(ResourceRouteError::ActionOwnerMismatch)
+        ));
+        // a supervisor-supplied return command must be the saved route content
+        let mut changed = input.clone();
+        changed.spec.timeout = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            OriginRoute::new_resource_action(changed),
+            Err(ResourceRouteError::ActionOwnerMismatch)
+        ));
+        let mut wrong_kind = input;
+        wrong_kind.binding.kind = crate::resource::bound_action::ResourceActionKind::ReleaseWatcher;
+        assert!(matches!(
+            OriginRoute::new_resource_action(wrong_kind),
+            Err(ResourceRouteError::ActionOwnerMismatch)
+        ));
+        assert!(ResourceActionRouteProof::from_route(&resource_route()).is_none());
     }
 }

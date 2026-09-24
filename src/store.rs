@@ -35,8 +35,27 @@ mod identity;
 mod message;
 mod resource;
 pub(crate) use events::EventRetentionBatch;
-pub use identity::IdentityError;
+pub use identity::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
 pub(crate) use resource::VerifiedReleaseProof;
+#[cfg(test)]
+pub(crate) use resource::test_support::mark_request_assigned_for_race;
+pub(crate) use resource::{
+    AcceptedActionTask, EndedRestoreResolution, PreparedReturnTask,
+    RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
+    ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput,
+    ReturnTaskOrigin,
+};
+pub(crate) use resource::{
+    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
+    BackgroundLaunchPhase, BackgroundLaunchView, RemoteBackgroundLaunchInput,
+    idle_boundary_decision_on, idle_opening_matches_on, open_idle_serving_loan_on,
+    pending_background_launch_on, promote_started_background_launch_on,
+};
+pub(crate) use resource::{OperatorGpuFreeError, operator_serving_release_matches_on};
+pub(crate) use resource::{
+    ResourceControlEffect, ResourceControlError, ResourceControlRequest, ResourceControlStart,
+    ResourceReadModel, SupervisorReplacement, open_action_id,
+};
 
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -245,6 +264,30 @@ DROP TABLE resource_release_checkpoint_states;
 ALTER TABLE resource_release_checkpoint_states_v21 RENAME TO resource_release_checkpoint_states;
 CREATE INDEX resource_release_checkpoint_states_resource
     ON resource_release_checkpoint_states(resource_id, action_id);
+";
+
+/// Restore closure receipts gained the native foreground end basis in version 26
+///
+/// SQLite cannot change a CHECK constraint in place, so the table is rebuilt.
+/// Existing receipts keep their bytes
+const MIGRATE_25_TO_26: &str = r"
+CREATE TABLE resource_restore_closures_v26 (
+    action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
+    task_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
+            'confirmed_running', 'foreground_ended', 'supervisor_resolved_end'
+        ), 0)
+    )
+);
+INSERT INTO resource_restore_closures_v26 (action_id, task_id, receipt_json)
+SELECT action_id, task_id, receipt_json FROM resource_restore_closures;
+DROP TABLE resource_restore_closures;
+ALTER TABLE resource_restore_closures_v26 RENAME TO resource_restore_closures;
 ";
 
 /// Schema version 1 had no `name` column.
@@ -599,6 +642,126 @@ fn insert_local_task_records_on(
     Ok(())
 }
 
+/// Fixed owners of one authority task whose callback route lives on another machine
+pub(crate) struct RemoteOriginTask {
+    /// Stable retry identity saved in the remote route
+    pub(crate) request_id: RequestId,
+    /// Supervisor machine that owns the callback route
+    pub(crate) origin_machine: MachineId,
+    /// Authority machine that executes the task
+    pub(crate) execution_machine: MachineId,
+    /// Supervisor thread named by the spec
+    pub(crate) thread: crate::domain::ThreadId,
+    /// Whether the task is the release watcher that its own action reserved
+    pub(crate) reserved_watcher: bool,
+}
+
+/// Insert one action-bound task whose callback route lives on the supervisor machine
+///
+/// The task row, accepted remote executor identity, first queued event, and exact
+/// action receipt commit in the caller's transaction. No origin route is written
+/// here because the supervisor machine saved it before sending the launch
+pub(crate) fn insert_remote_action_task_records_on(
+    conn: &Connection,
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    receipt: &crate::resource::bound_action::ActionTaskReceipt,
+) -> Result<(), AppError> {
+    if row.id != receipt.task_id {
+        return Err(AppError::ClusterTaskConflict { task: row.id });
+    }
+    insert_remote_origin_task_records_on(
+        conn,
+        row,
+        spec,
+        &RemoteOriginTask {
+            request_id: receipt.request_id,
+            origin_machine: receipt.origin_machine(),
+            execution_machine: receipt.execution_machine(),
+            thread: receipt.authority.supervisor.thread,
+            // only the watcher bound by this exact action may use its reserved identity
+            reserved_watcher: receipt.kind
+                == crate::resource::bound_action::ResourceActionKind::ReleaseWatcher,
+        },
+    )
+}
+
+/// Insert one authority task whose callback route lives on a remote supervisor machine
+///
+/// The task row, accepted remote executor identity, and first queued event commit
+/// in the caller's transaction. The caller saves its own receipt in the same one
+pub(crate) fn insert_remote_origin_task_records_on(
+    conn: &Connection,
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    owners: &RemoteOriginTask,
+) -> Result<(), AppError> {
+    let task = row.id;
+    let origin = owners.origin_machine;
+    let execution = owners.execution_machine;
+    if origin == execution
+        || spec.machine.is_some()
+        || spec.thread != owners.thread
+        || !matches!(&spec.workload, crate::spec::NormalizedWorkload::Task(_))
+        || row.status() != ProcessStatus::Queued
+        || row.name.as_ref() != Some(&spec.name)
+        || row.thread != spec.thread
+        || row.workload != crate::invocation::persist_workload(&spec.workload)
+        || row.cwd != spec.cwd
+        || row.timeout != spec.timeout
+        || !row.cwd.is_absolute()
+        || !row.binary.is_absolute()
+    {
+        return Err(AppError::ClusterTaskConflict { task });
+    }
+    let watcher_reserved = release_watcher_task_id_is_reserved(conn, task)?;
+    if resource_request_task_id_is_reserved(conn, task)?
+        || (watcher_reserved && !owners.reserved_watcher)
+    {
+        return Err(AppError::ClusterTaskConflict { task });
+    }
+    let occupied: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE id=?1
+            UNION ALL SELECT 1 FROM executor_identities WHERE task_id=?1
+            UNION ALL SELECT 1 FROM origin_routes WHERE task_id=?1 OR request_id=?2
+            UNION ALL SELECT 1 FROM executor_outbox WHERE task_id=?1
+            UNION ALL SELECT 1 FROM executor_event_receipts WHERE task_id=?1
+        )",
+        params![task.to_string(), owners.request_id.0.to_string()],
+        |entry| entry.get(0),
+    )?;
+    if occupied {
+        return Err(AppError::ClusterTaskConflict { task });
+    }
+
+    let project_root = find_project_root(&row.cwd);
+    insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
+    let identity = ExecutorIdentity::Accepted(ExecutionRecord {
+        task,
+        origin_machine: origin,
+        execution_machine: execution,
+        spec: spec.clone().into(),
+        state: ProcessStatus::Queued,
+    });
+    conn.execute(
+        "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
+        params![
+            task.to_string(),
+            origin.to_string(),
+            serde_json::to_string(&identity)?
+        ],
+    )?;
+    events::append_produced_event_on(
+        conn,
+        task,
+        EventPayload::State {
+            status: ProcessStatus::Queued,
+        },
+    )?;
+    Ok(())
+}
+
 /// Both machine owners of one accepted execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskOwners {
@@ -711,6 +874,28 @@ impl Store {
             20 => {
                 transaction.execute_batch(MIGRATE_20_TO_21)?;
             }
+            21 => {
+                // resource schema hook below installs the return decision, closure, and
+                // remote action-task receipts
+            }
+            22 => {
+                // resource schema hook below installs resource control operations
+                transaction.execute_batch(MIGRATE_25_TO_26)?;
+            }
+            23 => {
+                // resource schema hook below installs background launch and idle opening receipts
+                transaction.execute_batch(MIGRATE_25_TO_26)?;
+            }
+            24 => {
+                // resource schema hook below installs and backfills registration receipts
+                transaction.execute_batch(MIGRATE_25_TO_26)?;
+            }
+            25 => {
+                transaction.execute_batch(MIGRATE_25_TO_26)?;
+            }
+            26 => {
+                // resource schema hook below installs operator attestation receipts
+            }
             v if v == SCHEMA_VERSION => {}
             other => {
                 return Err(AppError::Internal {
@@ -723,6 +908,12 @@ impl Store {
                 migrate_16_to_17(&transaction)?;
             }
             transaction.execute_batch(RESOURCE_SCHEMA)?;
+            if version > 0 {
+                crate::resource::store::backfill_resource_registration_receipts(&transaction)
+                    .map_err(|error| AppError::Internal {
+                        message: format!("resource registration receipt migration: {error}"),
+                    })?;
+            }
             transaction.execute_batch(MESSAGE_SCHEMA)?;
             if version < 12 {
                 transaction.execute_batch(MIGRATE_12_TO_13)?;
@@ -3477,6 +3668,178 @@ CREATE TABLE reports (
     }
 
     #[test]
+    fn migrate_schema_21_installs_return_receipts_and_keeps_loans() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let loan_state = serde_json::json!({
+            "type": "active",
+            "phase": {
+                "type": "awaiting_return",
+                "action_id": uuid::Uuid::now_v7(),
+                "return_context": { "type": "idle" },
+            },
+        })
+        .to_string();
+        {
+            let store = Store::open(&path).unwrap();
+            let resource = uuid::Uuid::now_v7().to_string();
+            let machine = uuid::Uuid::now_v7().to_string();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO resources (
+                        id, display_name, authority_machine, supervisor_machine,
+                        supervisor_thread, assignment_revision, state_revision
+                     ) VALUES (?1, 'gpu', ?2, ?2, ?3, 0, 1)",
+                    params![resource, machine, uuid::Uuid::now_v7().to_string()],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
+                    params![uuid::Uuid::now_v7().to_string(), resource, loan_state],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE resource_restore_closures;
+                     DROP TABLE resource_return_decisions;
+                     PRAGMA user_version = 21;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_resource_tables_installed(&store);
+        let saved: String = store
+            .conn
+            .query_row("SELECT state_json FROM loans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saved, loan_state);
+    }
+
+    #[test]
+    fn migrate_schema_25_restore_closures_accept_the_foreground_end_basis() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (resource, loan) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        // each closure needs its parent return decision
+        let insert = |conn: &Connection, basis: &str| {
+            let (action, task) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let decision = serde_json::json!({
+                "authority": { "action_id": action, "resource_id": resource, "loan_id": loan },
+                "decision": { "type": "no_resume", "reason": "fixture" },
+                "result": { "type": "restore_bound" },
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO resource_return_decisions (action_id, resource_id, loan_id, receipt_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    action.to_string(),
+                    resource.to_string(),
+                    loan.to_string(),
+                    decision
+                ],
+            )
+            .unwrap();
+            let receipt = serde_json::json!({
+                "action_id": action,
+                "task_id": task,
+                "basis": { "type": basis },
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO resource_restore_closures (action_id, task_id, receipt_json)
+                 VALUES (?1, ?2, ?3)",
+                params![action.to_string(), task.to_string(), receipt],
+            )
+            .map(|_| receipt)
+        };
+        let saved = {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO resources (
+                        id, display_name, authority_machine, supervisor_machine,
+                        supervisor_thread, assignment_revision, state_revision
+                     ) VALUES (?1, 'gpu', ?2, ?2, ?3, 0, 1)",
+                    params![
+                        resource.to_string(),
+                        uuid::Uuid::now_v7().to_string(),
+                        uuid::Uuid::now_v7().to_string()
+                    ],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
+                    params![
+                        loan.to_string(),
+                        resource.to_string(),
+                        serde_json::json!({
+                            "type": "closed",
+                            "result": {
+                                "type": "no_resume",
+                                "return_context": { "type": "idle" },
+                                "reason": "fixture",
+                            },
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+            // restore the version 25 constraint that predates the foreground end basis
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE resource_restore_closures;
+                     CREATE TABLE resource_restore_closures (
+                         action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
+                         task_id TEXT NOT NULL UNIQUE,
+                         receipt_json TEXT NOT NULL CHECK (
+                             json_valid(receipt_json)
+                             AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
+                                 'confirmed_running', 'supervisor_resolved_end'
+                             ), 0)
+                         )
+                     );
+                     PRAGMA user_version = 25;",
+                )
+                .unwrap();
+            assert!(insert(&store.conn, "foreground_ended").is_err());
+            insert(&store.conn, "confirmed_running").unwrap()
+        };
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let kept: String = store
+            .conn
+            .query_row(
+                "SELECT receipt_json FROM resource_restore_closures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, saved);
+        insert(&store.conn, "foreground_ended").unwrap();
+        assert!(insert(&store.conn, "guessed_release").is_err());
+    }
+
+    #[test]
     fn migrate_schema_20_checkpoint_phase_constraint_for_cancellation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
@@ -3565,6 +3928,12 @@ CREATE TABLE reports (
             "resource_supervisor_notices",
             "resource_release_completions",
             "resource_release_checkpoint_states",
+            "resource_return_decisions",
+            "resource_restore_closures",
+            "resource_action_task_receipts",
+            "resource_background_launches",
+            "resource_idle_openings",
+            "resource_registration_receipts",
         ] {
             let exists: bool = store
                 .conn

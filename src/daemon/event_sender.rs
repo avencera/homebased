@@ -225,6 +225,10 @@ impl Sender {
         let destination = if origin == self.local {
             None
         } else {
+            // the authority observes its own task row, so a remote callback outage
+            // cannot hide a confirmed start from the resource owner
+            self.supervisor
+                .cast(SupervisorMsg::RemoteOriginEvent { id: task })?;
             let FleetState::Enabled(fleet) = &self.fleet else {
                 return Ok(DeliveryResult::Retry(
                     "fleet is disabled for remote origin".into(),

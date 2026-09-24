@@ -98,6 +98,7 @@
 				v{store.status.version} &middot; pid {store.status.pid}
 			</span>
 		{/if}
+		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}

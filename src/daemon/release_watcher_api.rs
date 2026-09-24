@@ -1,4 +1,4 @@
-//! Socket-only internal route for co-located resource release watchers
+//! Socket-only internal route for release watchers running on the resource authority
 //!
 //! The route is merged only into the Unix-socket router. The dashboard and fleet
 //! TCP listeners never serve it, so only local processes with socket access can

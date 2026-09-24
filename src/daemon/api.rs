@@ -68,6 +68,7 @@ impl IntoResponse for AppError {
 pub fn read_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::daemon::fleet_api::read_routes())
+        .merge(crate::daemon::resource_api::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
@@ -92,6 +93,8 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(write_routes())
         .merge(crate::daemon::fleet_api::socket_routes())
         .merge(crate::daemon::release_watcher_api::socket_routes())
+        .merge(crate::daemon::resource_action::socket_routes())
+        .merge(crate::daemon::resource_api::socket_routes())
         .with_state(state)
 }
 
@@ -186,7 +189,7 @@ where
     }
 }
 
-fn missing_field(pointer: &str, name: &str) -> AppError {
+pub(super) fn missing_field(pointer: &str, name: &str) -> AppError {
     AppError::InvalidSpec {
         pointer: pointer.into(),
         value: Value::Null,
@@ -195,7 +198,7 @@ fn missing_field(pointer: &str, name: &str) -> AppError {
 }
 
 /// Build an `invalid_spec` at the failing path, rooted at `prefix`.
-fn invalid_at(
+pub(super) fn invalid_at(
     root: &Value,
     prefix: &str,
     err: &serde_path_to_error::Error<serde_json::Error>,
@@ -209,7 +212,7 @@ fn invalid_at(
 }
 
 /// Re-root an `invalid_spec` pointer under `prefix`.
-fn prefix(prefix: &str, err: AppError) -> AppError {
+pub(super) fn prefix(prefix: &str, err: AppError) -> AppError {
     match err {
         AppError::InvalidSpec {
             pointer,
@@ -542,7 +545,21 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
             return Err(AppError::ClusterTaskConflict { task: id });
         }
         match route.submission {
-            crate::submission::SubmissionState::Rejected { .. } => {
+            // an action-bound launch is resolved only by its own retry, never by a
+            // cancellation that could fence the fixed identity before acceptance
+            crate::submission::SubmissionState::Rejected { .. }
+            | crate::submission::SubmissionState::ResourceAction {
+                phase:
+                    crate::submission::ResourceActionRoutePhase::AcceptanceUnknown
+                    | crate::submission::ResourceActionRoutePhase::Rejected { .. },
+                ..
+            }
+            | crate::submission::SubmissionState::ResourceBackground {
+                phase:
+                    crate::submission::ResourceBackgroundRoutePhase::AcceptanceUnknown
+                    | crate::submission::ResourceBackgroundRoutePhase::Rejected { .. },
+                ..
+            } => {
                 return Err(AppError::ClusterTaskConflict { task: id });
             }
             crate::submission::SubmissionState::Resource { resource, phase } => {
@@ -558,16 +575,22 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
                 )
             }
             crate::submission::SubmissionState::AcceptanceUnknown
-            | crate::submission::SubmissionState::Accepted => {
-                crate::cancellation::CancellationOwner::Execution(
-                    crate::cancellation::ExecutionCancellationTarget {
-                        request_id: Some(route.request),
-                        task: route.task,
-                        origin_machine: route.origin_machine,
-                        execution_machine: route.execution_machine,
-                    },
-                )
+            | crate::submission::SubmissionState::Accepted
+            | crate::submission::SubmissionState::ResourceAction {
+                phase: crate::submission::ResourceActionRoutePhase::Accepted,
+                ..
             }
+            | crate::submission::SubmissionState::ResourceBackground {
+                phase: crate::submission::ResourceBackgroundRoutePhase::Accepted,
+                ..
+            } => crate::cancellation::CancellationOwner::Execution(
+                crate::cancellation::ExecutionCancellationTarget {
+                    request_id: Some(route.request),
+                    task: route.task,
+                    origin_machine: route.origin_machine,
+                    execution_machine: route.execution_machine,
+                },
+            ),
         }
     } else {
         let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {

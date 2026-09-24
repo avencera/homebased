@@ -295,6 +295,14 @@ one or more known peers could not be checked. Retry the lookup; the daemon only
 returns `task_not_found` after every machine in the current known Fleet gives a
 definitive negative result.
 
+### GPU resource loans
+
+Use a registered resource for shared GPU work. The resource authority owns the
+queue, active loan, and release proof. Read the
+[GPU resource loan runbook](docs/resource-loans.md) for the real CLI commands,
+JSON inputs, retry rules, and supervisor steps. Do not use the current live
+training job to test this workflow.
+
 ### Events
 
 Delivery is at-least-once. For new events, use `(task, seq)` to detect a

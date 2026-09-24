@@ -511,7 +511,9 @@ fn resource_from_route(route: &OriginRoute) -> Option<ResourceId> {
         SubmissionState::Resource { resource, .. } => Some(*resource),
         SubmissionState::AcceptanceUnknown
         | SubmissionState::Accepted
-        | SubmissionState::Rejected { .. } => None,
+        | SubmissionState::Rejected { .. }
+        | SubmissionState::ResourceAction { .. }
+        | SubmissionState::ResourceBackground { .. } => None,
     }
 }
 
@@ -749,7 +751,9 @@ mod tests {
             inspection.reconcile_outcome,
             Some(ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: ResourceQueueAttentionReason::IdleNotProven,
+                reason: ResourceQueueAttentionReason::IdleNotProven {
+                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                },
             }) if request.request_id == route.request
         ));
 

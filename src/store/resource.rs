@@ -4,14 +4,62 @@ use std::path::PathBuf;
 
 use chrono::{SecondsFormat, Utc};
 
+mod action_task;
+mod background;
+mod controls;
+mod operator_release;
 mod release_proof;
+mod restore;
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use super::super::Store;
+    use crate::resource::{LoanId, ResourceRequestState};
+    use crate::submission::RequestId;
+
+    /// Model activation winning after an API control receipt commits
+    pub(crate) fn mark_request_assigned_for_race(db_path: &Path, request_id: RequestId) {
+        let store = Store::open(db_path).expect("open race fixture store");
+        let assigned = serde_json::to_string(&ResourceRequestState::Assigned {
+            loan_id: LoanId::new(),
+        })
+        .expect("encode assigned fixture");
+        store
+            .conn
+            .execute(
+                "UPDATE resource_requests SET state_json = ?1 WHERE request_id = ?2",
+                rusqlite::params![assigned, request_id.0.to_string()],
+            )
+            .expect("advance request in race fixture");
+    }
+}
+mod trainer_lock;
+pub(crate) use action_task::{
+    AcceptedActionTask, RemoteReleaseWatcherAcceptanceInput, ResourceActionError,
+};
+pub(crate) use background::{
+    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
+    BackgroundLaunchPhase, BackgroundLaunchView, RemoteBackgroundLaunchInput,
+    idle_boundary_decision_on, idle_opening_matches_on, open_idle_serving_loan_on,
+    pending_background_launch_on, promote_started_background_launch_on,
+};
+pub(crate) use controls::{
+    ResourceControlEffect, ResourceControlError, ResourceControlRequest, ResourceControlStart,
+    ResourceReadModel, SupervisorReplacement, open_action_id,
+};
+pub(crate) use operator_release::{OperatorGpuFreeError, operator_serving_release_matches_on};
 pub(crate) use release_proof::VerifiedReleaseProof;
 use release_proof::{ReleaseProofEvidence, VerifiedReleaseEvidence};
+pub(crate) use restore::{
+    EndedRestoreResolution, PreparedReturnTask, RestoreReconcileOutcome, ReturnClosure,
+    ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput, ReturnTaskOrigin,
+};
 
 use super::Store;
 use crate::cancellation::ResourceCancellationRequestIdentity;
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskState,
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskState, ThreadId,
 };
 use crate::error::AppError;
 use crate::events::{EventPayload, TaskEvent};
@@ -221,11 +269,16 @@ struct ReleaseProofPreflight {
 }
 
 enum ReleaseProofTerminalEvidence {
+    /// Exit status 0; a verified result publication makes it completed, and
+    /// its absence makes it an ended run with no usable result
     Completed,
     Stopped {
         decision: Box<ReleaseCheckpointStopDecision>,
         cancellation: ReleaseCheckpointCancellation,
     },
+    /// Any other terminal outcome, or a cancellation without this action's
+    /// committed stop; only the released lock can prove its release
+    Ended { outcome: ExitReason },
 }
 
 fn trainer_association_bind_snapshot(
@@ -410,6 +463,52 @@ fn revalidate_selected_checkpoint(
     }
 }
 
+/// Saved acceptance that owns one bound watcher task
+///
+/// The supervisor assignment can change while an accepted watcher runs, so the
+/// running check follows the records written at acceptance, not the current assignment
+enum SavedWatcherAcceptance {
+    /// No record accepts this watcher identity yet
+    NotAccepted,
+    /// The authority accepted the watcher with local origin routes
+    Local(Box<LocalWatcherRoutes>),
+    /// The authority accepted the watcher for a remote supervisor under this receipt
+    Remote(crate::resource::bound_action::ActionTaskReceipt),
+}
+
+/// Origin routes saved by one local watcher acceptance
+struct LocalWatcherRoutes {
+    by_request: OriginRoute,
+    by_task: OriginRoute,
+}
+
+fn saved_watcher_acceptance(
+    conn: &rusqlite::Connection,
+    intent: &ReleaseWatcherIntent,
+) -> Result<SavedWatcherAcceptance, ReleaseCheckpointError> {
+    let task_id = intent.watcher_task_id.as_task_id();
+    let conflict = || ReleaseCheckpointError::WatcherIdentityConflict { task_id };
+    let receipt = action_task::action_task_receipt_by_task(conn, task_id)?;
+    let by_request = super::identity::origin_route_by_request_on(conn, intent.request_id)
+        .map_err(ResourceStoreError::from)?;
+    let by_task = super::identity::origin_route_by_task_on(conn, task_id)
+        .map_err(ResourceStoreError::from)?;
+    match (receipt, by_request, by_task) {
+        (Some(receipt), None, None) => Ok(SavedWatcherAcceptance::Remote(receipt)),
+        (None, Some(by_request), Some(by_task)) => Ok(SavedWatcherAcceptance::Local(Box::new(
+            LocalWatcherRoutes {
+                by_request,
+                by_task,
+            },
+        ))),
+        // a task row without either acceptance record was accepted for another owner
+        (None, None, None) if super::task_by_id_on(conn, task_id)?.is_none() => {
+            Ok(SavedWatcherAcceptance::NotAccepted)
+        }
+        _ => Err(conflict()),
+    }
+}
+
 fn release_watcher_is_running_on(
     conn: &rusqlite::Connection,
     authority_machine: MachineId,
@@ -417,18 +516,6 @@ fn release_watcher_is_running_on(
     intent: &ReleaseWatcherIntent,
 ) -> Result<bool, ReleaseCheckpointError> {
     let task_id = intent.watcher_task_id.as_task_id();
-    let task = super::task_by_id_on(conn, task_id)?;
-    let identity =
-        super::identity::executor_identity_on(conn, task_id).map_err(ResourceStoreError::from)?;
-    let by_request = super::identity::origin_route_by_request_on(conn, intent.request_id)
-        .map_err(ResourceStoreError::from)?;
-    let by_task = super::identity::origin_route_by_task_on(conn, task_id)
-        .map_err(ResourceStoreError::from)?;
-    let (Some(task), Some(identity), Some(by_request), Some(by_task)) =
-        (task, identity, by_request, by_task)
-    else {
-        return Ok(false);
-    };
     let Some(resource) = select_resource(conn, resource_id)? else {
         return Err(ResourceStoreError::ResourceNotFound.into());
     };
@@ -439,9 +526,27 @@ fn release_watcher_is_running_on(
         }
         .into());
     }
-    if resource.supervisor.machine != authority_machine {
-        return Err(ReleaseCheckpointError::WatcherIdentityConflict { task_id });
-    }
+    let (by_request, by_task) = match saved_watcher_acceptance(conn, intent)? {
+        SavedWatcherAcceptance::NotAccepted => return Ok(false),
+        // a remote supervisor's watcher has no authority-local route; its receipt,
+        // remote identity, and first event prove the same acceptance instead
+        SavedWatcherAcceptance::Remote(receipt) => {
+            return action_task::remote_release_watcher_is_running_on(
+                conn,
+                authority_machine,
+                resource_id,
+                intent,
+                &receipt,
+            );
+        }
+        SavedWatcherAcceptance::Local(routes) => (routes.by_request, routes.by_task),
+    };
+    let task = super::task_by_id_on(conn, task_id)?;
+    let identity =
+        super::identity::executor_identity_on(conn, task_id).map_err(ResourceStoreError::from)?;
+    let (Some(task), Some(identity)) = (task, identity) else {
+        return Ok(false);
+    };
     let ExecutorIdentity::Accepted(record) = &identity else {
         return Ok(false);
     };
@@ -466,12 +571,14 @@ fn release_watcher_is_running_on(
     {
         return Ok(false);
     }
+    // the intent digest binds the spec thread, so the saved routes are checked
+    // against it rather than the current, possibly replaced, supervisor
     if !watcher_routes_match(
         &by_request,
         &by_task,
         (intent.request_id, task_id),
         authority_machine,
-        resource.supervisor,
+        spec.thread,
         &by_request.callback,
         spec,
     )? || !watcher_identity_matches(&identity, task_id, authority_machine, spec, task.status())?
@@ -1069,6 +1176,10 @@ impl Store {
             &normalized_spec.cwd,
         )
         .map_err(ResourceStoreError::TaskPreparation)?;
+        // a bare program name resolves from the executor PATH only here, so the
+        // resolved entry point must pass the foreground contract before any row exists
+        crate::resource::foreground::inspect_foreground_entry_point(&binary)
+            .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })?;
         let row = super::new_queued_task(super::NewTask {
             id: input.task_id,
             name: Some(normalized_spec.name.clone()),
@@ -1833,7 +1944,7 @@ impl Store {
                 &route_by_task,
                 (intent.request_id, task_id),
                 authority_machine,
-                supervisor,
+                supervisor.thread,
                 &callback,
                 &spec,
             )?
@@ -1904,9 +2015,6 @@ impl Store {
         };
         if resource.authority_machine() != authority_machine {
             return attention(ReleaseWatcherPollAttention::WrongAuthority);
-        }
-        if resource.supervisor.machine != authority_machine {
-            return attention(ReleaseWatcherPollAttention::RemoteSupervisorUnsupported);
         }
 
         let Some((state, _)) =
@@ -2150,13 +2258,15 @@ impl Store {
                 } => ReleaseProofTerminalEvidence::Completed,
                 TaskState::Finished {
                     reason: ExitReason::Cancelled,
-                } => {
+                } => 'cancelled: {
+                    // a cancellation that this action did not commit is a generic
+                    // end; it names no checkpoint that the run could resume from
                     let Some((checkpoint_state, _)) =
                         release_checkpoint_state_for_action(&tx, resource_id, action_id)?
                     else {
-                        return Err(CompleteReleaseError::StoppedProofUnavailable {
-                            task_id: observed_background_task,
-                        });
+                        break 'cancelled ReleaseProofTerminalEvidence::Ended {
+                            outcome: ExitReason::Cancelled,
+                        };
                     };
                     if checkpoint_state.action
                         != (ReleaseCheckpointAction {
@@ -2176,9 +2286,9 @@ impl Store {
                         cancellation,
                     } = checkpoint_state.phase
                     else {
-                        return Err(CompleteReleaseError::StoppedProofUnavailable {
-                            task_id: observed_background_task,
-                        });
+                        break 'cancelled ReleaseProofTerminalEvidence::Ended {
+                            outcome: ExitReason::Cancelled,
+                        };
                     };
                     if baseline.binding.association
                         != TrainerAttemptAssociationProof::from(&association)
@@ -2205,11 +2315,10 @@ impl Store {
                         cancellation,
                     }
                 }
-                TaskState::Finished { .. } => {
-                    return Err(CompleteReleaseError::StoppedProofUnavailable {
-                        task_id: observed_background_task,
-                    });
-                }
+                // a failed run never implies that any checkpoint is resumable
+                TaskState::Finished { reason } => ReleaseProofTerminalEvidence::Ended {
+                    outcome: reason.clone(),
+                },
                 TaskState::Lost => {
                     return Err(CompleteReleaseError::BackgroundTaskLost {
                         task_id: observed_background_task,
@@ -2225,6 +2334,7 @@ impl Store {
             let expected_identity_state = match &terminal_evidence {
                 ReleaseProofTerminalEvidence::Completed => ProcessStatus::Succeeded,
                 ReleaseProofTerminalEvidence::Stopped { .. } => ProcessStatus::Cancelled,
+                ReleaseProofTerminalEvidence::Ended { .. } => task_row.status(),
             };
             if record.state != expected_identity_state {
                 return Err(CompleteReleaseError::TrainerIdentityChanged {
@@ -2270,14 +2380,17 @@ impl Store {
         )?;
         let verified_attempt = preflight.association.verified_attempt();
         let release_evidence = match preflight.terminal_evidence {
-            ReleaseProofTerminalEvidence::Completed => {
-                let completed_result = find_completed_result(
+            ReleaseProofTerminalEvidence::Completed => 'completed: {
+                // a zero exit with no publication is an end with no usable result
+                let Some(completed_result) = find_completed_result(
                     verified_attempt.canonical_runtime_root(),
                     verified_attempt.binding(),
                 )?
-                .ok_or(CompleteReleaseError::CompletedResultMissing {
-                    task_id: preflight.task_id,
-                })?;
+                else {
+                    break 'completed VerifiedReleaseEvidence::Ended {
+                        outcome: ExitReason::Exit { code: 0 },
+                    };
+                };
                 if completed_result.binding != *verified_attempt.binding()
                     || completed_result.request_sha256 != verified_attempt.request_digest().to_hex()
                 {
@@ -2321,8 +2434,13 @@ impl Store {
                     cancellation,
                 }
             }
+            ReleaseProofTerminalEvidence::Ended { outcome } => {
+                VerifiedReleaseEvidence::Ended { outcome }
+            }
         };
 
+        // every basis, including an ended run, needs the exact saved lock free and
+        // held exclusively until the release transaction commits
         let ownership_guard = match probe_segment_ownership_lock(
             verified_attempt.canonical_runtime_root(),
             verified_attempt.ownership_lock_identity(),
@@ -2709,7 +2827,7 @@ fn watcher_routes_match(
     by_task: &OriginRoute,
     route_identity: (RequestId, TaskId),
     authority: MachineId,
-    supervisor: SupervisorAddress,
+    thread: ThreadId,
     callback: &CallbackContext,
     spec: &NormalizedSpec,
 ) -> Result<bool, AppError> {
@@ -2726,7 +2844,7 @@ fn watcher_routes_match(
             && route.task == task
             && route.origin_machine == authority
             && route.execution_machine == authority
-            && route.thread == supervisor.thread
+            && route.thread == thread
             && route.callback == *callback
             && matches!(&route.submission, SubmissionState::Accepted)
             && same_spec)
@@ -4178,6 +4296,14 @@ mod tests {
     }
 
     fn serving_fixture(local_origin: bool, save_local_route: bool) -> ServingFixture {
+        serving_fixture_with_spec(local_origin, save_local_route, spec())
+    }
+
+    fn serving_fixture_with_spec(
+        local_origin: bool,
+        save_local_route: bool,
+        spec: NormalizedSpec,
+    ) -> ServingFixture {
         let directory = tempdir().unwrap();
         let mut store = Store::open(&directory.path().join("db")).unwrap();
         let authority = MachineId::new();
@@ -4186,7 +4312,6 @@ mod tests {
         } else {
             MachineId::new()
         };
-        let spec = spec();
         let background_task = TaskId::new();
         let request_id = RequestId::new();
         let task_id = TaskId::new();
@@ -4863,14 +4988,12 @@ mod tests {
             .reconcile_assigned_resource_task_for_authority(first_input)
             .unwrap();
         let (loan, next_request) = match completion(first) {
-            Ok(
-                ResourceTaskCompletionResult::Assigned {
-                    finished_request,
-                    loan,
-                    next_request,
-                    ..
-                },
-            ) => {
+            Ok(ResourceTaskCompletionResult::Assigned {
+                finished_request,
+                loan,
+                next_request,
+                ..
+            }) => {
                 assert!(matches!(
                     &finished_request.state,
                     ResourceRequestState::Finished {
@@ -4897,6 +5020,35 @@ mod tests {
                 .state,
             ResourceRequestState::Queued
         ));
+        let committed_revision = fixture
+            .store
+            .resource_snapshots_for_authority(fixture.authority)
+            .unwrap()[0]
+            .resource
+            .state_revision;
+        // a duplicate terminal event returns the stored assignment without a new revision
+        let duplicate = fixture
+            .store
+            .reconcile_assigned_resource_task_for_authority(first_input)
+            .unwrap();
+        assert!(matches!(
+            completion(duplicate),
+            Ok(ResourceTaskCompletionResult::Assigned {
+                next_request: duplicate_next,
+                state_revision,
+                ..
+            }) if duplicate_next.request_id == second.request_id
+                && state_revision == committed_revision
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .resource_snapshots_for_authority(fixture.authority)
+                .unwrap()[0]
+                .resource
+                .state_revision,
+            committed_revision
+        );
         refresh_serving_fixture(&mut fixture, loan, next_request);
 
         let second_input = accept_and_finish_next_resource_task(
@@ -4909,14 +5061,12 @@ mod tests {
             .reconcile_assigned_resource_task_for_authority(second_input)
             .unwrap();
         let (loan, next_request) = match completion(second_result) {
-            Ok(
-                ResourceTaskCompletionResult::Assigned {
-                    finished_request,
-                    loan,
-                    next_request,
-                    ..
-                },
-            ) => {
+            Ok(ResourceTaskCompletionResult::Assigned {
+                finished_request,
+                loan,
+                next_request,
+                ..
+            }) => {
                 assert!(matches!(
                     &finished_request.state,
                     ResourceRequestState::Finished {
@@ -4943,13 +5093,11 @@ mod tests {
             .reconcile_assigned_resource_task_for_authority(third_input)
             .unwrap();
         let (loan, notice) = match completion(third_result) {
-            Ok(
-                ResourceTaskCompletionResult::ReturnRequired {
-                    finished_request,
-                    loan,
-                    notice,
-                },
-            ) => {
+            Ok(ResourceTaskCompletionResult::ReturnRequired {
+                finished_request,
+                loan,
+                notice,
+            }) => {
                 assert!(matches!(
                     &finished_request.state,
                     ResourceRequestState::Finished {
@@ -5016,9 +5164,9 @@ mod tests {
                 .store
                 .reconcile_assigned_resource_task_for_authority(task_reconcile_input(&fixture))
                 .unwrap(),
-            AssignedResourceTaskReconcileOutcome::Active {
-                state: ProcessStatus::Running
-            }
+            AssignedResourceTaskReconcileOutcome::Active(
+                crate::resource::store::AssignedResourceTaskProgress::Running
+            )
         ));
         fixture
             .store
@@ -5310,9 +5458,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             completion(result),
-            Ok(
-                ResourceTaskCompletionResult::ReturnRequired { .. }
-            )
+            Ok(ResourceTaskCompletionResult::ReturnRequired { .. })
         ));
         let receipt: String = fixture
             .store
@@ -5340,6 +5486,95 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_an_accepted_task_before_its_worker_starts_is_an_explicit_release_proof() {
+        let mut fixture = serving_fixture(true, true);
+        let next = fixture
+            .store
+            .accept_resource_request(
+                fixture.authority,
+                RequestId::new(),
+                TaskId::new(),
+                fixture.resource.id,
+                MachineId::new(),
+                fixture.spec.clone(),
+            )
+            .unwrap();
+        fixture
+            .store
+            .accept_assigned_resource_task(acceptance_input(&fixture))
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .request_cancel(fixture.request.task_id)
+                .unwrap(),
+            crate::store::CancelResult::CancelledQueued(_)
+        ));
+
+        let result = fixture
+            .store
+            .reconcile_assigned_resource_task_for_authority(task_reconcile_input(&fixture))
+            .unwrap();
+        assert!(matches!(
+            completion(result),
+            Ok(ResourceTaskCompletionResult::Assigned { next_request, .. })
+                if next_request.request_id == next.request_id
+        ));
+        let receipt: String = fixture
+            .store
+            .conn
+            .query_row(
+                "SELECT receipt_json FROM resource_task_completions WHERE task_id=?1",
+                [fixture.request.task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&receipt).unwrap()["release_proof"],
+            "no_child_spawned_after_queued_cancel"
+        );
+    }
+
+    #[test]
+    fn no_child_evidence_after_a_worker_started_requires_a_spawn_failure() {
+        let mut fixture = serving_fixture(true, true);
+        fixture
+            .store
+            .accept_assigned_resource_task(acceptance_input(&fixture))
+            .unwrap();
+        fixture
+            .store
+            .cas_status(
+                fixture.request.task_id,
+                ProcessStatus::Queued,
+                ProcessStatus::Running,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            fixture
+                .store
+                .cas_exit_with_evidence(
+                    fixture.request.task_id,
+                    ProcessStatus::Running,
+                    &ExitReason::Cancelled,
+                    ProcessGroupExitEvidence::NoChildSpawned,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_task(fixture.request.task_id)
+                .unwrap()
+                .unwrap()
+                .status(),
+            ProcessStatus::Running
+        );
+    }
+
+    #[test]
     fn exact_task_completion_retry_after_reopen_returns_the_same_return_notice() {
         let mut fixture = serving_fixture(true, true);
         let input = accept_and_finish_resource_task(
@@ -5352,11 +5587,9 @@ mod tests {
             .reconcile_assigned_resource_task_for_authority(input)
             .unwrap();
         let (action_id, notice_id, revision) = match completion(first) {
-            Ok(
-                ResourceTaskCompletionResult::ReturnRequired {
-                    notice, ..
-                },
-            ) => (notice.action_id, notice.id, notice.state_revision),
+            Ok(ResourceTaskCompletionResult::ReturnRequired { notice, .. }) => {
+                (notice.action_id, notice.id, notice.state_revision)
+            }
             other => panic!("the empty queue must reserve one return notice: {other:?}"),
         };
         let database = fixture.directory.path().join("db");
@@ -7804,23 +8037,95 @@ mod tests {
     }
 
     fn fake_resource_task_spec(root: &Path, marker: &Path) -> NormalizedSpec {
-        let command = root.join("fake-resource-command");
-        fs::write(
-            &command,
-            format!("#!/bin/sh\nprintf x >> '{}'\n", marker.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        native_resource_command_spec(root, "fake resource command", &[marker])
+    }
+
+    // the command stays in its foreground process group until the test creates the
+    // gate, so a test can inspect the Serving loan while the task is running
+    fn gated_resource_task_spec(root: &Path, marker: &Path, gate: &Path) -> NormalizedSpec {
+        native_resource_command_spec(root, "gated resource command", &[marker, gate])
+    }
+
+    fn native_resource_command_spec(root: &Path, name: &str, args: &[&Path]) -> NormalizedSpec {
+        let mut command = vec![crate::resource::foreground::test_support::native_fake_command()];
+        command.extend_from_slice(args);
 
         serde_json::from_value(json!({
             "api_version": 1,
             "thread": Uuid::now_v7(),
-            "name": "fake resource command",
+            "name": name,
             "cwd": root,
             "timeout": "4h",
-            "workload": { "type": "task", "command": [command] }
+            "workload": { "type": "task", "command": command }
         }))
         .unwrap()
+    }
+
+    async fn wait_for_running_task(
+        store: &ractor::ActorRef<StoreMsg>,
+        task_id: TaskId,
+    ) -> crate::domain::TaskRow {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(row) = call(store, |reply| StoreMsg::GetTask { id: task_id, reply })
+                    .await
+                    .unwrap()
+                    && row.status() == ProcessStatus::Running
+                {
+                    return row;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("resource task must reach the running state")
+    }
+
+    /// Wait for the task-terminal event path, without a client wake, to reserve the return
+    async fn wait_for_awaiting_return(
+        supervisor: &ractor::ActorRef<SupervisorMsg>,
+        resource_id: ResourceId,
+    ) -> Loan {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let inspection = call(supervisor, |reply| SupervisorMsg::InspectResource {
+                    id: resource_id,
+                    reply,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                if let Some(loan) = inspection.loan
+                    && matches!(
+                        loan.state,
+                        LoanState::Active {
+                            phase: LoanPhase::AwaitingReturn { .. }
+                        }
+                    )
+                {
+                    return loan;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("empty queue must reserve the return")
+    }
+
+    fn return_notice_count(home: &Home, loan_id: LoanId) -> i64 {
+        Store::open(&home.db_path())
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM resource_supervisor_notices
+                 WHERE loan_id = ?1
+                   AND json_extract(notice_json, '$.payload.type') = 'return_required'",
+                [loan_id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     async fn wait_for_terminal_task(
@@ -7874,9 +8179,25 @@ mod tests {
         let authority = load_or_create_machine_id(&home).unwrap();
         let fixture = TrainerAssociationFixture::new_for_home(directory, &home, authority);
         let marker = fixture.home.join("activation-count");
-        let request_spec = fake_resource_task_spec(&fixture.home, &marker);
+        let gate = fixture.home.join("release-commands");
+        let request_spec = gated_resource_task_spec(&fixture.home, &marker, &gate);
         let (mut fixture, binding, request_id, action_id, _, loan_id) =
-            release_completion_fixture_with(fixture, request_spec, machine_other_than(authority));
+            release_completion_fixture_with(
+                fixture,
+                request_spec.clone(),
+                machine_other_than(authority),
+            );
+        let second = fixture
+            .store
+            .accept_resource_request(
+                authority,
+                RequestId::new(),
+                TaskId::new(),
+                fixture.resource.id,
+                machine_other_than(authority),
+                request_spec,
+            )
+            .unwrap();
         publish_completed_result(
             &mut fixture,
             &binding,
@@ -7903,9 +8224,7 @@ mod tests {
         let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
             .await
             .unwrap();
-        let row = wait_for_terminal_task(&store, request.task_id).await;
-        assert_eq!(row.status(), ProcessStatus::Succeeded);
-
+        wait_for_running_task(&store, request.task_id).await;
         for _ in 0..3 {
             call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
                 id: resource_id,
@@ -7914,8 +8233,6 @@ mod tests {
             .await
             .unwrap();
         }
-        let bytes = fs::read(&marker).unwrap();
-        assert_eq!(bytes, b"x");
         let inspection = call(&supervisor, |reply| SupervisorMsg::InspectResource {
             id: resource_id,
             reply,
@@ -7927,6 +8244,7 @@ mod tests {
             inspection.loan.as_ref().map(|loan| &loan.state),
             Some(LoanState::Active {
                 phase: LoanPhase::Serving {
+                    current_request_id,
                     release_provenance:
                         ServingReleaseProvenance::CompletedTrainerResult {
                             action_id: saved_action,
@@ -7935,14 +8253,52 @@ mod tests {
                         },
                     ..
                 }
-            }) if *saved_action == action_id
+            }) if *current_request_id == request_id
+                && *saved_action == action_id
                 && *saved_task == trainer_task_id
                 && *publication_sha256 == publication.publication_sha256
         ));
-        assert!(matches!(
-            inspection.loan.map(|loan| loan.id),
-            Some(saved_loan) if saved_loan == loan_id
-        ));
+        // the next FIFO request waits for the running task's confirmed exit
+        assert!(
+            call(&store, |reply| StoreMsg::GetTask {
+                id: second.task_id,
+                reply,
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        fs::write(&gate, b"").unwrap();
+        let row = wait_for_terminal_task(&store, request.task_id).await;
+        assert_eq!(row.status(), ProcessStatus::Succeeded);
+        let second_row = wait_for_terminal_task(&store, second.task_id).await;
+        assert_eq!(second_row.status(), ProcessStatus::Succeeded);
+        let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+        assert_eq!(loan.id, loan_id);
+        for _ in 0..3 {
+            call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
+                id: resource_id,
+                reply,
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(fs::read(&marker).unwrap(), b"xx");
+        assert_eq!(return_notice_count(&home, loan_id), 1);
+        let requests = call(&store, |reply| StoreMsg::ResourceRequests {
+            authority_machine: authority,
+            resource_id,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(requests.iter().all(|request| matches!(
+            request.state,
+            ResourceRequestState::Finished {
+                outcome: ExitReason::Exit { code: 0 }
+            }
+        )));
 
         stop_test_supervisor(supervisor, handle).await;
     }
@@ -7957,7 +8313,8 @@ mod tests {
         let authority = load_or_create_machine_id(&home).unwrap();
         let fixture = TrainerAssociationFixture::new_for_home(directory, &home, authority);
         let marker = fixture.home.join("activation-count");
-        let request_spec = fake_resource_task_spec(&fixture.home, &marker);
+        let gate = fixture.home.join("release-commands");
+        let request_spec = gated_resource_task_spec(&fixture.home, &marker, &gate);
         let (fixture, binding, request_id, action_id, _, loan_id) =
             release_completion_fixture_with(fixture, request_spec, machine_other_than(authority));
         let request = fixture
@@ -8013,9 +8370,7 @@ mod tests {
         assert_eq!(terminal.status(), ProcessStatus::Succeeded);
         drop(trainer_lock);
 
-        let row = wait_for_terminal_task(&store, request.task_id).await;
-        assert_eq!(row.status(), ProcessStatus::Succeeded);
-        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        wait_for_running_task(&store, request.task_id).await;
         let after = call(&supervisor, |reply| SupervisorMsg::InspectResource {
             id: resource_id,
             reply,
@@ -8041,6 +8396,14 @@ mod tests {
             after.loan.map(|loan| loan.id),
             Some(saved_loan) if saved_loan == loan_id
         ));
+
+        fs::write(&gate, b"").unwrap();
+        let row = wait_for_terminal_task(&store, request.task_id).await;
+        assert_eq!(row.status(), ProcessStatus::Succeeded);
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+        assert_eq!(loan.id, loan_id);
+        assert_eq!(return_notice_count(&home, loan_id), 1);
 
         stop_test_supervisor(supervisor, handle).await;
     }
@@ -8148,6 +8511,8 @@ mod tests {
             .unwrap();
         let row = wait_for_terminal_task(&store, second_task_id).await;
         assert_eq!(row.status(), ProcessStatus::Succeeded);
+        let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+        assert_eq!(loan.id, loan_id);
         assert_eq!(fs::read(&marker).unwrap(), b"x");
         let requests = call(&store, |reply| StoreMsg::ResourceRequests {
             authority_machine: authority,
@@ -8166,11 +8531,15 @@ mod tests {
             })
         ));
         assert!(matches!(
-            requests.iter().find(|request| request.request_id == second_request.request_id),
+            requests
+                .iter()
+                .find(|request| request.request_id == second_request.request_id),
             Some(ResourceRequest {
-                state: ResourceRequestState::Assigned { loan_id: assigned_loan },
+                state: ResourceRequestState::Finished {
+                    outcome: ExitReason::Exit { code: 0 }
+                },
                 ..
-            }) if *assigned_loan == loan_id
+            })
         ));
 
         stop_test_supervisor(supervisor, handle).await;
@@ -8260,6 +8629,7 @@ mod tests {
 
     #[tokio::test]
     async fn ongoing_unproven_or_unconfirmed_trainer_keeps_request_queued_and_does_not_launch() {
+        // an ended run with no result is released by its lock, so a held lock keeps it reserved
         for (finish_task, publish_result, exit_evidence, expected_reason) in [
             (
                 false,
@@ -8271,7 +8641,7 @@ mod tests {
                 true,
                 false,
                 ProcessGroupExitEvidence::ConfirmedExited,
-                ReleaseProofAttentionReason::CompletedResultUnavailable,
+                ReleaseProofAttentionReason::OwnershipLockUnverified,
             ),
             (
                 true,
@@ -8292,10 +8662,12 @@ mod tests {
                 request_spec,
                 machine_other_than(authority),
             );
+            let mut lock_holder = None;
             if publish_result {
                 publish_completed_result(&mut fixture, &binding, exit_evidence);
             } else if finish_task {
                 fixture.finish_registered_task_with_evidence(exit_evidence);
+                lock_holder = Some(fixture.hold_saved_lock());
             }
             let resource_id = fixture.resource.id;
             let task_id = fixture
@@ -8368,6 +8740,7 @@ mod tests {
             assert!(!marker.exists());
 
             stop_test_resource_actor(actor, actor_handle, store, store_handle).await;
+            drop(lock_holder);
         }
     }
 
@@ -8862,20 +9235,62 @@ mod tests {
         ));
     }
 
+    /// Assert that a release served the queue only as a non-resumable ended run
+    fn assert_ended_release(
+        result: &ReleaseCompletionResult,
+        task: TaskId,
+        action: ActionId,
+        outcome: &ExitReason,
+    ) {
+        let ReleaseCompletionResult::Assigned { loan, .. } = result else {
+            panic!("the queued request must be assigned after an ended release: {result:?}");
+        };
+        assert!(
+            matches!(
+                &loan.state,
+                LoanState::Active {
+                    phase: LoanPhase::Serving {
+                        return_context: ReturnContext::EndedWithoutResult {
+                            task_id,
+                            outcome: saved_outcome,
+                        },
+                        release_provenance: ServingReleaseProvenance::EndedTrainerLockReleased {
+                            action_id,
+                            task_id: proven_task,
+                            outcome: proven_outcome,
+                            ..
+                        },
+                        ..
+                    }
+                } if *task_id == task
+                    && saved_outcome == outcome
+                    && *action_id == action
+                    && *proven_task == task
+                    && proven_outcome == outcome
+            ),
+            "unexpected ended release: {loan:?}"
+        );
+    }
+
     #[test]
-    fn completed_release_rejects_missing_or_mismatched_result() {
+    fn zero_exit_without_result_is_ended_and_a_mismatched_result_fails_closed() {
         let (mut missing, _, _, action_id, revision, _) = release_completion_fixture();
         missing.finish_registered_task_with_evidence(ProcessGroupExitEvidence::ConfirmedExited);
-        assert!(matches!(
-            missing.store.complete_release_for_authority(
+        let result = missing
+            .store
+            .complete_release_for_authority(
                 missing.authority,
                 missing.resource.id,
                 action_id,
                 revision,
-            ),
-            Err(CompleteReleaseError::CompletedResultMissing { task_id })
-                if task_id == missing.task_id
-        ));
+            )
+            .unwrap();
+        assert_ended_release(
+            &result,
+            missing.task_id,
+            action_id,
+            &ExitReason::Exit { code: 0 },
+        );
 
         let (mut mismatched, binding, _, action_id, revision, _) = release_completion_fixture();
         publish_completed_result(
@@ -8904,7 +9319,7 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_exit_stays_fail_closed_without_durable_stop_evidence() {
+    fn nonzero_exit_releases_only_as_an_ended_run_despite_saved_artifacts() {
         let (mut fixture, binding, _, action_id, revision, _) = release_completion_fixture();
         crate::resource::watcher::tests::write_completed_result_for_test(
             &fixture.runtime_root,
@@ -8931,16 +9346,22 @@ mod tests {
             .update_execution_state(fixture.task_id, ProcessStatus::Failed)
             .unwrap();
 
-        assert!(matches!(
-            fixture.store.complete_release_for_authority(
+        // neither the result file nor the checkpoint makes a failed run resumable
+        let result = fixture
+            .store
+            .complete_release_for_authority(
                 fixture.authority,
                 fixture.resource.id,
                 action_id,
                 revision,
-            ),
-            Err(CompleteReleaseError::StoppedProofUnavailable { task_id })
-                if task_id == fixture.task_id
-        ));
+            )
+            .unwrap();
+        assert_ended_release(
+            &result,
+            fixture.task_id,
+            action_id,
+            &ExitReason::Exit { code: 3 },
+        );
     }
 
     #[test]
@@ -9025,7 +9446,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_cancellation_and_checkpoint_alone_do_not_release_the_loan() {
+    fn generic_cancellation_and_checkpoint_release_only_as_an_ended_run() {
         let (mut fixture, binding, _, action_id, revision, _) = release_completion_fixture();
         crate::resource::watcher::tests::write_generation_for_test(
             &fixture.runtime_root,
@@ -9041,20 +9462,21 @@ mod tests {
             ProcessGroupExitEvidence::ConfirmedExited,
         );
 
-        assert!(matches!(
-            fixture.store.complete_release_for_authority(
+        // a cancellation that no stop decision committed names no resumable checkpoint
+        let result = fixture
+            .store
+            .complete_release_for_authority(
                 fixture.authority,
                 fixture.resource.id,
                 action_id,
                 revision,
-            ),
-            Err(CompleteReleaseError::StoppedProofUnavailable { task_id })
-                if task_id == fixture.task_id
-        ));
+            )
+            .unwrap();
+        assert_ended_release(&result, fixture.task_id, action_id, &ExitReason::Cancelled);
     }
 
     #[test]
-    fn stopped_release_rejects_nonterminal_lost_and_failed_trainer_tasks() {
+    fn stopped_release_rejects_nonterminal_and_lost_trainers_and_ends_a_failed_stop() {
         let (mut running, _, _, action_id, revision, _) = release_completion_fixture();
         assert!(matches!(
             running.store.complete_release_for_authority(
@@ -9102,16 +9524,22 @@ mod tests {
             .store
             .update_execution_state(failed.task_id, ProcessStatus::Failed)
             .unwrap();
-        assert!(matches!(
-            failed.store.complete_release_for_authority(
+        // a saved stop decision does not make a failed run resumable
+        let result = failed
+            .store
+            .complete_release_for_authority(
                 failed.authority,
                 failed.resource.id,
                 action_id,
                 revision,
-            ),
-            Err(CompleteReleaseError::StoppedProofUnavailable { task_id })
-                if task_id == failed.task_id
-        ));
+            )
+            .unwrap();
+        assert_ended_release(
+            &result,
+            failed.task_id,
+            action_id,
+            &ExitReason::Exit { code: 9 },
+        );
     }
 
     #[test]
@@ -10418,5 +10846,12 @@ mod tests {
         assert_eq!(identity_count(&store, terminal.task_id), 0);
     }
 
+    mod background;
+    mod completed_boundary;
+    mod ended_trainer;
+    mod foreground;
+    mod operator_release;
+    mod registration;
     mod release_watcher;
+    mod restore;
 }

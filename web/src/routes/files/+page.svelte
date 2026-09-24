@@ -163,6 +163,7 @@
 			<ArrowLeft class="size-3.5" />
 			tasks
 		</a>
+		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		<h1 class="text-base font-semibold tracking-tight">files</h1>
 		<span class="text-muted-foreground">device-wide read-only</span>
 	</header>

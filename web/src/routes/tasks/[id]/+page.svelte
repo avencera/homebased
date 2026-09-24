@@ -63,6 +63,7 @@
 			<ArrowLeft class="size-3.5" />
 			all workers
 		</a>
+		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		{#if task}
 			<h1 class="text-base font-semibold tracking-tight" title={task.display_name}>
 				{task.display_name}
@@ -241,6 +242,7 @@
 				{/if}
 			</div>
 			<pre
+				id="output-log"
 				bind:this={logBox}
 				onscroll={onLogScroll}
 				class="max-h-96 overflow-auto rounded border border-border bg-card px-3 py-2 font-mono text-[12px] leading-5 whitespace-pre-wrap">{store

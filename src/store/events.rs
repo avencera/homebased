@@ -15,7 +15,10 @@ use crate::events::{
     EventRouteStatus, FailedInboxEvent, InboxEvent, OutboxEvent, OutboxState, TaskEvent,
 };
 use crate::machine::MachineId;
-use crate::submission::{ExecutorIdentity, OriginRoute, ResourceRoutePhase, SubmissionState};
+use crate::submission::{
+    ExecutorIdentity, OriginRoute, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
+    ResourceRoutePhase, SubmissionState,
+};
 
 const EVENT_RETENTION_DAYS: i64 = 30;
 const EVENT_RETENTION_BATCH_SIZE: i64 = 64;
@@ -1027,6 +1030,41 @@ impl Store {
             });
         }
         let activate_resource = match &route.submission {
+            // the first queued event proves that the authority accepted the fixed
+            // identity, even when its launch reply was lost
+            SubmissionState::ResourceAction { phase, .. } => match phase {
+                ResourceActionRoutePhase::AcceptanceUnknown => {
+                    if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
+                        return Err(EventError::Invalid {
+                            message: "first resource action task event must report queued state"
+                                .into(),
+                        });
+                    }
+                    true
+                }
+                ResourceActionRoutePhase::Accepted => false,
+                ResourceActionRoutePhase::Rejected { .. } => {
+                    return Err(EventError::Invalid {
+                        message: "resource action route was rejected before task acceptance".into(),
+                    });
+                }
+            },
+            // the authority's durable first queued event proves acceptance even
+            // after a refusal was saved, since a delayed send may have won; the
+            // callback owner must keep the running trainer's results
+            SubmissionState::ResourceBackground { phase, .. } => match phase {
+                ResourceBackgroundRoutePhase::AcceptanceUnknown
+                | ResourceBackgroundRoutePhase::Rejected { .. } => {
+                    if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
+                        return Err(EventError::Invalid {
+                            message: "first background launch event must report queued state"
+                                .into(),
+                        });
+                    }
+                    true
+                }
+                ResourceBackgroundRoutePhase::Accepted => false,
+            },
             SubmissionState::Resource { phase, .. } => match phase {
                 ResourceRoutePhase::AcceptanceUnknown | ResourceRoutePhase::Waiting => {
                     if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
@@ -1076,9 +1114,19 @@ impl Store {
         if let Some(state) = event.payload.process_state() {
             route.last_execution_state = Some(state);
         }
-        if activate_resource && let SubmissionState::Resource { phase, .. } = &mut route.submission
-        {
-            *phase = ResourceRoutePhase::Activated;
+        if activate_resource {
+            match &mut route.submission {
+                SubmissionState::Resource { phase, .. } => *phase = ResourceRoutePhase::Activated,
+                SubmissionState::ResourceAction { phase, .. } => {
+                    *phase = ResourceActionRoutePhase::Accepted;
+                }
+                SubmissionState::ResourceBackground { phase, .. } => {
+                    *phase = ResourceBackgroundRoutePhase::Accepted;
+                }
+                SubmissionState::AcceptanceUnknown
+                | SubmissionState::Accepted
+                | SubmissionState::Rejected { .. } => {}
+            }
         }
         route.validate().map_err(|error| {
             EventError::Storage(AppError::Internal {
@@ -1980,5 +2028,221 @@ mod tests {
             )
             .unwrap();
         assert!(exists);
+    }
+
+    fn action_route() -> OriginRoute {
+        let base = route();
+        OriginRoute::new_resource_action(crate::submission::NewResourceActionRoute {
+            request: base.request,
+            task: base.task,
+            callback: base.callback.clone(),
+            spec: base.current_spec().unwrap().clone(),
+            binding: crate::submission::ResourceActionRouteBinding {
+                kind: crate::resource::bound_action::ResourceActionKind::ReleaseWatcher,
+                authority: crate::resource::SupervisorActionAuthority {
+                    authority_machine: base.execution_machine,
+                    resource_id: crate::resource::ResourceId::new(),
+                    loan_id: crate::resource::LoanId::new(),
+                    action_id: crate::resource::ActionId::new(),
+                    expected_state_revision: crate::resource::ResourceRevision::new(1),
+                    supervisor: crate::resource::SupervisorAddress {
+                        machine: base.origin_machine,
+                        thread: base.thread,
+                    },
+                    assignment_revision: crate::resource::AssignmentRevision::new(0),
+                },
+            },
+            launch: crate::resource::bound_action::ResourceActionLaunch::ReleaseWatcher {
+                observed_background_task: TaskId::new(),
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn first_queued_event_accepts_an_action_route_and_duplicates_settle_once() {
+        use crate::domain::ProcessStatus;
+
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = action_route();
+        store.insert_origin_route(&route).unwrap();
+
+        assert!(matches!(
+            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running)),
+            Err(EventError::Invalid { .. })
+        ));
+        assert_eq!(
+            store
+                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
+                .unwrap(),
+            EventAcceptance::Acknowledged { seq: 1 }
+        );
+        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
+        assert!(matches!(
+            saved.submission,
+            SubmissionState::ResourceAction {
+                phase: crate::submission::ResourceActionRoutePhase::Accepted,
+                ..
+            }
+        ));
+        // a duplicate is acknowledged from the saved inbox, a later event is ordered
+        assert_eq!(
+            store
+                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
+                .unwrap(),
+            EventAcceptance::Acknowledged { seq: 1 }
+        );
+        assert_eq!(
+            store
+                .accept_inbound_event(&event(&route, 3, ProcessStatus::Running))
+                .unwrap(),
+            EventAcceptance::Expected { seq: 2 }
+        );
+        assert_eq!(
+            store
+                .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
+                .unwrap(),
+            EventAcceptance::Acknowledged { seq: 2 }
+        );
+        assert_eq!(store.inbound_events(route.task).unwrap().len(), 2);
+        // an event from another execution owner is refused
+        let mut foreign = event(&route, 3, ProcessStatus::Running);
+        foreign.execution_machine = MachineId::new();
+        assert!(matches!(
+            store.accept_inbound_event(&foreign),
+            Err(EventError::OwnerConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn rejected_action_route_refuses_task_events() {
+        use crate::domain::ProcessStatus;
+
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = action_route();
+        store.insert_origin_route(&route).unwrap();
+        store
+            .resolve_resource_action_route(
+                route.task,
+                &crate::store::ResourceActionRouteResult::Rejected(
+                    crate::resource::bound_action::ResourceActionRejection::ActionNotPending,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Queued)),
+            Err(EventError::Invalid { .. })
+        ));
+        assert!(store.inbound_events(route.task).unwrap().is_empty());
+    }
+
+    fn background_route() -> OriginRoute {
+        let base = route();
+        OriginRoute::new_resource_background(crate::submission::NewResourceBackgroundRoute {
+            request: base.request,
+            task: base.task,
+            callback: base.callback.clone(),
+            spec: base.current_spec().unwrap().clone(),
+            binding: crate::resource::background_launch::BackgroundLaunchBinding {
+                assignment: crate::resource::background_launch::BackgroundSupervisorAssignment {
+                    authority_machine: base.execution_machine,
+                    resource_id: crate::resource::ResourceId::new(),
+                    supervisor: crate::resource::SupervisorAddress {
+                        machine: base.origin_machine,
+                        thread: base.thread,
+                    },
+                    assignment_revision: crate::resource::AssignmentRevision::new(0),
+                },
+                expected_state_revision: crate::resource::ResourceRevision::new(2),
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn background_route_keeps_a_trainer_that_the_authority_accepted_after_a_saved_refusal() {
+        use crate::domain::ProcessStatus;
+        use crate::resource::background_launch::{
+            RemoteBackgroundLaunchReceipt, ResourceBackgroundRejection,
+        };
+        use crate::store::ResourceBackgroundRouteResult;
+        use crate::submission::ResourceBackgroundRoutePhase;
+
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = background_route();
+        store.insert_origin_route(&route).unwrap();
+        let SubmissionState::ResourceBackground { binding, .. } = &route.submission else {
+            unreachable!();
+        };
+        let receipt = RemoteBackgroundLaunchReceipt {
+            binding: *binding,
+            request_id: route.request,
+            task_id: route.task,
+            normalized_spec_sha256: crate::submission::normalized_spec_sha256(
+                route.current_spec().unwrap(),
+            )
+            .unwrap(),
+        };
+        // a receipt for another assignment cannot accept this route
+        let mut other = receipt;
+        other.binding.assignment.assignment_revision = crate::resource::AssignmentRevision::new(1);
+        assert!(matches!(
+            store.resolve_resource_background_route(
+                route.task,
+                &ResourceBackgroundRouteResult::Accepted(other)
+            ),
+            Err(crate::store::IdentityError::Conflict)
+        ));
+
+        // a delayed send may win after a refusal was saved; its first queued
+        // event is durable acceptance, so the trainer keeps its callback owner
+        store
+            .resolve_resource_background_route(
+                route.task,
+                &ResourceBackgroundRouteResult::Rejected(
+                    ResourceBackgroundRejection::LaunchPending {
+                        task_id: TaskId::new(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running)),
+            Err(EventError::Invalid { .. })
+        ));
+        assert_eq!(
+            store
+                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
+                .unwrap(),
+            EventAcceptance::Acknowledged { seq: 1 }
+        );
+        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
+        assert!(matches!(
+            saved.submission,
+            SubmissionState::ResourceBackground {
+                phase: ResourceBackgroundRoutePhase::Accepted,
+                ..
+            }
+        ));
+
+        // an accepted route never moves back to a refusal; the exact receipt is idempotent
+        assert!(matches!(
+            store.resolve_resource_background_route(
+                route.task,
+                &ResourceBackgroundRouteResult::Rejected(
+                    ResourceBackgroundRejection::NotCurrentSupervisor
+                )
+            ),
+            Err(crate::store::IdentityError::Conflict)
+        ));
+        store
+            .resolve_resource_background_route(
+                route.task,
+                &ResourceBackgroundRouteResult::Accepted(receipt),
+            )
+            .unwrap();
     }
 }

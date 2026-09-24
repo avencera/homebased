@@ -29,6 +29,8 @@ pub enum DirectSegmentPathRole {
     InputVerificationReceipt,
     /// The accepted task's effective working directory
     WorkingDirectory,
+    /// The trainer runtime root passed with `--runtime-root`
+    RuntimeRoot,
 }
 
 /// A validated argv and filesystem binding for `python -m ops.run_segment run`
@@ -98,6 +100,27 @@ impl DirectSegmentCommandShape {
             );
         }
 
+        Self::validate_invocation(spec, task, Some(verified_attempt.canonical_runtime_root()))
+    }
+
+    /// Validate a first background launch before its task record exists
+    ///
+    /// The trainer creates its attempt and lock only after it starts, so this
+    /// check binds no runtime evidence. The runtime root must be absolute; the
+    /// later association compares it with the canonical root that the running
+    /// trainer locked
+    pub fn validate_launch(
+        spec: &NormalizedSpec,
+        task: &TaskRow,
+    ) -> Result<Self, DirectSegmentCommandShapeError> {
+        Self::validate_invocation(spec, task, None)
+    }
+
+    fn validate_invocation(
+        spec: &NormalizedSpec,
+        task: &TaskRow,
+        associated_runtime_root: Option<&Path>,
+    ) -> Result<Self, DirectSegmentCommandShapeError> {
         let NormalizedWorkload::Task(spec_workload) = &spec.workload else {
             return Err(DirectSegmentCommandShapeError::NotCommandTask { task_id: task.id });
         };
@@ -145,12 +168,21 @@ impl DirectSegmentCommandShape {
         let input_root =
             canonical_directory(DirectSegmentPathRole::InputRoot, Path::new(&input_root_arg))?;
         let runtime_root = PathBuf::from(required_flag(parsed.runtime_root, "--runtime-root")?);
-        let associated_runtime_root = verified_attempt.canonical_runtime_root();
-        if runtime_root.as_os_str() != associated_runtime_root.as_os_str() {
-            return Err(DirectSegmentCommandShapeError::RuntimeRootMismatch {
-                provided: runtime_root,
-                expected: associated_runtime_root.to_path_buf(),
-            });
+        match associated_runtime_root {
+            Some(expected) if runtime_root.as_os_str() != expected.as_os_str() => {
+                return Err(DirectSegmentCommandShapeError::RuntimeRootMismatch {
+                    provided: runtime_root,
+                    expected: expected.to_path_buf(),
+                });
+            }
+            Some(_) => {}
+            None if !runtime_root.is_absolute() => {
+                return Err(DirectSegmentCommandShapeError::PathNotAbsolute {
+                    role: DirectSegmentPathRole::RuntimeRoot,
+                    path: runtime_root,
+                });
+            }
+            None => {}
         }
         let image_argument = required_flag(parsed.image_argument, "--image-digest")?.to_owned();
         let input_verification_receipt = parsed
@@ -742,6 +774,75 @@ fn parse_flags(command: &CommandLine) -> Result<ParsedFlags, DirectSegmentComman
     Ok(parsed)
 }
 
+/// Return the `--runtime-root` value of one maintained direct-segment command
+///
+/// The argv must have the module invocation and valid flags. Path and shape
+/// checks against a task row stay with the caller
+pub(crate) fn direct_segment_runtime_root(command: &CommandLine) -> Option<PathBuf> {
+    check_module_invocation(command).ok()?;
+    parse_flags(command).ok()?.runtime_root.map(PathBuf::from)
+}
+
+/// Build the same-run resume argv from one saved direct-segment command
+///
+/// The saved command must have the maintained module invocation and all required
+/// flags. The result keeps the program and every saved flag value, and sets only
+/// `--resume` to the selected generation. Path checks and the choice to resume
+/// stay with the caller
+pub(crate) fn same_run_resume_command(
+    command: &CommandLine,
+    generation: &str,
+) -> Result<CommandLine, DirectSegmentCommandShapeError> {
+    check_module_invocation(command)?;
+    let mut parsed = parse_flags(command)?;
+    for flag in [
+        DirectSegmentFlag::TaskFile,
+        DirectSegmentFlag::InputRoot,
+        DirectSegmentFlag::RuntimeRoot,
+        DirectSegmentFlag::ImageArgument,
+    ] {
+        required_flag(parsed.value(flag).cloned(), flag.name())?;
+    }
+    let resume = DirectSegmentFlag::ResumeGeneration.name();
+    if generation.is_empty() {
+        return Err(DirectSegmentCommandShapeError::MissingFlagValue { flag: resume });
+    }
+    if generation.starts_with('-') {
+        return Err(DirectSegmentCommandShapeError::AmbiguousFlagValue {
+            flag: resume,
+            value: generation.to_owned(),
+        });
+    }
+    parsed.set(DirectSegmentFlag::ResumeGeneration, generation.to_owned());
+
+    let mut argv = vec![command.program().to_owned()];
+    argv.extend(
+        REQUIRED_MODULE_ARGS
+            .iter()
+            .map(|argument| (*argument).to_owned()),
+    );
+    for flag in [
+        DirectSegmentFlag::TaskFile,
+        DirectSegmentFlag::InputRoot,
+        DirectSegmentFlag::RuntimeRoot,
+        DirectSegmentFlag::ImageArgument,
+        DirectSegmentFlag::InputVerificationReceipt,
+        DirectSegmentFlag::ResumeGeneration,
+        DirectSegmentFlag::TimeoutSeconds,
+    ] {
+        if let Some(value) = parsed.value(flag) {
+            argv.push(flag.name().to_owned());
+            argv.push(value.clone());
+        }
+    }
+
+    CommandLine::try_from_argv(argv).map_err(|_| {
+        DirectSegmentCommandShapeError::UnexpectedArgument {
+            value: generation.to_owned(),
+        }
+    })
+}
+
 fn required_flag(
     value: Option<String>,
     flag: &'static str,
@@ -759,6 +860,105 @@ fn parse_timeout(value: String) -> Result<Duration, DirectSegmentCommandShapeErr
         })?;
     Duration::try_from_secs_f64(seconds)
         .map_err(|_| DirectSegmentCommandShapeError::InvalidTimeout { value })
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use crate::domain::{TaskEnv, ThreadId};
+    use crate::spec::NormalizedSpec;
+
+    /// Fake maintained trainer layout whose `python3` is a gated shell script
+    ///
+    /// The script appends one byte to `marker` for every start and exits only
+    /// after `gate` exists, so a test can count spawns without a real GPU
+    pub(crate) struct FakeTrainer {
+        /// Canonical trainer working directory
+        pub(crate) cwd: PathBuf,
+        /// Runtime root passed with `--runtime-root`
+        pub(crate) runtime_root: PathBuf,
+        /// File that records each start
+        pub(crate) marker: PathBuf,
+        /// File whose creation lets the fake trainer exit
+        pub(crate) gate: PathBuf,
+        /// Executor environment whose PATH resolves the fake `python3` first
+        pub(crate) env: TaskEnv,
+        task_file: PathBuf,
+        input_root: PathBuf,
+    }
+
+    impl FakeTrainer {
+        /// Build the layout under an existing canonical directory
+        pub(crate) fn new(root: &Path) -> Self {
+            let cwd = root.join("trainer");
+            fs::create_dir_all(cwd.join("ops")).unwrap();
+            fs::write(cwd.join("ops/run_segment.py"), b"# maintained runner\n").unwrap();
+            fs::write(cwd.join("ops/segment_artifacts.py"), b"# artifacts\n").unwrap();
+            let runtime_root = root.join("runtime");
+            fs::create_dir_all(&runtime_root).unwrap();
+            let task_file = root.join("task.json");
+            fs::write(&task_file, b"{}\n").unwrap();
+            let input_root = root.join("inputs");
+            fs::create_dir_all(&input_root).unwrap();
+            let (marker, gate) = (root.join("trainer-starts"), root.join("trainer-gate"));
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let python = bin.join("python3");
+            fs::write(
+                &python,
+                format!(
+                    "#!/bin/sh\nprintf x >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+                    marker.display(),
+                    gate.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+
+            Self {
+                cwd,
+                runtime_root,
+                marker,
+                gate,
+                env: TaskEnv {
+                    path: format!("{}:/bin:/usr/bin", bin.display()),
+                    home: root.to_string_lossy().into_owned(),
+                },
+                task_file,
+                input_root,
+            }
+        }
+
+        /// Normalized trainer spec whose callbacks go to `thread`
+        pub(crate) fn spec(&self, thread: ThreadId, name: &str) -> NormalizedSpec {
+            serde_json::from_value(serde_json::json!({
+                "api_version": 1,
+                "thread": thread,
+                "name": name,
+                "cwd": self.cwd,
+                "timeout": "4h",
+                "workload": {
+                    "type": "task",
+                    "command": [
+                        "python3", "-m", "ops.run_segment", "run",
+                        "--task", self.task_file,
+                        "--input-root", self.input_root,
+                        "--runtime-root", self.runtime_root,
+                        "--image-digest", "not-validated-by-shape"
+                    ]
+                }
+            }))
+            .unwrap()
+        }
+
+        /// Number of times the fake trainer started
+        pub(crate) fn starts(&self) -> usize {
+            fs::read(&self.marker).map_or(0, |bytes| bytes.len())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1372,6 +1572,33 @@ mod tests {
         assert!(matches!(
             DirectSegmentCommandShape::validate(&fixture.spec, &fixture.task, &fixture.association,),
             Err(DirectSegmentCommandShapeError::InvalidModuleInvocation { .. })
+        ));
+    }
+
+    #[test]
+    fn same_run_resume_keeps_saved_flags_and_sets_only_the_selected_generation() {
+        let fixture = Fixture::new();
+        let mut argv = fixture.argv();
+        argv.extend(["--resume".into(), "generation-0".into()]);
+        let saved = CommandLine::try_from_argv(argv).unwrap();
+
+        let resumed = same_run_resume_command(&saved, "generation-9").unwrap();
+        let mut expected = fixture.argv();
+        expected.extend(["--resume".into(), "generation-9".into()]);
+        assert_eq!(resumed.to_vec(), expected);
+
+        let mut wrapped = fixture.argv();
+        wrapped.splice(1..4, ["ops/run_segment.py".into(), "run".into()]);
+        assert!(matches!(
+            same_run_resume_command(
+                &CommandLine::try_from_argv(wrapped).unwrap(),
+                "generation-9"
+            ),
+            Err(DirectSegmentCommandShapeError::InvalidModuleInvocation { .. })
+        ));
+        assert!(matches!(
+            same_run_resume_command(&saved, "--task"),
+            Err(DirectSegmentCommandShapeError::AmbiguousFlagValue { .. })
         ));
     }
 }

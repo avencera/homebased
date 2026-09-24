@@ -7,20 +7,23 @@ use crate::daemon::actors::{StoreMsg, SupervisorMsg, call, send_reply};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::resource::bound_action::{PreparedActionTask, ResourceActionRejection};
 use crate::resource::release_watcher::{ReleaseWatcherCommand, release_watcher_executable};
 use crate::resource::store::{
-    AssignedResourceTaskAttention, AssignedResourceTaskReconcileInput,
-    AssignedResourceTaskReconcileOutcome, CompleteReleaseError, ReleaseCompletionResult,
-    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ResourceSnapshot,
-    ResourceTaskAcceptance, ResourceTaskAcceptanceInput, ResourceTaskCompletionResult,
+    AssignedResourceTaskAttention, AssignedResourceTaskProgress,
+    AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome, CompleteReleaseError,
+    ReleaseCompletionResult, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
+    ResourceSnapshot, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
+    ResourceTaskCompletionResult,
 };
 use crate::resource::{
     ActionId, Loan, LoanPhase, LoanState, ReleaseProofAttentionReason, ReleaseWatcherIntent,
     ReleaseWatcherTaskId, Resource, ResourceId, ResourceQueueAttentionReason,
-    ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState,
-    SavedReleaseWatcherIntent, ServingReleaseProvenance,
+    ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState, RestoreAttentionReason,
+    SavedReleaseWatcherIntent, ServingReleaseProvenance, SupervisorActionAuthority,
 };
-use crate::submission::RequestId;
+use crate::store::{BackgroundLaunchPhase, BackgroundLaunchView, RestoreReconcileOutcome};
+use crate::submission::{RequestId, normalized_spec_sha256};
 
 /// Messages for one resource actor
 pub enum ResourceMsg {
@@ -50,6 +53,55 @@ pub enum ResourceMsg {
         /// Result returned by the dedicated assigned-task launch path
         result: ResourceTaskActivationResult,
     },
+    /// Wake when a durable event for one task was delivered; only the bound return task matters
+    TaskProgress {
+        /// Task whose durable state may have changed
+        task_id: TaskId,
+    },
+    /// The supervisor is about to bind and launch one fixed return task
+    RestoreLaunchStarted {
+        /// Return action that owns the task
+        action_id: ActionId,
+        /// Fixed return task identity
+        task_id: TaskId,
+    },
+    /// Result of the supervisor's one bind-and-launch request for a return task
+    RestoreLaunchFinished {
+        /// Return action that owns the task
+        action_id: ActionId,
+        /// Fixed return task identity
+        task_id: TaskId,
+        /// Whether that request inserted the task and started its worker
+        result: RestoreLaunchResult,
+    },
+    /// The supervisor is about to bind and launch one first background task
+    BackgroundLaunchStarted {
+        /// Stable launch request identity
+        request_id: RequestId,
+    },
+    /// Result of the supervisor's one bind-and-launch request for a first background task
+    BackgroundLaunchFinished {
+        /// Stable launch request identity
+        request_id: RequestId,
+        /// Whether that request inserted the task and started its worker
+        result: BackgroundLaunchResult,
+    },
+    /// Bind and baseline the watcher for a remote supervisor, then return its canonical task
+    PrepareRemoteWatcher {
+        /// Exact action authority named by the supervisor machine
+        authority: SupervisorActionAuthority,
+        /// Background task named by the release action
+        observed_background_task: TaskId,
+        /// Canonical watcher task or a definitive refusal
+        reply: RpcReplyPort<Result<Result<PreparedActionTask, ResourceActionRejection>, AppError>>,
+    },
+    /// The supervisor is about to accept a remote supervisor's bound watcher
+    RemoteWatcherLaunchStarted {
+        /// Release action that owns the watcher
+        action_id: ActionId,
+        /// Exact bound watcher task
+        watcher_task_id: TaskId,
+    },
     /// Result of one asynchronous, bound release-watcher launch request
     WatcherLaunchFinished {
         /// Release action that owns the watcher
@@ -59,6 +111,19 @@ pub enum ResourceMsg {
         /// Result returned by the dedicated watcher launch path
         result: ReleaseWatcherLaunchResult,
     },
+}
+
+/// Outcome of one supervisor request to bind and launch a first background task
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundLaunchResult {
+    /// The launch request has not replied yet
+    Pending,
+    /// The launch was inserted by this request, so it was the only spawn attempt
+    Inserted,
+    /// An exact earlier launch existed and was only observed
+    Existing,
+    /// Nothing was inserted, or a committed row may have no worker
+    NotInserted,
 }
 
 /// Outcome of asking the supervisor to accept one bound release watcher
@@ -81,9 +146,34 @@ pub enum ReleaseWatcherLaunchResult {
     Uncertain,
 }
 
+/// Outcome of the supervisor's one bind-and-launch request for a return task
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreLaunchResult {
+    /// The request has not replied yet
+    Pending,
+    /// The request inserted the task, so its worker launch was the only spawn attempt
+    Inserted,
+    /// An exact earlier binding existed, so the request only observed it
+    Existing {
+        /// State retained by the task layer
+        state: ProcessStatus,
+    },
+    /// The request wrote no task records or its result was not definitive
+    NotInserted,
+}
+
 /// Launch and observation state of the bound watcher for one release action
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseWatcherStatus {
+    /// The watcher is bound, and the remote supervisor machine must save its route and launch it
+    AwaitingRemoteSupervisor {
+        /// Release action that owns the watcher
+        action_id: ActionId,
+        /// Exact bound watcher task
+        watcher_task_id: TaskId,
+        /// Machine that owns the supervisor thread and the watcher callback route
+        supervisor_machine: MachineId,
+    },
     /// The one launch request for this watcher is in flight or its task has not started
     Launching {
         /// Release action that owns the watcher
@@ -196,6 +286,26 @@ pub struct ResourceActorState {
     activation_attempt: Option<ActivationAttempt>,
     watcher_launch: Option<WatcherLaunchAttempt>,
     release_watcher: Option<ReleaseWatcherStatus>,
+    restore_launch: Option<RestoreLaunchAttempt>,
+    background_launch: Option<BackgroundLaunchAttempt>,
+    pending_background_task: Option<TaskId>,
+}
+
+// one supervisor launch request per first background request and actor lifetime;
+// a queued row that this lifetime did not insert may have lost its spawn
+#[derive(Debug, Clone, Copy)]
+struct BackgroundLaunchAttempt {
+    request_id: RequestId,
+    result: BackgroundLaunchResult,
+}
+
+// one supervisor launch request per return task and actor lifetime; a queued row
+// that this lifetime did not insert may have lost its spawn and is only observed
+#[derive(Debug, Clone, Copy)]
+struct RestoreLaunchAttempt {
+    action_id: ActionId,
+    task_id: TaskId,
+    result: RestoreLaunchResult,
 }
 
 // one launch request per watcher identity and actor lifetime; a new actor after a
@@ -252,6 +362,9 @@ impl Actor for ResourceActor {
             activation_attempt: None,
             watcher_launch: None,
             release_watcher: None,
+            restore_launch: None,
+            background_launch: None,
+            pending_background_task: None,
         };
         reconcile_and_refresh(&_myself, &mut state).await?;
 
@@ -269,9 +382,58 @@ impl Actor for ResourceActor {
                 send_reply(reply, reconcile_and_refresh(&myself, state).await);
             }
             ResourceMsg::TaskTerminal { task_id } => {
-                if serving_task_id(state).await? == Some(task_id) {
+                if restoring_task_id(state) == Some(task_id)
+                    || state.pending_background_task == Some(task_id)
+                    || serving_task_id(state).await? == Some(task_id)
+                {
                     reconcile_and_refresh(&myself, state).await?;
                 }
+            }
+            ResourceMsg::TaskProgress { task_id } => {
+                if restoring_task_id(state) == Some(task_id)
+                    || state.pending_background_task == Some(task_id)
+                    || state
+                        .watcher_launch
+                        .is_some_and(|attempt| attempt.watcher_task_id == task_id)
+                {
+                    reconcile_and_refresh(&myself, state).await?;
+                }
+            }
+            ResourceMsg::RestoreLaunchStarted { action_id, task_id } => {
+                state.restore_launch = Some(RestoreLaunchAttempt {
+                    action_id,
+                    task_id,
+                    result: RestoreLaunchResult::Pending,
+                });
+            }
+            ResourceMsg::RestoreLaunchFinished {
+                action_id,
+                task_id,
+                result,
+            } => {
+                if let Some(attempt) = state.restore_launch.as_mut()
+                    && attempt.action_id == action_id
+                    && attempt.task_id == task_id
+                    && attempt.result == RestoreLaunchResult::Pending
+                {
+                    attempt.result = result;
+                }
+                reconcile_and_refresh(&myself, state).await?;
+            }
+            ResourceMsg::BackgroundLaunchStarted { request_id } => {
+                state.background_launch = Some(BackgroundLaunchAttempt {
+                    request_id,
+                    result: BackgroundLaunchResult::Pending,
+                });
+            }
+            ResourceMsg::BackgroundLaunchFinished { request_id, result } => {
+                if let Some(attempt) = state.background_launch.as_mut()
+                    && attempt.request_id == request_id
+                    && attempt.result == BackgroundLaunchResult::Pending
+                {
+                    attempt.result = result;
+                }
+                reconcile_and_refresh(&myself, state).await?;
             }
             ResourceMsg::Wake => {
                 reconcile_and_refresh(&myself, state).await?;
@@ -289,6 +451,27 @@ impl Actor for ResourceActor {
                 result,
             } => {
                 handle_watcher_launch_finished(state, action_id, watcher_task_id, result).await?;
+            }
+            ResourceMsg::PrepareRemoteWatcher {
+                authority,
+                observed_background_task,
+                reply,
+            } => {
+                let prepared =
+                    prepare_remote_watcher(state, authority, observed_background_task).await;
+                send_reply(reply, prepared);
+                reconcile_and_refresh(&myself, state).await?;
+            }
+            ResourceMsg::RemoteWatcherLaunchStarted {
+                action_id,
+                watcher_task_id,
+            } => {
+                // only this lifetime's own accepted request may show a queued row as launching
+                state.watcher_launch = Some(WatcherLaunchAttempt {
+                    action_id,
+                    watcher_task_id,
+                    result: ReleaseWatcherLaunchResult::Pending,
+                });
             }
             ResourceMsg::Inspect { reply } => send_reply(
                 reply,
@@ -379,7 +562,7 @@ async fn reconcile_and_refresh(
         Some((attempt.request_id, attempt.task_id)) == current_activation
             && matches!(attempt.result, ActivationAttemptResult::Inserted)
     });
-    let mut accepted_state = None;
+    let mut accepted_progress = None;
     let mut task_attention = None;
     let mut completion_committed = false;
     if let Some((loan, request, _)) = &serving_request {
@@ -396,15 +579,18 @@ async fn reconcile_and_refresh(
         })
         .await?
         {
-            Err(_) => {
-                task_attention = Some(AssignedResourceTaskAttention::TaskIdentityMismatch);
+            Err(error) => {
+                let task_id = request.task_id;
+                tracing::warn!(%task_id, "assigned resource task reconciliation failed: {error}");
+                task_attention =
+                    Some(ResourceQueueAttentionReason::AssignedTaskReconcileFailed { task_id });
             }
             Ok(AssignedResourceTaskReconcileOutcome::NotAccepted) => {}
-            Ok(AssignedResourceTaskReconcileOutcome::Active { state }) => {
-                accepted_state = Some(state);
+            Ok(AssignedResourceTaskReconcileOutcome::Active(progress)) => {
+                accepted_progress = Some(progress);
             }
             Ok(AssignedResourceTaskReconcileOutcome::Attention(reason)) => {
-                task_attention = Some(reason);
+                task_attention = Some(task_completion_attention_reason(request.task_id, reason));
             }
             Ok(AssignedResourceTaskReconcileOutcome::Completed(result)) => {
                 let next_assignment =
@@ -433,42 +619,26 @@ async fn reconcile_and_refresh(
                 reason,
             };
         } else if let Some((loan, request, provenance)) = serving_request.take() {
-            if let Some(attention) = task_attention {
-                let task_id = request.task_id;
-                outcome = ResourceQueueReconcileOutcome::AttentionRequired {
-                    request,
-                    reason: task_completion_attention_reason(task_id, attention),
-                };
+            if let Some(reason) = task_attention {
+                outcome = ResourceQueueReconcileOutcome::AttentionRequired { request, reason };
             } else if matches!(provenance, ServingReleaseProvenance::Unverified) {
                 outcome = ResourceQueueReconcileOutcome::AttentionRequired {
                     request,
                     reason: ResourceQueueAttentionReason::UnverifiedServingRelease,
                 };
-            } else if let Some(status) = accepted_state {
-                match status {
-                    ProcessStatus::Queued if !fresh_inserted => {
-                        outcome = ResourceQueueReconcileOutcome::AttentionRequired {
-                            request: request.clone(),
-                            reason: ResourceQueueAttentionReason::AssignedTaskLaunchUncertain {
-                                task_id: request.task_id,
-                            },
-                        };
-                    }
-                    ProcessStatus::Queued | ProcessStatus::Running => {
-                        outcome = ResourceQueueReconcileOutcome::LoanAlreadyActive { loan };
-                    }
-                    ProcessStatus::Succeeded
-                    | ProcessStatus::Failed
-                    | ProcessStatus::Cancelled
-                    | ProcessStatus::Lost => {
-                        let task_id = request.task_id;
-                        outcome = ResourceQueueReconcileOutcome::AttentionRequired {
-                            request,
-                            reason: ResourceQueueAttentionReason::AssignedTaskIdentityMismatch {
-                                task_id,
-                            },
-                        };
-                    }
+            } else if let Some(progress) = accepted_progress {
+                // only this actor's own Inserted launch may still be starting; an
+                // existing queued row from before is never respawned here
+                if progress == AssignedResourceTaskProgress::Queued && !fresh_inserted {
+                    let task_id = request.task_id;
+                    outcome = ResourceQueueReconcileOutcome::AttentionRequired {
+                        request,
+                        reason: ResourceQueueAttentionReason::AcceptedTaskLaunchUncertain {
+                            task_id,
+                        },
+                    };
+                } else {
+                    outcome = ResourceQueueReconcileOutcome::LoanAlreadyActive { loan };
                 }
             } else if let Some(attempt) = state.activation_attempt {
                 if attempt.request_id == request.request_id
@@ -511,11 +681,203 @@ async fn reconcile_and_refresh(
         }
     }
 
+    if let Some(restore_outcome) = reconcile_restore(myself, state, &mut snapshot).await? {
+        outcome = restore_outcome;
+    }
+
+    if let Some(launch_outcome) = observe_background_launch(state, &snapshot).await? {
+        outcome = launch_outcome;
+    }
+
     state.resource = snapshot.resource;
     state.loan = snapshot.loan;
     state.reconcile_outcome = Some(outcome.clone());
 
     Ok(outcome)
+}
+
+/// Observe the bound return task and close the loan by its saved execution mode
+///
+/// A direct-segment task closes the loan on a confirmed start. A native
+/// foreground task keeps it until a successful end with a confirmed
+/// process-group exit. A queued row is a launch in progress only while this actor's own supervisor
+/// request is pending or inserted it; otherwise its worker may never start. After
+/// closure the queue is reconciled again, so requests accepted after the return
+/// reservation open the next loan under the normal rules
+async fn reconcile_restore(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    snapshot: &mut ResourceSnapshot,
+) -> Result<Option<ResourceQueueReconcileOutcome>, AppError> {
+    let pending_action = snapshot.loan.as_ref().and_then(|loan| match &loan.state {
+        LoanState::Active {
+            phase:
+                LoanPhase::AwaitingReturn { action_id, .. } | LoanPhase::Restoring { action_id, .. },
+        } => Some(*action_id),
+        LoanState::Active { .. } | LoanState::NeedsAttention { .. } | LoanState::Closed { .. } => {
+            None
+        }
+    });
+    if state
+        .restore_launch
+        .is_some_and(|attempt| Some(attempt.action_id) != pending_action)
+    {
+        state.restore_launch = None;
+    }
+    let Some((loan, action_id, task_id)) = restoring(snapshot) else {
+        return Ok(None);
+    };
+
+    let reply = call(&state.store, |reply| {
+        StoreMsg::ReconcileRestoringLoanForAuthority {
+            authority_machine: state.authority_machine,
+            resource_id: snapshot.resource.id,
+            reply,
+        }
+    })
+    .await?;
+    let attention = |loan, action_id, task_id, reason| {
+        Ok(Some(
+            ResourceQueueReconcileOutcome::RestoreAttentionRequired {
+                loan,
+                action_id,
+                task_id,
+                reason,
+            },
+        ))
+    };
+    match reply {
+        Err(error) => {
+            tracing::warn!(%task_id, "restoring resource task reconciliation failed: {error}");
+            attention(
+                loan,
+                action_id,
+                task_id,
+                RestoreAttentionReason::ReconcileFailed,
+            )
+        }
+        Ok(RestoreReconcileOutcome::NotRestoring) => Ok(None),
+        Ok(RestoreReconcileOutcome::Queued {
+            loan,
+            action_id,
+            task_id,
+        }) => {
+            let launching = state.restore_launch.is_some_and(|attempt| {
+                attempt.action_id == action_id
+                    && attempt.task_id == task_id
+                    && matches!(
+                        attempt.result,
+                        RestoreLaunchResult::Pending | RestoreLaunchResult::Inserted
+                    )
+            });
+            if launching {
+                return Ok(Some(ResourceQueueReconcileOutcome::LoanAlreadyActive {
+                    loan,
+                }));
+            }
+            attention(
+                loan,
+                action_id,
+                task_id,
+                RestoreAttentionReason::LaunchUncertain,
+            )
+        }
+        Ok(RestoreReconcileOutcome::Attention {
+            loan,
+            action_id,
+            task_id,
+            reason,
+        }) => attention(loan, action_id, task_id, reason),
+        // the running foreground task keeps the loan, so no queued request can start
+        Ok(RestoreReconcileOutcome::ForegroundRunning { loan, .. }) => {
+            Ok(Some(ResourceQueueReconcileOutcome::LoanAlreadyActive {
+                loan,
+            }))
+        }
+        Ok(
+            RestoreReconcileOutcome::Closed { .. }
+            | RestoreReconcileOutcome::ForegroundEnded { .. },
+        ) => {
+            state.restore_launch = None;
+            let outcome = call(&state.store, |reply| StoreMsg::ReconcileResourceQueue {
+                authority_machine: state.authority_machine,
+                resource_id: snapshot.resource.id,
+                reply,
+            })
+            .await?;
+            *snapshot = load_snapshot(state).await?;
+            // a newly opened loan still needs its watcher and assignment steps
+            myself.cast(ResourceMsg::Wake)?;
+            Ok(Some(outcome))
+        }
+    }
+}
+
+/// Track the pending first background launch and surface a queued row as uncertain
+///
+/// A queued row is a launch in progress only while this actor's own supervisor
+/// request is pending or inserted it. The store registers the task on its
+/// confirmed start, so a registered or ended launch needs no tracking here
+async fn observe_background_launch(
+    state: &mut ResourceActorState,
+    snapshot: &ResourceSnapshot,
+) -> Result<Option<ResourceQueueReconcileOutcome>, AppError> {
+    let view = call(&state.store, |reply| {
+        StoreMsg::BackgroundLaunchForAuthority {
+            authority_machine: state.authority_machine,
+            resource_id: snapshot.resource.id,
+            reply,
+        }
+    })
+    .await?;
+    state.pending_background_task = view.as_ref().and_then(BackgroundLaunchView::pending_task);
+    let Some(view) = view.filter(|view| view.phase == BackgroundLaunchPhase::Queued) else {
+        return Ok(None);
+    };
+    let launching = state.background_launch.is_some_and(|attempt| {
+        attempt.request_id == view.request_id
+            && matches!(
+                attempt.result,
+                BackgroundLaunchResult::Pending | BackgroundLaunchResult::Inserted
+            )
+    });
+    if launching {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        ResourceQueueReconcileOutcome::BackgroundLaunchUncertain {
+            task_id: view.task_id,
+        },
+    ))
+}
+
+fn restoring(snapshot: &ResourceSnapshot) -> Option<(Loan, ActionId, TaskId)> {
+    let loan = snapshot.loan.as_ref()?;
+    let LoanState::Active {
+        phase:
+            LoanPhase::Restoring {
+                action_id,
+                resume_task_id,
+                ..
+            },
+    } = &loan.state
+    else {
+        return None;
+    };
+
+    Some((loan.clone(), *action_id, *resume_task_id))
+}
+
+fn restoring_task_id(state: &ResourceActorState) -> Option<TaskId> {
+    match &state.loan.as_ref()?.state {
+        LoanState::Active {
+            phase: LoanPhase::Restoring { resume_task_id, .. },
+        } => Some(*resume_task_id),
+        LoanState::Active { .. } | LoanState::NeedsAttention { .. } | LoanState::Closed { .. } => {
+            None
+        }
+    }
 }
 
 async fn load_snapshot(state: &ResourceActorState) -> Result<ResourceSnapshot, AppError> {
@@ -649,11 +1011,14 @@ async fn handle_activation_finished(
     Ok(())
 }
 
-/// Bind, baseline, and request the one co-located watcher for a running trainer
+/// Bind, baseline, and request the one watcher for a running trainer
 ///
 /// Every step reuses saved identities first, so a retry or restart binds the same
-/// watcher task and request instead of allocating replacements. The supervisor is
-/// called from a detached task because it may be waiting on this actor
+/// watcher task and request instead of allocating replacements. A co-located
+/// supervisor's watcher is launched here; a remote supervisor's machine saves the
+/// callback route first and then asks the authority to accept the same identity.
+/// The supervisor is called from a detached task because it may be waiting on
+/// this actor
 async fn progress_release_watcher(
     myself: &ActorRef<ResourceMsg>,
     state: &mut ResourceActorState,
@@ -680,19 +1045,75 @@ async fn progress_release_watcher(
         state.watcher_launch = None;
     }
 
-    let attention = |reason| Ok(Some(ReleaseWatcherStatus::Attention { action_id, reason }));
+    let (intent, executable) =
+        match bind_release_watcher(state, resource, loan, action_id, trainer_task_id).await? {
+            WatcherBinding::NotNeeded => return Ok(None),
+            WatcherBinding::Attention(reason) => {
+                return Ok(Some(ReleaseWatcherStatus::Attention { action_id, reason }));
+            }
+            WatcherBinding::Bound { intent, executable } => (intent, executable),
+        };
+
+    let watcher_task_id = intent.watcher_task_id.as_task_id();
     if resource.supervisor.machine != state.authority_machine {
-        return attention(ReleaseWatcherAttentionReason::RemoteSupervisorUnsupported {
-            supervisor_machine: resource.supervisor.machine,
-        });
+        return remote_watcher_status(state, resource, action_id, watcher_task_id)
+            .await
+            .map(Some);
     }
+    let attempt = WatcherLaunchAttempt {
+        action_id,
+        watcher_task_id,
+        result: ReleaseWatcherLaunchResult::Pending,
+    };
+    state.watcher_launch = Some(attempt);
+    schedule_release_watcher_launch(
+        myself.clone(),
+        supervisor,
+        ReleaseWatcherLaunch {
+            authority_machine: state.authority_machine,
+            resource_id: resource.id,
+            supervisor: resource.supervisor,
+            intent,
+            executable,
+        },
+    );
+
+    watcher_status(state, attempt).await.map(Some)
+}
+
+/// Result of binding and baselining the watcher for one release action
+enum WatcherBinding {
+    /// The trainer is not running, so no watcher is needed now
+    NotNeeded,
+    /// The watcher cannot be bound, and the loan stays reserved
+    Attention(ReleaseWatcherAttentionReason),
+    /// The saved watcher identity and a verified checkpoint baseline exist
+    Bound {
+        /// Saved watcher intent
+        intent: ReleaseWatcherIntent,
+        /// Executable placed in the canonical watcher command
+        executable: std::path::PathBuf,
+    },
+}
+
+/// Bind the watcher identity to the release action and capture its checkpoint baseline
+///
+/// The authority allocates the watcher and request identities once and binds
+/// them before any launch, so co-located and remote supervisors use one path
+async fn bind_release_watcher(
+    state: &ResourceActorState,
+    resource: &Resource,
+    loan: &Loan,
+    action_id: ActionId,
+    trainer_task_id: TaskId,
+) -> Result<WatcherBinding, AppError> {
     let trainer = call(&state.store, |reply| StoreMsg::GetTask {
         id: trainer_task_id,
         reply,
     })
     .await?;
     if trainer.is_none_or(|row| row.status() != ProcessStatus::Running) {
-        return Ok(None);
+        return Ok(WatcherBinding::NotNeeded);
     }
     let association = call(&state.store, |reply| {
         StoreMsg::TrainerAttemptAssociationForTaskForAuthority {
@@ -706,12 +1127,16 @@ async fn progress_release_watcher(
         association,
         Ok(Some(ref association)) if association.resource_id() == resource.id
     ) {
-        return attention(ReleaseWatcherAttentionReason::TrainerAssociationMissing {
-            task_id: trainer_task_id,
-        });
+        return Ok(WatcherBinding::Attention(
+            ReleaseWatcherAttentionReason::TrainerAssociationMissing {
+                task_id: trainer_task_id,
+            },
+        ));
     }
     let Ok(executable) = release_watcher_executable() else {
-        return attention(ReleaseWatcherAttentionReason::ExecutableUnavailable);
+        return Ok(WatcherBinding::Attention(
+            ReleaseWatcherAttentionReason::ExecutableUnavailable,
+        ));
     };
 
     let saved_intent = match &loan.state {
@@ -719,13 +1144,15 @@ async fn progress_release_watcher(
             phase: LoanPhase::AwaitingRelease { watcher_intent, .. },
         } => watcher_intent.clone(),
         LoanState::Active { .. } | LoanState::NeedsAttention { .. } | LoanState::Closed { .. } => {
-            return Ok(None);
+            return Ok(WatcherBinding::NotNeeded);
         }
     };
     let intent = match saved_intent {
         Some(SavedReleaseWatcherIntent::Complete(intent)) => intent,
         Some(SavedReleaseWatcherIntent::LegacyUnproven(_)) => {
-            return attention(ReleaseWatcherAttentionReason::LegacyWatcherIntent);
+            return Ok(WatcherBinding::Attention(
+                ReleaseWatcherAttentionReason::LegacyWatcherIntent,
+            ));
         }
         None => {
             let command = ReleaseWatcherCommand {
@@ -738,7 +1165,9 @@ async fn progress_release_watcher(
             let Ok(normalized_spec_sha256) =
                 command.normalized_spec_sha256(&executable, resource.supervisor.thread)
             else {
-                return attention(ReleaseWatcherAttentionReason::ExecutableUnavailable);
+                return Ok(WatcherBinding::Attention(
+                    ReleaseWatcherAttentionReason::ExecutableUnavailable,
+                ));
             };
             let intent = ReleaseWatcherIntent {
                 action_id,
@@ -761,7 +1190,9 @@ async fn progress_release_watcher(
                 Ok(intent) => intent,
                 Err(error) => {
                     tracing::warn!(resource = %resource.id.as_uuid(), action = %action_id.as_uuid(), "bind release watcher: {error}");
-                    return attention(ReleaseWatcherAttentionReason::BindingRejected);
+                    return Ok(WatcherBinding::Attention(
+                        ReleaseWatcherAttentionReason::BindingRejected,
+                    ));
                 }
             }
         }
@@ -779,29 +1210,102 @@ async fn progress_release_watcher(
     .await?;
     if let Err(error) = baseline {
         tracing::warn!(resource = %resource.id.as_uuid(), action = %action_id.as_uuid(), "capture release checkpoint baseline: {error}");
-        return attention(ReleaseWatcherAttentionReason::BaselineUnavailable);
+        return Ok(WatcherBinding::Attention(
+            ReleaseWatcherAttentionReason::BaselineUnavailable,
+        ));
     }
 
-    let watcher_task_id = intent.watcher_task_id.as_task_id();
-    let attempt = WatcherLaunchAttempt {
-        action_id,
-        watcher_task_id,
-        result: ReleaseWatcherLaunchResult::Pending,
-    };
-    state.watcher_launch = Some(attempt);
-    schedule_release_watcher_launch(
-        myself.clone(),
-        supervisor,
-        ReleaseWatcherLaunch {
-            authority_machine: state.authority_machine,
-            resource_id: resource.id,
-            supervisor: resource.supervisor,
-            intent,
-            executable,
-        },
-    );
+    Ok(WatcherBinding::Bound { intent, executable })
+}
 
-    watcher_status(state, attempt).await.map(Some)
+/// Observe a remote supervisor's watcher without launching it from this actor
+///
+/// No row means the supervisor machine has not launched it. A row that this actor
+/// lifetime did not see accepted is observed like any existing acceptance, so a
+/// queued row whose spawn may have been lost needs attention
+async fn remote_watcher_status(
+    state: &ResourceActorState,
+    resource: &Resource,
+    action_id: ActionId,
+    watcher_task_id: TaskId,
+) -> Result<ReleaseWatcherStatus, AppError> {
+    let row = call(&state.store, |reply| StoreMsg::GetTask {
+        id: watcher_task_id,
+        reply,
+    })
+    .await?;
+    if row.is_none() {
+        return Ok(ReleaseWatcherStatus::AwaitingRemoteSupervisor {
+            action_id,
+            watcher_task_id,
+            supervisor_machine: resource.supervisor.machine,
+        });
+    }
+    watcher_status(
+        state,
+        WatcherLaunchAttempt {
+            action_id,
+            watcher_task_id,
+            result: ReleaseWatcherLaunchResult::Uncertain,
+        },
+    )
+    .await
+}
+
+/// Validate a remote supervisor's action, then return the bound canonical watcher
+async fn prepare_remote_watcher(
+    state: &ResourceActorState,
+    authority: SupervisorActionAuthority,
+    observed_background_task: TaskId,
+) -> Result<Result<PreparedActionTask, ResourceActionRejection>, AppError> {
+    let snapshot = load_snapshot(state).await?;
+    let resource = &snapshot.resource;
+    if resource.supervisor != authority.supervisor
+        || resource.assignment_revision != authority.assignment_revision
+        || resource.supervisor.machine == state.authority_machine
+    {
+        return Ok(Err(ResourceActionRejection::NotCurrentSupervisor));
+    }
+    if resource.state_revision != authority.expected_state_revision {
+        return Ok(Err(ResourceActionRejection::StaleRevision {
+            expected: authority.expected_state_revision,
+            actual: resource.state_revision,
+        }));
+    }
+    let Some((loan, action_id, trainer_task_id)) = awaiting_release(&snapshot) else {
+        return Ok(Err(ResourceActionRejection::ActionNotPending));
+    };
+    if loan.id != authority.loan_id
+        || action_id != authority.action_id
+        || trainer_task_id != observed_background_task
+    {
+        return Ok(Err(ResourceActionRejection::ActionNotPending));
+    }
+
+    let unavailable =
+        |reason: String| Ok(Err(ResourceActionRejection::WatcherUnavailable { reason }));
+    let (intent, executable) =
+        match bind_release_watcher(state, resource, &loan, action_id, trainer_task_id).await? {
+            WatcherBinding::NotNeeded => {
+                return unavailable("the observed background task is not running".into());
+            }
+            WatcherBinding::Attention(reason) => return unavailable(format!("{reason:?}")),
+            WatcherBinding::Bound { intent, executable } => (intent, executable),
+        };
+    let spec = ReleaseWatcherCommand::from_intent(resource.id, &intent)
+        .normalized_spec(&executable, resource.supervisor.thread)?;
+    let normalized_spec_sha256 = normalized_spec_sha256(&spec)?;
+    // a changed daemon executable cannot silently replace the bound command
+    if normalized_spec_sha256 != intent.normalized_spec_sha256 {
+        return unavailable("the watcher executable differs from the bound command".into());
+    }
+
+    Ok(Ok(PreparedActionTask {
+        request_id: intent.request_id,
+        task_id: intent.watcher_task_id.as_task_id(),
+        spec,
+        normalized_spec_sha256,
+    }))
 }
 
 fn schedule_release_watcher_launch(
@@ -985,6 +1489,10 @@ fn release_proof_attention_reason(error: CompleteReleaseError) -> ReleaseProofAt
         | CompleteReleaseError::OwnershipLock(_) => {
             ReleaseProofAttentionReason::OwnershipLockUnverified
         }
+        // no saved lock names the worker, so only an operator can resolve it
+        CompleteReleaseError::TrainerAssociationMissing { .. } => {
+            ReleaseProofAttentionReason::TrainerAssociationMissing
+        }
         CompleteReleaseError::Resource(_)
         | CompleteReleaseError::Notice(_)
         | CompleteReleaseError::TrainerAssociation(_)
@@ -996,7 +1504,6 @@ fn release_proof_attention_reason(error: CompleteReleaseError) -> ReleaseProofAt
         | CompleteReleaseError::InvalidReleaseNotice { .. }
         | CompleteReleaseError::StaleRevision { .. }
         | CompleteReleaseError::BackgroundTaskMissing { .. }
-        | CompleteReleaseError::TrainerAssociationMissing { .. }
         | CompleteReleaseError::TrainerAssociationMismatch { .. }
         | CompleteReleaseError::TrainerIdentityMissing { .. }
         | CompleteReleaseError::TrainerIdentityChanged { .. }

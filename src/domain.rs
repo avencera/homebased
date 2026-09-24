@@ -15,7 +15,7 @@ use crate::error::AppError;
 pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`. Earlier databases migrate in place to this version.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// Maximum Unicode scalar values in a submitted task name.
 pub const TASK_NAME_MAX_CHARS: usize = 120;

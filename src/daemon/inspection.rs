@@ -24,7 +24,9 @@ use crate::fleet::probe::{VerifiedDestination, check_probed, probe};
 use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
-use crate::submission::{ExecutorIdentity, SubmissionState};
+use crate::submission::{
+    ExecutorIdentity, ResourceActionRoutePhase, ResourceBackgroundRoutePhase, SubmissionState,
+};
 
 /// Strict read query for a peer log, with an optional line limit
 #[derive(Debug, Deserialize)]
@@ -740,6 +742,16 @@ fn cached_route(records: &Records, id: TaskId) -> Result<Value, AppError> {
         SubmissionState::Accepted => route.last_execution_state,
         SubmissionState::Rejected { .. } => None,
         SubmissionState::Resource { .. } => route.last_execution_state,
+        SubmissionState::ResourceAction {
+            phase: ResourceActionRoutePhase::Accepted,
+            ..
+        } => route.last_execution_state,
+        SubmissionState::ResourceAction { .. } => None,
+        SubmissionState::ResourceBackground {
+            phase: ResourceBackgroundRoutePhase::Accepted,
+            ..
+        } => route.last_execution_state,
+        SubmissionState::ResourceBackground { .. } => None,
     };
     let mut value = json!({
         "api_version": API_VERSION,
@@ -751,7 +763,18 @@ fn cached_route(records: &Records, id: TaskId) -> Result<Value, AppError> {
         "failed_events": route.failed_events,
         "last_update": route.last_updated_at,
     });
-    let availability = if matches!(route.submission, SubmissionState::Rejected { .. }) {
+    let availability = if matches!(
+        route.submission,
+        SubmissionState::Rejected { .. }
+            | SubmissionState::ResourceAction {
+                phase: ResourceActionRoutePhase::Rejected { .. },
+                ..
+            }
+            | SubmissionState::ResourceBackground {
+                phase: ResourceBackgroundRoutePhase::Rejected { .. },
+                ..
+            }
+    ) {
         "rejected"
     } else if records.unchecked.contains(&route.execution_machine) {
         "executor_unavailable"

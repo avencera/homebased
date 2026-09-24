@@ -39,6 +39,17 @@ export function formatTimestamp(value: Instant | null | undefined): string {
 	return new Date(ms).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' });
 }
 
+/** Clock time in the resource dashboard's fixed US Central time zone. */
+export function formatCentralTimestamp(value: Instant | null | undefined): string {
+	const ms = epochMs(value);
+	if (ms === null) return EM_DASH;
+	return new Date(ms).toLocaleString('en-US', {
+		dateStyle: 'short',
+		timeStyle: 'medium',
+		timeZone: 'America/Chicago'
+	});
+}
+
 /** Compact duration: `2h 05m`, `3m 12s`, `9s`. */
 export function formatDuration(ms: number): string {
 	if (!Number.isFinite(ms)) return EM_DASH;
@@ -77,7 +88,7 @@ export function formatWorkload(workload: WorkloadView): string {
 }
 
 /** Full argv for the detail page. No shell quoting. */
-export function formatCommandArgv(command: string[]): string {
+export function formatCommandArgv(command: readonly string[]): string {
 	return command.join('\n');
 }
 

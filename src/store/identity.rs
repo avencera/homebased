@@ -6,10 +6,16 @@ use super::{Store, resource_task_id_is_reserved};
 use crate::domain::{ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::resource::ActionId;
+use crate::resource::background_launch::{
+    RemoteBackgroundLaunchReceipt, ResourceBackgroundRejection,
+};
+use crate::resource::bound_action::ActionTaskReceipt;
 use crate::submission::{
     ExecutionRecord, ExecutorIdentity, OriginRoute, PreAcceptanceRejection, RejectionTombstone,
-    RequestId, ResourceCancellationOutcome, ResourceCancellationReceipt, ResourceQueueOutcome,
-    ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
+    RequestId, ResourceActionRoutePhase, ResourceBackgroundRoutePhase, ResourceCancellationOutcome,
+    ResourceCancellationReceipt, ResourceQueueOutcome, ResourceQueueReceipt, ResourceRoutePhase,
+    SubmissionState,
 };
 
 /// A durable identity operation failed without changing its existing owner.
@@ -140,8 +146,95 @@ fn same_route_identity(left: &OriginRoute, right: &OriginRoute) -> Result<bool, 
             && *left_resource == *right_resource
             && same_spec),
         (SubmissionState::Resource { .. }, _) | (_, SubmissionState::Resource { .. }) => Ok(false),
+        // a retry must repeat the prepared identities, content, action, and callback
+        (
+            SubmissionState::ResourceAction {
+                binding: left_binding,
+                launch: left_launch,
+                ..
+            },
+            SubmissionState::ResourceAction {
+                binding: right_binding,
+                launch: right_launch,
+                ..
+            },
+        ) => Ok(left.task == right.task
+            && left.execution_machine == right.execution_machine
+            && same_thread
+            && left.callback == right.callback
+            && left_binding == right_binding
+            && left_launch == right_launch
+            && same_spec),
+        (SubmissionState::ResourceAction { .. }, _)
+        | (_, SubmissionState::ResourceAction { .. }) => Ok(false),
+        // a retry must repeat the fixed identities, content, assignment, and callback
+        (
+            SubmissionState::ResourceBackground {
+                binding: left_binding,
+                ..
+            },
+            SubmissionState::ResourceBackground {
+                binding: right_binding,
+                ..
+            },
+        ) => Ok(left.task == right.task
+            && left.execution_machine == right.execution_machine
+            && same_thread
+            && left.callback == right.callback
+            && left_binding == right_binding
+            && same_spec),
+        (SubmissionState::ResourceBackground { .. }, _)
+        | (_, SubmissionState::ResourceBackground { .. }) => Ok(false),
         _ => Ok(same_thread && same_spec),
     }
+}
+
+/// Definitive authority result that resolves one remote first background launch route
+#[derive(Debug, Clone)]
+pub enum ResourceBackgroundRouteResult {
+    /// The authority saved this exact launch binding with the task
+    Accepted(RemoteBackgroundLaunchReceipt),
+    /// The authority refused the launch and wrote no task records
+    Rejected(ResourceBackgroundRejection),
+}
+
+/// Definitive authority result that resolves one action-bound route
+#[derive(Debug, Clone)]
+pub enum ResourceActionRouteResult {
+    /// The authority saved this exact action binding with the task
+    Accepted(ActionTaskReceipt),
+    /// The authority refused the launch and wrote no task records
+    Rejected(crate::resource::bound_action::ResourceActionRejection),
+}
+
+pub(super) fn resource_action_route_by_action_on(
+    conn: &rusqlite::Connection,
+    action: ActionId,
+) -> Result<Option<OriginRoute>, IdentityError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT route_json FROM origin_routes
+             WHERE CASE WHEN json_valid(route_json) THEN
+                json_extract(route_json, '$.submission.type') = 'resource_action'
+                AND json_extract(route_json, '$.submission.binding.authority.action_id') = ?1
+             ELSE 0 END",
+        )
+        .map_err(storage)?;
+    let routes = statement
+        .query_map([action.as_uuid().to_string()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    let mut routes = routes
+        .iter()
+        .map(|json| decode_route(json))
+        .collect::<Result<Vec<_>, _>>()?;
+    if routes.len() > 1 {
+        return Err(IdentityError::Conflict);
+    }
+    Ok(routes.pop())
 }
 
 fn check_resource_receipt(
@@ -213,6 +306,19 @@ impl Store {
             && !matches!(phase, ResourceRoutePhase::AcceptanceUnknown)
         {
             return Err(IdentityError::Conflict);
+        }
+        if let SubmissionState::ResourceBackground { phase, .. } = &route.submission
+            && !matches!(phase, ResourceBackgroundRoutePhase::AcceptanceUnknown)
+        {
+            return Err(IdentityError::Conflict);
+        }
+        if let SubmissionState::ResourceAction { binding, phase, .. } = &route.submission {
+            // one action binds at most one task, so another identity for it conflicts
+            if !matches!(phase, ResourceActionRoutePhase::AcceptanceUnknown)
+                || resource_action_route_by_action_on(&tx, binding.authority.action_id)?.is_some()
+            {
+                return Err(IdentityError::Conflict);
+            }
         }
         let occupied: bool = tx
             .query_row(
@@ -351,6 +457,237 @@ impl Store {
         Ok(routes)
     }
 
+    /// Read the one saved action-bound route for a resource action
+    pub fn resource_action_route_by_action(
+        &self,
+        action: ActionId,
+    ) -> Result<Option<OriginRoute>, IdentityError> {
+        resource_action_route_by_action_on(&self.conn, action)
+    }
+
+    /// Find action-bound routes whose authority acceptance was unknown at startup
+    pub fn unknown_resource_action_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT request_id,task_id,route_json FROM origin_routes
+                 WHERE CASE WHEN json_valid(route_json) THEN
+                    json_extract(route_json, '$.submission.type') = 'resource_action'
+                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
+                 ELSE 0 END
+                 ORDER BY request_id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut routes = Vec::new();
+        for row in rows {
+            let (request, task, json) = row.map_err(storage)?;
+            let route = decode_route(&json)?;
+            if route.request.0.to_string() != request
+                || route.task.to_string() != task
+                || !matches!(
+                    route.submission,
+                    SubmissionState::ResourceAction {
+                        phase: ResourceActionRoutePhase::AcceptanceUnknown,
+                        ..
+                    }
+                )
+            {
+                return Err(IdentityError::Conflict);
+            }
+            routes.push(route);
+        }
+        Ok(routes)
+    }
+
+    /// Apply a definitive authority result to one action-bound route
+    ///
+    /// An acceptance must carry the exact saved binding and identities. A later
+    /// phase is never replaced, and an identical retry leaves the route unchanged
+    pub fn resolve_resource_action_route(
+        &mut self,
+        task: TaskId,
+        result: &ResourceActionRouteResult,
+    ) -> Result<OriginRoute, IdentityError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let data: Option<String> = tx
+            .query_row(
+                "SELECT route_json FROM origin_routes WHERE task_id=?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let mut route = decode_route(data.as_deref().ok_or(IdentityError::RouteNotFound)?)?;
+        let SubmissionState::ResourceAction {
+            binding,
+            launch,
+            phase,
+        } = &route.submission
+        else {
+            return Err(IdentityError::Conflict);
+        };
+        let target = match result {
+            ResourceActionRouteResult::Accepted(receipt) => {
+                let spec = route.current_spec().ok_or(IdentityError::Conflict)?;
+                let digest = crate::submission::normalized_spec_sha256(spec)
+                    .map_err(|error| IdentityError::Storage(error.into()))?;
+                if receipt.kind != binding.kind
+                    || receipt.authority != binding.authority
+                    || receipt.request_id != route.request
+                    || receipt.task_id != route.task
+                    || receipt.normalized_spec_sha256 != digest
+                {
+                    return Err(IdentityError::Conflict);
+                }
+                ResourceActionRoutePhase::Accepted
+            }
+            ResourceActionRouteResult::Rejected(reason) => ResourceActionRoutePhase::Rejected {
+                reason: reason.clone(),
+            },
+        };
+        let next = match (phase, &target) {
+            (ResourceActionRoutePhase::AcceptanceUnknown, _) => Some(target),
+            (saved, target) if saved == target => None,
+            _ => return Err(IdentityError::Conflict),
+        };
+        if let Some(phase) = next {
+            route.submission = SubmissionState::ResourceAction {
+                binding: *binding,
+                launch: launch.clone(),
+                phase,
+            };
+            route.last_updated_at = Some(chrono::Utc::now());
+            validate_route(&route)?;
+            save_route(&tx, &route)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(route)
+    }
+
+    /// Find remote first background launch routes whose acceptance was unknown at startup
+    pub fn unknown_resource_background_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT request_id,task_id,route_json FROM origin_routes
+                 WHERE CASE WHEN json_valid(route_json) THEN
+                    json_extract(route_json, '$.submission.type') = 'resource_background'
+                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
+                 ELSE 0 END
+                 ORDER BY request_id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut routes = Vec::new();
+        for row in rows {
+            let (request, task, json) = row.map_err(storage)?;
+            let route = decode_route(&json)?;
+            if route.request.0.to_string() != request
+                || route.task.to_string() != task
+                || !matches!(
+                    route.submission,
+                    SubmissionState::ResourceBackground {
+                        phase: ResourceBackgroundRoutePhase::AcceptanceUnknown,
+                        ..
+                    }
+                )
+            {
+                return Err(IdentityError::Conflict);
+            }
+            routes.push(route);
+        }
+        Ok(routes)
+    }
+
+    /// Apply a definitive authority result to one remote first background launch route
+    ///
+    /// An acceptance must carry the exact saved binding and identities. An accepted
+    /// route is never replaced, and an identical retry leaves the route unchanged.
+    /// A refusal only replaces an unresolved phase, since a first queued event may
+    /// already have accepted the route
+    pub fn resolve_resource_background_route(
+        &mut self,
+        task: TaskId,
+        result: &ResourceBackgroundRouteResult,
+    ) -> Result<OriginRoute, IdentityError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let data: Option<String> = tx
+            .query_row(
+                "SELECT route_json FROM origin_routes WHERE task_id=?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let mut route = decode_route(data.as_deref().ok_or(IdentityError::RouteNotFound)?)?;
+        let SubmissionState::ResourceBackground { binding, phase } = &route.submission else {
+            return Err(IdentityError::Conflict);
+        };
+        let target = match result {
+            ResourceBackgroundRouteResult::Accepted(receipt) => {
+                let spec = route.current_spec().ok_or(IdentityError::Conflict)?;
+                let digest = crate::submission::normalized_spec_sha256(spec)
+                    .map_err(|error| IdentityError::Storage(error.into()))?;
+                if receipt.binding != *binding
+                    || receipt.request_id != route.request
+                    || receipt.task_id != route.task
+                    || receipt.normalized_spec_sha256 != digest
+                {
+                    return Err(IdentityError::Conflict);
+                }
+                ResourceBackgroundRoutePhase::Accepted
+            }
+            ResourceBackgroundRouteResult::Rejected(reason) => {
+                ResourceBackgroundRoutePhase::Rejected {
+                    reason: reason.clone(),
+                }
+            }
+        };
+        let next = match (phase, &target) {
+            (ResourceBackgroundRoutePhase::AcceptanceUnknown, _)
+            | (
+                ResourceBackgroundRoutePhase::Rejected { .. },
+                ResourceBackgroundRoutePhase::Accepted,
+            ) => Some(target),
+            (saved, target) if saved == target => None,
+            _ => return Err(IdentityError::Conflict),
+        };
+        if let Some(phase) = next {
+            route.submission = SubmissionState::ResourceBackground {
+                binding: *binding,
+                phase,
+            };
+            route.last_updated_at = Some(chrono::Utc::now());
+            validate_route(&route)?;
+            save_route(&tx, &route)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(route)
+    }
+
     /// Set a definitive submission result only while acceptance is unknown.
     pub fn resolve_origin_route(
         &mut self,
@@ -359,7 +696,10 @@ impl Store {
     ) -> Result<OriginRoute, IdentityError> {
         if matches!(
             outcome,
-            SubmissionState::AcceptanceUnknown | SubmissionState::Resource { .. }
+            SubmissionState::AcceptanceUnknown
+                | SubmissionState::Resource { .. }
+                | SubmissionState::ResourceAction { .. }
+                | SubmissionState::ResourceBackground { .. }
         ) {
             return Err(IdentityError::Conflict);
         }
@@ -1530,5 +1870,189 @@ mod tests {
             store.accept_execution(&record),
             Err(IdentityError::Conflict)
         ));
+    }
+
+    fn action_route(launch: crate::resource::bound_action::ResourceActionLaunch) -> OriginRoute {
+        let spec = spec();
+        let binding = crate::submission::ResourceActionRouteBinding {
+            kind: launch.kind(),
+            authority: crate::resource::SupervisorActionAuthority {
+                authority_machine: MachineId::new(),
+                resource_id: ResourceId::new(),
+                loan_id: crate::resource::LoanId::new(),
+                action_id: crate::resource::ActionId::new(),
+                expected_state_revision: ResourceRevision::new(4),
+                supervisor: SupervisorAddress {
+                    machine: MachineId::new(),
+                    thread: spec.thread,
+                },
+                assignment_revision: AssignmentRevision::new(2),
+            },
+        };
+        OriginRoute::new_resource_action(crate::submission::NewResourceActionRoute {
+            request: RequestId::new(),
+            task: TaskId::new(),
+            callback: CallbackContext {
+                env: TaskEnv {
+                    path: "/bin".into(),
+                    home: "/tmp".into(),
+                },
+                cwd: Path::new("/tmp").to_path_buf(),
+                codex: Path::new("/bin/echo").to_path_buf().into(),
+            },
+            spec,
+            binding,
+            launch,
+        })
+        .unwrap()
+    }
+
+    fn watcher_route() -> OriginRoute {
+        action_route(
+            crate::resource::bound_action::ResourceActionLaunch::ReleaseWatcher {
+                observed_background_task: TaskId::new(),
+            },
+        )
+    }
+
+    fn action_receipt(route: &OriginRoute) -> ActionTaskReceipt {
+        let SubmissionState::ResourceAction { binding, .. } = &route.submission else {
+            panic!("fixture must be an action route");
+        };
+        ActionTaskReceipt {
+            kind: binding.kind,
+            authority: binding.authority,
+            request_id: route.request,
+            task_id: route.task,
+            normalized_spec_sha256: crate::submission::normalized_spec_sha256(
+                route.current_spec().unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn action_route_retry_needs_the_same_identity_content_and_one_route_per_action() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = watcher_route();
+        let SubmissionState::ResourceAction { binding, .. } = &route.submission else {
+            unreachable!();
+        };
+        let action = binding.authority.action_id;
+        assert_eq!(store.insert_origin_route(&route).unwrap().task, route.task);
+        // an exact retry returns the saved route
+        assert_eq!(store.insert_origin_route(&route).unwrap().task, route.task);
+
+        let mut changed = route.clone();
+        changed.callback.cwd = Path::new("/var").to_path_buf();
+        assert!(matches!(
+            store.insert_origin_route(&changed),
+            Err(IdentityError::Conflict)
+        ));
+        let mut other_task = route.clone();
+        other_task.task = TaskId::new();
+        assert!(matches!(
+            store.insert_origin_route(&other_task),
+            Err(IdentityError::Conflict)
+        ));
+        // a second identity for the same action cannot be saved
+        let mut second = route.clone();
+        second.request = RequestId::new();
+        second.task = TaskId::new();
+        assert!(matches!(
+            store.insert_origin_route(&second),
+            Err(IdentityError::Conflict)
+        ));
+        assert_eq!(
+            store
+                .resource_action_route_by_action(action)
+                .unwrap()
+                .unwrap()
+                .task,
+            route.task
+        );
+
+        // recovery retries it by identity; the generic abandon scan never sees it
+        assert_eq!(store.unknown_resource_action_routes().unwrap().len(), 1);
+        assert!(store.unknown_origin_routes().unwrap().is_empty());
+        assert!(store.unknown_resource_origin_routes().unwrap().is_empty());
+
+        // the saved route survives reopen with the same launch choice
+        drop(store);
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
+        assert!(matches!(
+            saved.submission,
+            SubmissionState::ResourceAction {
+                phase: ResourceActionRoutePhase::AcceptanceUnknown,
+                ..
+            }
+        ));
+        assert_eq!(saved.callback, route.callback);
+    }
+
+    #[test]
+    fn action_route_resolution_requires_the_exact_receipt_and_never_moves_back() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = watcher_route();
+        store.insert_origin_route(&route).unwrap();
+        let receipt = action_receipt(&route);
+
+        let mut other_supervisor = receipt;
+        other_supervisor.authority.assignment_revision = AssignmentRevision::new(3);
+        assert!(matches!(
+            store.resolve_resource_action_route(
+                route.task,
+                &ResourceActionRouteResult::Accepted(other_supervisor)
+            ),
+            Err(IdentityError::Conflict)
+        ));
+        let mut other_digest = receipt;
+        other_digest.normalized_spec_sha256 = crate::submission::normalized_spec_sha256(&{
+            let mut spec = spec();
+            spec.timeout = std::time::Duration::from_secs(1);
+            spec
+        })
+        .unwrap();
+        assert!(matches!(
+            store.resolve_resource_action_route(
+                route.task,
+                &ResourceActionRouteResult::Accepted(other_digest)
+            ),
+            Err(IdentityError::Conflict)
+        ));
+
+        let accepted = store
+            .resolve_resource_action_route(
+                route.task,
+                &ResourceActionRouteResult::Accepted(receipt),
+            )
+            .unwrap();
+        assert!(matches!(
+            accepted.submission,
+            SubmissionState::ResourceAction {
+                phase: ResourceActionRoutePhase::Accepted,
+                ..
+            }
+        ));
+        // a duplicate acceptance is idempotent, and a rejection cannot replace it
+        store
+            .resolve_resource_action_route(
+                route.task,
+                &ResourceActionRouteResult::Accepted(receipt),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.resolve_resource_action_route(
+                route.task,
+                &ResourceActionRouteResult::Rejected(
+                    crate::resource::bound_action::ResourceActionRejection::ActionNotPending
+                )
+            ),
+            Err(IdentityError::Conflict)
+        ));
+        assert!(store.unknown_resource_action_routes().unwrap().is_empty());
     }
 }

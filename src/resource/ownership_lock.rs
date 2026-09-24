@@ -1170,7 +1170,12 @@ fn classify_open_error(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::PathBuf;
+    #![allow(clippy::expect_used)]
+
+    use std::env;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdout, Command, Stdio};
 
     use super::{
         AttemptBinding, OwnershipLockIdentity, TrainerRequestDigest, VerifiedTrainerAttempt,
@@ -1199,75 +1204,27 @@ pub(crate) mod test_support {
             ownership_lock_identity: lock_identity,
         }
     }
-}
 
-#[cfg(unix)]
-fn identity_mismatch(
-    path: &Path,
-    expected: OwnershipLockIdentity,
-    observed: Option<OwnershipLockIdentity>,
-    reason: OwnershipLockIdentityMismatchReason,
-) -> OwnershipLockProbeError {
-    OwnershipLockProbeError::IdentityMismatch {
-        path: path.to_path_buf(),
-        expected,
-        observed,
-        reason,
-    }
-}
+    pub(crate) const CHILD_PATH_ENV: &str = "HOMEBASED_OWNERSHIP_LOCK_TEST_PATH";
+    pub(crate) const CHILD_MODE_ENV: &str = "HOMEBASED_OWNERSHIP_LOCK_TEST_MODE";
+    pub(crate) const HELPER_TEST: &str =
+        "resource::ownership_lock::tests::fake_process_lock_helper";
+    pub(crate) const LOCK_ACQUIRED: &str = "FAKE_LOCK_ACQUIRED";
+    pub(crate) const LOCK_CONTENDED: &str = "FAKE_LOCK_CONTENDED";
 
-#[cfg(all(test, unix))]
-mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use std::env;
-    use std::fs::{self, File, OpenOptions};
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdout, Command, Stdio};
-    use std::time::SystemTime;
-
-    use tempfile::TempDir;
-
-    use super::{
-        AttemptBinding, OwnershipLockIdentity, OwnershipLockIdentityMismatchReason,
-        OwnershipLockProbe, OwnershipLockProbeError, TrainerAttemptEvidenceError,
-        TrainerAttemptUnsafePathReason, VerifiedTrainerAttempt,
-        build_trainer_attempt_registration_evidence,
-        build_trainer_attempt_registration_evidence_inner, probe_segment_ownership_lock,
-    };
-    use serde_json::{Value, json};
-    use sha2::{Digest, Sha256};
-
-    const CHILD_PATH_ENV: &str = "HOMEBASED_OWNERSHIP_LOCK_TEST_PATH";
-    const CHILD_MODE_ENV: &str = "HOMEBASED_OWNERSHIP_LOCK_TEST_MODE";
-    const HELPER_TEST: &str = "resource::ownership_lock::tests::fake_process_lock_helper";
-    const LOCK_ACQUIRED: &str = "FAKE_LOCK_ACQUIRED";
-    const LOCK_CONTENDED: &str = "FAKE_LOCK_CONTENDED";
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct FileSnapshot {
-        identity: OwnershipLockIdentity,
-        contents: Vec<u8>,
-        length: u64,
-        modified: Option<SystemTime>,
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    enum TreeSnapshotEntry {
-        Directory(OwnershipLockIdentity),
-        File(FileSnapshot),
-        Symlink(PathBuf),
-    }
-
-    struct FakeLockProcess {
+    /// Separate test process that holds one exact lock file until released or dropped
+    ///
+    /// flock is owned by the open file description, so a holder in another process
+    /// behaves like the trainer worker that outlives its wrapper
+    pub(crate) struct FakeLockProcess {
         child: Child,
         output: BufReader<ChildStdout>,
         released: bool,
     }
 
     impl FakeLockProcess {
-        fn release(&mut self) {
+        /// Let the holder release the lock and wait for it to exit
+        pub(crate) fn release(&mut self) {
             self.child
                 .stdin
                 .as_mut()
@@ -1297,6 +1254,100 @@ mod tests {
             self.child.stdin.take();
             let _ = self.child.wait();
         }
+    }
+
+    /// Start a separate process that holds the existing lock file at `path`
+    pub(crate) fn start_fake_lock_process(path: &Path) -> FakeLockProcess {
+        let mut child = Command::new(env::current_exe().expect("find current test binary"))
+            .arg("--exact")
+            .arg(HELPER_TEST)
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .env(CHILD_MODE_ENV, "hold")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start fake lock-holder process");
+        let mut process = FakeLockProcess {
+            output: BufReader::new(child.stdout.take().expect("capture helper stdout")),
+            child,
+            released: false,
+        };
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = process
+                .output
+                .read_line(&mut line)
+                .expect("read fake lock-holder readiness");
+            assert_ne!(bytes, 0, "fake lock-holder exited before acquiring lock");
+            if line.trim() == LOCK_ACQUIRED {
+                break;
+            }
+        }
+
+        process
+    }
+}
+
+#[cfg(unix)]
+fn identity_mismatch(
+    path: &Path,
+    expected: OwnershipLockIdentity,
+    observed: Option<OwnershipLockIdentity>,
+    reason: OwnershipLockIdentityMismatchReason,
+) -> OwnershipLockProbeError {
+    OwnershipLockProbeError::IdentityMismatch {
+        path: path.to_path_buf(),
+        expected,
+        observed,
+        reason,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::env;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::SystemTime;
+
+    use tempfile::TempDir;
+
+    use super::{
+        AttemptBinding, OwnershipLockIdentity, OwnershipLockIdentityMismatchReason,
+        OwnershipLockProbe, OwnershipLockProbeError, TrainerAttemptEvidenceError,
+        TrainerAttemptUnsafePathReason, VerifiedTrainerAttempt,
+        build_trainer_attempt_registration_evidence,
+        build_trainer_attempt_registration_evidence_inner, probe_segment_ownership_lock,
+    };
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    use super::test_support::{
+        CHILD_MODE_ENV, CHILD_PATH_ENV, HELPER_TEST, LOCK_ACQUIRED, LOCK_CONTENDED,
+        start_fake_lock_process,
+    };
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileSnapshot {
+        identity: OwnershipLockIdentity,
+        contents: Vec<u8>,
+        length: u64,
+        modified: Option<SystemTime>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TreeSnapshotEntry {
+        Directory(OwnershipLockIdentity),
+        File(FileSnapshot),
+        Symlink(PathBuf),
     }
 
     fn lock_path(runtime_root: &Path) -> PathBuf {
@@ -1451,40 +1502,6 @@ mod tests {
         assert_eq!(evidence.binding(), binding);
         assert_eq!(evidence.request_digest().to_hex(), request_digest(request));
         assert_eq!(evidence.ownership_lock_identity(), lock_identity);
-    }
-
-    fn start_fake_lock_process(path: &Path) -> FakeLockProcess {
-        let mut child = Command::new(env::current_exe().expect("find current test binary"))
-            .arg("--exact")
-            .arg(HELPER_TEST)
-            .arg("--nocapture")
-            .env(CHILD_PATH_ENV, path)
-            .env(CHILD_MODE_ENV, "hold")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start fake lock-holder process");
-        let mut process = FakeLockProcess {
-            output: BufReader::new(child.stdout.take().expect("capture helper stdout")),
-            child,
-            released: false,
-        };
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes = process
-                .output
-                .read_line(&mut line)
-                .expect("read fake lock-holder readiness");
-            assert_ne!(bytes, 0, "fake lock-holder exited before acquiring lock");
-            if line.trim() == LOCK_ACQUIRED {
-                break;
-            }
-        }
-
-        process
     }
 
     fn try_fake_lock_process(path: &Path) -> String {

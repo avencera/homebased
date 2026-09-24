@@ -1,8 +1,10 @@
-//! Canonical co-located release-watcher command and its socket-only poll protocol
+//! Canonical release-watcher command and its socket-only poll protocol
 //!
 //! The resource authority builds the only accepted watcher command from typed release
-//! identities. The hidden watcher subcommand sends the same identities back through the
-//! local daemon socket; neither side accepts caller-authored command text
+//! identities. The watcher always runs on the authority, even when its supervisor
+//! thread and callback route are on another machine. The hidden watcher subcommand
+//! sends the same identities back through the local daemon socket; neither side
+//! accepts caller-authored command text
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -226,8 +228,6 @@ impl ReleaseWatcherPollOutcome {
 pub enum ReleaseWatcherPollAttention {
     /// This daemon is not the resource authority
     WrongAuthority,
-    /// The resource supervisor runs on another machine
-    RemoteSupervisorUnsupported,
     /// The poll names an action, revision, or trainer that is not the saved release action
     ActionNotCurrent,
     /// The poll names a watcher task other than the saved watcher identity

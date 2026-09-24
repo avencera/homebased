@@ -11,7 +11,12 @@ use crate::machine::MachineId;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
 use crate::submission::{NormalizedSpecSha256, RequestId, ResourceQueueReceipt};
 
+pub mod api;
+pub mod background_launch;
+pub mod bound_action;
 pub mod command_shape;
+pub mod foreground;
+pub mod operator_release;
 pub mod ownership_lock;
 pub mod release_watcher;
 #[expect(
@@ -290,6 +295,44 @@ impl Resource {
     pub const fn authority_machine(&self) -> MachineId {
         self.authority_machine
     }
+}
+
+/// Immutable content of the first registration of one resource
+///
+/// A later replacement changes the current supervisor, so a registration retry
+/// compares this saved content and never the mutable resource row
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceRegistrationReceipt {
+    /// Registered resource identity
+    pub(crate) resource_id: ResourceId,
+    /// Display name named by the first registration
+    pub(crate) display_name: String,
+    /// Fixed authority that accepted the first registration
+    pub(crate) authority_machine: MachineId,
+    /// Supervisor named by the first registration
+    pub(crate) initial_supervisor: SupervisorAddress,
+}
+
+impl ResourceRegistrationReceipt {
+    /// Registration content named by a resource before its first insert
+    pub(crate) fn initial(resource: &Resource) -> Self {
+        Self {
+            resource_id: resource.id,
+            display_name: resource.display_name.clone(),
+            authority_machine: resource.authority_machine,
+            initial_supervisor: resource.supervisor,
+        }
+    }
+}
+
+/// Registration evidence saved for one existing resource
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SavedResourceRegistration {
+    /// Exact content of the first registration
+    Recorded(ResourceRegistrationReceipt),
+    /// Older row whose initial supervisor cannot be proven, so no retry can match it
+    LegacyUnproven,
 }
 
 /// Durable association between one authority-owned resource and one trainer task
@@ -580,8 +623,137 @@ pub enum ReturnContext {
         /// Opaque final result reference
         result_ref: String,
     },
+    /// A training task ended with no usable result and no saved checkpoint stop
+    ///
+    /// No evidence names a checkpoint that the run can resume from. The release
+    /// basis is saved beside this context: either the authority proved that the
+    /// exact trainer worker released its saved ownership lock, or an operator
+    /// attested that its GPU work is gone. The supervisor can start new work or
+    /// record no-resume; a same-run resume is never valid for this context
+    EndedWithoutResult {
+        /// Exact background task that ended
+        task_id: TaskId,
+        /// Task-layer outcome of the ended run
+        outcome: ExitReason,
+    },
+    /// A training task was lost with no exit reason, no result, and no checkpoint stop
+    ///
+    /// Only an operator attestation releases a lost trainer, and its receipt is
+    /// the release basis. The supervisor can start new work or record
+    /// no-resume; a same-run resume is never valid for this context
+    LostWithoutResult {
+        /// Exact background task that was lost
+        task_id: TaskId,
+    },
     /// No registered live background task occupied the resource
     Idle,
+}
+
+impl ReturnContext {
+    /// Return the released background task named by this context, if any
+    #[must_use]
+    pub const fn released_task(&self) -> Option<TaskId> {
+        match self {
+            Self::Stopped { task_id, .. }
+            | Self::AlreadyCompleted { task_id, .. }
+            | Self::EndedWithoutResult { task_id, .. }
+            | Self::LostWithoutResult { task_id } => Some(*task_id),
+            Self::Idle => None,
+        }
+    }
+}
+
+/// Foreground ownership contract accepted for one resource background command
+///
+/// Homebased proves release only for a command whose GPU ownership has a
+/// witness that the authority can check after the process exits. Command names
+/// alone cannot detect a shebang wrapper or a self-daemonizing executable, so
+/// every other shape is refused before a task record exists
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BackgroundCommandContract {
+    /// The maintained `python -m ops.run_segment run` trainer
+    ///
+    /// Its witness is the segment ownership lock under the runtime root. A
+    /// release needs a trainer-attempt association that the supervisor binds
+    /// after the running trainer holds that lock
+    DirectSegmentTrainer {
+        /// Runtime root named by `--runtime-root`
+        runtime_root: PathBuf,
+    },
+}
+
+/// Saved evidence that no background work holds an unregistered resource
+///
+/// Each variant names the latest resource history record that cleared or never
+/// created the background registration. A missing task row is never evidence
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdleBoundaryProof {
+    /// The latest loan closed with the supervisor's explicit no-resume decision
+    ///
+    /// That decision required the prior background task to be terminal with a
+    /// verified or operator-attested release, or no background task at all
+    SupervisorNoResume {
+        /// Closed loan that holds the decision
+        loan_id: LoanId,
+    },
+    /// The latest loan closed after the supervisor resolved a return task that
+    /// ended with proven process-group release
+    RestoreEndedWithProvenRelease {
+        /// Closed loan that holds the resolution
+        loan_id: LoanId,
+        /// Return task that ended
+        task_id: TaskId,
+    },
+    /// The latest loan closed after a native foreground return task ended
+    /// successfully with a confirmed process-group exit
+    ForegroundReturnEnded {
+        /// Closed loan that holds the foreground-end evidence
+        loan_id: LoanId,
+        /// Native foreground return task that ended
+        task_id: TaskId,
+    },
+    /// The latest first background launch ended before a child process started
+    BackgroundLaunchNeverSpawned {
+        /// Stable launch request identity
+        request_id: RequestId,
+        /// Launch task that recorded no child spawn
+        task_id: TaskId,
+    },
+    /// An operator attested that the ended registered trainer no longer holds the GPU
+    ///
+    /// This is a human trust decision saved with its receipt, not a process or
+    /// lock proof. The attestation cleared the registration
+    OperatorAttestedGpuFree {
+        /// Attestation whose receipt holds the observation and evidence
+        operation_id: operator_release::OperatorAttestationId,
+        /// Registered trainer that the operator resolved
+        task_id: TaskId,
+    },
+}
+
+/// Missing evidence that keeps an unregistered resource from serving queued work
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleProofGap {
+    /// No loan closure or background launch records why the GPU is free
+    NoIdleEvidence,
+    /// The latest first background launch ended, but its process release is not proven
+    BackgroundLaunchReleaseUnproven {
+        /// Launch task that ended without a no-child-spawned record
+        task_id: TaskId,
+    },
+    /// The latest closure or launch record does not match the resource registration
+    InconsistentHistory,
+}
+
+/// Authority decision at the idle boundary of an unregistered resource
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleBoundaryDecision {
+    /// Saved history proves that no background work holds the resource
+    Proven(IdleBoundaryProof),
+    /// The exact proof that is missing, so the resource stays reserved
+    Unproven(IdleProofGap),
 }
 
 /// Stable Homebased task identity reserved for one release watcher
@@ -921,6 +1093,14 @@ pub enum ServingReleaseProvenance {
         /// SHA-256 digest of the published completed result
         publication_sha256: String,
     },
+    /// The authority derived a saved idle boundary before opening the loan
+    ///
+    /// No background task was registered, and the latest resource history
+    /// records why no background work holds the GPU
+    IdleBoundary {
+        /// Evidence named by the loan-opening receipt
+        proof: IdleBoundaryProof,
+    },
     /// The authority verified a stopped trainer's exact checkpoint publication
     StoppedTrainerCheckpoint {
         /// Release action whose committed stop decision was proved
@@ -933,6 +1113,32 @@ pub enum ServingReleaseProvenance {
         record_sha256: String,
         /// SHA-256 digest of the selected checkpoint inventory
         inventory_sha256: String,
+    },
+    /// The authority proved that an ended trainer released its exact saved lock
+    ///
+    /// The trainer had no usable completed result and no committed checkpoint
+    /// stop, so this release carries no resume evidence
+    EndedTrainerLockReleased {
+        /// Release action whose authority-built proof was accepted
+        action_id: ActionId,
+        /// Exact registered trainer task in the proof
+        task_id: TaskId,
+        /// Task-layer outcome of the ended trainer
+        outcome: ExitReason,
+        /// Request digest of the trainer-attempt association that named the lock
+        attempt_request_sha256: String,
+    },
+    /// An operator attested that the ended trainer of this release action no longer holds the GPU
+    ///
+    /// No process-group exit or trainer lock proves the release. The attestation
+    /// receipt holds the operator observation and the authority evidence snapshot
+    OperatorAttestedGpuFree {
+        /// Attestation whose receipt permits activation
+        operation_id: operator_release::OperatorAttestationId,
+        /// Release action that the attestation resolved
+        action_id: ActionId,
+        /// Exact registered trainer task that the operator resolved
+        task_id: TaskId,
     },
 }
 
@@ -1003,6 +1209,308 @@ pub enum LoanClosure {
         /// Evidence that the watcher cannot stop the task later
         reason: String,
     },
+    /// A native foreground return task ended successfully with a confirmed process-group exit
+    ///
+    /// The task was never registered as background training, so the closure
+    /// leaves the resource unregistered and names the terminal evidence
+    ForegroundReturnEnded {
+        /// Return evidence retained after closure
+        return_context: ReturnContext,
+        /// Bound native foreground return task that ended
+        task_id: TaskId,
+        /// Successful task-layer outcome
+        outcome: ExitReason,
+    },
+    /// The bound return task ended without a successful closure, and the supervisor accepted that end
+    ///
+    /// A direct-segment task ended before a confirmed start. A native foreground
+    /// task ended without success. Both needed proven process release
+    RestoreEnded {
+        /// Return evidence retained after closure
+        return_context: ReturnContext,
+        /// Bound return task that ended
+        task_id: TaskId,
+        /// Task-layer outcome with proven process release
+        outcome: ExitReason,
+        /// Supervisor's durable resolution reason
+        reason: String,
+    },
+}
+
+/// Exact supervisor authority presented with one release or return action
+///
+/// The deciding transaction compares every field with the saved resource, loan,
+/// action, and supervisor assignment. A stale or different value cannot decide
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorActionAuthority {
+    /// Resource authority that owns the loan
+    pub authority_machine: MachineId,
+    /// Resource whose loan awaits the decision
+    pub resource_id: ResourceId,
+    /// Loan that owns the return action
+    pub loan_id: LoanId,
+    /// Stable return action identity
+    pub action_id: ActionId,
+    /// Resource revision that the supervisor observed with the action
+    pub expected_state_revision: ResourceRevision,
+    /// Supervisor that makes the decision
+    pub supervisor: SupervisorAddress,
+    /// Supervisor assignment revision that the decision uses
+    pub assignment_revision: AssignmentRevision,
+}
+
+/// Supervisor's explicit choice after the ready queue drained
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReturnDecision {
+    /// Close the interruption without starting background work
+    NoResume {
+        /// Supervisor's durable decision reason
+        reason: String,
+    },
+    /// Bind one fixed task identity as the returning background work
+    Launch(Box<ReturnLaunch>),
+}
+
+/// Fixed task identity and typed work for one return launch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReturnLaunch {
+    /// Stable caller retry identity for the return task
+    pub request_id: RequestId,
+    /// Preallocated task identity for the return task
+    pub task_id: TaskId,
+    /// Kind of background work, checked against the saved return context
+    pub work: ReturnWork,
+}
+
+/// Kind of background work that the supervisor chose
+///
+/// Each kind is valid for exactly one return context. Homebased does not infer
+/// the kind from a checkpoint or an optimization result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReturnWork {
+    /// Resume the stopped run from its selected checkpoint
+    ///
+    /// The authority derives the command from the saved run records, so the
+    /// caller cannot supply command text for this choice
+    SameRunResume {
+        /// Stopped task named by the return context
+        stopped_task: TaskId,
+        /// Recovery reference named by the return context
+        recovery_ref: String,
+    },
+    /// Run evaluation or the next epoch after the previous run completed
+    EvaluationOrNextEpoch {
+        /// Completed task named by the return context
+        completed_task: TaskId,
+        /// Command chosen by the supervisor
+        spec: CommandSpec,
+    },
+    /// Start new background work when no background task was registered
+    NewBackgroundWork {
+        /// Command chosen by the supervisor
+        spec: CommandSpec,
+    },
+    /// Start new background work after the previous run ended or was lost without a usable result
+    ///
+    /// The ended run has no resume evidence, so the command is a new choice by
+    /// the supervisor and never a continuation of that run
+    AfterEndedRun {
+        /// Ended task named by the return context
+        ended_task: TaskId,
+        /// Command chosen by the supervisor
+        spec: CommandSpec,
+    },
+}
+
+impl ReturnWork {
+    /// Return the command chosen by the supervisor, or `None` for a same-run resume
+    ///
+    /// The authority derives a same-run resume command from saved run records
+    #[must_use]
+    pub const fn supervisor_spec(&self) -> Option<&CommandSpec> {
+        match self {
+            Self::SameRunResume { .. } => None,
+            Self::EvaluationOrNextEpoch { spec, .. }
+            | Self::NewBackgroundWork { spec }
+            | Self::AfterEndedRun { spec, .. } => Some(spec),
+        }
+    }
+}
+
+/// How one accepted return task holds the resource, fixed when the task is accepted
+///
+/// The authority derives the mode from the validated ownership contract in the
+/// accepting transaction and saves it with the decision receipt. Later
+/// reconciliation, restart, and retry read the saved mode; they never classify
+/// the command again
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReturnExecutionMode {
+    /// Maintained direct-segment trainer
+    ///
+    /// A confirmed start closes the Restoring loan and registers the task as the
+    /// background trainer. Its segment ownership lock is the release witness
+    DirectSegmentTrainer,
+    /// Native foreground executable
+    ///
+    /// The task never becomes registered background training. The Restoring
+    /// loan keeps the resource reserved while the task runs and closes only
+    /// after a successful end with a confirmed process-group exit
+    NativeForeground,
+}
+
+impl From<foreground::CommandOwnershipContract> for ReturnExecutionMode {
+    fn from(contract: foreground::CommandOwnershipContract) -> Self {
+        match contract {
+            foreground::CommandOwnershipContract::ForegroundExecutable => Self::NativeForeground,
+            foreground::CommandOwnershipContract::DirectSegmentTrainer => {
+                Self::DirectSegmentTrainer
+            }
+        }
+    }
+}
+
+/// Why a return decision cannot apply to the saved action
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReturnDecisionRejection {
+    /// A decision identity is nil or reuses one UUID for two roles
+    #[error("return decision identities are invalid")]
+    InvalidIdentity,
+    /// A no-resume decision has no reason
+    #[error("no-resume reason must not be empty")]
+    EmptyReason,
+    /// Same-run resume needs the stopped context with the same task and recovery reference
+    #[error("same-run resume requires the matching stopped return context")]
+    ResumeRequiresStoppedContext,
+    /// Evaluation or next epoch needs the completed context with the same task
+    #[error("evaluation or next epoch requires the matching completed return context")]
+    EvaluationRequiresCompletedContext,
+    /// New background work needs the idle context
+    #[error("new background work requires the idle return context")]
+    NewWorkRequiresIdleContext,
+    /// Work after an ended run needs the ended or lost context with the same task
+    #[error("work after an ended run requires the matching ended return context")]
+    AfterEndedRunRequiresEndedContext,
+    /// The command callback thread is not the assigned supervisor thread
+    #[error("return command thread must be the assigned supervisor thread")]
+    ThreadMismatch,
+    /// The command shape can keep GPU work alive outside its task process group
+    #[error("return command can outlive its task process group ({risk:?})")]
+    UnsupportedCommandOwnership {
+        /// Recognized command shape that can outlive the task-run process group
+        risk: ResourceTaskOwnershipRisk,
+    },
+    /// The saved records cannot prove the stopped run's immutable resume inputs
+    #[error("saved records cannot prove same-run resume ({gap:?})")]
+    ResumeUnproven {
+        /// First missing or changed proof element
+        gap: SameRunResumeGap,
+    },
+}
+
+/// Missing or changed evidence that prevents a same-run resume
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameRunResumeGap {
+    /// No verified release receipt produced this loan's stopped context
+    ReleaseReceiptMissing,
+    /// The committed checkpoint stop decision is missing or names another checkpoint
+    CheckpointDecisionMismatch,
+    /// The selected checkpoint publication is missing or changed on disk
+    CheckpointUnavailable,
+    /// The stopped run has no matching trainer-attempt association
+    AssociationMissing,
+    /// The accepted identity, task row, or spec digest of the stopped run changed
+    RunRecordsChanged,
+    /// The saved command does not have the maintained direct-segment shape
+    CommandShapeInvalid,
+    /// The saved interpreter no longer resolves from the saved environment
+    InterpreterChanged,
+}
+
+impl ReturnDecision {
+    /// Check the typed choice against the saved return context and supervisor thread
+    ///
+    /// Storage and command-derivation checks run later in the deciding transaction
+    pub fn validate_for(
+        &self,
+        context: &ReturnContext,
+        supervisor_thread: ThreadId,
+    ) -> Result<(), ReturnDecisionRejection> {
+        let launch = match self {
+            Self::NoResume { reason } if reason.trim().is_empty() => {
+                return Err(ReturnDecisionRejection::EmptyReason);
+            }
+            Self::NoResume { .. } => return Ok(()),
+            Self::Launch(launch) => launch,
+        };
+        if launch.request_id.0.is_nil()
+            || launch.task_id.0.is_nil()
+            || launch.request_id.0 == launch.task_id.0
+        {
+            return Err(ReturnDecisionRejection::InvalidIdentity);
+        }
+
+        let spec = match (&launch.work, context) {
+            (
+                ReturnWork::SameRunResume {
+                    stopped_task,
+                    recovery_ref,
+                },
+                ReturnContext::Stopped {
+                    task_id,
+                    recovery_ref: saved_recovery,
+                    ..
+                },
+            ) if stopped_task == task_id
+                && recovery_ref == saved_recovery
+                && *task_id != launch.task_id =>
+            {
+                return Ok(());
+            }
+            (ReturnWork::SameRunResume { .. }, _) => {
+                return Err(ReturnDecisionRejection::ResumeRequiresStoppedContext);
+            }
+            (
+                ReturnWork::EvaluationOrNextEpoch {
+                    completed_task,
+                    spec,
+                },
+                ReturnContext::AlreadyCompleted { task_id, .. },
+            ) if completed_task == task_id && *task_id != launch.task_id => spec,
+            (ReturnWork::EvaluationOrNextEpoch { .. }, _) => {
+                return Err(ReturnDecisionRejection::EvaluationRequiresCompletedContext);
+            }
+            (ReturnWork::NewBackgroundWork { spec }, ReturnContext::Idle) => spec,
+            (ReturnWork::NewBackgroundWork { .. }, _) => {
+                return Err(ReturnDecisionRejection::NewWorkRequiresIdleContext);
+            }
+            (
+                ReturnWork::AfterEndedRun { ended_task, spec },
+                ReturnContext::EndedWithoutResult { task_id, .. }
+                | ReturnContext::LostWithoutResult { task_id },
+            ) if ended_task == task_id && *task_id != launch.task_id => spec,
+            (ReturnWork::AfterEndedRun { .. }, _) => {
+                return Err(ReturnDecisionRejection::AfterEndedRunRequiresEndedContext);
+            }
+        };
+
+        if spec.as_normalized().thread != supervisor_thread {
+            return Err(ReturnDecisionRejection::ThreadMismatch);
+        }
+        let command = foreground::task_command(spec.as_normalized()).ok_or(
+            ReturnDecisionRejection::UnsupportedCommandOwnership {
+                risk: ResourceTaskOwnershipRisk::UninspectableEntryPoint,
+            },
+        )?;
+        foreground::CommandOwnershipContract::for_return_command(command)
+            .map_err(|risk| ReturnDecisionRejection::UnsupportedCommandOwnership { risk })?;
+
+        Ok(())
+    }
 }
 
 /// Lifecycle of one resource interruption and its return obligation
@@ -1135,6 +1643,20 @@ pub enum ResourceQueueReconcileOutcome {
         /// Existing loan that prevents a second loan from opening
         loan: Loan,
     },
+    /// Saved idle evidence opened a loan that serves the oldest request
+    IdleServing {
+        /// Serving loan with an idle return context
+        loan: Loan,
+        /// Request selected by the opening
+        request: ResourceRequest,
+        /// Evidence named by the loan-opening receipt
+        proof: IdleBoundaryProof,
+    },
+    /// A queued first background launch row may have lost its worker spawn
+    BackgroundLaunchUncertain {
+        /// Launch task that keeps the resource reserved
+        task_id: TaskId,
+    },
     /// A running registered task now has one durable release action
     ReleaseRequired {
         /// Loan created for the resource interruption
@@ -1148,6 +1670,17 @@ pub enum ResourceQueueReconcileOutcome {
         request: ResourceRequest,
         /// Authoritative reason why the resource cannot be assigned
         reason: ResourceQueueAttentionReason,
+    },
+    /// The bound return task keeps the loan reserved because its start or release is not proven
+    RestoreAttentionRequired {
+        /// Restoring loan that keeps the resource reserved
+        loan: Loan,
+        /// Return action bound to the task
+        action_id: ActionId,
+        /// Bound return task
+        task_id: TaskId,
+        /// Authority-classified reason
+        reason: RestoreAttentionReason,
     },
     /// The exact registered trainer remains reserved because its release proof failed
     ReleaseProofUnavailable {
@@ -1166,7 +1699,15 @@ pub enum ResourceQueueReconcileOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceQueueAttentionReason {
     /// No registered task exists, and the store has no proof that the GPU is idle
-    IdleNotProven,
+    IdleNotProven {
+        /// Exact proof that is missing
+        gap: IdleProofGap,
+    },
+    /// A first background launch has not reached a confirmed start
+    BackgroundLaunchPending {
+        /// Launch task that keeps the resource reserved
+        task_id: TaskId,
+    },
     /// A registered background task has no authority-owned task row
     BackgroundTaskMissing {
         /// Exact task registered on the resource
@@ -1183,13 +1724,6 @@ pub enum ResourceQueueAttentionReason {
     AcceptedTaskLaunchUncertain {
         /// Exact accepted command task that needs an owner decision
         task_id: TaskId,
-    },
-    /// The assigned command task terminated with a failure outcome
-    AssignedTaskFailed {
-        /// Exact assigned command task that needs an owner decision
-        task_id: TaskId,
-        /// Durable terminal state observed by the authority
-        state: ProcessStatus,
     },
     /// The saved Serving loan came from a legacy or otherwise unverified release
     UnverifiedServingRelease,
@@ -1239,12 +1773,50 @@ pub enum ResourceQueueAttentionReason {
         /// Exact assigned command task that needs an owner decision
         task_id: TaskId,
     },
+    /// The authority store could not evaluate the assigned task, so the loan stays reserved
+    AssignedTaskReconcileFailed {
+        /// Exact assigned command task that needs an owner decision
+        task_id: TaskId,
+    },
 }
 
-/// Recognized command shapes whose ownership can outlive the local task-run process group
+/// Why a Restoring loan cannot close or advance
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreAttentionReason {
+    /// The task row is queued, and this actor did not insert it, so its worker may never start
+    LaunchUncertain,
+    /// The task ended before a confirmed start; the supervisor must resolve it explicitly
+    EndedBeforeConfirmedStart {
+        /// Terminal task state
+        state: ProcessStatus,
+    },
+    /// The native foreground task ended without success; the supervisor must resolve it explicitly
+    ForegroundEnded {
+        /// Terminal task state
+        state: ProcessStatus,
+    },
+    /// The native foreground task ended, but its process-group exit is not confirmed
+    ForegroundExitUnconfirmed {
+        /// Terminal task state
+        state: ProcessStatus,
+    },
+    /// The task is lost, so its process release is not proven
+    Lost,
+    /// The task, route, identity, or receipt does not match the bound return action
+    IdentityMismatch,
+    /// A legacy receipt has no saved execution mode, and the saved decision cannot prove one
+    ExecutionModeUnproven,
+    /// The authority store could not evaluate the restore
+    ReconcileFailed,
+}
+
+/// Why a command falls outside the foreground ownership contract
+///
+/// See [`foreground`] for the contract. Each variant names a shape whose GPU work
+/// can outlive, or hide from, the task-run process group that release proof observes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceTaskOwnershipRisk {
-    /// An SSH client can exit while a remote command continues
+    /// A remote execution client can exit while its remote command continues
     RemoteShell,
     /// A container client can exit while a container process continues
     ContainerClient,
@@ -1252,6 +1824,14 @@ pub enum ResourceTaskOwnershipRisk {
     ShellWrapper,
     /// A command explicitly starts or manages detached work
     DetachedLauncher,
+    /// An interpreter runs code that Homebased does not inspect
+    Interpreter,
+    /// A launcher runs another program named in its arguments
+    ProgramLauncher,
+    /// The entry point is a script whose interpreter and code Homebased does not inspect
+    ScriptEntryPoint,
+    /// The entry point is missing, unreadable, or not a recognized native executable
+    UninspectableEntryPoint,
 }
 
 /// Safe, inspectable classification for a failed release proof
@@ -1269,6 +1849,9 @@ pub enum ReleaseProofAttentionReason {
     StoppedCheckpointUnavailable,
     /// The saved ownership lock is held or cannot be verified
     OwnershipLockUnverified,
+    /// The registered trainer has no trainer-attempt association, so no saved
+    /// lock can prove its release; only a separate operator resolution applies
+    TrainerAssociationMissing,
     /// Saved task, authority, route, or proof identities do not match
     SavedEvidenceMismatch,
 }
@@ -1324,16 +1907,11 @@ impl SupervisorNoticeRequest {
         }
 
         let payload_task = match &self.payload {
-            SupervisorNoticePayload::ReleaseRequired { task_id } => Some(task_id),
-            SupervisorNoticePayload::ReturnRequired {
-                return_context:
-                    ReturnContext::Stopped { task_id, .. }
-                    | ReturnContext::AlreadyCompleted { task_id, .. },
-            } => Some(task_id),
-            SupervisorNoticePayload::ReturnRequired {
-                return_context: ReturnContext::Idle,
+            SupervisorNoticePayload::ReleaseRequired { task_id } => Some(*task_id),
+            SupervisorNoticePayload::ReturnRequired { return_context } => {
+                return_context.released_task()
             }
-            | SupervisorNoticePayload::AttentionRequired { .. } => None,
+            SupervisorNoticePayload::AttentionRequired { .. } => None,
         };
         if payload_task.is_some_and(|task_id| task_id.0.is_nil()) {
             return Err(crate::error::AppError::MessageInvalid {
@@ -1397,11 +1975,13 @@ mod tests {
 
     use super::{
         AcceptanceSequence, ActionId, AssignmentRevision, CommandSpec, CommandSpecError,
-        DeliveryAttemptId, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
+        DeliveryAttemptId, LoanClosure, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
         ResourceQueueRequest, ResourceQueueResponse, ResourceRequest, ResourceRequestState,
-        ResourceRevision, ReturnContext, ServingReleaseProvenance, SupervisorAddress,
-        SupervisorNoticePayload, SupervisorNoticeRequest,
+        ResourceRevision, ReturnContext, ReturnDecision, ReturnDecisionRejection, ReturnLaunch,
+        ReturnWork, ServingReleaseProvenance, SupervisorAddress, SupervisorNoticePayload,
+        SupervisorNoticeRequest,
     };
+    use crate::domain::ExitReason;
 
     fn task_spec() -> NormalizedSpec {
         NormalizedSpec {
@@ -1685,6 +2265,176 @@ mod tests {
 
             assert!(serde_json::from_value::<LoanState>(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn return_decisions_are_strict_and_older_closures_still_decode() {
+        let launch = ReturnDecision::Launch(Box::new(ReturnLaunch {
+            request_id: RequestId::new(),
+            task_id: TaskId::new(),
+            work: ReturnWork::NewBackgroundWork {
+                spec: CommandSpec::try_from(task_spec()).unwrap(),
+            },
+        }));
+        let mut encoded = serde_json::to_value(&launch).unwrap();
+        assert_eq!(encoded["type"], "launch");
+        assert_eq!(encoded["work"]["type"], "new_background_work");
+        serde_json::from_value::<ReturnDecision>(encoded.clone()).unwrap();
+        encoded["work"]["command"] = json!(["/bin/sh", "-c", "resume"]);
+        assert!(serde_json::from_value::<ReturnDecision>(encoded).is_err());
+
+        let legacy = json!({
+            "type": "closed",
+            "result": {
+                "type": "no_resume",
+                "return_context": { "type": "idle" },
+                "reason": "legacy",
+            },
+        });
+        assert!(matches!(
+            serde_json::from_value::<LoanState>(legacy).unwrap(),
+            LoanState::Closed {
+                result: LoanClosure::NoResume { .. }
+            }
+        ));
+        let ended = LoanState::Closed {
+            result: LoanClosure::RestoreEnded {
+                return_context: ReturnContext::Idle,
+                task_id: TaskId::new(),
+                outcome: ExitReason::Cancelled,
+                reason: "never started".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::from_value::<LoanState>(serde_json::to_value(&ended).unwrap()).unwrap(),
+            ended
+        );
+    }
+
+    #[test]
+    fn return_decision_choice_must_match_its_context_and_supervisor_thread() {
+        let spec = task_spec();
+        let thread = spec.thread;
+        let new_work = |spec: NormalizedSpec| {
+            ReturnDecision::Launch(Box::new(ReturnLaunch {
+                request_id: RequestId::new(),
+                task_id: TaskId::new(),
+                work: ReturnWork::NewBackgroundWork {
+                    spec: CommandSpec::try_from(spec).unwrap(),
+                },
+            }))
+        };
+
+        assert_eq!(
+            new_work(spec.clone()).validate_for(&ReturnContext::Idle, thread),
+            Ok(())
+        );
+        assert_eq!(
+            new_work(spec.clone()).validate_for(
+                &ReturnContext::AlreadyCompleted {
+                    task_id: TaskId::new(),
+                    result_ref: "result".into(),
+                },
+                thread
+            ),
+            Err(ReturnDecisionRejection::NewWorkRequiresIdleContext)
+        );
+        assert_eq!(
+            new_work(spec.clone()).validate_for(&ReturnContext::Idle, ThreadId(Uuid::now_v7())),
+            Err(ReturnDecisionRejection::ThreadMismatch)
+        );
+        let mut detached = spec;
+        detached.workload = NormalizedWorkload::Task(NormalizedTaskWorkload {
+            command: CommandLine::try_from_argv(vec!["setsid".into(), "trainer".into()]).unwrap(),
+        });
+        assert_eq!(
+            new_work(detached).validate_for(&ReturnContext::Idle, thread),
+            Err(ReturnDecisionRejection::UnsupportedCommandOwnership {
+                risk: super::ResourceTaskOwnershipRisk::DetachedLauncher,
+            })
+        );
+        assert_eq!(
+            ReturnDecision::NoResume { reason: " ".into() }
+                .validate_for(&ReturnContext::Idle, thread),
+            Err(ReturnDecisionRejection::EmptyReason)
+        );
+    }
+
+    #[test]
+    fn ended_context_permits_new_work_or_no_resume_but_never_same_run_resume() {
+        let spec = task_spec();
+        let thread = spec.thread;
+        let ended_task = TaskId::new();
+        let ended = ReturnContext::EndedWithoutResult {
+            task_id: ended_task,
+            outcome: ExitReason::Exit { code: 3 },
+        };
+        let launch = |work| {
+            ReturnDecision::Launch(Box::new(ReturnLaunch {
+                request_id: RequestId::new(),
+                task_id: TaskId::new(),
+                work,
+            }))
+        };
+        let after_ended = |ended_task| ReturnWork::AfterEndedRun {
+            ended_task,
+            spec: CommandSpec::try_from(spec.clone()).unwrap(),
+        };
+
+        assert_eq!(
+            launch(after_ended(ended_task)).validate_for(&ended, thread),
+            Ok(())
+        );
+        assert_eq!(
+            ReturnDecision::NoResume {
+                reason: "failed run".into()
+            }
+            .validate_for(&ended, thread),
+            Ok(())
+        );
+        assert_eq!(
+            launch(ReturnWork::SameRunResume {
+                stopped_task: ended_task,
+                recovery_ref: "generation-after-failure".into(),
+            })
+            .validate_for(&ended, thread),
+            Err(ReturnDecisionRejection::ResumeRequiresStoppedContext)
+        );
+        assert_eq!(
+            launch(after_ended(TaskId::new())).validate_for(&ended, thread),
+            Err(ReturnDecisionRejection::AfterEndedRunRequiresEndedContext)
+        );
+        assert_eq!(
+            launch(after_ended(ended_task)).validate_for(&ReturnContext::Idle, thread),
+            Err(ReturnDecisionRejection::AfterEndedRunRequiresEndedContext)
+        );
+        // a lost run released by an operator attestation has the same choices
+        let lost = ReturnContext::LostWithoutResult {
+            task_id: ended_task,
+        };
+        assert_eq!(
+            launch(after_ended(ended_task)).validate_for(&lost, thread),
+            Ok(())
+        );
+        assert_eq!(
+            launch(after_ended(TaskId::new())).validate_for(&lost, thread),
+            Err(ReturnDecisionRejection::AfterEndedRunRequiresEndedContext)
+        );
+        assert_eq!(
+            launch(ReturnWork::SameRunResume {
+                stopped_task: ended_task,
+                recovery_ref: "generation-before-loss".into(),
+            })
+            .validate_for(&lost, thread),
+            Err(ReturnDecisionRejection::ResumeRequiresStoppedContext)
+        );
+        assert_eq!(
+            launch(ReturnWork::NewBackgroundWork {
+                spec: CommandSpec::try_from(spec.clone()).unwrap(),
+            })
+            .validate_for(&ended, thread),
+            Err(ReturnDecisionRejection::NewWorkRequiresIdleContext)
+        );
     }
 
     fn supervisor_notice_request() -> SupervisorNoticeRequest {

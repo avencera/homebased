@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::domain::{AgentKind, ProcessStatus, TaskId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
+use crate::resource::ResourceId;
 use crate::submission::RequestId;
 
 /// Application error with a stable machine-readable code.
@@ -335,6 +337,76 @@ pub enum AppError {
         remote: ProtocolRange,
     },
     /// Unexpected internal failure.
+    /// No checked authority owns this resource
+    #[error("resource not found: {}", resource.as_uuid())]
+    ResourceNotFound {
+        /// Resource that no checked authority owns
+        resource: ResourceId,
+    },
+    /// Some machines could not be checked, so the resource may still exist
+    #[error("resource lookup incomplete for {}", resource.as_uuid())]
+    ResourceLookupIncomplete {
+        /// Resource being located
+        resource: ResourceId,
+        /// Machines that did not answer
+        unchecked: Vec<MachineId>,
+    },
+    /// The fixed resource authority could not be reached before a mutation was sent
+    #[error("resource authority {machine} unavailable: {message}")]
+    ResourceAuthorityUnavailable {
+        /// Resource owned by the authority
+        resource: ResourceId,
+        /// Fixed resource authority
+        machine: MachineId,
+        /// Why the authority is unavailable
+        message: String,
+    },
+    /// A resource mutation may have committed; retry the same operation identity
+    #[error("resource operation outcome unknown: {message}")]
+    ResourceOutcomeUnknown {
+        /// Resource that the mutation targets
+        resource: ResourceId,
+        /// Stable operation identity, when the mutation has one
+        operation: Option<Uuid>,
+        /// Why the outcome is unknown
+        message: String,
+    },
+    /// The caller observed an older resource revision
+    #[error("resource revision is stale: expected {expected}, current {current}")]
+    ResourceStaleRevision {
+        /// Resource whose revision changed
+        resource: ResourceId,
+        /// Revision that the caller observed
+        expected: u64,
+        /// Current authority revision
+        current: u64,
+    },
+    /// A resource operation identity was reused with different content
+    #[error("resource operation conflict: {message}")]
+    ResourceOperationConflict {
+        /// Resource that the operation targets
+        resource: ResourceId,
+        /// Reused operation identity, when the mutation has one
+        operation: Option<Uuid>,
+        /// Conflict detail
+        message: String,
+    },
+    /// The action does not apply to the current resource phase
+    #[error("resource action not allowed: {message}")]
+    ResourceActionNotAllowed {
+        /// Resource that the action targets
+        resource: ResourceId,
+        /// Why the current phase refuses the action
+        message: String,
+    },
+    /// The operation needs an owner proof that this daemon cannot supply yet
+    #[error("resource operation unavailable: {message}")]
+    ResourceOperationUnavailable {
+        /// Resource that the operation targets
+        resource: ResourceId,
+        /// Missing owner or proof
+        message: String,
+    },
     #[error("{message}")]
     Internal {
         /// Underlying failure text.
@@ -392,6 +464,14 @@ impl AppError {
             Self::MessageOutcomeUnknown { .. } => "message_outcome_unknown",
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
+            Self::ResourceNotFound { .. } => "resource_not_found",
+            Self::ResourceLookupIncomplete { .. } => "resource_lookup_incomplete",
+            Self::ResourceAuthorityUnavailable { .. } => "resource_authority_unavailable",
+            Self::ResourceOutcomeUnknown { .. } => "resource_outcome_unknown",
+            Self::ResourceStaleRevision { .. } => "resource_stale_revision",
+            Self::ResourceOperationConflict { .. } => "resource_operation_conflict",
+            Self::ResourceActionNotAllowed { .. } => "resource_action_not_allowed",
+            Self::ResourceOperationUnavailable { .. } => "resource_operation_unavailable",
             Self::Internal { .. } => "internal",
         }
     }
@@ -408,6 +488,9 @@ impl AppError {
             | Self::SubmissionOutcomeUnknown { .. }
             | Self::ClusterLookupIncomplete { .. }
             | Self::TaskUnavailable { .. }
+            | Self::ResourceLookupIncomplete { .. }
+            | Self::ResourceAuthorityUnavailable { .. }
+            | Self::ResourceOutcomeUnknown { .. }
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
             | Self::SummaryTooLong { .. }
@@ -423,7 +506,8 @@ impl AppError {
             | Self::FileNotFound { .. }
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. }
-            | Self::MachineNotFound { .. } => 3,
+            | Self::MachineNotFound { .. }
+            | Self::ResourceNotFound { .. } => 3,
             Self::AgentThreadNotFound { .. } => 3,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
@@ -442,7 +526,11 @@ impl AppError {
             | Self::ClusterProtocolIncompatible { .. } => 5,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
-            | Self::MessageConflict { .. } => 5,
+            | Self::MessageConflict { .. }
+            | Self::ResourceStaleRevision { .. }
+            | Self::ResourceOperationConflict { .. }
+            | Self::ResourceActionNotAllowed { .. }
+            | Self::ResourceOperationUnavailable { .. } => 5,
             Self::MessageDeliveryFailed { .. }
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. } => 1,
@@ -466,7 +554,8 @@ impl AppError {
             | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
-            | Self::MachineNotFound { .. } => http::StatusCode::NOT_FOUND,
+            | Self::MachineNotFound { .. }
+            | Self::ResourceNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::AgentThreadNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
@@ -485,7 +574,11 @@ impl AppError {
             | Self::ClusterProtocolIncompatible { .. } => http::StatusCode::CONFLICT,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
-            | Self::MessageConflict { .. } => http::StatusCode::CONFLICT,
+            | Self::MessageConflict { .. }
+            | Self::ResourceStaleRevision { .. }
+            | Self::ResourceOperationConflict { .. }
+            | Self::ResourceActionNotAllowed { .. }
+            | Self::ResourceOperationUnavailable { .. } => http::StatusCode::CONFLICT,
             Self::MachineUnavailable { .. }
             | Self::RemoteSubmissionUnavailable { .. }
             | Self::ClusterLookupIncomplete { .. }
@@ -493,7 +586,10 @@ impl AppError {
             | Self::MessageDeliveryFailed { .. }
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. }
-            | Self::SubmissionOutcomeUnknown { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
+            | Self::SubmissionOutcomeUnknown { .. }
+            | Self::ResourceLookupIncomplete { .. }
+            | Self::ResourceAuthorityUnavailable { .. }
+            | Self::ResourceOutcomeUnknown { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             Self::DaemonUnavailable { .. }
             | Self::ConfigInvalid { .. }
             | Self::UnitInvalid { .. }
@@ -516,6 +612,9 @@ impl AppError {
                 | Self::MessageDeliveryFailed { .. }
                 | Self::MessageOutcomeUnknown { .. }
                 | Self::MessageUnavailable { .. }
+                | Self::ResourceLookupIncomplete { .. }
+                | Self::ResourceAuthorityUnavailable { .. }
+                | Self::ResourceOutcomeUnknown { .. }
         )
     }
 
@@ -576,6 +675,39 @@ impl AppError {
                 configured,
             } => json!({ "selected": selected, "configured": configured }),
             Self::Internal { message } => json!({ "message": message }),
+            Self::ResourceNotFound { resource } => json!({ "resource_id": resource }),
+            Self::ResourceLookupIncomplete {
+                resource,
+                unchecked,
+            } => json!({ "resource_id": resource, "unchecked": unchecked }),
+            Self::ResourceAuthorityUnavailable {
+                resource,
+                machine,
+                message,
+            } => json!({ "resource_id": resource, "machine": machine, "message": message }),
+            Self::ResourceOutcomeUnknown {
+                resource,
+                operation,
+                message,
+            } => json!({ "resource_id": resource, "operation_id": operation, "message": message }),
+            Self::ResourceStaleRevision {
+                resource,
+                expected,
+                current,
+            } => json!({
+                "resource_id": resource,
+                "expected_revision": expected,
+                "current_revision": current,
+            }),
+            Self::ResourceOperationConflict {
+                resource,
+                operation,
+                message,
+            } => json!({ "resource_id": resource, "operation_id": operation, "message": message }),
+            Self::ResourceActionNotAllowed { resource, message }
+            | Self::ResourceOperationUnavailable { resource, message } => {
+                json!({ "resource_id": resource, "message": message })
+            }
             Self::ConfigInvalid { path, .. } => json!({ "path": path }),
             Self::MachineNotFound { machine } => json!({ "machine": machine }),
             Self::MachineIdentityMismatch { expected, found } => {

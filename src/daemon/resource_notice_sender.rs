@@ -52,6 +52,49 @@ pub(crate) async fn deliver_one(
     .await
 }
 
+/// Deliver and settle one attempt that an explicit renotify already reserved
+///
+/// Returns `None` without sending when the notice no longer holds that exact
+/// reservation, so a replayed operation never sends a second copy
+pub(crate) async fn deliver_reserved_attempt(
+    state: &AppState,
+    notice_id: NoticeId,
+    attempt_id: DeliveryAttemptId,
+) -> Result<Option<ResourceNoticeDeliveryOutcome>, ResourceNoticeSendError> {
+    let notice = call(&state.store, |reply| StoreMsg::SupervisorNotice {
+        notice_id,
+        reply,
+    })
+    .await??
+    .ok_or(ResourceNoticeSendError::Store(
+        SupervisorNoticeStoreError::NotFound,
+    ))?;
+    if !matches!(
+        notice.delivery,
+        SupervisorNoticeDelivery::Sending {
+            attempt_id: reserved,
+            ..
+        } if reserved == attempt_id
+    ) {
+        return Ok(None);
+    }
+    let delivery = deliver_reserved(state, &notice, attempt_id).await;
+    let (receipt, result) = match delivery {
+        Ok(receipt) => (Some(receipt), Ok(())),
+        Err(error) => (None, Err(error)),
+    };
+    let notice = call(&state.store, |reply| {
+        StoreMsg::SettleSupervisorNoticeAttempt {
+            notice_id,
+            attempt_id,
+            result,
+            reply,
+        }
+    })
+    .await??;
+    Ok(Some(ResourceNoticeDeliveryOutcome { notice, receipt }))
+}
+
 async fn reserve_deliver_settle<F, Fut>(
     store: &ractor::ActorRef<StoreMsg>,
     notice_id: NoticeId,

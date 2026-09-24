@@ -1,4 +1,4 @@
-use crate::domain::{TaskId, TaskRow};
+use crate::domain::{ExitReason, TaskId, TaskRow};
 use crate::machine::MachineId;
 use crate::resource::ownership_lock::{OwnershipLockGuard, verify_ownership_lock_guard};
 use crate::resource::watcher::{
@@ -15,9 +15,17 @@ pub(super) enum VerifiedReleaseEvidence {
         decision: Box<ReleaseCheckpointStopDecision>,
         cancellation: ReleaseCheckpointCancellation,
     },
+    /// The trainer ended with no usable result and no committed checkpoint stop
+    ///
+    /// The released lock is the only evidence, so the release names the
+    /// outcome and carries no resume reference
+    Ended {
+        outcome: ExitReason,
+    },
 }
 
-/// Authority-created proof for one completed result or action-committed stopped checkpoint
+/// Authority-created proof for one completed result, action-committed stopped checkpoint,
+/// or ended trainer whose exact lock is released
 ///
 /// This type has no serialization or public constructor. It keeps the exact lock guard alive
 /// while the release transaction rechecks the saved task, identity, association, and result
@@ -107,11 +115,19 @@ impl VerifiedReleaseProof {
         &ReleaseCheckpointCancellation,
     )> {
         match &self.release_evidence {
-            VerifiedReleaseEvidence::Completed(_) => None,
+            VerifiedReleaseEvidence::Completed(_) | VerifiedReleaseEvidence::Ended { .. } => None,
             VerifiedReleaseEvidence::Stopped {
                 decision,
                 cancellation,
             } => Some((decision, cancellation)),
+        }
+    }
+
+    /// Outcome of an ended trainer that has no result or stop evidence
+    pub(crate) fn ended_outcome(&self) -> Option<&ExitReason> {
+        match &self.release_evidence {
+            VerifiedReleaseEvidence::Ended { outcome } => Some(outcome),
+            VerifiedReleaseEvidence::Completed(_) | VerifiedReleaseEvidence::Stopped { .. } => None,
         }
     }
 
@@ -137,6 +153,10 @@ impl VerifiedReleaseProof {
                     recovery_ref: checkpoint.generation_id.clone(),
                 }
             }
+            VerifiedReleaseEvidence::Ended { outcome } => ReturnContext::EndedWithoutResult {
+                task_id: self.task_id,
+                outcome: outcome.clone(),
+            },
         }
     }
 
@@ -157,6 +177,18 @@ impl VerifiedReleaseProof {
                     generation_id: checkpoint.generation_id.clone(),
                     record_sha256: checkpoint.record_sha256.clone(),
                     inventory_sha256: checkpoint.inventory_sha256.clone(),
+                }
+            }
+            VerifiedReleaseEvidence::Ended { outcome } => {
+                ServingReleaseProvenance::EndedTrainerLockReleased {
+                    action_id: self.action_id,
+                    task_id: self.task_id,
+                    outcome: outcome.clone(),
+                    attempt_request_sha256: self
+                        .association
+                        .verified_attempt()
+                        .request_digest()
+                        .to_hex(),
                 }
             }
         }
@@ -201,6 +233,8 @@ impl VerifiedReleaseProof {
                     }
                 }
             }
+            // the exact released lock below is the whole external evidence
+            VerifiedReleaseEvidence::Ended { .. } => {}
         }
 
         verify_ownership_lock_guard(

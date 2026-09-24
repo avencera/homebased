@@ -3293,3 +3293,1501 @@ async fn local_duplicate_identity_recovers_after_the_clone_goes_offline() {
         assert_eq!(inventory["local"]["identity"]["state"], expected);
     }
 }
+
+/// Fixed identities for one AwaitingReturn action whose supervisor runs on another machine
+struct RemoteReturnAction {
+    action: homebased::resource::SupervisorActionAuthority,
+}
+
+/// Seed one resource, AwaitingReturn loan, and delivered return notice on a stopped authority
+fn seed_remote_return_action(authority: &Daemon, supervisor: &Daemon) -> RemoteReturnAction {
+    use homebased::resource::{
+        ActionId, AssignmentRevision, LoanId, LoanPhase, LoanState, NoticeId, ResourceRevision,
+        ReturnContext, SupervisorActionAuthority, SupervisorAddress, SupervisorNotice,
+        SupervisorNoticeDelivery, SupervisorNoticePayload,
+    };
+
+    let action = SupervisorActionAuthority {
+        authority_machine: authority.machine_id(),
+        resource_id: ResourceId::new(),
+        loan_id: LoanId::new(),
+        action_id: ActionId::new(),
+        expected_state_revision: ResourceRevision::new(1),
+        supervisor: SupervisorAddress {
+            machine: supervisor.machine_id(),
+            thread: ThreadId(uuid::Uuid::now_v7()),
+        },
+        assignment_revision: AssignmentRevision::new(0),
+    };
+    let loan_state = LoanState::Active {
+        phase: LoanPhase::AwaitingReturn {
+            action_id: action.action_id,
+            return_context: ReturnContext::Idle,
+        },
+    };
+    let notice = SupervisorNotice {
+        id: NoticeId::new(),
+        loan_id: action.loan_id,
+        action_id: action.action_id,
+        state_revision: action.expected_state_revision,
+        destination: action.supervisor,
+        assignment_revision: action.assignment_revision,
+        payload: SupervisorNoticePayload::ReturnRequired {
+            return_context: ReturnContext::Idle,
+        },
+        delivery: SupervisorNoticeDelivery::Delivered { attempts: 1 },
+    };
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO resources (
+                id, display_name, authority_machine, supervisor_machine, supervisor_thread,
+                assignment_revision, state_revision, registered_background_task
+             ) VALUES (?1, 'remote-gpu', ?2, ?3, ?4, 0, 1, NULL)",
+            rusqlite::params![
+                action.resource_id.as_uuid().to_string(),
+                action.authority_machine.as_uuid().to_string(),
+                action.supervisor.machine.as_uuid().to_string(),
+                action.supervisor.thread.to_string(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                action.loan_id.as_uuid().to_string(),
+                action.resource_id.as_uuid().to_string(),
+                serde_json::to_string(&loan_state).unwrap(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO resource_supervisor_notices (id, loan_id, action_id, notice_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                notice.id.as_uuid().to_string(),
+                action.loan_id.as_uuid().to_string(),
+                action.action_id.as_uuid().to_string(),
+                serde_json::to_string(&notice).unwrap(),
+            ],
+        )
+        .unwrap();
+    RemoteReturnAction { action }
+}
+
+/// Foreground command on the authority that runs until its gate file exists
+fn gated_background_work(
+    authority: &Daemon,
+    thread: ThreadId,
+    name: &str,
+) -> (homebased::resource::ReturnWork, PathBuf, PathBuf) {
+    let marker = authority.user_home.join(format!("{name}.marker"));
+    let gate = authority.user_home.join(format!("{name}.gate"));
+    let spec = homebased::spec::parse_normalized_value(&serde_json::json!({
+        "api_version": 1,
+        "thread": thread,
+        "name": name,
+        "cwd": authority.user_home,
+        "timeout": "30m",
+        "workload": {
+            "type": "task",
+            "command": [native_gated_command(), &marker, &gate]
+        }
+    }))
+    .unwrap();
+    (
+        homebased::resource::ReturnWork::NewBackgroundWork {
+            spec: CommandSpec::try_from(spec).unwrap(),
+        },
+        marker,
+        gate,
+    )
+}
+
+/// Native foreground command that appends `x` to its marker, then waits for its gate
+///
+/// Resource work must name an inspectable native executable, so the tests build
+/// one once per process instead of using a shell script
+fn native_gated_command() -> &'static Path {
+    static COMMAND: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    COMMAND.get_or_init(|| {
+        let directory =
+            std::env::temp_dir().join(format!("homebased-fleet-gated-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("gated.c");
+        fs::write(
+            &source,
+            "#include <stdio.h>\n#include <unistd.h>\n\
+             int main(int argc, char **argv) {\n\
+             if (argc != 3) return 2;\n\
+             FILE *marker = fopen(argv[1], \"a\");\n\
+             if (marker == NULL || fputs(\"x\", marker) < 0 || fclose(marker) != 0) return 1;\n\
+             while (access(argv[2], F_OK) != 0) usleep(50000);\n\
+             return 0;\n}\n",
+        )
+        .unwrap();
+        let binary = directory.join("gated");
+        let status = std::process::Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap();
+        assert!(status.success(), "cc must build the gated command");
+        binary
+    })
+}
+
+async fn submit_resource_action(
+    supervisor: &Daemon,
+    action: homebased::resource::SupervisorActionAuthority,
+    choice: homebased::resource::bound_action::ResourceActionChoice,
+) -> Result<Value, homebased::error::AppError> {
+    homebased::client::Client::new(supervisor.home.join("homebased.sock"))
+        .post(
+            homebased::resource::bound_action::RESOURCE_ACTION_SUBMIT_PATH,
+            &serde_json::to_value(
+                homebased::resource::bound_action::ResourceActionSubmitRequest {
+                    api_version: 1,
+                    authority: action,
+                    choice,
+                },
+            )
+            .unwrap(),
+        )
+        .await
+}
+
+fn return_choice(
+    launch: &homebased::resource::ReturnLaunch,
+) -> homebased::resource::bound_action::ResourceActionChoice {
+    homebased::resource::bound_action::ResourceActionChoice::Return {
+        decision: homebased::resource::ReturnDecision::Launch(Box::new(launch.clone())),
+    }
+}
+
+async fn post_resource_action(authority: &Daemon, request: &Value) -> (u16, Value) {
+    let response = ClusterClient::default()
+        .post_json(
+            &authority.address(),
+            homebased::resource::bound_action::RESOURCE_ACTION_PATH,
+            request,
+        )
+        .await
+        .unwrap();
+    (
+        response.status.as_u16(),
+        serde_json::from_slice(&response.body).unwrap_or(Value::Null),
+    )
+}
+
+fn task_count(daemon: &Daemon, task: TaskId) -> i64 {
+    rusqlite::Connection::open(daemon.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn action_receipt_count(daemon: &Daemon) -> i64 {
+    rusqlite::Connection::open(daemon.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM resource_action_task_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn loan_state(daemon: &Daemon, loan: homebased::resource::LoanId) -> Value {
+    let json: String = rusqlite::Connection::open(daemon.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state_json FROM loans WHERE id = ?1",
+            [loan.as_uuid().to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+async fn wait_for(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < budget {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    done()
+}
+
+/// Two daemons whose peers know each other, with a remote return action on the authority
+async fn remote_return_daemons(names: (&str, &str)) -> (Daemon, Daemon, RemoteReturnAction) {
+    let mut authority = Daemon::start(names.0, true);
+    let supervisor = Daemon::start(names.1, true);
+    add_peer(&authority, &supervisor);
+    add_peer(&supervisor, &authority);
+    authority.stop();
+    let seeded = seed_remote_return_action(&authority, &supervisor);
+    // the authority restores its resource actor from the seeded records at startup
+    authority.spawn();
+    wait_for_probe(&authority.address()).await;
+    (authority, supervisor, seeded)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_supervisor_return_runs_once_on_the_authority_and_owns_its_callbacks() {
+    let (authority, supervisor, seeded) =
+        remote_return_daemons(("remote-return-authority", "remote-return-supervisor")).await;
+    let action = seeded.action;
+    let (work, marker, gate) =
+        gated_background_work(&authority, action.supervisor.thread, "return");
+    let launch = homebased::resource::ReturnLaunch {
+        request_id: RequestId::new(),
+        task_id: TaskId::new(),
+        work,
+    };
+    let task = launch.task_id;
+
+    let accepted = submit_resource_action(&supervisor, action, return_choice(&launch))
+        .await
+        .unwrap();
+    assert_eq!(accepted["outcome"]["type"], "accepted", "{accepted}");
+    assert_eq!(
+        accepted["outcome"]["receipt"]["task_id"],
+        serde_json::json!(task)
+    );
+    assert_eq!(task_count(&authority, task), 1);
+    assert_eq!(action_receipt_count(&authority), 1);
+    // the authority keeps only the execution identity; the route lives on the supervisor
+    let authority_store = Store::open(&authority.home.join("homebased.sqlite")).unwrap();
+    assert!(
+        authority_store
+            .origin_route_by_task(task)
+            .unwrap()
+            .is_none()
+    );
+    let Some(homebased::submission::ExecutorIdentity::Accepted(record)) =
+        authority_store.executor_identity(task).unwrap()
+    else {
+        panic!("authority must accept the return task");
+    };
+    assert_eq!(record.origin_machine, supervisor.machine_id());
+    assert_eq!(record.execution_machine, authority.machine_id());
+
+    // the authority's task events reach the supervisor machine's saved route
+    let supervisor_db = supervisor.home.join("homebased.sqlite");
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let route = Store::open(&supervisor_db)
+                .unwrap()
+                .origin_route_by_task(task)
+                .unwrap()
+                .unwrap();
+            route.last_execution_state == Some(ProcessStatus::Running)
+        })
+        .await,
+        "running event did not reach the supervisor route"
+    );
+    let route = Store::open(&supervisor_db)
+        .unwrap()
+        .origin_route_by_task(task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(route.thread, action.supervisor.thread);
+    assert!(matches!(
+        route.submission,
+        SubmissionState::ResourceAction {
+            phase: homebased::submission::ResourceActionRoutePhase::Accepted,
+            ..
+        }
+    ));
+
+    // the running native foreground task keeps its Restoring loan and is never registered
+    let restoring = loan_state(&authority, action.loan_id);
+    assert_eq!(restoring["type"], "active", "{restoring}");
+    assert_eq!(restoring["phase"]["type"], "restoring", "{restoring}");
+
+    // an exact retry is answered from the saved route without a second task
+    let retried = submit_resource_action(&supervisor, action, return_choice(&launch))
+        .await
+        .unwrap();
+    assert_eq!(retried["outcome"]["type"], "accepted");
+    let mut changed = launch.clone();
+    let (other_work, _, _) = gated_background_work(&authority, action.supervisor.thread, "other");
+    changed.work = other_work;
+    assert!(matches!(
+        submit_resource_action(&supervisor, action, return_choice(&changed)).await,
+        Err(homebased::error::AppError::SubmissionConflict { .. })
+    ));
+    assert_eq!(task_count(&authority, task), 1);
+    assert_eq!(action_receipt_count(&authority), 1);
+
+    fs::write(&gate, b"").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            Store::open(&authority.home.join("homebased.sqlite"))
+                .unwrap()
+                .get_task(task)
+                .unwrap()
+                .is_some_and(|row| row.status().is_terminal())
+        })
+        .await
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+
+    // the successful confirmed end closes the loan without registering the task
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            loan_state(&authority, action.loan_id)["type"] == "closed"
+        })
+        .await,
+        "confirmed foreground end did not close the loan: {}",
+        loan_state(&authority, action.loan_id)
+    );
+    assert_eq!(
+        loan_state(&authority, action.loan_id)["result"]["type"],
+        "foreground_return_ended"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_remote_return_route_retries_the_same_identity_after_restart_and_lost_reply() {
+    let (mut authority, mut supervisor, seeded) =
+        remote_return_daemons(("remote-retry-authority", "remote-retry-supervisor")).await;
+    let action = seeded.action;
+    let (work, marker, gate) = gated_background_work(&authority, action.supervisor.thread, "retry");
+    let launch = homebased::resource::ReturnLaunch {
+        request_id: RequestId::new(),
+        task_id: TaskId::new(),
+        work,
+    };
+    let task = launch.task_id;
+    let homebased::resource::ReturnWork::NewBackgroundWork { spec } = &launch.work else {
+        unreachable!();
+    };
+    // the supervisor saved its fixed-ID route, then the send never reached the authority
+    supervisor.stop();
+    authority.stop();
+    let route = OriginRoute::new_resource_action(homebased::submission::NewResourceActionRoute {
+        request: launch.request_id,
+        task,
+        callback: CallbackContext {
+            env: TaskEnv {
+                path: "/bin:/usr/bin".into(),
+                home: supervisor.user_home.to_string_lossy().into_owned(),
+            },
+            cwd: supervisor.user_home.clone(),
+            codex: PathBuf::from("/bin/true").into(),
+        },
+        spec: spec.as_normalized().clone(),
+        binding: homebased::submission::ResourceActionRouteBinding {
+            kind: homebased::resource::bound_action::ResourceActionKind::Return,
+            authority: action,
+        },
+        launch: homebased::resource::bound_action::ResourceActionLaunch::Return {
+            work: launch.work.clone(),
+        },
+    })
+    .unwrap();
+    Store::open(&supervisor.home.join("homebased.sqlite"))
+        .unwrap()
+        .insert_origin_route(&route)
+        .unwrap();
+
+    // startup recovery with the authority offline keeps the same unresolved route
+    supervisor.spawn();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(task_count(&authority, task), 0);
+    let supervisor_db = supervisor.home.join("homebased.sqlite");
+    let unresolved = || {
+        Store::open(&supervisor_db)
+            .unwrap()
+            .unknown_resource_action_routes()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(unresolved(), 1);
+
+    authority.spawn();
+    wait_for_probe(&authority.address()).await;
+    supervisor.restart();
+    assert!(
+        wait_for(Duration::from_secs(20), || unresolved() == 0).await,
+        "startup recovery did not resolve the saved route"
+    );
+    assert_eq!(task_count(&authority, task), 1);
+
+    // a lost reply is answered by the same identity without a second task
+    let digest = homebased::submission::normalized_spec_sha256(spec.as_normalized()).unwrap();
+    let request = homebased::resource::bound_action::ResourceActionRequest::new(
+        homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+        action,
+        homebased::resource::bound_action::ResourceActionOperation::LaunchReturn {
+            launch: launch.clone(),
+            normalized_spec_sha256: digest,
+        },
+    );
+    let (status, body) =
+        post_resource_action(&authority, &serde_json::to_value(&request).unwrap()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"]["type"], "accepted", "{body}");
+    assert_eq!(body["outcome"]["acceptance"]["type"], "existing");
+    assert_eq!(task_count(&authority, task), 1);
+    assert_eq!(action_receipt_count(&authority), 1);
+
+    fs::write(&gate, b"").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            Store::open(&authority.home.join("homebased.sqlite"))
+                .unwrap()
+                .get_task(task)
+                .unwrap()
+                .is_some_and(|row| row.status().is_terminal())
+        })
+        .await
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_action_refuses_wrong_route_owner_revision_and_evidence_without_records() {
+    use homebased::resource::bound_action::{ResourceActionOperation, ResourceActionRequest};
+
+    let (authority, supervisor, seeded) =
+        remote_return_daemons(("remote-wrong-authority", "remote-wrong-supervisor")).await;
+    let action = seeded.action;
+    let (work, _, _) = gated_background_work(&authority, action.supervisor.thread, "wrong");
+    let launch = homebased::resource::ReturnLaunch {
+        request_id: RequestId::new(),
+        task_id: TaskId::new(),
+        work,
+    };
+    let homebased::resource::ReturnWork::NewBackgroundWork { spec } = &launch.work else {
+        unreachable!();
+    };
+    let digest = homebased::submission::normalized_spec_sha256(spec.as_normalized()).unwrap();
+    let protocol = homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0;
+    let wire = |action, operation| {
+        serde_json::to_value(ResourceActionRequest::new(protocol, action, operation)).unwrap()
+    };
+    let launch_operation = ResourceActionOperation::LaunchReturn {
+        launch: launch.clone(),
+        normalized_spec_sha256: digest,
+    };
+
+    let mut wrong_destination = wire(action, launch_operation.clone());
+    wrong_destination["destination_machine"] = serde_json::json!(supervisor.machine_id());
+    assert_ne!(
+        post_resource_action(&authority, &wrong_destination).await.0,
+        200
+    );
+    let mut wrong_source = wire(action, launch_operation.clone());
+    wrong_source["source_machine"] = serde_json::json!(MachineId::new());
+    assert_ne!(post_resource_action(&authority, &wrong_source).await.0, 200);
+    let mut unknown_field = wire(action, launch_operation.clone());
+    unknown_field["operation"]["command"] = serde_json::json!(["/bin/sh", "-c", "anything"]);
+    assert_ne!(
+        post_resource_action(&authority, &unknown_field).await.0,
+        200
+    );
+
+    // the supervisor machine has no saved route for this task yet
+    let (status, body) = post_resource_action(&authority, &wire(action, launch_operation)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"]["reason"]["type"], "route_evidence_missing");
+
+    // a replaced thread, stale revision, or watcher request for a return action is refused
+    let mut other_thread = action;
+    other_thread.supervisor.thread = ThreadId(uuid::Uuid::now_v7());
+    let (_, body) = post_resource_action(
+        &authority,
+        &wire(
+            other_thread,
+            ResourceActionOperation::PrepareReturn {
+                launch: launch.clone(),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(body["outcome"]["reason"]["type"], "not_current_supervisor");
+    let mut stale = action;
+    stale.expected_state_revision = homebased::resource::ResourceRevision::new(7);
+    let (_, body) = post_resource_action(
+        &authority,
+        &wire(
+            stale,
+            ResourceActionOperation::PrepareReturn {
+                launch: launch.clone(),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(body["outcome"]["reason"]["type"], "stale_revision");
+    let (_, body) = post_resource_action(
+        &authority,
+        &wire(
+            action,
+            ResourceActionOperation::PrepareReleaseWatcher {
+                observed_background_task: TaskId::new(),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(body["outcome"]["reason"]["type"], "action_not_pending");
+
+    // a saved route whose content differs from the launch is wrong-route evidence
+    let mut other = launch.clone();
+    let (other_work, _, _) = gated_background_work(&authority, action.supervisor.thread, "saved");
+    other.work = other_work;
+    let homebased::resource::ReturnWork::NewBackgroundWork { spec: saved_spec } = &other.work
+    else {
+        unreachable!();
+    };
+    Store::open(&supervisor.home.join("homebased.sqlite"))
+        .unwrap()
+        .insert_origin_route(
+            &OriginRoute::new_resource_action(homebased::submission::NewResourceActionRoute {
+                request: launch.request_id,
+                task: launch.task_id,
+                callback: CallbackContext {
+                    env: TaskEnv {
+                        path: "/bin:/usr/bin".into(),
+                        home: supervisor.user_home.to_string_lossy().into_owned(),
+                    },
+                    cwd: supervisor.user_home.clone(),
+                    codex: PathBuf::from("/bin/true").into(),
+                },
+                spec: saved_spec.as_normalized().clone(),
+                binding: homebased::submission::ResourceActionRouteBinding {
+                    kind: homebased::resource::bound_action::ResourceActionKind::Return,
+                    authority: action,
+                },
+                launch: homebased::resource::bound_action::ResourceActionLaunch::Return {
+                    work: other.work.clone(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let (_, body) = post_resource_action(
+        &authority,
+        &wire(
+            action,
+            ResourceActionOperation::LaunchReturn {
+                launch: launch.clone(),
+                normalized_spec_sha256: digest,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(body["outcome"]["reason"]["type"], "route_evidence_mismatch");
+
+    assert_eq!(task_count(&authority, launch.task_id), 0);
+    assert_eq!(action_receipt_count(&authority), 0);
+    assert_eq!(
+        loan_state(&authority, action.loan_id)["phase"]["type"],
+        "awaiting_return"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_supervisor_no_resume_closes_the_loan_without_a_task() {
+    let (authority, supervisor, seeded) =
+        remote_return_daemons(("remote-no-resume-authority", "remote-no-resume-supervisor")).await;
+    let action = seeded.action;
+    let closed = submit_resource_action(
+        &supervisor,
+        action,
+        homebased::resource::bound_action::ResourceActionChoice::Return {
+            decision: homebased::resource::ReturnDecision::NoResume {
+                reason: "evaluation is next week".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed["outcome"]["type"], "closed", "{closed}");
+    let state = loan_state(&authority, action.loan_id);
+    assert_eq!(state["type"], "closed");
+    assert_eq!(state["result"]["type"], "no_resume");
+    assert_eq!(action_receipt_count(&authority), 0);
+
+    // a repeated identical decision replays the saved closure
+    let replayed = submit_resource_action(
+        &supervisor,
+        action,
+        homebased::resource::bound_action::ResourceActionChoice::Return {
+            decision: homebased::resource::ReturnDecision::NoResume {
+                reason: "evaluation is next week".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed["outcome"]["type"], "closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_watcher_choice_is_refused_before_any_route_when_the_authority_cannot_bind() {
+    use homebased::resource::{LoanPhase, LoanState, SupervisorNoticePayload};
+
+    let mut authority = Daemon::start("remote-watcher-authority", true);
+    let supervisor = Daemon::start("remote-watcher-supervisor", true);
+    add_peer(&authority, &supervisor);
+    add_peer(&supervisor, &authority);
+    authority.stop();
+    let seeded = seed_remote_return_action(&authority, &supervisor);
+    let action = seeded.action;
+    // turn the seeded action into a release action for a trainer that is not running
+    let trainer = TaskId::new();
+    let release = LoanState::Active {
+        phase: LoanPhase::AwaitingRelease {
+            action_id: action.action_id,
+            observed_background_task: trainer,
+            watcher_intent: None,
+        },
+    };
+    let connection = rusqlite::Connection::open(authority.home.join("homebased.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE resources SET registered_background_task = ?1 WHERE id = ?2",
+            rusqlite::params![
+                trainer.to_string(),
+                action.resource_id.as_uuid().to_string()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE loans SET state_json = ?1 WHERE id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&release).unwrap(),
+                action.loan_id.as_uuid().to_string()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE resource_supervisor_notices SET notice_json = json_set(notice_json, '$.payload', json(?1))
+             WHERE action_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&SupervisorNoticePayload::ReleaseRequired { task_id: trainer })
+                    .unwrap(),
+                action.action_id.as_uuid().to_string()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    authority.spawn();
+    wait_for_probe(&authority.address()).await;
+
+    let refused = submit_resource_action(
+        &supervisor,
+        action,
+        homebased::resource::bound_action::ResourceActionChoice::ReleaseWatcher {
+            observed_background_task: trainer,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["outcome"]["type"], "rejected", "{refused}");
+    assert_eq!(
+        refused["outcome"]["reason"]["type"], "watcher_unavailable",
+        "{refused}"
+    );
+    assert!(
+        Store::open(&supervisor.home.join("homebased.sqlite"))
+            .unwrap()
+            .resource_action_route_by_action(action.action_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(action_receipt_count(&authority), 0);
+    assert_eq!(
+        loan_state(&authority, action.loan_id)["phase"]["type"],
+        "awaiting_release"
+    );
+}
+
+// ---- remote-supervisor first background launch ----
+
+/// Fake maintained trainer layout on the authority whose interpreter is a gated script
+///
+/// Every start appends one byte to `marker`; the script exits after `gate` exists
+/// or its test directory is removed
+struct FleetTrainer {
+    cwd: PathBuf,
+    runtime_root: PathBuf,
+    task_file: PathBuf,
+    input_root: PathBuf,
+    python: PathBuf,
+    marker: PathBuf,
+    gate: PathBuf,
+}
+
+impl Drop for FleetTrainer {
+    fn drop(&mut self) {
+        // a failed test must not leave the gated trainer running
+        let _ = fs::write(&self.gate, b"");
+    }
+}
+
+impl FleetTrainer {
+    fn new(authority: &Daemon) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = authority
+            .user_home
+            .canonicalize()
+            .unwrap()
+            .join("trainer-root");
+        let cwd = root.join("trainer");
+        fs::create_dir_all(cwd.join("ops")).unwrap();
+        fs::write(cwd.join("ops/run_segment.py"), b"# maintained runner\n").unwrap();
+        fs::write(cwd.join("ops/segment_artifacts.py"), b"# artifacts\n").unwrap();
+        let runtime_root = root.join("runtime");
+        fs::create_dir_all(&runtime_root).unwrap();
+        let task_file = root.join("task.json");
+        fs::write(&task_file, b"{}\n").unwrap();
+        let input_root = root.join("inputs");
+        fs::create_dir_all(&input_root).unwrap();
+        let (marker, gate) = (root.join("trainer-starts"), root.join("trainer-gate"));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let python = bin.join("python3");
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nwhile [ ! -e '{}' ] && [ -d '{}' ]; do sleep 0.05; done\n",
+                marker.display(),
+                gate.display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            cwd,
+            runtime_root,
+            task_file,
+            input_root,
+            python,
+            marker,
+            gate,
+        }
+    }
+
+    fn spec(&self, thread: ThreadId, name: &str) -> NormalizedSpec {
+        homebased::spec::parse_normalized_value(&serde_json::json!({
+            "api_version": 1,
+            "thread": thread,
+            "name": name,
+            "cwd": self.cwd,
+            "timeout": "4h",
+            "workload": {
+                "type": "task",
+                "command": [
+                    self.python, "-m", "ops.run_segment", "run",
+                    "--task", self.task_file,
+                    "--input-root", self.input_root,
+                    "--runtime-root", self.runtime_root,
+                    "--image-digest", "not-validated-by-shape"
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn starts(&self) -> usize {
+        fs::read(&self.marker).map_or(0, |bytes| bytes.len())
+    }
+
+    /// Write the running attempt's request and hold its ownership lock
+    fn hold_attempt(&self, binding: &homebased::resource::watcher::AttemptBinding) -> fs::File {
+        let attempt = self.runtime_root.join("attempts").join(&binding.attempt_id);
+        fs::create_dir_all(&attempt).unwrap();
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "binding": binding,
+            "adapter": {"kind": "speakrs"},
+            "start_mode": {"kind": "fresh"},
+            "payload": {"training": {"epochs": 1}},
+            "input_view": {
+                "schema_version": 1,
+                "revision_id": binding.campaign_revision_id,
+                "root": "/trainer/input",
+            },
+            "inputs": [],
+            "expected_outputs": [{"path": "checkpoint.bin", "kind": "file"}],
+            "resources": {"accelerator": "cuda"},
+            "worker": {
+                "worker_id": "trainer-worker",
+                "executable_digest": "a".repeat(64),
+                "source_digest": "b".repeat(64),
+                "environment_digest": "c".repeat(64),
+            },
+        });
+        fs::write(
+            attempt.join("request.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.runtime_root.join(".segment.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+}
+
+fn attempt_binding(attempt: &str) -> homebased::resource::watcher::AttemptBinding {
+    homebased::resource::watcher::AttemptBinding {
+        campaign_id: "campaign-a".into(),
+        campaign_revision_id: "revision-a".into(),
+        task_id: "trainer-task-a".into(),
+        attempt_id: attempt.into(),
+        attempt_number: 1,
+        ownership_token: "owner-a".into(),
+    }
+}
+
+/// Fake Codex on the supervisor machine that records every callback delivery
+struct SupervisorCallbacks {
+    bin: PathBuf,
+    log: PathBuf,
+    cwd: PathBuf,
+}
+
+impl SupervisorCallbacks {
+    fn new(supervisor: &Daemon) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = supervisor.user_home.canonicalize().unwrap();
+        let bin = cwd.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = cwd.join("codex-calls");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        Self { bin, log, cwd }
+    }
+
+    fn env(&self) -> Value {
+        serde_json::json!({
+            "path": format!("{}:/bin:/usr/bin", self.bin.display()),
+            "home": self.cwd,
+        })
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// Authority and supervisor daemons that know each other, with one resource
+/// whose supervisor thread runs on the supervisor machine
+struct RemoteBackground {
+    // the trainer drops first so its gate opens before the daemon directories go
+    trainer: FleetTrainer,
+    callbacks: SupervisorCallbacks,
+    authority: Daemon,
+    supervisor: Daemon,
+    resource: ResourceId,
+    thread: ThreadId,
+}
+
+impl RemoteBackground {
+    async fn start(names: (&str, &str)) -> Self {
+        let mut authority = Daemon::start(names.0, true);
+        let mut supervisor = Daemon::start(names.1, true);
+        // no daemon may reach a real Codex through an inherited pin or PATH
+        let callbacks = SupervisorCallbacks::new(&supervisor);
+        for daemon in [&mut authority, &mut supervisor] {
+            daemon.codex_override = Some(callbacks.bin.join("codex"));
+            daemon.restart();
+        }
+        add_peer(&authority, &supervisor);
+        add_peer(&supervisor, &authority);
+        let resource = ResourceId::new();
+        let thread = ThreadId(uuid::Uuid::now_v7());
+        socket(&authority)
+            .post(
+                homebased::resource::api::RESOURCE_REGISTER_PATH,
+                &serde_json::json!({
+                    "api_version": 1,
+                    "spec": {
+                        "id": resource,
+                        "display_name": "remote gpu",
+                        "supervisor": { "machine": supervisor.machine_id(), "thread": thread },
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let trainer = FleetTrainer::new(&authority);
+        Self {
+            trainer,
+            callbacks,
+            authority,
+            supervisor,
+            resource,
+            thread,
+        }
+    }
+
+    fn background_path(&self) -> String {
+        format!("/v1/resources/{}/background", self.resource.as_uuid())
+    }
+
+    fn body(&self, request: RequestId, spec: &NormalizedSpec) -> Value {
+        serde_json::json!({
+            "api_version": 1,
+            "request_id": request,
+            "spec": spec,
+            "env": self.callbacks.env(),
+            "callback_cwd": self.callbacks.cwd,
+        })
+    }
+
+    async fn launch(
+        &self,
+        request: RequestId,
+        spec: &NormalizedSpec,
+    ) -> Result<Value, homebased::error::AppError> {
+        socket(&self.supervisor)
+            .post(&self.background_path(), &self.body(request, spec))
+            .await
+    }
+
+    async fn bind_attempt(
+        &self,
+        task: TaskId,
+        attempt: &homebased::resource::watcher::AttemptBinding,
+    ) -> Result<Value, homebased::error::AppError> {
+        socket(&self.supervisor)
+            .post(
+                &format!(
+                    "/v1/resources/{}/background/{task}/trainer-attempt",
+                    self.resource.as_uuid()
+                ),
+                &serde_json::json!({ "api_version": 1, "attempt_binding": attempt }),
+            )
+            .await
+    }
+
+    async fn queue_request(&self) -> Value {
+        let spec = homebased::spec::parse_normalized_value(&serde_json::json!({
+            "api_version": 1,
+            "thread": ThreadId(uuid::Uuid::now_v7()),
+            "name": "optimization",
+            "cwd": self.authority.user_home,
+            "timeout": "30m",
+            "workload": { "type": "task", "command": ["/bin/echo", "optimize"] }
+        }))
+        .unwrap();
+        socket(&self.supervisor)
+            .post(
+                &format!("/v1/resources/{}/requests", self.resource.as_uuid()),
+                &self.body(RequestId::new(), &spec),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn detail(&self) -> Value {
+        socket(&self.authority)
+            .get(&format!("/v1/resources/{}", self.resource.as_uuid()))
+            .await
+            .unwrap()
+    }
+
+    fn supervisor_route(&self, request: RequestId) -> Option<OriginRoute> {
+        Store::open(&self.supervisor.home.join("homebased.sqlite"))
+            .unwrap()
+            .origin_route_by_request(request)
+            .unwrap()
+    }
+
+    /// Wire launch that a lost reply would repeat, built from a saved supervisor route
+    fn wire_launch(&self, route: &OriginRoute) -> Value {
+        use homebased::resource::background_launch::{
+            ResourceBackgroundOperation, ResourceBackgroundRequest,
+        };
+
+        let SubmissionState::ResourceBackground { binding, .. } = &route.submission else {
+            panic!("the supervisor must save a background launch route");
+        };
+        let spec = route.current_spec().unwrap().clone();
+        serde_json::to_value(ResourceBackgroundRequest::new(
+            homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+            binding.assignment,
+            ResourceBackgroundOperation::Launch {
+                expected_state_revision: binding.expected_state_revision,
+                request_id: route.request,
+                task_id: route.task,
+                normalized_spec_sha256: homebased::submission::normalized_spec_sha256(&spec)
+                    .unwrap(),
+                spec,
+            },
+        ))
+        .unwrap()
+    }
+}
+
+/// Whether a socket call failed with the daemon error text for one resource refusal
+///
+/// The socket client keeps resource error codes only in the daemon's message
+fn refused(result: Result<Value, homebased::error::AppError>, text: &str) -> bool {
+    matches!(result, Err(error) if error.to_string().contains(text))
+}
+
+fn socket(daemon: &Daemon) -> homebased::client::Client {
+    homebased::client::Client::new(daemon.home.join("homebased.sock"))
+}
+
+async fn post_background(authority: &Daemon, request: &Value) -> (u16, Value) {
+    let response = ClusterClient::default()
+        .post_json(
+            &authority.address(),
+            homebased::resource::background_launch::RESOURCE_BACKGROUND_PATH,
+            request,
+        )
+        .await
+        .unwrap();
+    (
+        response.status.as_u16(),
+        serde_json::from_slice(&response.body).unwrap_or(Value::Null),
+    )
+}
+
+fn background_receipt_count(daemon: &Daemon) -> i64 {
+    rusqlite::Connection::open(daemon.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM resource_background_launches",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_supervisor_first_launch_runs_once_and_binds_its_trainer_attempt() {
+    let fixture = RemoteBackground::start(("bg-authority", "bg-supervisor")).await;
+    let (authority, supervisor) = (&fixture.authority, &fixture.supervisor);
+    let request = RequestId::new();
+    let spec = fixture.trainer.spec(fixture.thread, "remote trainer");
+
+    let launched = fixture.launch(request, &spec).await.unwrap();
+    assert_eq!(launched["outcome"]["type"], "inserted", "{launched}");
+    let task: TaskId = serde_json::from_value(launched["task_id"].clone()).unwrap();
+    // the launch binds a task but registers nothing before its confirmed start
+    assert_eq!(
+        launched["resource"]["registered_background_task"],
+        Value::Null
+    );
+
+    // the authority keeps the execution identity; the supervisor machine owns the route
+    assert_eq!(task_count(authority, task), 1);
+    assert_eq!(background_receipt_count(authority), 1);
+    let authority_store = Store::open(&authority.home.join("homebased.sqlite")).unwrap();
+    assert!(
+        authority_store
+            .origin_route_by_task(task)
+            .unwrap()
+            .is_none()
+    );
+    let Some(homebased::submission::ExecutorIdentity::Accepted(record)) =
+        authority_store.executor_identity(task).unwrap()
+    else {
+        panic!("the authority must accept the launch");
+    };
+    assert_eq!(record.origin_machine, supervisor.machine_id());
+    assert_eq!(record.execution_machine, authority.machine_id());
+    let route = fixture.supervisor_route(request).unwrap();
+    assert_eq!(route.task, task);
+    assert_eq!(route.thread, fixture.thread);
+    assert_eq!(route.callback.cwd, fixture.callbacks.cwd);
+
+    // the confirmed start reaches the supervisor route and registers the task
+    let supervisor_db = supervisor.home.join("homebased.sqlite");
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            Store::open(&supervisor_db)
+                .unwrap()
+                .origin_route_by_task(task)
+                .unwrap()
+                .is_some_and(|route| route.last_execution_state == Some(ProcessStatus::Running))
+        })
+        .await,
+        "the running event did not reach the supervisor route"
+    );
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            Store::open(&authority.home.join("homebased.sqlite"))
+                .unwrap()
+                .origin_route_by_task(task)
+                .unwrap()
+                .is_none()
+                && fixture.trainer.starts() == 1
+        })
+        .await
+    );
+    let mut registered = false;
+    for _ in 0..100 {
+        if fixture.detail().await["resource"]["registered_background_task"]
+            == serde_json::json!(task)
+        {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(registered, "the confirmed start did not register the task");
+
+    // an exact retry and a repeated lost reply only observe the running task
+    let retried = fixture.launch(request, &spec).await.unwrap();
+    assert_eq!(retried["outcome"]["type"], "existing", "{retried}");
+    assert_eq!(retried["outcome"]["state"], "running");
+    assert_eq!(retried["task_id"], serde_json::json!(task));
+    let (status, body) = post_background(authority, &fixture.wire_launch(&route)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"]["type"], "accepted", "{body}");
+    assert_eq!(body["outcome"]["acceptance"]["type"], "existing");
+    let changed = fixture.trainer.spec(fixture.thread, "changed trainer");
+    assert!(refused(
+        fixture.launch(request, &changed).await,
+        "resource operation conflict"
+    ));
+    assert_eq!(task_count(authority, task), 1);
+    assert_eq!(background_receipt_count(authority), 1);
+
+    // without a held lock and attempt request the authority refuses the association
+    let attempt = attempt_binding("attempt-a");
+    assert!(refused(
+        fixture.bind_attempt(task, &attempt).await,
+        "resource action not allowed"
+    ));
+
+    // queued work opens a release action whose proof stays blocked without the association
+    fixture.queue_request().await;
+    let blocked_reason = |detail: &Value| {
+        detail["attention"]["code"] == "release_proof_unavailable"
+            && detail["attention"]["task_id"] == serde_json::json!(task)
+    };
+    let mut blocked = Value::Null;
+    for _ in 0..100 {
+        blocked = fixture.detail().await;
+        if blocked_reason(&blocked) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(blocked_reason(&blocked), "{blocked}");
+    // the association is the first release evidence that the authority requires
+    assert!(
+        blocked["attention"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("TrainerAssociationMissing"),
+        "{blocked}"
+    );
+    let phase = &blocked["loan"]["state"]["phase"];
+    assert_eq!(phase["type"], "awaiting_release");
+    assert_eq!(phase["observed_background_task"], serde_json::json!(task));
+    assert_eq!(phase["watcher_intent"], Value::Null);
+
+    // the authority verifies the running attempt from its own runtime evidence
+    let lock = fixture.trainer.hold_attempt(&attempt);
+    let bound = fixture.bind_attempt(task, &attempt).await.unwrap();
+    assert_eq!(bound["task_id"], serde_json::json!(task));
+    assert_eq!(
+        bound["runtime_root"],
+        serde_json::json!(fixture.trainer.runtime_root)
+    );
+    assert_eq!(fixture.bind_attempt(task, &attempt).await.unwrap(), bound);
+    assert!(refused(
+        fixture
+            .bind_attempt(task, &attempt_binding("attempt-b"))
+            .await,
+        "resource operation conflict"
+    ));
+
+    // with the association saved, release waits only for the trainer to stop
+    let mut associated = Value::Null;
+    for _ in 0..100 {
+        associated = fixture.detail().await;
+        if associated["attention"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("TrainerNotCompleted"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        associated["attention"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("TrainerNotCompleted")),
+        "{associated}"
+    );
+    assert_eq!(
+        associated["loan"]["state"]["phase"]["type"],
+        "awaiting_release"
+    );
+
+    // the trainer's result is delivered to the supervisor thread on its own machine
+    drop(lock);
+    fs::write(&fixture.trainer.gate, b"").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(30), || fixture
+            .callbacks
+            .calls()
+            .contains(&fixture.thread.to_string()))
+        .await,
+        "no callback reached the supervisor machine: {} route={:?} task={:?}",
+        fixture.callbacks.calls(),
+        fixture.supervisor_route(request),
+        Store::open(&authority.home.join("homebased.sqlite"))
+            .unwrap()
+            .get_task(task)
+            .unwrap()
+            .map(|row| (row.status(), row.callback_status)),
+    );
+    assert_eq!(fixture.trainer.starts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_background_launch_refuses_wrong_owners_revision_and_queued_work_without_records() {
+    use homebased::resource::background_launch::BackgroundLaunchBinding;
+
+    let fixture = RemoteBackground::start(("bg-refuse-authority", "bg-refuse-supervisor")).await;
+    let (authority, supervisor) = (&fixture.authority, &fixture.supervisor);
+    let spec = fixture.trainer.spec(fixture.thread, "trainer");
+
+    // the authority cannot own the remote thread's callbacks, so its socket writes nothing
+    assert!(refused(
+        socket(authority)
+            .post(
+                &fixture.background_path(),
+                &fixture.body(RequestId::new(), &spec)
+            )
+            .await,
+        "resource operation unavailable"
+    ));
+    // a spec for another thread is refused before the supervisor saves a route
+    let other_thread_request = RequestId::new();
+    let other_thread = fixture
+        .trainer
+        .spec(ThreadId(uuid::Uuid::now_v7()), "trainer");
+    assert!(refused(
+        fixture.launch(other_thread_request, &other_thread).await,
+        "resource action not allowed"
+    ));
+    assert!(fixture.supervisor_route(other_thread_request).is_none());
+
+    // wire requests with the wrong owners, unknown fields, or no saved route are refused
+    let saved_route = |binding: BackgroundLaunchBinding, spec: &NormalizedSpec| {
+        OriginRoute::new_resource_background(homebased::submission::NewResourceBackgroundRoute {
+            request: RequestId::new(),
+            task: TaskId::new(),
+            callback: CallbackContext {
+                env: TaskEnv {
+                    path: "/bin:/usr/bin".into(),
+                    home: supervisor.user_home.to_string_lossy().into_owned(),
+                },
+                cwd: supervisor.user_home.clone(),
+                codex: PathBuf::from("/bin/true").into(),
+            },
+            spec: spec.clone(),
+            binding,
+        })
+        .unwrap()
+    };
+    let detail = fixture.detail().await;
+    let resource: homebased::resource::Resource =
+        serde_json::from_value(detail["resource"].clone()).unwrap();
+    let current = BackgroundLaunchBinding {
+        assignment: homebased::resource::background_launch::BackgroundSupervisorAssignment::of(
+            &resource,
+        ),
+        expected_state_revision: resource.state_revision,
+    };
+    let unsaved = saved_route(current, &spec);
+    let wire = fixture.wire_launch(&unsaved);
+    let mut wrong_destination = wire.clone();
+    wrong_destination["destination_machine"] = serde_json::json!(supervisor.machine_id());
+    let mut wrong_source = wire.clone();
+    wrong_source["source_machine"] = serde_json::json!(MachineId::new());
+    let mut unknown_field = wire.clone();
+    unknown_field["operation"]["callback"] = serde_json::json!({"cwd": "/tmp"});
+    for request in [wrong_destination, wrong_source, unknown_field] {
+        assert_ne!(post_background(authority, &request).await.0, 200);
+    }
+    let (status, body) = post_background(authority, &wire).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"]["reason"]["type"], "route_evidence_missing");
+
+    // saved routes whose assignment or revision is stale are refused by the authority
+    let mut stale_assignment = current;
+    stale_assignment.assignment.assignment_revision =
+        serde_json::from_value(serde_json::json!(5)).unwrap();
+    let mut stale_revision = current;
+    stale_revision.expected_state_revision = serde_json::from_value(serde_json::json!(9)).unwrap();
+    let supervisor_db = supervisor.home.join("homebased.sqlite");
+    for (binding, reason) in [
+        (stale_assignment, "not_current_supervisor"),
+        (stale_revision, "stale_revision"),
+    ] {
+        let route = saved_route(binding, &spec);
+        Store::open(&supervisor_db)
+            .unwrap()
+            .insert_origin_route(&route)
+            .unwrap();
+        let (status, body) = post_background(authority, &fixture.wire_launch(&route)).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["outcome"]["reason"]["type"], reason, "{body}");
+    }
+    // a saved route with other content is not evidence for this launch
+    let other = saved_route(current, &fixture.trainer.spec(fixture.thread, "other"));
+    Store::open(&supervisor_db)
+        .unwrap()
+        .insert_origin_route(&other)
+        .unwrap();
+    let mut mismatched = fixture.wire_launch(&unsaved);
+    mismatched["operation"]["request_id"] = serde_json::json!(other.request);
+    mismatched["operation"]["task_id"] = serde_json::json!(other.task);
+    let (_, body) = post_background(authority, &mismatched).await;
+    assert_eq!(body["outcome"]["reason"]["type"], "route_evidence_mismatch");
+
+    // queued work keeps its FIFO position, and a fresh resource does not start it
+    let queued = fixture.queue_request().await;
+    let queued_task: TaskId = serde_json::from_value(queued["task_id"].clone()).unwrap();
+    let request = RequestId::new();
+    assert!(refused(
+        fixture.launch(request, &spec).await,
+        "resource action not allowed"
+    ));
+    assert!(matches!(
+        fixture.supervisor_route(request).unwrap().submission,
+        SubmissionState::ResourceBackground {
+            phase: homebased::submission::ResourceBackgroundRoutePhase::Rejected { .. },
+            ..
+        }
+    ));
+    // the saved refusal answers a retry of the same request
+    assert!(refused(
+        fixture.launch(request, &spec).await,
+        "resource action not allowed"
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(task_count(authority, queued_task), 0);
+    assert_eq!(background_receipt_count(authority), 0);
+    assert_eq!(fixture.trainer.starts(), 0);
+    let detail = fixture.detail().await;
+    assert_eq!(detail["loan"], Value::Null);
+    assert_eq!(detail["attention"]["code"], "queue_blocked", "{detail}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_remote_background_route_retries_after_restart_and_lost_reply_without_a_second_trainer()
+ {
+    let mut fixture = RemoteBackground::start(("bg-retry-authority", "bg-retry-supervisor")).await;
+    let spec = fixture.trainer.spec(fixture.thread, "retried trainer");
+    let detail = fixture.detail().await;
+    let resource: homebased::resource::Resource =
+        serde_json::from_value(detail["resource"].clone()).unwrap();
+    let request = RequestId::new();
+    let task = TaskId::new();
+    // the supervisor saved its fixed-ID route, then the send never reached the authority
+    fixture.supervisor.stop();
+    fixture.authority.stop();
+    let route =
+        OriginRoute::new_resource_background(homebased::submission::NewResourceBackgroundRoute {
+            request,
+            task,
+            callback: CallbackContext {
+                env: TaskEnv {
+                    path: format!("{}:/bin:/usr/bin", fixture.callbacks.bin.display()),
+                    home: fixture.callbacks.cwd.to_string_lossy().into_owned(),
+                },
+                cwd: fixture.callbacks.cwd.clone(),
+                codex: fixture.callbacks.bin.join("codex").into(),
+            },
+            spec: spec.clone(),
+            binding: homebased::resource::background_launch::BackgroundLaunchBinding {
+                assignment:
+                    homebased::resource::background_launch::BackgroundSupervisorAssignment::of(
+                        &resource,
+                    ),
+                expected_state_revision: resource.state_revision,
+            },
+        })
+        .unwrap();
+    let supervisor_db = fixture.supervisor.home.join("homebased.sqlite");
+    Store::open(&supervisor_db)
+        .unwrap()
+        .insert_origin_route(&route)
+        .unwrap();
+    let unresolved = || {
+        Store::open(&supervisor_db)
+            .unwrap()
+            .unknown_resource_background_routes()
+            .unwrap()
+            .len()
+    };
+
+    // startup recovery with the authority offline keeps the same unresolved route
+    fixture.supervisor.spawn();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(unresolved(), 1);
+    assert_eq!(task_count(&fixture.authority, task), 0);
+
+    fixture.authority.spawn();
+    wait_for_probe(&fixture.authority.address()).await;
+    fixture.supervisor.restart();
+    assert!(
+        wait_for(Duration::from_secs(20), || unresolved() == 0).await,
+        "startup recovery did not resolve the saved route"
+    );
+    assert_eq!(task_count(&fixture.authority, task), 1);
+    assert!(
+        wait_for(Duration::from_secs(20), || fixture.trainer.starts() == 1).await,
+        "the accepted launch did not start"
+    );
+
+    // a lost reply and a socket retry are answered by the same identity
+    let (status, body) = post_background(&fixture.authority, &fixture.wire_launch(&route)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"]["acceptance"]["type"], "existing", "{body}");
+    let retried = fixture.launch(request, &spec).await.unwrap();
+    assert_eq!(retried["outcome"]["type"], "existing", "{retried}");
+    assert_eq!(retried["task_id"], serde_json::json!(task));
+
+    // an authority restart observes the running trainer and never relaunches it
+    fixture.authority.restart();
+    wait_for_probe(&fixture.authority.address()).await;
+    let retried = fixture.launch(request, &spec).await.unwrap();
+    assert_eq!(retried["outcome"]["type"], "existing", "{retried}");
+    assert_eq!(task_count(&fixture.authority, task), 1);
+    assert_eq!(background_receipt_count(&fixture.authority), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fixture.trainer.starts(), 1);
+    fs::write(&fixture.trainer.gate, b"").unwrap();
+}

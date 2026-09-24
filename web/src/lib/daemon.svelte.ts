@@ -16,6 +16,15 @@ import {
 	type TaskQuery,
 	type TaskSummary
 } from './api';
+import {
+	fetchPendingActions,
+	fetchResourceDetail,
+	fetchResourceOverview,
+	type PendingAction,
+	type PendingActionResult,
+	type ResourceDetail,
+	type ResourceOverview
+} from './resources';
 
 /** Refresh cadence while the tab is visible. */
 export const POLL_INTERVAL_MS = 2000;
@@ -152,6 +161,142 @@ export class TaskStore {
 			this.error = asApiError(cause);
 		}
 		this.lastFetched = Date.now();
+	}
+}
+
+/** Resource overview and authority availability. */
+export class ResourceOverviewStore {
+	/** Last validated resource list. */
+	overview = $state<ResourceOverview | null>(null);
+	/** Error from the last attempt, cleared by the next success. */
+	error = $state<ApiError | null>(null);
+	/** Epoch milliseconds of the last settled attempt. */
+	lastFetched = $state<number | null>(null);
+
+	#visible = new IsDocumentVisible();
+	#generation = 0;
+
+	constructor() {
+		startPolling({
+			key: () => 'resources',
+			active: () => this.#visible.current,
+			run: () => void this.refresh()
+		});
+	}
+
+	/** Fetch the resource list and authority state. */
+	async refresh(): Promise<void> {
+		const generation = ++this.#generation;
+		try {
+			const overview = await fetchResourceOverview();
+			if (generation !== this.#generation) return;
+			this.overview = overview;
+			this.error = null;
+		} catch (cause) {
+			if (generation !== this.#generation) return;
+			this.error = asApiError(cause);
+		}
+		this.lastFetched = Date.now();
+	}
+}
+
+/** One resource detail, including actions assigned to its exact supervisor. */
+export class ResourceDetailStore {
+	/** Last validated detail from the fixed resource authority. */
+	detail = $state<ResourceDetail | null>(null);
+	/** Pending actions for the assigned supervisor, or null until first success. */
+	pendingActions = $state<PendingAction[] | null>(null);
+	/** Authorities that could not answer the supervisor action query. */
+	pendingUnavailableAuthorities = $state<readonly Record<string, unknown>[] | null>(null);
+	/** Error from the resource detail request. */
+	error = $state<ApiError | null>(null);
+	/** Error from the pending-action query. */
+	pendingError = $state<ApiError | null>(null);
+	/** Epoch milliseconds of the last settled detail attempt. */
+	lastFetched = $state<number | null>(null);
+
+	#id: () => string;
+	#visible = new IsDocumentVisible();
+	#generation = 0;
+	#pendingGeneration = 0;
+	#loadedId = '';
+
+	constructor(id: () => string) {
+		this.#id = id;
+		startPolling({
+			key: id,
+			active: () => this.#visible.current,
+			run: () => void this.refresh()
+		});
+	}
+
+	/** Fetch detail, then refresh the supervisor's pending-action projection. */
+	async refresh(): Promise<void> {
+		const generation = ++this.#generation;
+		const id = this.#id();
+		if (this.#loadedId !== id) {
+			this.detail = null;
+			this.pendingActions = null;
+			this.pendingUnavailableAuthorities = null;
+		}
+
+		try {
+			const detail = await fetchResourceDetail(id);
+			if (generation !== this.#generation) return;
+			this.detail = detail;
+			this.error = null;
+			this.#loadedId = id;
+		} catch (cause) {
+			if (generation !== this.#generation) return;
+			this.error = asApiError(cause);
+			this.lastFetched = Date.now();
+			return;
+		}
+
+		await this.refreshPendingActions(generation);
+		if (generation === this.#generation) this.lastFetched = Date.now();
+	}
+
+	/** Keep the exact detail returned by an acknowledged mutation on screen. */
+	showAuthoritative(detail: ResourceDetail): void {
+		if (detail.resource.id === this.#id()) {
+			this.#generation += 1;
+			this.#pendingGeneration += 1;
+			this.detail = detail;
+			this.pendingActions = null;
+			this.pendingUnavailableAuthorities = null;
+			this.pendingError = null;
+			this.error = null;
+			this.#loadedId = detail.resource.id;
+			this.lastFetched = Date.now();
+		}
+	}
+
+	/** Refresh the pending-action query without replacing resource detail. */
+	async refreshPending(): Promise<void> {
+		await this.refreshPendingActions(this.#generation);
+	}
+
+	async refreshPendingActions(generation = this.#generation): Promise<void> {
+		const detail = this.detail;
+		if (!detail) return;
+		const pendingGeneration = ++this.#pendingGeneration;
+		try {
+			const result: PendingActionResult = await fetchPendingActions(
+				detail.resource.supervisor.machine,
+				detail.resource.supervisor.thread
+			);
+			if (generation !== this.#generation || pendingGeneration !== this.#pendingGeneration) return;
+			this.pendingActions = result.actions.filter(
+				(action) => action.resource_id === detail.resource.id
+			);
+			this.pendingUnavailableAuthorities = result.unavailable_authorities ?? [];
+			this.pendingError = null;
+		} catch (cause) {
+			if (generation !== this.#generation || pendingGeneration !== this.#pendingGeneration) return;
+			this.pendingError = asApiError(cause);
+			this.pendingUnavailableAuthorities = null;
+		}
 	}
 }
 

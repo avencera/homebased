@@ -424,6 +424,9 @@ pub fn routes(fleet: FleetHandle) -> Router<AppState> {
             "/v1/cluster/resource-notices",
             post(receive_supervisor_notice),
         )
+        .merge(super::resource_action::cluster_routes())
+        .merge(super::resource_background::cluster_routes())
+        .merge(super::resource_api::cluster_routes())
 }
 
 async fn receive_message(
@@ -721,24 +724,39 @@ async fn cancel_origin_resource_request(
         .check_destination(body.destination_machine)?;
     check_api_version(body.api_version)?;
     check_protocol(body.protocol_version, body.requester_machine)?;
-    let _intent_guard = super::api::lock_cancellation_intent(body.task).await?;
+    let outcome = origin_resource_cancellation_intent(&state, body.task).await?;
+    Ok(Json(CancelOriginResourceBody {
+        api_version: API_VERSION,
+        protocol_version: body.protocol_version,
+        destination_machine: origin_machine,
+        outcome,
+    }))
+}
+
+/// Save or reuse the origin-owned cancellation intent for one resource-routed task
+pub(super) async fn origin_resource_cancellation_intent(
+    state: &AppState,
+    task: TaskId,
+) -> Result<OriginResourceCancellationOutcome, AppError> {
+    let origin_machine = state.machine.identity.machine;
+    let _intent_guard = super::api::lock_cancellation_intent(task).await?;
     let route = call(&state.store, |reply| StoreMsg::OriginRoute {
-        id: body.task,
+        id: task,
         reply,
     })
     .await?
-    .ok_or(AppError::TaskNotFound { id: body.task })?;
-    if route.task != body.task || route.origin_machine != origin_machine {
-        return Err(AppError::ClusterTaskConflict { task: body.task });
+    .ok_or(AppError::TaskNotFound { id: task })?;
+    if route.task != task || route.origin_machine != origin_machine {
+        return Err(AppError::ClusterTaskConflict { task });
     }
     let saved = call(&state.store, |reply| StoreMsg::GetCancellationRequest {
-        task: body.task,
+        task,
         reply,
     })
     .await?;
     let outcome = if let Some(saved) = saved {
         if !saved_origin_resource_cancellation_matches_route(&route, &saved) {
-            return Err(AppError::ClusterTaskConflict { task: body.task });
+            return Err(AppError::ClusterTaskConflict { task });
         }
         OriginResourceCancellationOutcome::Intent {
             request: Box::new(saved),
@@ -760,22 +778,20 @@ async fn cancel_origin_resource_request(
                     request_id: Some(route.request),
                 },
                 ResourceRoutePhase::CancelledBeforeLaunch => {
-                    return Ok(Json(CancelOriginResourceBody {
-                        api_version: API_VERSION,
-                        protocol_version: body.protocol_version,
-                        destination_machine: origin_machine,
-                        outcome: OriginResourceCancellationOutcome::AlreadyCancelled,
-                    }));
+                    return Ok(OriginResourceCancellationOutcome::AlreadyCancelled);
                 }
                 ResourceRoutePhase::Rejected { .. } => {
-                    return Err(AppError::TaskNotStarted { task: body.task });
+                    return Err(AppError::TaskNotStarted { task });
                 }
             },
-            SubmissionState::AcceptanceUnknown | SubmissionState::Accepted => {
-                return Err(AppError::ClusterTaskConflict { task: body.task });
+            SubmissionState::AcceptanceUnknown
+            | SubmissionState::Accepted
+            | SubmissionState::ResourceAction { .. }
+            | SubmissionState::ResourceBackground { .. } => {
+                return Err(AppError::ClusterTaskConflict { task });
             }
             SubmissionState::Rejected { .. } => {
-                return Err(AppError::TaskNotStarted { task: body.task });
+                return Err(AppError::TaskNotStarted { task });
             }
         };
         let request = CancellationRequest {
@@ -796,13 +812,7 @@ async fn cancel_origin_resource_request(
             request: Box::new(saved),
         }
     };
-
-    Ok(Json(CancelOriginResourceBody {
-        api_version: API_VERSION,
-        protocol_version: body.protocol_version,
-        destination_machine: origin_machine,
-        outcome,
-    }))
+    Ok(outcome)
 }
 
 fn saved_origin_resource_cancellation_matches_route(
@@ -1330,7 +1340,7 @@ async fn receive_event(
     }))
 }
 
-fn check_api_version(version: u32) -> Result<(), AppError> {
+pub(super) fn check_api_version(version: u32) -> Result<(), AppError> {
     if version != API_VERSION {
         return Err(AppError::Usage {
             message: "unsupported API version".into(),
@@ -1339,7 +1349,7 @@ fn check_api_version(version: u32) -> Result<(), AppError> {
     Ok(())
 }
 
-fn check_protocol(version: u32, machine: MachineId) -> Result<(), AppError> {
+pub(super) fn check_protocol(version: u32, machine: MachineId) -> Result<(), AppError> {
     let version = ClusterProtocolVersion(version);
     if SUPPORTED_PROTOCOLS.min() <= version && version <= SUPPORTED_PROTOCOLS.max() {
         return Ok(());
@@ -2292,7 +2302,9 @@ mod resource_queue_tests {
             first_inspection.reconcile_outcome,
             Some(crate::resource::ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven,
+                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven {
+                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                },
             }) if request.request_id == request_id
         ));
 
@@ -2320,7 +2332,9 @@ mod resource_queue_tests {
             retry_inspection.reconcile_outcome,
             Some(crate::resource::ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven,
+                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven {
+                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                },
             }) if request.request_id == request_id
         ));
         let requests = call(&store, |reply| {

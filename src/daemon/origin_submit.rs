@@ -195,7 +195,9 @@ async fn finish_saved(
             reason: reason.clone(),
         }),
         SubmissionState::AcceptanceUnknown => reconcile(state, route).await,
-        SubmissionState::Resource { .. } => {
+        SubmissionState::Resource { .. }
+        | SubmissionState::ResourceAction { .. }
+        | SubmissionState::ResourceBackground { .. } => {
             Err(conflict(&route, "request UUID belongs to a resource route"))
         }
     }
@@ -319,7 +321,9 @@ async fn resolve_identity(
             reason,
         }),
         SubmissionState::AcceptanceUnknown => Err(unknown(&route, "origin route is unresolved")),
-        SubmissionState::Resource { .. } => {
+        SubmissionState::Resource { .. }
+        | SubmissionState::ResourceAction { .. }
+        | SubmissionState::ResourceBackground { .. } => {
             Err(conflict(&saved, "request UUID belongs to a resource route"))
         }
     }
@@ -382,7 +386,13 @@ fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppError {
 }
 
 fn ensure_direct_route(route: &OriginRoute) -> Result<(), AppError> {
-    if matches!(route.submission, SubmissionState::Resource { .. }) {
+    // resource and action-bound routes never use the generic abandon path
+    if matches!(
+        route.submission,
+        SubmissionState::Resource { .. }
+            | SubmissionState::ResourceAction { .. }
+            | SubmissionState::ResourceBackground { .. }
+    ) {
         return Err(conflict(route, "request UUID belongs to a resource route"));
     }
     if route.spec.current().is_none() {

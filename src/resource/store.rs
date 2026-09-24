@@ -8,12 +8,13 @@ use uuid::Uuid;
 
 use super::{
     AcceptanceSequence, ActionId, AssignmentRevision, CommandSpec, CommandSpecError,
-    DeliveryAttemptId, Loan, LoanId, LoanPhase, LoanState, NoticeId, ReleaseCheckpointAction,
-    ReleaseCheckpointPhase, ReleaseCheckpointState, ReleaseWatcherIntent, Resource, ResourceId,
-    ResourceQueueAttentionReason, ResourceQueueReconcileOutcome, ResourceRequest,
-    ResourceRequestState, ResourceRevision, ResourceTaskOwnershipRisk, ReturnContext,
-    SavedReleaseWatcherIntent, ServingReleaseProvenance, SupervisorAddress, SupervisorNotice,
-    SupervisorNoticeDelivery, SupervisorNoticePayload,
+    DeliveryAttemptId, IdleBoundaryDecision, Loan, LoanId, LoanPhase, LoanState, NoticeId,
+    ReleaseCheckpointAction, ReleaseCheckpointPhase, ReleaseCheckpointState, ReleaseWatcherIntent,
+    Resource, ResourceId, ResourceQueueAttentionReason, ResourceQueueReconcileOutcome,
+    ResourceRegistrationReceipt, ResourceRequest, ResourceRequestState, ResourceRevision,
+    ResourceTaskOwnershipRisk, ReturnContext, SavedReleaseWatcherIntent, SavedResourceRegistration,
+    ServingReleaseProvenance, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
+    SupervisorNoticePayload,
 };
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskState, ThreadId,
@@ -203,9 +204,137 @@ CREATE TABLE IF NOT EXISTS resource_release_checkpoint_states (
 CREATE INDEX IF NOT EXISTS resource_release_checkpoint_states_resource
     ON resource_release_checkpoint_states(resource_id, action_id);
 
+CREATE TABLE IF NOT EXISTS resource_return_decisions (
+    action_id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    loan_id TEXT NOT NULL REFERENCES loans(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.authority.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.authority.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.authority.loan_id') = loan_id, 0)
+        AND COALESCE(json_type(receipt_json, '$.decision') = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.result.type') IN (
+            'closed', 'restore_bound'
+        ), 0)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS resource_restore_closures (
+    action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
+    task_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
+            'confirmed_running', 'foreground_ended', 'supervisor_resolved_end'
+        ), 0)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS resource_action_task_receipts (
+    task_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    action_id TEXT NOT NULL UNIQUE,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.request_id') = request_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.authority.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.authority.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.kind') IN ('release_watcher', 'return'), 0)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS resource_background_launches (
+    request_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.request_id') = request_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(receipt_json, '$.contract') = 'object', 0)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS resource_background_launches_resource
+    ON resource_background_launches(resource_id);
+
+CREATE TABLE IF NOT EXISTS resource_idle_openings (
+    loan_id TEXT PRIMARY KEY REFERENCES loans(id),
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.loan_id') = loan_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(receipt_json, '$.proof') = 'object', 0)
+    )
+);
+
 CREATE INDEX IF NOT EXISTS resource_supervisor_notices_pending
     ON resource_supervisor_notices(id)
     WHERE json_extract(notice_json, '$.delivery.type') IN ('pending', 'retry_pending');
+
+CREATE TABLE IF NOT EXISTS resource_control_operations (
+    operation_id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    request_json TEXT NOT NULL CHECK (
+        json_valid(request_json)
+        AND COALESCE(json_type(request_json) = 'object', 0)
+        AND COALESCE(json_extract(request_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(request_json, '$.action') = 'object', 0)
+    ),
+    attempt_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS resource_operator_attestations (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    task_id TEXT NOT NULL UNIQUE,
+    preceding_loan TEXT,
+    preceding_launch TEXT,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.operation_id') = operation_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.task_id') = task_id, 0)
+        AND COALESCE(
+            json_extract(receipt_json, '$.attestation.confirmation') = 'operator_confirmed_gpu_free',
+            0
+        )
+        AND COALESCE(length(trim(json_extract(receipt_json, '$.attestation.observation'))) > 0, 0)
+        AND COALESCE(json_type(receipt_json, '$.evidence') = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.outcome.type') IN (
+            'release_resolved_serving', 'release_resolved_return_required',
+            'idle_serving', 'idle_boundary'
+        ), 0)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS resource_operator_attestations_resource
+    ON resource_operator_attestations(resource_id);
+
+CREATE TABLE IF NOT EXISTS resource_registration_receipts (
+    resource_id TEXT PRIMARY KEY NOT NULL REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(receipt_json, '$.display_name') = 'text', 0)
+        AND COALESCE(json_type(receipt_json, '$.authority_machine') = 'text', 0)
+        AND COALESCE(json_type(receipt_json, '$.initial_supervisor') = 'object', 0)
+    )
+);
 ";
 
 const SUPERVISOR_NOTICE_MAX_ATTEMPTS: u8 = 3;
@@ -221,6 +350,18 @@ pub(crate) enum ResourceStoreError {
     /// An older watcher intent is readable but lacks evidence required for reuse.
     #[error("saved release watcher identity is legacy and unproven")]
     LegacyWatcherIntentUnproven,
+    /// The resource identity was first registered with different content
+    #[error("resource {resource:?} is already registered with different content")]
+    RegistrationConflict {
+        /// Resource whose saved registration differs
+        resource: ResourceId,
+    },
+    /// The resource row predates registration receipts and its initial supervisor is unknown
+    #[error("resource {resource:?} has no provable initial registration")]
+    LegacyRegistrationUnproven {
+        /// Resource whose first registration content was not saved
+        resource: ResourceId,
+    },
     /// The request was cancelled before it entered the resource queue.
     #[error("resource request was prevented before acceptance")]
     Prevented,
@@ -253,6 +394,12 @@ pub(crate) enum ResourceStoreError {
     /// An agent workload cannot enter the finite command queue.
     #[error(transparent)]
     InvalidCommandSpec(#[from] CommandSpecError),
+    /// The command falls outside the foreground ownership contract, so its end cannot release the resource.
+    #[error("resource command can outlive or hide from its task process group ({risk:?})")]
+    UnsupportedCommandOwnership {
+        /// First contract violation found in the command or its entry point.
+        risk: ResourceTaskOwnershipRisk,
+    },
     /// The saved command cannot be prepared on the executor machine.
     #[error("resource command cannot be prepared: {0}")]
     TaskPreparation(#[from] crate::error::AppError),
@@ -675,7 +822,7 @@ pub(crate) enum ReleaseWatcherAcceptance {
         task: TaskId,
         state: crate::domain::TaskState,
     },
-    /// The supervisor runs elsewhere and needs the later remote-launch path.
+    /// The supervisor runs elsewhere and must launch through the remote action path.
     UnsupportedRemoteSupervisor {
         /// Machine that owns this resource.
         authority_machine: MachineId,
@@ -917,6 +1064,11 @@ struct ReleaseCompletionReceipt {
     resource_id: ResourceId,
     expected_state_revision: ResourceRevision,
     return_context: ReturnContext,
+    /// Proof basis accepted by this completion, for either result
+    ///
+    /// Receipts written before the basis was saved decode as unverified
+    #[serde(default)]
+    release_provenance: ServingReleaseProvenance,
     result: ReleaseCompletionResult,
 }
 
@@ -1433,12 +1585,31 @@ pub(crate) fn retarget_supervisor_notice(
     destination: SupervisorAddress,
     new_assignment_revision: AssignmentRevision,
 ) -> Result<SupervisorNotice, SupervisorNoticeStoreError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let notice = retarget_supervisor_notice_in_transaction(
+        &tx,
+        notice_id,
+        expected_assignment_revision,
+        destination,
+        new_assignment_revision,
+    )?;
+    tx.commit()?;
+    Ok(notice)
+}
+
+/// Retarget an undelivered notice inside the caller's transaction.
+pub(crate) fn retarget_supervisor_notice_in_transaction(
+    tx: &Transaction<'_>,
+    notice_id: NoticeId,
+    expected_assignment_revision: AssignmentRevision,
+    destination: SupervisorAddress,
+    new_assignment_revision: AssignmentRevision,
+) -> Result<SupervisorNotice, SupervisorNoticeStoreError> {
     if new_assignment_revision.get() <= expected_assignment_revision.get() {
         return Err(SupervisorNoticeStoreError::AssignmentRevisionMustIncrease);
     }
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (mut notice, old_json) = select_supervisor_notice_record(&tx, notice_id)?
+    let (mut notice, old_json) = select_supervisor_notice_record(tx, notice_id)?
         .ok_or(SupervisorNoticeStoreError::NotFound)?;
     if notice.assignment_revision != expected_assignment_revision {
         return Err(SupervisorNoticeStoreError::StaleAssignmentRevision);
@@ -1463,8 +1634,7 @@ pub(crate) fn retarget_supervisor_notice(
     notice.destination = destination;
     notice.assignment_revision = new_assignment_revision;
 
-    update_supervisor_notice_cas(&tx, &notice, &old_json)?;
-    tx.commit()?;
+    update_supervisor_notice_cas(tx, &notice, &old_json)?;
     Ok(notice)
 }
 
@@ -1478,7 +1648,7 @@ fn same_supervisor_notice_content(left: &SupervisorNotice, right: &SupervisorNot
         && left.payload == right.payload
 }
 
-fn select_supervisor_notice_record(
+pub(crate) fn select_supervisor_notice_record(
     conn: &Connection,
     notice_id: NoticeId,
 ) -> Result<Option<(SupervisorNotice, String)>, rusqlite::Error> {
@@ -1491,7 +1661,7 @@ fn select_supervisor_notice_record(
     .optional()
 }
 
-fn select_supervisor_notice_record_by_action(
+pub(crate) fn select_supervisor_notice_record_by_action(
     conn: &Connection,
     action_id: ActionId,
 ) -> Result<Option<(SupervisorNotice, String)>, rusqlite::Error> {
@@ -1504,7 +1674,9 @@ fn select_supervisor_notice_record_by_action(
     .optional()
 }
 
-fn decode_supervisor_notice_record(row: &Row<'_>) -> rusqlite::Result<(SupervisorNotice, String)> {
+pub(crate) fn decode_supervisor_notice_record(
+    row: &Row<'_>,
+) -> rusqlite::Result<(SupervisorNotice, String)> {
     let id = NoticeId(uuid_column(row, 0)?);
     let loan_id = LoanId(uuid_column(row, 1)?);
     let action_id = ActionId(uuid_column(row, 2)?);
@@ -1521,7 +1693,7 @@ fn decode_supervisor_notice_record(row: &Row<'_>) -> rusqlite::Result<(Superviso
     Ok((notice, notice_json))
 }
 
-fn update_supervisor_notice_cas(
+pub(crate) fn update_supervisor_notice_cas(
     tx: &Transaction<'_>,
     notice: &SupervisorNotice,
     expected_json: &str,
@@ -1630,21 +1802,14 @@ fn open_release_loan_in_transaction(
     let task_id = resource
         .registered_background_task
         .ok_or(OpenReleaseLoanError::BackgroundTaskNotRegistered)?;
-    let task_status: Option<String> = tx
-        .query_row(
-            "SELECT status FROM tasks WHERE id = ?1",
-            [task_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match task_status.as_deref() {
-        None => return Err(OpenReleaseLoanError::BackgroundTaskMissing { task_id }),
-        Some("running") => {}
-        Some(state) => {
-            return Err(OpenReleaseLoanError::BackgroundTaskNotRunning {
-                task_id,
-                state: state.to_owned(),
-            });
+    match observe_registered_background_on(&tx, resource_id, task_id)? {
+        RegisteredBackgroundObservation::Missing => {
+            return Err(OpenReleaseLoanError::BackgroundTaskMissing { task_id });
+        }
+        RegisteredBackgroundObservation::Running
+        | RegisteredBackgroundObservation::EndedCandidate => {}
+        RegisteredBackgroundObservation::NotReleasable { state } => {
+            return Err(OpenReleaseLoanError::BackgroundTaskNotRunning { task_id, state });
         }
     }
 
@@ -1741,36 +1906,66 @@ pub(crate) fn reconcile_resource_queue_for_authority(
         return Ok(ResourceQueueReconcileOutcome::LoanAlreadyActive { loan });
     }
 
+    // a first background launch with a confirmed start becomes the registered
+    // task before any queue decision reads the registration
+    let resource = match crate::store::promote_started_background_launch_on(&tx, &resource)? {
+        Some(promoted) => promoted,
+        None => resource,
+    };
+
     let Some(request) = oldest_queued_request_inner(&tx, Some(authority_machine), resource_id)?
     else {
         tx.commit()?;
         return Ok(ResourceQueueReconcileOutcome::NoQueuedRequest);
     };
 
-    let Some(task_id) = resource.registered_background_task else {
+    if let Some(task_id) = crate::store::pending_background_launch_on(&tx, &resource)? {
         tx.commit()?;
         return Ok(ResourceQueueReconcileOutcome::AttentionRequired {
             request,
-            reason: ResourceQueueAttentionReason::IdleNotProven,
+            reason: ResourceQueueAttentionReason::BackgroundLaunchPending { task_id },
         });
+    }
+
+    let Some(task_id) = resource.registered_background_task else {
+        let outcome = match crate::store::idle_boundary_decision_on(&tx, &resource)? {
+            IdleBoundaryDecision::Proven(proof) => {
+                let (loan, request) = crate::store::open_idle_serving_loan_on(
+                    &tx,
+                    authority_machine,
+                    &resource,
+                    request,
+                    proof.clone(),
+                )?;
+                ResourceQueueReconcileOutcome::IdleServing {
+                    loan,
+                    request,
+                    proof,
+                }
+            }
+            IdleBoundaryDecision::Unproven(gap) => {
+                ResourceQueueReconcileOutcome::AttentionRequired {
+                    request,
+                    reason: ResourceQueueAttentionReason::IdleNotProven { gap },
+                }
+            }
+        };
+        tx.commit()?;
+        return Ok(outcome);
     };
 
-    let task_status: Option<String> = tx
-        .query_row(
-            "SELECT status FROM tasks WHERE id = ?1",
-            [task_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match task_status.as_deref() {
-        None => {
+    match observe_registered_background_on(&tx, resource_id, task_id)? {
+        RegisteredBackgroundObservation::Missing => {
             tx.commit()?;
             Ok(ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
                 reason: ResourceQueueAttentionReason::BackgroundTaskMissing { task_id },
             })
         }
-        Some("running") => {
+        // an ended trainer opens the same release action as a running one, so
+        // only the authority release proof can serve the queue from it
+        RegisteredBackgroundObservation::Running
+        | RegisteredBackgroundObservation::EndedCandidate => {
             let outcome = open_release_loan_in_transaction(
                 tx,
                 authority_machine,
@@ -1784,17 +1979,94 @@ pub(crate) fn reconcile_resource_queue_for_authority(
                 }
             }
         }
-        Some(state) => {
+        RegisteredBackgroundObservation::NotReleasable { state } => {
             tx.commit()?;
             Ok(ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: ResourceQueueAttentionReason::BackgroundTaskNotRunning {
-                    task_id,
-                    state: state.to_owned(),
-                },
+                reason: ResourceQueueAttentionReason::BackgroundTaskNotRunning { task_id, state },
             })
         }
     }
+}
+
+/// Authority view of the registered background task when queued work needs the resource
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredBackgroundObservation {
+    /// The registered task has no authority task row
+    Missing,
+    /// The task is running, so a watcher must stop it at a checkpoint
+    Running,
+    /// The task succeeded, failed, or was cancelled, its process-group exit is
+    /// confirmed, and a trainer attempt association is saved
+    ///
+    /// These facts do not release the resource. They only let the release action
+    /// open, and the authority release proof must still verify the released
+    /// ownership lock, and any result or stop evidence, before it serves the queue
+    EndedCandidate,
+    /// The task ended without the facts a release proof needs
+    ///
+    /// A lost or unconfirmed end, or a missing association, can leave trainer
+    /// work alive, so the queue stays blocked for an owner
+    NotReleasable {
+        /// Durable task status observed by the authority
+        state: String,
+    },
+}
+
+fn observe_registered_background_on(
+    conn: &Connection,
+    resource_id: ResourceId,
+    task_id: TaskId,
+) -> Result<RegisteredBackgroundObservation, ResourceStoreError> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Ok(RegisteredBackgroundObservation::Missing);
+    };
+    match ProcessStatus::from_storage(&status).ok() {
+        Some(ProcessStatus::Running) => return Ok(RegisteredBackgroundObservation::Running),
+        // a lost task never has a confirmed exit, so it is not a candidate
+        Some(ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled)
+            if ended_release_candidate(conn, resource_id, task_id)? =>
+        {
+            return Ok(RegisteredBackgroundObservation::EndedCandidate);
+        }
+        _ => {}
+    }
+
+    Ok(RegisteredBackgroundObservation::NotReleasable { state: status })
+}
+
+/// Check the saved facts that an ended-trainer release proof needs before it can run
+fn ended_release_candidate(
+    conn: &Connection,
+    resource_id: ResourceId,
+    task_id: TaskId,
+) -> Result<bool, ResourceStoreError> {
+    let evidence: Option<String> = conn.query_row(
+        "SELECT process_group_exit_evidence FROM tasks WHERE id = ?1",
+        [task_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if ProcessGroupExitEvidence::from_storage(evidence.as_deref())
+        != ProcessGroupExitEvidence::ConfirmedExited
+    {
+        return Ok(false);
+    }
+
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM trainer_attempt_associations
+            WHERE resource_id = ?1 AND task_id = ?2
+        )",
+        params![resource_id.as_uuid().to_string(), task_id.to_string()],
+        |row| row.get(0),
+    )?)
 }
 
 /// Bind one preallocated Homebased watcher launch identity to the exact release action
@@ -1980,6 +2252,19 @@ pub(crate) fn release_completion_for_retry(
     Ok(Some(receipt.result))
 }
 
+/// Whether a release notice names an assignment its action may still complete under
+///
+/// A replacement retargets only undelivered notices. A delivered notice keeps the
+/// older assignment whose supervisor launched the watcher, so it stays valid
+fn release_notice_assignment_is_valid(notice: &SupervisorNotice, resource: &Resource) -> bool {
+    let current = notice.destination == resource.supervisor
+        && notice.assignment_revision == resource.assignment_revision;
+    let delivered_before_replacement =
+        matches!(notice.delivery, SupervisorNoticeDelivery::Delivered { .. })
+            && notice.assignment_revision.get() < resource.assignment_revision.get();
+    current || delivered_before_replacement
+}
+
 /// Complete a saved release action with an authority-built proof and atomically assign work
 pub(crate) fn complete_release_for_authority(
     conn: &mut Connection,
@@ -2057,8 +2342,7 @@ pub(crate) fn complete_release_for_authority(
             != (SupervisorNoticePayload::ReleaseRequired {
                 task_id: observed_task_id,
             })
-        || notice.destination != resource.supervisor
-        || notice.assignment_revision != resource.assignment_revision
+        || !release_notice_assignment_is_valid(&notice, &resource)
     {
         return Err(CompleteReleaseError::InvalidReleaseNotice { action_id });
     }
@@ -2180,6 +2464,7 @@ pub(crate) fn complete_release_for_authority(
         resource_id,
         expected_state_revision,
         return_context,
+        release_provenance: proof.serving_release_provenance(),
         result: result.clone(),
     };
     let receipt_json = encode_completion_json(&receipt)?;
@@ -2255,12 +2540,28 @@ fn require_release_proof_matches_transaction(
             }
         }
         None => {
+            let expected_reason = proof
+                .ended_outcome()
+                .cloned()
+                .unwrap_or(crate::domain::ExitReason::Exit { code: 0 });
             if !matches!(
-                current_task.state,
-                TaskState::Finished {
-                    reason: crate::domain::ExitReason::Exit { code: 0 }
-                }
+                &current_task.state,
+                TaskState::Finished { reason } if *reason == expected_reason
             ) {
+                return Err(CompleteReleaseError::TaskStateChanged { task_id });
+            }
+            // an ended cancellation is generic only while this action committed no stop
+            if proof.ended_outcome() == Some(&crate::domain::ExitReason::Cancelled)
+                && let Some((checkpoint_state, _)) = release_checkpoint_state_for_action(
+                    conn,
+                    proof.resource_id(),
+                    proof.action_id(),
+                )?
+                && matches!(
+                    checkpoint_state.phase,
+                    ReleaseCheckpointPhase::CancellationCommitted { .. }
+                )
+            {
                 return Err(CompleteReleaseError::TaskStateChanged { task_id });
             }
         }
@@ -2759,25 +3060,14 @@ fn resource_task_release_proof(
     }
 }
 
-fn resource_task_ownership_risk(command: &CommandSpec) -> Option<ResourceTaskOwnershipRisk> {
-    let crate::spec::NormalizedWorkload::Task(workload) = &command.as_normalized().workload else {
-        return None;
-    };
-    let program = std::path::Path::new(workload.command.program())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(workload.command.program())
-        .to_ascii_lowercase();
-    match program.as_str() {
-        "ssh" | "scp" | "sftp" | "mosh" => Some(ResourceTaskOwnershipRisk::RemoteShell),
-        "docker" | "podman" | "nerdctl" | "ctr" | "kubectl" | "crictl" | "apptainer"
-        | "singularity" | "lxc" => Some(ResourceTaskOwnershipRisk::ContainerClient),
-        "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "pwsh" | "powershell" | "cmd"
-        | "cmd.exe" => Some(ResourceTaskOwnershipRisk::ShellWrapper),
-        "nohup" | "setsid" | "daemon" | "daemonize" | "start-stop-daemon" | "screen" | "tmux"
-        | "systemd-run" => Some(ResourceTaskOwnershipRisk::DetachedLauncher),
-        _ => None,
-    }
+/// Classify a queued command against the foreground ownership contract
+///
+/// Only the foreground contract lets process-group exit release the resource
+pub(crate) fn resource_task_ownership_risk(
+    command: &CommandSpec,
+) -> Option<ResourceTaskOwnershipRisk> {
+    let command = crate::resource::foreground::task_command(command.as_normalized())?;
+    crate::resource::foreground::CommandOwnershipContract::for_queued_command(command).err()
 }
 
 fn select_resource_task_completion_receipt(
@@ -2902,6 +3192,32 @@ fn update_resource_revision(
     Ok(())
 }
 
+/// Read the action and return context that a verified release receipt gave one loan
+pub(crate) fn release_completion_for_loan(
+    conn: &Connection,
+    resource_id: ResourceId,
+    loan_id: LoanId,
+) -> Result<Option<(ActionId, ReturnContext)>, rusqlite::Error> {
+    let receipt_json: Option<String> = conn
+        .query_row(
+            "SELECT receipt_json FROM resource_release_completions
+             WHERE json_extract(receipt_json, '$.resource_id') = ?1
+               AND json_extract(receipt_json, '$.result.loan.id') = ?2",
+            params![
+                resource_id.as_uuid().to_string(),
+                loan_id.as_uuid().to_string()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    receipt_json
+        .map(|json| {
+            decode_json::<ReleaseCompletionReceipt>(&json, 0)
+                .map(|receipt| (receipt.action_id, receipt.return_context))
+        })
+        .transpose()
+}
+
 fn select_release_completion_receipt(
     conn: &Connection,
     action_id: ActionId,
@@ -2955,9 +3271,21 @@ fn register_resource_inner(
     let state_revision = sqlite_integer(resource.state_revision.get())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+    let receipt = ResourceRegistrationReceipt::initial(resource);
     if let Some(saved) = select_resource(&tx, resource.id)? {
-        if saved != *resource {
-            return Err(ResourceStoreError::Conflict);
+        // an exact retry matches the first registration, even after a supervisor replacement
+        match select_resource_registration(&tx, resource.id)? {
+            Some(SavedResourceRegistration::Recorded(first)) if first == receipt => {}
+            Some(SavedResourceRegistration::Recorded(_)) => {
+                return Err(ResourceStoreError::RegistrationConflict {
+                    resource: resource.id,
+                });
+            }
+            Some(SavedResourceRegistration::LegacyUnproven) | None => {
+                return Err(ResourceStoreError::LegacyRegistrationUnproven {
+                    resource: resource.id,
+                });
+            }
         }
 
         tx.commit()?;
@@ -2982,8 +3310,79 @@ fn register_resource_inner(
                 .map(|task| task.to_string()),
         ],
     )?;
+    insert_resource_registration(&tx, &receipt)?;
     tx.commit()?;
     Ok(resource.clone())
+}
+
+fn insert_resource_registration(
+    conn: &Connection,
+    receipt: &ResourceRegistrationReceipt,
+) -> Result<(), ResourceStoreError> {
+    let json = encode_json(receipt)?;
+    conn.execute(
+        "INSERT INTO resource_registration_receipts (resource_id, receipt_json)
+         VALUES (?1, ?2)",
+        params![receipt.resource_id.as_uuid().to_string(), json],
+    )?;
+    Ok(())
+}
+
+/// Read the first registration saved for one resource, or `None` when no resource exists
+pub(crate) fn select_resource_registration(
+    conn: &Connection,
+    resource_id: ResourceId,
+) -> Result<Option<SavedResourceRegistration>, ResourceStoreError> {
+    let row = conn
+        .query_row(
+            "SELECT r.receipt_json
+             FROM resources s
+             LEFT JOIN resource_registration_receipts r ON r.resource_id = s.id
+             WHERE s.id = ?1",
+            [resource_id.as_uuid().to_string()],
+            |row| {
+                row.get::<_, Option<String>>(0)?
+                    .map(|json| decode_json::<ResourceRegistrationReceipt>(&json, 0))
+                    .transpose()
+            },
+        )
+        .optional()?;
+    let Some(receipt) = row else {
+        return Ok(None);
+    };
+    let Some(receipt) = receipt else {
+        return Ok(Some(SavedResourceRegistration::LegacyUnproven));
+    };
+    if receipt.resource_id != resource_id {
+        return Err(ResourceStoreError::Conflict);
+    }
+    Ok(Some(SavedResourceRegistration::Recorded(receipt)))
+}
+
+/// Save first-registration receipts that older resource rows still prove
+///
+/// Registration always assigned revision zero, and only a supervisor replacement
+/// raises it. A row still at revision zero keeps its first supervisor, so its
+/// receipt is provable. A replaced row gets no receipt, and a retry fails closed
+pub(crate) fn backfill_resource_registration_receipts(
+    conn: &Connection,
+) -> Result<(), ResourceStoreError> {
+    let ids = {
+        let mut statement = conn.prepare(
+            "SELECT id FROM resources
+             WHERE assignment_revision = 0
+               AND id NOT IN (SELECT resource_id FROM resource_registration_receipts)",
+        )?;
+        statement
+            .query_map([], |row| uuid_column(row, 0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        let resource = select_resource(conn, ResourceId::from_uuid(id))?
+            .ok_or(ResourceStoreError::ResourceNotFound)?;
+        insert_resource_registration(conn, &ResourceRegistrationReceipt::initial(&resource))?;
+    }
+    Ok(())
 }
 
 /// Accept one command request on the resource's fixed authority.
@@ -3038,21 +3437,27 @@ fn accept_request_inner(
     origin_machine: MachineId,
     normalized_spec: NormalizedSpec,
 ) -> Result<ResourceRequest, ResourceStoreError> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-    if let Some(saved) = select_request_by_id(&tx, request_id)? {
-        if saved.task_id != task_id
-            || saved.resource_id != resource_id
-            || saved.origin_machine != origin_machine
+    let identity = RequestIdentity {
+        request_id,
+        task_id,
+        resource_id,
+        origin_machine,
+    };
+    {
+        // an exact retry is answered from the saved request before the command
+        // checks, so a file that changed after acceptance cannot reject it
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if let Some(saved) = replay_request_on(&tx, authority_machine, identity, &normalized_spec)?
         {
-            return Err(ResourceStoreError::Conflict);
+            tx.commit()?;
+            return Ok(saved);
         }
-        let command_spec = CommandSpec::try_from(normalized_spec)?;
-        if !same_spec(saved.spec().as_normalized(), command_spec.as_normalized())? {
-            return Err(ResourceStoreError::Conflict);
-        }
-        check_resource_authority(&tx, resource_id, authority_machine)?;
+    }
+    // the entry-point check reads the file system outside the IMMEDIATE write transaction
+    check_queued_command_ownership(&normalized_spec)?;
 
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(saved) = replay_request_on(&tx, authority_machine, identity, &normalized_spec)? {
         tx.commit()?;
         return Ok(saved);
     }
@@ -3061,12 +3466,6 @@ fn accept_request_inner(
         return Err(ResourceStoreError::Conflict);
     }
 
-    let identity = RequestIdentity {
-        request_id,
-        task_id,
-        resource_id,
-        origin_machine,
-    };
     if prevention_exists(&tx, identity)? {
         return Err(ResourceStoreError::Prevented);
     }
@@ -3104,6 +3503,44 @@ fn accept_request_inner(
     )?;
     tx.commit()?;
     Ok(saved)
+}
+
+/// Return the saved request for an exact retry, or a conflict for changed content
+fn replay_request_on(
+    conn: &Connection,
+    authority_machine: Option<MachineId>,
+    identity: RequestIdentity,
+    normalized_spec: &NormalizedSpec,
+) -> Result<Option<ResourceRequest>, ResourceStoreError> {
+    let Some(saved) = select_request_by_id(conn, identity.request_id)? else {
+        return Ok(None);
+    };
+    if saved.task_id != identity.task_id
+        || saved.resource_id != identity.resource_id
+        || saved.origin_machine != identity.origin_machine
+    {
+        return Err(ResourceStoreError::Conflict);
+    }
+    let command_spec = CommandSpec::try_from(normalized_spec.clone())?;
+    if !same_spec(saved.spec().as_normalized(), command_spec.as_normalized())? {
+        return Err(ResourceStoreError::Conflict);
+    }
+    check_resource_authority(conn, identity.resource_id, authority_machine)?;
+
+    Ok(Some(saved))
+}
+
+/// Refuse a new queued command outside the foreground ownership contract
+///
+/// A path-qualified entry point is inspected now. A bare program name resolves
+/// from the executor `PATH`, so its task binding inspects it before any spawn
+fn check_queued_command_ownership(spec: &NormalizedSpec) -> Result<(), ResourceStoreError> {
+    let command_spec = CommandSpec::try_from(spec.clone())?;
+    if let Some(risk) = resource_task_ownership_risk(&command_spec) {
+        return Err(ResourceStoreError::UnsupportedCommandOwnership { risk });
+    }
+    crate::resource::foreground::inspect_path_qualified_entry_point(spec)
+        .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })
 }
 
 /// Validate the exact FIFO assignment that is eligible for task-layer acceptance.
@@ -3236,10 +3673,33 @@ fn serving_release_provenance_matches(
 ) -> Result<bool, ResourceStoreError> {
     let (action_id, task_id) = match provenance {
         ServingReleaseProvenance::Unverified => return Ok(false),
+        ServingReleaseProvenance::IdleBoundary { proof } => {
+            return crate::store::idle_opening_matches_on(
+                conn,
+                authority,
+                resource,
+                loan,
+                return_context,
+                proof,
+            );
+        }
+        ServingReleaseProvenance::OperatorAttestedGpuFree { .. } => {
+            return crate::store::operator_serving_release_matches_on(
+                conn,
+                authority,
+                resource,
+                loan,
+                return_context,
+                provenance,
+            );
+        }
         ServingReleaseProvenance::CompletedTrainerResult {
             action_id, task_id, ..
         }
         | ServingReleaseProvenance::StoppedTrainerCheckpoint {
+            action_id, task_id, ..
+        }
+        | ServingReleaseProvenance::EndedTrainerLockReleased {
             action_id, task_id, ..
         } => (*action_id, *task_id),
     };
@@ -3265,6 +3725,7 @@ fn serving_release_provenance_matches(
     {
         return Ok(false);
     }
+    let receipt_provenance = receipt.release_provenance;
 
     let ReleaseCompletionResult::Assigned {
         loan: completed_loan,
@@ -3301,7 +3762,10 @@ fn serving_release_provenance_matches(
     }
 
     match provenance {
-        ServingReleaseProvenance::Unverified => Ok(false),
+        // an idle opening and an operator attestation have no release completion receipt
+        ServingReleaseProvenance::Unverified
+        | ServingReleaseProvenance::IdleBoundary { .. }
+        | ServingReleaseProvenance::OperatorAttestedGpuFree { .. } => Ok(false),
         ServingReleaseProvenance::CompletedTrainerResult { task_id, .. } => Ok(matches!(
             return_context,
             ReturnContext::AlreadyCompleted { task_id: returned_task, .. }
@@ -3317,6 +3781,17 @@ fn serving_release_provenance_matches(
                 return_context,
             )
         }
+        // only a receipt that saved this exact basis can permit activation
+        ServingReleaseProvenance::EndedTrainerLockReleased {
+            task_id, outcome, ..
+        } => Ok(receipt_provenance == *provenance
+            && matches!(
+                return_context,
+                ReturnContext::EndedWithoutResult {
+                    task_id: returned_task,
+                    outcome: returned_outcome,
+                } if returned_task == task_id && returned_outcome == outcome
+            )),
     }
 }
 
@@ -3948,7 +4423,7 @@ fn decode_resource_snapshot(row: &Row<'_>) -> rusqlite::Result<ResourceSnapshot>
     Ok(ResourceSnapshot { resource, loan })
 }
 
-fn select_request_by_id(
+pub(crate) fn select_request_by_id(
     conn: &Connection,
     request_id: RequestId,
 ) -> Result<Option<ResourceRequest>, rusqlite::Error> {
@@ -4309,6 +4784,7 @@ pub(crate) fn seed_verified_serving_provenance_for_test(
         resource_id,
         expected_state_revision,
         return_context: return_context.clone(),
+        release_provenance: release_provenance.clone(),
         result: ReleaseCompletionResult::Assigned {
             loan: loan.clone(),
             request,
@@ -4439,20 +4915,96 @@ mod tests {
     }
 
     #[test]
-    fn assigned_task_release_proof_rejects_commands_that_can_outlive_the_group() {
-        for (program, risk) in [
-            ("ssh", ResourceTaskOwnershipRisk::RemoteShell),
-            ("docker", ResourceTaskOwnershipRisk::ContainerClient),
-            ("sh", ResourceTaskOwnershipRisk::ShellWrapper),
-            ("setsid", ResourceTaskOwnershipRisk::DetachedLauncher),
+    fn no_child_evidence_proves_release_only_for_pre_spawn_outcomes() {
+        let request = ResourceRequest::new(
+            RequestId::new(),
+            TaskId::new(),
+            ResourceId::new(),
+            AcceptanceSequence::new(1),
+            MachineId::new(),
+            command_spec(&["ssh", "gpu-host"]),
+        )
+        .unwrap();
+        let spawn_failed = ExitReason::SpawnFailed {
+            message: "fake spawn failure".into(),
+        };
+        // no child ran, so the command shape cannot have left work behind
+        assert_eq!(
+            resource_task_release_proof(
+                &request,
+                &spawn_failed,
+                ProcessGroupExitEvidence::NoChildSpawned
+            ),
+            Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterSpawnFailure)
+        );
+        assert_eq!(
+            resource_task_release_proof(
+                &request,
+                &ExitReason::Cancelled,
+                ProcessGroupExitEvidence::NoChildSpawned
+            ),
+            Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterQueuedCancel)
+        );
+        for outcome in [
+            ExitReason::Exit { code: 0 },
+            ExitReason::Signal { signal: 9 },
         ] {
+            assert_eq!(
+                resource_task_release_proof(
+                    &request,
+                    &outcome,
+                    ProcessGroupExitEvidence::NoChildSpawned
+                ),
+                Err(AssignedResourceTaskAttention::InvalidNoChildSpawnEvidence)
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_task_release_proof_rejects_commands_that_can_outlive_the_group() {
+        for (command, risk) in [
+            (
+                &["ssh", "gpu-host"][..],
+                ResourceTaskOwnershipRisk::RemoteShell,
+            ),
+            (
+                &["docker", "run"][..],
+                ResourceTaskOwnershipRisk::ContainerClient,
+            ),
+            (
+                &["sh", "-c", "bench"][..],
+                ResourceTaskOwnershipRisk::ShellWrapper,
+            ),
+            (
+                &["setsid", "bench"][..],
+                ResourceTaskOwnershipRisk::DetachedLauncher,
+            ),
+            // wrappers whose own exit hides a detached container or other launch
+            (
+                &["env", "docker", "run", "-d", "gpu"][..],
+                ResourceTaskOwnershipRisk::ProgramLauncher,
+            ),
+            (
+                &["sudo", "/opt/gpu/bench"][..],
+                ResourceTaskOwnershipRisk::ProgramLauncher,
+            ),
+            (
+                &["timeout", "1h", "bench"][..],
+                ResourceTaskOwnershipRisk::ProgramLauncher,
+            ),
+            (
+                &["/opt/tools/runner", "docker", "run", "-d"][..],
+                ResourceTaskOwnershipRisk::ContainerClient,
+            ),
+        ] {
+            // a request saved before the contract existed still cannot release
             let request = ResourceRequest::new(
                 RequestId::new(),
                 TaskId::new(),
                 ResourceId::new(),
                 AcceptanceSequence::new(1),
                 MachineId::new(),
-                command_spec(&[program, "fake-command"]),
+                command_spec(command),
             )
             .unwrap();
             assert_eq!(
@@ -5511,7 +6063,7 @@ mod tests {
         conflicting.display_name = "replacement".into();
         assert!(matches!(
             register_resource(&mut conn, &conflicting),
-            Err(ResourceStoreError::Conflict)
+            Err(ResourceStoreError::RegistrationConflict { .. })
         ));
         let conflicting_authority = Resource::new(
             resource.id,
@@ -5524,7 +6076,7 @@ mod tests {
         );
         assert!(matches!(
             register_resource(&mut conn, &conflicting_authority),
-            Err(ResourceStoreError::Conflict)
+            Err(ResourceStoreError::RegistrationConflict { .. })
         ));
         assert_eq!(select_resource(&conn, resource.id).unwrap(), Some(resource));
     }
@@ -5801,7 +6353,9 @@ mod tests {
             outcome,
             ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: ResourceQueueAttentionReason::IdleNotProven,
+                reason: ResourceQueueAttentionReason::IdleNotProven {
+                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                },
             } if request.request_id == first.request_id
         ));
         assert!(
@@ -5843,18 +6397,19 @@ mod tests {
                 | ResourceQueueAttentionReason::BackgroundTaskNotRunning { task_id, .. } => {
                     *task_id
                 }
-                ResourceQueueAttentionReason::IdleNotProven
+                ResourceQueueAttentionReason::IdleNotProven { .. }
+                | ResourceQueueAttentionReason::BackgroundLaunchPending { .. }
                 | ResourceQueueAttentionReason::AcceptedTaskLaunchUncertain { .. }
                 | ResourceQueueAttentionReason::UnverifiedServingRelease
                 | ResourceQueueAttentionReason::ReleaseProofUnavailable { .. }
                 | ResourceQueueAttentionReason::AssignedTaskLaunchUncertain { .. }
-                | ResourceQueueAttentionReason::AssignedTaskFailed { .. }
                 | ResourceQueueAttentionReason::AssignedTaskLost { .. }
                 | ResourceQueueAttentionReason::AssignedTaskExitUnconfirmed { .. }
                 | ResourceQueueAttentionReason::AssignedTaskIdentityMismatch { .. }
                 | ResourceQueueAttentionReason::AssignedTaskNoChildSpawnProofInvalid { .. }
                 | ResourceQueueAttentionReason::AssignedTaskOwnershipUncertain { .. }
-                | ResourceQueueAttentionReason::AssignedTaskStaleRevision { .. } => {
+                | ResourceQueueAttentionReason::AssignedTaskStaleRevision { .. }
+                | ResourceQueueAttentionReason::AssignedTaskReconcileFailed { .. } => {
                     unreachable!()
                 }
             };

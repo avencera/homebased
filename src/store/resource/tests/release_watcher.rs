@@ -104,6 +104,29 @@ impl PollFixture {
         .unwrap();
     }
 
+    /// Replace the supervisor machine through the operator control
+    fn replace_supervisor(&mut self, machine: MachineId) {
+        let resource = self
+            .store
+            .resource_snapshots_for_authority(self.authority)
+            .unwrap()
+            .remove(0)
+            .resource;
+        let replaced = self
+            .store
+            .replace_resource_supervisor(
+                self.authority,
+                resource.id,
+                resource.state_revision,
+                SupervisorAddress {
+                    machine,
+                    thread: resource.supervisor.thread,
+                },
+            )
+            .unwrap();
+        assert!(replaced.resource.assignment_revision.get() > resource.assignment_revision.get());
+    }
+
     fn write_generation(&self, generation_id: &str, update_count: u64) {
         crate::resource::watcher::tests::write_generation_for_test(
             &self.runtime_root,
@@ -360,7 +383,27 @@ fn changed_selected_checkpoint_and_lost_trainer_keep_the_loan_without_a_marker()
 }
 
 #[test]
-fn remote_supervisor_poll_is_typed_unsupported() {
+fn local_watcher_keeps_its_stop_after_the_supervisor_moves_to_another_machine() {
+    let mut fixture = PollFixture::new();
+    fixture.start_watcher();
+    let remote = machine_other_than(fixture.authority);
+    fixture.replace_supervisor(remote);
+    fixture.write_generation("generation-after-baseline", 20);
+    let command = fixture.command();
+
+    // the saved local routes, not the new remote assignment, own this watcher
+    let ReleaseWatcherPollOutcome::StopCommitted {
+        cancel_requested_at,
+        ..
+    } = fixture.poll(command)
+    else {
+        panic!("the accepted local watcher must keep its stop authority");
+    };
+    assert_eq!(fixture.trainer_cancel_marker(), Some(cancel_requested_at));
+}
+
+#[test]
+fn local_watcher_with_a_changed_route_is_refused_without_a_marker() {
     let mut fixture = PollFixture::new();
     fixture.start_watcher();
     fixture.write_generation("generation-after-baseline", 20);
@@ -368,10 +411,11 @@ fn remote_supervisor_poll_is_typed_unsupported() {
         .store
         .conn
         .execute(
-            "UPDATE resources SET supervisor_machine = ?1 WHERE id = ?2",
+            "UPDATE origin_routes SET route_json = json_set(route_json, '$.thread', ?1)
+             WHERE request_id = ?2",
             params![
-                MachineId::new().as_uuid().to_string(),
-                fixture.resource.id.as_uuid().to_string(),
+                uuid::Uuid::now_v7().to_string(),
+                fixture.intent.request_id.0.to_string(),
             ],
         )
         .unwrap();
@@ -379,7 +423,7 @@ fn remote_supervisor_poll_is_typed_unsupported() {
 
     assert_eq!(
         fixture.poll(command),
-        attention(ReleaseWatcherPollAttention::RemoteSupervisorUnsupported)
+        attention(ReleaseWatcherPollAttention::WatcherIdentityConflict)
     );
     assert!(fixture.trainer_cancel_marker().is_none());
 }
@@ -538,7 +582,8 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
     // the fake trainer runs until its task-run cancels the child group
     fs::write(&fixture.python, b"#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
     let marker = fixture.home.join("activation-count");
-    let request_spec = fake_resource_task_spec(&fixture.home, &marker);
+    let gate = fixture.home.join("release-commands");
+    let request_spec = gated_resource_task_spec(&fixture.home, &marker, &gate);
     let resource_id = fixture.resource.id;
     let trainer_task_id = fixture.task_id;
 
@@ -642,27 +687,10 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
         trainer.process_group_exit_evidence(),
         ProcessGroupExitEvidence::ConfirmedExited
     );
-    let optimization = wait_for_task(&store, request.task_id, Duration::from_secs(30), |row| {
-        row.status().is_terminal()
+    wait_for_task(&store, request.task_id, Duration::from_secs(30), |row| {
+        row.status() == ProcessStatus::Running
     })
     .await;
-    assert_eq!(optimization.status(), ProcessStatus::Succeeded);
-    let watcher = wait_for_task(&store, watcher_task_id, Duration::from_secs(30), |row| {
-        row.status().is_terminal()
-    })
-    .await;
-    assert_eq!(watcher.status(), ProcessStatus::Succeeded);
-
-    for _ in 0..3 {
-        call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
-            id: resource_id,
-            reply,
-        })
-        .await
-        .unwrap();
-    }
-    assert_eq!(fs::read(&marker).unwrap(), b"x");
-    assert_eq!(watcher_task_count(&fixture.database), 1);
     let inspection = call(&supervisor, |reply| SupervisorMsg::InspectResource {
         id: resource_id,
         reply,
@@ -686,6 +714,31 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
             && *saved_task == trainer_task_id
             && generation_id == "generation-after-baseline"
     ));
+
+    fs::write(&gate, b"").unwrap();
+    let optimization = wait_for_task(&store, request.task_id, Duration::from_secs(30), |row| {
+        row.status().is_terminal()
+    })
+    .await;
+    assert_eq!(optimization.status(), ProcessStatus::Succeeded);
+    let watcher = wait_for_task(&store, watcher_task_id, Duration::from_secs(30), |row| {
+        row.status().is_terminal()
+    })
+    .await;
+    assert_eq!(watcher.status(), ProcessStatus::Succeeded);
+
+    for _ in 0..3 {
+        call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
+            id: resource_id,
+            reply,
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(watcher_task_count(&fixture.database), 1);
+    let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+    assert_eq!(return_notice_count(&home, loan.id), 1);
 
     assert_route_is_socket_only(state).await;
     socket_server.abort();
@@ -944,7 +997,7 @@ async fn accepted_queued_watcher_after_restart_is_uncertain_and_never_spawned() 
 }
 
 #[tokio::test]
-async fn remote_supervisor_is_typed_unsupported_before_any_watcher_record() {
+async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_supervisor_machine() {
     let _guard = SUPERVISOR_TEST_LOCK.lock().await;
     crate::runner::set_task_run_executable_for_tests(watcher_executable());
     let directory = tempdir().unwrap();
@@ -1003,33 +1056,581 @@ async fn remote_supervisor_is_typed_unsupported_before_any_watcher_record() {
         .await
         .unwrap();
     let status = wait_for_watcher_status(&supervisor, resource_id, |_| true).await;
+    let ReleaseWatcherStatus::AwaitingRemoteSupervisor {
+        watcher_task_id,
+        supervisor_machine,
+        ..
+    } = status
+    else {
+        panic!("remote supervisor watcher status was {status:?}");
+    };
+    assert_eq!(supervisor_machine, remote_supervisor);
+    let saved = Store::open(&home.db_path())
+        .unwrap()
+        .resource_snapshots_for_authority(authority)
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.resource.id == resource_id)
+        .unwrap();
+    // the authority binds the identity and baseline, but writes no task until the
+    // supervisor machine has saved its callback route and asks for the launch
     assert!(matches!(
-        status,
-        ReleaseWatcherStatus::Attention {
-            reason: ReleaseWatcherAttentionReason::RemoteSupervisorUnsupported {
-                supervisor_machine,
-            },
-            ..
-        } if supervisor_machine == remote_supervisor
-    ));
-    let inspection = call(&supervisor, |reply| SupervisorMsg::InspectResource {
-        id: resource_id,
-        reply,
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        inspection.loan.map(|loan| loan.state),
+        saved.loan.clone().map(|loan| loan.state),
         Some(LoanState::Active {
             phase: LoanPhase::AwaitingRelease {
-                watcher_intent: None,
+                watcher_intent: Some(SavedReleaseWatcherIntent::Complete(intent)),
                 ..
             }
-        })
+        }) if intent.watcher_task_id.as_task_id() == watcher_task_id
     ));
     assert_eq!(watcher_task_count(&home.db_path()), 0);
 
+    // the supervisor machine prepares, saves its route, and launches the same identity
+    let SupervisorAddress { thread, .. } = saved.resource.supervisor;
+    let loan = saved.loan.unwrap();
+    let LoanState::Active {
+        phase: LoanPhase::AwaitingRelease { action_id, .. },
+    } = loan.state
+    else {
+        unreachable!();
+    };
+    let action = crate::resource::SupervisorActionAuthority {
+        authority_machine: authority,
+        resource_id,
+        loan_id: loan.id,
+        action_id,
+        expected_state_revision: saved.resource.state_revision,
+        supervisor: SupervisorAddress {
+            machine: remote_supervisor,
+            thread,
+        },
+        assignment_revision: saved.resource.assignment_revision,
+    };
+    let send = |operation| {
+        let supervisor = supervisor.clone();
+        async move {
+            call(&supervisor, |reply| SupervisorMsg::ResourceAction {
+                request: Box::new(crate::resource::bound_action::ResourceActionRequest::new(
+                    1, action, operation,
+                )),
+                reply,
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let crate::resource::bound_action::ResourceActionOutcome::Prepared { task } = send(
+        crate::resource::bound_action::ResourceActionOperation::PrepareReleaseWatcher {
+            observed_background_task: background_task,
+        },
+    )
+    .await
+    else {
+        panic!("the authority must prepare the bound watcher");
+    };
+    assert_eq!(task.task_id, watcher_task_id);
+    assert!(task.digest_matches());
+    assert_eq!(task.spec.thread, thread);
+    let launch = crate::resource::bound_action::ResourceActionOperation::LaunchReleaseWatcher {
+        observed_background_task: background_task,
+        task: crate::resource::bound_action::ActionTaskIdentity {
+            request_id: task.request_id,
+            task_id: task.task_id,
+            normalized_spec_sha256: task.normalized_spec_sha256,
+        },
+    };
+    let crate::resource::bound_action::ResourceActionOutcome::Accepted { acceptance, .. } =
+        send(launch.clone()).await
+    else {
+        panic!("the first launch must be accepted");
+    };
+    assert_eq!(
+        acceptance,
+        crate::resource::bound_action::ActionTaskAcceptance::Inserted
+    );
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+    wait_for_task(&store, watcher_task_id, Duration::from_secs(10), |row| {
+        row.status() == ProcessStatus::Running
+    })
+    .await;
+    let crate::resource::bound_action::ResourceActionOutcome::Accepted { acceptance, .. } =
+        send(launch).await
+    else {
+        panic!("an exact retry must observe the accepted watcher");
+    };
+    assert_eq!(
+        acceptance,
+        crate::resource::bound_action::ActionTaskAcceptance::Existing {
+            state: ProcessStatus::Running
+        }
+    );
+    assert_eq!(watcher_task_count(&home.db_path()), 1);
+    wait_for_watcher_status(&supervisor, resource_id, |status| {
+        matches!(status, ReleaseWatcherStatus::Running { watcher_task_id: running, .. } if *running == watcher_task_id)
+    })
+    .await;
+
+    cancel_watcher(&supervisor, watcher_task_id).await;
     stop_test_supervisor(supervisor, handle).await;
     drop(trainer_lock);
+}
+
+/// Release action whose supervisor thread runs on another machine
+struct RemoteWatcherFixture {
+    poll: PollFixture,
+    authority: crate::resource::SupervisorActionAuthority,
+}
+
+impl RemoteWatcherFixture {
+    fn new() -> Self {
+        let poll = PollFixture::new();
+        let remote = machine_other_than(poll.authority);
+        poll.store
+            .conn
+            .execute(
+                "UPDATE resources SET supervisor_machine = ?1 WHERE id = ?2",
+                params![
+                    remote.as_uuid().to_string(),
+                    poll.resource.id.as_uuid().to_string()
+                ],
+            )
+            .unwrap();
+        let authority = crate::resource::SupervisorActionAuthority {
+            authority_machine: poll.authority,
+            resource_id: poll.resource.id,
+            loan_id: poll.notice.loan_id,
+            action_id: poll.notice.action_id,
+            expected_state_revision: poll.notice.state_revision,
+            supervisor: SupervisorAddress {
+                machine: remote,
+                thread: poll.resource.supervisor.thread,
+            },
+            assignment_revision: poll.resource.assignment_revision,
+        };
+        Self { poll, authority }
+    }
+
+    fn identity(&self) -> crate::resource::bound_action::ActionTaskIdentity {
+        crate::resource::bound_action::ActionTaskIdentity {
+            request_id: self.poll.intent.request_id,
+            task_id: self.poll.intent.watcher_task_id.as_task_id(),
+            normalized_spec_sha256: self.poll.intent.normalized_spec_sha256,
+        }
+    }
+
+    fn input(&self) -> crate::store::RemoteReleaseWatcherAcceptanceInput {
+        let spec = watcher_spec(&self.poll.resource, &self.poll.intent);
+        let row = remote_task(self.poll.intent.watcher_task_id.as_task_id(), &spec);
+        crate::store::RemoteReleaseWatcherAcceptanceInput {
+            authority: self.authority,
+            observed_background_task: self.poll.background_task,
+            task: self.identity(),
+            row,
+            spec,
+        }
+    }
+
+    fn accept(
+        &mut self,
+        input: crate::store::RemoteReleaseWatcherAcceptanceInput,
+    ) -> Result<crate::store::AcceptedActionTask, crate::store::ResourceActionError> {
+        self.poll
+            .store
+            .accept_remote_release_watcher_for_authority(input)
+    }
+
+    fn start(&mut self) {
+        let task = self.poll.intent.watcher_task_id.as_task_id();
+        self.poll
+            .store
+            .cas_status(task, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap()
+            .unwrap();
+        self.poll
+            .store
+            .set_pid(task, std::process::id() as i32)
+            .unwrap();
+        self.poll
+            .store
+            .update_execution_state(task, ProcessStatus::Running)
+            .unwrap();
+    }
+
+    /// Overwrite the saved receipt JSON as a corrupted or forged acceptance would
+    fn rewrite_receipt(
+        &self,
+        change: impl FnOnce(&mut crate::resource::bound_action::ActionTaskReceipt),
+    ) {
+        let task = self.poll.intent.watcher_task_id.as_task_id();
+        let mut receipt = crate::store::resource::action_task::action_task_receipt_by_task(
+            &self.poll.store.conn,
+            task,
+        )
+        .unwrap()
+        .unwrap();
+        change(&mut receipt);
+        self.poll
+            .store
+            .conn
+            .execute(
+                "UPDATE resource_action_task_receipts SET receipt_json = ?1 WHERE task_id = ?2",
+                params![serde_json::to_string(&receipt).unwrap(), task.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn receipt_count(&self) -> i64 {
+        self.poll
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM resource_action_task_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+fn rejected(
+    result: Result<crate::store::AcceptedActionTask, crate::store::ResourceActionError>,
+) -> crate::resource::bound_action::ResourceActionRejection {
+    match result {
+        Err(crate::store::ResourceActionError::Rejected(reason)) => reason,
+        other => panic!("expected a typed rejection, found {other:?}"),
+    }
+}
+
+#[test]
+fn remote_watcher_acceptance_saves_one_receipt_and_remote_identity_without_a_local_route() {
+    use crate::resource::bound_action::ActionTaskAcceptance;
+
+    let mut fixture = RemoteWatcherFixture::new();
+    let task = fixture.poll.intent.watcher_task_id.as_task_id();
+    let request = fixture.poll.intent.request_id;
+    let accepted = fixture.accept(fixture.input()).unwrap();
+    assert_eq!(accepted.acceptance, ActionTaskAcceptance::Inserted);
+    assert_eq!(accepted.receipt.task_id, task);
+    assert_eq!(
+        accepted.receipt.origin_machine(),
+        fixture.authority.supervisor.machine
+    );
+    // row, identity, and first event exist; the callback route lives on the supervisor machine
+    assert_eq!(
+        watcher_acceptance_counts(&fixture.poll.store, request, task),
+        [1, 0, 1, 1]
+    );
+    assert_eq!(fixture.receipt_count(), 1);
+    let Some(ExecutorIdentity::Accepted(record)) =
+        fixture.poll.store.executor_identity(task).unwrap()
+    else {
+        panic!("the watcher must have an accepted identity");
+    };
+    assert_eq!(record.origin_machine, fixture.authority.supervisor.machine);
+    assert_eq!(record.execution_machine, fixture.poll.authority);
+    let event = fixture
+        .poll
+        .store
+        .first_pending_outbound(task)
+        .unwrap()
+        .unwrap()
+        .event;
+    assert_eq!(event.origin_machine, fixture.authority.supervisor.machine);
+
+    // an exact retry, even after reopening, only observes the saved acceptance
+    let retried = fixture.accept(fixture.input()).unwrap();
+    assert_eq!(
+        retried.acceptance,
+        ActionTaskAcceptance::Existing {
+            state: ProcessStatus::Queued
+        }
+    );
+    let path = fixture.poll._directory.path().join("db");
+    fixture.poll.store = Store::open(&path).unwrap();
+    assert_eq!(
+        fixture.accept(fixture.input()).unwrap().acceptance,
+        ActionTaskAcceptance::Existing {
+            state: ProcessStatus::Queued
+        }
+    );
+    assert_eq!(
+        watcher_acceptance_counts(&fixture.poll.store, request, task),
+        [1, 0, 1, 1]
+    );
+
+    // a changed digest for the saved identity is a conflicting retry
+    let mut changed = fixture.input();
+    changed.task.normalized_spec_sha256 = normalized_spec_sha256(&spec()).unwrap();
+    assert_eq!(
+        rejected(fixture.accept(changed)),
+        crate::resource::bound_action::ResourceActionRejection::ConflictingRetry
+    );
+    assert_eq!(fixture.receipt_count(), 1);
+}
+
+#[test]
+fn remote_watcher_acceptance_rejects_changed_command_owner_and_revision_without_records() {
+    use crate::resource::bound_action::ResourceActionRejection;
+
+    let mut fixture = RemoteWatcherFixture::new();
+    let task = fixture.poll.intent.watcher_task_id.as_task_id();
+    let request = fixture.poll.intent.request_id;
+
+    let mut caller_command = fixture.input();
+    caller_command.row.binary = PathBuf::from("/bin/sh");
+    assert_eq!(
+        rejected(fixture.accept(caller_command)),
+        ResourceActionRejection::SpecMismatch
+    );
+    let mut caller_spec = fixture.input();
+    caller_spec.spec.timeout = std::time::Duration::from_secs(60);
+    assert_eq!(
+        rejected(fixture.accept(caller_spec)),
+        ResourceActionRejection::SpecMismatch
+    );
+    let mut other_task = fixture.input();
+    other_task.task.task_id = TaskId::new();
+    assert_eq!(
+        rejected(fixture.accept(other_task)),
+        ResourceActionRejection::IdentityConflict
+    );
+    let mut other_thread = fixture.input();
+    other_thread.authority.supervisor.thread = crate::domain::ThreadId(uuid::Uuid::now_v7());
+    assert_eq!(
+        rejected(fixture.accept(other_thread)),
+        ResourceActionRejection::NotCurrentSupervisor
+    );
+    let mut old_assignment = fixture.input();
+    old_assignment.authority.assignment_revision =
+        crate::resource::AssignmentRevision::new(fixture.authority.assignment_revision.get() + 1);
+    assert_eq!(
+        rejected(fixture.accept(old_assignment)),
+        ResourceActionRejection::NotCurrentSupervisor
+    );
+    let mut stale = fixture.input();
+    stale.authority.expected_state_revision =
+        ResourceRevision::new(fixture.authority.expected_state_revision.get() + 1);
+    assert!(matches!(
+        rejected(fixture.accept(stale)),
+        ResourceActionRejection::StaleRevision { .. }
+    ));
+    let mut other_action = fixture.input();
+    other_action.authority.action_id = ActionId::new();
+    assert_eq!(
+        rejected(fixture.accept(other_action)),
+        ResourceActionRejection::ActionNotPending
+    );
+    let mut other_trainer = fixture.input();
+    other_trainer.observed_background_task = TaskId::new();
+    assert_eq!(
+        rejected(fixture.accept(other_trainer)),
+        ResourceActionRejection::ActionNotPending
+    );
+    assert_eq!(
+        watcher_acceptance_counts(&fixture.poll.store, request, task),
+        [0, 0, 0, 0]
+    );
+    assert_eq!(fixture.receipt_count(), 0);
+
+    // the remote path never serves a supervisor that runs on the authority
+    let mut co_located = RemoteWatcherFixture::new();
+    co_located
+        .poll
+        .store
+        .conn
+        .execute(
+            "UPDATE resources SET supervisor_machine = ?1 WHERE id = ?2",
+            params![
+                co_located.poll.authority.as_uuid().to_string(),
+                co_located.poll.resource.id.as_uuid().to_string()
+            ],
+        )
+        .unwrap();
+    let mut local_input = co_located.input();
+    local_input.authority.supervisor.machine = co_located.poll.authority;
+    assert_eq!(
+        rejected(co_located.accept(local_input)),
+        ResourceActionRejection::NotCurrentSupervisor
+    );
+    assert_eq!(co_located.receipt_count(), 0);
+}
+
+#[test]
+fn remote_watcher_uses_the_same_baseline_stop_marker_and_leaves_release_to_process_exit() {
+    let mut fixture = RemoteWatcherFixture::new();
+    let command = fixture.poll.command();
+    fixture.accept(fixture.input()).unwrap();
+    // a queued acceptance is not a running watcher and cannot stop the trainer
+    assert_eq!(
+        fixture.poll.poll(command),
+        ReleaseWatcherPollOutcome::WatcherNotRunning
+    );
+    fixture.start();
+    assert_eq!(
+        fixture.poll.poll(command),
+        ReleaseWatcherPollOutcome::WaitingForCheckpoint
+    );
+    assert!(fixture.poll.trainer_cancel_marker().is_none());
+
+    fixture
+        .poll
+        .write_generation("generation-after-baseline", 30);
+    let ReleaseWatcherPollOutcome::StopCommitted {
+        generation_id,
+        cancel_requested_at,
+    } = fixture.poll.poll(command)
+    else {
+        panic!("a new checkpoint must commit the exact stop");
+    };
+    assert_eq!(generation_id, "generation-after-baseline");
+    assert_eq!(
+        fixture.poll.trainer_cancel_marker(),
+        Some(cancel_requested_at)
+    );
+    // an exact retry reuses the saved decision and marker
+    assert_eq!(
+        fixture.poll.poll(command),
+        ReleaseWatcherPollOutcome::StopCommitted {
+            generation_id,
+            cancel_requested_at,
+        }
+    );
+
+    // the stop marker alone does not release the loan while the trainer runs
+    assert!(
+        fixture
+            .poll
+            .store
+            .complete_release_for_authority(
+                fixture.poll.authority,
+                fixture.poll.resource.id,
+                fixture.poll.notice.action_id,
+                fixture.poll.notice.state_revision,
+            )
+            .is_err()
+    );
+    let snapshot = fixture
+        .poll
+        .store
+        .resource_snapshots_for_authority(fixture.poll.authority)
+        .unwrap()
+        .remove(0);
+    assert!(matches!(
+        snapshot.loan.unwrap().state,
+        LoanState::Active {
+            phase: LoanPhase::AwaitingRelease { .. }
+        }
+    ));
+}
+
+#[test]
+fn accepted_remote_watcher_keeps_polling_after_its_supervisor_is_replaced() {
+    for local_replacement in [false, true] {
+        let mut fixture = RemoteWatcherFixture::new();
+        let command = fixture.poll.command();
+        fixture.accept(fixture.input()).unwrap();
+        fixture.start();
+        let replacement = if local_replacement {
+            fixture.poll.authority
+        } else {
+            machine_other_than(fixture.authority.supervisor.machine)
+        };
+        fixture.poll.replace_supervisor(replacement);
+        fixture
+            .poll
+            .write_generation("generation-after-baseline", 30);
+
+        // the saved receipt, not the current assignment, owns the accepted watcher
+        let ReleaseWatcherPollOutcome::StopCommitted {
+            generation_id,
+            cancel_requested_at,
+        } = fixture.poll.poll(command)
+        else {
+            panic!("the accepted watcher must keep its stop authority ({local_replacement})");
+        };
+        assert_eq!(
+            fixture.poll.trainer_cancel_marker(),
+            Some(cancel_requested_at)
+        );
+        assert_eq!(
+            fixture.poll.poll(command),
+            ReleaseWatcherPollOutcome::StopCommitted {
+                generation_id,
+                cancel_requested_at,
+            }
+        );
+        // an exact acceptance retry observes the saved watcher and inserts nothing
+        assert!(matches!(
+            fixture.accept(fixture.input()).unwrap().acceptance,
+            crate::resource::bound_action::ActionTaskAcceptance::Existing { .. }
+        ));
+        assert_eq!(fixture.receipt_count(), 1);
+    }
+}
+
+#[test]
+fn remote_watcher_acceptance_after_replacement_requires_the_current_assignment() {
+    use crate::resource::bound_action::ResourceActionRejection;
+
+    let mut fixture = RemoteWatcherFixture::new();
+    fixture
+        .poll
+        .replace_supervisor(machine_other_than(fixture.authority.supervisor.machine));
+
+    // an unaccepted watcher named by the replaced assignment is not a new owner
+    assert_eq!(
+        rejected(fixture.accept(fixture.input())),
+        ResourceActionRejection::NotCurrentSupervisor
+    );
+    assert_eq!(fixture.receipt_count(), 0);
+}
+
+#[test]
+fn remote_watcher_with_a_missing_or_changed_receipt_is_refused_without_a_marker() {
+    type Tamper = fn(&RemoteWatcherFixture);
+    let cases: [(&str, Tamper); 4] = [
+        ("missing receipt", |fixture| {
+            fixture
+                .poll
+                .store
+                .conn
+                .execute("DELETE FROM resource_action_task_receipts", [])
+                .unwrap();
+        }),
+        ("receipt names the authority as supervisor", |fixture| {
+            fixture.rewrite_receipt(|receipt| {
+                receipt.authority.supervisor.machine = fixture.poll.authority;
+            });
+        }),
+        ("receipt names another command", |fixture| {
+            fixture.rewrite_receipt(|receipt| {
+                receipt.normalized_spec_sha256 = normalized_spec_sha256(&spec()).unwrap();
+            });
+        }),
+        ("receipt names another revision", |fixture| {
+            fixture.rewrite_receipt(|receipt| {
+                receipt.authority.expected_state_revision =
+                    ResourceRevision::new(receipt.authority.expected_state_revision.get() + 1);
+            });
+        }),
+    ];
+    for (name, tamper) in cases {
+        let mut fixture = RemoteWatcherFixture::new();
+        let command = fixture.poll.command();
+        fixture.accept(fixture.input()).unwrap();
+        fixture.start();
+        fixture
+            .poll
+            .write_generation("generation-after-baseline", 30);
+        tamper(&fixture);
+
+        assert_eq!(
+            fixture.poll.poll(command),
+            attention(ReleaseWatcherPollAttention::WatcherIdentityConflict),
+            "{name}"
+        );
+        assert!(fixture.poll.trainer_cancel_marker().is_none(), "{name}");
+    }
 }

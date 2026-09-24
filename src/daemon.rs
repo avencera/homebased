@@ -12,12 +12,11 @@ pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
 mod release_watcher_api;
+mod resource_action;
+mod resource_api;
+mod resource_background;
 mod resource_notice_delivery;
 pub(crate) mod resource_notice_sender;
-#[expect(
-    dead_code,
-    reason = "resource submission awaits its scheduler consumer"
-)]
 mod resource_submit;
 pub mod web;
 
@@ -126,6 +125,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     ));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
     let resource_recovery = tokio::spawn(resource_submit::recover(state.clone()));
+    let action_recovery = tokio::spawn(resource_action::recover(state.clone()));
+    let background_recovery = tokio::spawn(resource_background::recover(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let notice_delivery = tokio::spawn(resource_notice_delivery::run(state.clone()));
     // listeners share one shutdown: the signal task flips the flag once
@@ -167,6 +168,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     sender.abort();
     recovery.abort();
     resource_recovery.abort();
+    action_recovery.abort();
+    background_recovery.abort();
     cancellation.abort();
     notice_delivery.abort();
     if !supervisor_died {

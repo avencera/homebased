@@ -37,6 +37,7 @@
 	"dependencies": {
 		"@lucide/svelte": "^1.47.0",
 		"clsx": "^2.1.1",
+		"effect": "^3.22.2",
 		"runed": "^0.37.1",
 		"tailwind-merge": "^3.7.0",
 		"tailwind-variants": "^3.3.1"

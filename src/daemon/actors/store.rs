@@ -11,7 +11,8 @@ use crate::cancellation::{
 };
 use crate::daemon::actors::send_reply;
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskReport, TaskRow, ThreadId,
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskReport, TaskRow,
+    ThreadId,
 };
 use crate::error::AppError;
 use std::num::NonZeroU64;
@@ -24,6 +25,11 @@ use crate::machine::MachineId;
 use crate::message::{
     MessageAttempt, MessageDelivery, MessageId, MessageReceipt, MessageSendRequest,
     OutboundMessageBinding, Recipient,
+};
+use crate::resource::ReturnLaunch;
+use crate::resource::operator_release::{
+    OperatorAttestationId, OperatorGpuFreeAttestation, OperatorGpuFreeReceipt,
+    OperatorGpuFreeResolution,
 };
 use crate::resource::ownership_lock::VerifiedTrainerAttempt;
 use crate::resource::release_watcher::{ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest};
@@ -39,15 +45,63 @@ use crate::resource::{
     ActionId, AssignmentRevision, DeliveryAttemptId, NoticeId, ReleaseCheckpointBaseline,
     ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome, ReleaseWatcherIntent, Resource,
     ResourceId, ResourceQueueReconcileOutcome, ResourceRequest, ResourceRevision,
-    SupervisorAddress, SupervisorNotice, TrainerAttemptAssociation,
+    SupervisorActionAuthority, SupervisorAddress, SupervisorNotice, TrainerAttemptAssociation,
 };
 use crate::spec::NormalizedSpec;
-use crate::store::IdentityError;
-use crate::store::{CancelResult, Store, TaskPresentation};
+use crate::store::{
+    AcceptedActionTask, BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
+    BackgroundLaunchView, EndedRestoreResolution, PreparedReturnTask, RemoteBackgroundLaunchInput,
+    RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
+    ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput,
+};
+use crate::store::{CancelResult, OperatorGpuFreeError, Store, TaskPresentation};
+use crate::store::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
+use crate::store::{
+    ResourceControlError, ResourceControlRequest, ResourceControlStart, ResourceReadModel,
+    SupervisorReplacement,
+};
 use crate::submission::{
     ExecutorIdentity, OriginRoute, RejectionTombstone, RequestId, ResourceCancellationReceipt,
     ResourceQueueReceipt, SubmissionState,
 };
+
+fn control_error(
+    error: ResourceControlError,
+    resource: ResourceId,
+    operation: Option<uuid::Uuid>,
+    expected: ResourceRevision,
+) -> AppError {
+    match error {
+        ResourceControlError::NotFound => AppError::ResourceNotFound { resource },
+        ResourceControlError::WrongAuthority { expected, found } => {
+            AppError::MachineIdentityMismatch {
+                expected,
+                found: Some(found),
+            }
+        }
+        ResourceControlError::StaleRevision { current } => AppError::ResourceStaleRevision {
+            resource,
+            expected: expected.get(),
+            current: current.get(),
+        },
+        ResourceControlError::Conflict => AppError::ResourceOperationConflict {
+            resource,
+            operation,
+            message: "operation identity already names different content".into(),
+        },
+        ResourceControlError::NotAllowed(message) => {
+            AppError::ResourceActionNotAllowed { resource, message }
+        }
+        ResourceControlError::Notice(SupervisorNoticeStoreError::Storage(error))
+        | ResourceControlError::Storage(error) => error.into(),
+        ResourceControlError::Notice(error) => AppError::ResourceActionNotAllowed {
+            resource,
+            message: error.to_string(),
+        },
+        ResourceControlError::Json(error) => error.into(),
+        ResourceControlError::Resource(error) => resource_error(error, None, None),
+    }
+}
 
 fn identity_error(error: IdentityError) -> AppError {
     match error {
@@ -76,6 +130,22 @@ fn resource_error(
         ResourceStoreError::LegacyWatcherIntentUnproven => AppError::Usage {
             message: "legacy release watcher identity is unproven".into(),
         },
+        ResourceStoreError::RegistrationConflict { resource } => {
+            AppError::ResourceOperationConflict {
+                resource,
+                operation: None,
+                message: "resource identity is already registered with different content".into(),
+            }
+        }
+        ResourceStoreError::LegacyRegistrationUnproven { resource } => {
+            AppError::ResourceOperationConflict {
+                resource,
+                operation: None,
+                message: "resource was registered before registration receipts, so its first \
+                          supervisor cannot be proven for a retry"
+                    .into(),
+            }
+        }
         ResourceStoreError::Prevented => match (request, task) {
             (Some(request), Some(task)) => AppError::SubmissionRejected {
                 request,
@@ -110,6 +180,9 @@ fn resource_error(
         },
         ResourceStoreError::Identity(IdentityError::Storage(error)) => error,
         ResourceStoreError::InvalidCommandSpec(error) => AppError::Usage {
+            message: error.to_string(),
+        },
+        error @ ResourceStoreError::UnsupportedCommandOwnership { .. } => AppError::Usage {
             message: error.to_string(),
         },
         ResourceStoreError::TaskPreparation(error) => error,
@@ -158,6 +231,41 @@ pub enum StoreMsg {
         authority_machine: MachineId,
         resource: Box<Resource>,
         reply: RpcReplyPort<Result<Resource, AppError>>,
+    },
+    /// Read durable resource state owned by this authority
+    ResourceReadModels {
+        /// Local authority identity
+        authority_machine: MachineId,
+        /// One resource, or every resource owned by the authority
+        resource_id: Option<ResourceId>,
+        /// Resource, loan, request, and notice state
+        reply: RpcReplyPort<Result<Vec<ResourceReadModel>, AppError>>,
+    },
+    /// Commit one idempotent resource control before its external effect
+    BeginResourceControl {
+        /// Local authority identity
+        authority_machine: MachineId,
+        /// Stable caller retry identity
+        operation_id: uuid::Uuid,
+        /// Immutable operation content
+        request: Box<ResourceControlRequest>,
+        /// Attempt identity to reserve when the control is a first renotify
+        attempt_id: DeliveryAttemptId,
+        /// Committed effect or typed refusal
+        reply: RpcReplyPort<Result<ResourceControlStart, AppError>>,
+    },
+    /// Replace one resource supervisor and retarget undelivered notices
+    ReplaceResourceSupervisor {
+        /// Local authority identity
+        authority_machine: MachineId,
+        /// Resource whose supervisor changes
+        resource_id: ResourceId,
+        /// Resource revision the caller observed
+        expected_revision: ResourceRevision,
+        /// Exact new supervisor thread
+        supervisor: SupervisorAddress,
+        /// New assignment and retargeted notices
+        reply: RpcReplyPort<Result<SupervisorReplacement, AppError>>,
     },
     /// Load the local authority's resources and non-closed loans for startup
     ResourceSnapshotsForAuthority {
@@ -383,7 +491,7 @@ pub enum StoreMsg {
             Result<Result<ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError>, AppError>,
         >,
     },
-    /// Validate one co-located watcher poll and advance its saved stop decision
+    /// Validate one authority-local watcher poll and advance its saved stop decision
     PollReleaseWatcherForAuthority {
         /// Machine that must own the polled resource
         authority_machine: MachineId,
@@ -407,6 +515,128 @@ pub enum StoreMsg {
         /// Storage result inside actor and transport errors
         reply:
             RpcReplyPort<Result<Result<ReleaseCompletionResult, CompleteReleaseError>, AppError>>,
+    },
+    /// Close one exact AwaitingReturn loan with an explicit no-resume decision
+    RecordNoResumeForAuthority {
+        /// Exact supervisor authority for the pending return action
+        authority: SupervisorActionAuthority,
+        /// Supervisor's durable decision reason
+        reason: String,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
+    },
+    /// Bind one fixed return task to its action and enter Restoring
+    AcceptReturnTaskForAuthority {
+        /// Authority, fixed identities, typed work, and executor context
+        input: Box<ReturnTaskAcceptanceInput>,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReturnTaskAcceptance, ReturnDecisionError>, AppError>>,
+    },
+    /// Observe one Restoring loan and close it only on a confirmed start
+    ReconcileRestoringLoanForAuthority {
+        /// Authority machine recorded on the resource
+        authority_machine: MachineId,
+        /// Resource whose Restoring loan is observed
+        resource_id: ResourceId,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<RestoreReconcileOutcome, ReturnDecisionError>, AppError>>,
+    },
+    /// Close a Restoring loan after the supervisor resolves an early task end
+    ResolveEndedRestoreForAuthority {
+        /// Exact authority, bound task, and supervisor reason
+        resolution: Box<EndedRestoreResolution>,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
+    },
+    /// Commit one operator attestation that an ended registered trainer no longer holds its GPU
+    ///
+    /// The store saves the receipt and the queue or loan transition in one
+    /// transaction, or returns a typed refusal with no records
+    AttestTrainerGpuFreeForAuthority {
+        /// Local daemon machine, which must be the resource authority
+        authority_machine: MachineId,
+        /// Exact operator attestation
+        attestation: Box<OperatorGpuFreeAttestation>,
+        /// Typed storage result inside actor and transport errors
+        reply:
+            RpcReplyPort<Result<Result<OperatorGpuFreeResolution, OperatorGpuFreeError>, AppError>>,
+    },
+    /// Read the saved receipt of one operator attestation on this authority
+    OperatorAttestationReceiptForAuthority {
+        /// Local daemon machine, which must be the resource authority
+        authority_machine: MachineId,
+        /// Stable attestation identity
+        operation_id: OperatorAttestationId,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<Result<Option<OperatorGpuFreeReceipt>, OperatorGpuFreeError>, AppError>,
+        >,
+    },
+    /// Derive the canonical return task for a remote supervisor without binding it
+    PrepareReturnTaskForAuthority {
+        /// Exact supervisor authority for the pending return action
+        authority: SupervisorActionAuthority,
+        /// Supervisor-chosen fixed identities and typed work
+        launch: Box<ReturnLaunch>,
+        /// Executor environment for a supervisor-supplied command
+        executor_env: TaskEnv,
+        /// Canonical spec and digest inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<PreparedReturnTask, ReturnDecisionError>, AppError>>,
+    },
+    /// Accept one remote-supervisor release watcher for its exact saved intent
+    AcceptRemoteReleaseWatcherForAuthority {
+        /// Authority, fixed identities, and canonical task
+        input: Box<RemoteReleaseWatcherAcceptanceInput>,
+        /// Saved receipt and whether this call inserted the task
+        reply: RpcReplyPort<Result<Result<AcceptedActionTask, ResourceActionError>, AppError>>,
+    },
+    /// Read the release-watcher task identities bound by non-closed loans on this authority
+    ReleaseWatcherTasksForAuthority {
+        /// Authority machine recorded on the resources
+        authority_machine: MachineId,
+        /// Bound watcher task identities
+        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
+    },
+    /// Read the task identities bound by Restoring loans on this authority
+    RestoringTasksForAuthority {
+        /// Authority machine recorded on the resources
+        authority_machine: MachineId,
+        /// Bound return task identities
+        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
+    },
+    /// Bind one first background launch; only an inserted launch may spawn
+    AcceptBackgroundLaunchForAuthority {
+        /// Fixed identities, full spec, and co-located executor context
+        input: Box<BackgroundLaunchInput>,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
+        >,
+    },
+    /// Bind one remote supervisor's first background launch; only an insertion may spawn
+    AcceptRemoteBackgroundLaunchForAuthority {
+        /// Fixed identities, digest, supervisor assignment, spec, and authority environment
+        input: Box<RemoteBackgroundLaunchInput>,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<
+            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
+        >,
+    },
+    /// Read the latest first background launch of one resource
+    BackgroundLaunchForAuthority {
+        /// Authority machine recorded on the resource
+        authority_machine: MachineId,
+        /// Resource whose launch is read
+        resource_id: ResourceId,
+        /// Latest launch and its derived task-layer phase
+        reply: RpcReplyPort<Result<Option<BackgroundLaunchView>, AppError>>,
+    },
+    /// Read the tasks of first background launches whose rows are still queued
+    QueuedBackgroundLaunchTasksForAuthority {
+        /// Authority machine recorded on the resources
+        authority_machine: MachineId,
+        /// Queued launch task identities
+        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
     },
     /// Read one durable supervisor notice
     SupervisorNotice {
@@ -618,6 +848,31 @@ pub enum StoreMsg {
     UnknownResourceOriginRoutes {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
+    /// Find action-bound origin routes whose authority acceptance is unknown
+    UnknownResourceActionRoutes {
+        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
+    },
+    /// Find remote first background launch routes whose authority acceptance is unknown
+    UnknownResourceBackgroundRoutes {
+        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
+    },
+    /// Apply a definitive authority result to one remote first background launch route
+    ResolveResourceBackgroundRoute {
+        task: TaskId,
+        result: Box<ResourceBackgroundRouteResult>,
+        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    },
+    /// Read the one action-bound origin route for a resource action
+    ResourceActionRouteByAction {
+        action: ActionId,
+        reply: RpcReplyPort<Result<Option<OriginRoute>, AppError>>,
+    },
+    /// Apply a definitive authority result to one action-bound origin route
+    ResolveResourceActionRoute {
+        task: TaskId,
+        result: Box<ResourceActionRouteResult>,
+        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    },
     /// Durably allocate a request and its origin route before network send
     InsertOriginRoute {
         route: Box<OriginRoute>,
@@ -786,6 +1041,52 @@ impl Actor for StoreActor {
             StoreMsg::MigrateLegacyLocal { machine, reply } => {
                 send_reply(reply, state.migrate_legacy_local(machine));
             }
+            StoreMsg::ResourceReadModels {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .resource_read_models(authority_machine, resource_id)
+                    .map_err(|error| resource_error(error, None, None)),
+            ),
+            StoreMsg::BeginResourceControl {
+                authority_machine,
+                operation_id,
+                request,
+                attempt_id,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .begin_resource_control(authority_machine, operation_id, &request, attempt_id)
+                    .map_err(|error| {
+                        control_error(
+                            error,
+                            request.resource_id,
+                            Some(operation_id),
+                            request.expected_revision,
+                        )
+                    }),
+            ),
+            StoreMsg::ReplaceResourceSupervisor {
+                authority_machine,
+                resource_id,
+                expected_revision,
+                supervisor,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .replace_resource_supervisor(
+                        authority_machine,
+                        resource_id,
+                        expected_revision,
+                        supervisor,
+                    )
+                    .map_err(|error| control_error(error, resource_id, None, expected_revision)),
+            ),
             StoreMsg::RegisterResource {
                 authority_machine,
                 resource,
@@ -1052,6 +1353,104 @@ impl Actor for StoreActor {
                 reply,
                 Ok(state.poll_release_watcher_for_authority(authority_machine, request)),
             ),
+            StoreMsg::RecordNoResumeForAuthority {
+                authority,
+                reason,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.record_no_resume_for_authority(authority, reason)),
+            ),
+            StoreMsg::AcceptReturnTaskForAuthority { input, reply } => {
+                send_reply(reply, Ok(state.accept_return_task_for_authority(*input)))
+            }
+            StoreMsg::ReconcileRestoringLoanForAuthority {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.reconcile_restoring_loan_for_authority(authority_machine, resource_id)),
+            ),
+            StoreMsg::ResolveEndedRestoreForAuthority { resolution, reply } => send_reply(
+                reply,
+                Ok(state.resolve_ended_restore_for_authority(*resolution)),
+            ),
+            StoreMsg::AttestTrainerGpuFreeForAuthority {
+                authority_machine,
+                attestation,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.attest_trainer_gpu_free_for_authority(authority_machine, *attestation)),
+            ),
+            StoreMsg::OperatorAttestationReceiptForAuthority {
+                authority_machine,
+                operation_id,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state
+                    .operator_attestation_receipt_for_authority(authority_machine, operation_id)),
+            ),
+            StoreMsg::PrepareReturnTaskForAuthority {
+                authority,
+                launch,
+                executor_env,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.prepare_return_task_for_authority(authority, *launch, executor_env)),
+            ),
+            StoreMsg::AcceptRemoteReleaseWatcherForAuthority { input, reply } => send_reply(
+                reply,
+                Ok(state.accept_remote_release_watcher_for_authority(*input)),
+            ),
+            StoreMsg::ReleaseWatcherTasksForAuthority {
+                authority_machine,
+                reply,
+            } => send_reply(
+                reply,
+                state.release_watcher_task_ids_for_authority(authority_machine),
+            ),
+            StoreMsg::AcceptBackgroundLaunchForAuthority { input, reply } => send_reply(
+                reply,
+                Ok(state.accept_background_launch_for_authority(*input)),
+            ),
+            StoreMsg::AcceptRemoteBackgroundLaunchForAuthority { input, reply } => send_reply(
+                reply,
+                Ok(state.accept_remote_background_launch_for_authority(*input)),
+            ),
+            StoreMsg::BackgroundLaunchForAuthority {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .background_launch_for_authority(authority_machine, resource_id)
+                    .map_err(|error| resource_error(error, None, None)),
+            ),
+            StoreMsg::QueuedBackgroundLaunchTasksForAuthority {
+                authority_machine,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .queued_background_launch_tasks_for_authority(authority_machine)
+                    .map_err(|error| resource_error(error, None, None)),
+            ),
+            StoreMsg::RestoringTasksForAuthority {
+                authority_machine,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .restoring_task_ids_for_authority(authority_machine)
+                    .map_err(|error| AppError::Internal {
+                        message: format!("read restoring resource tasks: {error}"),
+                    }),
+            ),
             StoreMsg::CompleteReleaseForAuthority {
                 authority_machine,
                 resource_id,
@@ -1243,6 +1642,50 @@ impl Actor for StoreActor {
                 state
                     .unknown_resource_origin_routes()
                     .map_err(identity_error),
+            ),
+            StoreMsg::UnknownResourceActionRoutes { reply } => send_reply(
+                reply,
+                state
+                    .unknown_resource_action_routes()
+                    .map_err(identity_error),
+            ),
+            StoreMsg::UnknownResourceBackgroundRoutes { reply } => send_reply(
+                reply,
+                state
+                    .unknown_resource_background_routes()
+                    .map_err(identity_error),
+            ),
+            StoreMsg::ResolveResourceBackgroundRoute {
+                task,
+                result,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .resolve_resource_background_route(task, &result)
+                    .map_err(|error| match error {
+                        IdentityError::Conflict => AppError::ClusterTaskConflict { task },
+                        other => identity_error(other),
+                    }),
+            ),
+            StoreMsg::ResourceActionRouteByAction { action, reply } => send_reply(
+                reply,
+                state
+                    .resource_action_route_by_action(action)
+                    .map_err(identity_error),
+            ),
+            StoreMsg::ResolveResourceActionRoute {
+                task,
+                result,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .resolve_resource_action_route(task, &result)
+                    .map_err(|error| match error {
+                        IdentityError::Conflict => AppError::ClusterTaskConflict { task },
+                        other => identity_error(other),
+                    }),
             ),
             StoreMsg::InsertOriginRoute { route, reply } => send_reply(
                 reply,
