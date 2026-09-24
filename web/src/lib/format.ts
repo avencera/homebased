@@ -27,6 +27,12 @@ export function shortenHome(path: string): string {
 	return path.replace(HOME_PREFIX, '~');
 }
 
+/** Project of a task: its Git worktree root name, or its directory name. */
+export function projectName(task: Pick<TaskSummary, 'cwd' | 'project_root'>): string {
+	const root = task.project_root ?? task.cwd;
+	return root.replace(/\/+$/, '').split('/').at(-1) || root;
+}
+
 /** Instant accepted by the display helpers. */
 export type Instant = string | number | Date;
 

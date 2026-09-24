@@ -4,7 +4,9 @@
 	import { isProcessStatus, peerTaskHref, type FleetMachine } from '$lib/api';
 	import type { ResourceQueue } from '$lib/resource-state';
 	import type { ResourceTaskSummary } from '$lib/resources';
+	import { machineHue } from '$lib/colors';
 	import { cn } from '$lib/utils';
+	import Capsule from './Capsule.svelte';
 	import Elapsed from './Elapsed.svelte';
 	import StatusBadge from './StatusBadge.svelte';
 
@@ -71,9 +73,13 @@
 	</div>
 {/snippet}
 
-<section aria-label="Resource queues" class={cn('flex flex-col gap-3', className)}>
+<section
+	aria-label="Resource queues"
+	class={cn('grid grid-cols-[repeat(auto-fit,minmax(20rem,1fr))] gap-3', className)}
+>
 	{#each queues as item (item.resource.id)}
-		<article class="rounded border border-border bg-card">
+		{@const authority = machineName(item.resource.authority_machine)}
+		<article class="flex flex-col rounded border border-border bg-card">
 			<header
 				class="flex items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px]"
 			>
@@ -84,9 +90,9 @@
 				>
 					{item.resource.display_name}
 				</a>
-				<span class="text-muted-foreground">
-					on {machineName(item.resource.authority_machine)}
-				</span>
+				<Capsule hue={machineHue(authority)} dot title={`Authority ${authority}`}
+					>{authority}</Capsule
+				>
 				<span
 					class={cn('ml-auto shrink-0', toneClass[item.status.tone])}
 					title={item.status.message}
@@ -95,7 +101,7 @@
 				</span>
 			</header>
 
-			<div class="flex flex-col gap-3 px-3 py-2.5">
+			<div class="flex flex-1 flex-col gap-3 px-3 py-2.5">
 				{#if item.current}
 					{@render holder('now', item.current, item.resource.authority_machine)}
 				{/if}
@@ -115,6 +121,7 @@
 					{:else}
 						<ol class="flex flex-col divide-y divide-border/60">
 							{#each item.queue as request, index (request.request_id)}
+								{@const origin = machineName(request.origin_machine)}
 								<li class="flex min-w-0 items-baseline gap-2 py-1">
 									<span
 										class="w-4 shrink-0 text-right font-mono text-muted-foreground tabular-nums"
@@ -125,9 +132,9 @@
 										{request.display_name}
 									</span>
 									{#if request.origin_machine !== item.resource.authority_machine}
-										<span class="shrink-0 text-[11px] text-muted-foreground">
-											from {machineName(request.origin_machine)}
-										</span>
+										<Capsule hue={machineHue(origin)} title={`Requested from ${origin}`}
+											>{origin}</Capsule
+										>
 									{/if}
 								</li>
 							{/each}

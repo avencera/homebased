@@ -2,7 +2,6 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import Ban from '@lucide/svelte/icons/ban';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import {
@@ -10,31 +9,28 @@
 		PROCESS_STATUSES,
 		isInFlight,
 		isProcessStatus,
-		peerTaskHref,
-		type ProcessStatus,
-		type TaskSummary
+		type ProcessStatus
 	} from '$lib/api';
-	import CallbackBadge from '$lib/components/CallbackBadge.svelte';
-	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import ResourceQueuePanel from '$lib/components/ResourceQueuePanel.svelte';
-	import StatusBadge from '$lib/components/StatusBadge.svelte';
-	import WorkloadCell from '$lib/components/WorkloadCell.svelte';
+	import TaskList from '$lib/components/TaskList.svelte';
 	import { DaemonStore, ResourceQueueStore } from '$lib/daemon.svelte';
 	import { isBusy } from '$lib/resource-state';
-	import { EM_DASH, formatTimestamp, shortId, shortenHome } from '$lib/format';
+	import { EM_DASH, projectName, shortId } from '$lib/format';
 	import { cn } from '$lib/utils';
 
 	const statuses = $derived(parseStatuses(page.url.searchParams.get('status')));
 	const thread = $derived(page.url.searchParams.get('thread'));
+	// project is a view filter over the fleet list; the daemon has no project query
+	const project = $derived(page.url.searchParams.get('project'));
 	const showFinished = $derived(statuses.some((status) => !isInFlight(status)));
 	const inFlightOnly = $derived(!showFinished && statuses.length === IN_FLIGHT_STATUSES.length);
 
 	const store = new DaemonStore(() => ({ statuses, thread }));
 	const resourceStore = new ResourceQueueStore();
 
-	const machineById = $derived(
-		new Map(store.machines.map((machine) => [machine.machine, machine]))
+	const visibleTasks = $derived(
+		project ? store.tasks.filter((entry) => projectName(entry.task) === project) : store.tasks
 	);
 	const unavailableMachines = $derived(
 		store.machines.flatMap((machine) =>
@@ -47,8 +43,20 @@
 		store.machines.find((machine) => machine.location.type === 'local')?.name ?? null
 	);
 	const busyQueues = $derived(resourceStore.queues.filter(isBusy));
-	// the queue panel takes the right column only while a resource runs or waits on work
+	// while a resource runs or waits on work, tasks and its queue share the screen
 	const split = $derived(busyQueues.length > 0);
+
+	interface Filters {
+		status: string | null;
+		thread: string | null;
+		project: string | null;
+	}
+
+	const currentFilters = $derived<Filters>({
+		status: page.url.searchParams.get('status'),
+		thread,
+		project
+	});
 
 	function parseStatuses(raw: string | null): ProcessStatus[] {
 		const parsed = (raw ?? '')
@@ -59,7 +67,7 @@
 	}
 
 	// The whole filter lives in the URL so a view can be bookmarked or shared
-	function navigate(filters: { status: string | null; thread: string | null }) {
+	function navigate(filters: Filters) {
 		const entries = Object.entries(filters).filter(
 			(entry): entry is [string, string] => entry[1] !== null
 		);
@@ -75,7 +83,7 @@
 		const isDefault =
 			next.length === IN_FLIGHT_STATUSES.length && next.every((status) => isInFlight(status));
 		const status = next.length === 0 || isDefault ? null : next.join(',');
-		navigate({ status, thread });
+		navigate({ ...currentFilters, status });
 	}
 
 	function toggleStatus(status: ProcessStatus) {
@@ -89,28 +97,12 @@
 		applyStatuses(showFinished ? [...IN_FLIGHT_STATUSES] : [...PROCESS_STATUSES]);
 	}
 
-	function clearThread() {
-		navigate({ status: page.url.searchParams.get('status'), thread: null });
-	}
-
-	function rowEnd(task: TaskSummary): string | null {
-		return isInFlight(task.status) ? null : task.updated_at;
-	}
-
-	function isLocal(machine: string): boolean {
-		return machineById.get(machine)?.location.type === 'local';
-	}
-
-	function machineName(id: string): string {
-		return machineById.get(id)?.name ?? shortId(id);
-	}
-
 	function machineList(names: readonly string[]): string {
 		return names.join(', ');
 	}
 </script>
 
-<div class={cn('mx-auto px-4 py-4', split ? 'max-w-[112rem]' : 'max-w-7xl')}>
+<div class="mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-4">
 	<header class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
 		<span class="flex items-center gap-1.5">
@@ -210,108 +202,50 @@
 		{#if thread}
 			<button
 				type="button"
-				onclick={clearThread}
-				class="rounded border border-border px-2 py-0.5 font-mono text-[11px] leading-5 text-muted-foreground hover:bg-accent"
+				onclick={() => navigate({ ...currentFilters, thread: null })}
+				class="rounded border border-primary/50 bg-primary/10 px-2 py-0.5 font-mono text-[11px] leading-5 hover:bg-accent"
 				title={`clear thread filter ${thread}`}
 			>
 				thread {shortId(thread)} &times;
 			</button>
 		{/if}
+		{#if project}
+			<button
+				type="button"
+				onclick={() => navigate({ ...currentFilters, project: null })}
+				class="rounded border border-primary/50 bg-primary/10 px-2 py-0.5 font-mono text-[11px] leading-5 hover:bg-accent"
+				title={`clear project filter ${project}`}
+			>
+				project {project} &times;
+			</button>
+		{/if}
 	</div>
 
-	<div class={cn('mt-3 grid gap-3', split && 'xl:grid-cols-[minmax(0,1fr)_24rem]')}>
+	<!-- with GPU work, tasks and the GPU queue split the rest of the screen evenly and grow past it -->
+	<div class="mt-3 flex flex-1 flex-col gap-3">
+		<TaskList
+			tasks={visibleTasks}
+			machines={store.machines}
+			activeThread={thread}
+			activeProject={project}
+			onThread={(next) => navigate({ ...currentFilters, thread: next })}
+			onProject={(next) => navigate({ ...currentFilters, project: next })}
+			class={cn(split && 'min-h-fit flex-1 basis-0')}
+		>
+			{#snippet empty()}
+				<p class="px-3 py-6 text-center text-muted-foreground">
+					{#if store.lastFetched === null}
+						{EM_DASH}
+					{:else if inFlightOnly && !project}
+						No workers in flight
+					{:else}
+						No tasks match this filter
+					{/if}
+				</p>
+			{/snippet}
+		</TaskList>
 		{#if split}
-			<ResourceQueuePanel queues={busyQueues} machines={store.machines} class="xl:order-last" />
+			<ResourceQueuePanel queues={busyQueues} machines={store.machines} class="flex-1 basis-0" />
 		{/if}
-		<div class="min-w-0 overflow-x-auto rounded border border-border bg-card">
-			<div class="min-w-[76rem]">
-				<div
-					class="grid grid-cols-[5.5rem_minmax(10rem,1.4fr)_minmax(9rem,0.8fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
-				>
-					<span>machine</span>
-					<span>name</span>
-					<span>agent</span>
-					<span>id</span>
-					<span>status</span>
-					<span>time</span>
-					<span>cwd</span>
-					<span>thread</span>
-					<span>callback</span>
-				</div>
-
-				{#each store.tasks as entry (entry.task.id)}
-					{@const task = entry.task}
-					{@const peerHref = peerTaskHref(machineById.get(entry.machine), entry.task.id)}
-					<div
-						class="relative grid grid-cols-[5.5rem_minmax(10rem,1.4fr)_minmax(9rem,0.8fr)_5.5rem_6.5rem_5.5rem_minmax(10rem,1fr)_7rem_5.5rem] items-center gap-2 border-b border-border/60 px-3 py-1.5 last:border-b-0 hover:bg-accent/60"
-					>
-						<span
-							class={cn(
-								'truncate font-mono text-[11px]',
-								isLocal(entry.machine) ? 'text-muted-foreground' : 'text-foreground'
-							)}
-							title={`runs on ${machineName(entry.machine)}`}
-						>
-							{machineName(entry.machine)}
-						</span>
-						{#if isLocal(entry.machine)}
-							<a
-								href={resolve('/tasks/[id]', { id: task.id })}
-								class="truncate font-mono text-primary after:absolute after:inset-0 after:content-['']"
-								title={task.display_name}
-							>
-								{task.display_name}
-							</a>
-						{:else if peerHref}
-							<a
-								href={peerHref}
-								rel="external"
-								class="truncate font-mono text-primary after:absolute after:inset-0 after:content-['']"
-								title={`${task.display_name} on ${machineName(entry.machine)}`}
-							>
-								{task.display_name}
-							</a>
-						{:else}
-							<span class="truncate font-mono" title={task.display_name}>{task.display_name}</span>
-						{/if}
-						<!-- raised above the row link overlay so the full workload title shows on hover -->
-						<WorkloadCell workload={task.workload} class="relative z-10" />
-						<span class="font-mono text-muted-foreground" title={task.id}>{shortId(task.id)}</span>
-						<span class="flex items-center gap-1">
-							<StatusBadge status={task.status} />
-							{#if task.cancel_requested_at}
-								<Ban
-									class="size-3 text-amber-600 dark:text-amber-400"
-									aria-label="cancel requested"
-									title={`cancel requested ${formatTimestamp(task.cancel_requested_at)}`}
-								/>
-							{/if}
-						</span>
-						<Elapsed from={task.created_at} to={rowEnd(task)} class="text-muted-foreground" />
-						<span class="truncate font-mono text-muted-foreground" title={task.cwd}>
-							{shortenHome(task.cwd)}
-						</span>
-						<CopyPath
-							value={task.thread}
-							label={shortId(task.thread)}
-							class="relative z-10 text-[11px] text-muted-foreground"
-						/>
-						<CallbackBadge callback={task.callback} class="justify-self-start" />
-					</div>
-				{/each}
-
-				{#if store.tasks.length === 0}
-					<p class="px-3 py-6 text-center text-muted-foreground">
-						{#if store.lastFetched === null}
-							{EM_DASH}
-						{:else if inFlightOnly}
-							No workers in flight
-						{:else}
-							No tasks match this filter
-						{/if}
-					</p>
-				{/if}
-			</div>
-		</div>
 	</div>
 </div>

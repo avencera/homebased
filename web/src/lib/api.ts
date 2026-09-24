@@ -123,6 +123,8 @@ export interface TaskSummary {
 	/** Submitting Codex thread. */
 	thread: string;
 	cwd: string;
+	/** Git worktree root that the executor found, when there is one. */
+	project_root?: string | null;
 	/** Worker pid while running. */
 	pid: number | null;
 	callback: CallbackStatus;
@@ -300,6 +302,7 @@ const TaskSummarySchema = Schema.Struct({
 	workload: WorkloadSchema,
 	thread: Schema.String,
 	cwd: Schema.String,
+	project_root: Schema.optional(Schema.NullOr(Schema.String)),
 	pid: Schema.NullOr(Schema.Finite),
 	callback: CallbackStatusSchema,
 	timeout_secs: Schema.Finite,
