@@ -120,22 +120,20 @@ fn set_package_version(contents: &str, version: Version) -> Result<String> {
     Ok(doc.to_string())
 }
 
+/// Record the new package version in `Cargo.lock`
+///
+/// Release builds use `--locked`, so a stale entry fails them. `cargo metadata`
+/// no longer rewrites the lockfile, so update only the homebased entry offline
 fn refresh_lockfile(root: &Path) -> Result<()> {
     let output = Command::new("cargo")
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-        ])
+        .args(["update", "--package", "homebased", "--offline"])
         .current_dir(root)
         .stdout(Stdio::null())
         .output()
-        .wrap_err("failed to run cargo metadata")?;
+        .wrap_err("failed to run cargo update")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("cargo metadata failed: {stderr}");
+        bail!("cargo update failed: {stderr}");
     }
     Ok(())
 }
