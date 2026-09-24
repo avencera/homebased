@@ -22,7 +22,8 @@ Check the exact actions for the assigned supervisor machine and thread:
 - when resource work starts
 - after compaction or resume
 - before launching any independent background task
-- after a notice or an unknown action result, when needed to resolve state
+- after every `HOMEBASED_RESOURCE_NOTICE` line
+- after an unknown action result, when needed to resolve state
 
 Use `homebased --json resource pending --machine <machine-uuid> --thread
 <thread-uuid>`. Read `unavailable_authorities` before interpreting `actions`.
@@ -39,8 +40,13 @@ Cancel a still-queued request with `resource request cancel`. Reorder one with
 successful move advances the resource revision even when the order does not
 change. Reuse the same operation UUID and input after an unknown result.
 
-A delivered notice does not complete an action. Read the action phase from a
-fresh authority-backed pending result. Keep the saved pending JSON unchanged for
+A notice only prompts a check, and it can arrive after its action is resolved.
+The authority stops notices when their action resolves, but a notice already in
+transit still arrives. Act only on an action whose `action_id` appears in a
+fresh authority-backed pending result. If all authorities answered and the
+notice's `action_id` is absent, the notice is stale. Ignore it, and do not
+reopen or retry the action. A delivered notice does not complete an action.
+Read the action phase from the same pending result. Keep the saved pending JSON unchanged for
 an unknown-outcome retry. Keep the action, request, task, and operation IDs
 unchanged as the runbook requires. If the authority returns a definite
 rejection, do not retry with changed content under the same ID.

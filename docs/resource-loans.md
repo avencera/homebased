@@ -362,6 +362,11 @@ notice arrived. It does not complete the release or return decision. Check
 `resource show` and a fresh `resource pending` result for the authority's current
 phase. Do not infer completion from a delivered notice or a finished watcher.
 
+The authority sends and retries a notice only while the loan waits for that
+exact decision. A notice that was already in transit when the action resolved
+still arrives. If all authorities answered and the notice's `action_id` is not
+in the pending result, the notice is stale. Ignore it.
+
 ### Release a background trainer
 
 For a remote supervisor, start the watcher for the exact `release_required`
@@ -597,7 +602,8 @@ operator can release it with the `restoring_foreground_return` binding. See
 
 ### Retry a failed notice
 
-Renotify only when the exact pending notice is `failed`:
+Renotify only when the exact pending notice is `failed` and its action is still
+pending. The authority refuses a renotify after the action resolves:
 
 ```sh
 homebased --json resource renotify <action-uuid> \

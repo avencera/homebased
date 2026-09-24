@@ -16,7 +16,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
 - Event delivery is at-least-once. For new events, deduplicate by `(task, seq)`; for a legacy event without `seq`, use `(task, event)`.
-- For GPU resource work, read [resource-loans.md](references/resource-loans.md). Check the exact pending actions at start, after compaction, and before an independent background launch. A delivered notice is not completion. An unavailable authority is not an empty action list.
+- For GPU resource work, read [resource-loans.md](references/resource-loans.md). Check the exact pending actions at start, after compaction, and before an independent background launch. A delivered notice is not completion, and a notice whose action is absent from a complete pending result is stale. An unavailable authority is not an empty action list.
 - Use `homebased message send` for a direct Codex-thread message. Read [messages.md](references/messages.md) for destination, source, and retry rules.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
 - Use `homebased daemon stop` or `homebased daemon restart`, never raw `systemctl` or `launchctl`, so in-flight tasks are protected.
