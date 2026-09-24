@@ -118,8 +118,8 @@
 			</span>
 		</span>
 		<span class="text-muted-foreground">
-			{store.status?.in_flight ?? 0} in flight{#if localName}<span class="hidden sm:inline">
-					on {localName}</span
+			{store.status?.in_flight ?? 0} in flight{#if localName}<span class="hidden sm:inline"
+					>{` on ${localName}`}</span
 				>{/if}
 		</span>
 		{#if store.status}
@@ -228,7 +228,8 @@
 		{/if}
 	</div>
 
-	<!-- the page fits the screen; each box scrolls on its own, and with GPU work tasks and the queue split it evenly -->
+	<!-- the page fits the screen and each box scrolls on its own. The task box is as tall as its
+	     rows, up to half the screen while a GPU has work; the GPU box takes the rest -->
 	<div class="mt-3 flex min-h-0 flex-1 flex-col gap-3">
 		<TaskList
 			tasks={visibleTasks}
@@ -237,7 +238,7 @@
 			activeProject={project}
 			onThread={(next) => navigate({ ...currentFilters, thread: next })}
 			onProject={(next) => navigate({ ...currentFilters, project: next })}
-			class="min-h-0 flex-1 basis-0"
+			class={cn('min-h-0 flex-initial', split && 'max-h-[50%]')}
 		>
 			{#snippet empty()}
 				<p class="px-3 py-6 text-center text-muted-foreground">
@@ -255,7 +256,7 @@
 			<ResourceQueuePanel
 				queues={busyQueues}
 				machines={store.machines}
-				class="scrollbar-none min-h-0 flex-none overflow-y-auto max-lg:max-h-[40%] lg:flex-1 lg:basis-0"
+				class="scrollbar-none min-h-0 flex-1 overflow-y-auto"
 			/>
 		{/if}
 	</div>
