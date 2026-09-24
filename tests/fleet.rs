@@ -4,7 +4,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
@@ -63,7 +62,9 @@ impl Daemon {
             home,
             user_home,
             config,
-            port: free_port(),
+            // the daemon binds port 0 and reports the port it got, so a concurrent
+            // test cannot take the port between choosing it and binding it
+            port: 0,
             listen_host: host.to_string(),
             mdns,
             codex_override: None,
@@ -111,6 +112,40 @@ impl Daemon {
             wait_until(Duration::from_secs(10), || sock.exists()),
             "socket did not appear"
         );
+        let port = self.bound_port();
+        assert!(
+            self.port == 0 || self.port == port,
+            "daemon bound port {port}, not the requested port {}",
+            self.port
+        );
+        self.port = port;
+    }
+
+    /// Port of the dashboard listener, which the daemon omits when its bind failed
+    fn bound_port(&self) -> u16 {
+        let mut status = None;
+        let answered = wait_until(Duration::from_secs(10), || {
+            status = self
+                .cmd()
+                .args(["--json", "daemon", "status"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok());
+            // the socket file appears before the daemon serves it
+            status
+                .as_ref()
+                .is_some_and(|status| status["socket"] == "up")
+        });
+        assert!(answered, "daemon did not start serving: {status:?}");
+        let status = status.unwrap();
+        let web = status["web"]
+            .as_str()
+            .unwrap_or_else(|| panic!("daemon has no dashboard listener: {status}"));
+        web.rsplit(':')
+            .next()
+            .and_then(|port| port.trim_end_matches('/').parse().ok())
+            .unwrap_or_else(|| panic!("dashboard URL has no port: {web}"))
     }
 
     fn stop(&mut self) {
@@ -142,14 +177,6 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn event_spec() -> NormalizedSpec {
