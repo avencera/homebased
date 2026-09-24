@@ -221,8 +221,10 @@ pub(crate) enum ConflictReason {
     RequestMissing,
     /// The request left the state that this transition expects
     RequestStateChanged,
-    /// An earlier request in the authority FIFO is still queued or assigned
+    /// A request before the selected request in serving order is still queued or assigned
     EarlierRequestActive,
+    /// The next queue rank would overflow the stored integer
+    QueueRankExhausted,
     /// A prevention record holds a different identity for this request or task
     PreventionIdentityMismatch,
     /// The task identity already belongs to a request, task row, or executor identity
@@ -270,7 +272,10 @@ impl ConflictReason {
             Self::RequestSpecMismatch => "request retry carries a different command",
             Self::RequestMissing => "request is missing from the authority queue",
             Self::RequestStateChanged => "request state changed",
-            Self::EarlierRequestActive => "an earlier queued request is still active",
+            Self::EarlierRequestActive => {
+                "an earlier request in serving order is still queued or assigned"
+            }
+            Self::QueueRankExhausted => "resource queue rank cannot advance",
             Self::PreventionIdentityMismatch => "prevention record holds a different identity",
             Self::TaskIdentityInUse => "task identity is already in use",
             Self::TaskRowMismatch => "task row disagrees with the accepted request",

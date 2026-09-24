@@ -1,7 +1,7 @@
 # GPU resource loans
 
 Use this runbook for an exclusive GPU registered with Homebased. The resource
-authority is the machine that owns the GPU. It owns resource state, FIFO order,
+authority is the machine that owns the GPU. It owns resource state, serving order,
 loan state, and release proof. Version 1 runs resource work on that authority.
 The assigned supervisor is one exact machine and thread. The submitting machine
 owns the task callback route.
@@ -283,9 +283,11 @@ homebased --json resource request submit \
   --spec request.json
 ```
 
-The authority assigns FIFO order. A request can wait or activate under a loan.
-Do not start a second task with ordinary `task submit` to avoid this queue.
-Use `resource requests <resource-uuid>` to read accepted requests.
+The authority assigns each request an immutable acceptance identity. Queued
+requests serve by queue rank, then acceptance identity. New requests join the
+back. A request can wait or activate under a loan. Do not start a second task
+with ordinary `task submit` to avoid this queue. Use
+`resource requests <resource-uuid>` to read requests in serving order.
 
 Cancel only a request that is still queued, before activation. Get the latest
 state revision with `resource show`; use a new operation UUID once, then keep it
@@ -301,6 +303,43 @@ homebased --json resource request cancel \
 
 Canceling the last request does not remove an active loan or its return
 obligation.
+
+Move only a request that is still queued. Read the latest state revision with
+`resource show`, then choose exactly one placement: `--front`, `--back`,
+`--before <request-uuid>`, or `--after <request-uuid>`. Use one new operation
+UUID and keep the same input and ID after an unknown result:
+
+```sh
+homebased --json resource request move \
+  11111111-1111-4111-8111-111111111111 \
+  88888888-8888-4888-8888-888888888888 \
+  --before 77777777-7777-4777-8777-777777777777 \
+  --expected-revision <resource-state-revision> \
+  --operation-id aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+```
+
+A successful move advances the resource state revision, even when the request
+stays in the same place. The public socket action uses the same revision and
+operation fields as other resource actions. Its request body for the example
+above is:
+
+```json
+{
+  "api_version": 1,
+  "operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "expected_revision": 3,
+  "action": {
+    "type": "move_queued",
+    "request_id": "88888888-8888-4888-8888-888888888888",
+    "placement": {
+      "type": "before",
+      "request_id": "77777777-7777-4777-8777-777777777777"
+    }
+  }
+}
+```
+
+Send this body to `POST /v1/resources/<resource-uuid>/actions` on the authority.
 
 ## Check and act on supervisor actions
 
@@ -355,7 +394,7 @@ releases the GPU for this context only when all of these are true:
 - The authority holds the exact saved `.segment.lock` until the transition
   commits.
 
-If a queue exists, the oldest request runs next. The ended run cannot resume.
+If a queue exists, the next request in serving order runs next. The ended run cannot resume.
 A checkpoint on disk does not make it resumable. A lost task, an unconfirmed
 exit, or a held lock keeps the GPU reserved. A trainer with no trainer-attempt
 association also keeps the GPU reserved. Its attention reason is
@@ -434,14 +473,14 @@ homebased --json resource show 11111111-1111-4111-8111-111111111111
 The authority saves the attestation, the task evidence it found, and the queue
 or loan transition in one transaction:
 
-- `awaiting_release`: with queued work, the oldest request serves. Otherwise
+- `awaiting_release`: with queued work, the next request in serving order serves. Otherwise
   the loan moves to `awaiting_return`, and the supervisor decides the return.
 - `no_loan` and `first_background_launch`: the registration clears. With
-  queued work, the oldest request serves. Otherwise the receipt is the idle
+  queued work, the next request in serving order serves. Otherwise the receipt is the idle
   boundary that a later request or first background launch uses.
 - `restoring_return` and `restoring_foreground_return`: the Restoring loan
   closes with the attested end, and the registration clears. With queued work,
-  the oldest request serves. Otherwise the closed loan and its receipt are the
+  the next request in serving order serves. Otherwise the closed loan and its receipt are the
   idle boundary. The task keeps its saved state. A lost task stays lost, and an
   unconfirmed process-group exit stays unconfirmed. The receipt records the
   operator's attestation, not a confirmed exit.
@@ -517,8 +556,8 @@ maintained direct-segment trainer command closes the `restoring` loan when its
 start is confirmed, and it becomes the registered training task. A native
 foreground command never becomes the registered training task. Its `restoring`
 loan keeps the GPU reserved while it runs, and new requests wait. When it exits
-with code 0 and a confirmed process-group exit, the loan closes and the oldest
-queued request runs. Any other end keeps the GPU reserved for `resolve`. A
+with code 0 and a confirmed process-group exit, the loan closes and the next
+queued request in serving order runs. Any other end keeps the GPU reserved for `resolve`. A
 container return task has the `container` execution mode and behaves the same
 way, but its witness is the removed container: the loan closes only when the
 container exits with code 0 and Homebased confirms that it is removed.

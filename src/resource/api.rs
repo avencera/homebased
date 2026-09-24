@@ -47,7 +47,7 @@ pub struct ResourceOverview {
     pub resource: Resource,
     /// Non-closed loan that reserves the resource, if one exists
     pub loan: Option<Loan>,
-    /// Requests still waiting for FIFO selection
+    /// Requests still waiting for selection in serving order
     pub queued_count: u64,
     /// Task that holds the resource for the current loan phase
     pub current_task: Option<ResourceTaskSummary>,
@@ -112,7 +112,7 @@ pub struct ResourceDetail {
     pub resource: Resource,
     /// Non-closed loan that reserves the resource, if one exists
     pub loan: Option<Loan>,
-    /// Every request for this resource in authority acceptance order
+    /// Every request for this resource in serving order
     pub requests: Vec<ResourceRequestView>,
     /// Supervisor notices for the non-closed loan with their delivery state
     pub notices: Vec<SupervisorNotice>,
@@ -142,7 +142,7 @@ pub struct ResourceRequestView {
     pub request_id: RequestId,
     /// Preallocated task identity
     pub task_id: TaskId,
-    /// Authority-assigned FIFO position
+    /// Immutable authority-assigned acceptance identity
     pub acceptance_sequence: AcceptanceSequence,
     /// Machine that owns the requesting thread and callback route
     pub origin_machine: MachineId,
@@ -341,14 +341,41 @@ pub struct ResourceActionBody {
     pub action: BrowserResourceAction,
 }
 
-/// The only resource controls exposed to the dashboard
+/// One place for a moved queued request, relative to other queued requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueuePlacement {
+    /// Place the request first in the queue
+    Front,
+    /// Place the request last in the queue
+    Back,
+    /// Place the request directly before another queued request
+    Before {
+        /// Anchor request identity
+        request_id: RequestId,
+    },
+    /// Place the request directly after another queued request
+    After {
+        /// Anchor request identity
+        request_id: RequestId,
+    },
+}
+
+/// The resource controls exposed to operators and the dashboard
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserResourceAction {
-    /// Remove one queued request from FIFO selection through its origin-owned cancellation
+    /// Remove one queued request through its origin-owned cancellation
     CancelQueued {
         /// Queued request identity
         request_id: RequestId,
+    },
+    /// Move one queued request to a new place in the serving order
+    MoveQueued {
+        /// Queued request identity
+        request_id: RequestId,
+        /// New place in the queue
+        placement: QueuePlacement,
     },
     /// Cancel the active command task through its origin-owned cancellation
     StopActive {
@@ -496,7 +523,7 @@ pub struct OperatorReleaseResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceRequestSubmitOutcome {
-    /// The request waits in the FIFO queue or runs under a loan
+    /// The request waits in serving order or runs under a loan
     Waiting,
     /// The authority activated the command task
     Activated,

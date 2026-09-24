@@ -6,7 +6,7 @@ use super::codec::{encode_json, sqlite_integer};
 use super::error::{ConflictReason, ResourceStoreError};
 use super::notice::{SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction};
 use super::queue::{
-    RequestIdentity, local_task_exists, oldest_queued_request_for_authority, prevention_exists,
+    RequestIdentity, local_task_exists, next_queued_request_for_authority, prevention_exists,
     request_matches_identity, select_executor_identity, task_id_exists,
 };
 use super::revision::swap_resource_revision;
@@ -214,7 +214,7 @@ fn cancel_assigned_request(
     saved.state = cancelled;
 
     let updated_loan = if let Some(mut next_request) =
-        oldest_queued_request_for_authority(tx, authority, saved.resource_id)?
+        next_queued_request_for_authority(tx, authority, saved.resource_id)?
     {
         next_request.state = ResourceRequestState::Assigned { loan_id };
         let next_state_json = encode_json(&next_request.state)?;

@@ -388,17 +388,75 @@ fn migrate_27_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn migrate_28_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
     conn.execute_batch(MIGRATE_28_TO_29_RESOURCES)?;
-    conn.execute_batch(RESOURCE_SCHEMA)
+    migrate_30_to_current(conn)
 }
 
 /// Schema version of the v0.5.1 release
 const RELEASED_V0_5_1_SCHEMA_VERSION: i64 = 29;
 
 /// Move a v0.5.1 database to the current schema
-///
-/// Version 30 adds only the initial idle attestation table, which
-/// `RESOURCE_SCHEMA` creates
 fn migrate_29_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    migrate_30_to_current(conn)
+}
+
+/// Released v0.7.0 and v0.6.0 databases use schema version 30
+const RELEASED_V0_7_SCHEMA_VERSION: i64 = 30;
+
+/// Add serving ranks before `RESOURCE_SCHEMA` creates serving-order indexes
+///
+/// Rebuilding the table keeps the upgraded column constraints identical to a
+/// fresh database. Existing requests retain their acceptance order.
+const MIGRATE_30_TO_CURRENT: &str = r"
+CREATE TABLE resource_requests_v31 (
+    acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (acceptance_sequence > 0),
+    queue_rank INTEGER NOT NULL CHECK (queue_rank > 0),
+    request_id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL UNIQUE,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    origin_machine TEXT NOT NULL,
+    spec_json TEXT NOT NULL CHECK (
+        json_valid(spec_json)
+        AND COALESCE(json_type(spec_json) = 'object', 0)
+        AND COALESCE(json_type(spec_json, '$.api_version') = 'integer', 0)
+        AND COALESCE(json_type(spec_json, '$.thread') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.name') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.cwd') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.timeout') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.workload') = 'object', 0)
+        AND COALESCE(
+            (
+                json_extract(spec_json, '$.workload.type') = 'task'
+                AND json_type(spec_json, '$.workload.command') = 'array'
+            ) OR (
+                json_extract(spec_json, '$.workload.type') = 'container'
+                AND json_type(spec_json, '$.workload.image') = 'text'
+                AND json_type(spec_json, '$.workload.gpus') IS NOT NULL
+            ),
+            0
+        )
+    ),
+    state_json TEXT NOT NULL CHECK (
+        json_valid(state_json)
+        AND COALESCE(json_type(state_json) = 'object', 0)
+        AND COALESCE(json_type(state_json, '$.type') = 'text', 0)
+        AND COALESCE(json_extract(state_json, '$.type') IN (
+            'queued', 'assigned', 'finished', 'cancelled_before_launch', 'rejected'
+        ), 0)
+    )
+);
+INSERT INTO resource_requests_v31
+    (acceptance_sequence, queue_rank, request_id, task_id, resource_id,
+     origin_machine, spec_json, state_json)
+SELECT acceptance_sequence, acceptance_sequence, request_id, task_id, resource_id,
+       origin_machine, spec_json, state_json
+FROM resource_requests ORDER BY acceptance_sequence;
+DROP TABLE resource_requests;
+ALTER TABLE resource_requests_v31 RENAME TO resource_requests;
+";
+
+/// Move a released schema version 30 database to the current schema
+fn migrate_30_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_30_TO_CURRENT)?;
     conn.execute_batch(RESOURCE_SCHEMA)
 }
 
@@ -780,6 +838,7 @@ impl Store {
                 RELEASED_V0_4_SCHEMA_VERSION => migrate_27_to_current(&transaction)?,
                 RELEASED_V0_5_SCHEMA_VERSION => migrate_28_to_current(&transaction)?,
                 RELEASED_V0_5_1_SCHEMA_VERSION => migrate_29_to_current(&transaction)?,
+                RELEASED_V0_7_SCHEMA_VERSION => migrate_30_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2307,8 +2366,8 @@ pub(crate) fn write_exit_json_with_evidence(
 mod tests {
     use super::{
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
-        RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, Store, new_queued_task,
-        read_exit_json, write_exit_json_with_evidence,
+        RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
+        Store, new_queued_task, read_exit_json, write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -2322,6 +2381,9 @@ mod tests {
     use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, OutboxState};
     use crate::invocation::CommandLine;
     use crate::machine::MachineId;
+    use crate::resource::{
+        AssignmentRevision, Resource, ResourceId, ResourceRevision, SupervisorAddress,
+    };
     use crate::spec::NormalizedSpec;
     use crate::submission::{
         CallbackContext, CallbackExecutable, ExecutorIdentity, OriginRoute, PersistedSpec,
@@ -2692,7 +2754,7 @@ mod tests {
         assert!(store.executor_identity(task).unwrap().is_none());
         assert_eq!(
             store
-                .oldest_queued_resource_request(authority, resource.id)
+                .next_queued_resource_request(authority, resource.id)
                 .unwrap()
                 .unwrap()
                 .task_id,
@@ -3645,6 +3707,7 @@ CREATE TABLE reports (
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_resource_tables_installed(&store);
+        assert_resource_request_serving_schema(&store, "fresh");
         assert_foreign_keys_enabled(&store);
     }
 
@@ -3719,6 +3782,167 @@ CREATE TABLE reports (
             .unwrap()
     }
 
+    fn prepare_released_resource_queue(
+        path: &Path,
+        version: i64,
+    ) -> (MachineId, ResourceId, Vec<RequestId>) {
+        let mut store = Store::open(path).unwrap();
+        let authority = MachineId::new();
+        let resource_id = ResourceId::new();
+        let resource = Resource::new(
+            resource_id,
+            "migration GPU".into(),
+            authority,
+            SupervisorAddress {
+                machine: authority,
+                thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+            },
+            AssignmentRevision::new(0),
+            ResourceRevision::new(0),
+            None,
+        );
+        store.register_resource(authority, &resource).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE resource_requests;
+                 CREATE TABLE resource_requests (
+                     acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     request_id TEXT NOT NULL UNIQUE,
+                     task_id TEXT NOT NULL UNIQUE,
+                     resource_id TEXT NOT NULL REFERENCES resources(id),
+                     origin_machine TEXT NOT NULL,
+                     spec_json TEXT NOT NULL,
+                     state_json TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+
+        let request_ids = vec![RequestId::new(), RequestId::new()];
+        let spec_json = json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "migration request",
+            "cwd": "/tmp",
+            "timeout": "4h",
+            "workload": { "type": "task", "command": ["/bin/echo", "migration"] }
+        })
+        .to_string();
+        for (sequence, request_id) in [7_i64, 13_i64].into_iter().zip(&request_ids) {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO resource_requests
+                        (acceptance_sequence, request_id, task_id, resource_id,
+                         origin_machine, spec_json, state_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        sequence,
+                        request_id.0.to_string(),
+                        TaskId::new().to_string(),
+                        resource_id.as_uuid().to_string(),
+                        authority.as_uuid().to_string(),
+                        spec_json,
+                        json!({ "type": "queued" }).to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        if version == RELEASED_V0_4_SCHEMA_VERSION || version == RELEASED_V0_5_SCHEMA_VERSION {
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE task_containers;
+                     ALTER TABLE tasks DROP COLUMN container_exit_evidence;",
+                )
+                .unwrap();
+        }
+        if version < RELEASED_V0_7_SCHEMA_VERSION {
+            store
+                .conn
+                .execute("DROP TABLE resource_initial_idle_attestations", [])
+                .unwrap();
+        }
+        store
+            .conn
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(store);
+        (authority, resource_id, request_ids)
+    }
+
+    #[test]
+    fn released_resource_schemas_backfill_queue_ranks_and_keep_the_request_order() {
+        for version in [
+            RELEASED_V0_4_SCHEMA_VERSION,
+            RELEASED_V0_5_SCHEMA_VERSION,
+            RELEASED_V0_5_1_SCHEMA_VERSION,
+            RELEASED_V0_7_SCHEMA_VERSION,
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (authority, resource_id, request_ids) =
+                prepare_released_resource_queue(&path, version);
+            let store = Store::open(&path).unwrap();
+            let current_version: i64 = store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                current_version, SCHEMA_VERSION,
+                "released version {version}"
+            );
+
+            let requests = store.resource_requests(authority, resource_id).unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.request_id)
+                    .collect::<Vec<_>>(),
+                request_ids,
+                "released version {version}"
+            );
+            let ranks = store
+                .conn
+                .prepare(
+                    "SELECT queue_rank FROM resource_requests
+                     WHERE resource_id = ?1 ORDER BY acceptance_sequence",
+                )
+                .unwrap()
+                .query_map([resource_id.as_uuid().to_string()], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(ranks, [7, 13], "released version {version}");
+            assert_resource_request_serving_schema(&store, &format!("released version {version}"));
+        }
+    }
+
+    fn assert_resource_request_serving_schema(store: &Store, label: &str) {
+        let request_schema = schema_sql(store, "resource_requests");
+        assert!(
+            request_schema.contains("queue_rank INTEGER NOT NULL CHECK (queue_rank > 0)"),
+            "{label}: {request_schema}"
+        );
+        assert!(
+            !request_schema.contains("queue_rank INTEGER NOT NULL DEFAULT"),
+            "{label}: {request_schema}"
+        );
+        assert!(
+            schema_sql(store, "resource_requests_serving_order")
+                .contains("resource_id, queue_rank, acceptance_sequence"),
+            "{label}"
+        );
+        assert!(
+            schema_sql(store, "resource_requests_queued_serving_order")
+                .contains("resource_id, queue_rank, acceptance_sequence"),
+            "{label}"
+        );
+    }
+
     #[test]
     fn released_v0_5_database_gains_the_container_witness_and_keeps_its_rows() {
         let dir = tempdir().unwrap();
@@ -3766,8 +3990,8 @@ CREATE TABLE reports (
         assert!(schema_sql(&store, "resource_requests").contains("'container'"));
         assert!(!schema_sql(&store, "resource_requests").contains("'task', 0) AND"));
         assert!(schema_sql(&store, "resource_restore_closures").contains("'container_ended'"));
-        schema_sql(&store, "resource_requests_fifo");
-        schema_sql(&store, "resource_requests_queued_fifo");
+        schema_sql(&store, "resource_requests_serving_order");
+        schema_sql(&store, "resource_requests_queued_serving_order");
         assert_resource_tables_installed(&store);
         assert_foreign_keys_enabled(&store);
     }

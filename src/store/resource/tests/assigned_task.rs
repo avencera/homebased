@@ -1,28 +1,40 @@
-//! Assigned resource task acceptance, FIFO drain, and completion tests
+//! Assigned resource task acceptance, queue drain, and completion tests
 
 use super::fixtures::{
     ServingFixture, accept_and_finish_next_resource_task, accept_and_finish_resource_task,
-    acceptance_counts, acceptance_input, completion, refresh_serving_fixture,
-    resource_cancellation_identity, resource_cancellation_proof, resource_origin_route,
-    serving_fixture, task_reconcile_input, waiting_receipt,
+    acceptance_counts, acceptance_input, completion, queue_waiting_request,
+    refresh_serving_fixture, resource_cancellation_identity, resource_cancellation_proof,
+    resource_origin_route, serving_fixture, task_reconcile_input, waiting_receipt,
 };
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskState,
 };
 use crate::events::{EventAcceptance, EventPayload};
 use crate::machine::MachineId;
+use crate::resource::api::{BrowserResourceAction, QueuePlacement};
 use crate::resource::store::{
     AssignedResourceTaskAttention, AssignedResourceTaskReconcileOutcome, ResourceStoreError,
     ResourceTaskAcceptance, ResourceTaskAcceptanceInput, ResourceTaskCompletionResult,
 };
 use crate::resource::{
-    Loan, LoanId, LoanPhase, LoanState, ResourceId, ResourceRequestState, ResourceRevision,
+    DeliveryAttemptId, Loan, LoanId, LoanPhase, LoanState, ResourceId, ResourceRequest,
+    ResourceRequestState, ResourceRevision,
 };
 use crate::spec::NormalizedWorkload;
-use crate::store::{ExecutorIdentity, Store};
+use crate::store::{ExecutorIdentity, ResourceControlEffect, ResourceControlRequest, Store};
 use crate::submission::{PreAcceptanceRejection, RequestId, ResourceRoutePhase, SubmissionState};
 use tempfile::tempdir;
 use uuid::Uuid;
+
+fn queue_request(fixture: &mut ServingFixture) -> ResourceRequest {
+    queue_waiting_request(
+        &mut fixture.store,
+        fixture.authority,
+        fixture.resource.id,
+        fixture.origin,
+        &fixture.spec,
+    )
+}
 
 #[test]
 fn assigned_resource_task_acceptance_commits_task_identity_and_first_event() {
@@ -277,7 +289,7 @@ fn assigned_resource_task_rejects_wrong_authority_loan_request_and_revision() {
 }
 
 #[test]
-fn assigned_resource_task_rejects_a_non_fifo_loan_selection() {
+fn assigned_resource_task_rejects_a_request_before_it_in_serving_order() {
     let mut fixture = serving_fixture(true, true);
     let later_request = fixture
         .store
@@ -374,7 +386,7 @@ fn assigned_resource_task_rejects_a_non_fifo_loan_selection() {
 }
 
 #[test]
-fn confirmed_success_failure_and_cancel_drain_three_requests_in_fifo_order() {
+fn confirmed_success_failure_and_cancel_drain_three_requests_in_serving_order() {
     let mut fixture = serving_fixture(true, true);
     let second = fixture
         .store
@@ -1307,4 +1319,68 @@ fn cancellation_and_assigned_resource_task_acceptance_resolve_in_either_order() 
             .state,
         ResourceRequestState::Assigned { loan_id } if loan_id == accepted_first.loan.id
     ));
+}
+
+#[test]
+fn moving_a_queued_request_ahead_of_an_assigned_request_selects_and_accepts_it_next() {
+    let mut fixture = serving_fixture(true, true);
+    let earlier_queued = queue_request(&mut fixture);
+    let moved_to_front = queue_request(&mut fixture);
+    let reordered = fixture
+        .store
+        .begin_resource_control(
+            fixture.authority,
+            Uuid::now_v7(),
+            &ResourceControlRequest {
+                resource_id: fixture.resource.id,
+                expected_revision: fixture.state_revision,
+                action: BrowserResourceAction::MoveQueued {
+                    request_id: moved_to_front.request_id,
+                    placement: QueuePlacement::Front,
+                },
+            },
+            DeliveryAttemptId::new(),
+        )
+        .unwrap();
+    assert!(matches!(reordered.effect, ResourceControlEffect::Reordered));
+    fixture.state_revision = ResourceRevision::new(fixture.state_revision.get() + 1);
+
+    let reconcile_input = accept_and_finish_resource_task(
+        &mut fixture,
+        ExitReason::Exit { code: 0 },
+        ProcessGroupExitEvidence::ConfirmedExited,
+    );
+    let result = fixture
+        .store
+        .reconcile_assigned_resource_task_for_authority(reconcile_input)
+        .unwrap();
+    let ResourceTaskCompletionResult::Assigned {
+        loan, next_request, ..
+    } = completion(result).unwrap()
+    else {
+        panic!("the completed request must assign the next queued request");
+    };
+    assert_eq!(next_request.request_id, moved_to_front.request_id);
+    assert_eq!(
+        fixture
+            .store
+            .resource_requests(fixture.authority, fixture.resource.id)
+            .unwrap()
+            .into_iter()
+            .find(|request| request.state == ResourceRequestState::Queued)
+            .map(|request| request.request_id),
+        Some(earlier_queued.request_id)
+    );
+
+    refresh_serving_fixture(&mut fixture, loan, next_request);
+    let acceptance = acceptance_input(&fixture);
+    assert_eq!(
+        fixture
+            .store
+            .accept_assigned_resource_task(acceptance)
+            .unwrap(),
+        ResourceTaskAcceptance::Inserted {
+            task: moved_to_front.task_id,
+        }
+    );
 }

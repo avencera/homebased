@@ -28,7 +28,7 @@ use crate::machine::MachineId;
 use crate::resource::background_launch::{BackgroundLaunchBinding, RemoteBackgroundLaunchReceipt};
 use crate::resource::command_shape::{DirectSegmentCommandShape, DirectSegmentCommandShapeError};
 use crate::resource::store::{
-    ConflictReason, ResourceStoreError, oldest_queued_request_for_authority, select_non_closed_loan,
+    ConflictReason, ResourceStoreError, next_queued_request_for_authority, select_non_closed_loan,
 };
 use crate::resource::{
     BackgroundCommandContract, IdleBoundaryDecision, IdleBoundaryProof, IdleProofGap, Loan,
@@ -137,10 +137,10 @@ pub(crate) enum BackgroundLaunchError {
         /// Non-closed loan
         loan_id: LoanId,
     },
-    /// Ready optimization work was accepted first and keeps its FIFO position
-    #[error("queued resource request {request_id:?} is ahead of the background launch")]
+    /// Queued resource work blocks a new background launch
+    #[error("queued resource request {request_id:?} blocks the background launch")]
     QueuedWorkAhead {
-        /// Oldest queued request
+        /// Queued request that blocks the launch
         request_id: RequestId,
     },
     /// The registered background task has not ended
@@ -667,8 +667,7 @@ fn require_launch_slot(
     if let Some(loan) = select_non_closed_loan(conn, resource.id)? {
         return Err(BackgroundLaunchError::ActiveLoan { loan_id: loan.id });
     }
-    if let Some(request) =
-        oldest_queued_request_for_authority(conn, authority_machine, resource.id)?
+    if let Some(request) = next_queued_request_for_authority(conn, authority_machine, resource.id)?
     {
         return Err(BackgroundLaunchError::QueuedWorkAhead {
             request_id: request.request_id,
@@ -1076,7 +1075,7 @@ fn loan_idle_decision(
     })
 }
 
-/// Open a Serving loan for the oldest request from a proven idle boundary
+/// Open a Serving loan for the next request in serving order from a proven idle boundary
 ///
 /// The loan, request assignment, resource revision, and opening receipt commit
 /// in the caller's transaction. The receipt is the only provenance that lets the

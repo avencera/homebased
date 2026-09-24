@@ -13,7 +13,7 @@ use super::rows::{select_request_by_id, select_resource};
 use super::schema::RESOURCE_SCHEMA;
 use super::{
     QueueCancellationResult, accept_request_for_authority, cancel_request_before_activation_on,
-    oldest_queued_request_for_authority, register_resource_for_authority,
+    next_queued_request_for_authority, register_resource_for_authority,
     requests_for_resource_for_authority,
 };
 use crate::domain::TaskId;
@@ -154,12 +154,12 @@ pub(crate) fn requests_for_resource(
     requests_for_resource_for_authority(conn, saved_authority(conn, resource_id), resource_id)
 }
 
-/// Read the oldest queued request of a resource on its saved authority
-pub(crate) fn oldest_queued_request(
+/// Read the next queued request of a resource on its saved authority
+pub(crate) fn next_queued_request(
     conn: &Connection,
     resource_id: ResourceId,
 ) -> Result<Option<ResourceRequest>, ResourceStoreError> {
-    oldest_queued_request_for_authority(conn, saved_authority(conn, resource_id), resource_id)
+    next_queued_request_for_authority(conn, saved_authority(conn, resource_id), resource_id)
 }
 
 /// Save a verified completed-trainer release receipt for one Serving loan

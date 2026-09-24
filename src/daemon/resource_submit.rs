@@ -42,7 +42,7 @@ pub(super) struct ResourceSubmitInput {
 /// Saved result of a resource-backed command submission
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResourceSubmitOutcome {
-    /// The authority accepted the command into its FIFO queue
+    /// The authority accepted the command into its serving queue
     Waiting { task: TaskId },
     /// The authority activated the command on a resource
     Activated { task: TaskId },

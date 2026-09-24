@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::machine::MachineId;
-use crate::resource::api::BrowserResourceAction;
+use crate::resource::api::{BrowserResourceAction, QueuePlacement};
 use crate::resource::store::{
     ResourceStoreError, SupervisorNoticeStoreError, decode_supervisor_notice_record,
     requests_for_resource_for_authority, resources_for_authority,
-    retarget_supervisor_notice_in_transaction, select_non_closed_loan, select_request_by_id,
-    select_supervisor_notice_record, update_supervisor_notice_cas,
+    retarget_supervisor_notice_in_transaction, rewrite_queued_request_ranks,
+    select_non_closed_loan, select_request_by_id, select_supervisor_notice_record,
+    swap_resource_revision, update_supervisor_notice_cas,
 };
 use crate::resource::{
     ActionId, AssignmentRevision, DeliveryAttemptId, Loan, LoanId, LoanPhase, LoanState, NoticeId,
@@ -23,6 +24,7 @@ use crate::resource::{
     ReturnExecutionMode, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
 };
 use crate::store::{BackgroundLaunchView, Store};
+use crate::submission::RequestId;
 
 use super::select_authority_resource;
 
@@ -36,7 +38,7 @@ pub(crate) struct ResourceReadModel {
     pub(crate) resource: Resource,
     /// Non-closed loan, if one reserves the resource
     pub(crate) loan: Option<Loan>,
-    /// Every request in acceptance order
+    /// Every request in serving order
     pub(crate) requests: Vec<ResourceRequest>,
     /// Notices that belong to the non-closed loan
     pub(crate) notices: Vec<SupervisorNotice>,
@@ -69,6 +71,8 @@ pub(crate) enum ResourceControlEffect {
         /// Queued request read in the committing transaction
         request: ResourceRequest,
     },
+    /// Queue ranks changed with no work outside the authority
+    Reordered,
     /// Ask the request origin to cancel this active command task
     StopActive {
         /// Assigned request whose task holds the resource
@@ -307,6 +311,33 @@ fn begin_resource_control(
             }
             ResourceControlEffect::CancelQueued { request: queued }
         }
+        BrowserResourceAction::MoveQueued {
+            request_id,
+            placement,
+        } => {
+            move_queued_request(
+                &tx,
+                authority_machine,
+                request.resource_id,
+                *request_id,
+                *placement,
+            )?;
+            let next_revision = resource.state_revision.next().ok_or_else(|| {
+                ResourceControlError::NotAllowed("resource revision cannot advance".into())
+            })?;
+            if !swap_resource_revision::<ResourceControlError>(
+                &tx,
+                authority_machine,
+                request.resource_id,
+                resource.state_revision,
+                next_revision,
+            )? {
+                return Err(ResourceControlError::StaleRevision {
+                    current: resource.state_revision,
+                });
+            }
+            ResourceControlEffect::Reordered
+        }
         BrowserResourceAction::StopActive { task_id } => {
             let active = active_request(&tx, loan.as_ref())?;
             if active.task_id != *task_id {
@@ -328,9 +359,9 @@ fn begin_resource_control(
         ResourceControlEffect::Renotify { attempt_id, .. } => {
             Some(attempt_id.as_uuid().to_string())
         }
-        ResourceControlEffect::CancelQueued { .. } | ResourceControlEffect::StopActive { .. } => {
-            None
-        }
+        ResourceControlEffect::CancelQueued { .. }
+        | ResourceControlEffect::StopActive { .. }
+        | ResourceControlEffect::Reordered => None,
     };
     tx.execute(
         "INSERT INTO resource_control_operations
@@ -399,6 +430,7 @@ fn replayed_effect(
                 request: request_for_resource(tx, request.resource_id, *request_id)?,
             })
         }
+        BrowserResourceAction::MoveQueued { .. } => Ok(ResourceControlEffect::Reordered),
         BrowserResourceAction::StopActive { task_id } => {
             let request =
                 requests_for_resource_for_authority(tx, authority_machine, request.resource_id)?
@@ -425,10 +457,93 @@ fn replayed_effect(
     }
 }
 
+fn move_queued_request(
+    tx: &Transaction<'_>,
+    authority_machine: MachineId,
+    resource_id: ResourceId,
+    request_id: RequestId,
+    placement: QueuePlacement,
+) -> Result<(), ResourceControlError> {
+    let request = request_for_resource(tx, resource_id, request_id)?;
+    if request.state != ResourceRequestState::Queued {
+        return Err(ResourceControlError::NotAllowed(format!(
+            "request is {}, not queued",
+            request_state_name(&request.state)
+        )));
+    }
+
+    if let QueuePlacement::Before {
+        request_id: anchor_id,
+    }
+    | QueuePlacement::After {
+        request_id: anchor_id,
+    } = placement
+    {
+        if anchor_id == request_id {
+            return Err(ResourceControlError::NotAllowed(
+                "a request cannot be its own queue anchor".into(),
+            ));
+        }
+        let anchor = request_for_resource(tx, resource_id, anchor_id)?;
+        if anchor.state != ResourceRequestState::Queued {
+            return Err(ResourceControlError::NotAllowed(format!(
+                "anchor request is {}, not queued",
+                request_state_name(&anchor.state)
+            )));
+        }
+    }
+
+    let mut order = requests_for_resource_for_authority(tx, authority_machine, resource_id)?
+        .into_iter()
+        .filter(|saved| saved.state == ResourceRequestState::Queued)
+        .map(|saved| saved.request_id)
+        .collect::<Vec<_>>();
+    let old_index = queue_position(
+        &order,
+        request_id,
+        "request is no longer queued on this resource",
+    )?;
+    order.remove(old_index);
+    let new_index = match placement {
+        QueuePlacement::Front => 0,
+        QueuePlacement::Back => order.len(),
+        QueuePlacement::Before {
+            request_id: anchor_id,
+        } => queue_position(
+            &order,
+            anchor_id,
+            "anchor request is no longer queued on this resource",
+        )?,
+        QueuePlacement::After {
+            request_id: anchor_id,
+        } => {
+            queue_position(
+                &order,
+                anchor_id,
+                "anchor request is no longer queued on this resource",
+            )? + 1
+        }
+    };
+    order.insert(new_index, request_id);
+    rewrite_queued_request_ranks(tx, resource_id, &order)?;
+    Ok(())
+}
+
+fn queue_position(
+    order: &[RequestId],
+    request_id: RequestId,
+    missing: &str,
+) -> Result<usize, ResourceControlError> {
+    order
+        .iter()
+        .position(|saved| *saved == request_id)
+        .ok_or_else(|| ResourceControlError::NotAllowed(missing.into()))
+}
+
 fn request_for_resource(
     conn: &Connection,
     resource_id: ResourceId,
-    request_id: crate::submission::RequestId,
+    request_id: RequestId,
 ) -> Result<ResourceRequest, ResourceControlError> {
     select_request_by_id(conn, request_id)?
         .filter(|request| request.resource_id == resource_id)

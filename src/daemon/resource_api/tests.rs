@@ -1225,6 +1225,63 @@ async fn queued_cancel_uses_the_origin_intent_and_retries_by_operation() {
 }
 
 #[tokio::test]
+async fn queued_move_action_route_reorders_and_replays_without_an_external_effect() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let (first_request, _) = fixture.submit_request().await;
+    let (second_request, _) = fixture.submit_request().await;
+    let detail = fixture.detail().await;
+    let revision = detail["resource"]["state_revision"].as_u64().unwrap();
+    let operation_id = Uuid::now_v7();
+    let move_action = json!({
+        "api_version": 1,
+        "expected_revision": revision,
+        "operation_id": operation_id,
+        "action": {
+            "type": "move_queued",
+            "request_id": second_request,
+            "placement": { "type": "front" },
+        },
+    });
+
+    let (status, response) = fixture.browser_action(move_action.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["requests"][0]["request_id"],
+        second_request.0.to_string()
+    );
+    assert_eq!(
+        response["requests"][1]["request_id"],
+        first_request.0.to_string()
+    );
+    assert_eq!(response["resource"]["state_revision"], revision + 1);
+
+    let (status, replayed) = fixture.browser_action(move_action).await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(
+        replayed["requests"][0]["request_id"],
+        second_request.0.to_string()
+    );
+    assert_eq!(replayed["resource"]["state_revision"], revision + 1);
+
+    let changed = json!({
+        "api_version": 1,
+        "expected_revision": revision,
+        "operation_id": operation_id,
+        "action": {
+            "type": "move_queued",
+            "request_id": second_request,
+            "placement": { "type": "back" },
+        },
+    });
+    let (status, response) = fixture.browser_action(changed).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(error_code(&response), "resource_operation_conflict");
+    assert_eq!(fixture.control_operation_count(), 1);
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn queued_cancel_race_reports_a_definite_activated_request_on_retry() {
     let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;

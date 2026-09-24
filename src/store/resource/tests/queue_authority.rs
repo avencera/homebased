@@ -50,7 +50,7 @@ fn queue_operations_require_the_registered_authority() {
     );
     assert!(
         store
-            .oldest_queued_resource_request(authority, resource.id)
+            .next_queued_resource_request(authority, resource.id)
             .unwrap()
             .is_none()
     );

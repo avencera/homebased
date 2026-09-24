@@ -9,7 +9,7 @@ use super::notice::{
     SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction,
     select_supervisor_notice_record_by_action,
 };
-use super::queue::oldest_queued_request_for_authority;
+use super::queue::next_queued_request_for_authority;
 use super::revision::swap_resource_revision;
 use super::rows::{check_authority, select_non_closed_loan, select_resource};
 use crate::domain::{ProcessGroupExitEvidence, ProcessStatus, TaskId};
@@ -195,7 +195,7 @@ pub(super) fn open_release_loan_in_transaction(
         });
     }
 
-    if oldest_queued_request_for_authority(&tx, authority_machine, resource_id)?.is_none() {
+    if next_queued_request_for_authority(&tx, authority_machine, resource_id)?.is_none() {
         return Err(OpenReleaseLoanError::NoQueuedRequest);
     }
 
@@ -285,7 +285,7 @@ pub(super) fn open_release_loan_in_transaction(
     Ok(OpenReleaseLoanResult::Opened { loan, notice })
 }
 
-/// Reconcile the oldest queued request using only authority-owned state
+/// Reconcile the next queued request using only authority-owned state
 pub(crate) fn reconcile_resource_queue_for_authority(
     conn: &mut Connection,
     authority_machine: MachineId,
@@ -308,7 +308,7 @@ pub(crate) fn reconcile_resource_queue_for_authority(
         None => resource,
     };
 
-    let Some(request) = oldest_queued_request_for_authority(&tx, authority_machine, resource_id)?
+    let Some(request) = next_queued_request_for_authority(&tx, authority_machine, resource_id)?
     else {
         tx.commit()?;
         return Ok(ResourceQueueReconcileOutcome::NoQueuedRequest);

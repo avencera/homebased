@@ -334,7 +334,7 @@ pub struct OperatorGpuFreeEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorGpuFreeOutcome {
-    /// The release action closed and the oldest queued request now serves
+    /// The release action closed and the next queued request now serves
     ReleaseResolvedServing {
         /// Loan moved from AwaitingRelease to Serving
         loan: Loan,
@@ -348,7 +348,7 @@ pub enum OperatorGpuFreeOutcome {
         /// Return notice saved in the same transaction
         notice: SupervisorNotice,
     },
-    /// The registration cleared and an idle loan serves the oldest queued request
+    /// The registration cleared and an idle loan serves the next queued request
     IdleServing {
         /// New Serving loan that names this attestation as its idle boundary
         loan: Loan,
@@ -359,7 +359,7 @@ pub enum OperatorGpuFreeOutcome {
     ///
     /// A later queue reconciliation or first background launch reads it
     IdleBoundary,
-    /// The Restoring loan closed and an idle loan serves the oldest queued request
+    /// The Restoring loan closed and an idle loan serves the next queued request
     RestoreClosedServing {
         /// Restoring loan closed with the operator-attested end
         closed: Box<Loan>,

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -19,11 +19,12 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::api::{
     BrowserResourceAction, InitialIdleBody, InitialIdleResponse, OperatorReleaseBody,
-    OperatorReleaseResponse, PendingActionList, PendingActionPhase, RESOURCE_PENDING_PATH,
-    RESOURCE_REGISTER_PATH, RequestCancelBody, ResourceActionBody, ResourceBackgroundSubmitOutcome,
-    ResourceBackgroundSubmitResponse, ResourceDetail, ResourceRegisterBody, ResourceRegistration,
-    ResourceRequestSubmitOutcome, ResourceRequestSubmitResponse, SupervisorReplacementBody,
-    TrainerAttemptBody, TrainerAttemptResponse, UnavailableAuthority,
+    OperatorReleaseResponse, PendingActionList, PendingActionPhase, QueuePlacement,
+    RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody, ResourceActionBody,
+    ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse, ResourceDetail,
+    ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
+    ResourceRequestSubmitResponse, SupervisorReplacementBody, TrainerAttemptBody,
+    TrainerAttemptResponse, UnavailableAuthority,
 };
 use crate::resource::bound_action::{
     LocalReturnAcceptance, RESOURCE_ACTION_SUBMIT_PATH, ResourceActionChoice, ResourceActionKind,
@@ -99,7 +100,7 @@ pub enum ResourceCommand {
         #[command(subcommand)]
         command: RequestCommand,
     },
-    /// List resource requests in acceptance order
+    /// List resource requests in serving order
     Requests {
         /// Full resource UUID
         #[arg(value_name = "RESOURCE_ID")]
@@ -267,6 +268,66 @@ pub enum RequestCommand {
         #[arg(long, required = true)]
         operation_id: Uuid,
     },
+    /// Move one queued request to a new place in the serving order
+    Move {
+        /// Full resource UUID
+        #[arg(value_name = "RESOURCE_ID")]
+        resource_id: Uuid,
+        /// Full request UUID, not a task UUID
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: Uuid,
+        /// Compare-and-set revision from `resource show`
+        #[arg(long, required = true)]
+        expected_revision: u64,
+        /// Stable operation UUID. Reuse it after an unknown response
+        #[arg(long, required = true)]
+        operation_id: Uuid,
+        /// New place in the queue
+        #[command(flatten)]
+        placement: PlacementArgs,
+    },
+}
+
+/// Exactly one queue placement flag of `resource request move`
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct PlacementArgs {
+    /// Move the request to the front of the queue
+    #[arg(long)]
+    front: bool,
+    /// Move the request to the back of the queue
+    #[arg(long)]
+    back: bool,
+    /// Move the request directly before this queued request
+    #[arg(long, value_name = "REQUEST_ID")]
+    before: Option<Uuid>,
+    /// Move the request directly after this queued request
+    #[arg(long, value_name = "REQUEST_ID")]
+    after: Option<Uuid>,
+}
+
+impl PlacementArgs {
+    /// Convert the one flag that clap accepted into a queue placement
+    fn placement(&self) -> Result<QueuePlacement, AppError> {
+        if let Some(anchor) = self.before {
+            validate_uuid("--before", anchor)?;
+            return Ok(QueuePlacement::Before {
+                request_id: RequestId(anchor),
+            });
+        }
+        if let Some(anchor) = self.after {
+            validate_uuid("--after", anchor)?;
+            return Ok(QueuePlacement::After {
+                request_id: RequestId(anchor),
+            });
+        }
+        // the required single-choice group leaves only front or back here
+        Ok(if self.front {
+            QueuePlacement::Front
+        } else {
+            QueuePlacement::Back
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1081,23 +1142,30 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
             };
             let client = Client::new(ctx.home.sock_path());
             let path = format!("/v1/resources/{resource_id}/requests/{request_id}/cancel");
-            let value = post_mutation(
-                &client,
-                &path,
-                &body,
-                id,
-                Some(operation_id),
-                &format!("operation id {operation_id}"),
-            )
-            .await?;
-            check_mutation_resource(
-                &value,
-                id,
-                Some(operation_id),
-                &format!("operation id {operation_id}"),
-            )?;
-            emit(ctx, value, Some(&operation_id.to_string()), None)?;
-            Ok(ExitCode::SUCCESS)
+            post_operation(ctx, &client, id, operation_id, &path, &body).await
+        }
+        RequestCommand::Move {
+            resource_id,
+            request_id,
+            expected_revision,
+            operation_id,
+            placement,
+        } => {
+            let id = resource_id_arg(resource_id)?;
+            validate_uuid("REQUEST_ID", request_id)?;
+            validate_uuid("--operation-id", operation_id)?;
+            let body = ResourceActionBody {
+                api_version: API_VERSION,
+                expected_revision: ResourceRevision::new(expected_revision),
+                operation_id,
+                action: BrowserResourceAction::MoveQueued {
+                    request_id: RequestId(request_id),
+                    placement: placement.placement()?,
+                },
+            };
+            let client = Client::new(ctx.home.sock_path());
+            let path = format!("/v1/resources/{resource_id}/actions");
+            post_operation(ctx, &client, id, operation_id, &path, &body).await
         }
     }
 }
@@ -1517,23 +1585,15 @@ async fn renotify(
         },
     };
     let path = format!("/v1/resources/{}/actions", context.resource_id.as_uuid());
-    let value = post_mutation(
+    post_operation(
+        ctx,
         &client,
+        context.resource_id,
+        operation_id,
         &path,
         &body,
-        context.resource_id,
-        Some(operation_id),
-        &format!("operation id {operation_id}"),
     )
-    .await?;
-    check_mutation_resource(
-        &value,
-        context.resource_id,
-        Some(operation_id),
-        &format!("operation id {operation_id}"),
-    )?;
-    emit(ctx, value, Some(&operation_id.to_string()), None)?;
-    Ok(ExitCode::SUCCESS)
+    .await
 }
 
 async fn action_context_for_current_supervisor<F>(
@@ -1822,6 +1882,30 @@ fn action_rejection(
             }
         }
     }
+}
+
+/// Post one resource control keyed by its operation id and print the confirmed detail
+async fn post_operation<T: Serialize>(
+    ctx: &Ctx,
+    client: &Client,
+    resource: ResourceId,
+    operation_id: Uuid,
+    path: &str,
+    body: &T,
+) -> Result<ExitCode, AppError> {
+    let retry_identity = format!("operation id {operation_id}");
+    let value = post_mutation(
+        client,
+        path,
+        body,
+        resource,
+        Some(operation_id),
+        &retry_identity,
+    )
+    .await?;
+    check_mutation_resource(&value, resource, Some(operation_id), &retry_identity)?;
+    emit(ctx, value, Some(&operation_id.to_string()), None)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn post_mutation<T: Serialize>(
@@ -2166,9 +2250,10 @@ mod tests {
     use crate::error::AppError;
     use crate::machine::MachineId;
     use crate::resource::api::{
-        BrowserResourceAction, OperatorReleaseResponse, RequestCancelBody, ResourceActionBody,
-        ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse, ResourceRegisterBody,
-        ResourceRegistration, SupervisorReplacementBody, TrainerAttemptResponse,
+        BrowserResourceAction, OperatorReleaseResponse, QueuePlacement, RequestCancelBody,
+        ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
+        ResourceRegisterBody, ResourceRegistration, SupervisorReplacementBody,
+        TrainerAttemptResponse,
     };
     use crate::resource::bound_action::{
         LocalReturnAcceptance, ResourceActionChoice, ResourceActionKind,
@@ -2428,6 +2513,71 @@ mod tests {
         assert_eq!(parsed_resource, resource_id);
         assert_eq!(parsed_request, request_id);
         assert_eq!(parsed_operation, operation_id);
+    }
+
+    #[test]
+    fn resource_request_move_requires_one_placement() {
+        let resource_id = "019b4f42-0000-7000-8000-000000000011";
+        let request_id = "019b4f42-0000-7000-8000-000000000012";
+        let anchor_id = "019b4f42-0000-7000-8000-000000000013";
+        let operation_id = "019b4f42-0000-7000-8000-000000000014";
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "homebased",
+                    "resource",
+                    "request",
+                    "move",
+                    resource_id,
+                    request_id,
+                    "--operation-id",
+                    operation_id,
+                ]
+                .into_iter()
+                .chain(args.iter().copied()),
+            )
+        };
+        let placement = |args: &[&str]| {
+            let Command::Resource {
+                command:
+                    ResourceCommand::Request {
+                        command: RequestCommand::Move { placement, .. },
+                    },
+            } = parse(args).unwrap().command
+            else {
+                panic!("resource request move must parse to its typed command");
+            };
+            placement.placement().unwrap()
+        };
+        assert_eq!(
+            placement(&["--expected-revision", "0", "--before", anchor_id]),
+            QueuePlacement::Before {
+                request_id: RequestId(uuid(anchor_id)),
+            }
+        );
+        assert_eq!(
+            placement(&["--expected-revision", "4", "--after", anchor_id]),
+            QueuePlacement::After {
+                request_id: RequestId(uuid(anchor_id)),
+            }
+        );
+        assert_eq!(
+            placement(&["--expected-revision", "4", "--front"]),
+            QueuePlacement::Front
+        );
+        assert_eq!(
+            placement(&["--expected-revision", "4", "--back"]),
+            QueuePlacement::Back
+        );
+
+        assert!(
+            parse(&["--expected-revision", "4"]).is_err(),
+            "a placement is required"
+        );
+        assert!(
+            parse(&["--expected-revision", "4", "--front", "--back"]).is_err(),
+            "two placements must be refused"
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
-//! Task-layer acceptance of the assigned FIFO request
+//! Task-layer acceptance of the assigned resource request
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
-use super::codec::sqlite_integer;
 use super::error::{ConflictReason, ResourceStoreError};
 use super::provenance::serving_release_provenance_matches;
 use super::queue::{
-    RequestIdentity, prevention_exists, request_matches_identity, select_executor_identity,
+    RequestIdentity, earlier_active_request_exists, prevention_exists, request_matches_identity,
+    select_executor_identity,
 };
 use super::rows::{
     check_resource_authority, select_non_closed_loan, select_request_by_id, select_resource,
@@ -30,7 +30,7 @@ pub(crate) struct ResourceTaskAcceptanceInput {
     pub(crate) request_id: RequestId,
     /// Preallocated task identity saved with the request
     pub(crate) task_id: TaskId,
-    /// Authority FIFO position of the selected request
+    /// Immutable authority-assigned acceptance identity of the selected request
     pub(crate) acceptance_sequence: AcceptanceSequence,
     /// Serving loan that owns the selected request
     pub(crate) loan_id: LoanId,
@@ -68,7 +68,7 @@ pub(crate) struct AcceptedResourceTask {
     pub(crate) state: ProcessStatus,
 }
 
-/// Validate the exact FIFO assignment that is eligible for task-layer acceptance
+/// Validate the exact assigned request that is eligible for task-layer acceptance
 pub(crate) fn assigned_resource_request_for_acceptance(
     conn: &Connection,
     input: &ResourceTaskAcceptanceInput,
@@ -175,19 +175,7 @@ pub(crate) fn assigned_resource_request_for_acceptance(
         ));
     }
 
-    let earlier_active: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM resource_requests
-            WHERE resource_id = ?1 AND acceptance_sequence < ?2
-              AND json_extract(state_json, '$.type') IN ('queued', 'assigned')
-        )",
-        params![
-            input.resource_id.as_uuid().to_string(),
-            sqlite_integer(input.acceptance_sequence.get())?,
-        ],
-        |row| row.get(0),
-    )?;
-    if earlier_active {
+    if earlier_active_request_exists(conn, input.resource_id, input.request_id)? {
         return Err(ResourceStoreError::Conflict(
             ConflictReason::EarlierRequestActive,
         ));

@@ -125,7 +125,7 @@ fn a_new_resource_serves_its_first_request_only_after_an_initial_idle_attestatio
         ..
     } = reconcile(&mut fixture)
     else {
-        panic!("the attested idle boundary must serve the oldest request");
+        panic!("the attested idle boundary must serve the next request in serving order");
     };
     assert_eq!(served.request_id, request.request_id);
     assert_eq!(

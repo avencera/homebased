@@ -515,7 +515,7 @@ async fn uncertain_background_state_stays_queued_and_is_inspectable() {
     assert!(
         Store::open(&home.db_path())
             .unwrap()
-            .oldest_queued_resource_request(authority, resource.id)
+            .next_queued_resource_request(authority, resource.id)
             .unwrap()
             .is_some()
     );

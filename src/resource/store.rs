@@ -46,7 +46,8 @@ pub(crate) use notice::{
 };
 pub(crate) use queue::{
     accept_request_for_authority, assigned_resource_requests_for_authority,
-    oldest_queued_request_for_authority, requests_for_resource_for_authority,
+    next_queued_request_for_authority, requests_for_resource_for_authority,
+    rewrite_queued_request_ranks,
 };
 pub(crate) use release_completion::{
     CompleteReleaseError, ReleaseCompletionResult, complete_release_for_authority,
@@ -66,5 +67,6 @@ pub(crate) use release_watcher::{
 pub(crate) use resources::{
     ResourceSnapshot, register_resource_for_authority, resources_for_authority,
 };
+pub(crate) use revision::swap_resource_revision;
 pub(crate) use rows::{select_non_closed_loan, select_request_by_id, select_resource};
 pub(crate) use schema::RESOURCE_SCHEMA;

@@ -290,7 +290,7 @@ fn remote_supervisor_launch_is_unsupported_and_writes_nothing() {
 }
 
 #[test]
-fn launch_after_queued_work_keeps_the_fifo_boundary() {
+fn launch_is_refused_while_queued_work_exists() {
     let mut fixture = LaunchFixture::new();
     let request = fixture.queue_request();
     let input = fixture.input(RequestId::new(), fixture.trainer_spec());
@@ -1006,7 +1006,7 @@ fn remote_launch_refuses_a_stale_assignment_revision_or_queue_before_writing() {
         Err(BackgroundLaunchError::StaleRevision { .. })
     ));
 
-    // queued optimization work keeps its FIFO position ahead of a first launch
+    // queued work blocks a first launch
     let request = fixture.queue_request();
     let launch = fixture.remote_launch("trainer");
     assert!(matches!(

@@ -15,8 +15,7 @@ use crate::resource::operator_release::{OperatorAttestationId, OperatorGpuFreeRe
 use crate::resource::store::{
     CompleteReleaseError, ConflictReason, OpenReleaseLoanError, OpenReleaseLoanResult,
     QueueCancellationResult, ResourceStoreError, SupervisorNoticeStoreError,
-    cancel_request_before_activation_on, oldest_queued_request_for_authority,
-    select_non_closed_loan,
+    cancel_request_before_activation_on, next_queued_request_for_authority, select_non_closed_loan,
 };
 use crate::resource::{
     ActionId, AssignmentRevision, Loan, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
@@ -217,13 +216,13 @@ impl Store {
             .map(|row| row.process_group_exit_evidence()))
     }
 
-    /// Read the oldest queued request for one resource
-    pub(crate) fn oldest_queued_resource_request(
+    /// Read the next queued request for one resource
+    pub(crate) fn next_queued_resource_request(
         &self,
         authority_machine: MachineId,
         resource_id: ResourceId,
     ) -> Result<Option<ResourceRequest>, ResourceStoreError> {
-        oldest_queued_request_for_authority(&self.conn, authority_machine, resource_id)
+        next_queued_request_for_authority(&self.conn, authority_machine, resource_id)
     }
 
     /// Cancel a queued request or atomically retain prevention before acceptance

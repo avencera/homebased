@@ -11,7 +11,7 @@ use crate::resource::{ResourceId, ResourceRevision};
 ///
 /// Returns `false` when the resource, its authority, or its revision no longer
 /// match, so each caller can report the stale state in its own error type
-pub(super) fn swap_resource_revision<E>(
+pub(crate) fn swap_resource_revision<E>(
     conn: &Connection,
     authority_machine: MachineId,
     resource_id: ResourceId,

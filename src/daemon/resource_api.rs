@@ -1181,6 +1181,7 @@ async fn authority_action(
                 }
             }
         }
+        ResourceControlEffect::Reordered => {}
         ResourceControlEffect::StopActive { request } => {
             request_origin_cancellation(state, &request, ResourceRoutePhase::Activated)
                 .await

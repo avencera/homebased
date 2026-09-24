@@ -1414,7 +1414,7 @@ async fn native_return_keeps_its_loan_while_running_and_its_end_serves_the_next_
     assert_eq!(ended.status(), ProcessStatus::Succeeded);
     assert_eq!(std::fs::read(&marker).unwrap(), b"x");
 
-    // the confirmed end closes the loan and FIFO reconciliation serves the request
+    // the confirmed end closes the loan and queue reconciliation serves the request
     let inspection = wait_for_inspection(&supervisor, resource.id, |inspection| {
         idle_serving(inspection).is_some()
     })

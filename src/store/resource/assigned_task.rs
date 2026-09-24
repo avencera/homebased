@@ -76,7 +76,7 @@ impl Store {
         Ok(accepted)
     }
 
-    /// Accept a resource request and assign its authority-local FIFO sequence
+    /// Accept a resource request and assign its acceptance identity and serving rank
     ///
     /// The origin route must be persisted by the caller before it sends this request
     pub(crate) fn accept_resource_request(

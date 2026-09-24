@@ -103,7 +103,7 @@ fn saved_request_digest(fixture: &TrainerAssociationFixture) -> TrainerRequestDi
 }
 
 #[test]
-fn failed_trainer_with_its_released_lock_serves_the_oldest_request() {
+fn failed_trainer_with_its_released_lock_serves_the_next_request() {
     let (mut fixture, binding, first_request, action_id, revision, loan_id) =
         release_completion_fixture();
     let second = queue(&mut fixture);
@@ -404,7 +404,7 @@ fn exact_ended_release_retry_survives_restart_and_stale_input_conflicts() {
 }
 
 #[test]
-fn trainer_that_failed_before_a_loan_opens_a_release_action_and_serves_fifo() {
+fn trainer_that_failed_before_a_loan_opens_a_release_action_and_serves_queued_work() {
     let mut fixture = TrainerAssociationFixture::new();
     fixture.insert_accepted_running_task();
     fixture.register_release_attempt();
@@ -433,7 +433,7 @@ fn trainer_that_failed_before_a_loan_opens_a_release_action_and_serves_fifo() {
 
     let result = complete(&mut fixture, notice.action_id, notice.state_revision).unwrap();
     let ReleaseCompletionResult::Assigned { request, .. } = &result else {
-        panic!("the proved release must assign the oldest request");
+        panic!("the proved release must assign the next request in serving order");
     };
     assert_eq!(request.request_id, first.request_id);
     assert_eq!(

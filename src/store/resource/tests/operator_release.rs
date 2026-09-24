@@ -220,7 +220,7 @@ fn unbound_failed_trainer_stays_reserved_until_the_attestation_serves_the_queue(
         }
     );
 
-    // the registration clears and the oldest request serves in the same transaction
+    // the registration clears and the next request in serving order serves in the same transaction
     let OperatorGpuFreeOutcome::IdleServing {
         loan,
         request: selected,
@@ -517,7 +517,7 @@ fn lost_trainer_release_keeps_the_return_obligation_for_the_supervisor() {
 }
 
 #[test]
-fn failed_trainer_release_serves_fifo_and_replays_after_restart() {
+fn failed_trainer_release_serves_requests_in_order_and_replays_after_restart() {
     let mut fixture = LaunchFixture::new();
     let task = registered_launch(&mut fixture, RequestId::new());
     let first = fixture.queue_request();
@@ -550,7 +550,7 @@ fn failed_trainer_release_serves_fifo_and_replays_after_restart() {
         request: selected,
     } = &receipt.outcome
     else {
-        panic!("the oldest queued request must serve after the attestation");
+        panic!("the next queued request must serve after the attestation");
     };
     assert_eq!(selected.request_id, first.request_id);
     // an ended run without a result is never a completed or resumable context
@@ -1055,7 +1055,7 @@ fn queued_running_or_never_spawned_first_launch_cannot_be_attested() {
 }
 
 #[test]
-fn lost_first_launch_attestation_serves_the_queue_in_fifo_order() {
+fn lost_first_launch_attestation_serves_the_queue_in_order() {
     let mut fixture = LaunchFixture::new();
     let launch_request = RequestId::new();
     let task = fixture.launch(launch_request);
@@ -1087,7 +1087,7 @@ fn lost_first_launch_attestation_serves_the_queue_in_fifo_order() {
     .receipt;
     assert_eq!(receipt.evidence.trainer_end, AttestedTrainerEnd::Lost);
     let OperatorGpuFreeOutcome::IdleServing { loan, request } = &receipt.outcome else {
-        panic!("the oldest request must serve with the attestation");
+        panic!("the next request in serving order must serve with the attestation");
     };
     assert_eq!(request.request_id, first.request_id);
     assert!(matches!(
@@ -1296,7 +1296,7 @@ fn restoring_return_that_ended_before_its_start_closes_through_its_exact_attesta
         request,
     } = &receipt.outcome
     else {
-        panic!("the closure must serve the oldest queued request");
+        panic!("the closure must serve the next queued request");
     };
     assert_eq!(closed.id, loan.id);
     assert!(matches!(
@@ -1614,7 +1614,7 @@ fn foreground_return_attestation_refuses_live_tasks_and_every_mismatch() {
 }
 
 #[test]
-fn lost_foreground_return_closes_through_its_exact_attestation_and_serves_fifo() {
+fn lost_foreground_return_closes_through_its_exact_attestation_and_serves_queued_work() {
     let (mut fixture, loan, action_id, task_id) = queued_foreground_return();
     start_task(&fixture.store, task_id);
     fixture
@@ -1674,7 +1674,7 @@ fn lost_foreground_return_closes_through_its_exact_attestation_and_serves_fifo()
         request,
     } = &receipt.outcome
     else {
-        panic!("the closure must serve the oldest queued request");
+        panic!("the closure must serve the next queued request");
     };
     assert!(matches!(
         &closed.state,

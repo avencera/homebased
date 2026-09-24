@@ -19,7 +19,7 @@ use super::notice::{
     select_supervisor_notice_record_by_action, settle_supervisor_notice_attempt, supervisor_notice,
 };
 use super::queue::{
-    accept_request_for_authority, executor_identity_exists, oldest_queued_request_for_authority,
+    accept_request_for_authority, executor_identity_exists, next_queued_request_for_authority,
     requests_for_resource_for_authority,
 };
 use super::release_loan::{
@@ -28,7 +28,7 @@ use super::release_loan::{
 use super::resources::{register_resource_for_authority, resources_for_authority};
 use super::rows::{select_non_closed_loan, select_request_by_id, select_resource};
 use super::test_support::{
-    accept_request, cancel_request_before_activation, install_schema, oldest_queued_request,
+    accept_request, cancel_request_before_activation, install_schema, next_queued_request,
     register_resource, requests_for_resource,
 };
 use super::test_support::{
@@ -365,7 +365,7 @@ fn insert_notice_fixture(conn: &mut Connection) -> SupervisorNotice {
 }
 
 #[test]
-fn acceptance_fifo_uses_authority_sequence_not_request_uuid_time() {
+fn acceptance_sequence_is_not_request_uuid_time() {
     let mut conn = connection();
     let resource = resource();
     register_resource(&mut conn, &resource).unwrap();
@@ -394,11 +394,11 @@ fn acceptance_fifo_uses_authority_sequence_not_request_uuid_time() {
 
     assert!(earlier_uuid.0 < later_uuid.0);
     assert!(accepted_later_uuid.acceptance_sequence < accepted_earlier_uuid.acceptance_sequence);
-    let fifo = requests_for_resource(&conn, resource.id).unwrap();
-    assert_eq!(fifo[0].request_id, later_uuid);
-    assert_eq!(fifo[1].request_id, earlier_uuid);
+    let serving_order = requests_for_resource(&conn, resource.id).unwrap();
+    assert_eq!(serving_order[0].request_id, later_uuid);
+    assert_eq!(serving_order[1].request_id, earlier_uuid);
     assert_eq!(
-        oldest_queued_request(&conn, resource.id)
+        next_queued_request(&conn, resource.id)
             .unwrap()
             .unwrap()
             .request_id,
@@ -519,7 +519,7 @@ fn cancellation_after_acceptance_retains_one_cancelled_row_and_its_sequence() {
         ResourceRequestState::CancelledBeforeLaunch
     ));
     assert_eq!(requests_for_resource(&conn, resource.id).unwrap().len(), 1);
-    assert!(oldest_queued_request(&conn, resource.id).unwrap().is_none());
+    assert!(next_queued_request(&conn, resource.id).unwrap().is_none());
 
     let prevention_count: i64 = conn
         .query_row(
@@ -674,7 +674,7 @@ fn queue_selection_skips_a_cancelled_request() {
     )
     .unwrap();
 
-    let selected = oldest_queued_request(&conn, resource.id).unwrap().unwrap();
+    let selected = next_queued_request(&conn, resource.id).unwrap().unwrap();
     assert_eq!(selected.request_id, ready.request_id);
     assert_eq!(selected.acceptance_sequence, ready.acceptance_sequence);
     let saved = requests_for_resource(&conn, resource.id).unwrap();
@@ -819,7 +819,7 @@ fn cancellation_preserves_assigned_state_when_executor_won_and_terminal_states()
 }
 
 #[test]
-fn assigned_cancellation_assigns_oldest_queued_request_to_the_same_loan() {
+fn assigned_cancellation_assigns_next_queued_request_to_the_same_loan() {
     let mut conn = connection();
     let resource = resource();
     register_resource(&mut conn, &resource).unwrap();
@@ -1142,7 +1142,7 @@ fn identical_retry_returns_saved_request_after_its_state_changes() {
     assert_eq!(retry.acceptance_sequence, first.acceptance_sequence);
     assert_eq!(retry.state, changed_state);
     assert_eq!(requests_for_resource(&conn, resource.id).unwrap().len(), 1);
-    assert!(oldest_queued_request(&conn, resource.id).unwrap().is_none());
+    assert!(next_queued_request(&conn, resource.id).unwrap().is_none());
 }
 
 #[test]
@@ -1460,7 +1460,7 @@ fn release_loan_requires_a_queued_request() {
 }
 
 #[test]
-fn queue_reconciliation_opens_one_release_action_and_keeps_fifo_requests_queued() {
+fn queue_reconciliation_opens_one_release_action_and_keeps_requests_queued_in_order() {
     let mut conn = connection();
     let authority = MachineId::new();
     let background_task = TaskId::new();
@@ -1538,7 +1538,7 @@ fn queue_reconciliation_opens_one_release_action_and_keeps_fifo_requests_queued(
 }
 
 #[test]
-fn queue_reconciliation_reports_fifo_and_does_not_infer_idle_from_missing_background() {
+fn queue_reconciliation_reports_queued_work_and_does_not_infer_idle_from_missing_background() {
     let mut conn = connection();
     let authority = MachineId::new();
     let resource = resource_for_authority(authority);
@@ -1661,7 +1661,7 @@ fn queue_reconciliation_requires_attention_for_missing_or_uncertain_background_s
                 .is_none()
         );
         assert!(matches!(
-            oldest_queued_request_for_authority(&conn, authority, resource.id)
+            next_queued_request_for_authority(&conn, authority, resource.id)
                 .unwrap()
                 .unwrap()
                 .state,
@@ -1846,7 +1846,7 @@ fn release_loan_opens_with_one_matching_pending_notice_and_revision() {
     let saved_loan = select_non_closed_loan(&conn, resource.id).unwrap().unwrap();
     assert_eq!(saved_loan, loan);
     assert_eq!(
-        oldest_queued_request(&conn, resource.id)
+        next_queued_request(&conn, resource.id)
             .unwrap()
             .map(|queued| queued.request_id),
         Some(request.request_id)
@@ -1916,7 +1916,7 @@ fn release_loan_retry_returns_the_saved_action_after_queue_cancellation() {
             notice: first_notice,
         }
     );
-    assert!(oldest_queued_request(&conn, resource.id).unwrap().is_none());
+    assert!(next_queued_request(&conn, resource.id).unwrap().is_none());
     let loan_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM loans", [], |row| row.get(0))
         .unwrap();
@@ -2021,7 +2021,7 @@ fn release_loan_notice_failure_rolls_back_loan_and_resource_revision() {
             .is_none()
     );
     assert_eq!(
-        oldest_queued_request(&conn, resource.id)
+        next_queued_request(&conn, resource.id)
             .unwrap()
             .map(|queued| queued.request_id),
         Some(request.request_id)

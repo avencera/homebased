@@ -311,9 +311,9 @@ pub enum ResourceBackgroundRejection {
         /// Non-closed loan
         loan_id: LoanId,
     },
-    /// Ready optimization work was accepted first and keeps its FIFO position
+    /// Queued resource work blocks a new background launch
     QueuedWorkAhead {
-        /// Oldest queued request
+        /// Queued request that blocks the launch
         request_id: RequestId,
     },
     /// The registered background task has not ended

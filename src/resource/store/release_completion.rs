@@ -11,7 +11,7 @@ use super::notice::{
     SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction,
     select_supervisor_notice_record_by_action,
 };
-use super::queue::oldest_queued_request_for_authority;
+use super::queue::next_queued_request_for_authority;
 use super::revision::swap_resource_revision;
 use super::rows::{check_authority, decode_loan, select_resource};
 use crate::domain::{ProcessGroupExitEvidence, TaskId, TaskState};
@@ -32,7 +32,7 @@ use crate::submission::RequestId;
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ReleaseCompletionResult {
-    /// The oldest queued request now owns the resource through this loan
+    /// The next queued request now owns the resource through this loan
     Assigned {
         /// Loan updated from AwaitingRelease to Serving
         loan: Loan,
@@ -235,7 +235,7 @@ pub(crate) enum CompleteReleaseError {
     /// A concurrent or inconsistent queue change prevented assignment
     #[error("queued request {request_id:?} changed during release completion")]
     RequestChanged {
-        /// Request selected at the head of the authority FIFO
+        /// Request selected at the head of the serving order
         request_id: RequestId,
     },
     /// A concurrent or inconsistent loan change prevented completion
@@ -392,7 +392,7 @@ pub(crate) fn complete_release_for_authority(
             })?;
 
     let result = if let Some(mut request) =
-        oldest_queued_request_for_authority(&tx, authority_machine, resource_id)?
+        next_queued_request_for_authority(&tx, authority_machine, resource_id)?
     {
         request.state = ResourceRequestState::Assigned { loan_id: loan.id };
         let request_state_json = encode_completion_json(&request.state)?;

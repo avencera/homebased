@@ -1,4 +1,4 @@
-//! Authority FIFO acceptance and reads of resource requests
+//! Authority queue acceptance, serving order, and reads of resource requests
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
@@ -87,8 +87,8 @@ pub(crate) fn accept_request_for_authority(
 
     tx.execute(
         "INSERT INTO resource_requests (
-            request_id, task_id, resource_id, origin_machine, spec_json, state_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            request_id, task_id, resource_id, origin_machine, spec_json, state_json, queue_rank
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             request_id.0.to_string(),
             task_id.to_string(),
@@ -96,6 +96,7 @@ pub(crate) fn accept_request_for_authority(
             origin_machine.as_uuid().to_string(),
             spec_json,
             state_json,
+            next_queue_rank(&tx, resource_id)?,
         ],
     )?;
     let raw_sequence = tx.last_insert_rowid();
@@ -158,7 +159,7 @@ fn check_queued_command_ownership(spec: &NormalizedSpec) -> Result<(), ResourceS
         .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })
 }
 
-/// Read all requests for one resource in authority acceptance order
+/// Read all requests for one resource in serving order
 pub(crate) fn requests_for_resource_for_authority(
     conn: &Connection,
     authority_machine: MachineId,
@@ -167,7 +168,7 @@ pub(crate) fn requests_for_resource_for_authority(
     check_resource_authority(conn, resource_id, authority_machine)?;
     let sql = format!(
         "SELECT {REQUEST_COLUMNS} FROM resource_requests \
-         WHERE resource_id = ?1 ORDER BY acceptance_sequence"
+         WHERE resource_id = ?1 ORDER BY queue_rank, acceptance_sequence"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([resource_id.as_uuid().to_string()], |row| {
@@ -188,7 +189,7 @@ pub(crate) fn assigned_resource_requests_for_authority(
          JOIN resources AS r ON r.id = rr.resource_id
          WHERE r.authority_machine = ?1
            AND json_extract(rr.state_json, '$.type') = 'assigned'
-         ORDER BY rr.acceptance_sequence",
+         ORDER BY rr.resource_id, rr.queue_rank, rr.acceptance_sequence",
     )?;
     let rows = statement.query_map([authority_machine.to_string()], |row| {
         Ok(decode_request(row))
@@ -196,8 +197,8 @@ pub(crate) fn assigned_resource_requests_for_authority(
     collect_decoded(rows)
 }
 
-/// Read the oldest still-queued request for one resource
-pub(crate) fn oldest_queued_request_for_authority(
+/// Read the next queued request for one resource in serving order
+pub(crate) fn next_queued_request_for_authority(
     conn: &Connection,
     authority_machine: MachineId,
     resource_id: ResourceId,
@@ -206,13 +207,109 @@ pub(crate) fn oldest_queued_request_for_authority(
     let sql = format!(
         "SELECT {REQUEST_COLUMNS} FROM resource_requests \
          WHERE resource_id = ?1 AND json_extract(state_json, '$.type') = 'queued' \
-         ORDER BY acceptance_sequence LIMIT 1"
+         ORDER BY queue_rank, acceptance_sequence LIMIT 1"
     );
     conn.query_row(&sql, [resource_id.as_uuid().to_string()], |row| {
         Ok(decode_request(row))
     })
     .optional()?
     .transpose()
+}
+
+/// Whether a queued or assigned request sits before `request_id` in serving order
+pub(super) fn earlier_active_request_exists(
+    conn: &Connection,
+    resource_id: ResourceId,
+    request_id: RequestId,
+) -> Result<bool, ResourceStoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM resource_requests AS earlier
+            JOIN resource_requests AS selected
+              ON selected.request_id = ?2
+             AND selected.resource_id = earlier.resource_id
+            WHERE earlier.resource_id = ?1
+              AND (earlier.queue_rank, earlier.acceptance_sequence)
+                  < (selected.queue_rank, selected.acceptance_sequence)
+              AND json_extract(earlier.state_json, '$.type') IN ('queued', 'assigned')
+        )",
+        params![resource_id.as_uuid().to_string(), request_id.0.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Rewrite queued ranks as a permutation of their current values
+///
+/// The caller supplies a validated serving order from the same write transaction
+pub(crate) fn rewrite_queued_request_ranks(
+    conn: &Connection,
+    resource_id: ResourceId,
+    request_order: &[RequestId],
+) -> Result<(), ResourceStoreError> {
+    let mut statement = conn.prepare(
+        "SELECT request_id, queue_rank FROM resource_requests
+         WHERE resource_id = ?1 AND json_extract(state_json, '$.type') = 'queued'
+         ORDER BY queue_rank, acceptance_sequence",
+    )?;
+    let rows = statement.query_map([resource_id.as_uuid().to_string()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let current = rows.collect::<Result<Vec<_>, _>>()?;
+    // rusqlite forbids another statement while this query statement is live
+    drop(statement);
+
+    let mut current_ids = current
+        .iter()
+        .map(|(request_id, _)| request_id.clone())
+        .collect::<Vec<_>>();
+    let mut requested_ids = request_order
+        .iter()
+        .map(|request_id| request_id.0.to_string())
+        .collect::<Vec<_>>();
+    current_ids.sort_unstable();
+    requested_ids.sort_unstable();
+    if current_ids != requested_ids {
+        return Err(ResourceStoreError::Conflict(
+            ConflictReason::RequestStateChanged,
+        ));
+    }
+
+    let mut ranks = current
+        .into_iter()
+        .map(|(_, queue_rank)| queue_rank)
+        .collect::<Vec<_>>();
+    ranks.sort_unstable();
+    for (request_id, queue_rank) in request_order.iter().zip(ranks) {
+        let changed = conn.execute(
+            "UPDATE resource_requests SET queue_rank = ?1
+             WHERE request_id = ?2 AND resource_id = ?3
+               AND json_extract(state_json, '$.type') = 'queued'",
+            params![
+                queue_rank,
+                request_id.0.to_string(),
+                resource_id.as_uuid().to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ResourceStoreError::Conflict(
+                ConflictReason::RequestStateChanged,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn next_queue_rank(conn: &Connection, resource_id: ResourceId) -> Result<i64, ResourceStoreError> {
+    let maximum: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(queue_rank), 0) FROM resource_requests WHERE resource_id = ?1",
+        [resource_id.as_uuid().to_string()],
+        |row| row.get(0),
+    )?;
+    maximum.checked_add(1).ok_or(ResourceStoreError::Conflict(
+        ConflictReason::QueueRankExhausted,
+    ))
 }
 
 pub(super) fn prevention_exists(

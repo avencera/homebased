@@ -296,7 +296,7 @@ pub(crate) enum StoreMsg {
         authority_machine: MachineId,
         reply: RpcReplyPort<Result<Vec<AcceptedResourceTask>, AppError>>,
     },
-    /// Accept a command request and allocate its authority FIFO position
+    /// Accept a command request and allocate its immutable acceptance identity
     AcceptResourceRequest {
         authority_machine: MachineId,
         request_id: RequestId,
@@ -322,7 +322,7 @@ pub(crate) enum StoreMsg {
             Result<Result<AssignedResourceTaskReconcileOutcome, ResourceStoreError>, AppError>,
         >,
     },
-    /// Read all requests for one resource in authority acceptance order
+    /// Read all requests for one resource in serving order
     ResourceRequests {
         authority_machine: MachineId,
         resource_id: ResourceId,

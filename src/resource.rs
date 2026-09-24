@@ -35,7 +35,7 @@ pub(crate) use release_checkpoint::{
     ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome,
 };
 
-/// Authority-assigned FIFO position for a resource request
+/// Immutable authority-assigned acceptance identity for a resource request
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AcceptanceSequence(u64);
@@ -318,7 +318,7 @@ pub enum CommandSpecError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceRequestState {
-    /// Ready for FIFO selection by the authority
+    /// Ready for selection in the authority's serving order
     Queued,
     /// Reserved by one loan and awaiting task-layer execution
     Assigned {
@@ -349,7 +349,7 @@ pub struct ResourceRequest {
     pub task_id: TaskId,
     /// Resource authority that accepted the request
     pub resource_id: ResourceId,
-    /// Authority-assigned FIFO position
+    /// Immutable authority-assigned acceptance identity
     pub acceptance_sequence: AcceptanceSequence,
     /// Machine that owns the requesting thread and callback route
     pub origin_machine: MachineId,
@@ -403,7 +403,7 @@ pub struct ResourceQueueRequest {
     pub request_id: RequestId,
     /// Preallocated global task identity
     pub task_id: TaskId,
-    /// Resource whose FIFO queue will receive the command
+    /// Resource whose serving queue will receive the command
     pub resource_id: ResourceId,
     /// Command workload with no explicit execution machine
     pub spec: CommandSpec,
@@ -1362,7 +1362,7 @@ pub enum ResourceQueueReconcileOutcome {
         /// Existing loan that prevents a second loan from opening
         loan: Loan,
     },
-    /// Saved idle evidence opened a loan that serves the oldest request
+    /// Saved idle evidence opened a loan that serves the next request in serving order
     IdleServing {
         /// Serving loan with an idle return context
         loan: Loan,

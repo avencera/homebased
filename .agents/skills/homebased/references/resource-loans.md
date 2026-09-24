@@ -6,8 +6,11 @@ Use `homebased resource --help` for the installed commands and
 ## Required checks
 
 Use the resource CLI. Do not use ordinary `task submit` for GPU work that
-belongs to a registered resource. Do not bypass an active loan or FIFO request
-queue. Do not monitor a loan by polling with a model or in a command loop.
+belongs to a registered resource. Do not bypass an active loan or the resource
+request queue. Queued requests serve by queue rank, then acceptance identity;
+new requests join the back. Do not monitor a loan by polling with a model or in
+a command loop.
+
 Queued GPU commands must run native foreground executables. Scripts,
 interpreters, shell wrappers, container clients, and detach tools are refused.
 For work in a pinned Docker image, submit a `container` workload with `gpus`
@@ -27,7 +30,14 @@ If any authority is unavailable, the result is incomplete. Do not treat it as
 no pending action and do not start independent GPU work. If all authorities
 answered and `actions` is empty, there is no pending supervisor action for that
 exact address; still check `resource show` for an active loan and
-`resource requests` for FIFO work.
+`resource requests` for queued work in serving order.
+
+Cancel a still-queued request with `resource request cancel`. Reorder one with
+`resource request move` and exactly one of `--front`, `--back`,
+`--before <request-uuid>`, or `--after <request-uuid>`. Both need
+`--expected-revision` from `resource show` and a stable `--operation-id`. A
+successful move advances the resource revision even when the order does not
+change. Reuse the same operation UUID and input after an unknown result.
 
 A delivered notice does not complete an action. Read the action phase from a
 fresh authority-backed pending result. Keep the saved pending JSON unchanged for

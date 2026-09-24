@@ -4648,7 +4648,7 @@ async fn remote_background_launch_refuses_wrong_owners_revision_and_queued_work_
     let (_, body) = post_background(authority, &mismatched).await;
     assert_eq!(body["outcome"]["reason"]["type"], "route_evidence_mismatch");
 
-    // queued work keeps its FIFO position, and a fresh resource does not start it
+    // queued work keeps its serving place, and a fresh resource does not start it
     let queued = fixture.queue_request().await;
     let queued_task: TaskId = serde_json::from_value(queued["task_id"].clone()).unwrap();
     let request = RequestId::new();

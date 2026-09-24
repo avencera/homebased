@@ -624,6 +624,47 @@ pub(super) fn resource_origin_route(
     .unwrap()
 }
 
+pub(super) fn queue_waiting_request(
+    store: &mut Store,
+    authority: MachineId,
+    resource_id: ResourceId,
+    origin: MachineId,
+    spec: &NormalizedSpec,
+) -> ResourceRequest {
+    let request_id = RequestId::new();
+    let task_id = TaskId::new();
+    store
+        .insert_origin_route(&resource_origin_route(
+            request_id,
+            task_id,
+            resource_id,
+            origin,
+            authority,
+            spec,
+        ))
+        .unwrap();
+    let request = store
+        .accept_resource_request(
+            authority,
+            request_id,
+            task_id,
+            resource_id,
+            origin,
+            spec.clone(),
+        )
+        .unwrap();
+    store
+        .resolve_resource_route(&waiting_receipt(
+            request_id,
+            task_id,
+            resource_id,
+            origin,
+            authority,
+        ))
+        .unwrap();
+    request
+}
+
 pub(super) fn waiting_receipt(
     request: RequestId,
     task: TaskId,

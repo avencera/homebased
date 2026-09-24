@@ -36,6 +36,7 @@ CREATE INDEX IF NOT EXISTS trainer_attempt_associations_resource_task
 
 CREATE TABLE IF NOT EXISTS resource_requests (
     acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (acceptance_sequence > 0),
+    queue_rank INTEGER NOT NULL CHECK (queue_rank > 0),
     request_id TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL UNIQUE,
     resource_id TEXT NOT NULL REFERENCES resources(id),
@@ -71,10 +72,10 @@ CREATE TABLE IF NOT EXISTS resource_requests (
     )
 );
 
-CREATE INDEX IF NOT EXISTS resource_requests_fifo
-    ON resource_requests(resource_id, acceptance_sequence);
-CREATE INDEX IF NOT EXISTS resource_requests_queued_fifo
-    ON resource_requests(resource_id, acceptance_sequence)
+CREATE INDEX IF NOT EXISTS resource_requests_serving_order
+    ON resource_requests(resource_id, queue_rank, acceptance_sequence);
+CREATE INDEX IF NOT EXISTS resource_requests_queued_serving_order
+    ON resource_requests(resource_id, queue_rank, acceptance_sequence)
     WHERE json_extract(state_json, '$.type') = 'queued';
 
 CREATE TABLE IF NOT EXISTS resource_request_preventions (

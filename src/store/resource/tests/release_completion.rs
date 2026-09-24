@@ -795,7 +795,7 @@ fn stopped_release_requires_the_saved_lock_to_be_exact_and_exclusively_free() {
 }
 
 #[test]
-fn proven_stopped_release_accepts_the_next_fifo_request_after_prelaunch_cancel() {
+fn proven_stopped_release_accepts_the_next_request_after_prelaunch_cancel() {
     let fixture = TrainerAssociationFixture::new();
     let authority = fixture.authority;
     let marker = fixture.home.join("assigned-command-marker");

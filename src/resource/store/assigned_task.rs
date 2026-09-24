@@ -7,7 +7,7 @@ use super::codec::{encode_json, sqlite_integer, stored_json};
 use super::error::{ConflictReason, ResourceStoreError};
 use super::notice::{SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction};
 use super::provenance::serving_release_provenance_matches;
-use super::queue::oldest_queued_request_for_authority;
+use super::queue::{earlier_active_request_exists, next_queued_request_for_authority};
 use super::revision::swap_resource_revision;
 use super::rows::{check_authority, select_non_closed_loan, select_request_by_id, select_resource};
 use crate::domain::{ExitReason, TaskId, TaskState, WorkExitEvidence};
@@ -88,13 +88,13 @@ pub(crate) enum AssignedResourceTaskAttention {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ResourceTaskCompletionResult {
-    /// The oldest still-queued request now owns this loan
+    /// The next queued request now owns this loan
     Assigned {
         /// Request whose exact task result was recorded
         finished_request: ResourceRequest,
         /// Loan that remains reserved for the same return context
         loan: Loan,
-        /// Oldest queued request selected for the next serving turn
+        /// Next queued request selected for the next serving turn
         next_request: ResourceRequest,
         /// Resource revision committed with the assignment
         state_revision: ResourceRevision,
@@ -249,19 +249,7 @@ pub(crate) fn reconcile_assigned_resource_task_for_authority(
             }
         };
 
-    let prior_work_exists: bool = tx.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM resource_requests
-            WHERE resource_id = ?1 AND acceptance_sequence < ?2
-              AND json_extract(state_json, '$.type') IN ('queued', 'assigned')
-        )",
-        params![
-            input.resource_id.as_uuid().to_string(),
-            sqlite_integer(request.acceptance_sequence.get())?,
-        ],
-        |row| row.get(0),
-    )?;
-    if prior_work_exists {
+    if earlier_active_request_exists(&tx, input.resource_id, request.request_id)? {
         return Ok(AssignedResourceTaskReconcileOutcome::Attention(
             AssignedResourceTaskAttention::RequestChanged,
         ));
@@ -300,7 +288,7 @@ pub(crate) fn reconcile_assigned_resource_task_for_authority(
                 ConflictReason::RevisionExhausted,
             ))?;
     let result = if let Some(mut next_request) =
-        oldest_queued_request_for_authority(&tx, input.authority_machine, input.resource_id)?
+        next_queued_request_for_authority(&tx, input.authority_machine, input.resource_id)?
     {
         next_request.state = ResourceRequestState::Assigned {
             loan_id: input.loan_id,

@@ -417,7 +417,7 @@ fn cancellation_after_queue_acceptance_is_atomic_and_idempotent() {
     assert!(store.origin_route_by_task(task).unwrap().is_none());
     assert_eq!(
         store
-            .oldest_queued_resource_request(authority, resource.id)
+            .next_queued_resource_request(authority, resource.id)
             .unwrap()
             .unwrap()
             .request_id,
@@ -437,7 +437,7 @@ fn cancellation_after_queue_acceptance_is_atomic_and_idempotent() {
     ));
     assert!(
         store
-            .oldest_queued_resource_request(authority, resource.id)
+            .next_queued_resource_request(authority, resource.id)
             .unwrap()
             .is_none()
     );
@@ -572,7 +572,7 @@ fn tombstone_insert_failure_rolls_back_queued_request_cancellation() {
     assert_eq!(identity_count(&store, task), 0);
     assert!(
         store
-            .oldest_queued_resource_request(authority, resource.id)
+            .next_queued_resource_request(authority, resource.id)
             .unwrap()
             .is_some()
     );

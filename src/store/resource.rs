@@ -84,7 +84,7 @@ impl Store {
         load_resources_for_authority(&self.conn, authority_machine)
     }
 
-    /// Read a resource's requests in authority-assigned FIFO order
+    /// Read a resource's requests in serving order
     pub(crate) fn resource_requests(
         &self,
         authority_machine: MachineId,

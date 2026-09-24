@@ -140,7 +140,7 @@ fn completed_trainer_serves_queued_work_through_its_release_proof_and_returns() 
         } if observed_background_task == fixture.task_id
     ));
 
-    // only the authority-built proof of the final result serves the oldest request
+    // only the authority-built proof of the final result serves the next request in serving order
     let completed = fixture
         .store
         .complete_release_for_authority(
@@ -151,7 +151,7 @@ fn completed_trainer_serves_queued_work_through_its_release_proof_and_returns() 
         )
         .unwrap();
     let ReleaseCompletionResult::Assigned { loan, request, .. } = completed.clone() else {
-        panic!("the verified completed result must assign the oldest request");
+        panic!("the verified completed result must assign the next request in serving order");
     };
     assert_eq!(request.request_id, first.request_id);
     let LoanState::Active {

@@ -10,13 +10,13 @@
 //! With an AwaitingRelease loan the release action closes into Serving or
 //! AwaitingReturn and keeps the return obligation, as a proven release would
 //! With no loan, for the registered trainer or for a first background launch
-//! that ended before registration, the registration clears. The oldest queued
+//! that ended before registration, the registration clears. The next queued
 //! request then serves from an idle loan in the same transaction, or the
 //! receipt becomes the saved idle boundary that a later reconciliation or first
 //! launch reads. With a Restoring loan whose direct-segment return task ended
 //! before its confirmed start, or whose native foreground return task ended or
 //! was lost, the loan closes with the attested end, as a supervisor resolution
-//! of a proven end would. The oldest queued request then serves from an idle
+//! of a proven end would. The next queued request then serves from an idle
 //! loan, or the closure is the saved idle boundary. The attestation never
 //! becomes process-group exit evidence; the task row keeps its saved state
 
@@ -40,7 +40,7 @@ use crate::resource::operator_release::{
 use crate::resource::ownership_lock::TrainerRequestDigest;
 use crate::resource::store::{
     ResourceStoreError, SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction,
-    oldest_queued_request_for_authority, select_non_closed_loan, select_resource,
+    next_queued_request_for_authority, select_non_closed_loan, select_resource,
     select_supervisor_notice_record_by_action,
 };
 use crate::resource::{
@@ -610,7 +610,7 @@ fn attested_return_context(task_id: TaskId, evidence: &OperatorGpuFreeEvidence) 
     }
 }
 
-/// Close the release action and select the oldest request or reserve the return decision
+/// Close the release action and select the next request in serving order, or reserve the return decision
 ///
 /// The trainer stays registered until the supervisor decides the return, as
 /// after a proven release, so the return obligation is kept
@@ -624,7 +624,7 @@ fn resolve_release_action(
 ) -> Result<(ResourceRevision, OperatorGpuFreeOutcome), OperatorGpuFreeError> {
     let return_context = attested_return_context(attestation.task_id, evidence);
     let authority = resource.authority_machine();
-    let queued = oldest_queued_request_for_authority(tx, authority, resource.id)?;
+    let queued = next_queued_request_for_authority(tx, authority, resource.id)?;
     let state_revision = advance(tx, resource, resource.registered_background_task)?;
 
     let Some(mut request) = queued else {
@@ -683,7 +683,7 @@ fn resolve_release_action(
     ))
 }
 
-/// Clear the registration and serve the oldest request, or keep this receipt as the boundary
+/// Clear the registration and serve the next request in serving order, or keep this receipt as the boundary
 ///
 /// No committed state shows a free resource between the two steps, because both
 /// commit in the caller's transaction
@@ -694,7 +694,7 @@ fn resolve_idle(
 ) -> Result<(ResourceRevision, OperatorGpuFreeOutcome), OperatorGpuFreeError> {
     let authority = resource.authority_machine();
     let cleared_revision = advance(tx, resource, None)?;
-    let Some(request) = oldest_queued_request_for_authority(tx, authority, resource.id)? else {
+    let Some(request) = next_queued_request_for_authority(tx, authority, resource.id)? else {
         return Ok((cleared_revision, OperatorGpuFreeOutcome::IdleBoundary));
     };
 
@@ -716,10 +716,10 @@ fn resolve_idle(
     ))
 }
 
-/// Close the Restoring loan with the attested end and serve the oldest request
+/// Close the Restoring loan with the attested end and serve the next request in serving order
 ///
 /// The closure clears the registration, as a supervisor resolution of a proven
-/// end would. The oldest queued request then serves from an idle loan in the
+/// end would. The next queued request then serves from an idle loan in the
 /// same transaction, or the closed loan is the saved idle boundary. No committed
 /// state shows a free resource between the two steps
 fn resolve_restoring(
@@ -747,7 +747,7 @@ fn resolve_restoring(
     }
 
     let authority = resource.authority_machine();
-    let Some(request) = oldest_queued_request_for_authority(tx, authority, resource.id)? else {
+    let Some(request) = next_queued_request_for_authority(tx, authority, resource.id)? else {
         return Ok((
             closed_revision,
             OperatorGpuFreeOutcome::RestoreClosedIdleBoundary { closed },

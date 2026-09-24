@@ -117,7 +117,7 @@ async fn startup_retries_completed_trainer_proof_and_launches_assigned_task_once
             && *saved_task == trainer_task_id
             && *publication_sha256 == publication.publication_sha256
     ));
-    // the next FIFO request waits for the running task's confirmed exit
+    // the next queued request waits for the running task's confirmed exit
     assert!(
         call(&store, |reply| StoreMsg::GetTask {
             id: second.task_id,
@@ -275,7 +275,7 @@ async fn exact_trainer_terminal_event_reconciles_without_a_client_wake() {
 }
 
 #[tokio::test]
-async fn pre_activation_cancellation_keeps_release_proof_for_the_next_fifo_request() {
+async fn pre_activation_cancellation_keeps_release_proof_for_the_next_request() {
     let _guard = SUPERVISOR_TEST_LOCK.lock().await;
     crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
     let directory = tempdir().unwrap();
