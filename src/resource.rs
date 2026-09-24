@@ -1260,6 +1260,37 @@ pub enum LoanState {
     },
 }
 
+impl LoanState {
+    /// Whether this state still waits for the exact decision that `notice` asks for
+    ///
+    /// Notice delivery state is independent of action completion, so a notice
+    /// with attempts left must stop once the loan moves past its action.
+    /// `Restoring` keeps the return action identity but already has its decision
+    #[must_use]
+    pub fn awaits_notice(&self, notice: &SupervisorNotice) -> bool {
+        let awaited = match (self, &notice.payload) {
+            (
+                Self::Active {
+                    phase: LoanPhase::AwaitingRelease { action_id, .. },
+                },
+                SupervisorNoticePayload::ReleaseRequired { .. },
+            )
+            | (
+                Self::Active {
+                    phase: LoanPhase::AwaitingReturn { action_id, .. },
+                },
+                SupervisorNoticePayload::ReturnRequired { .. },
+            )
+            | (
+                Self::NeedsAttention { action_id, .. },
+                SupervisorNoticePayload::AttentionRequired { .. },
+            ) => action_id,
+            _ => return false,
+        };
+        *awaited == notice.action_id
+    }
+}
+
 /// One interruption spanning all optimization requests before training returns
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

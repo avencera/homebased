@@ -248,17 +248,17 @@ mod tests {
         reserve_deliver_settle, verify_receipt,
     };
     use crate::daemon::actors::{StoreActor, StoreMsg, call};
-    use crate::domain::{API_VERSION, ThreadId};
+    use crate::domain::{API_VERSION, TaskId, ThreadId};
     use crate::fleet::address::MachineAddress;
     use crate::fleet::http::ClusterClient;
     use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
     use crate::machine::MachineId;
     use crate::resource::store::insert_supervisor_notice_in_transaction;
     use crate::resource::{
-        ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, NoticeId, ResourceId,
-        ResourceRevision, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
-        SupervisorNoticePayload, SupervisorNoticeReceipt, SupervisorNoticeRequest,
-        SupervisorNoticeResponse,
+        ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, LoanPhase, LoanState, NoticeId,
+        ResourceId, ResourceRevision, SupervisorAddress, SupervisorNotice,
+        SupervisorNoticeDelivery, SupervisorNoticePayload, SupervisorNoticeReceipt,
+        SupervisorNoticeRequest, SupervisorNoticeResponse,
     };
     use crate::store::Store;
     use axum::Json;
@@ -498,10 +498,20 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, '{\"type\":\"active\"}')",
+                "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
                 params![
                     notice.loan_id.as_uuid().to_string(),
                     resource_id.as_uuid().to_string(),
+                    serde_json::to_string(&LoanState::NeedsAttention {
+                        action_id: notice.action_id,
+                        last_safe_phase: LoanPhase::AwaitingRelease {
+                            action_id: ActionId::new(),
+                            observed_background_task: TaskId::new(),
+                            watcher_intent: None,
+                        },
+                        reason: "test notice".into(),
+                    })
+                    .unwrap(),
                 ],
             )
             .unwrap();

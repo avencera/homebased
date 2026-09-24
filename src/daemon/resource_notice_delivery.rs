@@ -13,6 +13,7 @@ use super::keyed_locks::KeyedLocks;
 use super::resource_notice_sender::{
     ResourceNoticeDeliveryOutcome, ResourceNoticeSendError, deliver_one,
 };
+use crate::resource::store::SupervisorNoticeStoreError;
 use crate::resource::{NoticeId, SupervisorNoticeDelivery};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(15);
@@ -114,6 +115,10 @@ impl DeliveryWorker {
             }
         };
 
+        // a notice drops out of the scan once its action resolves, so forget its backoff
+        self.retries
+            .retain(|notice_id, _| pending.iter().any(|notice| notice.id == *notice_id));
+
         for notice in pending {
             let ready = self
                 .retries
@@ -135,6 +140,12 @@ impl DeliveryWorker {
 
             match result {
                 Ok(outcome) => self.record_outcome(notice_id, outcome),
+                Err(ResourceNoticeSendError::Store(
+                    SupervisorNoticeStoreError::ActionNoLongerAwaited,
+                )) => {
+                    info!(notice_id = %notice_id.as_uuid(), "supervisor notice action resolved before delivery");
+                    self.retries.remove(&notice_id);
+                }
                 Err(error) => {
                     warn!(notice_id = %notice_id.as_uuid(), "supervisor notice delivery call failed: {error}");
                     self.retry_later(notice_id);
@@ -263,13 +274,13 @@ mod tests {
     use crate::daemon::resource_notice_sender::{
         ResourceNoticeDeliveryOutcome, ResourceNoticeSendError,
     };
-    use crate::domain::ThreadId;
+    use crate::domain::{TaskId, ThreadId};
     use crate::machine::MachineId;
     use crate::resource::store::insert_supervisor_notice_in_transaction;
     use crate::resource::{
-        ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, NoticeId, ResourceId,
-        ResourceRevision, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
-        SupervisorNoticePayload,
+        ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, LoanPhase, LoanState, NoticeId,
+        ResourceId, ResourceRevision, SupervisorAddress, SupervisorNotice,
+        SupervisorNoticeDelivery, SupervisorNoticePayload,
     };
     use crate::store::Store;
     use std::time::Duration;
@@ -504,10 +515,20 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, '{\"type\":\"active\"}')",
+                "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
                 params![
                     notice.loan_id.as_uuid().to_string(),
                     resource_id.as_uuid().to_string(),
+                    serde_json::to_string(&LoanState::NeedsAttention {
+                        action_id: notice.action_id,
+                        last_safe_phase: LoanPhase::AwaitingRelease {
+                            action_id: ActionId::new(),
+                            observed_background_task: TaskId::new(),
+                            watcher_intent: None,
+                        },
+                        reason: "test notice".into(),
+                    })
+                    .unwrap(),
                 ],
             )
             .unwrap();

@@ -2413,13 +2413,11 @@ fn supervisor_retarget_uses_assignment_cas_and_invalidates_old_attempts() {
 #[test]
 fn pending_notices_are_ordered_by_stable_notice_id() {
     let mut conn = connection();
-    let first = insert_notice_fixture(&mut conn);
-    let mut second = first.clone();
-    second.id = NoticeId::from_uuid(Uuid::from_u128(2)).unwrap();
-    second.action_id = ActionId::new();
-    let mut first = first;
+    // each loan awaits one action, so each notice needs its own loan
+    let mut first = insert_notice_fixture(&mut conn);
     first.id = NoticeId::from_uuid(Uuid::from_u128(1)).unwrap();
-    first.action_id = ActionId::new();
+    let mut second = insert_notice_fixture(&mut conn);
+    second.id = NoticeId::from_uuid(Uuid::from_u128(2)).unwrap();
     persist_notice_for_test(&mut conn, &second).unwrap();
     persist_notice_for_test(&mut conn, &first).unwrap();
 
@@ -2449,5 +2447,128 @@ fn corrupt_notice_record_is_not_a_retryable_storage_error() {
     assert!(matches!(
         pending_supervisor_notices(&conn),
         Err(SupervisorNoticeStoreError::CorruptRecord { .. })
+    ));
+}
+
+fn set_loan_state(conn: &Connection, loan_id: LoanId, state: &LoanState) {
+    conn.execute(
+        "UPDATE loans SET state_json = ?1 WHERE id = ?2",
+        params![
+            serde_json::to_string(state).unwrap(),
+            loan_id.as_uuid().to_string()
+        ],
+    )
+    .unwrap();
+}
+
+fn return_notice_awaiting_retry(conn: &mut Connection) -> SupervisorNotice {
+    let release_notice = insert_notice_fixture(conn);
+    return_notice_after_release(conn, release_notice)
+}
+
+/// Complete the release of `release_notice` and fail the first return notice attempt
+fn return_notice_after_release(
+    conn: &mut Connection,
+    release_notice: SupervisorNotice,
+) -> SupervisorNotice {
+    let return_context = ReturnContext::Idle;
+    let action_id = ActionId::new();
+    set_loan_state(
+        conn,
+        release_notice.loan_id,
+        &LoanState::Active {
+            phase: LoanPhase::AwaitingReturn {
+                action_id,
+                return_context: return_context.clone(),
+            },
+        },
+    );
+    let notice = SupervisorNotice {
+        id: NoticeId::new(),
+        action_id,
+        payload: SupervisorNoticePayload::ReturnRequired { return_context },
+        ..release_notice
+    };
+    persist_notice_for_test(conn, &notice).unwrap();
+    let attempt_id = DeliveryAttemptId::new();
+    reserve_supervisor_notice_attempt(conn, notice.id, attempt_id).unwrap();
+    settle_supervisor_notice_attempt(conn, notice.id, attempt_id, Err("queue timed out".into()))
+        .unwrap()
+}
+
+fn assert_not_deliverable(conn: &mut Connection, notice: &SupervisorNotice) {
+    assert!(pending_supervisor_notices(conn).unwrap().is_empty());
+    assert!(matches!(
+        reserve_supervisor_notice_attempt(conn, notice.id, DeliveryAttemptId::new()),
+        Err(SupervisorNoticeStoreError::ActionNoLongerAwaited)
+    ));
+    assert!(matches!(
+        supervisor_notice(conn, notice.id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        SupervisorNoticeDelivery::RetryPending { attempts: 1, .. }
+    ));
+}
+
+#[test]
+fn return_notice_awaiting_retry_is_deliverable_while_the_return_is_undecided() {
+    let mut conn = connection();
+    let notice = return_notice_awaiting_retry(&mut conn);
+
+    let pending = pending_supervisor_notices(&conn).unwrap();
+    assert_eq!(pending, vec![notice.clone()]);
+    reserve_supervisor_notice_attempt(&mut conn, notice.id, DeliveryAttemptId::new()).unwrap();
+}
+
+#[test]
+fn return_notice_stops_once_the_return_decision_is_accepted() {
+    let mut conn = connection();
+    let notice = return_notice_awaiting_retry(&mut conn);
+    set_loan_state(
+        &conn,
+        notice.loan_id,
+        &LoanState::Active {
+            phase: LoanPhase::Restoring {
+                action_id: notice.action_id,
+                return_context: ReturnContext::Idle,
+                resume_task_id: TaskId::new(),
+            },
+        },
+    );
+
+    assert_not_deliverable(&mut conn, &notice);
+}
+
+#[test]
+fn return_notice_stops_once_the_loan_is_closed() {
+    let mut conn = connection();
+    let notice = return_notice_awaiting_retry(&mut conn);
+    set_loan_state(
+        &conn,
+        notice.loan_id,
+        &LoanState::Closed {
+            result: LoanClosure::NoResume {
+                return_context: ReturnContext::Idle,
+                reason: "done for today".into(),
+            },
+        },
+    );
+
+    assert_not_deliverable(&mut conn, &notice);
+}
+
+#[test]
+fn release_notice_stops_once_the_loan_awaits_its_return() {
+    let mut conn = connection();
+    let release_notice = insert_notice_fixture(&mut conn);
+    persist_notice_for_test(&mut conn, &release_notice).unwrap();
+    let return_notice = return_notice_after_release(&mut conn, release_notice.clone());
+
+    let pending = pending_supervisor_notices(&conn).unwrap();
+    assert_eq!(pending, vec![return_notice]);
+    assert!(matches!(
+        reserve_supervisor_notice_attempt(&mut conn, release_notice.id, DeliveryAttemptId::new()),
+        Err(SupervisorNoticeStoreError::ActionNoLongerAwaited)
     ));
 }

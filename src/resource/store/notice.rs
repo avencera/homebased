@@ -4,8 +4,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 
 use super::codec::{StoredReadError, collect_decoded, stored_column, stored_id, stored_json};
 use crate::resource::{
-    ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, NoticeId, SupervisorAddress,
-    SupervisorNotice, SupervisorNoticeDelivery,
+    ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, LoanState, NoticeId,
+    SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
 };
 
 const SUPERVISOR_NOTICE_MAX_ATTEMPTS: u8 = 3;
@@ -26,6 +26,9 @@ pub(crate) enum SupervisorNoticeStoreError {
     /// The notice has already been delivered and cannot be retargeted
     #[error("delivered supervisor notice cannot be retargeted")]
     AlreadyDelivered,
+    /// The loan no longer waits for the decision this notice asks for
+    #[error("supervisor notice action is no longer awaited")]
+    ActionNoLongerAwaited,
     /// A delivery attempt is already in flight
     #[error("supervisor notice delivery attempt is already in flight")]
     AttemptInFlight,
@@ -122,18 +125,33 @@ pub(crate) fn supervisor_notice(
 }
 
 /// Read notices that can receive another delivery attempt in stable ID order
+///
+/// A notice whose loan has moved past its action keeps its delivery state but
+/// is not listed, so a late copy never reaches the supervisor
 pub(crate) fn pending_supervisor_notices(
     conn: &Connection,
 ) -> Result<Vec<SupervisorNotice>, SupervisorNoticeStoreError> {
     let mut statement = conn.prepare(
-        "SELECT id, loan_id, action_id, notice_json
-         FROM resource_supervisor_notices
-         WHERE json_extract(notice_json, '$.delivery.type') IN ('pending', 'retry_pending')
-         ORDER BY id ASC",
+        "SELECT notice.id, notice.loan_id, notice.action_id, notice.notice_json, loan.state_json
+         FROM resource_supervisor_notices AS notice
+         JOIN loans AS loan ON loan.id = notice.loan_id
+         WHERE json_extract(notice.notice_json, '$.delivery.type') IN ('pending', 'retry_pending')
+         ORDER BY notice.id ASC",
     )?;
-    let rows = statement.query_map([], |row| Ok(decode_supervisor_notice_record(row)))?;
+    let rows = statement.query_map([], |row| {
+        Ok(
+            decode_supervisor_notice_record(row).and_then(|(notice, _)| {
+                let loan_state = decode_loan_state(row, 4)?;
+                Ok((notice, loan_state))
+            }),
+        )
+    })?;
     let records = collect_decoded::<_, StoredReadError>(rows)?;
-    Ok(records.into_iter().map(|(notice, _)| notice).collect())
+    Ok(records
+        .into_iter()
+        .filter(|(notice, loan_state)| loan_state.awaits_notice(notice))
+        .map(|(notice, _)| notice)
+        .collect())
 }
 
 /// Reserve one bounded attempt, or return an existing reservation for an identical retry
@@ -145,6 +163,10 @@ pub(crate) fn reserve_supervisor_notice_attempt(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (mut notice, old_json) = select_supervisor_notice_record(&tx, notice_id)?
         .ok_or(SupervisorNoticeStoreError::NotFound)?;
+    // the loan can close between the pending scan and this reservation
+    if !select_loan_state(&tx, notice.loan_id)?.awaits_notice(&notice) {
+        return Err(SupervisorNoticeStoreError::ActionNoLongerAwaited);
+    }
 
     let attempts = match notice.delivery {
         SupervisorNoticeDelivery::Pending { attempts }
@@ -335,6 +357,21 @@ pub(crate) fn select_supervisor_notice_record_by_action(
     )
     .optional()?
     .transpose()
+}
+
+fn select_loan_state(conn: &Connection, loan_id: LoanId) -> Result<LoanState, StoredReadError> {
+    conn.query_row(
+        "SELECT state_json FROM loans WHERE id = ?1",
+        [loan_id.as_uuid().to_string()],
+        |row| Ok(decode_loan_state(row, 0)),
+    )?
+}
+
+fn decode_loan_state(row: &Row<'_>, index: usize) -> Result<LoanState, StoredReadError> {
+    stored_json(
+        "loan state",
+        &stored_column::<String>(row, index, "loan state")?,
+    )
 }
 
 /// Decode `id, loan_id, action_id, notice_json` columns and check that they agree

@@ -583,10 +583,9 @@ fn reserve_explicit_attempt(
     let (mut notice, old_json) = select_supervisor_notice_record(tx, notice_id)
         .map_err(SupervisorNoticeStoreError::from)?
         .ok_or_else(|| ResourceControlError::NotAllowed("notice not found".into()))?;
-    let pending = loan
-        .filter(|loan| loan.id == notice.loan_id)
-        .and_then(open_action_id);
-    if pending != Some(notice.action_id) {
+    let awaited =
+        loan.is_some_and(|loan| loan.id == notice.loan_id && loan.state.awaits_notice(&notice));
+    if !awaited {
         return Err(ResourceControlError::NotAllowed(
             "the notice action is no longer pending".into(),
         ));
