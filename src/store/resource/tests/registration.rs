@@ -1,7 +1,13 @@
 //! Registration retries compare the saved first registration, not the current row
 
-use super::*;
+use super::fixtures::{machine_other_than, resource};
+use crate::domain::ThreadId;
+use crate::machine::MachineId;
 use crate::resource::store::ResourceStoreError;
+use crate::resource::{AssignmentRevision, Resource, SupervisorAddress};
+use crate::store::Store;
+use tempfile::tempdir;
+use uuid::Uuid;
 
 fn replace_supervisor(store: &mut Store, authority: MachineId, machine: MachineId) -> Resource {
     let current = store.resource_snapshots_for_authority(authority).unwrap()[0]
@@ -74,103 +80,5 @@ fn exact_registration_retry_succeeds_after_a_supervisor_replacement() {
     assert_eq!(
         store.resource_snapshots_for_authority(authority).unwrap()[0].resource,
         replaced
-    );
-}
-
-#[test]
-fn schema_24_backfills_only_registrations_that_still_prove_their_first_supervisor() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("db");
-    let authority = MachineId::new();
-    let kept = resource(authority);
-    let replaced = resource(authority);
-    let replaced_now = {
-        let mut store = Store::open(&path).unwrap();
-        store.register_resource(authority, &kept).unwrap();
-        store.register_resource(authority, &replaced).unwrap();
-        let replaced_now = {
-            let current = store
-                .resource_snapshots_for_authority(authority)
-                .unwrap()
-                .into_iter()
-                .find(|snapshot| snapshot.resource.id == replaced.id)
-                .unwrap()
-                .resource;
-            store
-                .replace_resource_supervisor(
-                    authority,
-                    current.id,
-                    current.state_revision,
-                    SupervisorAddress {
-                        machine: machine_other_than(authority),
-                        thread: ThreadId(Uuid::now_v7()),
-                    },
-                )
-                .unwrap()
-                .resource
-        };
-        // a v24 database has resource rows and no registration receipts
-        store
-            .conn
-            .execute_batch(
-                "DROP TABLE resource_registration_receipts;
-                 PRAGMA user_version = 24;",
-            )
-            .unwrap();
-        replaced_now
-    };
-
-    let mut store = Store::open(&path).unwrap();
-    let version: i64 = store
-        .conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, crate::domain::SCHEMA_VERSION);
-    let receipts: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM resource_registration_receipts",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(receipts, 1);
-    let mut rows = store
-        .resource_snapshots_for_authority(authority)
-        .unwrap()
-        .into_iter()
-        .map(|snapshot| snapshot.resource)
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|resource| resource.id.as_uuid());
-    let mut expected = vec![kept.clone(), replaced_now.clone()];
-    expected.sort_by_key(|resource| resource.id.as_uuid());
-    assert_eq!(rows, expected);
-
-    // an unreplaced row proves its first supervisor, so an exact retry still matches
-    assert_eq!(store.register_resource(authority, &kept).unwrap(), kept);
-    let mut renamed = kept.clone();
-    renamed.display_name = "another GPU".into();
-    assert!(matches!(
-        store.register_resource(authority, &renamed),
-        Err(ResourceStoreError::RegistrationConflict { .. })
-    ));
-    // a replaced row cannot prove which supervisor came first, so no retry matches
-    for retry in [replaced.clone(), {
-        let mut current = replaced.clone();
-        current.supervisor = replaced_now.supervisor;
-        current
-    }] {
-        assert!(matches!(
-            store.register_resource(authority, &retry),
-            Err(ResourceStoreError::LegacyRegistrationUnproven { resource })
-                if resource == replaced.id
-        ));
-    }
-    assert_eq!(
-        store
-            .resource_read_models(authority, Some(replaced.id))
-            .unwrap()[0]
-            .resource,
-        replaced_now
     );
 }

@@ -1,4 +1,4 @@
-//! Duplicate machine identity detection.
+//! Duplicate machine identity detection
 //!
 //! One installation UUID must map to one live daemon. Two fresh probes that
 //! report different boot UUIDs for one machine UUID can mean a live clone, but
@@ -6,7 +6,7 @@
 //! name can also mean an ordinary rename across a restart. So a first round
 //! only marks a machine as suspect, and a second probe round of the same
 //! addresses decides. Cached metadata is never evidence: only answers from the
-//! current rounds count.
+//! current rounds count
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,51 +17,72 @@ use crate::fleet::address::MachineAddress;
 use crate::fleet::advertisement::MachineHeader;
 use crate::machine::{BootId, LocalIdentity, MachineId, MachineName};
 
-/// One successful probe in a round.
+/// One successful probe in a round
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeObservation {
-    /// Address that answered.
+    /// Address that answered
     pub address: MachineAddress,
-    /// Identity the address reported.
+    /// Identity the address reported
     pub header: MachineHeader,
-    /// When the answer arrived.
+    /// When the answer arrived
     pub observed_at: DateTime<Utc>,
 }
 
-/// Identity state that the peer directory keeps per machine.
+/// Fresh results of one probe sweep over candidate addresses
+///
+/// A timeout or unreachable host says nothing, since a network outage looks
+/// the same as a clone that is still up behind it. A refused connection does
+/// say something: the host answered, and no daemon listens at that address
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeSweep {
+    /// Probes that returned an advertisement
+    pub answers: Vec<ProbeObservation>,
+    /// Addresses whose host refused the connection
+    pub refused: Vec<MachineAddress>,
+}
+
+impl ProbeSweep {
+    /// Whether any probed host responded, with an answer or a refusal
+    #[must_use]
+    pub fn reached_a_host(&self) -> bool {
+        !self.answers.is_empty() || !self.refused.is_empty()
+    }
+}
+
+/// Identity state that the peer directory keeps per machine
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum IdentityStatus {
-    /// One live daemon answers for this machine UUID.
+    /// One live daemon answers for this machine UUID
     Consistent,
     /// Distinct live daemons report different boot UUIDs for this machine
-    /// UUID. Operations must not route to it until this clears.
+    /// UUID. Operations must not route to it until this clears
     DuplicateMachineIdentity {
-        /// Boot UUIDs seen in the confirming round.
+        /// Boot UUIDs seen in the confirming round
         boots: BTreeSet<BootId>,
-        /// When the second round confirmed the conflict.
+        /// When the second round confirmed the conflict
         detected_at: DateTime<Utc>,
     },
 }
 
-/// Decision for one suspect machine after the confirming round.
+/// Decision for one suspect machine after the confirming round
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityVerdict {
     /// Every first-round responder answered again with one boot UUID. The
-    /// earlier difference was a restart or rename.
+    /// earlier difference was a restart or rename
     Consistent {
-        /// Current boot UUID.
+        /// Current boot UUID
         boot: BootId,
-        /// Current name.
+        /// Current name
         name: MachineName,
     },
-    /// Distinct live daemons still claim the machine UUID.
+    /// Distinct live daemons still claim the machine UUID
     Duplicate {
-        /// Boot UUIDs seen in the confirming round.
+        /// Boot UUIDs seen in the confirming round
         boots: BTreeSet<BootId>,
     },
     /// Some first-round responders did not answer again. Keep the previous
-    /// status and decide in a later round.
+    /// status and decide in a later round
     Inconclusive,
 }
 
@@ -89,15 +110,15 @@ impl LocalDuplicateRecovery {
     /// Check two fresh probe sweeps for one runtime round
     ///
     /// A missing observation in one runtime round is not enough to clear a
-    /// confirmed duplicate; any foreign claim resets the absence count
+    /// confirmed duplicate; any foreign claim, or a sweep that reached no
+    /// host, resets the absence count
     pub fn observe(
         &mut self,
-        first: &[ProbeObservation],
-        second: &[ProbeObservation],
+        first: &ProbeSweep,
+        second: &ProbeSweep,
         local: &LocalIdentity,
-        candidate_count: usize,
     ) -> LocalRecoveryVerdict {
-        let second_foreign = foreign_boots(second, local);
+        let second_foreign = foreign_boots(&second.answers, local);
         if !second_foreign.is_empty() {
             self.missing_rounds = 0;
             return LocalRecoveryVerdict::Duplicate {
@@ -105,13 +126,14 @@ impl LocalDuplicateRecovery {
             };
         }
 
-        if !foreign_boots(first, local).is_empty() {
+        if !foreign_boots(&first.answers, local).is_empty() {
             self.missing_rounds = 0;
             return LocalRecoveryVerdict::Inconclusive;
         }
 
-        // no address means there was no fresh probe evidence this round
-        if candidate_count == 0 {
+        // absence only counts when both sweeps reached a host; timeouts,
+        // such as during a network outage, say nothing about the clone
+        if !first.reached_a_host() || !second.reached_a_host() {
             self.missing_rounds = 0;
             return LocalRecoveryVerdict::Inconclusive;
         }
@@ -131,11 +153,11 @@ impl LocalDuplicateRecovery {
     }
 }
 
-/// Machines that need a confirming round.
+/// Machines that need a confirming round
 ///
 /// A machine is suspect when fresh answers disagree on its boot UUID or name,
 /// when another daemon claims the local machine UUID, or when the directory
-/// already marks it as a duplicate and the round can clear it.
+/// already marks it as a duplicate and the round can clear it
 #[must_use]
 pub fn suspects(
     round: &[ProbeObservation],
@@ -162,11 +184,11 @@ pub fn suspects(
     out
 }
 
-/// Decide one suspect machine from the first and confirming rounds.
+/// Decide one suspect machine from the first and confirming rounds
 ///
 /// For the local machine UUID, any other boot in the confirming round is a
 /// duplicate: this daemon holds the state-directory lock, so an earlier boot
-/// of this installation cannot still answer.
+/// of this installation cannot still answer
 #[must_use]
 pub fn confirm(
     machine: MachineId,
@@ -216,7 +238,7 @@ fn foreign_boots(round: &[ProbeObservation], local: &LocalIdentity) -> BTreeSet<
         .collect()
 }
 
-/// Addresses to probe again for the confirming round.
+/// Addresses to probe again for the confirming round
 #[must_use]
 pub fn recheck_addresses(
     round: &[ProbeObservation],
@@ -239,8 +261,15 @@ fn group_by_machine(round: &[ProbeObservation]) -> BTreeMap<MachineId, Vec<&Prob
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        IdentityVerdict, LocalDuplicateRecovery, LocalRecoveryVerdict, ProbeObservation,
+        ProbeSweep, confirm, suspects,
+    };
+    use crate::fleet::advertisement::MachineHeader;
     use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+    use crate::machine::{BootId, LocalIdentity, MachineId, MachineName};
+    use chrono::Utc;
+    use std::collections::BTreeSet;
 
     fn obs(address: &str, machine: MachineId, boot: BootId, name: &str) -> ProbeObservation {
         ProbeObservation {
@@ -260,6 +289,20 @@ mod tests {
         LocalIdentity {
             machine: MachineId::new(),
             boot: BootId::new(),
+        }
+    }
+
+    fn answered(observation: &ProbeObservation) -> ProbeSweep {
+        ProbeSweep {
+            answers: vec![observation.clone()],
+            refused: Vec::new(),
+        }
+    }
+
+    fn refused(address: &str) -> ProbeSweep {
+        ProbeSweep {
+            answers: Vec::new(),
+            refused: vec![address.parse().unwrap()],
         }
     }
 
@@ -376,25 +419,20 @@ mod tests {
     #[test]
     fn local_duplicate_needs_two_missing_runtime_rounds_to_recover() {
         let local = local();
-        let own = obs("http://10.0.0.1:7677", local.machine, local.boot, "main");
+        let own = answered(&obs(
+            "http://10.0.0.1:7677",
+            local.machine,
+            local.boot,
+            "main",
+        ));
         let mut recovery = LocalDuplicateRecovery::default();
 
         assert_eq!(
-            recovery.observe(
-                std::slice::from_ref(&own),
-                std::slice::from_ref(&own),
-                &local,
-                1
-            ),
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(
-                std::slice::from_ref(&own),
-                std::slice::from_ref(&own),
-                &local,
-                1
-            ),
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Recovered
         );
     }
@@ -403,27 +441,72 @@ mod tests {
     fn missing_or_partial_probe_evidence_does_not_clear_local_duplicate() {
         let local = local();
         let foreign = BootId::new();
-        let clone = obs("http://10.0.0.9:7677", local.machine, foreign, "main");
+        let clone = answered(&obs("http://10.0.0.9:7677", local.machine, foreign, "main"));
+        let silent = ProbeSweep::default();
         let mut recovery = LocalDuplicateRecovery::default();
 
         assert_eq!(
-            recovery.observe(&[clone], &[], &local, 1),
+            recovery.observe(&clone, &silent, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(&[], &[], &local, 1),
+            recovery.observe(&silent, &silent, &local),
+            LocalRecoveryVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn unanswered_probe_rounds_do_not_clear_local_duplicate() {
+        let local = local();
+        let own = answered(&obs(
+            "http://10.0.0.1:7677",
+            local.machine,
+            local.boot,
+            "main",
+        ));
+        let silent = ProbeSweep::default();
+        let mut recovery = LocalDuplicateRecovery::default();
+
+        // candidates existed but every probe timed out, as in a network outage
+        for _ in 0..3 {
+            assert_eq!(
+                recovery.observe(&silent, &silent, &local),
+                LocalRecoveryVerdict::Inconclusive
+            );
+        }
+
+        // a silent sweep breaks a run of clean rounds
+        assert_eq!(
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(&[], &[], &local, 0),
+            recovery.observe(&own, &silent, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(&[], &[], &local, 1),
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(&[], &[], &local, 1),
+            recovery.observe(&own, &own, &local),
+            LocalRecoveryVerdict::Recovered
+        );
+    }
+
+    #[test]
+    fn refused_connections_clear_local_duplicate() {
+        let local = local();
+        // the host of the former clone is up but no daemon listens there
+        let gone = refused("http://10.0.0.9:7677");
+        let mut recovery = LocalDuplicateRecovery::default();
+
+        assert_eq!(
+            recovery.observe(&gone, &gone, &local),
+            LocalRecoveryVerdict::Inconclusive
+        );
+        assert_eq!(
+            recovery.observe(&gone, &gone, &local),
             LocalRecoveryVerdict::Recovered
         );
     }
@@ -431,38 +514,28 @@ mod tests {
     #[test]
     fn local_duplicate_reappearance_resets_recovery() {
         let local = local();
-        let own = obs("http://10.0.0.1:7677", local.machine, local.boot, "main");
+        let own = answered(&obs(
+            "http://10.0.0.1:7677",
+            local.machine,
+            local.boot,
+            "main",
+        ));
         let foreign = BootId::new();
-        let clone = obs("http://10.0.0.9:7677", local.machine, foreign, "main");
+        let clone = answered(&obs("http://10.0.0.9:7677", local.machine, foreign, "main"));
         let mut recovery = LocalDuplicateRecovery::default();
 
         assert_eq!(
-            recovery.observe(
-                std::slice::from_ref(&own),
-                std::slice::from_ref(&own),
-                &local,
-                2
-            ),
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Inconclusive
         );
         assert_eq!(
-            recovery.observe(
-                std::slice::from_ref(&clone),
-                std::slice::from_ref(&clone),
-                &local,
-                2
-            ),
+            recovery.observe(&clone, &clone, &local),
             LocalRecoveryVerdict::Duplicate {
                 boots: BTreeSet::from([foreign])
             }
         );
         assert_eq!(
-            recovery.observe(
-                std::slice::from_ref(&own),
-                std::slice::from_ref(&own),
-                &local,
-                2
-            ),
+            recovery.observe(&own, &own, &local),
             LocalRecoveryVerdict::Inconclusive
         );
     }

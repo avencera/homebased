@@ -1,4 +1,4 @@
-//! Validated command lines and resolved child invocations.
+//! Validated command lines and resolved child invocations
 
 use std::ffi::OsString;
 use std::fmt;
@@ -14,20 +14,20 @@ use crate::domain::{AgentKind, AgentWorkload, TaskIdentity, TaskWorkload, Worklo
 use crate::error::AppError;
 use crate::spec::{NormalizedAgentWorkload, NormalizedWorkload};
 
-/// How the child receives stdin.
+/// How the child receives stdin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StdinPolicy {
-    /// `/dev/null`.
+    /// `/dev/null`
     Null,
-    /// Prompt feed bytes are written to a pipe.
+    /// Prompt feed bytes are written to a pipe
     PromptFeed,
 }
 
-/// Environment assignments that a child policy adds to the worker environment.
+/// Environment assignments that a child policy adds to the worker environment
 ///
 /// Values are intentionally hidden from `Debug` output. An assignment may
-/// contain provider configuration that must never appear in logs or fixtures.
+/// contain provider configuration that must never appear in logs or fixtures
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct ChildEnvironment {
     assignments: Vec<(String, String)>,
@@ -58,39 +58,39 @@ impl ChildEnvironment {
     }
 }
 
-/// Safe dry-run description of a managed child environment.
+/// Safe dry-run description of a managed child environment
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedEnvironmentPreview {
-    /// Policy that owns the environment assignments.
+    /// Policy that owns the environment assignments
     pub policy: ManagedEnvironmentPolicy,
-    /// Child working directory also assigned to `PWD`.
+    /// Child working directory also assigned to `PWD`
     pub working_directory: PathBuf,
-    /// Wildcard permission applied through `OPENCODE_PERMISSION`.
+    /// Wildcard permission applied through `OPENCODE_PERMISSION`
     pub wildcard_permission: &'static str,
-    /// Agent overlay added to `OPENCODE_CONFIG_CONTENT`.
+    /// Agent overlay added to `OPENCODE_CONFIG_CONTENT`
     pub generated_agent: GeneratedAgentOverlay,
 }
 
-/// Managed child environment policy.
+/// Managed child environment policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedEnvironmentPolicy {
-    /// OpenCode may use every work tool for this child only.
+    /// OpenCode may use every work tool for this child only
     OpenCodeFullWorkPermissions,
 }
 
-/// Safe preview of the generated OpenCode agent configuration.
+/// Safe preview of the generated OpenCode agent configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GeneratedAgentOverlay {
-    /// Generated primary-agent name.
+    /// Generated primary-agent name
     pub name: String,
-    /// OpenCode agent mode.
+    /// OpenCode agent mode
     pub mode: &'static str,
-    /// OpenCode agent permission scalar.
+    /// OpenCode agent permission scalar
     pub permission: &'static str,
 }
 
-/// Validated argv: non-empty program, no NUL bytes, later args may be empty.
+/// Validated argv: non-empty program, no NUL bytes, later args may be empty
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandLine {
     program: String,
@@ -98,7 +98,7 @@ pub struct CommandLine {
 }
 
 impl CommandLine {
-    /// Build from an argv array. Index 0 is the program.
+    /// Build from an argv array. Index 0 is the program
     pub fn try_from_argv(argv: Vec<String>) -> Result<Self, CommandLineError> {
         if argv.is_empty() {
             return Err(CommandLineError::Empty);
@@ -121,19 +121,19 @@ impl CommandLine {
         })
     }
 
-    /// Program at index 0.
+    /// Program at index 0
     #[must_use]
     pub fn program(&self) -> &str {
         &self.program
     }
 
-    /// Arguments after the program.
+    /// Arguments after the program
     #[must_use]
     pub fn args(&self) -> &[String] {
         &self.args
     }
 
-    /// Full argv including the program.
+    /// Full argv including the program
     #[must_use]
     pub fn to_vec(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(1 + self.args.len());
@@ -189,7 +189,7 @@ impl schemars::JsonSchema for CommandLine {
 
     /// Mirrors `try_from_argv`: `prefixItems` carries the non-empty program
     /// rule that `items` alone cannot express, so the published schema rejects
-    /// exactly what the parser rejects.
+    /// exactly what the parser rejects
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "array",
@@ -211,25 +211,25 @@ impl schemars::JsonSchema for CommandLine {
     }
 }
 
-/// Why a command line failed validation.
+/// Why a command line failed validation
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandLineError {
-    /// Empty argv.
+    /// Empty argv
     #[error("command must be a non-empty array")]
     Empty,
-    /// Program at index 0 is empty.
+    /// Program at index 0 is empty
     #[error("command[0] must be a non-empty program")]
     EmptyProgram,
-    /// An element contains a NUL byte.
+    /// An element contains a NUL byte
     #[error("command[{index}] must not contain a NUL byte")]
     Nul {
-        /// Index of the bad element.
+        /// Index of the bad element
         index: usize,
     },
 }
 
 impl CommandLineError {
-    /// JSON pointer under `/workload/command`.
+    /// JSON pointer under `/workload/command`
     #[must_use]
     pub fn pointer(&self) -> String {
         match self {
@@ -239,7 +239,7 @@ impl CommandLineError {
         }
     }
 
-    /// Convert to `AppError::InvalidSpec` with the raw value.
+    /// Convert to `AppError::InvalidSpec` with the raw value
     #[must_use]
     pub fn into_invalid_spec(self, value: Value) -> AppError {
         AppError::InvalidSpec {
@@ -250,25 +250,25 @@ impl CommandLineError {
     }
 }
 
-/// Resolved program, arguments, and stdin policy for the runner.
+/// Resolved program, arguments, and stdin policy for the runner
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChildInvocation {
-    /// Absolute executable path.
+    /// Absolute executable path
     pub program: PathBuf,
-    /// Arguments not including argv0.
+    /// Arguments not including argv0
     pub args: Vec<String>,
-    /// Stdin policy.
+    /// Stdin policy
     pub stdin: StdinPolicy,
-    /// Typed environment assignments owned by the agent policy.
+    /// Typed environment assignments owned by the agent policy
     #[serde(skip)]
     pub environment: ChildEnvironment,
-    /// Safe description of managed environment behavior for dry runs.
+    /// Safe description of managed environment behavior for dry runs
     #[serde(skip)]
     pub managed_environment: Option<ManagedEnvironmentPreview>,
 }
 
 impl ChildInvocation {
-    /// Full argv including the program.
+    /// Full argv including the program
     #[must_use]
     pub fn to_vec(&self) -> Vec<String> {
         let mut out = vec![self.program.to_string_lossy().into_owned()];
@@ -277,7 +277,7 @@ impl ChildInvocation {
     }
 }
 
-/// Resolve a program path against captured `PATH` and task `cwd`.
+/// Resolve a program path against captured `PATH` and task `cwd`
 pub fn resolve_executable(program: &str, path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
     let candidate = PathBuf::from(program);
     let resolved = if candidate.is_absolute() {
@@ -312,7 +312,7 @@ fn require_executable_file(path: &Path, requested: &str) -> Result<PathBuf, AppE
     Ok(path.to_path_buf())
 }
 
-/// Resolve an agent binary: `HOMEBASED_<AGENT>` then `which` on `path`.
+/// Resolve an agent binary: `HOMEBASED_<AGENT>` then `which` on `path`
 pub fn resolve_agent_binary(kind: AgentKind, path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
     let pinned = std::env::var(kind.binary_env()).ok();
     resolve_agent_binary_with(kind, pinned.as_deref(), path, cwd)
@@ -321,8 +321,8 @@ pub fn resolve_agent_binary(kind: AgentKind, path: &str, cwd: &Path) -> Result<P
 /// Agent resolution with the override supplied instead of read from the
 /// environment. A pin must itself be an executable file, exactly as a task
 /// program must: silently falling back to whatever `PATH` finds would run a
-/// different binary than the operator asked for.
-fn resolve_agent_binary_with(
+/// different binary than the operator asked for
+pub(crate) fn resolve_agent_binary_with(
     kind: AgentKind,
     pinned: Option<&str>,
     path: &str,
@@ -338,10 +338,10 @@ fn resolve_agent_binary_with(
     })
 }
 
-/// Build a child invocation from a normalized workload.
+/// Build a child invocation from a normalized workload
 ///
 /// Agent workloads always receive a prompt-feed path; the agent policy decides
-/// whether that path is an argv argument or only a stdin source.
+/// whether that path is an argv argument or only a stdin source
 pub fn invocation_from_normalized(
     workload: &NormalizedWorkload,
     env_path: &str,
@@ -357,7 +357,7 @@ pub fn invocation_from_normalized(
     )
 }
 
-/// Build a normalized workload invocation for a specific task identity.
+/// Build a normalized workload invocation for a specific task identity
 pub fn invocation_from_normalized_for_identity(
     workload: &NormalizedWorkload,
     env_path: &str,
@@ -398,10 +398,10 @@ pub fn invocation_from_normalized_for_identity(
     }
 }
 
-/// Build a child invocation from a persisted workload and resolved binary.
+/// Build a child invocation from a persisted workload and resolved binary
 ///
 /// `agent_prompt_feed` is the task evidence feed path. Agent policy consumes it;
-/// task workloads ignore it.
+/// task workloads ignore it
 pub fn invocation_from_workload(
     workload: &Workload,
     binary: &Path,
@@ -429,7 +429,7 @@ pub fn invocation_from_workload(
     }
 }
 
-/// Build a persisted workload invocation for a worker task identity.
+/// Build a persisted workload invocation for a worker task identity
 pub fn invocation_from_workload_for_identity(
     workload: &Workload,
     binary: &Path,
@@ -463,7 +463,7 @@ pub fn invocation_from_workload_for_identity(
     }
 }
 
-/// Resolve the executable for a normalized workload without building argv.
+/// Resolve the executable for a normalized workload without building argv
 pub fn resolve_workload_binary(
     workload: &NormalizedWorkload,
     env_path: &str,
@@ -475,7 +475,7 @@ pub fn resolve_workload_binary(
     }
 }
 
-/// Convert a normalized agent workload into the persisted form.
+/// Convert a normalized agent workload into the persisted form
 #[must_use]
 pub fn persist_agent_workload(agent: &NormalizedAgentWorkload) -> AgentWorkload {
     AgentWorkload {
@@ -485,7 +485,7 @@ pub fn persist_agent_workload(agent: &NormalizedAgentWorkload) -> AgentWorkload 
     }
 }
 
-/// Convert a normalized task workload into the persisted form.
+/// Convert a normalized task workload into the persisted form
 #[must_use]
 pub fn persist_task_workload(task: &crate::spec::NormalizedTaskWorkload) -> TaskWorkload {
     TaskWorkload {
@@ -493,7 +493,7 @@ pub fn persist_task_workload(task: &crate::spec::NormalizedTaskWorkload) -> Task
     }
 }
 
-/// Convert a normalized workload into the persisted form.
+/// Convert a normalized workload into the persisted form
 #[must_use]
 pub fn persist_workload(workload: &NormalizedWorkload) -> Workload {
     match workload {
@@ -504,8 +504,11 @@ pub fn persist_workload(workload: &NormalizedWorkload) -> Workload {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CommandLine, CommandLineError, resolve_agent_binary_with, resolve_executable};
+    use crate::domain::AgentKind;
+    use crate::error::AppError;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
 
     #[test]
     fn command_rejects_empty_argv() {

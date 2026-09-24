@@ -280,20 +280,42 @@ arrives. The same checks then apply.
 
 ### Resolve an unproven ended trainer
 
-Use `operator-release` only when the registered trainer has ended or is lost,
-automatic release proof is unavailable, and an operator has inspected the GPU
-authority machine and confirmed that no work from that trainer remains. For
-example, a trainer with no saved attempt association has no saved lock that the
-authority can use as release proof. This command records the operator's
-decision. It does not prove process exit, lock release, or a reusable
-checkpoint. It cannot release a running trainer.
+Use `operator-release` only when a trainer has ended or is lost, automatic
+release proof is unavailable, and an operator has inspected the GPU authority
+machine and confirmed that no work from that trainer remains. For example, a
+trainer with no saved attempt association has no saved lock that the authority
+can use as release proof. A trainer that ends before its confirmed start
+registers it can never get an association. This command records the
+operator's decision. It does not prove process exit, lock release, or a
+reusable checkpoint. It cannot release a queued or running task.
 
 Run this command on the GPU authority machine, not on a remote supervisor. Read
-the current `resource show` result first. Use its exact resource authority,
-registered background task UUID, and `state_revision`. If a loan is
-`awaiting_release`, use that loan and action UUID in `state_binding`. If there
-is no active loan, use `no_loan`. Other loan phases cannot be resolved by this
-command. Save the complete document before sending it:
+the current `resource show` result first. Use its exact resource authority and
+`state_revision`, and choose the `state_binding` and `task_id` from this table:
+
+| `resource show` state | `state_binding` | `task_id` |
+| --- | --- | --- |
+| No `loan`; `registered_background_task` has ended or is lost | `{"type":"no_loan"}` | `registered_background_task` |
+| `loan` is `awaiting_release` | `{"type":"awaiting_release","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `registered_background_task` |
+| No `loan`; `background_launch.status` is `release_unproven` | `{"type":"first_background_launch","request_id":"<background_launch.request_id>"}` | `background_launch.task_id` |
+| `loan` is `restoring`; `return_execution_mode` is `direct_segment_trainer` | `{"type":"restoring_return","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `phase.resume_task_id` |
+| `loan` is `restoring`; `return_execution_mode` is `native_foreground` | `{"type":"restoring_foreground_return","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `phase.resume_task_id` |
+
+Other loan phases cannot be resolved by this command. A native foreground
+return task that succeeded with a confirmed process-group exit closes its loan
+automatically. If it failed with a confirmed exit, use `resource resolve`. Use
+`restoring_foreground_return` only when that proof is missing, for example
+when the task is lost or its process-group exit is not confirmed. The two
+Restoring bindings are not interchangeable. Read `resource show` and use its
+exact `return_execution_mode` value to choose the binding. If that field is
+absent or unknown, stop; do not infer the mode from the return decision, task
+status, command name, or command text, and do not submit either Restoring
+binding. The authority refuses a binding that does not match the saved mode.
+The `release_unproven` launch status has the attention code
+`background_launch_release_unproven`. The dashboard shows it as
+`Operator release required`, not `Available`, even when no request is queued.
+
+Save the complete document before sending it:
 
 ```json
 {
@@ -312,10 +334,9 @@ command. Save the complete document before sending it:
 }
 ```
 
-For a resource with no active loan, set `state_binding` to
-`{"type":"no_loan"}`. Replace every example value with the exact observed
-value. The observation must describe what the operator checked; do not copy
-the example text. Then run:
+Replace every example value with the exact observed value, and use the
+`state_binding` from the table. The observation must describe what the operator
+checked; do not copy the example text. Then run:
 
 ```sh
 homebased --json resource operator-release --spec operator-release.json
@@ -323,13 +344,30 @@ homebased --json resource show 11111111-1111-4111-8111-111111111111
 ```
 
 The authority saves the attestation, the task evidence it found, and the queue
-or return transition in one transaction. If queued work exists, the oldest
-request can serve. Otherwise, an `awaiting_release` loan moves to
-`awaiting_return`; a resource with no loan records an idle boundary. After an
-unknown result, retry the exact same file and operation UUID, even if the
-resource revision has changed. An exact retry returns the saved receipt. A
-definite refusal needs a fresh state read and, if the operator still confirms
-release, a new attestation with a new operation UUID.
+or loan transition in one transaction:
+
+- `awaiting_release`: with queued work, the oldest request serves. Otherwise
+  the loan moves to `awaiting_return`, and the supervisor decides the return.
+- `no_loan` and `first_background_launch`: the registration clears. With
+  queued work, the oldest request serves. Otherwise the receipt is the idle
+  boundary that a later request or first background launch uses.
+- `restoring_return` and `restoring_foreground_return`: the Restoring loan
+  closes with the attested end, and the registration clears. With queued work,
+  the oldest request serves. Otherwise the closed loan and its receipt are the
+  idle boundary. The task keeps its saved state. A lost task stays lost, and an
+  unconfirmed process-group exit stays unconfirmed. The receipt records the
+  operator's attestation, not a confirmed exit.
+
+Until the receipt commits, the existing loan or launch keeps the resource
+reserved. A task that has ended is not enough; only the saved receipt releases
+it, and it stays released after a daemon restart.
+
+After an unknown result, retry on the same authority with the exact same file
+and operation UUID, even if the resource revision has changed. An exact retry
+returns the saved receipt with `replayed: true`. The same operation UUID with
+changed content is a conflict. A definite refusal writes nothing. It needs a
+fresh state read and, if the operator still confirms release, a new attestation
+with a new operation UUID.
 
 ### Choose what happens after the queue drains
 
@@ -414,7 +452,11 @@ homebased --json resource resolve <loan-uuid> \
 The authority checks the task and release evidence. This is not a way to force
 the GPU free while a task is running or uncertain. A lost task, a task whose
 process-group exit is not confirmed, or a task whose identity changed stays
-reserved.
+reserved. If a direct-segment return task has no lock proof, only an operator
+can release it with the `restoring_return` binding. If a native foreground
+return task is lost or has no confirmed process-group exit, only an operator
+can release it with the `restoring_foreground_return` binding. See
+[Resolve an unproven ended trainer](#resolve-an-unproven-ended-trainer).
 
 ### Retry a failed notice
 

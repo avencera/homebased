@@ -13,10 +13,12 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use super::trainer_association_by_task;
+use super::background::{AdvanceError, advance_resource_on};
+use super::trainer_association::trainer_association_by_task;
 use super::trainer_lock::{
     HeldTrainerRelease, TrainerLockReleaseError, TrainerLockReleaseGap, hold_released_trainer_lock,
 };
+use super::{LoanActionPhase, replace_loan_in_action_phase_on, select_authority_resource};
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskRow, TaskState,
 };
@@ -29,7 +31,7 @@ use crate::resource::store::{
     ResourceStoreError, release_checkpoint_state_for_action, release_completion_for_loan,
     select_non_closed_loan, select_resource, select_supervisor_notice_record_by_action,
 };
-use crate::resource::watcher::revalidate_checkpoint_publication;
+use crate::resource::trainer_publication::revalidate_checkpoint_publication;
 use crate::resource::{
     ActionId, Loan, LoanClosure, LoanId, LoanPhase, LoanState, ReleaseCheckpointPhase, Resource,
     ResourceId, ResourceRevision, ResourceTaskOwnershipRisk, RestoreAttentionReason, ReturnContext,
@@ -38,6 +40,7 @@ use crate::resource::{
 };
 use crate::spec::{NormalizedSpec, NormalizedTaskWorkload, NormalizedWorkload};
 use crate::store::IdentityError;
+use crate::store::identity::{executor_identity_on, origin_route_by_request_on};
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutorIdentity, NormalizedSpecSha256, RequestId,
     normalized_spec_sha256,
@@ -240,12 +243,6 @@ pub(crate) enum ReturnDecisionError {
         /// Missing or failed part of the lock proof
         gap: TrainerLockReleaseGap,
     },
-    /// A legacy receipt has no saved execution mode, and its saved decision cannot prove one
-    #[error("return task {task_id} has no provable execution mode")]
-    ExecutionModeUnproven {
-        /// Bound task
-        task_id: TaskId,
-    },
     /// A saved receipt holds a different decision for the same action
     #[error("return action {action_id:?} was retried with a different decision")]
     ConflictingRetry {
@@ -301,12 +298,7 @@ enum SavedReturnResult {
         normalized_spec_sha256: NormalizedSpecSha256,
         state_revision: ResourceRevision,
         /// Mode fixed by the validated ownership contract at acceptance
-        ///
-        /// Only receipts saved before the mode existed omit it. Those receipts
-        /// derive it from their saved decision or fail closed; see
-        /// [`ReturnDecisionReceipt::execution_mode`]
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        execution_mode: Option<ReturnExecutionMode>,
+        execution_mode: ReturnExecutionMode,
     },
 }
 
@@ -350,38 +342,83 @@ struct RestoreClosureReceipt {
 }
 
 impl ReturnDecisionReceipt {
-    /// Execution mode of a bound launch, or `None` when it cannot be proven
-    ///
-    /// A receipt saved before the mode existed derives it once from its own
-    /// immutable decision: a same-run resume always reruns the verified
-    /// direct-segment trainer, and a supervisor command selects its contract
-    /// from its saved argv, which acceptance already validated. A decision that
-    /// no longer classifies stays unproven, so its loan remains reserved
+    /// Execution mode of a bound launch, or `None` for a no-resume closure
     fn execution_mode(&self) -> Option<ReturnExecutionMode> {
-        let SavedReturnResult::RestoreBound { execution_mode, .. } = &self.result else {
-            return None;
-        };
-        if let Some(mode) = execution_mode {
-            return Some(*mode);
+        match &self.result {
+            SavedReturnResult::RestoreBound { execution_mode, .. } => Some(*execution_mode),
+            SavedReturnResult::Closed { .. } => None,
         }
-        let ReturnDecision::Launch(launch) = &self.decision else {
-            return None;
-        };
-        let Some(spec) = launch.work.supervisor_spec() else {
-            return Some(ReturnExecutionMode::DirectSegmentTrainer);
-        };
-        let command = foreground::task_command(spec.as_normalized())?;
-        CommandOwnershipContract::for_return_command(command)
-            .ok()
-            .map(ReturnExecutionMode::from)
     }
+}
+
+/// Read the accepted mode only when a saved decision still proves the current Restoring loan
+pub(crate) fn current_return_execution_mode_on(
+    conn: &Connection,
+    resource: &Resource,
+    loan: Option<&Loan>,
+) -> Result<Option<ReturnExecutionMode>, ReturnDecisionError> {
+    let Some(loan) = loan else {
+        return Ok(None);
+    };
+    let LoanState::Active {
+        phase:
+            LoanPhase::Restoring {
+                action_id,
+                resume_task_id,
+                ..
+            },
+    } = &loan.state
+    else {
+        return Ok(None);
+    };
+
+    let Some(receipt) = saved_decision(conn, *action_id)? else {
+        return Ok(None);
+    };
+    let ReturnDecision::Launch(launch) = &receipt.decision else {
+        return Ok(None);
+    };
+    let SavedReturnResult::RestoreBound {
+        loan: bound_loan,
+        request_id,
+        task_id,
+        normalized_spec_sha256,
+        execution_mode,
+        ..
+    } = &receipt.result
+    else {
+        return Ok(None);
+    };
+    if bound_loan != loan
+        || *task_id != *resume_task_id
+        || launch.request_id != *request_id
+        || launch.task_id != *task_id
+        || receipt.authority.action_id != *action_id
+        || receipt.authority.loan_id != loan.id
+        || receipt.authority.resource_id != resource.id
+        || receipt.authority.authority_machine != resource.authority_machine()
+    {
+        return Ok(None);
+    }
+    if bound_restore_task(
+        conn,
+        &receipt.authority,
+        *request_id,
+        *task_id,
+        *normalized_spec_sha256,
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(*execution_mode))
 }
 
 /// Bound return task with the evidence its reconciliation needs
 struct BoundRestoreTask {
     row: TaskRow,
-    /// `None` only for a legacy receipt whose mode cannot be proven
-    execution_mode: Option<ReturnExecutionMode>,
+    execution_mode: ReturnExecutionMode,
     /// Stopped run that a same-run resume continues in the same runtime root
     resumed_run: Option<TaskId>,
 }
@@ -491,7 +528,12 @@ fn record_no_resume_for_authority(
     };
     // neither the stopped nor the completed run is live, and no work replaces it
     let state_revision = advance_resource(&tx, &pending.resource, None)?;
-    update_active_loan(&tx, &loan, "awaiting_return", authority.action_id)?;
+    update_active_loan(
+        &tx,
+        &loan,
+        LoanActionPhase::AwaitingReturn,
+        authority.action_id,
+    )?;
     insert_decision_receipt(
         &tx,
         &ReturnDecisionReceipt {
@@ -531,9 +573,7 @@ fn prepare_return_task_for_authority(
                 action_id: authority.action_id,
             });
         };
-        let Some(ExecutorIdentity::Accepted(record)) =
-            super::super::identity::executor_identity_on(&tx, task_id)?
-        else {
+        let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(&tx, task_id)? else {
             return Err(ReturnDecisionError::IdentityConflict { task_id });
         };
         let spec = record
@@ -678,7 +718,7 @@ fn accept_return_task_for_authority(
 
     let task_id = launch.task_id;
     let (spec, env, binary) = return_task_spec(&tx, &pending, &authority, &launch, executor_env)?;
-    if return_identity_is_used(&tx, launch.request_id, task_id)? {
+    if super::task_identity_is_used(&tx, launch.request_id, task_id)? {
         return Err(ReturnDecisionError::IdentityConflict { task_id });
     }
 
@@ -761,7 +801,12 @@ fn accept_return_task_for_authority(
         &pending.resource,
         pending.resource.registered_background_task,
     )?;
-    update_active_loan(&tx, &loan, "awaiting_return", authority.action_id)?;
+    update_active_loan(
+        &tx,
+        &loan,
+        LoanActionPhase::AwaitingReturn,
+        authority.action_id,
+    )?;
     insert_decision_receipt(
         &tx,
         &ReturnDecisionReceipt {
@@ -773,7 +818,7 @@ fn accept_return_task_for_authority(
                 task_id,
                 normalized_spec_sha256: normalized_spec_sha256(&spec)?,
                 state_revision,
-                execution_mode: Some(execution_mode),
+                execution_mode,
             },
         },
     )?;
@@ -798,7 +843,7 @@ fn reconcile_restoring_loan_for_authority(
     resource_id: ResourceId,
 ) -> Result<RestoreReconcileOutcome, ReturnDecisionError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let resource = authority_resource(&tx, authority_machine, resource_id)?;
+    let resource = select_authority_resource(&tx, authority_machine, resource_id)?;
     let Some(loan) = select_non_closed_loan(&tx, resource_id)? else {
         return Ok(RestoreReconcileOutcome::NotRestoring);
     };
@@ -835,8 +880,7 @@ fn reconcile_restoring_loan_for_authority(
             });
         }
         (TaskState::Lost, _) => return attention(RestoreAttentionReason::Lost),
-        (_, None) => return attention(RestoreAttentionReason::ExecutionModeUnproven),
-        (TaskState::Running { .. }, Some(ReturnExecutionMode::DirectSegmentTrainer)) => (
+        (TaskState::Running { .. }, ReturnExecutionMode::DirectSegmentTrainer) => (
             LoanClosure::Resumed {
                 return_context: return_context.clone(),
                 task_id,
@@ -844,19 +888,19 @@ fn reconcile_restoring_loan_for_authority(
             Some(task_id),
             RestoreClosureBasis::ConfirmedRunning,
         ),
-        (TaskState::Finished { .. }, Some(ReturnExecutionMode::DirectSegmentTrainer)) => {
+        (TaskState::Finished { .. }, ReturnExecutionMode::DirectSegmentTrainer) => {
             return attention(RestoreAttentionReason::EndedBeforeConfirmedStart {
                 state: bound.row.status(),
             });
         }
-        (TaskState::Running { .. }, Some(ReturnExecutionMode::NativeForeground)) => {
+        (TaskState::Running { .. }, ReturnExecutionMode::NativeForeground) => {
             return Ok(RestoreReconcileOutcome::ForegroundRunning {
                 loan: loan.clone(),
                 action_id,
                 task_id,
             });
         }
-        (TaskState::Finished { reason }, Some(ReturnExecutionMode::NativeForeground)) => {
+        (TaskState::Finished { reason }, ReturnExecutionMode::NativeForeground) => {
             if let Some(reason) = foreground_end_gap(&bound.row, reason) {
                 return attention(reason);
             }
@@ -882,7 +926,7 @@ fn reconcile_restoring_loan_for_authority(
     // a foreground end also clears the ended prior registration, so the queue
     // can serve its next request from this closure's idle boundary
     let state_revision = advance_resource(&tx, &resource, registered)?;
-    update_active_loan(&tx, &closed, "restoring", action_id)?;
+    update_active_loan(&tx, &closed, LoanActionPhase::Restoring, action_id)?;
     insert_closure_receipt(
         &tx,
         &RestoreClosureReceipt {
@@ -1039,7 +1083,12 @@ fn resolve_ended_restore_for_authority(
         },
     };
     let state_revision = advance_resource(&tx, &resource, None)?;
-    update_active_loan(&tx, &closed, "restoring", authority.action_id)?;
+    update_active_loan(
+        &tx,
+        &closed,
+        LoanActionPhase::Restoring,
+        authority.action_id,
+    )?;
     insert_closure_receipt(
         &tx,
         &RestoreClosureReceipt {
@@ -1083,9 +1132,7 @@ fn hold_restore_release(
     bound: &BoundRestoreTask,
 ) -> Result<Option<HeldTrainerRelease>, ReturnDecisionError> {
     let task_id = bound.row.id;
-    let mode = bound
-        .execution_mode
-        .ok_or(ReturnDecisionError::ExecutionModeUnproven { task_id })?;
+    let mode = bound.execution_mode;
     if mode == ReturnExecutionMode::NativeForeground {
         return Ok(None);
     }
@@ -1129,36 +1176,15 @@ fn restoring_task_ids_for_authority(
         .collect()
 }
 
-fn authority_resource(
-    conn: &Connection,
-    authority_machine: MachineId,
-    resource_id: ResourceId,
-) -> Result<Resource, ReturnDecisionError> {
-    let resource =
-        select_resource(conn, resource_id)?.ok_or(ResourceStoreError::ResourceNotFound)?;
-    if resource.authority_machine() != authority_machine {
-        return Err(ResourceStoreError::WrongAuthority {
-            expected: resource.authority_machine(),
-            found: authority_machine,
-        }
-        .into());
-    }
-
-    Ok(resource)
-}
-
 fn current_supervisor_resource(
     conn: &Connection,
     authority: &SupervisorActionAuthority,
 ) -> Result<Resource, ReturnDecisionError> {
-    if authority.resource_id.as_uuid().is_nil()
-        || authority.loan_id.as_uuid().is_nil()
-        || authority.action_id.as_uuid().is_nil()
-        || authority.supervisor.thread.0.is_nil()
-    {
+    if authority.supervisor.thread.0.is_nil() {
         return Err(ReturnDecisionRejection::InvalidIdentity.into());
     }
-    let resource = authority_resource(conn, authority.authority_machine, authority.resource_id)?;
+    let resource =
+        select_authority_resource(conn, authority.authority_machine, authority.resource_id)?;
     if resource.supervisor != authority.supervisor
         || resource.assignment_revision != authority.assignment_revision
     {
@@ -1194,11 +1220,11 @@ fn pending_return(
         return Err(not_pending());
     }
 
-    let (notice, _) = select_supervisor_notice_record_by_action(conn, authority.action_id)?.ok_or(
-        ReturnDecisionError::InvalidReturnNotice {
+    let (notice, _) = select_supervisor_notice_record_by_action(conn, authority.action_id)
+        .map_err(ResourceStoreError::from)?
+        .ok_or(ReturnDecisionError::InvalidReturnNotice {
             action_id: authority.action_id,
-        },
-    )?;
+        })?;
     if notice.loan_id != loan.id
         || notice.payload
             != (SupervisorNoticePayload::ReturnRequired {
@@ -1265,7 +1291,7 @@ fn require_prior_background_ended(
 ///
 /// The closure receipt must record the confirmed start that registered the
 /// task, and the bound decision must name this resource, a direct-segment
-/// execution mode, and the task's matching accepted identity and callback owner.
+/// execution mode, and the task's matching accepted identity and callback owner
 /// The result is the return action, its request, and the accepted spec digest
 pub(super) fn direct_segment_return_of_registered_trainer_on(
     conn: &Connection,
@@ -1314,10 +1340,53 @@ pub(super) fn direct_segment_return_of_registered_trainer_on(
     Ok(Some((closure.action_id, request_id, digest)))
 }
 
+/// Return the return task of one execution mode that one Restoring loan still binds
+///
+/// The saved decision must bind this exact task to the loan and action with
+/// `mode` as its accepted execution mode, and the task's accepted identity and
+/// callback owner must still match. The result is the return request and the
+/// accepted spec digest. A decision whose mode cannot be proven never matches
+pub(super) fn restoring_return_of_mode_on(
+    conn: &Connection,
+    resource: &Resource,
+    loan: &Loan,
+    action_id: ActionId,
+    task_id: TaskId,
+    mode: ReturnExecutionMode,
+) -> Result<Option<(RequestId, NormalizedSpecSha256)>, ReturnDecisionError> {
+    let Some(decision) = saved_decision(conn, action_id)? else {
+        return Ok(None);
+    };
+    let SavedReturnResult::RestoreBound {
+        loan: bound_loan,
+        request_id,
+        task_id: bound_task,
+        normalized_spec_sha256,
+        ..
+    } = &decision.result
+    else {
+        return Ok(None);
+    };
+    let (request_id, digest) = (*request_id, *normalized_spec_sha256);
+    if *bound_task != task_id
+        || bound_loan.id != loan.id
+        || decision.authority.action_id != action_id
+        || decision.authority.loan_id != loan.id
+        || decision.authority.resource_id != resource.id
+        || decision.authority.authority_machine != resource.authority_machine()
+        || decision.execution_mode() != Some(mode)
+        || bound_restore_task(conn, &decision.authority, request_id, task_id, digest)?.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((request_id, digest)))
+}
+
 /// Derive the resume command from the stopped run's saved records
 ///
 /// The verified release receipt, committed checkpoint decision, trainer
-/// association, accepted identity, and task row must all name the same run.
+/// association, accepted identity, and task row must all name the same run
 /// Only the callback thread and `--resume` generation differ from that run
 fn same_run_resume(
     conn: &Connection,
@@ -1371,9 +1440,7 @@ fn same_run_resume(
                 && association.authority_machine() == resource.authority_machine()
         })
         .ok_or_else(|| unproven(SameRunResumeGap::AssociationMissing))?;
-    let Some(ExecutorIdentity::Accepted(record)) =
-        super::super::identity::executor_identity_on(conn, *task_id)?
-    else {
+    let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(conn, *task_id)? else {
         return Err(unproven(SameRunResumeGap::RunRecordsChanged));
     };
     let original = record
@@ -1381,9 +1448,7 @@ fn same_run_resume(
         .ok_or_else(|| unproven(SameRunResumeGap::RunRecordsChanged))?;
     let row = crate::store::task_by_id_on(conn, *task_id)?
         .ok_or_else(|| unproven(SameRunResumeGap::RunRecordsChanged))?;
-    if record.task != *task_id
-        || record.execution_machine != resource.authority_machine()
-        || !record.has_valid_spec_owners()
+    if !record.is_executed_by(*task_id, resource.authority_machine())
         || normalized_spec_sha256(original)? != association.normalized_spec_sha256()
         || !super::resource_task_row_matches(&row, *task_id, original)
         || !matches!(
@@ -1432,22 +1497,6 @@ fn same_run_resume(
     Ok((spec, row.env, binary))
 }
 
-fn return_identity_is_used(
-    conn: &Connection,
-    request_id: RequestId,
-    task_id: TaskId,
-) -> Result<bool, ReturnDecisionError> {
-    Ok(
-        super::resource_request_identity_exists(conn, request_id, task_id)?
-            || crate::store::release_watcher_task_id_is_reserved(conn, task_id)?
-            || crate::store::task_by_id_on(conn, task_id)?.is_some()
-            || super::super::identity::origin_route_by_request_on(conn, request_id)?.is_some()
-            || super::super::identity::origin_route_by_task_on(conn, task_id)?.is_some()
-            || super::super::identity::executor_identity_on(conn, task_id)?.is_some()
-            || super::task_has_any_event(conn, task_id)?,
-    )
-}
-
 /// Return the bound task when its receipt, route, and accepted identity match
 fn restoring_task_row(
     conn: &Connection,
@@ -1459,7 +1508,6 @@ fn restoring_task_row(
     let Some(receipt) = saved_decision(conn, action_id)? else {
         return Ok(None);
     };
-    let execution_mode = receipt.execution_mode();
     let ReturnDecision::Launch(launch) = &receipt.decision else {
         return Ok(None);
     };
@@ -1473,6 +1521,7 @@ fn restoring_task_row(
         request_id,
         task_id: bound_task,
         normalized_spec_sha256,
+        execution_mode,
         ..
     } = receipt.result
     else {
@@ -1531,12 +1580,10 @@ fn bound_restore_task(
     let Some(row) = crate::store::task_by_id_on(conn, task_id)? else {
         return Ok(None);
     };
-    let Some(ExecutorIdentity::Accepted(record)) =
-        super::super::identity::executor_identity_on(conn, task_id)?
-    else {
+    let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(conn, task_id)? else {
         return Ok(None);
     };
-    let Some(route) = super::super::identity::origin_route_by_request_on(conn, request_id)? else {
+    let Some(route) = origin_route_by_request_on(conn, request_id)? else {
         return Ok(None);
     };
     let spec_matches = record
@@ -1545,17 +1592,16 @@ fn bound_restore_task(
         .transpose()?
         .is_some_and(|saved| saved == digest);
 
-    Ok((record.task == task_id
-        && record.origin_machine == authority_machine
-        && record.execution_machine == authority_machine
-        && record.has_valid_spec_owners()
-        && record.state == row.status()
-        && spec_matches
-        && route.task == task_id
-        && route.origin_machine == authority_machine
-        && route.execution_machine == authority_machine
-        && route.thread == row.thread)
-        .then_some(row))
+    Ok(
+        (record.is_owned_by(task_id, authority_machine, authority_machine)
+            && record.state == row.status()
+            && spec_matches
+            && route.task == task_id
+            && route.origin_machine == authority_machine
+            && route.execution_machine == authority_machine
+            && route.thread == row.thread)
+            .then_some(row),
+    )
 }
 
 fn replayed_result(
@@ -1563,9 +1609,7 @@ fn replayed_result(
     authority: &SupervisorActionAuthority,
     decision: &ReturnDecision,
 ) -> Result<SavedReturnResult, ReturnDecisionError> {
-    if receipt.authority != *authority
-        || serde_json::to_value(&receipt.decision)? != serde_json::to_value(decision)?
-    {
+    if receipt.authority != *authority || receipt.decision != *decision {
         return Err(ReturnDecisionError::ConflictingRetry {
             action_id: authority.action_id,
         });
@@ -1574,77 +1618,36 @@ fn replayed_result(
     Ok(receipt.result)
 }
 
-fn advance_resource(
+/// Advance the resource revision under the shared compare-and-set
+pub(super) fn advance_resource(
     tx: &Transaction<'_>,
     resource: &Resource,
     registered_background_task: Option<TaskId>,
 ) -> Result<ResourceRevision, ReturnDecisionError> {
-    let next = resource
-        .state_revision
-        .get()
-        .checked_add(1)
-        .map(ResourceRevision::new)
-        .ok_or(ReturnDecisionError::RevisionExhausted {
+    match advance_resource_on(tx, resource, registered_background_task) {
+        Ok(next) => Ok(next),
+        Err(AdvanceError::Exhausted) => Err(ReturnDecisionError::RevisionExhausted {
             revision: resource.state_revision,
-        })?;
-    let revision = |value: ResourceRevision| {
-        i64::try_from(value.get())
-            .map_err(|_| ReturnDecisionError::RevisionExhausted { revision: value })
-    };
-    // the supervisor assignment and prior registration are part of the compare
-    let changed = tx.execute(
-        "UPDATE resources SET state_revision = ?1, registered_background_task = ?2
-         WHERE id = ?3 AND authority_machine = ?4 AND state_revision = ?5
-           AND supervisor_machine = ?6 AND supervisor_thread = ?7
-           AND assignment_revision = ?8 AND registered_background_task IS ?9",
-        params![
-            revision(next)?,
-            registered_background_task.map(|task| task.to_string()),
-            resource.id.as_uuid().to_string(),
-            resource.authority_machine().as_uuid().to_string(),
-            revision(resource.state_revision)?,
-            resource.supervisor.machine.as_uuid().to_string(),
-            resource.supervisor.thread.to_string(),
-            i64::try_from(resource.assignment_revision.get())
-                .map_err(|_| { ReturnDecisionError::NotCurrentSupervisor })?,
-            resource
-                .registered_background_task
-                .map(|task| task.to_string()),
-        ],
-    )?;
-    if changed != 1 {
-        let actual = select_resource(tx, resource.id)?
-            .map_or(resource.state_revision, |saved| saved.state_revision);
-        return Err(ReturnDecisionError::StaleRevision {
-            expected: resource.state_revision,
-            actual,
-        });
+        }),
+        Err(AdvanceError::Changed) => {
+            let actual = select_resource(tx, resource.id)?
+                .map_or(resource.state_revision, |saved| saved.state_revision);
+            Err(ReturnDecisionError::StaleRevision {
+                expected: resource.state_revision,
+                actual,
+            })
+        }
+        Err(AdvanceError::Storage(error)) => Err(error.into()),
     }
-
-    Ok(next)
 }
 
 fn update_active_loan(
     tx: &Transaction<'_>,
     loan: &Loan,
-    phase_type: &str,
+    phase: LoanActionPhase,
     action_id: ActionId,
 ) -> Result<(), ReturnDecisionError> {
-    let changed = tx.execute(
-        "UPDATE loans SET state_json = ?1
-         WHERE id = ?2 AND resource_id = ?3
-           AND json_extract(state_json, '$.type') = 'active'
-           AND json_extract(state_json, '$.phase.type') = ?4
-           AND json_extract(state_json, '$.phase.action_id') = ?5",
-        params![
-            serde_json::to_string(&loan.state)?,
-            loan.id.as_uuid().to_string(),
-            loan.resource_id.as_uuid().to_string(),
-            phase_type,
-            action_id.as_uuid().to_string(),
-        ],
-    )?;
-    if changed != 1 {
+    if !replace_loan_in_action_phase_on(tx, loan, phase, action_id)? {
         return Err(ReturnDecisionError::ActionNotPending {
             loan_id: loan.id,
             action_id,

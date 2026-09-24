@@ -1,23 +1,47 @@
 //! Supervisor return decisions, fixed-identity restore binding, and restore closure
 
-use super::*;
+use super::fixtures::{
+    ServingFixture, TrainerAssociationFixture, accept_and_finish_resource_task,
+    commit_stopped_release_decision, completion, machine_other_than, release_completion_fixture,
+    resource, serving_fixture,
+};
+use crate::domain::{
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload,
+};
+use crate::machine::MachineId;
 use crate::resource::ownership_lock::test_support::start_fake_lock_process;
 use crate::resource::ownership_lock::{
-    OwnershipLockIdentityMismatchReason, OwnershipLockProbe, OwnershipLockProbeError,
-    probe_segment_ownership_lock,
+    OwnershipLockIdentity, OwnershipLockIdentityMismatchReason, OwnershipLockProbe,
+    OwnershipLockProbeError, probe_segment_ownership_lock,
+};
+use crate::resource::store::{
+    ReleaseCompletionResult, ResourceStoreError, ResourceTaskCompletionResult,
 };
 use crate::resource::{
-    CommandSpec, IdleBoundaryProof, LoanClosure, RestoreAttentionReason, ReturnDecisionRejection,
+    ActionId, AssignmentRevision, CommandSpec, IdleBoundaryProof, Loan, LoanClosure, LoanId,
+    LoanPhase, LoanState, ReleaseCheckpointStopDecision, Resource, ResourceQueueReconcileOutcome,
+    ResourceRequest, ResourceRequestState, ResourceRevision, ResourceTaskOwnershipRisk,
+    RestoreAttentionReason, ReturnContext, ReturnDecisionRejection, ReturnExecutionMode,
     ReturnLaunch, ReturnWork, SameRunResumeGap, SupervisorActionAuthority,
 };
+use crate::spec::NormalizedWorkload;
 use crate::store::resource::trainer_lock::TrainerLockReleaseGap;
 use crate::store::{
-    EndedRestoreResolution, RestoreReconcileOutcome, ReturnClosure, ReturnDecisionError,
-    ReturnTaskAcceptance, ReturnTaskAcceptanceInput, ReturnTaskOrigin,
+    EndedRestoreResolution, ExecutorIdentity, RestoreReconcileOutcome, ReturnClosure,
+    ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput, ReturnTaskOrigin, Store,
 };
+use crate::submission::{
+    CallbackExecutable, NormalizedSpecSha256, RequestId, SubmissionState, normalized_spec_sha256,
+};
+use rusqlite::{OptionalExtension, params};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use tempfile::tempdir;
+use uuid::Uuid;
 
 /// Drain the serving fixture's only request so the loan awaits its return decision
-fn awaiting_return_fixture() -> (ServingFixture, SupervisorActionAuthority) {
+pub(super) fn awaiting_return_fixture() -> (ServingFixture, SupervisorActionAuthority) {
     let mut fixture = serving_fixture(true, true);
     let input = accept_and_finish_resource_task(
         &mut fixture,
@@ -68,7 +92,7 @@ fn command(fixture: &ServingFixture, argv: &[&str]) -> CommandSpec {
     CommandSpec::try_from(spec).unwrap()
 }
 
-fn evaluation(fixture: &ServingFixture, argv: &[&str]) -> ReturnLaunch {
+pub(super) fn evaluation(fixture: &ServingFixture, argv: &[&str]) -> ReturnLaunch {
     ReturnLaunch {
         request_id: RequestId::new(),
         task_id: TaskId::new(),
@@ -79,7 +103,7 @@ fn evaluation(fixture: &ServingFixture, argv: &[&str]) -> ReturnLaunch {
     }
 }
 
-fn launch_input(
+pub(super) fn launch_input(
     authority: SupervisorActionAuthority,
     launch: ReturnLaunch,
 ) -> ReturnTaskAcceptanceInput {
@@ -322,7 +346,7 @@ fn return_launch_binds_one_fixed_task_with_its_callback_route_and_replays_it() {
         (
             evaluation(&fixture, &["/bin/sh", "-c", "nohup trainer &"]),
             ReturnDecisionRejection::UnsupportedCommandOwnership {
-                risk: crate::resource::ResourceTaskOwnershipRisk::ShellWrapper,
+                risk: ResourceTaskOwnershipRisk::ShellWrapper,
             },
         ),
         (
@@ -331,19 +355,19 @@ fn return_launch_binds_one_fixed_task_with_its_callback_route_and_replays_it() {
                 &["/usr/bin/env", "docker", "run", "-d", "trainer"],
             ),
             ReturnDecisionRejection::UnsupportedCommandOwnership {
-                risk: crate::resource::ResourceTaskOwnershipRisk::ProgramLauncher,
+                risk: ResourceTaskOwnershipRisk::ProgramLauncher,
             },
         ),
         (
             evaluation(&fixture, &["python3", "-m", "ops.evaluate_checkpoint"]),
             ReturnDecisionRejection::UnsupportedCommandOwnership {
-                risk: crate::resource::ResourceTaskOwnershipRisk::Interpreter,
+                risk: ResourceTaskOwnershipRisk::Interpreter,
             },
         ),
         (
             evaluation(&fixture, &[script.to_str().unwrap()]),
             ReturnDecisionRejection::UnsupportedCommandOwnership {
-                risk: crate::resource::ResourceTaskOwnershipRisk::ScriptEntryPoint,
+                risk: ResourceTaskOwnershipRisk::ScriptEntryPoint,
             },
         ),
     ] {
@@ -906,81 +930,100 @@ fn native_foreground_return_without_a_successful_confirmed_end_stays_reserved() 
     }
 }
 
-/// Remove the saved mode, as in a receipt written before the mode existed
-fn strip_saved_execution_mode(store: &Store, action_id: ActionId) {
-    let changed = store
-        .conn
-        .execute(
-            "UPDATE resource_return_decisions
-             SET receipt_json = json_remove(receipt_json, '$.result.execution_mode')
-             WHERE action_id = ?1
-               AND json_extract(receipt_json, '$.result.execution_mode') IS NOT NULL",
-            [action_id.as_uuid().to_string()],
-        )
-        .unwrap();
-    assert_eq!(changed, 1);
+fn read_return_execution_mode(fixture: &ServingFixture) -> Option<ReturnExecutionMode> {
+    read_return_execution_mode_for(&fixture.store, fixture.authority, fixture.resource.id)
+}
+
+fn read_return_execution_mode_for(
+    store: &Store,
+    authority: MachineId,
+    resource: crate::resource::ResourceId,
+) -> Option<ReturnExecutionMode> {
+    store
+        .resource_read_models(authority, Some(resource))
+        .unwrap()
+        .pop()
+        .unwrap()
+        .return_execution_mode
 }
 
 #[test]
-fn legacy_restore_receipt_derives_its_mode_from_the_saved_decision_or_fails_closed() {
-    let (mut fixture, authority, launch, later) = native_restore_fixture();
-    let task_id = launch.task_id;
-    strip_saved_execution_mode(&fixture.store, authority.action_id);
-    start_task(&fixture.store, task_id);
-    // the saved native argv still selects the foreground contract
-    assert!(matches!(
-        reconcile_restore(&mut fixture),
-        RestoreReconcileOutcome::ForegroundRunning { task_id: running, .. } if running == task_id
-    ));
-    assert_native_restore_reserved(&mut fixture, task_id, later.request_id);
+fn resource_read_model_uses_saved_return_modes_only_while_restoring() {
+    let (mut awaiting, authority) = awaiting_return_fixture();
+    assert_eq!(read_return_execution_mode(&awaiting), None);
+    awaiting
+        .store
+        .record_no_resume_for_authority(authority, "no return task".into())
+        .unwrap();
+    assert_eq!(read_return_execution_mode(&awaiting), None);
 
-    // a legacy decision that no longer classifies cannot prove its mode
-    fixture
+    let (native, _, _, _) = native_restore_fixture();
+    assert_eq!(
+        read_return_execution_mode(&native),
+        Some(ReturnExecutionMode::NativeForeground)
+    );
+
+    let (mut direct, direct_authority, decision) = stopped_return_fixture();
+    let input = resume_input(
+        direct_authority,
+        direct.task_id,
+        &decision.selected_checkpoint.generation_id,
+    );
+    let ReturnTaskAcceptance::Inserted { .. } = direct
+        .store
+        .accept_return_task_for_authority(input)
+        .unwrap()
+    else {
+        panic!("the direct-segment return task must be accepted");
+    };
+    assert_eq!(
+        read_return_execution_mode_for(&direct.store, direct.authority, direct.resource.id),
+        Some(ReturnExecutionMode::DirectSegmentTrainer)
+    );
+}
+
+#[test]
+fn resource_read_model_hides_mismatched_return_modes() {
+    let (stale_action, _, _, _) = native_restore_fixture();
+    stale_action
         .store
         .conn
         .execute(
-            "UPDATE resource_return_decisions
-             SET receipt_json = json_set(
-                 receipt_json,
-                 '$.decision.work.spec.workload.command',
-                 json_array('/bin/sh', '-c', 'evaluate')
-             )
-             WHERE action_id = ?1",
-            [authority.action_id.as_uuid().to_string()],
+            "UPDATE loans
+             SET state_json = json_set(state_json, '$.phase.action_id', ?1)
+             WHERE id = ?2",
+            rusqlite::params![
+                ActionId::new().as_uuid().to_string(),
+                stale_action.loan.id.as_uuid().to_string(),
+            ],
         )
         .unwrap();
-    assert!(matches!(
-        reconcile_restore(&mut fixture),
-        RestoreReconcileOutcome::Attention {
-            reason: RestoreAttentionReason::ExecutionModeUnproven,
-            ..
-        }
-    ));
-    finish_running_task(
-        &fixture.store,
-        task_id,
-        ExitReason::Exit { code: 0 },
-        ProcessGroupExitEvidence::ConfirmedExited,
-    );
-    assert!(matches!(
-        reconcile_restore(&mut fixture),
-        RestoreReconcileOutcome::Attention {
-            reason: RestoreAttentionReason::ExecutionModeUnproven,
-            ..
-        }
-    ));
-    assert!(matches!(
+    assert_eq!(read_return_execution_mode(&stale_action), None);
+
+    for identity in ["loan", "task"] {
+        let (fixture, current_authority, launch, _) = native_restore_fixture();
+        let (column, replacement) = match identity {
+            "loan" => ("$.result.loan.id", LoanId::new().as_uuid().to_string()),
+            "task" => ("$.result.task_id", TaskId::new().to_string()),
+            _ => unreachable!(),
+        };
         fixture
             .store
-            .resolve_ended_restore_for_authority(EndedRestoreResolution {
-                authority,
-                task_id,
-                reason: "legacy".into(),
-            }),
-        Err(ReturnDecisionError::ExecutionModeUnproven { task_id: unproven })
-            if unproven == task_id
-    ));
-    assert_native_restore_reserved(&mut fixture, task_id, later.request_id);
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE resource_return_decisions SET receipt_json = json_set(receipt_json, '{column}', ?1) WHERE action_id = ?2"
+                ),
+                rusqlite::params![replacement, current_authority.action_id.as_uuid().to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            read_return_execution_mode(&fixture),
+            None,
+            "mismatched {identity} identity must not expose a mode for task {}",
+            launch.task_id
+        );
+    }
 }
 
 #[test]
@@ -1492,57 +1535,51 @@ fn resume_that_never_spawned_closes_without_a_lock_witness() {
 
 #[test]
 fn same_run_resume_closes_on_its_confirmed_start_and_registers_the_trainer() {
-    for legacy in [false, true] {
-        let (mut fixture, authority, decision) = stopped_return_fixture();
-        let input = resume_input(
-            authority,
-            fixture.task_id,
-            &decision.selected_checkpoint.generation_id,
-        );
-        let task_id = input.launch.task_id;
-        let ReturnTaskAcceptance::Inserted { state_revision, .. } = fixture
-            .store
-            .accept_return_task_for_authority(input)
-            .unwrap()
-        else {
-            panic!("the first exact resume must insert its task");
-        };
-        // a legacy resume receipt derives the direct-segment mode from its decision
-        if legacy {
-            strip_saved_execution_mode(&fixture.store, authority.action_id);
-        }
-        start_task(&fixture.store, task_id);
+    let (mut fixture, authority, decision) = stopped_return_fixture();
+    let input = resume_input(
+        authority,
+        fixture.task_id,
+        &decision.selected_checkpoint.generation_id,
+    );
+    let task_id = input.launch.task_id;
+    let ReturnTaskAcceptance::Inserted { state_revision, .. } = fixture
+        .store
+        .accept_return_task_for_authority(input)
+        .unwrap()
+    else {
+        panic!("the first exact resume must insert its task");
+    };
+    start_task(&fixture.store, task_id);
 
-        let RestoreReconcileOutcome::Closed {
-            closure,
-            task_id: registered,
-        } = fixture
-            .store
-            .reconcile_restoring_loan_for_authority(fixture.authority, fixture.resource.id)
-            .unwrap()
-        else {
-            panic!("legacy={legacy}: a confirmed trainer start must close the loan");
-        };
-        assert_eq!(registered, task_id);
-        assert_eq!(
-            closure.state_revision,
-            ResourceRevision::new(state_revision.get() + 1)
-        );
-        assert!(matches!(
-            closure.loan.state,
-            LoanState::Closed {
-                result: LoanClosure::Resumed { task_id: resumed, .. }
-            } if resumed == task_id
-        ));
-        assert_eq!(
-            saved_resource(&fixture.store, fixture.authority).registered_background_task,
-            Some(task_id)
-        );
-        assert_eq!(
-            restore_closure_basis(&fixture.store, authority.action_id).as_deref(),
-            Some("confirmed_running")
-        );
-    }
+    let RestoreReconcileOutcome::Closed {
+        closure,
+        task_id: registered,
+    } = fixture
+        .store
+        .reconcile_restoring_loan_for_authority(fixture.authority, fixture.resource.id)
+        .unwrap()
+    else {
+        panic!("a confirmed trainer start must close the loan");
+    };
+    assert_eq!(registered, task_id);
+    assert_eq!(
+        closure.state_revision,
+        ResourceRevision::new(state_revision.get() + 1)
+    );
+    assert!(matches!(
+        closure.loan.state,
+        LoanState::Closed {
+            result: LoanClosure::Resumed { task_id: resumed, .. }
+        } if resumed == task_id
+    ));
+    assert_eq!(
+        saved_resource(&fixture.store, fixture.authority).registered_background_task,
+        Some(task_id)
+    );
+    assert_eq!(
+        restore_closure_basis(&fixture.store, authority.action_id).as_deref(),
+        Some("confirmed_running")
+    );
 }
 
 /// Move the drained fixture's supervisor to another machine
@@ -1842,4 +1879,28 @@ fn remote_return_early_end_and_no_resume_need_the_exact_remote_supervisor() {
             result: LoanClosure::NoResume { .. }
         }
     ));
+}
+
+#[test]
+fn unstorable_assignment_revision_is_a_failed_compare_not_a_supervisor_change() {
+    let directory = tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("db")).unwrap();
+    let authority = MachineId::new();
+    let saved = resource(authority);
+    store.register_resource(authority, &saved).unwrap();
+    // no stored row can hold this revision, so the compare can never match
+    let mut snapshot = saved.clone();
+    snapshot.assignment_revision = AssignmentRevision::new(u64::MAX);
+
+    let tx = store.conn.transaction().unwrap();
+    let result = crate::store::resource::restore::advance_resource(&tx, &snapshot, None);
+
+    assert!(
+        matches!(
+            result,
+            Err(ReturnDecisionError::StaleRevision { expected, actual })
+                if expected == saved.state_revision && actual == saved.state_revision
+        ),
+        "{result:?}"
+    );
 }

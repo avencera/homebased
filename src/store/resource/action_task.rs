@@ -5,9 +5,11 @@
 //! exact action receipt in one IMMEDIATE transaction. A retry with the same receipt
 //! observes the saved task and never inserts or spawns it again
 
+use crate::store::IdentityError;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{resource_task_row_matches, validate_release_checkpoint_baseline_on};
+use super::release_checkpoint::validate_release_checkpoint_baseline_on;
+use super::resource_task_row_matches;
 use crate::domain::{ProcessStatus, TaskId, TaskRow};
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -17,12 +19,11 @@ use crate::resource::bound_action::{
 };
 use crate::resource::release_watcher::ReleaseWatcherCommand;
 use crate::resource::store::{
-    ReleaseCheckpointError, select_non_closed_loan, select_resource,
+    ReleaseCheckpointError, ResourceStoreError, select_non_closed_loan, select_resource,
     validate_release_watcher_intent_on,
 };
 use crate::resource::{
-    ActionId, LoanPhase, LoanState, ReleaseWatcherIntent, SavedReleaseWatcherIntent,
-    SupervisorActionAuthority,
+    ActionId, LoanPhase, LoanState, ReleaseWatcherIntent, SupervisorActionAuthority,
 };
 use crate::spec::NormalizedSpec;
 use crate::submission::{ExecutorIdentity, normalized_spec_sha256};
@@ -44,17 +45,28 @@ impl From<rusqlite::Error> for ResourceActionError {
     }
 }
 
+impl From<ResourceStoreError> for ResourceActionError {
+    fn from(error: ResourceStoreError) -> Self {
+        match error {
+            ResourceStoreError::Storage(error) => Self::Storage(error.into()),
+            error => Self::Storage(AppError::Internal {
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+
 impl From<serde_json::Error> for ResourceActionError {
     fn from(error: serde_json::Error) -> Self {
         Self::Storage(error.into())
     }
 }
 
-impl From<crate::store::IdentityError> for ResourceActionError {
-    fn from(error: crate::store::IdentityError) -> Self {
+impl From<IdentityError> for ResourceActionError {
+    fn from(error: IdentityError) -> Self {
         match error {
-            crate::store::IdentityError::Storage(error) => Self::Storage(error),
-            crate::store::IdentityError::Conflict | crate::store::IdentityError::RouteNotFound => {
+            IdentityError::Storage(error) => Self::Storage(error),
+            IdentityError::Conflict | IdentityError::RouteNotFound => {
                 Self::Rejected(ResourceActionRejection::IdentityConflict)
             }
         }
@@ -159,8 +171,7 @@ fn accept_remote_release_watcher(
     let resource_id = authority.resource_id;
     let authority_machine = authority.authority_machine;
     let resource = current_remote_supervisor(&tx, &authority)?;
-    let loan = select_non_closed_loan(&tx, resource_id)
-        .map_err(AppError::from)?
+    let loan = select_non_closed_loan(&tx, resource_id)?
         .filter(|loan| loan.id == authority.loan_id)
         .ok_or(ResourceActionError::Rejected(
             ResourceActionRejection::ActionNotPending,
@@ -179,7 +190,7 @@ fn accept_remote_release_watcher(
     if *action_id != authority.action_id || *saved_task != observed_background_task {
         return rejected(ResourceActionRejection::ActionNotPending);
     }
-    let Some(SavedReleaseWatcherIntent::Complete(intent)) = watcher_intent else {
+    let Some(intent) = watcher_intent else {
         return rejected(ResourceActionRejection::WatcherUnavailable {
             reason: "the release action has no complete watcher identity".into(),
         });
@@ -234,11 +245,9 @@ pub(super) fn current_remote_supervisor(
     conn: &Connection,
     authority: &SupervisorActionAuthority,
 ) -> Result<crate::resource::Resource, ResourceActionError> {
-    let resource = select_resource(conn, authority.resource_id)
-        .map_err(AppError::from)?
-        .ok_or(ResourceActionError::Rejected(
-            ResourceActionRejection::ActionNotPending,
-        ))?;
+    let resource = select_resource(conn, authority.resource_id)?.ok_or(
+        ResourceActionError::Rejected(ResourceActionRejection::ActionNotPending),
+    )?;
     if resource.authority_machine() != authority.authority_machine {
         return rejected(ResourceActionRejection::ActionNotPending);
     }
@@ -371,11 +380,11 @@ pub(crate) fn remote_action_task_row_on(
     .map_err(|error| AppError::Internal {
         message: format!("action task first event: {error}"),
     })?;
-    let matches = record.task == task_id
-        && record.origin_machine == receipt.origin_machine()
-        && record.execution_machine == receipt.execution_machine()
-        && record.has_valid_spec_owners()
-        && record.state == row.status()
+    let matches = record.is_owned_by(
+        task_id,
+        receipt.origin_machine(),
+        receipt.execution_machine(),
+    ) && record.state == row.status()
         && spec.thread == receipt.authority.supervisor.thread
         && normalized_spec_sha256(spec)? == receipt.normalized_spec_sha256
         && resource_task_row_matches(&row, task_id, spec)

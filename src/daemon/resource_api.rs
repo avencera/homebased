@@ -6,6 +6,8 @@
 //! authority through the StoreActor and the existing owners: origin-owned
 //! cancellation, the resource queue submission path, and the notice sender
 
+use crate::resource::ReturnContext;
+use crate::resource::trainer_publication::AttemptBinding;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -39,15 +41,16 @@ use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
 use crate::resource::api::{
-    AttentionCode, AttentionView, BrowserResourceAction, CLUSTER_RESOURCE_PENDING_PATH,
-    CLUSTER_RESOURCES_PATH, ClusterPendingActions, ClusterResourceControl, ClusterResourceDetail,
-    ClusterResourceList, OperatorReleaseBody, OperatorReleaseResponse, PendingActionList,
-    PendingActionPhase, PendingActionView, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH,
-    RequestCancelBody, ResourceActionBody, ResourceBackgroundSubmitOutcome,
-    ResourceBackgroundSubmitResponse, ResourceControl, ResourceDetail, ResourceList,
-    ResourceOverview, ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
-    ResourceRequestSubmitResponse, ResourceRequestView, ResourceTaskSummary,
-    SupervisorReplacementBody, TrainerAttemptBody, TrainerAttemptResponse, UnavailableAuthority,
+    AttentionCode, AttentionView, BackgroundLaunchReservation, BackgroundLaunchReservationStatus,
+    BrowserResourceAction, CLUSTER_RESOURCE_PENDING_PATH, CLUSTER_RESOURCES_PATH,
+    ClusterPendingActions, ClusterResourceControl, ClusterResourceDetail, ClusterResourceList,
+    OperatorReleaseBody, OperatorReleaseResponse, PendingActionList, PendingActionPhase,
+    PendingActionView, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody,
+    ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
+    ResourceControl, ResourceDetail, ResourceList, ResourceOverview, ResourceRegisterBody,
+    ResourceRegistration, ResourceRequestSubmitOutcome, ResourceRequestSubmitResponse,
+    ResourceRequestView, ResourceTaskSummary, SupervisorReplacementBody, TrainerAttemptBody,
+    TrainerAttemptResponse, UnavailableAuthority,
 };
 use crate::resource::operator_release::OperatorGpuFreeRefusal;
 use crate::resource::{
@@ -58,8 +61,8 @@ use crate::resource::{
 };
 use crate::spec::{self, NormalizedSpec};
 use crate::store::{
-    BackgroundLaunchAcceptance, BackgroundLaunchError, OperatorGpuFreeError, ResourceControlEffect,
-    ResourceControlRequest, ResourceReadModel, open_action_id,
+    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchPhase, OperatorGpuFreeError,
+    ResourceControlEffect, ResourceControlRequest, ResourceReadModel, open_action_id,
 };
 use crate::submission::{RequestId, ResourceRoutePhase, SubmissionState};
 
@@ -650,8 +653,8 @@ async fn operator_release(
         return Err(AppError::ResourceActionNotAllowed {
             resource,
             message: format!(
-                "operator attestation names authority {}, but this daemon is {}",
-                body.attestation.authority_machine, authority
+                "operator attestation names authority {}, but this daemon is {authority}",
+                body.attestation.authority_machine
             ),
         });
     }
@@ -756,7 +759,7 @@ fn operator_release_unknown(resource: ResourceId, operation: Uuid, detail: Strin
 /// Bind the supervisor-named trainer attempt to the registered background task
 ///
 /// The trainer creates its attempt and ownership lock only after it starts, so
-/// this runs after the resource owner registered the task on its confirmed start.
+/// this runs after the resource owner registered the task on its confirmed start
 /// The authority reads the attempt request and probes the held lock itself. An
 /// exact saved association is returned without a new probe
 async fn trainer_attempt(
@@ -791,7 +794,7 @@ pub(super) async fn authority_trainer_attempt(
     state: &AppState,
     resource: ResourceId,
     task_id: TaskId,
-    attempt_binding: crate::resource::watcher::AttemptBinding,
+    attempt_binding: AttemptBinding,
 ) -> Result<TrainerAttemptResponse, AppError> {
     let authority = state.machine.identity.machine;
     let not_allowed = |message: String| AppError::ResourceActionNotAllowed { resource, message };
@@ -837,7 +840,7 @@ async fn bind_trainer_attempt(
     state: &AppState,
     resource: ResourceId,
     task_id: TaskId,
-    binding: crate::resource::watcher::AttemptBinding,
+    binding: AttemptBinding,
 ) -> Result<crate::resource::TrainerAttemptAssociation, AppError> {
     let authority = state.machine.identity.machine;
     let not_allowed = |message: String| AppError::ResourceActionNotAllowed { resource, message };
@@ -1600,6 +1603,7 @@ async fn local_overviews(state: &AppState) -> Result<Vec<ResourceOverview>, AppE
                 .count() as u64,
             current_task: current_task_id(&model).and_then(|id| tasks.get(&id).cloned()),
             attention: attention(&model, inspection.as_ref()),
+            background_launch: background_launch_reservation(&model),
             resource: model.resource,
             loan: model.loan,
         });
@@ -1626,7 +1630,10 @@ async fn local_detail(
     .await?;
     let inspection = inspect(state, resource).await;
     let attention = attention(&model, inspection.as_ref());
+    let background_launch = background_launch_reservation(&model);
     Ok(Some(ResourceDetail {
+        background_launch,
+        return_execution_mode: model.return_execution_mode,
         api_version: API_VERSION,
         requests: model.requests.iter().map(request_view).collect(),
         current_task: current_task_id.and_then(|id| tasks.get(&id).cloned()),
@@ -1665,7 +1672,7 @@ fn pending_action(model: &ResourceReadModel) -> Option<PendingActionView> {
         } => (
             PendingActionPhase::AttentionRequired {
                 reason: reason.clone(),
-                last_safe_phase: last_safe_phase.clone(),
+                last_safe_phase: Box::new(last_safe_phase.clone()),
             },
             phase_return_context(last_safe_phase),
         ),
@@ -1689,9 +1696,7 @@ fn pending_action(model: &ResourceReadModel) -> Option<PendingActionView> {
     })
 }
 
-fn pending_phase(
-    phase: &LoanPhase,
-) -> Option<(PendingActionPhase, Option<crate::resource::ReturnContext>)> {
+fn pending_phase(phase: &LoanPhase) -> Option<(PendingActionPhase, Option<ReturnContext>)> {
     match phase {
         LoanPhase::AwaitingRelease {
             observed_background_task,
@@ -1720,13 +1725,34 @@ fn pending_phase(
     }
 }
 
-fn phase_return_context(phase: &LoanPhase) -> Option<crate::resource::ReturnContext> {
+fn phase_return_context(phase: &LoanPhase) -> Option<ReturnContext> {
     match phase {
         LoanPhase::Serving { return_context, .. }
         | LoanPhase::AwaitingReturn { return_context, .. }
         | LoanPhase::Restoring { return_context, .. } => Some(return_context.clone()),
         LoanPhase::AwaitingRelease { .. } => None,
     }
+}
+
+/// First background launch that still reserves the resource, from durable launch state
+fn background_launch_reservation(model: &ResourceReadModel) -> Option<BackgroundLaunchReservation> {
+    use BackgroundLaunchReservationStatus as Status;
+
+    let launch = model.background_launch.as_ref()?;
+    let status = match launch.phase {
+        BackgroundLaunchPhase::Queued => Status::Queued,
+        BackgroundLaunchPhase::StartedUnregistered => Status::StartedUnregistered,
+        BackgroundLaunchPhase::IdentityMismatch => Status::IdentityMismatch,
+        _ if launch.awaits_operator_release() => Status::ReleaseUnproven,
+        BackgroundLaunchPhase::Superseded
+        | BackgroundLaunchPhase::Registered
+        | BackgroundLaunchPhase::EndedBeforeRegistration { .. } => return None,
+    };
+    Some(BackgroundLaunchReservation {
+        request_id: launch.request_id,
+        task_id: launch.task_id,
+        status,
+    })
 }
 
 /// Task that holds the resource in the current loan phase
@@ -1850,9 +1876,38 @@ fn attention(
             notice_id: None,
         });
     }
-    inspection
-        .and_then(|inspection| actor_attention(model, inspection))
+    // durable launch state needs no actor snapshot and no queued request to show
+    launch_attention(model)
+        .or_else(|| inspection.and_then(|inspection| actor_attention(model, inspection)))
         .or_else(|| notice_attention(model))
+}
+
+fn launch_attention(model: &ResourceReadModel) -> Option<AttentionView> {
+    let reservation = background_launch_reservation(model)?;
+    let (code, message) = match reservation.status {
+        BackgroundLaunchReservationStatus::ReleaseUnproven => (
+            AttentionCode::BackgroundLaunchReleaseUnproven,
+            "the first background launch ended before registration, and its GPU release is not \
+             proven; the resource stays reserved until an operator inspects the authority GPU \
+             and attests with the first_background_launch binding"
+                .to_owned(),
+        ),
+        BackgroundLaunchReservationStatus::IdentityMismatch => (
+            AttentionCode::QueueBlocked,
+            "the first background launch records do not match its receipt, so the resource \
+             stays reserved"
+                .to_owned(),
+        ),
+        BackgroundLaunchReservationStatus::Queued
+        | BackgroundLaunchReservationStatus::StartedUnregistered => return None,
+    };
+    Some(AttentionView {
+        code,
+        message,
+        action_id: None,
+        task_id: Some(reservation.task_id),
+        notice_id: None,
+    })
 }
 
 fn actor_attention(
@@ -1940,7 +1995,6 @@ fn watcher_attention(
             watcher_task_id, ..
         } => Some(*watcher_task_id),
         ReleaseWatcherAttentionReason::RemoteSupervisorUnsupported { .. }
-        | ReleaseWatcherAttentionReason::LegacyWatcherIntent
         | ReleaseWatcherAttentionReason::ExecutableUnavailable
         | ReleaseWatcherAttentionReason::BindingRejected
         | ReleaseWatcherAttentionReason::BaselineUnavailable => None,
@@ -2075,14 +2129,15 @@ fn restore_attention(reason: RestoreAttentionReason) -> String {
         }
         RestoreAttentionReason::ForegroundExitUnconfirmed { state } => format!(
             "the native foreground return task ended ({state}), but its process-group exit is \
-             not confirmed"
+             not confirmed; the resource stays reserved until an operator inspects the authority \
+             GPU and attests with the restoring_foreground_return binding"
         ),
-        RestoreAttentionReason::Lost => "the return task is lost".into(),
+        RestoreAttentionReason::Lost => "the return task is lost; the resource stays reserved \
+             until an operator inspects the authority GPU and attests with the Restoring binding \
+             of its execution mode"
+            .into(),
         RestoreAttentionReason::IdentityMismatch => {
             "the return task identity does not match the bound action".into()
-        }
-        RestoreAttentionReason::ExecutionModeUnproven => {
-            "the saved return decision cannot prove how the return task holds the resource".into()
         }
         RestoreAttentionReason::ReconcileFailed => {
             "the authority could not evaluate the return task".into()

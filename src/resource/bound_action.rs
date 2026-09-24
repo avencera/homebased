@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ActionId, Loan, ResourceRevision, ReturnDecision, ReturnLaunch, ReturnWork,
-    SupervisorActionAuthority,
+    SupervisorActionAuthority, validate_release_watcher_identity,
 };
 use crate::domain::{API_VERSION, ProcessStatus, TaskId};
 use crate::machine::MachineId;
@@ -42,7 +42,7 @@ pub enum ResourceActionKind {
 ///
 /// The route keeps it so a retry after a lost reply or restart resends exactly
 /// the same launch without asking the caller again
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceActionLaunch {
     /// The watcher bound to the release action for this background task
@@ -56,19 +56,6 @@ pub enum ResourceActionLaunch {
         work: ReturnWork,
     },
 }
-
-// normalized specs have no structural equality; their JSON encoding is the
-// retry-comparison form used everywhere else, so equality follows it
-impl PartialEq for ResourceActionLaunch {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (serde_json::to_value(self), serde_json::to_value(other)),
-            (Ok(left), Ok(right)) if left == right
-        )
-    }
-}
-
-impl Eq for ResourceActionLaunch {}
 
 impl ResourceActionLaunch {
     /// Kind of task this choice launches
@@ -252,9 +239,6 @@ impl ResourceActionRequest {
         }
         if self.source_machine.as_uuid().is_nil()
             || self.destination_machine.as_uuid().is_nil()
-            || authority.resource_id.as_uuid().is_nil()
-            || authority.loan_id.as_uuid().is_nil()
-            || authority.action_id.as_uuid().is_nil()
             || authority.supervisor.thread.0.is_nil()
         {
             return Err(ResourceActionRequestError::InvalidIdentity);
@@ -270,8 +254,12 @@ impl ResourceActionRequest {
                 observed_background_task,
                 task,
             } if observed_background_task.0.is_nil()
-                || !distinct_identity(task.request_id, task.task_id)
-                || task.task_id == *observed_background_task =>
+                || validate_release_watcher_identity(
+                    *observed_background_task,
+                    task.request_id,
+                    task.task_id,
+                )
+                .is_err() =>
             {
                 Err(ResourceActionRequestError::InvalidIdentity)
             }
@@ -587,9 +575,19 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::*;
-    use crate::domain::ThreadId;
-    use crate::resource::{AssignmentRevision, LoanId, ResourceId, SupervisorAddress};
+    use super::{
+        ActionTaskIdentity, PreparedActionTask, RESOURCE_ACTION_PROTOCOL_VERSION,
+        ResourceActionKind, ResourceActionOperation, ResourceActionRequest,
+        ResourceActionRequestError,
+    };
+    use crate::domain::{TaskId, ThreadId};
+    use crate::machine::MachineId;
+    use crate::resource::{
+        ActionId, AssignmentRevision, LoanId, ResourceId, ResourceRevision, ReturnLaunch,
+        ReturnWork, SupervisorActionAuthority, SupervisorAddress,
+    };
+    use crate::spec::NormalizedSpec;
+    use crate::submission::{RequestId, normalized_spec_sha256};
 
     fn authority() -> SupervisorActionAuthority {
         SupervisorActionAuthority {

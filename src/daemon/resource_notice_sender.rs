@@ -1,4 +1,4 @@
-//! One authority-side delivery attempt for a durable supervisor notice.
+//! One authority-side delivery attempt for a durable supervisor notice
 
 use axum::http::StatusCode;
 use std::future::Future;
@@ -18,30 +18,30 @@ use crate::resource::{
 
 const RESOURCE_NOTICE_PATH: &str = "/v1/cluster/resource-notices";
 
-/// Settled delivery state and the verified receiver receipt, when delivery succeeded.
+/// Settled delivery state and the verified receiver receipt, when delivery succeeded
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResourceNoticeDeliveryOutcome {
-    /// Notice after this attempt was settled by the StoreActor.
+    /// Notice after this attempt was settled by the StoreActor
     pub notice: SupervisorNotice,
-    /// Receipt returned by the exact local or remote destination.
+    /// Receipt returned by the exact local or remote destination
     pub receipt: Option<SupervisorNoticeReceipt>,
 }
 
-/// The attempt could not be reserved or its settlement could not be persisted.
+/// The attempt could not be reserved or its settlement could not be persisted
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResourceNoticeSendError {
-    /// Actor transport failed.
+    /// Actor transport failed
     #[error(transparent)]
     Actor(#[from] AppError),
-    /// Durable notice state rejected the operation.
+    /// Durable notice state rejected the operation
     #[error(transparent)]
     Store(#[from] SupervisorNoticeStoreError),
-    /// The StoreActor did not return the attempt reserved by this call.
+    /// The StoreActor did not return the attempt reserved by this call
     #[error("reserved supervisor notice attempt does not match its identity")]
     ReservationMismatch,
 }
 
-/// Reserve and settle at most one supervisor-notice delivery attempt.
+/// Reserve and settle at most one supervisor-notice delivery attempt
 pub(crate) async fn deliver_one(
     state: &AppState,
     notice_id: NoticeId,
@@ -243,19 +243,26 @@ fn verify_receipt(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::daemon::actors::StoreMsg;
-    use crate::daemon::actors::{StoreActor, call};
-    use crate::domain::ThreadId;
+    use super::{
+        RESOURCE_NOTICE_PATH, decode_remote_receipt, notice_request, post_remote_notice,
+        reserve_deliver_settle, verify_receipt,
+    };
+    use crate::daemon::actors::{StoreActor, StoreMsg, call};
+    use crate::domain::{API_VERSION, ThreadId};
     use crate::fleet::address::MachineAddress;
+    use crate::fleet::http::ClusterClient;
+    use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
     use crate::machine::MachineId;
     use crate::resource::store::insert_supervisor_notice_in_transaction;
     use crate::resource::{
-        ActionId, AssignmentRevision, LoanId, NoticeId, ResourceId, ResourceRevision,
-        SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery, SupervisorNoticePayload,
+        ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, NoticeId, ResourceId,
+        ResourceRevision, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
+        SupervisorNoticePayload, SupervisorNoticeReceipt, SupervisorNoticeRequest,
+        SupervisorNoticeResponse,
     };
     use crate::store::Store;
     use axum::Json;
+    use axum::http::StatusCode;
     use axum::routing::post;
     use chrono::Utc;
     use ractor::Actor;

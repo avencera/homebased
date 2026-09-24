@@ -1,12 +1,8 @@
 //! Origin-owned submission of command requests to resource authorities
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use super::AppState;
@@ -25,9 +21,6 @@ use crate::submission::{
     CallbackContext, NewResourceRoute, OriginRoute, RequestId, ResourceQueueOutcome,
     ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
 };
-
-const SUBMISSION_SHARDS: usize = 64;
-static SUBMISSION_PERMITS: OnceLock<[Semaphore; SUBMISSION_SHARDS]> = OnceLock::new();
 
 /// Input that identifies one resource-backed command submission
 #[derive(Debug, Clone)]
@@ -59,25 +52,12 @@ pub(super) enum ResourceSubmitOutcome {
     CancelledBeforeLaunch { task: TaskId },
 }
 
-async fn lock_request(request: RequestId) -> Result<SemaphorePermit<'static>, AppError> {
-    let permits = SUBMISSION_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
-    let mut hasher = DefaultHasher::new();
-    request.hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % SUBMISSION_SHARDS;
-    permits[shard]
-        .acquire()
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("resource submission permit unavailable: {error}"),
-        })
-}
-
 /// Submit a resource-backed command or return its durable saved result
 pub(super) async fn submit(
     state: &AppState,
     input: ResourceSubmitInput,
 ) -> Result<ResourceSubmitOutcome, AppError> {
-    let _request_guard = lock_request(input.request).await?;
+    let _request_guard = state.locks.resource_submissions.lock(input.request).await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request: input.request,
         reply,
@@ -98,7 +78,11 @@ async fn retry_saved_route(
     state: &AppState,
     expected: &OriginRoute,
 ) -> Result<ResourceSubmitOutcome, AppError> {
-    let _request_guard = lock_request(expected.request).await?;
+    let _request_guard = state
+        .locks
+        .resource_submissions
+        .lock(expected.request)
+        .await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request: expected.request,
         reply,
@@ -158,8 +142,7 @@ fn ensure_same_recovery_identity(
             "saved route is no longer a resource route",
         ));
     };
-    let same_spec = serde_json::to_value(expected.current_spec())?
-        == serde_json::to_value(saved.current_spec())?;
+    let same_spec = expected.current_spec() == saved.current_spec();
     if expected.request != saved.request
         || expected.task != saved.task
         || expected.origin_machine != saved.origin_machine
@@ -269,7 +252,7 @@ fn validate_retry(route: &OriginRoute, input: &ResourceSubmitInput) -> Result<()
     };
     if route.execution_machine != input.authority
         || *resource != input.resource
-        || serde_json::to_value(saved_spec)? != serde_json::to_value(&input.spec)?
+        || *saved_spec != input.spec
     {
         return Err(conflict(
             route,
@@ -363,7 +346,7 @@ fn local_receipt(
         || stored.task_id != route.task
         || stored.resource_id != resource
         || stored.origin_machine != route.origin_machine
-        || serde_json::to_value(stored.spec().as_normalized())? != serde_json::to_value(spec)?
+        || stored.spec().as_normalized() != spec
     {
         return Err(unknown(
             route,
@@ -576,21 +559,32 @@ mod tests {
     use ractor::Actor;
     use tempfile::tempdir;
 
-    use super::*;
-    use crate::daemon::actors::call;
-    use crate::daemon::actors::{SupervisorActor, SupervisorMsg};
+    use super::{
+        ResourceSubmitInput, ResourceSubmitOutcome, decode_resource_response,
+        ensure_same_recovery_identity, outcome_from_route, resource_from_route,
+        route_acceptance_is_unknown, submit_local, validate_retry,
+    };
+    use crate::daemon::AppState;
+    use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+    use crate::domain::{TaskEnv, TaskId};
+    use crate::error::AppError;
     use crate::files::StreamSlots;
     use crate::fleet::FleetState;
     use crate::fleet::directory::LocalMachine;
+    use crate::fleet::http::ClusterResponse;
     use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
     use crate::home::Home;
-    use crate::machine::MachineId;
-    use crate::machine::{LocalIdentity, MachineName};
+    use crate::machine::{LocalIdentity, MachineId, MachineName};
     use crate::resource::{
         AssignmentRevision, Resource, ResourceId, ResourceQueueAttentionReason,
-        ResourceQueueReconcileOutcome, ResourceRevision, SupervisorAddress,
+        ResourceQueueReconcileOutcome, ResourceQueueResponse, ResourceRevision, SupervisorAddress,
     };
-    use crate::submission::{CallbackExecutable, ResourceQueueOutcome};
+    use crate::spec::NormalizedSpec;
+    use crate::submission::{
+        CallbackContext, CallbackExecutable, NewResourceRoute, OriginRoute, RequestId,
+        ResourceQueueOutcome, ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
+    };
+    use serde_json::Value;
 
     fn spec() -> NormalizedSpec {
         serde_json::from_value(serde_json::json!({
@@ -687,10 +681,13 @@ mod tests {
         let directory = tempdir().unwrap();
         let home = Home::resolve(Some(directory.path().join("state"))).unwrap();
         home.ensure().unwrap();
-        let (supervisor, supervisor_handle) =
-            SupervisorActor::spawn(None, SupervisorActor, home.clone())
-                .await
-                .unwrap();
+        let (supervisor, supervisor_handle) = SupervisorActor::spawn(
+            None,
+            SupervisorActor,
+            SupervisorArgs::new(home.clone(), None),
+        )
+        .await
+        .unwrap();
         let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
             .await
             .unwrap();
@@ -736,6 +733,7 @@ mod tests {
             machine,
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
+            locks: crate::daemon::DaemonLocks::default(),
         };
 
         let first = submit_local(&state, &route).await.unwrap();
@@ -868,10 +866,7 @@ mod tests {
         assert_eq!(resource_from_route(&saved), resource_from_route(&expected));
         assert_eq!(saved.execution_machine, expected.execution_machine);
         assert_eq!(saved.callback, expected.callback);
-        assert_eq!(
-            serde_json::to_value(saved.current_spec()).unwrap(),
-            serde_json::to_value(expected.current_spec()).unwrap()
-        );
+        assert_eq!(saved.current_spec(), expected.current_spec());
 
         let mut changed_request = saved.clone();
         changed_request.request = RequestId::new();

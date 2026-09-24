@@ -1,4 +1,4 @@
-//! Domain types and legal state transitions.
+//! Domain types and legal state transitions
 
 use std::fmt;
 use std::path::PathBuf;
@@ -11,34 +11,37 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
-/// Public JSON schema version.
+/// Public JSON schema version
 pub const API_VERSION: u32 = 1;
 
-/// SQLite `user_version`. Earlier databases migrate in place to this version.
-pub const SCHEMA_VERSION: i64 = 27;
+/// SQLite `user_version`
+///
+/// Released versions 1, 2, and 27 migrate in place to this version
+/// Unreleased development versions 3 through 26 are refused
+pub const SCHEMA_VERSION: i64 = 28;
 
-/// Maximum Unicode scalar values in a submitted task name.
+/// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;
 
-/// Minimum output-inactivity timeout. Values below this are rejected at submit.
+/// Minimum output-inactivity timeout. Values below this are rejected at submit
 pub const MIN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Default output-inactivity timeout when the submitter omits `timeout`.
+/// Default output-inactivity timeout when the submitter omits `timeout`
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// Maximum length of one report summary.
+/// Maximum length of one report summary
 pub const SUMMARY_MAX_BYTES: usize = 4096;
 
-/// Maximum number of reports on one task.
+/// Maximum number of reports on one task
 pub const REPORTS_MAX: usize = 20;
 
-/// Human-readable task name from submit. Non-unique; `TaskId` is identity.
+/// Human-readable task name from submit. Non-unique; `TaskId` is identity
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TaskName(String);
 
 impl TaskName {
-    /// Trim and validate a submitted name.
+    /// Trim and validate a submitted name
     pub fn parse(raw: &str) -> Result<Self, TaskNameError> {
         for ch in raw.chars() {
             if ch == '\n' || ch == '\r' {
@@ -61,7 +64,7 @@ impl TaskName {
         Ok(Self(trimmed.to_string()))
     }
 
-    /// Borrow the validated name.
+    /// Borrow the validated name
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -103,30 +106,30 @@ impl schemars::JsonSchema for TaskName {
     }
 }
 
-/// Why a submitted task name was rejected.
+/// Why a submitted task name was rejected
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TaskNameError {
-    /// Empty after trim.
+    /// Empty after trim
     #[error("name must not be blank")]
     Blank,
-    /// Contains a newline or carriage return.
+    /// Contains a newline or carriage return
     #[error("name must not contain line breaks")]
     LineBreak,
-    /// Contains a Unicode control character.
+    /// Contains a Unicode control character
     #[error("name must not contain control character U+{:04X}", *.ch as u32)]
     Control {
-        /// Offending scalar value.
+        /// Offending scalar value
         ch: char,
     },
-    /// Longer than [`TASK_NAME_MAX_CHARS`] scalars after trim.
+    /// Longer than [`TASK_NAME_MAX_CHARS`] scalars after trim
     #[error("name must be at most {max} characters (got {len})", max = TASK_NAME_MAX_CHARS)]
     TooLong {
-        /// Scalar count after trim.
+        /// Scalar count after trim
         len: usize,
     },
 }
 
-/// Codex thread that submitted the task.
+/// Codex thread that submitted the task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ThreadId(pub Uuid);
@@ -161,13 +164,13 @@ impl schemars::JsonSchema for ThreadId {
     }
 }
 
-/// Task identifier (UUID v7 at creation).
+/// Task identifier (UUID v7 at creation)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub Uuid);
 
 impl TaskId {
-    /// Allocate a new v7 id.
+    /// Allocate a new v7 id
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::now_v7())
@@ -186,20 +189,20 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// Identity available while constructing one child invocation.
+/// Identity available while constructing one child invocation
 ///
 /// Dry runs use [`Self::Preview`] because no task row exists. Workers use
-/// [`Self::Actual`] so agent-specific names cannot collide across tasks.
+/// [`Self::Actual`] so agent-specific names cannot collide across tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskIdentity {
-    /// Deterministic placeholder used by dry-run output.
+    /// Deterministic placeholder used by dry-run output
     Preview,
-    /// Persisted task identity used by a worker.
+    /// Persisted task identity used by a worker
     Actual(TaskId),
 }
 
 impl TaskIdentity {
-    /// Build the OpenCode primary-agent name for this identity.
+    /// Build the OpenCode primary-agent name for this identity
     #[must_use]
     pub fn opencode_agent_name(self) -> String {
         format!("homebased-{self}")
@@ -239,7 +242,7 @@ impl schemars::JsonSchema for TaskId {
     }
 }
 
-/// Supported agent CLIs.
+/// Supported agent CLIs
 #[derive(
     Debug,
     Clone,
@@ -255,21 +258,21 @@ impl schemars::JsonSchema for TaskId {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum AgentKind {
-    /// `codex exec`.
+    /// `codex exec`
     Codex,
-    /// `claude -p`.
+    /// `claude -p`
     Claude,
-    /// `grok` full agent.
+    /// `grok` full agent
     Grok,
-    /// `opencode run`.
+    /// `opencode run`
     OpenCode,
 }
 
 impl AgentKind {
-    /// Every supported agent, in declaration order.
+    /// Every supported agent, in declaration order
     pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Grok, Self::OpenCode];
 
-    /// Environment override that pins this agent's binary.
+    /// Environment override that pins this agent's binary
     #[must_use]
     pub fn binary_env(self) -> &'static str {
         match self {
@@ -280,7 +283,7 @@ impl AgentKind {
         }
     }
 
-    /// Default binary name on PATH.
+    /// Default binary name on PATH
     #[must_use]
     pub fn binary_name(self) -> &'static str {
         match self {
@@ -298,19 +301,19 @@ impl fmt::Display for AgentKind {
     }
 }
 
-/// Agent kind plus an optional model id.
+/// Agent kind plus an optional model id
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
-    /// CLI kind. Serialized as `agent` to match the public workload shape.
+    /// CLI kind. Serialized as `agent` to match the public workload shape
     #[serde(rename = "agent")]
     pub kind: AgentKind,
-    /// Model id such as `fable`, `grok-4.6`, or `provider/model#variant`. Empty becomes `None`.
+    /// Model id such as `fable`, `grok-4.6`, or `provider/model#variant`. Empty becomes `None`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
 impl Agent {
-    /// Build an agent, treating a blank model as unset.
+    /// Build an agent, treating a blank model as unset
     #[must_use]
     pub fn new(kind: AgentKind, model: Option<String>) -> Self {
         let model = model.and_then(|value| {
@@ -325,7 +328,7 @@ impl Agent {
     }
 }
 
-/// Process lifecycle.
+/// Process lifecycle
 #[derive(
     Debug,
     Clone,
@@ -341,22 +344,22 @@ impl Agent {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum ProcessStatus {
-    /// Inserted, worker not yet CAS-marked running.
+    /// Inserted, worker not yet CAS-marked running
     Queued,
-    /// Worker holds `runner.lock` and the child may be alive.
+    /// Worker holds `runner.lock` and the child may be alive
     Running,
-    /// Child exited 0.
+    /// Child exited 0
     Succeeded,
-    /// Child exited non-zero, failed to spawn, or was signalled without cancel.
+    /// Child exited non-zero, failed to spawn, or was signalled without cancel
     Failed,
-    /// Cancelled by `task cancel` or `stop --yes`.
+    /// Cancelled by `task cancel` or `stop --yes`
     Cancelled,
-    /// Lock free and no `exit.json`.
+    /// Lock free and no `exit.json`
     Lost,
 }
 
 impl ProcessStatus {
-    /// Whether this status is terminal.
+    /// Whether this status is terminal
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -365,7 +368,7 @@ impl ProcessStatus {
         )
     }
 
-    /// SQLite storage tag.
+    /// SQLite storage tag
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -378,7 +381,7 @@ impl ProcessStatus {
         }
     }
 
-    /// Parse a storage tag.
+    /// Parse a storage tag
     pub fn from_storage(value: &str) -> Result<Self, AppError> {
         match value {
             "queued" => Ok(Self::Queued),
@@ -401,47 +404,47 @@ impl fmt::Display for ProcessStatus {
 }
 
 /// Why the process ended. `runner_lost` is a process payload, not a stored reason
-/// on a live worker: Lost tasks have no `exit.json`.
+/// on a live worker: Lost tasks have no `exit.json`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExitReason {
-    /// Process exited.
+    /// Process exited
     Exit {
-        /// Exit code the process returned.
+        /// Exit code the process returned
         code: i32,
     },
-    /// Process received a signal.
+    /// Process received a signal
     Signal {
-        /// Signal number that ended the process.
+        /// Signal number that ended the process
         signal: i32,
     },
-    /// Cancelled.
+    /// Cancelled
     Cancelled,
-    /// `task-run` or the child binary could not start.
+    /// `task-run` or the child binary could not start
     SpawnFailed {
-        /// Why the spawn failed.
+        /// Why the spawn failed
         message: String,
     },
 }
 
-/// Evidence about the child process group owned by one live task-run worker.
+/// Evidence about the child process group owned by one live task-run worker
 /// This is separate from `ExitReason`: a terminal task can still have an
 /// unconfirmed process group. It does not cover detached containers or
-/// processes in another session.
+/// processes in another session
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessGroupExitEvidence {
-    /// The worker did not confirm that its child process group exited.
+    /// The worker did not confirm that its child process group exited
     #[default]
     Unconfirmed,
-    /// The worker's post-cleanup probe confirmed that its owned process group was gone.
+    /// The worker's post-cleanup probe confirmed that its owned process group was gone
     ConfirmedExited,
-    /// The task-run worker did not spawn a child process.
+    /// The task-run worker did not spawn a child process
     NoChildSpawned,
 }
 
 impl ProcessGroupExitEvidence {
-    /// SQLite storage tag.
+    /// SQLite storage tag
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -451,7 +454,7 @@ impl ProcessGroupExitEvidence {
         }
     }
 
-    /// Parse a storage tag. Unknown values remain conservative.
+    /// Parse a storage tag. Unknown values remain conservative
     #[must_use]
     pub fn from_storage(value: Option<&str>) -> Self {
         match value {
@@ -463,22 +466,22 @@ impl ProcessGroupExitEvidence {
     }
 }
 
-/// Compatibility projection of the terminal event's origin-inbox result.
+/// Compatibility projection of the terminal event's origin-inbox result
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallbackStatus {
-    /// No queue attempt is in flight and the terminal event is unsettled.
+    /// No queue attempt is in flight and the terminal event is unsettled
     Pending,
-    /// A queue attempt has been reserved for the terminal event.
+    /// A queue attempt has been reserved for the terminal event
     Sending,
-    /// `codex queue` succeeded.
+    /// `codex queue` succeeded
     Sent,
-    /// The terminal event settled without queue success.
+    /// The terminal event settled without queue success
     Failed,
 }
 
 impl CallbackStatus {
-    /// SQLite storage tag.
+    /// SQLite storage tag
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -489,7 +492,7 @@ impl CallbackStatus {
         }
     }
 
-    /// Parse a storage tag.
+    /// Parse a storage tag
     pub fn from_storage(value: &str) -> Result<Self, AppError> {
         match value {
             "pending" => Ok(Self::Pending),
@@ -509,35 +512,35 @@ impl fmt::Display for CallbackStatus {
     }
 }
 
-/// Origin-inbox status exposed beside a task row.
+/// Origin-inbox status exposed beside a task row
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackProjection {
-    /// Status retained by a row that predates typed event ownership.
+    /// Status retained by a row that predates typed event ownership
     Legacy(CallbackStatus),
-    /// Status read from this machine's origin inbox.
+    /// Status read from this machine's origin inbox
     OriginInbox(CallbackStatus),
-    /// The origin machine owns delivery, so this executor cannot report it.
+    /// The origin machine owns delivery, so this executor cannot report it
     NotOwned,
 }
 
 /// Attention-reminder delivery state. A third axis, independent of the process
-/// status and of the terminal callback: a reminder never changes either one.
-/// `Delivered` carries its timestamp, so "delivered with no time" cannot exist.
+/// status and of the terminal callback: a reminder never changes either one
+/// `Delivered` carries its timestamp, so "delivered with no time" cannot exist
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionState {
-    /// No reminder claimed yet.
+    /// No reminder claimed yet
     Pending,
-    /// A sender holds the claim and the queue send is in flight.
+    /// A sender holds the claim and the queue send is in flight
     Sending,
-    /// `TASK_CHECK_DUE` was delivered.
+    /// `TASK_CHECK_DUE` was delivered
     Delivered {
-        /// When the queue send succeeded.
+        /// When the queue send succeeded
         at: DateTime<Utc>,
     },
 }
 
 impl AttentionState {
-    /// SQLite storage tag for the `attention_state` column.
+    /// SQLite storage tag for the `attention_state` column
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -547,7 +550,7 @@ impl AttentionState {
         }
     }
 
-    /// Rebuild from the `attention_state` and `timeout_notified_at` columns.
+    /// Rebuild from the `attention_state` and `timeout_notified_at` columns
     pub fn from_storage(tag: &str, at: Option<DateTime<Utc>>) -> Result<Self, AppError> {
         match (tag, at) {
             ("pending", None) => Ok(Self::Pending),
@@ -562,7 +565,7 @@ impl AttentionState {
         }
     }
 
-    /// When the reminder was delivered, if it was.
+    /// When the reminder was delivered, if it was
     #[must_use]
     pub fn delivered_at(&self) -> Option<DateTime<Utc>> {
         match self {
@@ -571,7 +574,7 @@ impl AttentionState {
         }
     }
 
-    /// Whether `TASK_CHECK_DUE` has already been delivered.
+    /// Whether `TASK_CHECK_DUE` has already been delivered
     #[must_use]
     pub fn is_delivered(&self) -> bool {
         matches!(self, Self::Delivered { .. })
@@ -585,18 +588,18 @@ impl fmt::Display for AttentionState {
 }
 
 /// Caller environment captured at submit. Closed like every other socket
-/// shape: an unrecognised key is a caller mistake, not data to ignore.
+/// shape: an unrecognised key is a caller mistake, not data to ignore
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskEnv {
-    /// Caller's `PATH`.
+    /// Caller's `PATH`
     pub path: String,
-    /// Caller's `HOME`.
+    /// Caller's `HOME`
     pub home: String,
 }
 
 impl TaskEnv {
-    /// Capture from this process.
+    /// Capture from this process
     #[must_use]
     pub fn capture() -> Self {
         Self {
@@ -606,23 +609,23 @@ impl TaskEnv {
     }
 }
 
-/// Worker-authored outcome.
+/// Worker-authored outcome
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum ReportOutcome {
-    /// Work completed.
+    /// Work completed
     Succeeded,
-    /// Work failed.
+    /// Work failed
     Failed,
-    /// Worker needs a decision.
+    /// Worker needs a decision
     Blocked,
 }
 
 impl ReportOutcome {
-    /// SQLite storage tag.
+    /// SQLite storage tag
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -632,7 +635,7 @@ impl ReportOutcome {
         }
     }
 
-    /// Parse a storage tag.
+    /// Parse a storage tag
     pub fn from_storage(value: &str) -> Result<Self, AppError> {
         match value {
             "succeeded" => Ok(Self::Succeeded),
@@ -651,32 +654,32 @@ impl fmt::Display for ReportOutcome {
     }
 }
 
-/// One append-only worker report. Belongs to the supervised task, not only to an agent.
+/// One append-only worker report. Belongs to the supervised task, not only to an agent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskReport {
-    /// 1-based sequence.
+    /// 1-based sequence
     pub seq: i64,
-    /// Worker outcome.
+    /// Worker outcome
     pub outcome: ReportOutcome,
-    /// Summary text, at most 4 KiB.
+    /// Summary text, at most 4 KiB
     pub summary: String,
-    /// When the row was appended.
+    /// When the row was appended
     pub reported_at: DateTime<Utc>,
-    /// When an interim `--notify` send succeeded.
+    /// When an interim `--notify` send succeeded
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notified_at: Option<DateTime<Utc>>,
 }
 
-/// Persisted agent workload. Prompt bytes live in task evidence files.
+/// Persisted agent workload. Prompt bytes live in task evidence files
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentWorkload {
-    /// Agent identity.
+    /// Agent identity
     #[serde(flatten)]
     pub agent: Agent,
-    /// Extra argv appended after the unattended flags.
+    /// Extra argv appended after the unattended flags
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    /// Whether the reporting trailer is fed to the child.
+    /// Whether the reporting trailer is fed to the child
     #[serde(default = "default_true")]
     pub report_trailer: bool,
 }
@@ -685,46 +688,46 @@ fn default_true() -> bool {
     true
 }
 
-/// Persisted task workload: a validated argv.
+/// Persisted task workload: a validated argv
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskWorkload {
-    /// Validated command line.
+    /// Validated command line
     pub command: crate::invocation::CommandLine,
 }
 
-/// Persisted workload discriminant.
+/// Persisted workload discriminant
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Workload {
-    /// Agent CLI with prompt evidence on disk.
+    /// Agent CLI with prompt evidence on disk
     Agent(AgentWorkload),
-    /// Arbitrary non-interactive command.
+    /// Arbitrary non-interactive command
     Task(TaskWorkload),
 }
 
 /// Lifecycle of one task, derived from the `status`, `exit_reason` and `pid`
 /// columns. Every terminal state except `Lost` carries the reason it ended, so
-/// `status` is never read without the data that explains it.
+/// `status` is never read without the data that explains it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskState {
-    /// Inserted, worker not yet CAS-marked running.
+    /// Inserted, worker not yet CAS-marked running
     Queued,
-    /// Worker holds `runner.lock`. `pid` is recorded just after the CAS.
+    /// Worker holds `runner.lock`. `pid` is recorded just after the CAS
     Running {
-        /// Worker pid (also pgid). Display and signalling only.
+        /// Worker pid (also pgid). Display and signalling only
         pid: Option<i32>,
     },
-    /// Worker wrote an exit reason.
+    /// Worker wrote an exit reason
     Finished {
-        /// Why the process ended.
+        /// Why the process ended
         reason: ExitReason,
     },
-    /// Lock free and no `exit.json`.
+    /// Lock free and no `exit.json`
     Lost,
 }
 
 impl TaskState {
-    /// Rebuild the state from the stored columns.
+    /// Rebuild the state from the stored columns
     pub fn from_storage(
         status: ProcessStatus,
         exit_reason: Option<ExitReason>,
@@ -744,7 +747,7 @@ impl TaskState {
         }
     }
 
-    /// Storage tag for the `status` column.
+    /// Storage tag for the `status` column
     #[must_use]
     pub fn status(&self) -> ProcessStatus {
         match self {
@@ -755,7 +758,7 @@ impl TaskState {
         }
     }
 
-    /// Stored exit reason, if the task ended with one.
+    /// Stored exit reason, if the task ended with one
     #[must_use]
     pub fn exit_reason(&self) -> Option<&ExitReason> {
         match self {
@@ -764,7 +767,7 @@ impl TaskState {
         }
     }
 
-    /// Worker pid while running.
+    /// Worker pid while running
     #[must_use]
     pub fn pid(&self) -> Option<i32> {
         match self {
@@ -773,62 +776,62 @@ impl TaskState {
         }
     }
 
-    /// Whether the task can no longer change process status.
+    /// Whether the task can no longer change process status
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Finished { .. } | Self::Lost)
     }
 }
 
-/// Persisted task row.
+/// Persisted task row
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
-    /// Task id.
+    /// Task id
     pub id: TaskId,
-    /// Submitted name. `None` only for rows stored before name was required.
+    /// Submitted name. `None` only for rows stored before name was required
     pub name: Option<TaskName>,
-    /// Submitting Codex thread.
+    /// Submitting Codex thread
     pub thread: ThreadId,
-    /// Workload configuration.
+    /// Workload configuration
     pub workload: Workload,
-    /// Working directory.
+    /// Working directory
     pub cwd: PathBuf,
-    /// Output-inactivity timeout. Reminds the submitter; does not kill the child.
+    /// Output-inactivity timeout. Reminds the submitter; does not kill the child
     pub timeout: Duration,
-    /// Captured caller environment.
+    /// Captured caller environment
     pub env: TaskEnv,
-    /// Resolved executable path.
+    /// Resolved executable path
     pub binary: PathBuf,
-    /// Process lifecycle.
+    /// Process lifecycle
     pub state: TaskState,
-    /// Durable evidence for the task-run worker's child process group.
+    /// Durable evidence for the task-run worker's child process group
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
-    /// Terminal callback delivery. A second axis: it outlives the process state.
+    /// Terminal callback delivery. A second axis: it outlives the process state
     pub callback_status: CallbackStatus,
-    /// Attention-reminder delivery state.
+    /// Attention-reminder delivery state
     pub attention: AttentionState,
-    /// When cancel was requested.
+    /// When cancel was requested
     pub cancel_requested_at: Option<DateTime<Utc>>,
-    /// Insert time.
+    /// Insert time
     pub created_at: DateTime<Utc>,
-    /// Last row update.
+    /// Last row update
     pub updated_at: DateTime<Utc>,
 }
 
 impl TaskRow {
-    /// Storage status of the process.
+    /// Storage status of the process
     #[must_use]
     pub fn status(&self) -> ProcessStatus {
         self.state.status()
     }
 
-    /// Exit reason once known.
+    /// Exit reason once known
     #[must_use]
     pub fn exit_reason(&self) -> Option<&ExitReason> {
         self.state.exit_reason()
     }
 
-    /// Child process-group evidence, unknown until the task reaches a terminal state.
+    /// Child process-group evidence, unknown until the task reaches a terminal state
     #[must_use]
     pub fn process_group_exit_evidence(&self) -> ProcessGroupExitEvidence {
         match &self.state {
@@ -839,20 +842,20 @@ impl TaskRow {
         }
     }
 
-    /// Worker pid while running.
+    /// Worker pid while running
     #[must_use]
     pub fn pid(&self) -> Option<i32> {
         self.state.pid()
     }
 
-    /// Non-empty label for UI and events: submitted name, else workload fallback.
+    /// Non-empty label for UI and events: submitted name, else workload fallback
     #[must_use]
     pub fn display_name(&self) -> String {
         display_name(self.name.as_ref(), &self.workload)
     }
 }
 
-/// Non-empty display label from an optional name and workload.
+/// Non-empty display label from an optional name and workload
 #[must_use]
 pub fn display_name(name: Option<&TaskName>, workload: &Workload) -> String {
     if let Some(name) = name {
@@ -861,12 +864,12 @@ pub fn display_name(name: Option<&TaskName>, workload: &Workload) -> String {
     workload_display_name(workload)
 }
 
-/// Workload-only fallback used when no submitted name is present.
+/// Workload-only fallback used when no submitted name is present
 #[must_use]
 pub fn workload_display_name(workload: &Workload) -> String {
     match workload {
         Workload::Agent(agent) => match &agent.agent.model {
-            Some(model) => format!("{}/{}", agent.agent.kind, model),
+            Some(model) => format!("{}/{model}", agent.agent.kind),
             None => agent.agent.kind.to_string(),
         },
         Workload::Task(task) => {
@@ -883,29 +886,29 @@ pub fn workload_display_name(workload: &Workload) -> String {
     }
 }
 
-/// Illegal transition.
+/// Illegal transition
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransitionError {
-    /// `Lost → Running` is forbidden.
+    /// `Lost → Running` is forbidden
     #[error("cannot move Lost to Running")]
     LostToRunning,
-    /// Reports cannot be appended after the process is terminal.
+    /// Reports cannot be appended after the process is terminal
     #[error("cannot report on terminal task ({status})")]
     ReportOnTerminal {
-        /// Terminal status that rejected the report.
+        /// Terminal status that rejected the report
         status: ProcessStatus,
     },
-    /// Any other illegal process-status pair.
+    /// Any other illegal process-status pair
     #[error("illegal status transition {from} -> {to}")]
     IllegalStatus {
-        /// Status the task holds.
+        /// Status the task holds
         from: ProcessStatus,
-        /// Status the caller asked for.
+        /// Status the caller asked for
         to: ProcessStatus,
     },
 }
 
-/// Check a process-status compare-and-swap.
+/// Check a process-status compare-and-swap
 pub fn check_status_transition(
     from: ProcessStatus,
     to: ProcessStatus,
@@ -936,7 +939,7 @@ pub fn check_status_transition(
     }
 }
 
-/// Reject a report on a terminal task.
+/// Reject a report on a terminal task
 pub fn check_report_allowed(status: ProcessStatus) -> Result<(), TransitionError> {
     if status.is_terminal() {
         Err(TransitionError::ReportOnTerminal { status })
@@ -967,7 +970,15 @@ impl From<&ExitReason> for ProcessStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        Agent, AgentKind, AgentWorkload, AttentionState, ExitReason, ProcessStatus, TaskId,
+        TaskIdentity, TaskName, TaskNameError, TaskState, TaskWorkload, ThreadId, TransitionError,
+        Workload, check_report_allowed, check_status_transition, display_name,
+        workload_display_name,
+    };
+    use crate::error::AppError;
+    use chrono::Utc;
+    use std::str::FromStr;
 
     #[test]
     fn thread_id_parse_rejects_prefix() {
@@ -1077,7 +1088,7 @@ mod tests {
         assert_eq!(finished.status(), ProcessStatus::Failed);
         assert_eq!(finished.exit_reason(), Some(&ExitReason::Exit { code: 1 }));
 
-        // Lost is the one terminal state with no exit.json to explain it
+        // `Lost` is the one terminal state with no exit.json to explain it
         assert_eq!(
             TaskState::from_storage(ProcessStatus::Lost, None, Some(7)).unwrap(),
             TaskState::Lost

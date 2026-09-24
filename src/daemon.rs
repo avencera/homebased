@@ -1,4 +1,4 @@
-//! Serve: daemon lock, socket, actors, shutdown.
+//! Serve: daemon lock, socket, actors, shutdown
 
 pub mod actors;
 pub mod api;
@@ -8,6 +8,7 @@ pub mod content;
 pub mod event_sender;
 pub mod fleet_api;
 mod inspection;
+mod keyed_locks;
 pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
@@ -30,8 +31,10 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorMsg, call};
+use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+use crate::daemon::keyed_locks::KeyedLocks;
 use crate::daemon::web::WebListen;
+use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::files::StreamSlots;
 use crate::fleet::FleetState;
@@ -40,33 +43,56 @@ use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 use crate::machine::LocalIdentity;
+use crate::resource::ActionId;
+use crate::submission::RequestId;
 
-/// Axum state: actor refs plus immutable path config.
+/// Axum state: actor refs plus immutable path config
 #[derive(Clone)]
 pub struct AppState {
-    /// State directory (immutable layout).
+    /// State directory (immutable layout)
     pub home: Home,
     /// Store actor for durable reads and writes
-    pub store: ActorRef<StoreMsg>,
-    /// Supervisor: owns the task lifecycle.
-    pub supervisor: ActorRef<SupervisorMsg>,
+    pub(crate) store: ActorRef<StoreMsg>,
+    /// Supervisor: owns the task lifecycle
+    pub(crate) supervisor: ActorRef<SupervisorMsg>,
     /// Address the dashboard listener bound, or `None` when it is off or the
-    /// bind failed.
+    /// bind failed
     pub web: Option<SocketAddr>,
-    /// Content-origin port on the same host as the dashboard, when bound.
+    /// Content-origin port on the same host as the dashboard, when bound
     pub content: Option<SocketAddr>,
-    /// Concurrent raw-file stream permits.
+    /// Concurrent raw-file stream permits
     pub stream_slots: StreamSlots,
-    /// Stable machine UUID, this boot's UUID, name, and protocol range.
+    /// Stable machine UUID, this boot's UUID, name, and protocol range
     pub machine: LocalMachine,
-    /// Fleet runtime handle when `fleet.enabled` is true.
+    /// Fleet runtime handle when `fleet.enabled` is true
     pub fleet: FleetState,
-    /// Daemon-owned serializer for direct-message queue attempts.
+    /// Daemon-owned serializer for direct-message queue attempts
     pub(crate) message_receiver: message_receiver::MessageReceiver,
+    /// Per-key locks that serialize idempotent daemon sections
+    pub(crate) locks: DaemonLocks,
+}
+
+/// Per-key locks this daemon holds while it resolves or sends one saved route
+///
+/// Each field is a separate key space. A section reads its saved state, decides,
+/// and saves or sends while it holds the key, so a concurrent retry of the same
+/// key observes the result instead of racing it
+#[derive(Clone, Default)]
+pub(crate) struct DaemonLocks {
+    /// Origin-side remote task submissions, by caller request
+    pub(crate) origin_submissions: KeyedLocks<RequestId>,
+    /// Origin-side resource queue submissions, by caller request
+    pub(crate) resource_submissions: KeyedLocks<RequestId>,
+    /// Supervisor-side resource action launches, by action
+    pub(crate) resource_actions: KeyedLocks<ActionId>,
+    /// Supervisor-side background launches, by launch request
+    pub(crate) background_launches: KeyedLocks<RequestId>,
+    /// Origin-side cancellation intents, by task
+    pub(crate) cancellation_intents: KeyedLocks<TaskId>,
 }
 
 /// Hold `daemon.lock`, bind the socket and optional dashboard port, start
-/// actors, start fleet discovery when enabled, serve until SIGTERM.
+/// actors, start fleet discovery when enabled, serve until SIGTERM
 pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<(), AppError> {
     home.ensure()?;
     let _daemon_lock = acquire_daemon_lock(&home)?;
@@ -94,7 +120,11 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         },
         None => (None, None),
     };
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
+    let supervisor_args = SupervisorArgs::new(
+        home.clone(),
+        std::env::var(crate::domain::AgentKind::Codex.binary_env()).ok(),
+    );
+    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await
         .map_err(|err| AppError::Internal {
             message: format!("spawn supervisor: {err}"),
@@ -116,6 +146,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         machine,
         fleet,
         message_receiver: message_receiver::MessageReceiver::default(),
+        locks: DaemonLocks::default(),
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),
@@ -194,7 +225,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
 
 /// Start fleet discovery in the background when the config enables it. A
 /// fleet failure never stops the daemon: local tasks keep working and the
-/// cluster routes stay absent.
+/// cluster routes stay absent
 fn start_fleet(
     home: &Home,
     config: &Config,
@@ -219,7 +250,7 @@ fn start_fleet(
 }
 
 /// Address a bound listener is reachable on. A listener with no readable
-/// address cannot be advertised, so the dashboard URL stays `null`.
+/// address cannot be advertised, so the dashboard URL stays `null`
 fn bound_addr(listener: &TcpListener) -> Option<SocketAddr> {
     match listener.local_addr() {
         Ok(addr) => Some(addr),
@@ -231,7 +262,7 @@ fn bound_addr(listener: &TcpListener) -> Option<SocketAddr> {
 }
 
 /// Serve the dashboard until shutdown. Its failure is never the daemon's:
-/// the socket API and the supervisor keep running.
+/// the socket API and the supervisor keep running
 async fn serve_web(
     listener: Option<TcpListener>,
     state: AppState,
@@ -250,7 +281,7 @@ async fn serve_web(
     }
 }
 
-/// Serve raw file content on a separate origin. Failure is non-fatal.
+/// Serve raw file content on a separate origin. Failure is non-fatal
 async fn serve_content(
     listener: Option<TcpListener>,
     addr: Option<SocketAddr>,

@@ -1,12 +1,13 @@
 //! Executor outbox and origin inbox persistence
 
+use crate::domain::ProcessStatus;
 use std::num::NonZeroU64;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use super::Store;
+use super::{IdentityError, Store};
 use crate::callback::EventKind;
 use crate::domain::{API_VERSION, SUMMARY_MAX_BYTES, TaskId};
 use crate::error::AppError;
@@ -23,16 +24,29 @@ use crate::submission::{
 const EVENT_RETENTION_DAYS: i64 = 30;
 const EVENT_RETENTION_BATCH_SIZE: i64 = 64;
 
-/// Result of one bounded event-retention cleanup transaction.
+/// Result of one bounded event-retention cleanup transaction
 pub(crate) struct EventRetentionBatch {
-    /// Number of payload rows compacted.
+    /// Number of payload rows compacted
     pub(crate) compacted: usize,
-    /// Whether either table filled its batch and may have more eligible rows.
+    /// Whether either table filled its batch and may have more eligible rows
     pub(crate) has_more: bool,
 }
 
 fn storage(error: rusqlite::Error) -> EventError {
     EventError::Storage(error.into())
+}
+
+/// Read one executor identity, treating an invalid saved owner as an owner conflict
+fn executor_identity_on(
+    conn: &Connection,
+    task: TaskId,
+) -> Result<Option<ExecutorIdentity>, EventError> {
+    super::identity::executor_identity_on(conn, task).map_err(|error| match error {
+        IdentityError::Storage(error) => EventError::Storage(error),
+        IdentityError::Conflict | IdentityError::RouteNotFound => {
+            EventError::OwnerConflict { task }
+        }
+    })
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<String, EventError> {
@@ -135,7 +149,7 @@ impl Store {
     /// Compact settled executor and origin event payloads older than 30 days
     ///
     /// Each side processes at most 64 rows in one immediate transaction. The
-    /// corresponding receipt is inserted before its payload row is deleted.
+    /// corresponding receipt is inserted before its payload row is deleted
     pub(crate) fn compact_old_event_payloads(&mut self) -> Result<EventRetentionBatch, EventError> {
         let cutoff = super::fmt_time(Utc::now() - ChronoDuration::days(EVENT_RETENTION_DAYS));
         let tx = self
@@ -300,19 +314,8 @@ impl Store {
         &self,
         task: TaskId,
     ) -> Result<Option<EventRouteStatus>, EventError> {
-        let identity: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        let Some(identity) = identity else {
-            return Ok(None);
-        };
-        let ExecutorIdentity::Accepted(record) = decode(&identity)? else {
+        let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(&self.conn, task)?
+        else {
             return Ok(None);
         };
         let (pending, acknowledged): (i64, i64) = self
@@ -730,12 +733,17 @@ pub(super) fn append_produced_event_on(
     task: TaskId,
     payload: EventPayload,
 ) -> Result<(), AppError> {
-    let identity: String = conn.query_row(
-        "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-        [task.to_string()],
-        |row| row.get(0),
-    )?;
-    let ExecutorIdentity::Accepted(record) = serde_json::from_str(&identity)? else {
+    let identity =
+        super::identity::executor_identity_on(conn, task).map_err(|error| match error {
+            IdentityError::Storage(error) => error,
+            IdentityError::Conflict | IdentityError::RouteNotFound => {
+                AppError::ClusterTaskConflict { task }
+            }
+        })?;
+    let ExecutorIdentity::Accepted(record) = identity.ok_or_else(|| AppError::Internal {
+        message: format!("executor identity for task {task} is missing"),
+    })?
+    else {
         return Err(AppError::ClusterTaskConflict { task });
     };
     append_outbound_event_on(
@@ -767,7 +775,7 @@ pub(super) fn initial_queued_event_matches_on(
         origin_machine,
         execution_machine,
         payload: EventPayload::State {
-            status: crate::domain::ProcessStatus::Queued,
+            status: ProcessStatus::Queued,
         },
     };
 
@@ -809,20 +817,7 @@ fn append_outbound_event_on(
     execution_machine: MachineId,
     payload: EventPayload,
 ) -> Result<OutboxEvent, EventError> {
-    let identity: Option<String> = conn
-        .query_row(
-            "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-            [task.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(storage)?;
-    let ExecutorIdentity::Accepted(record) = decode(
-        identity
-            .as_deref()
-            .ok_or(EventError::OwnerConflict { task })?,
-    )?
-    else {
+    let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(conn, task)? else {
         return Err(EventError::OwnerConflict { task });
     };
     if record.origin_machine != origin_machine || record.execution_machine != execution_machine {
@@ -1034,7 +1029,7 @@ impl Store {
             // identity, even when its launch reply was lost
             SubmissionState::ResourceAction { phase, .. } => match phase {
                 ResourceActionRoutePhase::AcceptanceUnknown => {
-                    if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
+                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
                         return Err(EventError::Invalid {
                             message: "first resource action task event must report queued state"
                                 .into(),
@@ -1055,7 +1050,7 @@ impl Store {
             SubmissionState::ResourceBackground { phase, .. } => match phase {
                 ResourceBackgroundRoutePhase::AcceptanceUnknown
                 | ResourceBackgroundRoutePhase::Rejected { .. } => {
-                    if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
+                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
                         return Err(EventError::Invalid {
                             message: "first background launch event must report queued state"
                                 .into(),
@@ -1067,7 +1062,7 @@ impl Store {
             },
             SubmissionState::Resource { phase, .. } => match phase {
                 ResourceRoutePhase::AcceptanceUnknown | ResourceRoutePhase::Waiting => {
-                    if event.payload.process_state() != Some(crate::domain::ProcessStatus::Queued) {
+                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
                         return Err(EventError::Invalid {
                             message: "first resource task event must report queued state".into(),
                         });
@@ -1193,17 +1188,29 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::ProcessStatus;
+    use crate::resource::{AssignmentRevision, ResourceId, ResourceRevision, SupervisorAddress};
     use std::path::Path;
 
     use tempfile::tempdir;
 
-    use super::*;
+    use super::EVENT_RETENTION_BATCH_SIZE;
     use crate::callback::ReportView;
-    use crate::domain::TaskEnv;
-    use crate::submission::{
-        CallbackContext, ExecutionRecord, OriginRoute, RequestId, ResourceQueueOutcome,
-        ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
+    use crate::domain::{TaskEnv, TaskId};
+    use crate::error::AppError;
+    use crate::events::{
+        DeliveryOutcome, DeliveryState, EventAcceptance, EventError, EventPayload, EventRouteState,
+        TaskEvent,
     };
+    use crate::machine::MachineId;
+    use crate::store::{IdentityError, Store};
+    use crate::submission::{
+        CallbackContext, ExecutionRecord, OriginRoute, RequestId, ResourceActionRoutePhase,
+        ResourceBackgroundRoutePhase, ResourceQueueOutcome, ResourceQueueReceipt,
+        ResourceRoutePhase, SubmissionState,
+    };
+    use rusqlite::params;
+    use std::num::NonZeroU64;
 
     fn route() -> OriginRoute {
         let spec: crate::spec::NormalizedSpec = serde_json::from_value(serde_json::json!({
@@ -1238,7 +1245,7 @@ mod tests {
         }
     }
 
-    fn event(route: &OriginRoute, seq: u64, status: crate::domain::ProcessStatus) -> TaskEvent {
+    fn event(route: &OriginRoute, seq: u64, status: ProcessStatus) -> TaskEvent {
         TaskEvent {
             task: route.task,
             seq: NonZeroU64::new(seq).unwrap(),
@@ -1248,11 +1255,7 @@ mod tests {
         }
     }
 
-    fn callback_event(
-        route: &OriginRoute,
-        seq: u64,
-        state: Option<crate::domain::ProcessStatus>,
-    ) -> TaskEvent {
+    fn callback_event(route: &OriginRoute, seq: u64, state: Option<ProcessStatus>) -> TaskEvent {
         let callback = serde_json::from_value(serde_json::json!({
             "api_version": 1,
             "event": if state.is_some() { "TASK_SUCCEEDED" } else { "TASK_REPORTED" },
@@ -1294,7 +1297,7 @@ mod tests {
     fn resource_route() -> OriginRoute {
         let mut route = route();
         route.submission = SubmissionState::Resource {
-            resource: crate::resource::ResourceId::new(),
+            resource: ResourceId::new(),
             phase: ResourceRoutePhase::AcceptanceUnknown,
         };
         route
@@ -1307,7 +1310,7 @@ mod tests {
         let route = resource_route();
         store.insert_origin_route(&route).unwrap();
 
-        let queued = event(&route, 1, crate::domain::ProcessStatus::Queued);
+        let queued = event(&route, 1, ProcessStatus::Queued);
         assert_eq!(
             store.accept_inbound_event(&queued).unwrap(),
             EventAcceptance::Acknowledged { seq: 1 }
@@ -1321,13 +1324,10 @@ mod tests {
             }
         ));
         assert_eq!(activated.last_accepted_seq, 1);
-        assert_eq!(
-            activated.last_execution_state,
-            Some(crate::domain::ProcessStatus::Queued)
-        );
+        assert_eq!(activated.last_execution_state, Some(ProcessStatus::Queued));
 
         store
-            .accept_inbound_event(&event(&route, 2, crate::domain::ProcessStatus::Running))
+            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
             .unwrap();
         let advanced = store.origin_route_by_task(route.task).unwrap().unwrap();
         assert!(matches!(
@@ -1338,10 +1338,7 @@ mod tests {
             }
         ));
         assert_eq!(advanced.last_accepted_seq, 2);
-        assert_eq!(
-            advanced.last_execution_state,
-            Some(crate::domain::ProcessStatus::Running)
-        );
+        assert_eq!(advanced.last_execution_state, Some(ProcessStatus::Running));
     }
 
     #[test]
@@ -1352,7 +1349,7 @@ mod tests {
         store.insert_origin_route(&route).unwrap();
 
         assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, crate::domain::ProcessStatus::Running,)),
+            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running,)),
             Err(EventError::Invalid { .. })
         ));
         let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
@@ -1390,7 +1387,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, crate::domain::ProcessStatus::Queued,)),
+            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Queued,)),
             Err(EventError::Invalid { .. })
         ));
         assert_eq!(
@@ -1409,7 +1406,7 @@ mod tests {
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let route = route();
         store.insert_origin_route(&route).unwrap();
-        let first = event(&route, 1, crate::domain::ProcessStatus::Running);
+        let first = event(&route, 1, ProcessStatus::Running);
         assert_eq!(
             store.accept_inbound_event(&first).unwrap(),
             EventAcceptance::Acknowledged { seq: 1 }
@@ -1418,14 +1415,14 @@ mod tests {
             store.accept_inbound_event(&first).unwrap(),
             EventAcceptance::Acknowledged { seq: 1 }
         );
-        let different = event(&route, 1, crate::domain::ProcessStatus::Succeeded);
+        let different = event(&route, 1, ProcessStatus::Succeeded);
         assert!(matches!(
             store.accept_inbound_event(&different),
             Err(EventError::ContentConflict { seq: 1, .. })
         ));
         assert_eq!(
             store
-                .accept_inbound_event(&event(&route, 3, crate::domain::ProcessStatus::Succeeded))
+                .accept_inbound_event(&event(&route, 3, ProcessStatus::Succeeded))
                 .unwrap(),
             EventAcceptance::Expected { seq: 2 }
         );
@@ -1440,10 +1437,7 @@ mod tests {
         let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
         assert_eq!(saved.last_accepted_seq, 1);
         assert_eq!(saved.last_settled_seq, 1);
-        assert_eq!(
-            saved.last_execution_state,
-            Some(crate::domain::ProcessStatus::Running)
-        );
+        assert_eq!(saved.last_execution_state, Some(ProcessStatus::Running));
         let inbox = store.inbound_events(route.task).unwrap();
         assert_eq!(inbox.len(), 1);
         assert!(!inbox[0].notification_required);
@@ -1466,7 +1460,7 @@ mod tests {
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
                 spec: route.spec.clone(),
-                state: crate::domain::ProcessStatus::Queued,
+                state: ProcessStatus::Queued,
             })
             .unwrap();
         let outbox = store
@@ -1475,7 +1469,7 @@ mod tests {
                 route.origin_machine,
                 route.execution_machine,
                 EventPayload::State {
-                    status: crate::domain::ProcessStatus::Running,
+                    status: ProcessStatus::Running,
                 },
             )
             .unwrap();
@@ -1536,7 +1530,7 @@ mod tests {
         let route_after_compaction = reopened.origin_route_by_task(route.task).unwrap().unwrap();
         assert_eq!(route_after_compaction.last_accepted_seq, 1);
         assert_eq!(route_after_compaction.last_settled_seq, 1);
-        let changed = event(&route, 1, crate::domain::ProcessStatus::Succeeded);
+        let changed = event(&route, 1, ProcessStatus::Succeeded);
         assert!(matches!(
             reopened.accept_inbound_event(&changed),
             Err(EventError::ContentConflict { seq: 1, .. })
@@ -1556,7 +1550,7 @@ mod tests {
                 origin_machine: pending_route.origin_machine,
                 execution_machine: pending_route.execution_machine,
                 spec: pending_route.spec.clone(),
-                state: crate::domain::ProcessStatus::Queued,
+                state: ProcessStatus::Queued,
             })
             .unwrap();
         let pending = callback_event(&pending_route, 1, None);
@@ -1581,7 +1575,7 @@ mod tests {
                 origin_machine: failed_route.origin_machine,
                 execution_machine: failed_route.execution_machine,
                 spec: failed_route.spec.clone(),
-                state: crate::domain::ProcessStatus::Queued,
+                state: ProcessStatus::Queued,
             })
             .unwrap();
         let failed = callback_event(&failed_route, 1, None);
@@ -1640,7 +1634,7 @@ mod tests {
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
                 spec: route.spec.clone(),
-                state: crate::domain::ProcessStatus::Queued,
+                state: ProcessStatus::Queued,
             })
             .unwrap();
         let outbox = store
@@ -1649,7 +1643,7 @@ mod tests {
                 route.origin_machine,
                 route.execution_machine,
                 EventPayload::State {
-                    status: crate::domain::ProcessStatus::Running,
+                    status: ProcessStatus::Running,
                 },
             )
             .unwrap();
@@ -1707,7 +1701,7 @@ mod tests {
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
                 spec: route.spec.clone(),
-                state: crate::domain::ProcessStatus::Queued,
+                state: ProcessStatus::Queued,
             })
             .unwrap();
         let outbox = store
@@ -1716,7 +1710,7 @@ mod tests {
                 route.origin_machine,
                 route.execution_machine,
                 EventPayload::State {
-                    status: crate::domain::ProcessStatus::Running,
+                    status: ProcessStatus::Running,
                 },
             )
             .unwrap();
@@ -1756,7 +1750,7 @@ mod tests {
                 origin_machine: MachineId::new(),
                 execution_machine: MachineId::new(),
                 payload: EventPayload::State {
-                    status: crate::domain::ProcessStatus::Running,
+                    status: ProcessStatus::Running,
                 },
             };
             let age = if index > EVENT_RETENTION_BATCH_SIZE {
@@ -1803,7 +1797,7 @@ mod tests {
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let route = route();
         store.insert_origin_route(&route).unwrap();
-        let mut wrong_owner = event(&route, 1, crate::domain::ProcessStatus::Running);
+        let mut wrong_owner = event(&route, 1, ProcessStatus::Running);
         wrong_owner.execution_machine = MachineId::new();
         assert!(matches!(
             store.accept_inbound_event(&wrong_owner),
@@ -1860,7 +1854,7 @@ mod tests {
         };
         store.accept_inbound_event(&notified).unwrap();
         store
-            .accept_inbound_event(&event(&route, 2, crate::domain::ProcessStatus::Running))
+            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
             .unwrap();
         let report = TaskEvent {
             task: route.task,
@@ -1908,7 +1902,7 @@ mod tests {
                     origin_machine: route.origin_machine,
                     execution_machine: route.execution_machine,
                     spec: route.spec.clone(),
-                    state: crate::domain::ProcessStatus::Queued,
+                    state: ProcessStatus::Queued,
                 })
                 .unwrap();
             let outbox = store
@@ -1917,7 +1911,7 @@ mod tests {
                     route.origin_machine,
                     route.execution_machine,
                     EventPayload::State {
-                        status: crate::domain::ProcessStatus::Running,
+                        status: ProcessStatus::Running,
                     },
                 )
                 .unwrap();
@@ -1951,7 +1945,7 @@ mod tests {
                     route.origin_machine,
                     route.execution_machine,
                     EventPayload::State {
-                        status: crate::domain::ProcessStatus::Succeeded,
+                        status: ProcessStatus::Succeeded,
                     },
                 )
                 .unwrap();
@@ -1968,66 +1962,6 @@ mod tests {
             EventRouteState::Orphaned
         );
         assert!(reopened.pending_outbound_tasks().unwrap().is_empty());
-        let legacy = dir.path().join("v3.db");
-        {
-            let mut store = Store::open(&legacy).unwrap();
-            store.insert_origin_route(&route).unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE executor_outbox; DROP TABLE executor_event_cursors;
-                 DROP TABLE executor_event_routes; DROP TABLE origin_inbox;
-                 DROP TABLE executor_cancellations; DROP TABLE cancellation_requests;
-                 ALTER TABLE tasks DROP COLUMN project_root;
-                 PRAGMA user_version=3;",
-                )
-                .unwrap();
-        }
-        let store = Store::open(&legacy).unwrap();
-        assert_eq!(
-            store
-                .origin_route_by_task(route.task)
-                .unwrap()
-                .unwrap()
-                .task,
-            route.task
-        );
-        assert!(store.inbound_events(route.task).unwrap().is_empty());
-        assert_eq!(
-            store
-                .conn
-                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            crate::domain::SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn version_four_adds_durable_route_state() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("v4.db");
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE executor_event_routes;
-                     DROP TABLE executor_cancellations; DROP TABLE cancellation_requests;
-                     ALTER TABLE tasks DROP COLUMN project_root;
-                     PRAGMA user_version=4;",
-                )
-                .unwrap();
-        }
-        let store = Store::open(&path).unwrap();
-        let exists: bool = store
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='executor_event_routes')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(exists);
     }
 
     fn action_route() -> OriginRoute {
@@ -2041,15 +1975,15 @@ mod tests {
                 kind: crate::resource::bound_action::ResourceActionKind::ReleaseWatcher,
                 authority: crate::resource::SupervisorActionAuthority {
                     authority_machine: base.execution_machine,
-                    resource_id: crate::resource::ResourceId::new(),
+                    resource_id: ResourceId::new(),
                     loan_id: crate::resource::LoanId::new(),
                     action_id: crate::resource::ActionId::new(),
-                    expected_state_revision: crate::resource::ResourceRevision::new(1),
-                    supervisor: crate::resource::SupervisorAddress {
+                    expected_state_revision: ResourceRevision::new(1),
+                    supervisor: SupervisorAddress {
                         machine: base.origin_machine,
                         thread: base.thread,
                     },
-                    assignment_revision: crate::resource::AssignmentRevision::new(0),
+                    assignment_revision: AssignmentRevision::new(0),
                 },
             },
             launch: crate::resource::bound_action::ResourceActionLaunch::ReleaseWatcher {
@@ -2082,7 +2016,7 @@ mod tests {
         assert!(matches!(
             saved.submission,
             SubmissionState::ResourceAction {
-                phase: crate::submission::ResourceActionRoutePhase::Accepted,
+                phase: ResourceActionRoutePhase::Accepted,
                 ..
             }
         ));
@@ -2148,14 +2082,14 @@ mod tests {
             binding: crate::resource::background_launch::BackgroundLaunchBinding {
                 assignment: crate::resource::background_launch::BackgroundSupervisorAssignment {
                     authority_machine: base.execution_machine,
-                    resource_id: crate::resource::ResourceId::new(),
-                    supervisor: crate::resource::SupervisorAddress {
+                    resource_id: ResourceId::new(),
+                    supervisor: SupervisorAddress {
                         machine: base.origin_machine,
                         thread: base.thread,
                     },
-                    assignment_revision: crate::resource::AssignmentRevision::new(0),
+                    assignment_revision: AssignmentRevision::new(0),
                 },
-                expected_state_revision: crate::resource::ResourceRevision::new(2),
+                expected_state_revision: ResourceRevision::new(2),
             },
         })
         .unwrap()
@@ -2168,7 +2102,6 @@ mod tests {
             RemoteBackgroundLaunchReceipt, ResourceBackgroundRejection,
         };
         use crate::store::ResourceBackgroundRouteResult;
-        use crate::submission::ResourceBackgroundRoutePhase;
 
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
@@ -2188,13 +2121,13 @@ mod tests {
         };
         // a receipt for another assignment cannot accept this route
         let mut other = receipt;
-        other.binding.assignment.assignment_revision = crate::resource::AssignmentRevision::new(1);
+        other.binding.assignment.assignment_revision = AssignmentRevision::new(1);
         assert!(matches!(
             store.resolve_resource_background_route(
                 route.task,
                 &ResourceBackgroundRouteResult::Accepted(other)
             ),
-            Err(crate::store::IdentityError::Conflict)
+            Err(IdentityError::Conflict)
         ));
 
         // a delayed send may win after a refusal was saved; its first queued
@@ -2236,7 +2169,7 @@ mod tests {
                     ResourceBackgroundRejection::NotCurrentSupervisor
                 )
             ),
-            Err(crate::store::IdentityError::Conflict)
+            Err(IdentityError::Conflict)
         ));
         store
             .resolve_resource_background_route(

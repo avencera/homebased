@@ -3,6 +3,7 @@
 //! The resource authority builds every view from durable resource, loan,
 //! request, notice, and task state. No view stores a second occupancy state
 
+use crate::resource::trainer_publication::AttemptBinding;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,8 +13,8 @@ use crate::machine::MachineId;
 use crate::resource::operator_release::{OperatorGpuFreeAttestation, OperatorGpuFreeReceipt};
 use crate::resource::{
     AcceptanceSequence, ActionId, AssignmentRevision, Loan, LoanId, LoanPhase, NoticeId, Resource,
-    ResourceId, ResourceRequestState, ResourceRevision, ReturnContext, SupervisorAddress,
-    SupervisorNotice,
+    ResourceId, ResourceRequestState, ResourceRevision, ReturnContext, ReturnExecutionMode,
+    SupervisorAddress, SupervisorNotice,
 };
 use crate::submission::RequestId;
 
@@ -52,6 +53,41 @@ pub struct ResourceOverview {
     pub current_task: Option<ResourceTaskSummary>,
     /// Most important condition that needs an operator or supervisor
     pub attention: Option<AttentionView>,
+    /// First background launch that reserves the unregistered resource, if one does
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_launch: Option<BackgroundLaunchReservation>,
+}
+
+/// First background launch that reserves a resource before its task is registered
+///
+/// The authority derives it from the launch receipt and the task row. It clears
+/// only when the task registers on its confirmed start, when saved evidence or
+/// an operator attestation releases it, or when a later loan supersedes it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundLaunchReservation {
+    /// Stable launch request identity, used by an operator attestation binding
+    pub request_id: RequestId,
+    /// Launch task that keeps the resource reserved
+    pub task_id: TaskId,
+    /// Why the launch still reserves the resource
+    pub status: BackgroundLaunchReservationStatus,
+}
+
+/// Why a first background launch still reserves its resource
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundLaunchReservationStatus {
+    /// The task row is queued, and its worker may still be starting
+    Queued,
+    /// The task started and waits for the resource owner to register it
+    StartedUnregistered,
+    /// The task ended before registration, and no proof shows that its GPU work stopped
+    ///
+    /// Only an operator attestation after inspecting the authority GPU releases it
+    ReleaseUnproven,
+    /// The launch records do not match the launch receipt
+    IdentityMismatch,
 }
 
 /// One authority that could not answer a resource read
@@ -90,6 +126,12 @@ pub struct ResourceDetail {
     pub current_task_id: Option<TaskId>,
     /// Identity of `background_task`, present even when its task row is unavailable
     pub background_task_id: Option<TaskId>,
+    /// First background launch that reserves the unregistered resource, if one does
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_launch: Option<BackgroundLaunchReservation>,
+    /// Accepted execution mode of the exact current Restoring loan, when proven
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_execution_mode: Option<ReturnExecutionMode>,
 }
 
 /// One queued, assigned, or retained request without its private command content
@@ -150,6 +192,10 @@ pub enum AttentionCode {
     RestoreBlocked,
     /// The exact trainer release proof is missing or failed validation
     ReleaseProofUnavailable,
+    /// A first background launch ended before registration with no release proof
+    ///
+    /// The resource stays reserved until an operator attests that its GPU work is gone
+    BackgroundLaunchReleaseUnproven,
     /// The bound release watcher cannot proceed
     ReleaseWatcherBlocked,
     /// A supervisor notice used its automatic delivery attempts
@@ -231,7 +277,7 @@ pub enum PendingActionPhase {
         /// Durable explanation of the condition
         reason: String,
         /// Last safe phase with its identities and return data
-        last_safe_phase: LoanPhase,
+        last_safe_phase: Box<LoanPhase>,
     },
 }
 
@@ -377,7 +423,7 @@ pub struct TrainerAttemptBody {
     /// Public API version
     pub api_version: u32,
     /// Trainer identity of the running attempt
-    pub attempt_binding: crate::resource::watcher::AttemptBinding,
+    pub attempt_binding: AttemptBinding,
 }
 
 /// Response to `POST /v1/resources/{id}/background/{task_id}/trainer-attempt`
@@ -393,12 +439,12 @@ pub struct TrainerAttemptResponse {
     /// Canonical runtime root whose lock the trainer held
     pub runtime_root: std::path::PathBuf,
     /// Trainer identity of the associated attempt
-    pub attempt_binding: crate::resource::watcher::AttemptBinding,
+    pub attempt_binding: AttemptBinding,
 }
 
 /// `POST /v1/resources/{id}/operator-release`
 ///
-/// The attestation is a human confirmation after inspecting the authority GPU.
+/// The attestation is a human confirmation after inspecting the authority GPU
 /// It is not an automatic proof that GPU work stopped
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

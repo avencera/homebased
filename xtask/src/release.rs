@@ -5,9 +5,16 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail};
-use serde_json::Value;
+use serde::Deserialize;
 
-#[derive(Debug, PartialEq, Eq)]
+/// The part of `homebased --json daemon status` that decides a restart
+#[derive(Debug, Deserialize)]
+struct DaemonStatus {
+    socket: DaemonSocket,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum DaemonSocket {
     Up,
     Down,
@@ -76,52 +83,43 @@ pub(crate) fn local() -> Result<()> {
 }
 
 fn daemon_socket(binary: &Path) -> Result<DaemonSocket> {
-    let output = Command::new(binary)
-        .args(["--json", "daemon", "status"])
-        .output()
-        .wrap_err_with(|| format!("failed to run {} --json daemon status", binary.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{} --json daemon status exited with {}: {}",
-            binary.display(),
-            output.status,
-            stderr.trim()
-        );
-    }
-
-    parse_daemon_socket(&output.stdout)
+    let stdout = run_daemon_command(binary, "status")?;
+    parse_daemon_socket(&stdout)
 }
 
 fn parse_daemon_socket(stdout: &[u8]) -> Result<DaemonSocket> {
-    let status: Value =
+    let status: DaemonStatus =
         serde_json::from_slice(stdout).wrap_err("failed to parse daemon status JSON")?;
-    match status.get("socket").and_then(Value::as_str) {
-        Some("up") => Ok(DaemonSocket::Up),
-        Some("down") => Ok(DaemonSocket::Down),
-        Some(value) => bail!("daemon status returned unknown socket state {value:?}"),
-        None => bail!("daemon status JSON has no string `socket` field"),
-    }
+    Ok(status.socket)
 }
 
 fn restart_daemon(binary: &Path) -> Result<()> {
+    run_daemon_command(binary, "restart").map(drop)
+}
+
+/// Run `<binary> --json daemon <subcommand>` and return its stdout on success
+fn run_daemon_command(binary: &Path, subcommand: &str) -> Result<Vec<u8>> {
     let output = Command::new(binary)
-        .args(["--json", "daemon", "restart"])
+        .args(["--json", "daemon", subcommand])
         .output()
-        .wrap_err_with(|| format!("failed to run {} --json daemon restart", binary.display()))?;
+        .wrap_err_with(|| {
+            format!(
+                "failed to run {} --json daemon {subcommand}",
+                binary.display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "{} --json daemon restart exited with {}: {}",
+            "{} --json daemon {subcommand} exited with {}: {}",
             binary.display(),
             output.status,
             stderr.trim()
         );
     }
 
-    Ok(())
+    Ok(output.stdout)
 }
 
 pub(crate) fn github() -> Result<()> {
@@ -170,7 +168,7 @@ pub(crate) fn github() -> Result<()> {
 }
 
 /// Run `npm ci` then `npm run build` in `web/`. Either failure fails the
-/// release: a binary without the dashboard is not a release build.
+/// release: a binary without the dashboard is not a release build
 fn build_dashboard(root: &Path) -> Result<()> {
     let web = root.join("web");
     if !web.join("package.json").is_file() {

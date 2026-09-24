@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use serde::Serialize;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -11,13 +12,14 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::cluster::{CancelBody, CancelExecution};
 use crate::cancellation::{
-    CancellationOwner, CancellationReceipt, CancellationRequest, CancellationTarget,
+    CancellationDelivery, CancellationReceipt, CancellationRequest, CancellationTarget,
     ExecutorCancelState, ResourceCancellationRequestIdentity,
 };
-use crate::domain::API_VERSION;
+use crate::domain::{API_VERSION, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::fleet::http::ClusterClient;
 use crate::fleet::protocol::ClusterProtocolVersion;
+use crate::machine::MachineId;
 use crate::store::CancelResult;
 use crate::submission::{
     ExecutorIdentity, ResourceCancellationOutcome, ResourceCancellationReceipt,
@@ -90,9 +92,6 @@ pub(super) async fn run(state: AppState) {
 
 async fn deliver(state: &AppState, request: &CancellationRequest) -> Result<(), AppError> {
     match &request.target {
-        CancellationTarget::LegacyExecution => {
-            verify_legacy_cancellation_owner(state, request).await?;
-        }
         CancellationTarget::Execution { .. } => {}
         CancellationTarget::Resource(target) => {
             if target.task_id != request.task
@@ -121,8 +120,7 @@ async fn deliver(state: &AppState, request: &CancellationRequest) -> Result<(), 
             api_version: API_VERSION,
             protocol_version: destination.protocol.0,
             request: request.identity(),
-            target: (destination.protocol == crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION)
-                .then(|| request.target.clone()),
+            target: request.target.clone(),
         };
         let response = ClusterClient::default()
             .post_json(&destination.address, "/v1/cluster/executions/cancel", &body)
@@ -269,37 +267,6 @@ fn verify_resource_receipt(
     Ok(())
 }
 
-async fn verify_legacy_cancellation_owner(
-    state: &AppState,
-    request: &CancellationRequest,
-) -> Result<(), AppError> {
-    let owner = crate::daemon::inspection::cancellation_owner(state, request.task).await?;
-    validate_legacy_cancellation_owner(request, owner)
-}
-
-fn validate_legacy_cancellation_owner(
-    request: &CancellationRequest,
-    owner: CancellationOwner,
-) -> Result<(), AppError> {
-    match owner {
-        CancellationOwner::Execution(target)
-            if target.task == request.task
-                && target.origin_machine == request.origin_machine
-                && target.execution_machine == request.execution_machine =>
-        {
-            Ok(())
-        }
-        CancellationOwner::Resource(target)
-            if target.task_id == request.task
-                && target.origin_machine == request.origin_machine
-                && target.authority_machine == request.execution_machine =>
-        {
-            Err(AppError::ResourceCancellationUnavailable { task: request.task })
-        }
-        _ => Err(AppError::ClusterTaskConflict { task: request.task }),
-    }
-}
-
 fn decode_acknowledgement(
     value: serde_json::Value,
     request: &CancellationRequest,
@@ -376,39 +343,97 @@ pub(super) async fn apply_executor(
     .await
 }
 
-/// Render a retained delivery result for the local socket
-pub(super) fn response(request: &CancellationRequest) -> serde_json::Value {
-    use crate::cancellation::CancellationDelivery;
-    let delivery = match &request.delivery {
-        CancellationDelivery::Pending => serde_json::json!({ "state": "pending" }),
-        CancellationDelivery::Delivered { result } => serde_json::json!({
-            "state": "delivered", "executor": result,
-        }),
-        CancellationDelivery::ResourceDelivered { result } => serde_json::json!({
-            "state": "resource_delivered", "resource": result,
-        }),
-    };
-    serde_json::json!({
-        "api_version": crate::domain::API_VERSION,
-        "id": request.task,
-        "requester_machine": request.requester_machine,
-        "cancellation": request.cancellation,
-        "origin_machine": request.origin_machine,
-        "execution_machine": request.execution_machine,
-        "delivery": delivery,
-    })
+/// Local socket response to one task cancellation
+///
+/// Callers tell the two shapes apart by the `delivery` field, which only a
+/// saved cancellation intent carries
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(super) enum CancelResponse {
+    /// The task already has a process status on this machine
+    Status {
+        api_version: u32,
+        id: TaskId,
+        status: ProcessStatus,
+    },
+    /// A durable cancellation intent that its owner delivers
+    Intent {
+        api_version: u32,
+        id: TaskId,
+        requester_machine: MachineId,
+        cancellation: Uuid,
+        origin_machine: MachineId,
+        execution_machine: MachineId,
+        delivery: Box<CancelDeliveryResponse>,
+    },
+}
+
+/// Delivery state of a saved cancellation intent, named by the owner that answered
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(super) enum CancelDeliveryResponse {
+    /// The owner has not acknowledged durable receipt
+    Pending,
+    /// The executor acknowledged durable receipt
+    Delivered { executor: ExecutorCancelState },
+    /// The resource authority returned a durable typed receipt
+    ResourceDelivered {
+        resource: ResourceCancellationReceipt,
+    },
+}
+
+impl From<&CancellationDelivery> for CancelDeliveryResponse {
+    fn from(delivery: &CancellationDelivery) -> Self {
+        match delivery {
+            CancellationDelivery::Pending => Self::Pending,
+            CancellationDelivery::Delivered { result } => Self::Delivered {
+                executor: result.clone(),
+            },
+            CancellationDelivery::ResourceDelivered { result } => Self::ResourceDelivered {
+                resource: result.clone(),
+            },
+        }
+    }
+}
+
+impl CancelResponse {
+    /// Report the process status of a task that needs no delivery
+    pub(super) fn status(id: TaskId, status: ProcessStatus) -> Self {
+        Self::Status {
+            api_version: API_VERSION,
+            id,
+            status,
+        }
+    }
+
+    /// Report a saved cancellation intent and its current delivery state
+    pub(super) fn intent(request: &CancellationRequest) -> Self {
+        Self::Intent {
+            api_version: API_VERSION,
+            id: request.task,
+            requester_machine: request.requester_machine,
+            cancellation: request.cancellation,
+            origin_machine: request.origin_machine,
+            execution_machine: request.execution_machine,
+            delivery: Box::new((&request.delivery).into()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CancelResponse, decode_acknowledgement};
     use crate::cancellation::{
-        CancellationDelivery, ExecutionCancellationTarget, ResourceCancellationTarget,
+        CancellationDelivery, CancellationReceipt, CancellationRequest, CancellationTarget,
+        ExecutorCancelState,
     };
-    use crate::domain::TaskId;
+    use crate::daemon::cluster::CancelBody;
+    use crate::domain::{API_VERSION, ProcessStatus, TaskId};
+    use crate::error::AppError;
+    use crate::fleet::protocol::ClusterProtocolVersion;
     use crate::machine::MachineId;
-    use crate::resource::ResourceId;
-    use crate::submission::{RequestId, ResourceRoutePhase};
+    use crate::submission::RequestId;
+    use uuid::Uuid;
 
     fn request() -> CancellationRequest {
         CancellationRequest {
@@ -417,7 +442,9 @@ mod tests {
             task: TaskId::new(),
             origin_machine: MachineId::new(),
             execution_machine: MachineId::new(),
-            target: CancellationTarget::LegacyExecution,
+            target: CancellationTarget::Execution {
+                request_id: RequestId::new(),
+            },
             delivery: CancellationDelivery::Pending,
         }
     }
@@ -458,44 +485,30 @@ mod tests {
         ));
     }
 
+    // the CLI reports "cancelled" or "cancellation accepted" by this field alone
     #[test]
-    fn legacy_executor_intent_must_match_a_proven_ordinary_owner() {
+    fn only_a_saved_intent_response_carries_its_delivery() {
         let request = request();
-        let target = CancellationOwner::Execution(ExecutionCancellationTarget {
-            request_id: Some(RequestId::new()),
-            task: request.task,
-            origin_machine: request.origin_machine,
-            execution_machine: request.execution_machine,
-        });
-        assert!(validate_legacy_cancellation_owner(&request, target).is_ok());
 
-        let wrong_owner = CancellationOwner::Execution(ExecutionCancellationTarget {
-            request_id: Some(RequestId::new()),
-            task: request.task,
-            origin_machine: request.origin_machine,
-            execution_machine: MachineId::new(),
-        });
-        assert!(matches!(
-            validate_legacy_cancellation_owner(&request, wrong_owner),
-            Err(AppError::ClusterTaskConflict { task }) if task == request.task
-        ));
-    }
+        let intent = serde_json::to_value(CancelResponse::intent(&request)).unwrap();
+        let status = serde_json::to_value(CancelResponse::status(
+            request.task,
+            ProcessStatus::Cancelled,
+        ))
+        .unwrap();
 
-    #[test]
-    fn legacy_executor_intent_refuses_a_resource_route() {
-        let request = request();
-        let target = CancellationOwner::Resource(ResourceCancellationTarget {
-            request_id: RequestId::new(),
-            task_id: request.task,
-            resource_id: ResourceId::new(),
-            origin_machine: request.origin_machine,
-            authority_machine: request.execution_machine,
-            phase: ResourceRoutePhase::AcceptanceUnknown,
-        });
-
-        assert!(matches!(
-            validate_legacy_cancellation_owner(&request, target),
-            Err(AppError::ResourceCancellationUnavailable { task }) if task == request.task
-        ));
+        assert_eq!(
+            intent["delivery"],
+            serde_json::json!({ "state": "pending" })
+        );
+        assert_eq!(intent["id"], serde_json::json!(request.task));
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "api_version": API_VERSION,
+                "id": request.task,
+                "status": "cancelled",
+            })
+        );
     }
 }

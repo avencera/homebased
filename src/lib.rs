@@ -1,4 +1,4 @@
-//! Supervise long-running agent and general task workloads and report them to a Codex thread.
+//! Supervise long-running agent and general task workloads and report them to a Codex thread
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agents;
@@ -8,6 +8,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod digest;
 pub mod domain;
 pub mod error;
 pub mod events;

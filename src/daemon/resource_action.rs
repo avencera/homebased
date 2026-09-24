@@ -1,7 +1,7 @@
 //! Two-machine resource actions: supervisor-owned routes and authority acceptance
 //!
 //! The supervisor machine asks the authority to prepare the canonical task, saves
-//! a fixed-ID origin route with that exact spec, and only then sends the launch.
+//! a fixed-ID origin route with that exact spec, and only then sends the launch
 //! The authority reads back the saved route as evidence before it accepts. A lost
 //! reply or restart repeats the same launch; nothing on this path abandons the
 //! identity, because abandoning could strand the resource action
@@ -10,17 +10,12 @@
 //! hands the choice to the supervisor actor's one-shot return and resolution
 //! owners instead, and their store receipts answer retries
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
-
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use super::AppState;
@@ -51,9 +46,6 @@ use crate::submission::{
     ResourceActionRouteBinding, ResourceActionRoutePhase, ResourceActionRouteProof,
     SubmissionState, normalized_spec_sha256,
 };
-
-const ACTION_SHARDS: usize = 64;
-static ACTION_PERMITS: OnceLock<[Semaphore; ACTION_SHARDS]> = OnceLock::new();
 
 /// Saved route proof returned by the supervisor machine
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,21 +216,6 @@ async fn route_proof(
 
 // ---- supervisor side ----
 
-async fn lock_action(
-    action: crate::resource::ActionId,
-) -> Result<SemaphorePermit<'static>, AppError> {
-    let permits = ACTION_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
-    let mut hasher = DefaultHasher::new();
-    action.as_uuid().hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % ACTION_SHARDS;
-    permits[shard]
-        .acquire()
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("resource action permit unavailable: {error}"),
-        })
-}
-
 async fn submit_from_socket(
     State(state): State<AppState>,
     Json(request): Json<ResourceActionSubmitRequest>,
@@ -275,7 +252,7 @@ pub(crate) async fn submit(
     if authority.authority_machine == local {
         return submit_co_located(state, authority, choice).await;
     }
-    let _action_guard = lock_action(authority.action_id).await?;
+    let _action_guard = state.locks.resource_actions.lock(authority.action_id).await;
     match choice {
         ResourceActionChoice::ReleaseWatcher {
             observed_background_task,
@@ -474,9 +451,11 @@ pub(super) async fn recover(state: AppState) {
         let SubmissionState::ResourceAction { binding, .. } = &route.submission else {
             continue;
         };
-        let Ok(_action_guard) = lock_action(binding.authority.action_id).await else {
-            continue;
-        };
+        let _action_guard = state
+            .locks
+            .resource_actions
+            .lock(binding.authority.action_id)
+            .await;
         if let Err(error) = send_saved_launch(&state, &route).await {
             warn!(task = %route.task, "resource action recovery: {error}");
         }
@@ -842,11 +821,20 @@ fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppError {
 mod tests {
     use uuid::Uuid;
 
-    use super::*;
-    use crate::domain::{ProcessStatus, ThreadId};
-    use crate::resource::{
-        ActionId, AssignmentRevision, LoanId, ResourceId, ResourceRevision, SupervisorAddress,
+    use super::{co_located_return_outcome, rejected};
+    use crate::daemon::actors::supervisor::ReturnDecisionOutcome;
+    use crate::domain::{ProcessStatus, TaskId, ThreadId};
+    use crate::machine::MachineId;
+    use crate::resource::bound_action::{
+        LocalReturnAcceptance, LocalReturnReceipt, ResourceActionRejection,
+        ResourceActionSubmitOutcome,
     };
+    use crate::resource::{
+        ActionId, AssignmentRevision, LoanId, ResourceId, ResourceRevision,
+        SupervisorActionAuthority, SupervisorAddress,
+    };
+    use crate::store::{ReturnDecisionError, ReturnTaskAcceptance};
+    use crate::submission::RequestId;
 
     fn co_located() -> SupervisorActionAuthority {
         let machine = MachineId::new();

@@ -63,12 +63,22 @@ const SupervisorNoticeSchema = Schema.Struct({
 	delivery: JsonObjectSchema
 });
 
+// the status stays a string so a newer reservation reason is shown as reserved, not dropped
+const BackgroundLaunchSchema = Schema.Struct({
+	request_id: Schema.String,
+	task_id: Schema.String,
+	status: Schema.String
+});
+
+const ReturnExecutionModeSchema = Schema.Literal('direct_segment_trainer', 'native_foreground');
+
 const ResourceOverviewItemSchema = Schema.Struct({
 	resource: ResourceSchema,
 	loan: Schema.NullOr(LoanSchema),
 	queued_count: Schema.Finite,
 	current_task: Schema.NullOr(ResourceTaskSchema),
-	attention: Schema.NullOr(AttentionSchema)
+	attention: Schema.NullOr(AttentionSchema),
+	background_launch: Schema.optional(BackgroundLaunchSchema)
 });
 
 const ResourceOverviewSchema = Schema.Struct({
@@ -87,7 +97,9 @@ const ResourceDetailSchema = Schema.Struct({
 	background_task: Schema.NullOr(ResourceTaskSchema),
 	current_task_id: Schema.optional(Schema.NullOr(Schema.String)),
 	background_task_id: Schema.optional(Schema.NullOr(Schema.String)),
-	attention: Schema.NullOr(AttentionSchema)
+	attention: Schema.NullOr(AttentionSchema),
+	background_launch: Schema.optional(BackgroundLaunchSchema),
+	return_execution_mode: Schema.optional(ReturnExecutionModeSchema)
 });
 
 const PendingActionSchema = Schema.Struct({
@@ -109,6 +121,12 @@ const PendingActionsSchema = Schema.Struct({
 
 /** Resource queue state, tagged by `type` in the daemon response. */
 export type ResourceRequestState = Schema.Schema.Type<typeof ResourceRequestSchema>['state'];
+
+/** First background launch that reserves an unregistered resource. */
+export type BackgroundLaunchReservation = Schema.Schema.Type<typeof BackgroundLaunchSchema>;
+
+/** Accepted execution mode exposed for the exact current Restoring loan. */
+export type ReturnExecutionMode = Schema.Schema.Type<typeof ReturnExecutionModeSchema>;
 
 /** Displayable portion of a Homebased task summary. */
 export type ResourceTaskSummary = Schema.Schema.Type<typeof ResourceTaskSchema>;

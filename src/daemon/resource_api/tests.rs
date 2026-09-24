@@ -1,3 +1,5 @@
+use crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK;
+use crate::store::Store;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -13,25 +15,42 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::*;
-use crate::daemon::actors::{SupervisorActor, SupervisorMsg};
-use crate::domain::ProcessStatus;
+use super::{attention, decode_control_response, local_models, local_resource, remote_detail};
+use crate::config::{Discovery, FleetSettings};
+use crate::daemon::AppState;
+use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+use crate::domain::{ProcessStatus, TaskId, ThreadId};
+use crate::error::AppError;
 use crate::files::StreamSlots;
 use crate::fleet::FleetState;
+use crate::fleet::address::MachineAddress;
 use crate::fleet::directory::LocalMachine;
+use crate::fleet::http::ClusterResponse;
 use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::Home;
-use crate::machine::{LocalIdentity, MachineName};
+use crate::machine::{LocalIdentity, MachineId, MachineName};
+use crate::resource::api::{
+    AttentionCode, BrowserResourceAction, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH,
+};
 use crate::resource::command_shape::test_support::FakeTrainer;
 use crate::resource::operator_release::{
     OperatorAttestationId, OperatorGpuFreeAttestation, OperatorGpuFreeConfirmation,
     OperatorObservation, OperatorStateBinding,
 };
 use crate::resource::{
-    ActionId, LoanId, NoticeId, ReturnContext, SupervisorNotice, SupervisorNoticePayload,
+    ActionId, AssignmentRevision, CommandSpec, DeliveryAttemptId, Loan, LoanId, LoanPhase,
+    LoanState, NoticeId, ResourceId, ResourceRevision, ReturnContext, ReturnExecutionMode,
+    ReturnLaunch, ReturnWork, SupervisorActionAuthority, SupervisorAddress, SupervisorNotice,
+    SupervisorNoticeDelivery, SupervisorNoticePayload,
 };
-use crate::store::{BackgroundLaunchAcceptance, BackgroundLaunchInput};
-use crate::submission::CallbackExecutable;
+use crate::spec::{NormalizedTaskWorkload, NormalizedWorkload};
+use crate::store::{
+    BackgroundLaunchAcceptance, BackgroundLaunchInput, ResourceControlRequest,
+    ReturnTaskAcceptance, ReturnTaskAcceptanceInput, ReturnTaskOrigin,
+};
+use crate::submission::{CallbackExecutable, RequestId};
+use uuid::Uuid;
 
 const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
 
@@ -62,10 +81,13 @@ impl Fixture {
         let callback_cwd = directory.path().join("callback");
         std::fs::create_dir(&callback_cwd).unwrap();
 
-        let (supervisor, supervisor_handle) =
-            SupervisorActor::spawn(None, SupervisorActor, home.clone())
-                .await
-                .unwrap();
+        let (supervisor, supervisor_handle) = SupervisorActor::spawn(
+            None,
+            SupervisorActor,
+            SupervisorArgs::new(home.clone(), None),
+        )
+        .await
+        .unwrap();
         let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
             .await
             .unwrap();
@@ -83,6 +105,7 @@ impl Fixture {
             },
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
+            locks: crate::daemon::DaemonLocks::default(),
         };
 
         let dashboard_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -272,6 +295,49 @@ impl Fixture {
         (task_id, resource.state_revision)
     }
 
+    /// Bind a first launch whose fake task starts and is lost before its start registers
+    async fn seed_early_ended_launch(&self) -> (RequestId, TaskId) {
+        let root = self.callback_cwd.canonicalize().unwrap();
+        let trainer = FakeTrainer::new(&root);
+        let (request_id, task_id) = (RequestId::new(), TaskId::new());
+        let acceptance = call(&self.state.store, |reply| {
+            StoreMsg::AcceptBackgroundLaunchForAuthority {
+                input: Box::new(BackgroundLaunchInput {
+                    authority_machine: self.local(),
+                    resource_id: self.resource,
+                    request_id,
+                    task_id,
+                    spec: trainer.spec(THREAD.parse().unwrap(), "controlled trainer fixture"),
+                    env: trainer.env.clone(),
+                    callback_codex: CallbackExecutable::available(self.bin.join("codex")),
+                }),
+                reply,
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            acceptance,
+            BackgroundLaunchAcceptance::Inserted { task, .. } if task == task_id
+        ));
+        for (from, to) in [
+            (ProcessStatus::Queued, ProcessStatus::Running),
+            (ProcessStatus::Running, ProcessStatus::Lost),
+        ] {
+            call(&self.state.store, |reply| StoreMsg::CasStatus {
+                id: task_id,
+                from,
+                to,
+                reply,
+            })
+            .await
+            .unwrap()
+            .expect("the synthetic launch row must change state");
+        }
+        (request_id, task_id)
+    }
+
     async fn socket_with_supervisor(
         &self,
         supervisor: ActorRef<SupervisorMsg>,
@@ -317,12 +383,70 @@ impl Fixture {
             resource_id: self.resource,
             state,
         };
-        crate::store::Store::seed_loan_notice_for_test(&self.state.home.db_path(), &loan, &notice);
+        Store::seed_loan_notice_for_test(&self.state.home.db_path(), &loan, &notice);
         notice
     }
 
+    /// Accept a queued return task without starting its worker
+    async fn seed_restoring_return(&self, mode: ReturnExecutionMode) -> TaskId {
+        let destination = SupervisorAddress {
+            machine: self.local(),
+            thread: THREAD.parse().unwrap(),
+        };
+        let notice = self.seed_failed_return_notice(destination);
+        let trainer = FakeTrainer::new(&self.callback_cwd.canonicalize().unwrap());
+        let mut spec = trainer.spec(destination.thread, "resource detail return fixture");
+        if mode == ReturnExecutionMode::NativeForeground {
+            spec.workload = NormalizedWorkload::Task(NormalizedTaskWorkload {
+                command: crate::invocation::CommandLine::try_from_argv(vec![
+                    "/bin/echo".into(),
+                    "foreground return".into(),
+                ])
+                .unwrap(),
+            });
+        }
+        let launch = ReturnLaunch {
+            request_id: RequestId::new(),
+            task_id: TaskId::new(),
+            work: ReturnWork::NewBackgroundWork {
+                spec: CommandSpec::try_from(spec).unwrap(),
+            },
+        };
+        let authority = SupervisorActionAuthority {
+            authority_machine: self.local(),
+            resource_id: self.resource,
+            loan_id: notice.loan_id,
+            action_id: notice.action_id,
+            expected_state_revision: notice.state_revision,
+            supervisor: notice.destination,
+            assignment_revision: notice.assignment_revision,
+        };
+        let task_id = launch.task_id;
+        let acceptance = call(&self.state.store, |reply| {
+            StoreMsg::AcceptReturnTaskForAuthority {
+                input: Box::new(ReturnTaskAcceptanceInput {
+                    authority,
+                    launch,
+                    executor_env: trainer.env.clone(),
+                    origin: ReturnTaskOrigin::Local {
+                        callback_codex: CallbackExecutable::available(self.bin.join("codex")),
+                    },
+                }),
+                reply,
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            acceptance,
+            ReturnTaskAcceptance::Inserted { task, .. } if task == task_id
+        ));
+        task_id
+    }
+
     fn control_operation_count(&self) -> i64 {
-        crate::store::Store::resource_control_operation_count_for_test(&self.state.home.db_path())
+        Store::resource_control_operation_count_for_test(&self.state.home.db_path())
     }
 
     async fn stop(self) {
@@ -452,10 +576,102 @@ async fn spawn_reconcile_probe(
 }
 
 #[tokio::test]
-async fn operator_release_checks_path_authority_and_confirmation_before_store() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
+async fn local_resource_detail_shows_the_saved_return_mode_only_while_restoring() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let idle = fixture.detail().await;
+    assert!(idle.get("return_execution_mode").is_none(), "{idle}");
+
+    fixture
+        .seed_restoring_return(ReturnExecutionMode::DirectSegmentTrainer)
         .await;
+    let detail = fixture.detail().await;
+    assert_eq!(detail["return_execution_mode"], "direct_segment_trainer");
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn remote_resource_detail_preserves_the_authority_return_mode() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let authority = Fixture::new().await;
+    let task = authority
+        .seed_restoring_return(ReturnExecutionMode::NativeForeground)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let authority_runtime = FleetRuntime::start(FleetStart {
+        local: authority.state.machine.clone(),
+        settings: FleetSettings {
+            discovery: Discovery {
+                mdns: false,
+                tailscale: None,
+            },
+            machines: Vec::new(),
+        },
+        listener: Some(address),
+        peers_path: authority._directory.path().join("authority-peers.json"),
+        timings: RuntimeTimings::default(),
+    })
+    .unwrap();
+    let mut authority_state = authority.state.clone();
+    authority_state.fleet = FleetState::Enabled(authority_runtime.handle());
+    let router = crate::daemon::web::router(authority_state, address);
+    let authority_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let caller_machine = LocalMachine {
+        identity: LocalIdentity {
+            machine: MachineId::new(),
+            boot: crate::machine::BootId::new(),
+        },
+        name: MachineName::parse("resource-reader").unwrap(),
+        protocol: SUPPORTED_PROTOCOLS,
+    };
+    let peer_address = MachineAddress::from_socket(address);
+    let caller_runtime = FleetRuntime::start(FleetStart {
+        local: caller_machine.clone(),
+        settings: FleetSettings {
+            discovery: Discovery {
+                mdns: false,
+                tailscale: None,
+            },
+            machines: vec![peer_address.clone()],
+        },
+        listener: None,
+        peers_path: authority._directory.path().join("caller-peers.json"),
+        timings: RuntimeTimings::default(),
+    })
+    .unwrap();
+    let caller_handle = caller_runtime.handle();
+    caller_handle.probe_address(&peer_address).await.unwrap();
+    let mut caller_state = authority.state.clone();
+    caller_state.machine = caller_machine;
+    caller_state.fleet = FleetState::Enabled(caller_handle);
+
+    let detail = remote_detail(&caller_state, authority.resource)
+        .await
+        .unwrap();
+    assert_eq!(detail.current_task_id, Some(task));
+    assert_eq!(
+        detail.return_execution_mode,
+        Some(ReturnExecutionMode::NativeForeground)
+    );
+    assert_eq!(
+        serde_json::to_value(detail).unwrap()["return_execution_mode"],
+        "native_foreground"
+    );
+
+    caller_runtime.shutdown().await;
+    authority_server.abort();
+    authority_runtime.shutdown().await;
+    authority.stop().await;
+}
+
+#[tokio::test]
+async fn operator_release_checks_path_authority_and_confirmation_before_store() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (task_id, revision) = fixture.seed_registered_trainer(true).await;
     let attestation = operator_attestation(fixture.resource, fixture.local(), task_id, revision);
@@ -524,6 +740,36 @@ async fn operator_release_checks_path_authority_and_confirmation_before_store() 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     assert_eq!(error_code(&response), "usage");
 
+    // every state binding is strict input, including the field-free no_loan tag
+    let loan_id = LoanId::new();
+    let action_id = ActionId::new();
+    for binding in [
+        json!({ "type": "no_loan" }),
+        json!({ "type": "awaiting_release", "loan_id": loan_id, "action_id": action_id }),
+        json!({ "type": "first_background_launch", "request_id": RequestId::new() }),
+        json!({ "type": "restoring_return", "loan_id": loan_id, "action_id": action_id }),
+        json!({
+            "type": "restoring_foreground_return",
+            "loan_id": loan_id,
+            "action_id": action_id,
+        }),
+    ] {
+        let mut extra_field = operator_release_body(&attestation);
+        extra_field["attestation"]["state_binding"] = binding;
+        extra_field["attestation"]["state_binding"]["unexpected"] = json!(true);
+        let (status, response) = fixture
+            .socket_post(
+                &format!(
+                    "/v1/resources/{}/operator-release",
+                    fixture.resource.as_uuid()
+                ),
+                extra_field,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(error_code(&response), "usage");
+    }
+
     let mut malformed_confirmation = operator_release_body(&attestation);
     malformed_confirmation["attestation"]["confirmation"] = json!("automatic_proof");
     let (status, response) = fixture
@@ -539,16 +785,10 @@ async fn operator_release_checks_path_authority_and_confirmation_before_store() 
     assert_eq!(error_code(&response), "usage");
 
     for attestation in [attestation, wrong_authority] {
-        let receipt = call(&fixture.state.store, |reply| {
-            StoreMsg::OperatorAttestationReceiptForAuthority {
-                authority_machine: fixture.local(),
-                operation_id: attestation.operation_id,
-                reply,
-            }
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let receipt = Store::open(&fixture.state.home.db_path())
+            .unwrap()
+            .operator_attestation_receipt_for_authority(fixture.local(), attestation.operation_id)
+            .unwrap();
         assert!(receipt.is_none());
     }
 
@@ -557,9 +797,7 @@ async fn operator_release_checks_path_authority_and_confirmation_before_store() 
 
 #[tokio::test]
 async fn operator_release_refuses_a_running_trainer() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (task_id, revision) = fixture.seed_registered_trainer(false).await;
     let attestation = operator_attestation(fixture.resource, fixture.local(), task_id, revision);
@@ -585,9 +823,7 @@ async fn operator_release_refuses_a_running_trainer() {
 
 #[tokio::test]
 async fn operator_release_commits_replays_and_requests_resource_reconciliation() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (task_id, revision) = fixture.seed_registered_trainer(true).await;
     let attestation = operator_attestation(fixture.resource, fixture.local(), task_id, revision);
@@ -672,9 +908,7 @@ async fn operator_release_commits_replays_and_requests_resource_reconciliation()
 
 #[tokio::test]
 async fn operator_release_keeps_its_saved_receipt_when_reconciliation_is_uncertain() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (task_id, revision) = fixture.seed_registered_trainer(true).await;
     let attestation = operator_attestation(fixture.resource, fixture.local(), task_id, revision);
@@ -703,17 +937,11 @@ async fn operator_release_keeps_its_saved_receipt_when_reconciliation_is_uncerta
         json!(attestation.operation_id.as_uuid())
     );
 
-    let receipt = call(&fixture.state.store, |reply| {
-        StoreMsg::OperatorAttestationReceiptForAuthority {
-            authority_machine: fixture.local(),
-            operation_id: attestation.operation_id,
-            reply,
-        }
-    })
-    .await
-    .unwrap()
-    .unwrap()
-    .expect("the transaction receipt must remain saved after the failed wake");
+    let receipt = Store::open(&fixture.state.home.db_path())
+        .unwrap()
+        .operator_attestation_receipt_for_authority(fixture.local(), attestation.operation_id)
+        .unwrap()
+        .expect("the transaction receipt must remain saved after the failed wake");
     assert_eq!(receipt.attestation, attestation);
     assert_eq!(requests.try_recv().unwrap(), fixture.resource);
     assert!(requests.try_recv().is_err());
@@ -725,10 +953,91 @@ async fn operator_release_keeps_its_saved_receipt_when_reconciliation_is_uncerta
 }
 
 #[tokio::test]
-async fn dashboard_action_requires_exact_origin_json_and_host() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
+async fn early_ended_first_launch_is_reserved_in_the_read_model_until_attested() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let (request_id, task_id) = fixture.seed_early_ended_launch().await;
+    let reserved = |body: &Value| {
+        body["loan"].is_null()
+            && body["resource"]["registered_background_task"].is_null()
+            && body["attention"]["code"] == "background_launch_release_unproven"
+            && body["attention"]["task_id"] == json!(task_id)
+            && body["background_launch"]
+                == json!({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "status": "release_unproven",
+                })
+    };
+
+    // no request is queued, and the durable state alone names the reservation
+    let detail = fixture.detail().await;
+    assert!(reserved(&detail), "{detail}");
+    assert_eq!(detail["requests"], json!([]));
+    let (status, list) = fixture.socket_get("/v1/resources").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let overview = list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["resource"]["id"] == json!(fixture.resource))
+        .unwrap();
+    assert!(reserved(overview), "{overview}");
+    assert_eq!(overview["queued_count"], 0);
+
+    // the view needs no actor snapshot, which a restarted daemon may not have yet
+    let model = local_models(&fixture.state, Some(fixture.resource))
+        .await
+        .unwrap()
+        .remove(0);
+    let durable = attention(&model, None).unwrap();
+    assert_eq!(durable.code, AttentionCode::BackgroundLaunchReleaseUnproven);
+    assert_eq!(durable.task_id, Some(task_id));
+
+    let revision = serde_json::from_value(detail["resource"]["state_revision"].clone()).unwrap();
+    let release_path = format!(
+        "/v1/resources/{}/operator-release",
+        fixture.resource.as_uuid()
+    );
+    // the registered-trainer binding cannot release an unregistered launch task
+    let registered = operator_attestation(fixture.resource, fixture.local(), task_id, revision);
+    let (status, response) = fixture
+        .socket_post(&release_path, operator_release_body(&registered))
         .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(error_code(&response), "resource_action_not_allowed");
+    assert!(reserved(&fixture.detail().await));
+
+    let attestation = OperatorGpuFreeAttestation {
+        state_binding: OperatorStateBinding::FirstBackgroundLaunch { request_id },
+        ..operator_attestation(fixture.resource, fixture.local(), task_id, revision)
+    };
+    let (status, receipt) = fixture
+        .socket_post(&release_path, operator_release_body(&attestation))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["replayed"], false);
+    assert_eq!(receipt["receipt"]["outcome"]["type"], "idle_boundary");
+    assert_eq!(
+        receipt["receipt"]["evidence"]["trainer_launch"],
+        json!({ "type": "first_background_launch", "request_id": request_id })
+    );
+    let (status, replay) = fixture
+        .socket_post(&release_path, operator_release_body(&attestation))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["receipt"], receipt["receipt"]);
+
+    let released = fixture.detail().await;
+    assert!(released["attention"].is_null(), "{released}");
+    assert!(released.get("background_launch").is_none(), "{released}");
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn dashboard_action_requires_exact_origin_json_and_host() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let path = format!("/v1/resources/{}/actions", fixture.resource.as_uuid());
     let body = json!({
@@ -830,9 +1139,7 @@ async fn dashboard_action_requires_exact_origin_json_and_host() {
 
 #[tokio::test]
 async fn queued_cancel_uses_the_origin_intent_and_retries_by_operation() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (request_id, task_id) = fixture.submit_request().await;
     let detail = fixture.detail().await;
@@ -919,9 +1226,7 @@ async fn queued_cancel_uses_the_origin_intent_and_retries_by_operation() {
 
 #[tokio::test]
 async fn queued_cancel_race_reports_a_definite_activated_request_on_retry() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let (request_id, task_id) = fixture.submit_request().await;
     let revision = fixture.detail().await["resource"]["state_revision"]
@@ -974,9 +1279,7 @@ async fn queued_cancel_race_reports_a_definite_activated_request_on_retry() {
 
 #[tokio::test]
 async fn renotify_reserves_one_explicit_attempt_without_resetting_the_budget() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     // an unreachable destination fails the attempt without starting Codex
     let destination = SupervisorAddress {
@@ -1054,9 +1357,7 @@ async fn renotify_reserves_one_explicit_attempt_without_resetting_the_budget() {
 
 #[tokio::test]
 async fn supervisor_replacement_retargets_undelivered_notices_and_checks_revision() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let notice = fixture.seed_failed_return_notice(SupervisorAddress {
         machine: fixture.local(),
@@ -1095,9 +1396,7 @@ async fn supervisor_replacement_retargets_undelivered_notices_and_checks_revisio
 
 #[tokio::test]
 async fn registration_retry_uses_the_first_supervisor_after_reassignment() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     let replacement = SupervisorAddress {
         machine: fixture.local(),
@@ -1136,9 +1435,7 @@ async fn registration_retry_uses_the_first_supervisor_after_reassignment() {
 
 #[tokio::test]
 async fn reads_are_read_only_and_unowned_writes_fail_closed() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     let fixture = Fixture::new().await;
     fixture.submit_request().await;
     let before = fixture.detail().await;
@@ -1288,13 +1585,11 @@ fn forwarded_control_keeps_typed_refusals_and_reports_unknown_outcomes() {
 
 #[tokio::test]
 async fn background_route_launches_one_co_located_trainer_and_refuses_remote_supervisors() {
-    let _serial = crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK
-        .lock()
-        .await;
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
     crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
     let fixture = Fixture::new().await;
     let root = fixture.callback_cwd.canonicalize().unwrap();
-    let trainer = crate::resource::command_shape::test_support::FakeTrainer::new(&root);
+    let trainer = FakeTrainer::new(&root);
     let body = |request_id: RequestId| {
         json!({
             "api_version": 1,

@@ -1,20 +1,19 @@
-//! Fleet endpoint work for durable direct-message and supervisor-notice delivery.
+//! Fleet endpoint work for durable direct-message and supervisor-notice delivery
 
-use std::collections::HashMap;
+use crate::domain::API_VERSION;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::callback::{check_saved_callback, send_saved_queue_attempt};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::keyed_locks::{KeyedGuard, KeyedLocks};
 use crate::domain::{AgentKind, TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::invocation::resolve_agent_binary;
@@ -30,21 +29,14 @@ const MESSAGE_PREFIX: &str = "HOMEBASED_MESSAGE ";
 const RESOURCE_NOTICE_PREFIX: &str = "HOMEBASED_RESOURCE_NOTICE ";
 
 /// Per-message delivery permits prevent concurrent retries from queueing one UUID twice
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct MessageReceiver {
-    attempts: Arc<Mutex<HashMap<MessageId, Weak<Mutex<()>>>>>,
-}
-
-impl Default for MessageReceiver {
-    fn default() -> Self {
-        Self {
-            attempts: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+    // per-key locks, not shards: a shard collision would fail an unrelated attempt as contended
+    attempts: KeyedLocks<MessageId>,
 }
 
 impl MessageReceiver {
-    /// Resolve, persist, and deliver one explicit message attempt.
+    /// Resolve, persist, and deliver one explicit message attempt
     pub(crate) async fn receive(
         &self,
         state: &AppState,
@@ -188,7 +180,7 @@ impl MessageReceiver {
         .map_err(|error| notice_delivery_failed(message_id, error))?;
 
         let receipt = MessageReceipt {
-            api_version: crate::domain::API_VERSION,
+            api_version: API_VERSION,
             protocol_version: request.protocol_version,
             message_id,
             destination_thread: attempt.destination_thread,
@@ -203,23 +195,10 @@ impl MessageReceiver {
         supervisor_notice_receipt(&request, receipt)
     }
 
-    async fn attempt_permit(&self, id: MessageId) -> (OwnedMutexGuard<()>, bool) {
-        let lock = {
-            let mut attempts = self.attempts.lock().await;
-            attempts.retain(|_, lock| lock.strong_count() > 0);
-            attempts
-                .get(&id)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| {
-                    let lock = Arc::new(Mutex::new(()));
-                    attempts.insert(id, Arc::downgrade(&lock));
-                    lock
-                })
-        };
-
-        match lock.clone().try_lock_owned() {
-            Ok(permit) => (permit, false),
-            Err(_) => (lock.lock_owned().await, true),
+    async fn attempt_permit(&self, id: MessageId) -> (KeyedGuard<MessageId>, bool) {
+        match self.attempts.try_lock(id) {
+            Some(permit) => (permit, false),
+            None => (self.attempts.lock(id).await, true),
         }
     }
 
@@ -245,7 +224,7 @@ impl MessageReceiver {
         .map_err(|error| delivery_failed(message_id, error))?;
 
         let receipt = MessageReceipt {
-            api_version: crate::domain::API_VERSION,
+            api_version: API_VERSION,
             protocol_version: attempt.request.protocol_version,
             message_id,
             destination_thread: attempt.destination_thread,
@@ -270,7 +249,7 @@ fn notice_backing_request(request: &SupervisorNoticeRequest) -> Result<MessageRe
             ),
         });
     }
-    // Keep the exact notice content in the existing durable UUID-keyed attempt ledger
+    // keep the exact notice content in the existing durable UUID-keyed attempt ledger
     Ok(MessageRequest {
         api_version: request.api_version,
         protocol_version: request.protocol_version,
@@ -294,7 +273,7 @@ fn supervisor_notice_receipt(
     receipt: MessageReceipt,
 ) -> Result<SupervisorNoticeReceipt, AppError> {
     if receipt.message_id.as_uuid() != request.attempt_id.as_uuid()
-        || receipt.api_version != crate::domain::API_VERSION
+        || receipt.api_version != API_VERSION
         || receipt.protocol_version != request.protocol_version
         || receipt.destination_thread != request.destination.thread
     {
@@ -354,7 +333,7 @@ async fn send_queue_line(
 #[derive(Serialize)]
 struct QueuedMessage<'a> {
     message_id: MessageId,
-    source: &'a crate::message::MessageSource,
+    source: &'a MessageSource,
     destination_thread: ThreadId,
     body: &'a str,
     reply_to: Option<MessageId>,
@@ -585,13 +564,17 @@ fn session_unavailable(error: impl std::fmt::Display) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::API_VERSION;
     use std::time::Duration;
 
-    use super::*;
-    use crate::domain::TaskId;
+    use super::{MESSAGE_PREFIX, MessageReceiver, QueuedMessage, notice_backing_request};
+    use crate::domain::{TaskId, ThreadId};
     use crate::machine::MachineId;
-    use crate::message::MessageSource;
+    use crate::message::{MessageAttempt, MessageId, MessageRequest, MessageSource, Recipient};
+    use crate::resource::SupervisorNoticeRequest;
     use serde_json::json;
+    use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn different_message_ids_do_not_queue_behind_one_delivery_permit() {
@@ -628,7 +611,7 @@ mod tests {
     #[test]
     fn queued_line_carries_the_message_route_and_body() {
         let request = MessageRequest {
-            api_version: crate::domain::API_VERSION,
+            api_version: API_VERSION,
             protocol_version: 1,
             message_id: MessageId::new(),
             destination_machine: MachineId::new(),
@@ -667,7 +650,7 @@ mod tests {
     #[test]
     fn notice_backing_request_uses_notice_identity_instead_of_a_fake_thread() {
         let request = SupervisorNoticeRequest {
-            api_version: crate::domain::API_VERSION,
+            api_version: API_VERSION,
             protocol_version: 1,
             source_machine: MachineId::new(),
             destination: crate::resource::SupervisorAddress {

@@ -15,14 +15,16 @@ use crate::resource::store::{
     ResourceStoreError, SupervisorNoticeStoreError, decode_supervisor_notice_record,
     requests_for_resource_for_authority, resources_for_authority,
     retarget_supervisor_notice_in_transaction, select_non_closed_loan, select_request_by_id,
-    select_resource, select_supervisor_notice_record, update_supervisor_notice_cas,
+    select_supervisor_notice_record, update_supervisor_notice_cas,
 };
 use crate::resource::{
     ActionId, AssignmentRevision, DeliveryAttemptId, Loan, LoanId, LoanPhase, LoanState, NoticeId,
     Resource, ResourceId, ResourceRequest, ResourceRequestState, ResourceRevision,
-    SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
+    ReturnExecutionMode, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
 };
-use crate::store::Store;
+use crate::store::{BackgroundLaunchView, Store};
+
+use super::select_authority_resource;
 
 #[cfg(test)]
 mod test_support;
@@ -38,6 +40,13 @@ pub(crate) struct ResourceReadModel {
     pub(crate) requests: Vec<ResourceRequest>,
     /// Notices that belong to the non-closed loan
     pub(crate) notices: Vec<SupervisorNotice>,
+    /// Latest first background launch with its phase derived from durable task state
+    ///
+    /// It keeps an unregistered resource reserved while it is pending or while it
+    /// ended before registration with no automatic or attested release
+    pub(crate) background_launch: Option<BackgroundLaunchView>,
+    /// Accepted execution mode of the exact current Restoring loan, if proven
+    pub(crate) return_execution_mode: Option<ReturnExecutionMode>,
 }
 
 /// Immutable content bound to one control operation identity
@@ -206,11 +215,20 @@ fn resource_read_models(
                 Some(loan) => notices_for_loan(conn, loan.id)?,
                 None => Vec::new(),
             };
+            let background_launch = super::background::current_launch_on(conn, &snapshot.resource)?;
+            let return_execution_mode = super::restore::current_return_execution_mode_on(
+                conn,
+                &snapshot.resource,
+                snapshot.loan.as_ref(),
+            )
+            .map_err(|error| ResourceStoreError::ReturnDecisionRead(error.to_string()))?;
             Ok(ResourceReadModel {
                 resource: snapshot.resource,
                 loan: snapshot.loan,
                 requests,
                 notices,
+                background_launch,
+                return_execution_mode,
             })
         })
         .collect()
@@ -219,20 +237,17 @@ fn resource_read_models(
 fn notices_for_loan(
     conn: &Connection,
     loan_id: LoanId,
-) -> Result<Vec<SupervisorNotice>, rusqlite::Error> {
+) -> Result<Vec<SupervisorNotice>, ResourceStoreError> {
     let mut statement = conn.prepare(
         "SELECT id, loan_id, action_id, notice_json
          FROM resource_supervisor_notices
          WHERE loan_id = ?1
          ORDER BY id ASC",
     )?;
-    statement
-        .query_map(
-            [loan_id.as_uuid().to_string()],
-            decode_supervisor_notice_record,
-        )?
-        .map(|record| record.map(|(notice, _)| notice))
-        .collect()
+    let rows = statement.query_map([loan_id.as_uuid().to_string()], |row| {
+        Ok(decode_supervisor_notice_record(row))
+    })?;
+    rows.map(|record| Ok(record??.0)).collect()
 }
 
 /// Action identity that the loan still waits on, if any
@@ -261,7 +276,7 @@ fn begin_resource_control(
     attempt_id: DeliveryAttemptId,
 ) -> Result<ResourceControlStart, ResourceControlError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let resource = authority_resource(&tx, authority_machine, request.resource_id)?;
+    let resource = select_authority_resource(&tx, authority_machine, request.resource_id)?;
 
     if let Some(saved) = saved_operation(&tx, operation_id)? {
         if saved.request != *request {
@@ -357,13 +372,11 @@ fn saved_operation(
     };
     let attempt_id = attempt_id
         .map(|value| {
-            Uuid::parse_str(&value)
-                .map(DeliveryAttemptId::from_uuid)
-                .map_err(|_| {
-                    ResourceControlError::NotAllowed(
-                        "saved control operation has an invalid attempt identity".into(),
-                    )
-                })
+            value.parse::<DeliveryAttemptId>().map_err(|_| {
+                ResourceControlError::NotAllowed(
+                    "saved control operation has an invalid attempt identity".into(),
+                )
+            })
         })
         .transpose()?;
     Ok(Some(SavedOperation {
@@ -412,21 +425,6 @@ fn replayed_effect(
     }
 }
 
-fn authority_resource(
-    conn: &Connection,
-    authority_machine: MachineId,
-    resource_id: ResourceId,
-) -> Result<Resource, ResourceControlError> {
-    let resource = select_resource(conn, resource_id)?.ok_or(ResourceControlError::NotFound)?;
-    if resource.authority_machine() != authority_machine {
-        return Err(ResourceControlError::WrongAuthority {
-            expected: resource.authority_machine(),
-            found: authority_machine,
-        });
-    }
-    Ok(resource)
-}
-
 fn request_for_resource(
     conn: &Connection,
     resource_id: ResourceId,
@@ -467,7 +465,8 @@ fn reserve_explicit_attempt(
     notice_id: NoticeId,
     attempt_id: DeliveryAttemptId,
 ) -> Result<(), ResourceControlError> {
-    let (mut notice, old_json) = select_supervisor_notice_record(tx, notice_id)?
+    let (mut notice, old_json) = select_supervisor_notice_record(tx, notice_id)
+        .map_err(SupervisorNoticeStoreError::from)?
         .ok_or_else(|| ResourceControlError::NotAllowed("notice not found".into()))?;
     let pending = loan
         .filter(|loan| loan.id == notice.loan_id)
@@ -509,7 +508,7 @@ fn replace_resource_supervisor(
     supervisor: SupervisorAddress,
 ) -> Result<SupervisorReplacement, ResourceControlError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut resource = authority_resource(&tx, authority_machine, resource_id)?;
+    let mut resource = select_authority_resource(&tx, authority_machine, resource_id)?;
     // an exact retry after a lost response finds the requested assignment already saved
     if resource.supervisor == supervisor {
         tx.commit()?;

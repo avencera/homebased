@@ -20,13 +20,13 @@ use tempfile::TempDir;
 const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
 
 /// `HOMEBASED_WEB_LISTEN` for a harness daemon. The dashboard is off unless a
-/// test opts in; dashboard tests bind `127.0.0.1:0` so they do not share a port.
+/// test opts in; dashboard tests bind `127.0.0.1:0` so they do not share a port
 const WEB_OFF: &str = "off";
 const WEB_EPHEMERAL: &str = "127.0.0.1:0";
 
 struct Harness {
     dir: TempDir,
-    /// Private `$HOME` so unit paths never touch the developer's real home.
+    /// Private `$HOME` so unit paths never touch the developer's real home
     user_home: PathBuf,
     home: PathBuf,
     record: PathBuf,
@@ -42,7 +42,7 @@ impl Harness {
         Self::with_web_listen(WEB_OFF)
     }
 
-    /// Harness whose daemon also serves the dashboard on a free port.
+    /// Harness whose daemon also serves the dashboard on a free port
     fn with_dashboard() -> Self {
         Self::with_web_listen(WEB_EPHEMERAL)
     }
@@ -176,7 +176,7 @@ impl Harness {
     }
 
     /// Pid the fake agent recorded for itself. VER-05 is about the agent
-    /// process, not the worker pid the test signalled.
+    /// process, not the worker pid the test signalled
     fn agent_pid(&self, id: &str) -> i32 {
         let path = self.record.join(format!("agent-pid-{id}.txt"));
         assert!(
@@ -186,7 +186,7 @@ impl Harness {
         fs::read_to_string(&path).unwrap().trim().parse().unwrap()
     }
 
-    /// Bytes the fake agent read on stdin for exactly this task.
+    /// Bytes the fake agent read on stdin for exactly this task
     fn agent_stdin(&self, id: &str) -> String {
         fs::read_to_string(self.record.join(format!("stdin-{id}.txt"))).unwrap()
     }
@@ -339,7 +339,7 @@ impl Harness {
         }
     }
 
-    /// Put a fake `systemctl`/`launchctl` ahead of PATH and clear its log.
+    /// Put a fake `systemctl`/`launchctl` ahead of PATH and clear its log
     fn install_fake_supervisor(&mut self) {
         let bin = self.dir.path().join("fake-bin");
         fs::create_dir_all(&bin).unwrap();
@@ -371,7 +371,7 @@ impl Harness {
         let _ = fs::remove_file(&self.supervisor_log);
     }
 
-    /// Write a host unit under the harness private `$HOME`.
+    /// Write a host unit under the harness private `$HOME`
     fn write_host_unit(&self, configured_home: &Path) {
         #[cfg(target_os = "linux")]
         {
@@ -1755,8 +1755,8 @@ fn install_dry_run_text() {
     }
     assert!(!text.contains("HOMEBASED_WEB_LISTEN"), "{text}");
 
-    // the installing shell's bind is baked in, and a bad one fails install.
-    // unset means the dashboard stays off; the unit does not invent a bind.
+    // the installing shell's bind is baked in, and a bad one fails install
+    // unset means the dashboard stays off; the unit does not invent a bind
     let out = Command::new(&hb)
         .env("HOMEBASED_WEB_LISTEN", "0.0.0.0:7677")
         .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
@@ -2006,10 +2006,10 @@ fn counter_evidence_scan() {
     }
 
     let daemon = src.join("daemon");
-    // the message receiver uses per-message permits, not one daemon-wide lock
+    // only the per-key lock type may use a mutex; the daemon holds no daemon-wide lock
     let mutex: Vec<_> = grep_src(&daemon, "Mutex")
         .into_iter()
-        .filter(|line| !line.contains("/message_receiver.rs:"))
+        .filter(|line| !line.contains("/keyed_locks.rs:"))
         .collect();
     assert!(mutex.is_empty(), "Mutex in daemon: {mutex:?}");
     let rwlock = grep_src(&daemon, "RwLock");
@@ -2038,7 +2038,7 @@ fn grep_daemon_except_store(daemon: &Path, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scan production sections of `.rs` files under `path`.
+/// Scan production sections of `.rs` files under `path`
 fn grep_src(path: &Path, needle: &str) -> Vec<String> {
     let mut matches = Vec::new();
     let files = if path.is_file() {
@@ -2048,6 +2048,9 @@ fn grep_src(path: &Path, needle: &str) -> Vec<String> {
     };
     for file in files {
         if file.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        if is_test_module_file(&file) {
             continue;
         }
         if let Ok(text) = fs::read_to_string(&file) {
@@ -2064,6 +2067,18 @@ fn grep_src(path: &Path, needle: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+/// Whether `file` is a child test module such as `foo/tests.rs`, `foo/tests/bar.rs`, or
+/// `foo/test_support.rs`, which production code only declares behind `#[cfg(test)]`
+fn is_test_module_file(file: &Path) -> bool {
+    let stem = file.file_stem().and_then(|s| s.to_str());
+    if matches!(stem, Some("tests" | "test_support")) {
+        return true;
+    }
+    file.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "tests")
 }
 
 fn walkdir_files(root: &Path) -> Vec<PathBuf> {
@@ -2493,7 +2508,7 @@ fn dashboard_file_browser_and_content_origin() {
     );
 }
 
-/// `host:port` of the running dashboard, from the daemon's own status body.
+/// `host:port` of the running dashboard, from the daemon's own status body
 fn dashboard_addr(h: &Harness) -> String {
     let out = h
         .cmd()
@@ -2515,7 +2530,7 @@ fn dashboard_addr(h: &Harness) -> String {
 #[derive(Debug)]
 struct HttpResponse {
     status: u16,
-    /// Response headers, lowercased, for substring checks.
+    /// Response headers, lowercased, for substring checks
     head: String,
     body: String,
 }
@@ -2542,7 +2557,7 @@ fn http_post_json(addr: &str, path: &str, body: &Value) -> HttpResponse {
 }
 
 /// Hand-written HTTP/1.1 over a plain socket: the assertions are about what a
-/// browser sees, so no client crate sits in between.
+/// browser sees, so no client crate sits in between
 fn http_request(
     addr: &str,
     method: &str,
@@ -2708,7 +2723,7 @@ fn sigterm_right_after_cas_is_cancelled_not_lost() {
     let h = Harness::new();
     // the window runs from the Queued->Running CAS to `signal()` inside
     // `run_agent`, and the only work in it is the feed read. Swap a very large
-    // feed in behind the daemon so that read takes long enough to signal into.
+    // feed in behind the daemon so that read takes long enough to signal into
     let big = h.home.join("big-feed.txt");
     fs::write(&big, vec![b'x'; 512 * 1024 * 1024]).unwrap();
 
@@ -2740,7 +2755,7 @@ fn sigterm_right_after_cas_is_cancelled_not_lost() {
     .unwrap();
 
     // poll SQLite directly with no back-off and signal from this process:
-    // going through the socket would cost more than the window is wide.
+    // going through the socket would cost more than the window is wide
     let store = h.store();
     let deadline = Instant::now() + Duration::from_secs(10);
     let pid = loop {
@@ -2982,12 +2997,11 @@ fn task_dry_run_returns_exact_argv_and_creates_no_row() {
 
 /// A terminal event must never overtake a `TASK_CHECK_DUE` that is already on
 /// the wire. The gated fake queue makes `queue-messages.txt` record completion
-/// order, so the assertion is about real delivery order, not about timing.
+/// order, so the assertion is about real delivery order, not about timing
 ///
-/// Also covers the settlement boundary past the old 15s release valve without
-/// waiting the full 90s settle budget: the gate stays closed past 15s from
-/// queue entry, still under the 20s attempt deadline, and the terminal event
-/// must not leak.
+/// Also covers a settlement boundary without waiting the full 90s settle
+/// budget: the gate stays closed past 15s from queue entry, still under the
+/// 20s attempt deadline, and the terminal event must not leak
 #[test]
 fn terminal_event_waits_for_an_in_flight_check_due() {
     use homebased::callback::{ATTENTION_SETTLE, QUEUE_ATTEMPT_TIMEOUT};
@@ -3025,7 +3039,7 @@ fn terminal_event_waits_for_an_in_flight_check_due() {
     );
     h.wait_status(&id, "cancelled");
 
-    // hold past the old 15s valve, still under the 20s attempt deadline, and
+    // hold past 15s, still under the 20s attempt deadline, and
     // prove the terminal event cannot overtake the live claim
     let hold_until = entered_at + Duration::from_secs(16);
     while Instant::now() < hold_until {

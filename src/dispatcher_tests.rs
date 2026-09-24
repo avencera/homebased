@@ -1,5 +1,6 @@
 //! Origin inbox dispatcher tests with a fake saved Codex executable
 
+use crate::daemon::actors::StoreActor;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -86,13 +87,9 @@ fn event(route: &OriginRoute, seq: u64, callback: bool) -> TaskEvent {
 }
 
 async fn dispatch(home: &Home, id: TaskId) {
-    let (store, handle) = crate::daemon::actors::StoreActor::spawn(
-        None,
-        crate::daemon::actors::StoreActor,
-        home.db_path(),
-    )
-    .await
-    .unwrap();
+    let (store, handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
     dispatch_inbox(store.clone(), home.clone(), id)
         .await
         .unwrap();
@@ -181,12 +178,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
     });
     let store = Store::open(&home.db_path()).unwrap();
     store
-        .insert_local_task(
-            &row,
-            spec,
-            machine,
-            route.callback.codex.path().unwrap().to_path_buf(),
-        )
+        .insert_local_task(&row, spec, machine, route.callback.codex.clone())
         .unwrap();
     store
         .cas_status(row.id, ProcessStatus::Queued, ProcessStatus::Running)
@@ -299,13 +291,9 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
         .accept_inbound_event(&event(&route, 1, true))
         .unwrap();
     drop(persisted);
-    let (store, store_handle) = crate::daemon::actors::StoreActor::spawn(
-        None,
-        crate::daemon::actors::StoreActor,
-        home.db_path(),
-    )
-    .await
-    .unwrap();
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
     let (callback, callback_handle) = CallbackActor::spawn(
         None,
         CallbackActor,

@@ -1,4 +1,4 @@
-//! One `TaskActor` per non-terminal task: flock watch, apply, inactivity timer.
+//! One `TaskActor` per non-terminal task: flock watch, apply, inactivity timer
 
 use std::path::Path;
 use std::time::Duration;
@@ -16,46 +16,46 @@ use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::store::{self, CancelResult};
 
-/// Retry interval when an attention event cannot be committed.
+/// Retry interval when an attention event cannot be committed
 const ATTENTION_RETRY: Duration = Duration::from_secs(30);
 
 /// Longest single sleep before the deadline is recomputed from the wall clock
 /// and `output.log` mtime. The inactivity timer has no product maximum, so
 /// bounded hops re-check for wall-clock changes and new output, and keep each
-/// sleep within a practical timer limit.
+/// sleep within a practical timer limit
 const ATTENTION_HOP_MAX: Duration = Duration::from_secs(3600);
 
-/// Per-task messages.
+/// Per-task messages
 pub enum TaskMsg {
-    /// `runner.lock` is free; apply `exit.json` or Lost.
+    /// `runner.lock` is free; apply `exit.json` or Lost
     LockReleased,
-    /// Output-inactivity timer fired.
+    /// Output-inactivity timer fired
     AttentionDue,
-    /// A legacy attention sender can no longer be alive.
+    /// A legacy attention sender can no longer be alive
     AttentionRecoveryDue,
 }
 
-/// Holds refs; `Arguments` is the `TaskId`.
+/// Holds refs; `Arguments` is the `TaskId`
 pub struct TaskActor {
-    /// State dir.
+    /// State dir
     pub home: Home,
-    /// Store actor.
-    pub store: ActorRef<StoreMsg>,
+    /// Store actor
+    pub(crate) store: ActorRef<StoreMsg>,
 }
 
 /// In-memory attention phase for one watch actor. Armed and recovering cannot
-/// overlap.
+/// overlap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttentionPhase {
-    /// Timer may still fire; no send is in flight.
+    /// Timer may still fire; no send is in flight
     Armed,
-    /// A legacy sender may still own the old persisted claim until its bound passes.
+    /// A legacy sender may still own the old persisted claim until its bound passes
     Recovering,
-    /// Delivered, or the task went terminal; no further reminder.
+    /// Delivered, or the task went terminal; no further reminder
     Done,
 }
 
-/// Runtime state of one watch actor.
+/// Runtime state of one watch actor
 pub struct TaskWatch {
     id: TaskId,
     attention: AttentionPhase,
@@ -186,7 +186,7 @@ impl Actor for TaskActor {
 
 /// Time left before an inactivity reminder is due. Saturating throughout:
 /// neither a timeout near `u64::MAX` nor a clock that moved backwards can
-/// overflow or collapse the wait to zero.
+/// overflow or collapse the wait to zero
 fn inactivity_wait(
     created_at: DateTime<Utc>,
     last_output_at: Option<DateTime<Utc>>,
@@ -201,7 +201,7 @@ fn inactivity_wait(
 }
 
 /// Modification time of a non-empty `output.log`. An empty or missing file is
-/// not activity: the runner creates the log at spawn.
+/// not activity: the runner creates the log at spawn
 fn last_output_at(output: &Path) -> Option<DateTime<Utc>> {
     let metadata = match std::fs::metadata(output) {
         Ok(metadata) if metadata.len() != 0 => metadata,
@@ -223,7 +223,7 @@ fn last_output_at(output: &Path) -> Option<DateTime<Utc>> {
 
 /// Hand-rolled rather than `send_after`: the wait is re-derived from the wall
 /// clock and `output.log` mtime on every hop so a long timeout survives clock
-/// changes, suspend, and new output.
+/// changes, suspend, and new output
 fn arm_attention_timer(
     myself: ActorRef<TaskMsg>,
     row: &TaskRow,
@@ -259,11 +259,11 @@ fn schedule_attention_recovery(myself: &ActorRef<TaskMsg>) -> AbortHandle {
         .abort_handle()
 }
 
-/// Outcome of starting one attention attempt.
+/// Outcome of starting one attention attempt
 enum AttentionStep {
-    /// The task has not started or output resumed, so another check is armed.
+    /// The task has not started or output resumed, so another check is armed
     Deferred(AbortHandle),
-    /// Nothing to produce: already recorded, or the task is terminal.
+    /// Nothing to produce: already recorded, or the task is terminal
     Done,
 }
 
@@ -329,7 +329,7 @@ async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<(), AppError>
     Ok(())
 }
 
-/// The worker released the lock without writing `exit.json`.
+/// The worker released the lock without writing `exit.json`
 async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<TaskRow, AppError> {
     if row.state.is_terminal() {
         return Ok(row);
@@ -352,7 +352,7 @@ async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<TaskRow, AppError
     }
 }
 
-/// The worker wrote `exit.json`; adopt its reason if the row is still live.
+/// The worker wrote `exit.json`; adopt its reason if the row is still live
 async fn apply_exit(
     actor: &TaskActor,
     row: TaskRow,
@@ -379,7 +379,7 @@ async fn apply_exit(
 
 /// Request cancel in the store, then signal a live worker when needed. Every state change is
 /// a store CAS, so this needs no per-task actor and the supervisor runs it
-/// directly.
+/// directly
 pub(crate) async fn cancel_task(
     store: &ActorRef<StoreMsg>,
     id: TaskId,
@@ -589,12 +589,10 @@ mod tests {
             },
             binary: Path::new("/bin/true").to_path_buf(),
         });
-        call(&store, |reply| StoreMsg::InsertTask {
-            row: Box::new(row),
-            reply,
-        })
-        .await
-        .unwrap();
+        crate::store::Store::open(&home.db_path())
+            .unwrap()
+            .insert_task(&row)
+            .unwrap();
 
         call(&store, |reply| StoreMsg::MigrateLegacyLocal {
             machine: crate::machine::MachineId::new(),

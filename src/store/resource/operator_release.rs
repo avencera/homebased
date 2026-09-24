@@ -1,26 +1,34 @@
 //! Authority-owned operator attestation for an ended trainer with no release proof
 //!
 //! One IMMEDIATE transaction checks the exact attestation against the current
-//! resource revision, registration, loan, task row, and the resource launch
-//! that registered the task. It then saves one receipt with the evidence
-//! snapshot and commits the queue or loan transition that follows. A refusal
-//! writes nothing. An exact retry returns the saved receipt without these
-//! checks, so a later transition cannot turn it into a refusal
+//! resource revision, registration, loan or launch reservation, task row, and
+//! the resource launch that bound the task. It then saves one receipt with the
+//! evidence snapshot and commits the queue or loan transition that follows. A
+//! refusal writes nothing. An exact retry returns the saved receipt without
+//! these checks, so a later transition cannot turn it into a refusal
 //!
 //! With an AwaitingRelease loan the release action closes into Serving or
-//! AwaitingReturn and keeps the return obligation, as a proven release would.
-//! With no loan the registration clears. The oldest queued request then serves
-//! from an idle loan in the same transaction, or the receipt becomes the saved
-//! idle boundary that a later reconciliation or first launch reads
+//! AwaitingReturn and keeps the return obligation, as a proven release would
+//! With no loan, for the registered trainer or for a first background launch
+//! that ended before registration, the registration clears. The oldest queued
+//! request then serves from an idle loan in the same transaction, or the
+//! receipt becomes the saved idle boundary that a later reconciliation or first
+//! launch reads. With a Restoring loan whose direct-segment return task ended
+//! before its confirmed start, or whose native foreground return task ended or
+//! was lost, the loan closes with the attested end, as a supervisor resolution
+//! of a proven end would. The oldest queued request then serves from an idle
+//! loan, or the closure is the saved idle boundary. The attestation never
+//! becomes process-group exit evidence; the task row keeps its saved state
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::background::{
-    AdvanceError, advance_resource_on, first_launch_of_registered_trainer_on,
-    latest_launch_request_on, latest_loan_on, open_idle_serving_loan_on,
-    pending_background_launch_on,
+    AdvanceError, BackgroundLaunchPhase, advance_resource_on, current_launch_and_predecessor_on,
+    first_launch_of_registered_trainer_on, latest_launch_request_on, latest_loan_on,
+    open_idle_serving_loan_on, pending_background_launch_on,
 };
-use super::restore::direct_segment_return_of_registered_trainer_on;
+use super::restore::{direct_segment_return_of_registered_trainer_on, restoring_return_of_mode_on};
+use super::{LoanActionPhase, replace_loan_in_action_phase_on};
 use crate::domain::{TaskId, TaskState};
 use crate::machine::MachineId;
 use crate::resource::operator_release::{
@@ -29,18 +37,19 @@ use crate::resource::operator_release::{
     OperatorGpuFreeReceipt, OperatorGpuFreeRefusal, OperatorGpuFreeResolution,
     OperatorStateBinding,
 };
+use crate::resource::ownership_lock::TrainerRequestDigest;
 use crate::resource::store::{
     ResourceStoreError, SupervisorNoticeStoreError, insert_supervisor_notice_in_transaction,
     oldest_queued_request_for_authority, select_non_closed_loan, select_resource,
     select_supervisor_notice_record_by_action,
 };
 use crate::resource::{
-    ActionId, IdleBoundaryProof, Loan, LoanId, LoanPhase, LoanState, NoticeId, Resource,
-    ResourceRequestState, ResourceRevision, ReturnContext, ServingReleaseProvenance,
-    SupervisorNotice, SupervisorNoticeDelivery, SupervisorNoticePayload,
+    ActionId, IdleBoundaryProof, Loan, LoanClosure, LoanId, LoanPhase, LoanState, NoticeId,
+    Resource, ResourceRequestState, ResourceRevision, ReturnContext, ReturnExecutionMode,
+    ServingReleaseProvenance, SupervisorNotice, SupervisorNoticeDelivery, SupervisorNoticePayload,
 };
 use crate::store::{BackgroundLaunchError, ReturnDecisionError, Store};
-use crate::submission::RequestId;
+use crate::submission::{NormalizedSpecSha256, RequestId};
 
 /// Why an operator attestation was refused or could not be evaluated
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +88,7 @@ pub(crate) enum OperatorGpuFreeError {
 pub(crate) struct OperatorIdleBoundary {
     /// Attestation whose receipt holds the observation and evidence
     pub(crate) operation_id: OperatorAttestationId,
-    /// Registered trainer that the attestation cleared
+    /// Registered trainer or first launch task that the attestation cleared
     pub(crate) task_id: TaskId,
     /// Latest first background launch when the attestation committed
     pub(crate) preceding_launch: Option<RequestId>,
@@ -96,16 +105,6 @@ impl Store {
         attestation: OperatorGpuFreeAttestation,
     ) -> Result<OperatorGpuFreeResolution, OperatorGpuFreeError> {
         attest_trainer_gpu_free(&mut self.conn, authority_machine, attestation)
-    }
-
-    /// Read the saved receipt of one operator attestation on this authority
-    pub(crate) fn operator_attestation_receipt_for_authority(
-        &self,
-        authority_machine: MachineId,
-        operation_id: OperatorAttestationId,
-    ) -> Result<Option<OperatorGpuFreeReceipt>, OperatorGpuFreeError> {
-        Ok(saved_receipt_on(&self.conn, operation_id)?
-            .filter(|receipt| receipt.attestation.authority_machine == authority_machine))
     }
 }
 
@@ -139,16 +138,43 @@ fn attest_trainer_gpu_free(
     }
 
     let resource = current_resource(&tx, &attestation)?;
-    let release = bound_release_action(&tx, &resource, &attestation)?;
-    let evidence = trainer_evidence(&tx, &resource, attestation.task_id)?;
     let preceding_loan = latest_loan_on(&tx, resource.id)?.map(|loan| loan.id);
     let preceding_launch = latest_launch_request_on(&tx, resource.id)?;
-
-    let (state_revision, outcome) = match release {
-        Some((loan, action_id)) => {
-            resolve_release_action(&tx, &resource, &attestation, &evidence, loan, action_id)?
+    let (evidence, (state_revision, outcome)) = match attestation.state_binding {
+        OperatorStateBinding::NoLoan | OperatorStateBinding::AwaitingRelease { .. } => {
+            let release = bound_release_action(&tx, &resource, &attestation)?;
+            let evidence = registered_trainer_evidence(&tx, &resource, attestation.task_id)?;
+            let transition = match release {
+                Some((loan, action_id)) => resolve_release_action(
+                    &tx,
+                    &resource,
+                    &attestation,
+                    &evidence,
+                    loan,
+                    action_id,
+                )?,
+                None => resolve_idle(&tx, &resource, &attestation)?,
+            };
+            (evidence, transition)
         }
-        None => resolve_idle(&tx, &resource, &attestation)?,
+        OperatorStateBinding::FirstBackgroundLaunch { request_id } => {
+            let evidence = bound_first_launch(&tx, &resource, &attestation, request_id)?;
+            (evidence, resolve_idle(&tx, &resource, &attestation)?)
+        }
+        OperatorStateBinding::RestoringReturn { loan_id, action_id }
+        | OperatorStateBinding::RestoringForegroundReturn { loan_id, action_id } => {
+            let (loan, return_context, evidence) =
+                bound_restoring_return(&tx, &resource, &attestation, loan_id, action_id)?;
+            let transition = resolve_restoring(
+                &tx,
+                &resource,
+                &attestation,
+                loan,
+                action_id,
+                return_context,
+            )?;
+            (evidence, transition)
+        }
     };
     let receipt = OperatorGpuFreeReceipt {
         attestation,
@@ -177,7 +203,9 @@ fn attest_trainer_gpu_free(
     })
 }
 
-/// Read the resource and compare its authority, revision, and registration
+/// Read the resource and compare its authority and revision
+///
+/// A binding that names the registered trainer also requires that registration
 fn current_resource(
     conn: &Connection,
     attestation: &OperatorGpuFreeAttestation,
@@ -198,7 +226,9 @@ fn current_resource(
         }
         .into());
     }
-    if resource.registered_background_task != Some(attestation.task_id) {
+    if attestation.state_binding.names_registered_trainer()
+        && resource.registered_background_task != Some(attestation.task_id)
+    {
         return Err(OperatorGpuFreeRefusal::NotRegisteredTrainer {
             task_id: attestation.task_id,
             registered: resource.registered_background_task,
@@ -233,7 +263,14 @@ fn bound_release_action(
         {
             (loan, loan_id, action_id)
         }
-        (_, current) => {
+        (
+            OperatorStateBinding::NoLoan
+            | OperatorStateBinding::AwaitingRelease { .. }
+            | OperatorStateBinding::FirstBackgroundLaunch { .. }
+            | OperatorStateBinding::RestoringReturn { .. }
+            | OperatorStateBinding::RestoringForegroundReturn { .. },
+            current,
+        ) => {
             return Err(OperatorGpuFreeRefusal::LoanStateChanged {
                 current_loan: current.map(|loan| loan.id),
             }
@@ -259,7 +296,8 @@ fn bound_release_action(
         .into());
     }
 
-    let notice = select_supervisor_notice_record_by_action(conn, action_id)?;
+    let notice = select_supervisor_notice_record_by_action(conn, action_id)
+        .map_err(ResourceStoreError::from)?;
     let notice_matches = notice.is_some_and(|(notice, _)| {
         notice.loan_id == loan_id
             && notice.action_id == action_id
@@ -272,32 +310,16 @@ fn bound_release_action(
     Ok(Some((loan, action_id)))
 }
 
-/// Snapshot the task end, registering launch, identity digest, and association
+/// Snapshot the registered trainer's end, registering launch, digest, and association
 ///
 /// The task must have ended or been lost. Its accepted identity and callback
 /// route must still match the resource launch that registered it
-fn trainer_evidence(
+fn registered_trainer_evidence(
     conn: &Connection,
     resource: &Resource,
     task_id: TaskId,
 ) -> Result<OperatorGpuFreeEvidence, OperatorGpuFreeError> {
-    let row = crate::store::task_by_id_on(conn, task_id)?
-        .ok_or(OperatorGpuFreeRefusal::TaskMissing { task_id })?;
-    let trainer_end = match &row.state {
-        TaskState::Queued | TaskState::Running { .. } => {
-            return Err(OperatorGpuFreeRefusal::TaskNotEnded {
-                task_id,
-                state: row.status(),
-            }
-            .into());
-        }
-        TaskState::Finished { reason } => AttestedTrainerEnd::Finished {
-            outcome: reason.clone(),
-            process_group_exit: row.process_group_exit_evidence(),
-        },
-        TaskState::Lost => AttestedTrainerEnd::Lost,
-    };
-
+    let trainer_end = ended_trainer(conn, task_id)?;
     let (trainer_launch, normalized_spec_sha256) = if let Some((request_id, digest)) =
         first_launch_of_registered_trainer_on(conn, resource, task_id)?
     {
@@ -319,6 +341,212 @@ fn trainer_evidence(
         return Err(OperatorGpuFreeRefusal::TrainerLaunchUnproven { task_id }.into());
     };
 
+    evidence(
+        conn,
+        resource,
+        task_id,
+        trainer_end,
+        trainer_launch,
+        normalized_spec_sha256,
+    )
+}
+
+/// Compare the named first background launch with the latest launch and snapshot its evidence
+///
+/// No loan may reserve the resource. The launch must be the latest one, bind
+/// the named task, and have ended before registration with no automatic
+/// release proof. The registration must still be the one that the launch
+/// replaced, so a later registration can never be cleared through it
+fn bound_first_launch(
+    conn: &Connection,
+    resource: &Resource,
+    attestation: &OperatorGpuFreeAttestation,
+    request_id: RequestId,
+) -> Result<OperatorGpuFreeEvidence, OperatorGpuFreeError> {
+    let task_id = attestation.task_id;
+    if let Some(loan) = select_non_closed_loan(conn, resource.id)? {
+        return Err(OperatorGpuFreeRefusal::LoanStateChanged {
+            current_loan: Some(loan.id),
+        }
+        .into());
+    }
+    let current = current_launch_and_predecessor_on(conn, resource)?;
+    let current_launch = current.as_ref().map(|(view, _)| view.request_id);
+    let Some((view, replaces_task)) = current.filter(|(view, _)| view.request_id == request_id)
+    else {
+        return Err(OperatorGpuFreeRefusal::LaunchNotAwaitingRelease {
+            request_id,
+            current_launch,
+        }
+        .into());
+    };
+    if view.task_id != task_id {
+        return Err(OperatorGpuFreeRefusal::NotBoundTask {
+            task_id,
+            bound: view.task_id,
+        }
+        .into());
+    }
+    // a queued or running launch task still owns the GPU
+    let trainer_end = ended_trainer(conn, task_id)?;
+    match view.phase {
+        _ if view.awaits_operator_release() => {}
+        BackgroundLaunchPhase::IdentityMismatch => {
+            return Err(OperatorGpuFreeRefusal::TrainerLaunchUnproven { task_id }.into());
+        }
+        BackgroundLaunchPhase::Superseded
+        | BackgroundLaunchPhase::Queued
+        | BackgroundLaunchPhase::StartedUnregistered
+        | BackgroundLaunchPhase::Registered
+        | BackgroundLaunchPhase::EndedBeforeRegistration { .. } => {
+            return Err(OperatorGpuFreeRefusal::LaunchNotAwaitingRelease {
+                request_id,
+                current_launch,
+            }
+            .into());
+        }
+    }
+    if resource.registered_background_task != replaces_task {
+        return Err(OperatorGpuFreeRefusal::InconsistentHistory { task_id }.into());
+    }
+    let Some((launch_request, digest)) =
+        first_launch_of_registered_trainer_on(conn, resource, task_id)?
+    else {
+        return Err(OperatorGpuFreeRefusal::TrainerLaunchUnproven { task_id }.into());
+    };
+    if launch_request != request_id {
+        return Err(OperatorGpuFreeRefusal::InconsistentHistory { task_id }.into());
+    }
+
+    evidence(
+        conn,
+        resource,
+        task_id,
+        trainer_end,
+        AttestedTrainerLaunch::FirstBackgroundLaunch { request_id },
+        digest,
+    )
+}
+
+/// Compare the named Restoring loan with the current loan and snapshot its task evidence
+///
+/// The loan must still be Restoring under the named action and bind the named
+/// task, and the saved decision must bind that task with the execution mode
+/// that the binding names. A native foreground task is never registered, so a
+/// registration that names it is inconsistent history. Returns the loan, its
+/// return context, and the evidence snapshot
+fn bound_restoring_return(
+    conn: &Connection,
+    resource: &Resource,
+    attestation: &OperatorGpuFreeAttestation,
+    loan_id: LoanId,
+    action_id: ActionId,
+) -> Result<(Loan, ReturnContext, OperatorGpuFreeEvidence), OperatorGpuFreeError> {
+    let task_id = attestation.task_id;
+    let mode = match attestation.state_binding {
+        OperatorStateBinding::RestoringReturn { .. } => ReturnExecutionMode::DirectSegmentTrainer,
+        OperatorStateBinding::RestoringForegroundReturn { .. } => {
+            ReturnExecutionMode::NativeForeground
+        }
+        OperatorStateBinding::NoLoan
+        | OperatorStateBinding::AwaitingRelease { .. }
+        | OperatorStateBinding::FirstBackgroundLaunch { .. } => {
+            return Err(OperatorGpuFreeRefusal::LoanNotRestoring { loan_id }.into());
+        }
+    };
+    let loan = match select_non_closed_loan(conn, resource.id)? {
+        Some(loan) if loan.id == loan_id => loan,
+        current => {
+            return Err(OperatorGpuFreeRefusal::LoanStateChanged {
+                current_loan: current.map(|loan| loan.id),
+            }
+            .into());
+        }
+    };
+    let LoanState::Active {
+        phase:
+            LoanPhase::Restoring {
+                action_id: saved_action,
+                return_context,
+                resume_task_id,
+            },
+    } = &loan.state
+    else {
+        return Err(OperatorGpuFreeRefusal::LoanNotRestoring { loan_id }.into());
+    };
+    if *saved_action != action_id {
+        return Err(OperatorGpuFreeRefusal::LoanStateChanged {
+            current_loan: Some(loan_id),
+        }
+        .into());
+    }
+    if *resume_task_id != task_id {
+        return Err(OperatorGpuFreeRefusal::NotBoundTask {
+            task_id,
+            bound: *resume_task_id,
+        }
+        .into());
+    }
+    if mode == ReturnExecutionMode::NativeForeground
+        && resource.registered_background_task == Some(task_id)
+    {
+        return Err(OperatorGpuFreeRefusal::InconsistentHistory { task_id }.into());
+    }
+    let return_context = return_context.clone();
+    // a queued or running return task still owns the GPU
+    let trainer_end = ended_trainer(conn, task_id)?;
+    let Some((request_id, digest)) =
+        restoring_return_of_mode_on(conn, resource, &loan, action_id, task_id, mode)?
+    else {
+        return Err(OperatorGpuFreeRefusal::TrainerLaunchUnproven { task_id }.into());
+    };
+    let trainer_launch = match mode {
+        ReturnExecutionMode::DirectSegmentTrainer => AttestedTrainerLaunch::DirectSegmentReturn {
+            action_id,
+            request_id,
+        },
+        ReturnExecutionMode::NativeForeground => AttestedTrainerLaunch::NativeForegroundReturn {
+            action_id,
+            request_id,
+        },
+    };
+    let evidence = evidence(conn, resource, task_id, trainer_end, trainer_launch, digest)?;
+
+    Ok((loan, return_context, evidence))
+}
+
+/// Read the task end, refusing a queued or running task
+fn ended_trainer(
+    conn: &Connection,
+    task_id: TaskId,
+) -> Result<AttestedTrainerEnd, OperatorGpuFreeError> {
+    let row = crate::store::task_by_id_on(conn, task_id)?
+        .ok_or(OperatorGpuFreeRefusal::TaskMissing { task_id })?;
+    match &row.state {
+        TaskState::Queued | TaskState::Running { .. } => {
+            Err(OperatorGpuFreeRefusal::TaskNotEnded {
+                task_id,
+                state: row.status(),
+            }
+            .into())
+        }
+        TaskState::Finished { reason } => Ok(AttestedTrainerEnd::Finished {
+            outcome: reason.clone(),
+            process_group_exit: row.process_group_exit_evidence(),
+        }),
+        TaskState::Lost => Ok(AttestedTrainerEnd::Lost),
+    }
+}
+
+/// Complete the evidence snapshot with the task's trainer-attempt association
+fn evidence(
+    conn: &Connection,
+    resource: &Resource,
+    task_id: TaskId,
+    trainer_end: AttestedTrainerEnd,
+    trainer_launch: AttestedTrainerLaunch,
+    normalized_spec_sha256: NormalizedSpecSha256,
+) -> Result<OperatorGpuFreeEvidence, OperatorGpuFreeError> {
     let association: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT resource_id, json_extract(association_json, '$.request_sha256')
@@ -332,6 +560,8 @@ fn trainer_evidence(
         Some((saved_resource, Some(attempt_request_sha256)))
             if saved_resource == resource.id.as_uuid().to_string() =>
         {
+            let attempt_request_sha256 = TrainerRequestDigest::from_hex(&attempt_request_sha256)
+                .ok_or(OperatorGpuFreeRefusal::InconsistentHistory { task_id })?;
             AttestedTrainerAssociation::Saved {
                 attempt_request_sha256,
             }
@@ -469,6 +699,65 @@ fn resolve_idle(
     ))
 }
 
+/// Close the Restoring loan with the attested end and serve the oldest request
+///
+/// The closure clears the registration, as a supervisor resolution of a proven
+/// end would. The oldest queued request then serves from an idle loan in the
+/// same transaction, or the closed loan is the saved idle boundary. No committed
+/// state shows a free resource between the two steps
+fn resolve_restoring(
+    tx: &Transaction<'_>,
+    resource: &Resource,
+    attestation: &OperatorGpuFreeAttestation,
+    loan: Loan,
+    action_id: ActionId,
+    return_context: ReturnContext,
+) -> Result<(ResourceRevision, OperatorGpuFreeOutcome), OperatorGpuFreeError> {
+    let closed = Loan {
+        id: loan.id,
+        resource_id: resource.id,
+        state: LoanState::Closed {
+            result: LoanClosure::OperatorAttestedRestoreEnded {
+                return_context,
+                task_id: attestation.task_id,
+                operation_id: attestation.operation_id,
+            },
+        },
+    };
+    let closed_revision = advance(tx, resource, None)?;
+    if !replace_loan_in_action_phase_on(tx, &closed, LoanActionPhase::Restoring, action_id)? {
+        return Err(OperatorGpuFreeError::Changed);
+    }
+
+    let authority = resource.authority_machine();
+    let Some(request) = oldest_queued_request_for_authority(tx, authority, resource.id)? else {
+        return Ok((
+            closed_revision,
+            OperatorGpuFreeOutcome::RestoreClosedIdleBoundary { closed },
+        ));
+    };
+    let mut cleared = resource.clone();
+    cleared.state_revision = closed_revision;
+    cleared.registered_background_task = None;
+    let proof = IdleBoundaryProof::OperatorAttestedGpuFree {
+        operation_id: attestation.operation_id,
+        task_id: attestation.task_id,
+    };
+    let (loan, request) = open_idle_serving_loan_on(tx, authority, &cleared, request, proof)?;
+    let state_revision = select_resource(tx, resource.id)?
+        .ok_or(ResourceStoreError::ResourceNotFound)?
+        .state_revision;
+
+    Ok((
+        state_revision,
+        OperatorGpuFreeOutcome::RestoreClosedServing {
+            closed: Box::new(closed),
+            loan,
+            request,
+        },
+    ))
+}
+
 fn advance(
     tx: &Transaction<'_>,
     resource: &Resource,
@@ -511,26 +800,13 @@ fn update_awaiting_release_loan(
     loan: &Loan,
     action_id: ActionId,
 ) -> Result<(), OperatorGpuFreeError> {
-    let changed = tx.execute(
-        "UPDATE loans SET state_json = ?1
-         WHERE id = ?2 AND resource_id = ?3
-           AND json_extract(state_json, '$.type') = 'active'
-           AND json_extract(state_json, '$.phase.type') = 'awaiting_release'
-           AND json_extract(state_json, '$.phase.action_id') = ?4",
-        params![
-            serde_json::to_string(&loan.state)?,
-            loan.id.as_uuid().to_string(),
-            loan.resource_id.as_uuid().to_string(),
-            action_id.as_uuid().to_string(),
-        ],
-    )?;
-    if changed != 1 {
+    if !replace_loan_in_action_phase_on(tx, loan, LoanActionPhase::AwaitingRelease, action_id)? {
         return Err(OperatorGpuFreeError::Changed);
     }
     Ok(())
 }
 
-fn saved_receipt_on(
+pub(super) fn saved_receipt_on(
     conn: &Connection,
     operation_id: OperatorAttestationId,
 ) -> Result<Option<OperatorGpuFreeReceipt>, OperatorGpuFreeError> {
@@ -578,7 +854,10 @@ pub(crate) fn current_operator_boundary_on(
         serde_json::from_str(&receipt_json).map_err(|_| invalid_receipt())?;
     if receipt.attestation.resource_id != resource.id
         || receipt.attestation.authority_machine != resource.authority_machine()
-        || receipt.attestation.state_binding != OperatorStateBinding::NoLoan
+        || !matches!(
+            receipt.attestation.state_binding,
+            OperatorStateBinding::NoLoan | OperatorStateBinding::FirstBackgroundLaunch { .. }
+        )
         || !matches!(receipt.outcome, OperatorGpuFreeOutcome::IdleBoundary)
         || resource.registered_background_task.is_some()
     {
@@ -656,10 +935,59 @@ pub(crate) fn operator_serving_release_matches_on(
         && attested_return_context(*task_id, &receipt.evidence) == *return_context)
 }
 
+/// Check that a loan closed with an operator-attested restore end matches its saved receipt
+///
+/// The receipt must name this resource, authority, loan, return task, and the
+/// exact closed loan state. A closure without its receipt proves nothing
+pub(crate) fn operator_restore_closure_matches_on(
+    conn: &Connection,
+    resource: &Resource,
+    loan: &Loan,
+) -> Result<bool, ResourceStoreError> {
+    let LoanState::Closed {
+        result:
+            LoanClosure::OperatorAttestedRestoreEnded {
+                task_id,
+                operation_id,
+                ..
+            },
+    } = &loan.state
+    else {
+        return Ok(false);
+    };
+    let receipt = saved_receipt_on(conn, *operation_id).map_err(|error| match error {
+        OperatorGpuFreeError::Storage(error) => ResourceStoreError::Storage(error),
+        _ => invalid_receipt(),
+    })?;
+    let Some(receipt) = receipt else {
+        return Ok(false);
+    };
+    let attestation = &receipt.attestation;
+    let closed = match &receipt.outcome {
+        OperatorGpuFreeOutcome::RestoreClosedServing { closed, .. } => closed.as_ref(),
+        OperatorGpuFreeOutcome::RestoreClosedIdleBoundary { closed } => closed,
+        OperatorGpuFreeOutcome::ReleaseResolvedServing { .. }
+        | OperatorGpuFreeOutcome::ReleaseResolvedReturnRequired { .. }
+        | OperatorGpuFreeOutcome::IdleServing { .. }
+        | OperatorGpuFreeOutcome::IdleBoundary => return Ok(false),
+    };
+    let binding_matches = attestation
+        .state_binding
+        .restoring_action()
+        .is_some_and(|(loan_id, _)| loan_id == loan.id);
+
+    Ok(binding_matches
+        && closed == loan
+        && loan.resource_id == resource.id
+        && attestation.resource_id == resource.id
+        && attestation.authority_machine == resource.authority_machine()
+        && attestation.task_id == *task_id
+        && attestation.operation_id == *operation_id)
+}
+
 fn invalid_receipt() -> ResourceStoreError {
-    ResourceStoreError::Storage(rusqlite::Error::InvalidColumnType(
-        0,
-        "invalid stored operator attestation receipt".into(),
-        rusqlite::types::Type::Text,
-    ))
+    ResourceStoreError::corrupt(
+        "operator attestation receipt",
+        "receipt does not decode or names other records",
+    )
 }

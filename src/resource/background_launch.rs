@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::api::ResourceBackgroundSubmitOutcome;
-use super::watcher::AttemptBinding;
+use super::trainer_publication::AttemptBinding;
 use super::{
     AssignmentRevision, LoanId, Resource, ResourceId, ResourceRevision, SupervisorAddress,
 };
@@ -221,7 +221,6 @@ impl ResourceBackgroundRequest {
         }
         if self.source_machine.as_uuid().is_nil()
             || self.destination_machine.as_uuid().is_nil()
-            || assignment.resource_id.as_uuid().is_nil()
             || assignment.supervisor.thread.0.is_nil()
         {
             return Err(Error::InvalidIdentity);
@@ -427,8 +426,16 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::*;
-    use crate::domain::ThreadId;
+    use super::{
+        BackgroundSupervisorAssignment, RESOURCE_BACKGROUND_PROTOCOL_VERSION,
+        ResourceBackgroundOperation, ResourceBackgroundRequest, ResourceBackgroundRequestError,
+    };
+    use crate::domain::{TaskId, ThreadId};
+    use crate::machine::MachineId;
+    use crate::resource::trainer_publication::AttemptBinding;
+    use crate::resource::{AssignmentRevision, ResourceId, ResourceRevision, SupervisorAddress};
+    use crate::spec::NormalizedSpec;
+    use crate::submission::{RequestId, normalized_spec_sha256};
 
     fn assignment() -> BackgroundSupervisorAssignment {
         BackgroundSupervisorAssignment {

@@ -966,16 +966,24 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::domain::{AgentKind, TaskEnv, TaskId, TaskName, TaskWorkload, Workload};
+    use super::{
+        DEFAULT_TIMEOUT, DirectSegmentCommandShape, DirectSegmentCommandShapeError,
+        DirectSegmentPathRole, same_run_resume_command,
+    };
+    use crate::domain::{AgentKind, TaskEnv, TaskId, TaskName, TaskRow, TaskWorkload, Workload};
+    use crate::invocation::CommandLine;
     use crate::machine::{MachineId, MachineName};
     use crate::resource::ownership_lock::{
         OwnershipLockIdentity, TrainerRequestDigest, VerifiedTrainerAttempt,
     };
-    use crate::resource::watcher::AttemptBinding;
+    use crate::resource::trainer_publication::AttemptBinding;
     use crate::resource::{ResourceId, TrainerAttemptAssociation};
+    use crate::spec::{NormalizedSpec, NormalizedWorkload};
     use crate::store::{NewTask, new_queued_task};
     use crate::submission::normalized_spec_sha256;
+    use std::fs;
+    use std::path::Path;
+    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use uuid::Uuid;
 

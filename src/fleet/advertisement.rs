@@ -1,10 +1,10 @@
-//! Machine advertisement: the body of the cluster machine probe.
+//! Machine advertisement: the body of the cluster machine probe
 //!
 //! The probe establishes identity and negotiates the protocol, so it must stay
 //! readable across a rolling update. Decoding therefore happens in two steps:
 //! a lenient [`MachineHeader`] that every protocol version keeps, then the
 //! full [`MachineAdvertisement`] only when the protocol ranges overlap. Other
-//! cluster request and response bodies stay strict.
+//! cluster request and response bodies stay strict
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -16,41 +16,41 @@ use crate::fleet::address::MachineAddress;
 use crate::fleet::protocol::{ClusterProtocolVersion, Compatibility, ProtocolRange};
 use crate::machine::{BootId, MachineId, MachineName};
 
-/// Path of the cluster machine probe on every Homebased TCP listener.
+/// Path of the cluster machine probe on every Homebased TCP listener
 pub const MACHINE_PROBE_PATH: &str = "/v1/cluster/machine";
 
-/// Identity and protocol fields that every cluster protocol version keeps.
+/// Identity and protocol fields that every cluster protocol version keeps
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineHeader {
-    /// Stable machine UUID.
+    /// Stable machine UUID
     pub machine: MachineId,
-    /// UUID of the answering daemon's current start.
+    /// UUID of the answering daemon's current start
     pub boot: BootId,
-    /// Display name.
+    /// Display name
     pub name: MachineName,
-    /// Homebased crate version.
+    /// Homebased crate version
     pub version: String,
-    /// Accepted cluster protocol versions.
+    /// Accepted cluster protocol versions
     pub protocol: ProtocolRange,
 }
 
-/// What a machine can run.
+/// What a machine can run
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    /// `std::env::consts::OS`, such as `macos` or `linux`.
+    /// `std::env::consts::OS`, such as `macos` or `linux`
     pub os: String,
-    /// `std::env::consts::ARCH`, such as `aarch64` or `x86_64`.
+    /// `std::env::consts::ARCH`, such as `aarch64` or `x86_64`
     pub arch: String,
     /// Agents whose binaries the daemon found. Names this build does not know
     /// are dropped while decoding, so a newer peer with a new agent stays
-    /// readable.
+    /// readable
     #[serde(deserialize_with = "known_agents")]
     pub agents: Vec<AgentKind>,
 }
 
 impl Capabilities {
     /// Detect the local OS, architecture, and agent binaries on the daemon's
-    /// `PATH` or pinned by the `HOMEBASED_<AGENT>` overrides.
+    /// `PATH` or pinned by the `HOMEBASED_<AGENT>` overrides
     #[must_use]
     pub fn detect(path: &str, cwd: &Path) -> Self {
         let agents = AgentKind::ALL
@@ -64,7 +64,7 @@ impl Capabilities {
         }
     }
 
-    /// Detect with the daemon's own `PATH` and `HOME`.
+    /// Detect with the daemon's own `PATH` and `HOME`
     #[must_use]
     pub fn detect_for_daemon() -> Self {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -89,30 +89,30 @@ fn known_agents<'de, D: serde::Deserializer<'de>>(
     Ok(agents)
 }
 
-/// Full probe body, `GET /v1/cluster/machine`.
+/// Full probe body, `GET /v1/cluster/machine`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineAdvertisement {
-    /// Public JSON schema version.
+    /// Public JSON schema version
     pub api_version: u32,
-    /// Stable machine UUID.
+    /// Stable machine UUID
     pub machine: MachineId,
-    /// UUID of the answering daemon's current start.
+    /// UUID of the answering daemon's current start
     pub boot: BootId,
-    /// Display name.
+    /// Display name
     pub name: MachineName,
-    /// Homebased crate version.
+    /// Homebased crate version
     pub version: String,
-    /// Accepted cluster protocol versions.
+    /// Accepted cluster protocol versions
     pub protocol: ProtocolRange,
-    /// OS, architecture, and installed agents.
+    /// OS, architecture, and installed agents
     pub capabilities: Capabilities,
     /// Base URLs where the machine expects to be reachable. Hints only: a
-    /// caller trusts an address after its own probe confirms the identity.
+    /// caller trusts an address after its own probe confirms the identity
     pub addresses: Vec<MachineAddress>,
 }
 
 impl MachineAdvertisement {
-    /// Identity and protocol part.
+    /// Identity and protocol part
     #[must_use]
     pub fn header(&self) -> MachineHeader {
         MachineHeader {
@@ -125,27 +125,27 @@ impl MachineAdvertisement {
     }
 }
 
-/// Decoded probe response.
+/// Decoded probe response
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbedMachine {
-    /// Protocol ranges overlap; the full advertisement is available.
+    /// Protocol ranges overlap; the full advertisement is available
     Compatible {
-        /// Full advertisement.
+        /// Full advertisement
         advertisement: MachineAdvertisement,
-        /// Highest shared protocol version.
+        /// Highest shared protocol version
         version: ClusterProtocolVersion,
     },
-    /// No shared protocol version. The machine stays visible by identity.
+    /// No shared protocol version. The machine stays visible by identity
     Incompatible {
-        /// Identity and protocol fields.
+        /// Identity and protocol fields
         header: MachineHeader,
-        /// Local accepted range.
+        /// Local accepted range
         local: ProtocolRange,
     },
 }
 
 impl ProbedMachine {
-    /// Identity and protocol fields in either case.
+    /// Identity and protocol fields in either case
     #[must_use]
     pub fn header(&self) -> MachineHeader {
         match self {
@@ -154,7 +154,7 @@ impl ProbedMachine {
         }
     }
 
-    /// Stable machine UUID.
+    /// Stable machine UUID
     #[must_use]
     pub fn machine(&self) -> MachineId {
         match self {
@@ -163,7 +163,7 @@ impl ProbedMachine {
         }
     }
 
-    /// Boot UUID of the answering daemon.
+    /// Boot UUID of the answering daemon
     #[must_use]
     pub fn boot(&self) -> BootId {
         match self {
@@ -173,18 +173,18 @@ impl ProbedMachine {
     }
 }
 
-/// Why a probe body could not be decoded.
+/// Why a probe body could not be decoded
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdvertisementError {
-    /// Not a Homebased machine advertisement.
+    /// Not a Homebased machine advertisement
     #[error("invalid machine advertisement: {0}")]
     Invalid(String),
-    /// Public JSON schema version this build does not read.
+    /// Public JSON schema version this build does not read
     #[error("unsupported api_version {0}")]
     ApiVersion(u32),
 }
 
-/// Decode a probe body against the local accepted protocol range.
+/// Decode a probe body against the local accepted protocol range
 pub fn decode_advertisement(
     body: &[u8],
     local: ProtocolRange,
@@ -216,8 +216,9 @@ pub fn decode_advertisement(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+    use super::{AdvertisementError, ProbedMachine, decode_advertisement};
+    use crate::domain::AgentKind;
+    use crate::fleet::protocol::{ClusterProtocolVersion, SUPPORTED_PROTOCOLS};
     use serde_json::json;
 
     fn body(protocol: serde_json::Value, extra: serde_json::Value) -> Vec<u8> {
@@ -240,7 +241,7 @@ mod tests {
     #[test]
     fn compatible_probe_decodes_fully_and_drops_unknown_agents() {
         let probed = decode_advertisement(
-            &body(json!({"min":1,"max":1}), json!({})),
+            &body(json!({"min":2,"max":2}), json!({})),
             SUPPORTED_PROTOCOLS,
         )
         .unwrap();
@@ -251,7 +252,7 @@ mod tests {
         else {
             panic!("expected compatible");
         };
-        assert_eq!(version, ClusterProtocolVersion(1));
+        assert_eq!(version, ClusterProtocolVersion(2));
         assert_eq!(advertisement.capabilities.agents, vec![AgentKind::Codex]);
         assert_eq!(advertisement.name.as_str(), "code");
     }
@@ -275,7 +276,7 @@ mod tests {
     #[test]
     fn rejects_other_api_version_and_garbage() {
         let err = decode_advertisement(
-            &body(json!({"min":1,"max":1}), json!({"api_version": 2})),
+            &body(json!({"min":2,"max":2}), json!({"api_version": 2})),
             SUPPORTED_PROTOCOLS,
         )
         .unwrap_err();

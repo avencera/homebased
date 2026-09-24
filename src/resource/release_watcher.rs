@@ -232,8 +232,8 @@ pub enum ReleaseWatcherPollAttention {
     ActionNotCurrent,
     /// The poll names a watcher task other than the saved watcher identity
     WrongWatcher,
-    /// The saved watcher identity is a legacy record that cannot prove release
-    LegacyWatcherIntent,
+    /// The release action has no saved watcher identity
+    WatcherIntentMissing,
     /// The accepted watcher task no longer matches its saved launch identity
     WatcherIdentityConflict,
     /// The registered trainer task, command, association, or cancel marker changed
@@ -248,11 +248,16 @@ pub enum ReleaseWatcherPollAttention {
     PublicationBeforeTrainerStart,
     /// The trainer exited successfully without a matching final result
     TrainerCompletedWithoutResult,
+    /// A saved authority record cannot be decoded, so a retry cannot succeed
+    CorruptRecord,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ReleaseWatcherCommand, ReleaseWatcherPollRequest};
+    use crate::domain::{TaskId, ThreadId};
+    use crate::resource::{ActionId, ReleaseWatcherTaskId, ResourceId, ResourceRevision};
+    use std::path::Path;
 
     fn command() -> ReleaseWatcherCommand {
         ReleaseWatcherCommand {

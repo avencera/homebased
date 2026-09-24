@@ -1,58 +1,29 @@
-//! Operator attestation that an unprovable ended trainer no longer holds its GPU
+//! Operator attestation that unprovable ended GPU work no longer holds its GPU
 //!
 //! A direct-segment trainer can end before the supervisor binds its trainer
-//! attempt, so no saved lock can prove that its detached worker exited. The
-//! automatic release proof stays fail-closed for that trainer. An operator who
-//! inspected the authority machine can instead record one explicit, auditable
-//! attestation. The authority saves it with an evidence snapshot and the
-//! resulting queue or loan transition in one transaction
+//! attempt, so no saved lock can prove that its detached worker exited. This
+//! includes a first background launch or a return task that ends before its
+//! confirmed start registers it, because only a registered trainer can bind an
+//! attempt. A native foreground return task can be lost, or end without a
+//! confirmed process-group exit, so the task layer cannot prove that its process
+//! released the GPU. The automatic release proof stays fail-closed for all of
+//! them. An operator who inspected the authority machine can instead record one
+//! explicit, auditable attestation. The authority saves it with an evidence
+//! snapshot and the resulting queue or loan transition in one transaction
 //!
 //! An attestation is a human trust decision. It is never a confirmed
 //! process-group exit, a trainer-lock release, or a resumable checkpoint, and
 //! every record that it produces says so through its own typed variant
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
+pub use super::id::OperatorAttestationId;
+use super::ownership_lock::TrainerRequestDigest;
 use super::{ActionId, Loan, LoanId, ResourceId, ResourceRequest, ResourceRevision};
 use super::{SupervisorNotice, TaskId};
 use crate::domain::{ExitReason, ProcessGroupExitEvidence, ProcessStatus};
 use crate::machine::MachineId;
 use crate::submission::{NormalizedSpecSha256, RequestId};
-
-/// Stable caller identity of one operator attestation
-///
-/// The caller allocates it before the first send. An exact retry returns the
-/// saved receipt, and different content under the same identity conflicts
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct OperatorAttestationId(Uuid);
-
-impl OperatorAttestationId {
-    /// Allocate a new attestation identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for OperatorAttestationId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Non-empty operator account of what was inspected and why the GPU is free
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,10 +70,21 @@ pub enum OperatorGpuFreeConfirmation {
 ///
 /// The authority compares it with the current state in the deciding
 /// transaction, so an attestation never applies to a state it did not name
+/// `NoLoan` and `AwaitingRelease` name the registered trainer
+/// `FirstBackgroundLaunch` and `RestoringReturn` name a trainer that ended
+/// before its confirmed start registered it. `RestoringForegroundReturn` names
+/// a native foreground return task, which is never registered
+///
+/// Decoding refuses unknown fields on every variant, including `NoLoan`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    from = "StrictStateBinding"
+)]
 pub enum OperatorStateBinding {
-    /// No non-closed loan reserves the resource
+    /// No non-closed loan reserves the resource, and the task is the registered trainer
     NoLoan,
     /// One exact release action waits for the registered trainer
     AwaitingRelease {
@@ -111,6 +93,108 @@ pub enum OperatorStateBinding {
         /// Release action that the attestation resolves
         action_id: ActionId,
     },
+    /// The latest first background launch ended before its confirmed start, with no loan
+    ///
+    /// The task is the launch task, which was never registered
+    FirstBackgroundLaunch {
+        /// Stable launch request identity
+        request_id: RequestId,
+    },
+    /// The direct-segment return task of one Restoring loan ended before its confirmed start
+    ///
+    /// The task is the loan's bound return task, which was never registered
+    RestoringReturn {
+        /// Restoring loan that keeps the resource reserved
+        loan_id: LoanId,
+        /// Return action that bound the task
+        action_id: ActionId,
+    },
+    /// The native foreground return task of one Restoring loan ended or was lost
+    /// without proof that its process group released the GPU
+    ///
+    /// The task is the loan's bound return task. It is terminal or lost, and
+    /// its saved decision accepted it as native foreground work
+    RestoringForegroundReturn {
+        /// Restoring loan that keeps the resource reserved
+        loan_id: LoanId,
+        /// Return action that bound the task
+        action_id: ActionId,
+    },
+}
+
+/// Decoding shape of [`OperatorStateBinding`]
+///
+/// Serde ignores extra fields on a unit variant of an internally tagged enum,
+/// so `no_loan` decodes through an empty struct variant that refuses them. The
+/// JSON shape is the same as the public enum
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum StrictStateBinding {
+    NoLoan {},
+    AwaitingRelease {
+        loan_id: LoanId,
+        action_id: ActionId,
+    },
+    FirstBackgroundLaunch {
+        request_id: RequestId,
+    },
+    RestoringReturn {
+        loan_id: LoanId,
+        action_id: ActionId,
+    },
+    RestoringForegroundReturn {
+        loan_id: LoanId,
+        action_id: ActionId,
+    },
+}
+
+impl From<StrictStateBinding> for OperatorStateBinding {
+    fn from(value: StrictStateBinding) -> Self {
+        match value {
+            StrictStateBinding::NoLoan {} => Self::NoLoan,
+            StrictStateBinding::AwaitingRelease { loan_id, action_id } => {
+                Self::AwaitingRelease { loan_id, action_id }
+            }
+            StrictStateBinding::FirstBackgroundLaunch { request_id } => {
+                Self::FirstBackgroundLaunch { request_id }
+            }
+            StrictStateBinding::RestoringReturn { loan_id, action_id } => {
+                Self::RestoringReturn { loan_id, action_id }
+            }
+            StrictStateBinding::RestoringForegroundReturn { loan_id, action_id } => {
+                Self::RestoringForegroundReturn { loan_id, action_id }
+            }
+        }
+    }
+}
+
+impl OperatorStateBinding {
+    /// Whether the attested task must be the registered trainer
+    #[must_use]
+    pub const fn names_registered_trainer(&self) -> bool {
+        match self {
+            Self::NoLoan | Self::AwaitingRelease { .. } => true,
+            Self::FirstBackgroundLaunch { .. }
+            | Self::RestoringReturn { .. }
+            | Self::RestoringForegroundReturn { .. } => false,
+        }
+    }
+
+    /// Restoring loan and return action that the binding names, if any
+    #[must_use]
+    pub const fn restoring_action(&self) -> Option<(LoanId, ActionId)> {
+        match *self {
+            Self::RestoringReturn { loan_id, action_id }
+            | Self::RestoringForegroundReturn { loan_id, action_id } => Some((loan_id, action_id)),
+            Self::NoLoan | Self::AwaitingRelease { .. } | Self::FirstBackgroundLaunch { .. } => {
+                None
+            }
+        }
+    }
+
+    fn has_nil_identity(&self) -> bool {
+        matches!(self, Self::FirstBackgroundLaunch { request_id } if request_id.0.is_nil())
+    }
 }
 
 /// Immutable operator request that one ended trainer no longer holds its GPU
@@ -119,11 +203,14 @@ pub enum OperatorStateBinding {
 pub struct OperatorGpuFreeAttestation {
     /// Stable caller retry identity
     pub operation_id: OperatorAttestationId,
-    /// Resource whose registered trainer ended
+    /// Resource whose trainer ended
     pub resource_id: ResourceId,
     /// Authority machine that the operator inspected
     pub authority_machine: MachineId,
-    /// Exact registered trainer task that the operator attests is gone
+    /// Exact task whose GPU work the operator attests is gone
+    ///
+    /// It is the registered trainer, the launch task, or the bound return task,
+    /// as `state_binding` requires
     pub task_id: TaskId,
     /// Resource revision that the operator observed
     pub expected_state_revision: ResourceRevision,
@@ -138,17 +225,9 @@ pub struct OperatorGpuFreeAttestation {
 impl OperatorGpuFreeAttestation {
     /// Check the identities that a well-formed attestation needs
     pub fn validate(&self) -> Result<(), OperatorGpuFreeRefusal> {
-        let binding_nil = match self.state_binding {
-            OperatorStateBinding::NoLoan => false,
-            OperatorStateBinding::AwaitingRelease { loan_id, action_id } => {
-                loan_id.as_uuid().is_nil() || action_id.as_uuid().is_nil()
-            }
-        };
-        if self.operation_id.as_uuid().is_nil()
-            || self.resource_id.as_uuid().is_nil()
-            || self.authority_machine.as_uuid().is_nil()
+        if self.authority_machine.as_uuid().is_nil()
             || self.task_id.0.is_nil()
-            || binding_nil
+            || self.state_binding.has_nil_identity()
         {
             return Err(OperatorGpuFreeRefusal::InvalidIdentity);
         }
@@ -159,7 +238,7 @@ impl OperatorGpuFreeAttestation {
     }
 }
 
-/// Task-layer end of the attested trainer when the attestation committed
+/// Task-layer end of the attested task when the attestation committed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttestedTrainerEnd {
@@ -167,24 +246,38 @@ pub enum AttestedTrainerEnd {
     Finished {
         /// Task-layer outcome
         outcome: ExitReason,
-        /// Wrapper process-group evidence as saved, which never covers the detached worker
+        /// Wrapper process-group evidence as saved
+        ///
+        /// It never covers a detached trainer worker. For a native foreground
+        /// return it is the saved task-layer fact, often `unconfirmed`; the
+        /// attestation does not upgrade it to a confirmed exit
         process_group_exit: ProcessGroupExitEvidence,
     },
     /// The wrapper was lost with no exit reason
     Lost,
 }
 
-/// Resource launch that made the attested task the registered trainer
+/// Resource launch that bound the attested task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttestedTrainerLaunch {
-    /// First background launch whose confirmed start registered the task
+    /// First background launch that bound the task
     FirstBackgroundLaunch {
         /// Stable launch request identity
         request_id: RequestId,
     },
-    /// Direct-segment return task whose confirmed start registered the task
+    /// Direct-segment return decision that bound the task
     DirectSegmentReturn {
+        /// Return action that bound the task
+        action_id: ActionId,
+        /// Stable return request identity
+        request_id: RequestId,
+    },
+    /// Native foreground return decision that bound the task
+    ///
+    /// The saved decision accepted the task as native foreground work, which
+    /// holds the GPU only through its own process group
+    NativeForegroundReturn {
         /// Return action that bound the task
         action_id: ActionId,
         /// Stable return request identity
@@ -201,7 +294,7 @@ pub enum AttestedTrainerAssociation {
     /// An attempt was bound, but its release proof was not used
     Saved {
         /// Request digest of the saved attempt
-        attempt_request_sha256: String,
+        attempt_request_sha256: TrainerRequestDigest,
     },
 }
 
@@ -214,7 +307,7 @@ pub enum AttestedTrainerAssociation {
 pub struct OperatorGpuFreeEvidence {
     /// Task-layer end of the trainer
     pub trainer_end: AttestedTrainerEnd,
-    /// Resource launch that registered the trainer
+    /// Resource launch that bound the trainer
     pub trainer_launch: AttestedTrainerLaunch,
     /// Digest of the accepted executor identity's normalized spec
     pub normalized_spec_sha256: NormalizedSpecSha256,
@@ -251,6 +344,20 @@ pub enum OperatorGpuFreeOutcome {
     ///
     /// A later queue reconciliation or first background launch reads it
     IdleBoundary,
+    /// The Restoring loan closed and an idle loan serves the oldest queued request
+    RestoreClosedServing {
+        /// Restoring loan closed with the operator-attested end
+        closed: Box<Loan>,
+        /// New Serving loan that names this attestation as its idle boundary
+        loan: Loan,
+        /// Request selected in the same transaction
+        request: ResourceRequest,
+    },
+    /// The Restoring loan closed with an empty queue, and its closure is the idle boundary
+    RestoreClosedIdleBoundary {
+        /// Restoring loan closed with the operator-attested end
+        closed: Loan,
+    },
 }
 
 /// Durable receipt of one committed operator attestation
@@ -319,6 +426,31 @@ pub enum OperatorGpuFreeRefusal {
         /// Current registration
         registered: Option<TaskId>,
     },
+    /// The task is not the task that the named launch or return action bound
+    #[error("task {task_id} is not the task bound by the attested launch or action")]
+    NotBoundTask {
+        /// Task named by the attestation
+        task_id: TaskId,
+        /// Task bound by the launch or return action
+        bound: TaskId,
+    },
+    /// The latest first background launch is not the named launch awaiting release
+    ///
+    /// It is another launch, it was registered or superseded, or it already has
+    /// automatic proof that no child started
+    #[error("first background launch {request_id:?} does not await an operator release")]
+    LaunchNotAwaitingRelease {
+        /// Launch named by the attestation
+        request_id: RequestId,
+        /// Latest first background launch, if any
+        current_launch: Option<RequestId>,
+    },
+    /// The named loan is not in its Restoring phase
+    #[error("loan {loan_id:?} is not restoring")]
+    LoanNotRestoring {
+        /// Current non-closed loan
+        loan_id: LoanId,
+    },
     /// The current loan state differs from the named binding
     #[error("the current loan state differs from the attested binding")]
     LoanStateChanged {
@@ -351,8 +483,13 @@ pub enum OperatorGpuFreeRefusal {
         /// Current task-layer state
         state: ProcessStatus,
     },
-    /// No saved resource launch and matching accepted identity name the task
-    #[error("task {task_id} has no matching resource launch and accepted identity")]
+    /// No saved resource launch of the binding's execution mode and matching accepted identity name the task
+    ///
+    /// A direct-segment binding needs direct-segment work, and a foreground
+    /// binding needs native foreground work
+    #[error(
+        "task {task_id} has no matching resource launch, execution mode, and accepted identity"
+    )]
     TrainerLaunchUnproven {
         /// Task named by the attestation
         task_id: TaskId,

@@ -4,13 +4,13 @@
 //! TCP listeners never serve it, so only local processes with socket access can
 //! advance a release action, and only with identities the authority saved
 
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::resource_api::StrictJson;
 use crate::error::AppError;
 use crate::resource::release_watcher::{
     RELEASE_WATCHER_POLL_PATH, RELEASE_WATCHER_PROTOCOL_VERSION, ReleaseWatcherPollOutcome,
@@ -24,12 +24,8 @@ pub(crate) fn socket_routes() -> Router<AppState> {
 
 async fn poll(
     State(state): State<AppState>,
-    body: Bytes,
+    StrictJson(request): StrictJson<ReleaseWatcherPollRequest>,
 ) -> Result<Json<ReleaseWatcherPollResponse>, AppError> {
-    let request: ReleaseWatcherPollRequest =
-        serde_json::from_slice(&body).map_err(|error| AppError::Usage {
-            message: format!("invalid release watcher poll: {error}"),
-        })?;
     if request.protocol_version != RELEASE_WATCHER_PROTOCOL_VERSION {
         return Err(AppError::Usage {
             message: format!(

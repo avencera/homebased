@@ -4,8 +4,6 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use uuid::Uuid;
-
 use crate::cli::Ctx;
 use crate::client::Client;
 use crate::domain::TaskId;
@@ -28,19 +26,19 @@ const WATCHER_POLL_TIMING: PollTiming = PollTiming {
 /// Exact release identities from the authority-built watcher command
 #[derive(Debug, clap::Args)]
 pub struct ReleaseWatcherArgs {
-    /// Resource whose release action owns this watcher.
+    /// Resource whose release action owns this watcher
     #[arg(long)]
-    resource_id: Uuid,
-    /// Stable release action identity.
+    resource_id: ResourceId,
+    /// Stable release action identity
     #[arg(long)]
-    action_id: Uuid,
-    /// Resource revision saved with the release action.
+    action_id: ActionId,
+    /// Resource revision saved with the release action
     #[arg(long)]
     state_revision: u64,
-    /// Exact registered trainer task.
+    /// Exact registered trainer task
     #[arg(long)]
     trainer_task_id: TaskId,
-    /// Preallocated task identity of this watcher.
+    /// Preallocated task identity of this watcher
     #[arg(long)]
     watcher_task_id: TaskId,
 }
@@ -48,8 +46,8 @@ pub struct ReleaseWatcherArgs {
 impl ReleaseWatcherArgs {
     fn command(&self) -> ReleaseWatcherCommand {
         ReleaseWatcherCommand {
-            resource_id: ResourceId::from_uuid(self.resource_id),
-            action_id: ActionId::from_uuid(self.action_id),
+            resource_id: self.resource_id,
+            action_id: self.action_id,
             state_revision: ResourceRevision::new(self.state_revision),
             trainer_task_id: self.trainer_task_id,
             watcher_task_id: ReleaseWatcherTaskId::new(self.watcher_task_id),
@@ -218,8 +216,18 @@ mod tests {
     use clap::Parser;
     use tempfile::tempdir;
 
-    use super::*;
+    use super::{PollTiming, check_task_identity, poll_until_final};
     use crate::cli::{Cli, Command};
+    use crate::client::Client;
+    use crate::domain::TaskId;
+    use crate::error::AppError;
+    use crate::resource::release_watcher::{
+        RELEASE_WATCHER_POLL_PATH, RELEASE_WATCHER_PROTOCOL_VERSION, ReleaseWatcherCommand,
+        ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest, ReleaseWatcherPollResponse,
+    };
+    use crate::resource::{ActionId, ReleaseWatcherTaskId, ResourceId, ResourceRevision};
+    use std::path::Path;
+    use std::time::Duration;
 
     const FAST: PollTiming = PollTiming {
         initial: Duration::from_millis(10),

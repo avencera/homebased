@@ -1,8 +1,20 @@
 //! A registered trainer that ended outside a loan and the queued work that follows it
 
-use super::*;
-use crate::resource::ReturnContext;
-use crate::resource::store::CompleteReleaseError;
+use super::fixtures::{
+    TrainerAssociationFixture, completion, machine_other_than, publish_completed_result, spec,
+};
+use crate::domain::{ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId};
+use crate::machine::MachineId;
+use crate::resource::store::{
+    AssignedResourceTaskReconcileInput, CompleteReleaseError, ReleaseCompletionResult,
+    ResourceTaskAcceptance, ResourceTaskAcceptanceInput, ResourceTaskCompletionResult,
+};
+use crate::resource::{
+    DeliveryAttemptId, Loan, LoanPhase, LoanState, ResourceQueueAttentionReason,
+    ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState, ResourceRevision,
+    ReturnContext, ServingReleaseProvenance, SupervisorAddress,
+};
+use crate::submission::RequestId;
 
 fn queue(fixture: &mut TrainerAssociationFixture) -> ResourceRequest {
     fixture

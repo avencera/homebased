@@ -1,5 +1,6 @@
-//! Typed direct messages delivered to Codex threads on a Fleet machine.
+//! Typed direct messages delivered to Codex threads on a Fleet machine
 
+use crate::domain::API_VERSION;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -13,22 +14,22 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::NoticeId;
 
-/// Maximum message body size in UTF-8 bytes.
+/// Maximum message body size in UTF-8 bytes
 pub const MESSAGE_BODY_MAX_BYTES: usize = 16 * 1024;
 
-/// Stable identity of one direct message and all its explicit retries.
+/// Stable identity of one direct message and all its explicit retries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct MessageId(Uuid);
 
 impl MessageId {
-    /// Allocate a new message identity.
+    /// Allocate a new message identity
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
 
-    /// Wrap a non-nil UUID.
+    /// Wrap a non-nil UUID
     pub fn from_uuid(uuid: Uuid) -> Result<Self, AppError> {
         if uuid.is_nil() {
             return Err(AppError::MessageInvalid {
@@ -38,7 +39,7 @@ impl MessageId {
         Ok(Self(uuid))
     }
 
-    /// Underlying UUID.
+    /// Underlying UUID
     #[must_use]
     pub const fn as_uuid(self) -> Uuid {
         self.0
@@ -81,35 +82,35 @@ impl<'de> Deserialize<'de> for MessageId {
     }
 }
 
-/// Source identity for a message from a thread, task, or resource notice.
+/// Source identity for a message from a thread, task, or resource notice
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageSource {
-    /// Reply route to one exact source thread.
+    /// Reply route to one exact source thread
     Thread {
-        /// Machine that owns the source thread.
+        /// Machine that owns the source thread
         machine: MachineId,
-        /// Source thread UUID.
+        /// Source thread UUID
         thread: ThreadId,
     },
-    /// Reply route to the machine and thread associated with one source task.
+    /// Reply route to the machine and thread associated with one source task
     Task {
-        /// Machine that owns the source task.
+        /// Machine that owns the source task
         machine: MachineId,
-        /// Source task UUID.
+        /// Source task UUID
         task: TaskId,
     },
-    /// Reply route for a durable resource notice.
+    /// Reply route for a durable resource notice
     ResourceNotice {
-        /// Machine that owns the resource authority.
+        /// Machine that owns the resource authority
         machine: MachineId,
-        /// Stable identity of the notice.
+        /// Stable identity of the notice
         notice_id: NoticeId,
     },
 }
 
 impl MessageSource {
-    /// Source machine for the selected route.
+    /// Source machine for the selected route
     #[must_use]
     pub const fn machine(&self) -> MachineId {
         match self {
@@ -120,80 +121,80 @@ impl MessageSource {
     }
 }
 
-/// Receiver-side destination selector.
+/// Receiver-side destination selector
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Recipient {
-    /// Deliver to this exact local Codex thread.
+    /// Deliver to this exact local Codex thread
     Thread {
-        /// Destination thread UUID.
+        /// Destination thread UUID
         thread: ThreadId,
     },
-    /// Deliver to the most recently active local thread with this exact cwd.
+    /// Deliver to the most recently active local thread with this exact cwd
     Cwd {
-        /// Absolute receiver path, or a path beginning with `~/` on the receiver.
+        /// Absolute receiver path, or a path beginning with `~/` on the receiver
         cwd: PathBuf,
     },
 }
 
-/// Source route selected by the local CLI before the daemon adds its machine identity.
+/// Source route selected by the local CLI before the daemon adds its machine identity
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageSourceSelector {
-    /// Reply route to one exact source thread.
+    /// Reply route to one exact source thread
     Thread {
-        /// Source thread UUID.
+        /// Source thread UUID
         thread: ThreadId,
     },
-    /// Reply route to one source task.
+    /// Reply route to one source task
     Task {
-        /// Source task UUID.
+        /// Source task UUID
         task: TaskId,
     },
 }
 
-/// Destination selected by the local CLI.
+/// Destination selected by the local CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageTarget {
-    /// A machine name or UUID and its receiver-side selector.
+    /// A machine name or UUID and its receiver-side selector
     Machine {
-        /// Display name or stable machine UUID.
+        /// Display name or stable machine UUID
         machine: String,
-        /// Exact thread or receiver-side working directory.
+        /// Exact thread or receiver-side working directory
         recipient: Recipient,
     },
-    /// The origin machine and thread for an existing task.
+    /// The origin machine and thread for an existing task
     Task {
-        /// Task whose origin route supplies the destination.
+        /// Task whose origin route supplies the destination
         task: TaskId,
     },
 }
 
-/// Strict request accepted by the local Unix-socket message sender.
+/// Strict request accepted by the local Unix-socket message sender
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageSendRequest {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Stable identity reused for every explicit retry.
+    /// Stable identity reused for every explicit retry
     pub message_id: MessageId,
-    /// Resolved by the local daemon before it contacts a receiver.
+    /// Resolved by the local daemon before it contacts a receiver
     pub target: MessageTarget,
-    /// Source thread or task. The local daemon adds its actual machine UUID.
+    /// Source thread or task. The local daemon adds its actual machine UUID
     pub source: MessageSourceSelector,
-    /// Message text, limited to [`MESSAGE_BODY_MAX_BYTES`] UTF-8 bytes.
+    /// Message text, limited to [`MESSAGE_BODY_MAX_BYTES`] UTF-8 bytes
     pub body: String,
-    /// Prior message this message answers, when present.
+    /// Prior message this message answers, when present
     pub reply_to: Option<MessageId>,
-    /// Conversation UUID shared by related messages.
+    /// Conversation UUID shared by related messages
     pub conversation_id: Uuid,
 }
 
 impl MessageSendRequest {
-    /// Validate fields that do not depend on the local daemon or remote receiver.
+    /// Validate fields that do not depend on the local daemon or remote receiver
     pub fn validate(&self) -> Result<(), AppError> {
-        if self.api_version != crate::domain::API_VERSION {
+        if self.api_version != API_VERSION {
             return Err(AppError::Usage {
                 message: "unsupported API version".into(),
             });
@@ -324,63 +325,63 @@ impl OutboundMessageBinding {
     }
 }
 
-/// Versioned response from a remote message receiver.
+/// Versioned response from a remote message receiver
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageResponse {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Machine identity checked by the receiver.
+    /// Machine identity checked by the receiver
     pub destination_machine: MachineId,
-    /// Durable queue receipt, including the resolved local destination.
+    /// Durable queue receipt, including the resolved local destination
     pub receipt: MessageReceipt,
 }
 
-/// Versioned response returned to the local CLI after sender routing completes.
+/// Versioned response returned to the local CLI after sender routing completes
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageSendResponse {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Stable identity of the sent message.
+    /// Stable identity of the sent message
     pub message_id: MessageId,
-    /// Resolved destination machine UUID.
+    /// Resolved destination machine UUID
     pub destination_machine: MachineId,
-    /// Resolved receiver thread UUID.
+    /// Resolved receiver thread UUID
     pub destination_thread: ThreadId,
-    /// Resolved receiver-side working directory.
+    /// Resolved receiver-side working directory
     pub destination_cwd: PathBuf,
-    /// Receiver's durable success receipt.
+    /// Receiver's durable success receipt
     pub receipt: MessageReceipt,
 }
 
-/// Typed request accepted by `POST /v1/cluster/messages`.
+/// Typed request accepted by `POST /v1/cluster/messages`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageRequest {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version used for this wire attempt.
+    /// Cluster protocol version used for this wire attempt
     pub protocol_version: u32,
-    /// Stable identity reused for every explicit retry.
+    /// Stable identity reused for every explicit retry
     pub message_id: MessageId,
-    /// Intended receiving machine.
+    /// Intended receiving machine
     pub destination_machine: MachineId,
-    /// Route that can be used for a reply.
+    /// Route that can be used for a reply
     pub source: MessageSource,
-    /// Exact thread or receiver-side working directory.
+    /// Exact thread or receiver-side working directory
     pub recipient: Recipient,
-    /// Message text, limited to [`MESSAGE_BODY_MAX_BYTES`] UTF-8 bytes.
+    /// Message text, limited to [`MESSAGE_BODY_MAX_BYTES`] UTF-8 bytes
     pub body: String,
-    /// Prior message this message answers, when present.
+    /// Prior message this message answers, when present
     pub reply_to: Option<MessageId>,
-    /// Conversation UUID shared by related messages.
+    /// Conversation UUID shared by related messages
     pub conversation_id: Uuid,
 }
 
-/// Semantic request identity, excluding only the negotiated wire protocol version.
+/// Semantic request identity, excluding only the negotiated wire protocol version
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MessageIdentity {
     api_version: u32,
@@ -407,9 +408,9 @@ impl MessageRequest {
         }
     }
 
-    /// Reject invalid body text and unsupported receiver-side cwd forms.
+    /// Reject invalid body text and unsupported receiver-side cwd forms
     pub fn validate(&self) -> Result<(), AppError> {
-        if self.api_version != crate::domain::API_VERSION {
+        if self.api_version != API_VERSION {
             return Err(AppError::Usage {
                 message: "unsupported API version".into(),
             });
@@ -428,13 +429,6 @@ impl MessageRequest {
             (MessageSource::Task { task, .. }, _) if task.0.is_nil() => {
                 return Err(AppError::MessageInvalid {
                     message: "source task UUID must not be nil".into(),
-                });
-            }
-            (MessageSource::ResourceNotice { notice_id, .. }, _)
-                if notice_id.as_uuid().is_nil() =>
-            {
-                return Err(AppError::MessageInvalid {
-                    message: "source notice UUID must not be nil".into(),
                 });
             }
             (_, Recipient::Thread { thread }) if thread.0.is_nil() => {
@@ -462,7 +456,7 @@ fn semantic_body(source: &MessageSource, body: &str) -> String {
         return body.to_string();
     }
 
-    // Supervisor notices embed the wire version in their serialized backing body
+    // supervisor notices embed the wire version in their serialized backing body
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
     };
@@ -517,12 +511,15 @@ fn validate_cwd_selector(cwd: &std::path::Path) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::domain::API_VERSION;
+    use super::{MessageId, MessageRequest, MessageSource, Recipient};
+    use crate::domain::{API_VERSION, ThreadId};
+    use crate::machine::MachineId;
+    use crate::resource::NoticeId;
+    use uuid::Uuid;
 
     #[test]
     fn resource_notice_source_requires_a_non_nil_notice_identity() {
-        let notice_id = NoticeId::from_uuid(Uuid::nil());
+        let notice_id = NoticeId::new();
         let request = MessageRequest {
             api_version: API_VERSION,
             protocol_version: 1,
@@ -539,11 +536,11 @@ mod tests {
             reply_to: None,
             conversation_id: Uuid::now_v7(),
         };
+        let mut wire = serde_json::to_value(&request).unwrap();
+        assert!(serde_json::from_value::<MessageRequest>(wire.clone()).is_ok());
 
-        assert!(matches!(
-            request.validate(),
-            Err(AppError::MessageInvalid { .. })
-        ));
+        wire["source"]["notice_id"] = serde_json::json!(Uuid::nil());
+        assert!(serde_json::from_value::<MessageRequest>(wire).is_err());
     }
 
     #[test]
@@ -575,36 +572,36 @@ mod tests {
     }
 }
 
-/// Durable binding between a message request and its resolved local destination.
+/// Durable binding between a message request and its resolved local destination
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageAttempt {
-    /// Immutable semantic content with the latest accepted wire protocol version.
+    /// Immutable semantic content with the latest accepted wire protocol version
     pub request: MessageRequest,
-    /// Resolved local destination thread.
+    /// Resolved local destination thread
     pub destination_thread: ThreadId,
-    /// Resolved local thread working directory.
+    /// Resolved local thread working directory
     pub destination_cwd: PathBuf,
 }
 
-/// Durable acknowledgement committed after one successful queue invocation.
+/// Durable acknowledgement committed after one successful queue invocation
 ///
 /// A crash after queue success and before receipt commit can cause a duplicate
-/// on explicit retry, so queued messages carry their stable UUID for deduplication.
+/// on explicit retry, so queued messages carry their stable UUID for deduplication
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageReceipt {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Message UUID that was queued.
+    /// Message UUID that was queued
     pub message_id: MessageId,
-    /// Destination thread used by the queue command.
+    /// Destination thread used by the queue command
     pub destination_thread: ThreadId,
-    /// Receiver-side working directory used by the queue command.
+    /// Receiver-side working directory used by the queue command
     pub destination_cwd: PathBuf,
-    /// Time when the receiver committed this receipt.
+    /// Time when the receiver committed this receipt
     pub delivered_at: DateTime<Utc>,
 }
 
@@ -617,11 +614,11 @@ impl MessageReceipt {
     }
 }
 
-/// Persisted attempt and optional receipt for one message UUID.
+/// Persisted attempt and optional receipt for one message UUID
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageDelivery {
-    /// Bound request and selected destination, if an attempt started.
+    /// Bound request and selected destination, if an attempt started
     pub attempt: Option<MessageAttempt>,
-    /// Durable success receipt, if queue delivery completed.
+    /// Durable success receipt, if queue delivery completed
     pub receipt: Option<MessageReceipt>,
 }

@@ -1,4 +1,4 @@
-//! `CallbackActor` owns `codex queue` delivery.
+//! `CallbackActor` owns `codex queue` delivery
 
 use std::collections::HashSet;
 
@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState};
 use crate::home::Home;
 
-/// One-way deliver; concurrent across tasks via `spawn_blocking` inside `tokio::spawn`.
+/// One-way deliver; concurrent across tasks via `spawn_blocking` inside `tokio::spawn`
 pub enum CallbackMsg {
     /// Start or join the one ordered origin-inbox worker for this task
     DispatchInbox { id: TaskId },
@@ -19,22 +19,22 @@ pub enum CallbackMsg {
     InboxFinished { id: TaskId, completed: bool },
 }
 
-/// Startup args.
+/// Startup args
 pub struct CallbackArgs {
-    /// Store actor.
-    pub store: ActorRef<StoreMsg>,
-    /// State dir for fallback log.
+    /// Store actor
+    pub(crate) store: ActorRef<StoreMsg>,
+    /// State dir for fallback log
     pub home: Home,
 }
 
-/// Holds store ref and home.
+/// Holds store ref and home
 pub struct CallbackState {
     store: ActorRef<StoreMsg>,
     home: Home,
     active_inbox: HashSet<TaskId>,
 }
 
-/// Owns callback transport for the daemon.
+/// Owns callback transport for the daemon
 pub struct CallbackActor;
 
 impl Actor for CallbackActor {

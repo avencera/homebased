@@ -1,11 +1,8 @@
-//! Axum routes and error mapping.
+//! Axum routes and error mapping
 
 pub mod views;
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -14,11 +11,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::callback::last_event_for_row;
+use crate::cancellation::{
+    CancellationOwner, CancellationPlan, CancellationRoute, CancellationTarget,
+};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
+use crate::daemon::cancel_delivery::CancelResponse;
 use crate::daemon::{AppState, web};
 use crate::domain::{
     API_VERSION, ProcessStatus, TaskEnv, TaskId, TaskIdentity, ThreadId, Workload,
@@ -36,27 +36,6 @@ use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::{self, CancelResult};
 use crate::submission::RequestId;
 
-const CANCELLATION_INTENT_SHARDS: usize = 64;
-static CANCELLATION_INTENT_PERMITS: OnceLock<[Semaphore; CANCELLATION_INTENT_SHARDS]> =
-    OnceLock::new();
-
-/// Serialize cancellation-intent creation for one task on its origin daemon.
-pub(super) async fn lock_cancellation_intent(
-    task: TaskId,
-) -> Result<SemaphorePermit<'static>, AppError> {
-    let permits =
-        CANCELLATION_INTENT_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
-    let mut hasher = DefaultHasher::new();
-    task.hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % CANCELLATION_INTENT_SHARDS;
-    permits[shard]
-        .acquire()
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("cancellation intent permit unavailable: {error}"),
-        })
-}
-
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.http_status();
@@ -64,7 +43,7 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Routes that only read state. Safe to expose on the TCP listener.
+/// Routes that only read state. Safe to expose on the TCP listener
 pub fn read_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::daemon::fleet_api::read_routes())
@@ -79,7 +58,7 @@ pub fn read_routes() -> Router<AppState> {
 }
 
 /// Routes that change state. Unix socket only: the socket is mode 0600, while a
-/// loopback port is reachable from any page the user has open.
+/// loopback port is reachable from any page the user has open
 pub fn write_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/tasks", post(submit))
@@ -87,7 +66,7 @@ pub fn write_routes() -> Router<AppState> {
         .route("/v1/tasks/{id}/cancel", post(cancel))
 }
 
-/// Full API for the Unix socket.
+/// Full API for the Unix socket
 pub fn socket_router(state: AppState) -> Router {
     read_routes()
         .merge(write_routes())
@@ -111,7 +90,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppEr
 }
 
 /// Validated socket request. Built only by `SpecBody`, which is where the
-/// envelope, the normalized spec, and the captured env are each checked.
+/// envelope, the normalized spec, and the captured env are each checked
 #[derive(Debug)]
 pub(super) struct SubmitBody {
     pub(super) spec: NormalizedSpec,
@@ -122,7 +101,7 @@ pub(super) struct SubmitBody {
 
 /// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
 /// parsed with its own pointer prefix, but `deny_unknown_fields` here is what
-/// makes an unknown top-level key an `invalid_spec` instead of silent input.
+/// makes an unknown top-level key an `invalid_spec` instead of silent input
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubmitEnvelope {
@@ -136,7 +115,7 @@ struct SubmitEnvelope {
     callback_cwd: Option<PathBuf>,
 }
 
-/// Application-owned JSON body extractor that maps failures to `AppError`.
+/// Application-owned JSON body extractor that maps failures to `AppError`
 struct SpecBody(SubmitBody);
 
 impl<S> FromRequest<S> for SpecBody
@@ -197,7 +176,7 @@ pub(super) fn missing_field(pointer: &str, name: &str) -> AppError {
     }
 }
 
-/// Build an `invalid_spec` at the failing path, rooted at `prefix`.
+/// Build an `invalid_spec` at the failing path, rooted at `prefix`
 pub(super) fn invalid_at(
     root: &Value,
     prefix: &str,
@@ -211,7 +190,7 @@ pub(super) fn invalid_at(
     }
 }
 
-/// Re-root an `invalid_spec` pointer under `prefix`.
+/// Re-root an `invalid_spec` pointer under `prefix`
 pub(super) fn prefix(prefix: &str, err: AppError) -> AppError {
     match err {
         AppError::InvalidSpec {
@@ -309,7 +288,7 @@ pub(super) fn local_dry_run(
 }
 
 /// Deterministic dry-run feed path for any agent. Only Grok puts it in argv;
-/// Codex and Claude keep it as the stdin evidence path.
+/// Codex and Claude keep it as the stdin evidence path
 fn agent_feed_placeholder(
     root: &std::path::Path,
     workload: &NormalizedWorkload,
@@ -461,137 +440,65 @@ async fn files_origin(State(state): State<AppState>) -> Result<Json<ContentOrigi
 async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
-) -> Result<Json<Value>, AppError> {
-    let _intent_guard = lock_cancellation_intent(id).await?;
+) -> Result<Json<CancelResponse>, AppError> {
+    let _intent_guard = state.locks.cancellation_intents.lock(id).await;
     let saved = call(&state.store, |reply| StoreMsg::GetCancellationRequest {
         task: id,
         reply,
     })
     .await?;
     if let Some(saved) = saved {
-        return Ok(Json(crate::daemon::cancel_delivery::response(&saved)));
+        return Ok(Json(CancelResponse::intent(&saved)));
     }
 
     let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
     if local.is_some() && local_task_already_cancelled(&state, id).await? {
-        return Ok(Json(json!({
-            "api_version": API_VERSION,
-            "id": id,
-            "status": ProcessStatus::Cancelled,
-        })));
+        return Ok(Json(CancelResponse::status(id, ProcessStatus::Cancelled)));
     }
 
     if local.is_none() {
         let owner = crate::daemon::inspection::cancellation_owner(&state, id).await?;
-        let action = cancellation_action(
-            owner,
-            state.machine.identity.machine,
-            id,
-            uuid::Uuid::now_v7(),
-        )?;
-        match action {
-            CancellationAction::AlreadyCancelled => {
-                return Ok(Json(json!({
-                    "api_version": API_VERSION,
-                    "id": id,
-                    "status": ProcessStatus::Cancelled,
-                })));
+        let plan = owner
+            .plan(state.machine.identity.machine, id, uuid::Uuid::now_v7())
+            .map_err(|refusal| refusal.into_error(id))?;
+        let response = match plan {
+            CancellationPlan::AlreadyCancelled => {
+                CancelResponse::status(id, ProcessStatus::Cancelled)
             }
-            CancellationAction::Execution(request) | CancellationAction::Resource(request) => {
+            CancellationPlan::Deliver(request) => {
                 let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
                     request: *request,
                     reply,
                 })
                 .await?;
-                return Ok(Json(crate::daemon::cancel_delivery::response(&saved)));
+                CancelResponse::intent(&saved)
             }
-            CancellationAction::ForwardResource(target) => {
-                let response =
-                    crate::daemon::cluster::forward_resource_cancellation_intent(&state, &target)
-                        .await?;
-                return Ok(Json(response));
+            CancellationPlan::ForwardToOrigin(target) => {
+                crate::daemon::cluster::forward_resource_cancellation_intent(&state, &target)
+                    .await?
             }
-        }
+        };
+        return Ok(Json(response));
     }
     let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
         id,
         reply,
     })
     .await?;
-    match result {
-        CancelResult::AlreadyTerminal(row) => Ok(Json(json!({
-            "api_version": API_VERSION,
-            "id": row.id,
-            "status": row.status(),
-        }))),
-        CancelResult::CancelledQueued(_) => Ok(Json(json!({
-            "api_version": API_VERSION,
-            "id": id,
-            "status": ProcessStatus::Cancelled,
-        }))),
-        CancelResult::SignalWorker(row) => Ok(Json(json!({
-            "api_version": API_VERSION,
-            "id": id,
-            "status": row.status(),
-        }))),
-    }
+    let response = match result {
+        CancelResult::AlreadyTerminal(row) => CancelResponse::status(row.id, row.status()),
+        CancelResult::CancelledQueued(_) => CancelResponse::status(id, ProcessStatus::Cancelled),
+        CancelResult::SignalWorker(row) => CancelResponse::status(id, row.status()),
+    };
+    Ok(Json(response))
 }
 
 async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bool, AppError> {
     let machine = state.machine.identity.machine;
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply }).await?;
     let owner = if let Some(route) = route {
-        if route.task != id || route.origin_machine != machine {
-            return Err(AppError::ClusterTaskConflict { task: id });
-        }
-        match route.submission {
-            // an action-bound launch is resolved only by its own retry, never by a
-            // cancellation that could fence the fixed identity before acceptance
-            crate::submission::SubmissionState::Rejected { .. }
-            | crate::submission::SubmissionState::ResourceAction {
-                phase:
-                    crate::submission::ResourceActionRoutePhase::AcceptanceUnknown
-                    | crate::submission::ResourceActionRoutePhase::Rejected { .. },
-                ..
-            }
-            | crate::submission::SubmissionState::ResourceBackground {
-                phase:
-                    crate::submission::ResourceBackgroundRoutePhase::AcceptanceUnknown
-                    | crate::submission::ResourceBackgroundRoutePhase::Rejected { .. },
-                ..
-            } => {
-                return Err(AppError::ClusterTaskConflict { task: id });
-            }
-            crate::submission::SubmissionState::Resource { resource, phase } => {
-                crate::cancellation::CancellationOwner::Resource(
-                    crate::cancellation::ResourceCancellationTarget {
-                        request_id: route.request,
-                        task_id: route.task,
-                        resource_id: resource,
-                        origin_machine: route.origin_machine,
-                        authority_machine: route.execution_machine,
-                        phase,
-                    },
-                )
-            }
-            crate::submission::SubmissionState::AcceptanceUnknown
-            | crate::submission::SubmissionState::Accepted
-            | crate::submission::SubmissionState::ResourceAction {
-                phase: crate::submission::ResourceActionRoutePhase::Accepted,
-                ..
-            }
-            | crate::submission::SubmissionState::ResourceBackground {
-                phase: crate::submission::ResourceBackgroundRoutePhase::Accepted,
-                ..
-            } => crate::cancellation::CancellationOwner::Execution(
-                crate::cancellation::ExecutionCancellationTarget {
-                    request_id: Some(route.request),
-                    task: route.task,
-                    origin_machine: route.origin_machine,
-                    execution_machine: route.execution_machine,
-                },
-            ),
-        }
+        CancellationOwner::from_route(id, machine, CancellationRoute::from(&route))
+            .map_err(|refusal| refusal.into_error(id))?
     } else {
         let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {
             id,
@@ -604,91 +511,20 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
         crate::daemon::inspection::cancellation_owner(state, id).await?
     };
 
-    let action = cancellation_action(owner, machine, id, uuid::Uuid::now_v7())?;
-    match action {
-        CancellationAction::AlreadyCancelled => Ok(true),
-        CancellationAction::Execution(request) if request.execution_machine == machine => Ok(false),
-        CancellationAction::Execution(_) => Err(AppError::ClusterTaskConflict { task: id }),
-        CancellationAction::Resource(_) => Err(AppError::ClusterTaskConflict { task: id }),
-        CancellationAction::ForwardResource(_) => Err(AppError::ClusterTaskConflict { task: id }),
-    }
-}
-
-enum CancellationAction {
-    Execution(Box<crate::cancellation::CancellationRequest>),
-    Resource(Box<crate::cancellation::CancellationRequest>),
-    ForwardResource(crate::cancellation::ResourceCancellationTarget),
-    AlreadyCancelled,
-}
-
-fn cancellation_action(
-    owner: crate::cancellation::CancellationOwner,
-    requester_machine: crate::machine::MachineId,
-    task: TaskId,
-    cancellation: uuid::Uuid,
-) -> Result<CancellationAction, AppError> {
-    match owner {
-        crate::cancellation::CancellationOwner::Execution(target) => {
-            if target.task != task {
-                return Err(AppError::ClusterTaskConflict { task });
-            }
-            Ok(CancellationAction::Execution(Box::new(
-                crate::cancellation::CancellationRequest {
-                    requester_machine,
-                    cancellation,
-                    task,
-                    origin_machine: target.origin_machine,
-                    execution_machine: target.execution_machine,
-                    target: crate::cancellation::CancellationTarget::Execution {
-                        request_id: target.request_id,
-                    },
-                    delivery: crate::cancellation::CancellationDelivery::Pending,
-                },
-            )))
+    let plan = owner
+        .plan(machine, id, uuid::Uuid::now_v7())
+        .map_err(|refusal| refusal.into_error(id))?;
+    match plan {
+        CancellationPlan::AlreadyCancelled => Ok(true),
+        // only an ordinary execution intent aimed at this machine may use the local row
+        CancellationPlan::Deliver(request)
+            if request.execution_machine == machine
+                && matches!(request.target, CancellationTarget::Execution { .. }) =>
+        {
+            Ok(false)
         }
-        crate::cancellation::CancellationOwner::Resource(target) => {
-            if target.task_id != task {
-                return Err(AppError::ClusterTaskConflict { task });
-            }
-            if target.origin_machine != requester_machine {
-                return Ok(CancellationAction::ForwardResource(target));
-            }
-            match &target.phase {
-                crate::submission::ResourceRoutePhase::CancelledBeforeLaunch => {
-                    return Ok(CancellationAction::AlreadyCancelled);
-                }
-                crate::submission::ResourceRoutePhase::Rejected { .. } => {
-                    return Err(AppError::TaskNotStarted { task });
-                }
-                crate::submission::ResourceRoutePhase::Activated => {
-                    return Ok(CancellationAction::Execution(Box::new(
-                        crate::cancellation::CancellationRequest {
-                            requester_machine,
-                            cancellation,
-                            task,
-                            origin_machine: target.origin_machine,
-                            execution_machine: target.authority_machine,
-                            target: crate::cancellation::CancellationTarget::Execution {
-                                request_id: Some(target.request_id),
-                            },
-                            delivery: crate::cancellation::CancellationDelivery::Pending,
-                        },
-                    )));
-                }
-                crate::submission::ResourceRoutePhase::AcceptanceUnknown
-                | crate::submission::ResourceRoutePhase::Waiting => {}
-            }
-            Ok(CancellationAction::Resource(Box::new(
-                crate::cancellation::CancellationRequest {
-                    requester_machine,
-                    cancellation,
-                    task,
-                    origin_machine: target.origin_machine,
-                    execution_machine: target.authority_machine,
-                    target: crate::cancellation::CancellationTarget::Resource(target),
-                    delivery: crate::cancellation::CancellationDelivery::Pending,
-                },
-            )))
+        CancellationPlan::Deliver(_) | CancellationPlan::ForwardToOrigin(_) => {
+            Err(AppError::ClusterTaskConflict { task: id })
         }
     }
 }
@@ -732,9 +568,14 @@ pub(super) async fn accept_task(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SpecBody, SubmitBody, SubmitResponse};
+    use crate::domain::{API_VERSION, ProcessStatus, TaskId};
+    use crate::error::AppError;
+    use crate::submission::RequestId;
     use axum::body::Body;
+    use axum::extract::{FromRequest, Request};
     use axum::http::Request as HttpRequest;
+    use serde_json::{Value, json};
 
     fn body(value: &Value) -> Request {
         HttpRequest::builder()
@@ -745,7 +586,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Run the socket extractor on its own: no actors, no database.
+    /// Run the socket extractor on its own: no actors, no database
     async fn extract(value: &Value) -> Result<SubmitBody, AppError> {
         SpecBody::from_request(body(value), &()).await.map(|b| b.0)
     }
@@ -762,174 +603,6 @@ mod tests {
             },
             "env": { "path": "/bin", "home": "/home/u" }
         })
-    }
-
-    #[test]
-    fn resource_cancellation_uses_the_typed_path_before_activation() {
-        let task = TaskId::new();
-        for phase in [
-            crate::submission::ResourceRoutePhase::AcceptanceUnknown,
-            crate::submission::ResourceRoutePhase::Waiting,
-        ] {
-            let origin_machine = crate::machine::MachineId::new();
-            let owner = crate::cancellation::CancellationOwner::Resource(
-                crate::cancellation::ResourceCancellationTarget {
-                    request_id: RequestId::new(),
-                    task_id: task,
-                    resource_id: crate::resource::ResourceId::new(),
-                    origin_machine,
-                    authority_machine: crate::machine::MachineId::new(),
-                    phase,
-                },
-            );
-
-            let CancellationAction::Resource(request) =
-                cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7()).unwrap()
-            else {
-                panic!("a pre-activation resource request needs resource cancellation");
-            };
-            assert!(matches!(
-                request.target,
-                crate::cancellation::CancellationTarget::Resource(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn activated_resource_cancellation_uses_the_executor_task_path() {
-        let task = TaskId::new();
-        let request_id = RequestId::new();
-        let origin_machine = crate::machine::MachineId::new();
-        let authority_machine = crate::machine::MachineId::new();
-        let owner = crate::cancellation::CancellationOwner::Resource(
-            crate::cancellation::ResourceCancellationTarget {
-                request_id,
-                task_id: task,
-                resource_id: crate::resource::ResourceId::new(),
-                origin_machine,
-                authority_machine,
-                phase: crate::submission::ResourceRoutePhase::Activated,
-            },
-        );
-        let CancellationAction::Execution(request) =
-            cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7()).unwrap()
-        else {
-            panic!("activated resource work must use ordinary execution cancellation");
-        };
-        assert_eq!(request.execution_machine, authority_machine);
-        assert_eq!(
-            request.target,
-            crate::cancellation::CancellationTarget::Execution {
-                request_id: Some(request_id)
-            }
-        );
-    }
-
-    #[test]
-    fn rejected_resource_route_does_not_build_a_cancellation_request() {
-        let task = TaskId::new();
-        let origin_machine = crate::machine::MachineId::new();
-        let owner = crate::cancellation::CancellationOwner::Resource(
-            crate::cancellation::ResourceCancellationTarget {
-                request_id: RequestId::new(),
-                task_id: task,
-                resource_id: crate::resource::ResourceId::new(),
-                origin_machine,
-                authority_machine: crate::machine::MachineId::new(),
-                phase: crate::submission::ResourceRoutePhase::Rejected {
-                    reason: "resource request rejected".into(),
-                },
-            },
-        );
-        assert!(matches!(
-            cancellation_action(
-                owner,
-                origin_machine,
-                task,
-                uuid::Uuid::now_v7(),
-            ),
-            Err(AppError::TaskNotStarted { task: found }) if found == task
-        ));
-    }
-
-    #[test]
-    fn cancelled_resource_route_returns_its_retained_result_without_executor_request() {
-        let task = TaskId::new();
-        let origin_machine = crate::machine::MachineId::new();
-        let owner = crate::cancellation::CancellationOwner::Resource(
-            crate::cancellation::ResourceCancellationTarget {
-                request_id: RequestId::new(),
-                task_id: task,
-                resource_id: crate::resource::ResourceId::new(),
-                origin_machine,
-                authority_machine: crate::machine::MachineId::new(),
-                phase: crate::submission::ResourceRoutePhase::CancelledBeforeLaunch,
-            },
-        );
-
-        assert!(matches!(
-            cancellation_action(owner, origin_machine, task, uuid::Uuid::now_v7(),),
-            Ok(CancellationAction::AlreadyCancelled)
-        ));
-    }
-
-    #[test]
-    fn cancellation_owner_task_mismatch_is_a_conflict() {
-        let task = TaskId::new();
-        let owner = crate::cancellation::CancellationOwner::Resource(
-            crate::cancellation::ResourceCancellationTarget {
-                request_id: RequestId::new(),
-                task_id: task,
-                resource_id: crate::resource::ResourceId::new(),
-                origin_machine: crate::machine::MachineId::new(),
-                authority_machine: crate::machine::MachineId::new(),
-                phase: crate::submission::ResourceRoutePhase::Waiting,
-            },
-        );
-
-        assert!(matches!(
-            cancellation_action(
-                owner,
-                crate::machine::MachineId::new(),
-                TaskId::new(),
-                uuid::Uuid::now_v7(),
-            ),
-            Err(AppError::ClusterTaskConflict { .. })
-        ));
-    }
-
-    #[test]
-    fn ordinary_execution_cancellation_keeps_the_generic_path() {
-        let task = TaskId::new();
-        let request_id = RequestId::new();
-        let origin_machine = crate::machine::MachineId::new();
-        let execution_machine = crate::machine::MachineId::new();
-        let cancellation = uuid::Uuid::now_v7();
-        let owner = crate::cancellation::CancellationOwner::Execution(
-            crate::cancellation::ExecutionCancellationTarget {
-                request_id: Some(request_id),
-                task,
-                origin_machine,
-                execution_machine,
-            },
-        );
-
-        let CancellationAction::Execution(request) =
-            cancellation_action(owner, crate::machine::MachineId::new(), task, cancellation)
-                .unwrap()
-        else {
-            panic!("ordinary execution must use its generic cancellation intent");
-        };
-        assert_eq!(request.task, task);
-        assert_eq!(request.origin_machine, origin_machine);
-        assert_eq!(request.execution_machine, execution_machine);
-        assert_eq!(request.cancellation, cancellation);
-        assert_eq!(
-            request.target,
-            crate::cancellation::CancellationTarget::Execution {
-                request_id: Some(request_id),
-            }
-        );
     }
 
     #[track_caller]

@@ -1,4 +1,4 @@
-//! Clap tree, `--json`/`--quiet` output, error shape.
+//! Clap tree, `--json`/`--quiet` output, error shape
 
 pub mod config;
 pub mod daemon;
@@ -9,6 +9,7 @@ pub mod resource;
 pub mod task;
 pub mod update;
 
+use crate::domain::API_VERSION;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,7 +32,7 @@ Exit codes:
   5  conflict
 ";
 
-/// Supervise long-running agent and general task workloads and report them to a Codex thread.
+/// Supervise long-running agent and general task workloads and report them to a Codex thread
 #[derive(Debug, Parser)]
 #[command(
     name = "homebased",
@@ -41,98 +42,98 @@ Exit codes:
     after_long_help = AFTER_HELP
 )]
 pub struct Cli {
-    /// JSON on stdout. Conflicts with `--quiet`.
+    /// JSON on stdout. Conflicts with `--quiet`
     #[arg(long, global = true, conflicts_with = "quiet")]
     pub json: bool,
-    /// Bare ids, one per line. Conflicts with `--json`.
+    /// Bare ids, one per line. Conflicts with `--json`
     #[arg(long, global = true, conflicts_with = "json")]
     pub quiet: bool,
-    /// State directory. Overrides `HOMEBASED_HOME`.
+    /// State directory. Overrides `HOMEBASED_HOME`
     #[arg(long, global = true, env = "HOMEBASED_HOME")]
     pub home: Option<PathBuf>,
     /// Config file. Overrides `HOMEBASED_CONFIG`. Default
-    /// `~/.config/homebased/config.toml`.
+    /// `~/.config/homebased/config.toml`
     #[arg(long, global = true, env = CONFIG_ENV)]
     pub config: Option<PathBuf>,
-    /// Subcommand to run.
+    /// Subcommand to run
     #[command(subcommand)]
     pub command: Command,
 }
 
-/// Top-level commands.
+/// Top-level commands
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Host-unit and serve lifecycle.
+    /// Host-unit and serve lifecycle
     Daemon {
-        /// Daemon subcommand.
+        /// Daemon subcommand
         #[command(subcommand)]
         command: daemon::DaemonCommand,
     },
-    /// Inspect and validate `config.toml`.
+    /// Inspect and validate `config.toml`
     Config {
-        /// Config subcommand.
+        /// Config subcommand
         #[command(subcommand)]
         command: config::ConfigCommand,
     },
-    /// Discover and manage fleet machines.
+    /// Discover and manage fleet machines
     Fleet {
-        /// Fleet subcommand.
+        /// Fleet subcommand
         #[command(subcommand)]
         command: fleet::FleetCommand,
     },
-    /// Send a message to a Codex thread on this or another machine.
+    /// Send a message to a Codex thread on this or another machine
     Message {
-        /// Message subcommand.
+        /// Message subcommand
         #[command(subcommand)]
         command: message::MessageCommand,
     },
-    /// Register and manage shared exclusive resources.
+    /// Register and manage shared exclusive resources
     Resource {
-        /// Resource subcommand.
+        /// Resource subcommand
         #[command(subcommand)]
         command: resource::ResourceCommand,
     },
-    /// Submit, inspect, cancel, and report tasks.
+    /// Submit, inspect, cancel, and report tasks
     Task {
-        /// Task subcommand.
+        /// Task subcommand
         #[command(subcommand)]
         command: task::TaskCommand,
     },
-    /// Replace this binary from GitHub and restart the daemon and dashboard.
+    /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
-    /// Print the version.
+    /// Print the version
     Version,
-    /// Hidden authority-bound resource release watcher run as one task.
+    /// Hidden authority-bound resource release watcher run as one task
     #[command(name = "resource-release-watcher", hide = true)]
     ResourceReleaseWatcher(release_watcher::ReleaseWatcherArgs),
-    /// Hidden worker parent of one agent.
+    /// Hidden worker parent of one agent
     #[command(name = "task-run", hide = true)]
     TaskRun {
-        /// State directory.
+        /// State directory
         #[arg(long)]
         home: PathBuf,
-        /// Task id.
+        /// Task id
         #[arg(long)]
         id: TaskId,
-        /// Inherited flock file descriptor.
+        /// Inherited flock file descriptor
         #[arg(long)]
         lock_fd: i32,
     },
 }
 
-/// Output mode.
+/// Output mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
-    /// Human text, color only on TTY without `NO_COLOR`.
+    /// Human text, color only on TTY without `NO_COLOR`
     Human,
-    /// JSON objects with `api_version`.
+    /// JSON objects with `api_version`
     Json,
-    /// Bare values.
+    /// Bare values
     Quiet,
 }
 
 impl OutputMode {
-    /// From global flags.
+    /// From global flags
     #[must_use]
     pub fn from_flags(json: bool, quiet: bool) -> Self {
         if json {
@@ -144,7 +145,7 @@ impl OutputMode {
         }
     }
 
-    /// Whether stdout should use color.
+    /// Whether stdout should use color
     #[must_use]
     pub fn color(self) -> bool {
         if self != Self::Human {
@@ -157,14 +158,14 @@ impl OutputMode {
     }
 }
 
-/// Shared CLI context.
+/// Shared CLI context
 pub struct Ctx {
-    /// Output mode.
+    /// Output mode
     pub output: OutputMode,
-    /// State dir.
+    /// State dir
     pub home: Home,
     /// `--config` / `HOMEBASED_CONFIG` value, resolved on demand so commands
-    /// that never read the config do not depend on it.
+    /// that never read the config do not depend on it
     config: Option<PathBuf>,
 }
 
@@ -177,22 +178,21 @@ impl Ctx {
         })
     }
 
-    /// Config file location for this invocation.
+    /// Config file location for this invocation
     pub fn config_location(&self) -> Result<ConfigLocation, AppError> {
         ConfigLocation::resolve(self.config.clone())
     }
 
-    /// Print a JSON object (adds `api_version` if missing).
+    /// Print a JSON object (adds `api_version` if missing)
     pub fn print_json(&self, mut value: Value) -> Result<(), AppError> {
         if let Some(obj) = value.as_object_mut() {
-            obj.entry("api_version")
-                .or_insert(Value::from(crate::domain::API_VERSION));
+            obj.entry("api_version").or_insert(Value::from(API_VERSION));
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         Ok(())
     }
 
-    /// Print a bare id in quiet mode, JSON, or human line.
+    /// Print a bare id in quiet mode, JSON, or human line
     pub fn print_id(&self, id: &str, human: &str, json: Value) -> Result<(), AppError> {
         match self.output {
             OutputMode::Quiet => {
@@ -207,13 +207,13 @@ impl Ctx {
         }
     }
 
-    /// Write an error to stderr.
+    /// Write an error to stderr
     pub fn print_error(&self, err: &AppError) {
         print_error(self.output, err);
     }
 }
 
-/// Write an error to stderr in the requested output mode.
+/// Write an error to stderr in the requested output mode
 fn print_error(output: OutputMode, err: &AppError) {
     // stderr is already failing if this write fails; there is nowhere left to report
     let _ = match output {
@@ -224,7 +224,7 @@ fn print_error(output: OutputMode, err: &AppError) {
     };
 }
 
-/// Parse argv and run.
+/// Parse argv and run
 pub async fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -277,7 +277,7 @@ fn version(ctx: &Ctx) -> Result<(), AppError> {
         ver,
         ver,
         serde_json::json!({
-            "api_version": crate::domain::API_VERSION,
+            "api_version": API_VERSION,
             "version": ver,
             "name": "homebased",
         }),

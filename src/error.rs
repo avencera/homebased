@@ -1,5 +1,6 @@
-//! CLI and HTTP error codes.
+//! CLI and HTTP error codes
 
+use crate::message::MessageId;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,19 +14,19 @@ use crate::machine::{MachineId, MachineName};
 use crate::resource::ResourceId;
 use crate::submission::RequestId;
 
-/// Application error with a stable machine-readable code.
+/// Application error with a stable machine-readable code
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    /// Daemon socket is missing or not accepting connections.
+    /// Daemon socket is missing or not accepting connections
     #[error("{message}")]
     DaemonUnavailable {
-        /// Why the socket could not be reached.
+        /// Why the socket could not be reached
         message: String,
     },
-    /// No task row for this id.
+    /// No task row for this id
     #[error("task not found: {id}")]
     TaskNotFound {
-        /// Id that had no row.
+        /// Id that had no row
         id: TaskId,
     },
     /// Known peers could not all be checked for this task
@@ -53,179 +54,179 @@ pub enum AppError {
     /// Spec `cwd` is missing or not a directory
     #[error("cwd not found: {}", path.display())]
     CwdNotFound {
-        /// Directory the spec asked for.
+        /// Directory the spec asked for
         path: PathBuf,
     },
-    /// Requested program is missing, not a file, or not executable.
+    /// Requested program is missing, not a file, or not executable
     #[error("executable missing: {program}")]
     ExecutableMissing {
-        /// Program name or path the caller requested.
+        /// Program name or path the caller requested
         program: String,
     },
-    /// Report summary exceeds 4 KiB.
+    /// Report summary exceeds 4 KiB
     #[error("summary too long: {len} bytes")]
     SummaryTooLong {
-        /// Summary length in bytes.
+        /// Summary length in bytes
         len: usize,
     },
-    /// Task already has 20 reports.
+    /// Task already has 20 reports
     #[error("too many reports: {count}")]
     TooManyReports {
-        /// Reports already stored for the task.
+        /// Reports already stored for the task
         count: usize,
     },
-    /// Report or mutate attempted on a terminal task.
+    /// Report or mutate attempted on a terminal task
     #[error("task {id} is terminal ({status})")]
     TaskTerminal {
-        /// Task that is already finished.
+        /// Task that is already finished
         id: TaskId,
-        /// Terminal status the task holds.
+        /// Terminal status the task holds
         status: ProcessStatus,
     },
-    /// Submit spec failed validation.
+    /// Submit spec failed validation
     #[error("{message}")]
     InvalidSpec {
-        /// JSON pointer to the offending key.
+        /// JSON pointer to the offending key
         pointer: String,
-        /// Value found at `pointer`.
+        /// Value found at `pointer`
         value: Value,
-        /// Why the value was rejected.
+        /// Why the value was rejected
         message: String,
     },
-    /// Agent-specific child configuration could not be built safely.
+    /// Agent-specific child configuration could not be built safely
     #[error("{agent} child configuration: {message}")]
     AgentConfiguration {
-        /// Agent whose child environment or command was invalid.
+        /// Agent whose child environment or command was invalid
         agent: AgentKind,
-        /// Safe configuration failure detail.
+        /// Safe configuration failure detail
         message: String,
     },
-    /// Another serve process holds `daemon.lock`.
+    /// Another serve process holds `daemon.lock`
     #[error("daemon already running")]
     DaemonAlreadyRunning,
-    /// A non-blocking `flock` found the file locked by another process.
+    /// A non-blocking `flock` found the file locked by another process
     #[error("lock held: {}", path.display())]
     LockHeld {
-        /// Lock file another process holds.
+        /// Lock file another process holds
         path: PathBuf,
     },
-    /// Stop or uninstall without `--yes` while tasks are queued or running.
+    /// Stop or uninstall without `--yes` while tasks are queued or running
     #[error("{count} task(s) in flight")]
     TasksInFlight {
-        /// Queued or running tasks that block the operation.
+        /// Queued or running tasks that block the operation
         count: usize,
     },
-    /// Generated host unit failed `systemd-analyze` or `plutil`.
+    /// Generated host unit failed `systemd-analyze` or `plutil`
     #[error("unit invalid: {message}")]
     UnitInvalid {
-        /// Validator output.
+        /// Validator output
         message: String,
     },
-    /// Uninstall refused because the host unit belongs to another home.
+    /// Uninstall refused because the host unit belongs to another home
     #[error(
         "host unit belongs to another home (selected {}, configured {})",
         selected.display(),
         configured.display()
     )]
     HostUnitHomeMismatch {
-        /// Home selected by this command.
+        /// Home selected by this command
         selected: PathBuf,
-        /// Home recorded in the installed unit.
+        /// Home recorded in the installed unit
         configured: PathBuf,
     },
-    /// Usage error (conflicting flags, bad UUID).
+    /// Usage error (conflicting flags, bad UUID)
     #[error("{message}")]
     Usage {
-        /// What the caller got wrong.
+        /// What the caller got wrong
         message: String,
     },
-    /// Permission denied.
+    /// Permission denied
     #[error("{message}")]
     Permission {
-        /// Operation that was denied.
+        /// Operation that was denied
         message: String,
     },
-    /// Filesystem path is missing.
+    /// Filesystem path is missing
     #[error("{message}")]
     FileNotFound {
-        /// Human-readable failure.
+        /// Human-readable failure
         message: String,
     },
-    /// Path exists but is not a directory when one was required.
+    /// Path exists but is not a directory when one was required
     #[error("{message}")]
     NotDirectory {
-        /// Human-readable failure.
+        /// Human-readable failure
         message: String,
     },
-    /// Directory or file changed while it was being read.
+    /// Directory or file changed while it was being read
     #[error("{message}")]
     ChangedDuringRead {
-        /// Human-readable failure.
+        /// Human-readable failure
         message: String,
     },
-    /// Special file (device, socket, FIFO) is not browsable.
+    /// Special file (device, socket, FIFO) is not browsable
     #[error("{message}")]
     UnsupportedFile {
-        /// Human-readable failure.
+        /// Human-readable failure
         message: String,
     },
-    /// Too many concurrent content streams.
+    /// Too many concurrent content streams
     #[error("{message}")]
     StreamLimit {
-        /// Human-readable failure.
+        /// Human-readable failure
         message: String,
     },
-    /// `config.toml` is missing, unreadable, or fails validation.
+    /// `config.toml` is missing, unreadable, or fails validation
     #[error("invalid config {}: {message}", path.display())]
     ConfigInvalid {
-        /// Config file path.
+        /// Config file path
         path: PathBuf,
-        /// Why the file was rejected.
+        /// Why the file was rejected
         message: String,
     },
-    /// No known machine matches this name or UUID.
+    /// No known machine matches this name or UUID
     #[error("machine not found: {machine}")]
     MachineNotFound {
-        /// Name or UUID the caller gave.
+        /// Name or UUID the caller gave
         machine: String,
     },
-    /// An address answered for another installation than the request named.
+    /// An address answered for another installation than the request named
     #[error(
         "machine identity mismatch: expected {expected}, found {}",
         found.map_or_else(|| "no machine".to_string(), |id| id.to_string())
     )]
     MachineIdentityMismatch {
-        /// Destination machine UUID the request carried.
+        /// Destination machine UUID the request carried
         expected: MachineId,
-        /// Machine UUID that answered, when known.
+        /// Machine UUID that answered, when known
         found: Option<MachineId>,
     },
-    /// Distinct live daemons claim one machine UUID.
+    /// Distinct live daemons claim one machine UUID
     #[error("duplicate machine identity: {machine}")]
     DuplicateMachineIdentity {
-        /// Conflicting machine UUID.
+        /// Conflicting machine UUID
         machine: MachineId,
     },
-    /// More than one machine uses one name.
+    /// More than one machine uses one name
     #[error("duplicate machine name: {name}")]
     DuplicateMachineName {
-        /// Conflicting name.
+        /// Conflicting name
         name: MachineName,
-        /// Machines that claim it.
+        /// Machines that claim it
         machines: Vec<MachineId>,
     },
-    /// Known machine that did not answer.
+    /// Known machine that did not answer
     #[error("machine {machine} unavailable: {message}")]
     MachineUnavailable {
-        /// Machine that did not answer.
+        /// Machine that did not answer
         machine: MachineId,
-        /// Last failure.
+        /// Last failure
         message: String,
     },
-    /// Remote execution cannot start until its event route is available.
+    /// Remote execution cannot start until its event route is available
     #[error("remote submission is unavailable: {message}")]
     RemoteSubmissionUnavailable {
-        /// Why this daemon cannot start the task now.
+        /// Why this daemon cannot start the task now
         message: String,
     },
     /// The executor may have accepted this task; retry the same request UUID
@@ -300,13 +301,13 @@ pub enum AppError {
     #[error("message conflict: {id}")]
     MessageConflict {
         /// Message UUID that already has a different saved request
-        id: crate::message::MessageId,
+        id: MessageId,
     },
     /// The receiver could not complete one explicit queue attempt
     #[error("message delivery failed: {id}")]
     MessageDeliveryFailed {
         /// Message UUID that remains available for an explicit retry
-        id: crate::message::MessageId,
+        id: MessageId,
         /// Safe summary of the queue failure
         message: String,
     },
@@ -314,7 +315,7 @@ pub enum AppError {
     #[error("message outcome unknown for {id} on machine {machine}: {message}")]
     MessageOutcomeUnknown {
         /// Message UUID to reuse for an explicit retry
-        id: crate::message::MessageId,
+        id: MessageId,
         /// Fixed receiver identity for the retry
         machine: MachineId,
         /// Why the acknowledgement is unknown
@@ -326,17 +327,17 @@ pub enum AppError {
         /// Safe failure summary
         message: String,
     },
-    /// Machines share no cluster protocol version.
+    /// Machines share no cluster protocol version
     #[error("machine {machine} speaks cluster protocol {remote}, this daemon accepts {local}")]
     ClusterProtocolIncompatible {
-        /// Remote machine.
+        /// Remote machine
         machine: MachineId,
-        /// Local accepted range.
+        /// Local accepted range
         local: ProtocolRange,
-        /// Remote accepted range.
+        /// Remote accepted range
         remote: ProtocolRange,
     },
-    /// Unexpected internal failure.
+    /// Unexpected internal failure
     /// No checked authority owns this resource
     #[error("resource not found: {}", resource.as_uuid())]
     ResourceNotFound {
@@ -409,13 +410,13 @@ pub enum AppError {
     },
     #[error("{message}")]
     Internal {
-        /// Underlying failure text.
+        /// Underlying failure text
         message: String,
     },
 }
 
 impl AppError {
-    /// Machine-readable code from `plan §CLI`.
+    /// Machine-readable code from `plan §CLI`
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
@@ -476,7 +477,7 @@ impl AppError {
         }
     }
 
-    /// Process exit code.
+    /// Process exit code
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
@@ -537,7 +538,7 @@ impl AppError {
         }
     }
 
-    /// HTTP status for the Unix-socket API.
+    /// HTTP status for the Unix-socket API
     #[must_use]
     pub fn http_status(&self) -> http::StatusCode {
         match self {
@@ -598,7 +599,7 @@ impl AppError {
         }
     }
 
-    /// Whether a caller should retry the same request.
+    /// Whether a caller should retry the same request
     #[must_use]
     pub fn retryable(&self) -> bool {
         matches!(
@@ -618,7 +619,7 @@ impl AppError {
         )
     }
 
-    /// Structured `input` object for the error envelope.
+    /// Structured `input` object for the error envelope
     #[must_use]
     pub fn input(&self) -> Value {
         match self {
@@ -747,7 +748,7 @@ impl AppError {
         }
     }
 
-    /// JSON envelope for `--json` and HTTP errors.
+    /// JSON envelope for `--json` and HTTP errors
     #[must_use]
     pub fn to_json(&self) -> Value {
         json!({
@@ -761,7 +762,7 @@ impl AppError {
         })
     }
 
-    /// Convert to a process exit code.
+    /// Convert to a process exit code
     #[must_use]
     pub fn to_exit_code(&self) -> ExitCode {
         ExitCode::from(self.exit_code())

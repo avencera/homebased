@@ -1,4 +1,4 @@
-//! Submit spec: serde, schemars, and prompt resolution.
+//! Submit spec: serde, schemars, and prompt resolution
 
 use std::fs;
 use std::io::{self, Read};
@@ -15,14 +15,14 @@ use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
 
-/// Default output-inactivity timeout.
+/// Default output-inactivity timeout
 #[must_use]
 pub fn default_timeout() -> Duration {
     DEFAULT_TIMEOUT
 }
 
 /// `api_version` is a constant, not just an integer: `check_api_version`
-/// rejects every other value, so the published schema says so too.
+/// rejects every other value, so the published schema says so too
 fn api_version_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "integer",
@@ -44,73 +44,73 @@ fn default_true() -> bool {
 }
 
 /// Wire agent workload. `prompt` and `prompt_file` stay as two keys because
-/// that is the documented JSON; validation collapses them into one source.
+/// that is the documented JSON; validation collapses them into one source
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitAgentWorkload {
-    /// Agent CLI.
+    /// Agent CLI
     pub agent: AgentKind,
-    /// Optional model id. OpenCode accepts `provider/model#variant`; empty becomes unset.
+    /// Optional model id. OpenCode accepts `provider/model#variant`; empty becomes unset
     #[serde(default)]
     pub model: Option<String>,
-    /// Inline prompt. Mutually exclusive with `prompt_file`.
+    /// Inline prompt. Mutually exclusive with `prompt_file`
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Prompt file. Relative paths resolve against `cwd`.
+    /// Prompt file. Relative paths resolve against `cwd`
     #[serde(default)]
     pub prompt_file: Option<PathBuf>,
-    /// Extra argv appended after the unattended flags.
+    /// Extra argv appended after the unattended flags
     #[serde(default)]
     pub extra_args: Vec<String>,
-    /// Append the reporting trailer to the child feed.
+    /// Append the reporting trailer to the child feed
     #[serde(default = "default_true")]
     pub report_trailer: bool,
 }
 
 /// Wire task workload: argv only. Command is validated after deserialize so
-/// JSON pointers land on `/workload/command/N`.
+/// JSON pointers land on `/workload/command/N`
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitTaskWorkload {
-    /// Argv array. Index 0 is the program.
+    /// Argv array. Index 0 is the program
     pub command: Vec<String>,
 }
 
-/// Wire shape of `task submit --spec`.
+/// Wire shape of `task submit --spec`
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "SubmitSpec")]
 struct SubmitSpecWire {
-    /// Must be 1.
+    /// Must be 1
     #[schemars(schema_with = "api_version_schema")]
     api_version: u32,
-    /// Codex thread that receives `HOMEBASED_EVENT`.
+    /// Codex thread that receives `HOMEBASED_EVENT`
     thread: ThreadId,
-    /// Human-readable name. Non-unique.
+    /// Human-readable name. Non-unique
     name: TaskName,
-    /// Working directory for the child.
+    /// Working directory for the child
     cwd: PathBuf,
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     machine: Option<MachineName>,
-    /// Output-inactivity timer. Default 1h, minimum 30m.
+    /// Output-inactivity timer. Default 1h, minimum 30m
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
     /// Workload variant. Parsed from `Value` after the envelope so nested
-    /// JSON pointers stay accurate under the internally tagged enum.
+    /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
     workload: Value,
 }
 
-/// Version 1 workload schema, written out rather than derived.
+/// Version 1 workload schema, written out rather than derived
 ///
 /// A derived internally tagged enum emits optional `prompt`/`prompt_file` and
 /// an unbounded `command`, which would accept specs the parser rejects. The
 /// outer `oneOf` separates the variants (each branch closed, so cross-variant
 /// fields fail both), and the inner `oneOf` on the agent branch is what makes
 /// the two prompt keys exactly-one rather than either-or. The agent kind and
-/// the command shape are pulled from their owning types so they cannot drift.
+/// the command shape are pulled from their owning types so they cannot drift
 fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let agent_kind = subschema::<AgentKind>(generator);
     let command = subschema::<CommandLine>(generator);
@@ -153,22 +153,22 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
 }
 
 /// Inline another type's schema as a plain value, so it can be embedded in a
-/// hand-written schema without a `$ref` into a definitions map.
+/// hand-written schema without a `$ref` into a definitions map
 fn subschema<T: JsonSchema>(generator: &mut schemars::SchemaGenerator) -> Value {
     <T as JsonSchema>::json_schema(generator).as_value().clone()
 }
 
-/// Where the prompt text comes from. Exactly one of the two wire keys.
+/// Where the prompt text comes from. Exactly one of the two wire keys
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptSource {
-    /// `prompt`: the text itself.
+    /// `prompt`: the text itself
     Inline(String),
-    /// `prompt_file`: a path, resolved against `cwd` when relative.
+    /// `prompt_file`: a path, resolved against `cwd` when relative
     File(PathBuf),
 }
 
 impl PromptSource {
-    /// Pick the source from the two mutually exclusive wire keys.
+    /// Pick the source from the two mutually exclusive wire keys
     fn from_wire(
         prompt: Option<String>,
         prompt_file: Option<PathBuf>,
@@ -196,7 +196,7 @@ impl PromptSource {
         }
     }
 
-    /// Read the prompt text, resolving a relative file against `cwd`.
+    /// Read the prompt text, resolving a relative file against `cwd`
     fn read(&self, cwd: &Path) -> Result<String, AppError> {
         match self {
             Self::Inline(text) => Ok(text.clone()),
@@ -224,112 +224,112 @@ fn exactly_one_prompt(value: Value) -> AppError {
     }
 }
 
-/// Validated agent submit workload before prompt resolution.
+/// Validated agent submit workload before prompt resolution
 #[derive(Debug, Clone)]
 pub struct SubmitAgent {
-    /// Agent CLI.
+    /// Agent CLI
     pub agent: AgentKind,
-    /// Optional model id. OpenCode accepts `provider/model#variant`.
+    /// Optional model id. OpenCode accepts `provider/model#variant`
     pub model: Option<String>,
-    /// Prompt source.
+    /// Prompt source
     pub prompt: PromptSource,
-    /// Extra argv.
+    /// Extra argv
     pub extra_args: Vec<String>,
-    /// Trailer flag.
+    /// Trailer flag
     pub report_trailer: bool,
 }
 
-/// Validated submit workload before prompt resolution.
+/// Validated submit workload before prompt resolution
 #[derive(Debug, Clone)]
 pub enum SubmitWorkloadValidated {
-    /// Agent with unresolved prompt source.
+    /// Agent with unresolved prompt source
     Agent(SubmitAgent),
-    /// Task command.
+    /// Task command
     Task {
-        /// Validated argv.
+        /// Validated argv
         command: CommandLine,
     },
 }
 
-/// Validated submit spec.
+/// Validated submit spec
 #[derive(Debug, Clone)]
 pub struct SubmitSpec {
-    /// Must be 1.
+    /// Must be 1
     pub api_version: u32,
-    /// Codex thread that receives `HOMEBASED_EVENT`.
+    /// Codex thread that receives `HOMEBASED_EVENT`
     pub thread: ThreadId,
-    /// Human-readable name.
+    /// Human-readable name
     pub name: TaskName,
-    /// Working directory for the child.
+    /// Working directory for the child
     pub cwd: PathBuf,
-    /// Execution machine name, or local when absent.
+    /// Execution machine name, or local when absent
     pub machine: Option<MachineName>,
-    /// Output-inactivity timeout.
+    /// Output-inactivity timeout
     pub timeout: Duration,
-    /// Workload variant.
+    /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
 
-/// Normalized agent workload with inline prompt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Normalized agent workload with inline prompt
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedAgentWorkload {
-    /// Agent CLI.
+    /// Agent CLI
     pub agent: AgentKind,
-    /// Optional model.
+    /// Optional model
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Prompt bytes as text.
+    /// Prompt bytes as text
     pub prompt: String,
-    /// Extra argv.
+    /// Extra argv
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    /// Trailer flag.
+    /// Trailer flag
     pub report_trailer: bool,
 }
 
-/// Normalized task workload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Normalized task workload
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedTaskWorkload {
-    /// Validated argv.
+    /// Validated argv
     pub command: CommandLine,
 }
 
-/// Daemon-socket workload: agent prompt is always inline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Daemon-socket workload: agent prompt is always inline
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NormalizedWorkload {
-    /// Agent with inline prompt.
+    /// Agent with inline prompt
     Agent(NormalizedAgentWorkload),
-    /// Arbitrary command.
+    /// Arbitrary command
     Task(NormalizedTaskWorkload),
 }
 
 /// Spec with prompt inlined and `prompt_file` removed. This is the only shape
-/// the daemon socket accepts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// the daemon socket accepts
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedSpec {
-    /// Schema version.
+    /// Schema version
     pub api_version: u32,
-    /// Codex thread.
+    /// Codex thread
     pub thread: ThreadId,
-    /// Human-readable name.
+    /// Human-readable name
     pub name: TaskName,
-    /// Working directory.
+    /// Working directory
     pub cwd: PathBuf,
-    /// Execution machine name, or local when absent.
+    /// Execution machine name, or local when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<MachineName>,
-    /// Output-inactivity timeout.
+    /// Output-inactivity timeout
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
-    /// Workload variant.
+    /// Workload variant
     pub workload: NormalizedWorkload,
 }
 
-/// Parse a spec from a file path or `-` for stdin.
+/// Parse a spec from a file path or `-` for stdin
 pub fn load_spec(path: &str) -> Result<SubmitSpec, AppError> {
     let bytes = if path == "-" {
         let mut buf = Vec::new();
@@ -347,7 +347,7 @@ pub fn load_spec(path: &str) -> Result<SubmitSpec, AppError> {
     parse_spec_bytes(&bytes)
 }
 
-/// Parse spec bytes, attaching a JSON pointer on failure.
+/// Parse spec bytes, attaching a JSON pointer on failure
 pub fn parse_spec_bytes(bytes: &[u8]) -> Result<SubmitSpec, AppError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|err| AppError::InvalidSpec {
         pointer: String::new(),
@@ -357,14 +357,14 @@ pub fn parse_spec_bytes(bytes: &[u8]) -> Result<SubmitSpec, AppError> {
     parse_spec_value(&value)
 }
 
-/// Parse an already-decoded JSON value.
+/// Parse an already-decoded JSON value
 pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
     let wire: SubmitSpecWire =
         serde_path_to_error::deserialize(value).map_err(|err| invalid_spec_from_de(value, &err))?;
     validate_spec(wire, value)
 }
 
-/// Envelope used to parse common normalized fields before the workload enum.
+/// Envelope used to parse common normalized fields before the workload enum
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NormalizedSpecEnvelope {
@@ -379,7 +379,7 @@ struct NormalizedSpecEnvelope {
     workload: Value,
 }
 
-/// Parse a normalized socket body, attaching a JSON pointer on failure.
+/// Parse a normalized socket body, attaching a JSON pointer on failure
 pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError> {
     let envelope: NormalizedSpecEnvelope =
         serde_path_to_error::deserialize(value).map_err(|err| invalid_spec_from_de(value, &err))?;
@@ -435,10 +435,10 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
     }
 }
 
-/// Map a serde failure onto `invalid_spec`, including missing required fields.
+/// Map a serde failure onto `invalid_spec`, including missing required fields
 ///
 /// `serde_path_to_error` leaves the path empty when a required field is
-/// absent, so the missing name is recovered from the inner serde message.
+/// absent, so the missing name is recovered from the inner serde message
 fn invalid_spec_from_de(
     value: &Value,
     err: &serde_path_to_error::Error<serde_json::Error>,
@@ -468,7 +468,7 @@ fn missing_field_name(err: &serde_json::Error) -> Option<String> {
     }
 }
 
-/// Render a `serde_path_to_error` path as an RFC 6901 JSON pointer.
+/// Render a `serde_path_to_error` path as an RFC 6901 JSON pointer
 pub(crate) fn json_pointer(path: &serde_path_to_error::Path) -> String {
     use serde_path_to_error::Segment;
 
@@ -485,7 +485,7 @@ pub(crate) fn json_pointer(path: &serde_path_to_error::Path) -> String {
     pointer
 }
 
-/// RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order.
+/// RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order
 pub(crate) fn escape_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
@@ -586,7 +586,7 @@ fn invalid_agent_extra_args(workload: &Value, error: OpenCodeExtraArgsError) -> 
     }
 }
 
-/// Drop the discriminant so content structs with `deny_unknown_fields` accept the body.
+/// Drop the discriminant so content structs with `deny_unknown_fields` accept the body
 fn workload_content(workload_raw: &Value) -> Value {
     match workload_raw {
         Value::Object(map) => {
@@ -616,7 +616,7 @@ fn deserialize_under<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// Resolve prompt bytes and produce a normalized spec.
+/// Resolve prompt bytes and produce a normalized spec
 pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
     if spec.machine.is_some()
         && let SubmitWorkloadValidated::Agent(agent) = &spec.workload
@@ -658,13 +658,13 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
     })
 }
 
-/// JSON Schema for the submit spec.
+/// JSON Schema for the submit spec
 pub fn schema_json() -> Result<Value, AppError> {
     let schema = schemars::schema_for!(SubmitSpecWire);
     Ok(serde_json::to_value(&schema)?)
 }
 
-/// Require `cwd` to exist and be a directory.
+/// Require `cwd` to exist and be a directory
 pub fn check_cwd(cwd: &Path) -> Result<(), AppError> {
     match fs::metadata(cwd) {
         Ok(meta) if meta.is_dir() => Ok(()),
@@ -709,8 +709,17 @@ fn example_task_json() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use super::{
+        NormalizedWorkload, PromptSource, SubmitAgent, SubmitSpec, SubmitWorkloadValidated,
+        default_timeout, example_agent_json, example_task_json, normalize, parse_normalized_value,
+        parse_spec_value, schema_json,
+    };
+    use crate::domain::{AgentKind, TaskName, ThreadId};
+    use crate::error::AppError;
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn absent_machine_keeps_local_spec_valid() {
@@ -951,14 +960,14 @@ mod tests {
         }
     }
 
-    /// One published schema, compiled once per assertion set.
+    /// One published schema, compiled once per assertion set
     fn validator() -> jsonschema::Validator {
         jsonschema::validator_for(&schema_json().unwrap()).unwrap()
     }
 
-    /// The schema and the parser must reach the same verdict on every spec.
+    /// The schema and the parser must reach the same verdict on every spec
     /// Asserting both here is what stops the generated document from drifting
-    /// away from the runtime rules.
+    /// away from the runtime rules
     #[track_caller]
     fn assert_verdict(value: &Value, accepted: bool, why: &str) {
         let schema_ok = validator().is_valid(value);

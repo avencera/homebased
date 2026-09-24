@@ -1,13 +1,9 @@
 //! Origin-owned remote submission and unknown-acceptance resolution
 
 use std::collections::BTreeMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use super::AppState;
@@ -27,22 +23,6 @@ use crate::submission::{
     CallbackContext, ExecutorIdentity, OriginRoute, RequestId, SubmissionState,
 };
 
-const SUBMISSION_SHARDS: usize = 64;
-static SUBMISSION_PERMITS: OnceLock<[Semaphore; SUBMISSION_SHARDS]> = OnceLock::new();
-
-async fn lock_request(request: RequestId) -> Result<SemaphorePermit<'static>, AppError> {
-    let permits = SUBMISSION_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
-    let mut hasher = DefaultHasher::new();
-    request.hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % SUBMISSION_SHARDS;
-    permits[shard]
-        .acquire()
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("submission permit unavailable: {error}"),
-        })
-}
-
 /// Submit a remote request once or resolve its saved outcome without resending
 pub(super) async fn submit(
     state: &AppState,
@@ -51,7 +31,7 @@ pub(super) async fn submit(
     let request = body.request.ok_or_else(|| AppError::Internal {
         message: "remote dispatch has no request UUID".into(),
     })?;
-    let _request_guard = lock_request(request).await?;
+    let _request_guard = state.locks.origin_submissions.lock(request).await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request,
         reply,
@@ -63,7 +43,7 @@ pub(super) async fn submit(
             .spec
             .current()
             .ok_or_else(|| conflict(&route, "migrated local task has no remote request"))?;
-        if serde_json::to_value(saved_spec)? != serde_json::to_value(&body.spec)? {
+        if *saved_spec != body.spec {
             return Err(conflict(
                 &route,
                 "request UUID has different normalized content",
@@ -217,8 +197,8 @@ async fn reconcile(
         .await
         .map_err(|error| unknown(&route, error.to_string()))?;
     let query = format!(
-        "/v1/cluster/executions/{}?api_version={}&destination_machine={}",
-        route.task, API_VERSION, route.execution_machine,
+        "/v1/cluster/executions/{}?api_version={API_VERSION}&destination_machine={}",
+        route.task, route.execution_machine,
     );
     let response = ClusterClient::default()
         .get(&destination.address, &query)
@@ -284,7 +264,7 @@ async fn resolve_identity(
             if record.task != route.task
                 || record.origin_machine != route.origin_machine
                 || record.execution_machine != route.execution_machine
-                || serde_json::to_value(&record.spec)? != serde_json::to_value(&route.spec)?
+                || record.spec != route.spec
             {
                 return Err(conflict(&route, "executor accepted a different identity"));
             }
@@ -495,12 +475,18 @@ fn local_dry_run(
 mod tests {
     use std::path::Path;
 
-    use super::*;
-    use crate::domain::TaskEnv;
+    use super::{decode_identity, decode_preview, ensure_direct_route};
+    use crate::daemon::cluster::PreviewBody;
+    use crate::domain::{API_VERSION, TaskEnv, TaskId};
+    use crate::error::AppError;
+    use crate::fleet::http::ClusterResponse;
+    use crate::fleet::protocol::ClusterProtocolVersion;
     use crate::machine::MachineId;
     use crate::resource::ResourceId;
+    use crate::spec::NormalizedSpec;
     use crate::submission::{
-        CallbackContext, CallbackExecutable, NewResourceRoute, RequestId, ResourceRoutePhase,
+        CallbackContext, CallbackExecutable, NewResourceRoute, OriginRoute, RequestId,
+        ResourceRoutePhase, SubmissionState,
     };
     use axum::http::StatusCode;
     use bytes::Bytes;

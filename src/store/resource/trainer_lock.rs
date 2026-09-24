@@ -2,7 +2,7 @@
 //!
 //! The maintained direct-segment wrapper starts its GPU worker in a new session,
 //! so a confirmed exit of the wrapper's process group does not show that the
-//! worker exited. The worker holds the runtime `.segment.lock` until it exits.
+//! worker exited. The worker holds the runtime `.segment.lock` until it exits
 //! Before a transition lets a new GPU worker start, or closes a Restoring loan,
 //! after such a task ended, the authority takes that exact lock. The immutable
 //! trainer-attempt association names the lock, and the authority holds it until
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 
-use super::trainer_association_by_resource_and_task;
+use super::trainer_association::trainer_association_by_resource_and_task;
 use crate::domain::TaskId;
 use crate::machine::MachineId;
 use crate::resource::command_shape::direct_segment_runtime_root;
@@ -24,6 +24,7 @@ use crate::resource::ownership_lock::{
 use crate::resource::store::{ResourceStoreError, TrainerAttemptAssociationStoreError};
 use crate::resource::{Resource, ResourceTaskOwnershipRisk};
 use crate::spec::NormalizedSpec;
+use crate::store::identity::executor_identity_on;
 use crate::submission::{ExecutorIdentity, normalized_spec_sha256};
 
 /// Why an ended task has no verified release of its trainer ownership lock
@@ -220,15 +221,11 @@ fn accepted_spec(
     authority_machine: MachineId,
     task_id: TaskId,
 ) -> Result<NormalizedSpec, TrainerLockReleaseError> {
-    let identity = super::super::identity::executor_identity_on(conn, task_id)
-        .map_err(ResourceStoreError::from)?;
+    let identity = executor_identity_on(conn, task_id).map_err(ResourceStoreError::from)?;
     let Some(ExecutorIdentity::Accepted(record)) = identity else {
         return Err(TrainerLockReleaseGap::RunRecordsMissing { task_id }.into());
     };
-    if record.task != task_id
-        || record.execution_machine != authority_machine
-        || !record.has_valid_spec_owners()
-    {
+    if !record.is_executed_by(task_id, authority_machine) {
         return Err(TrainerLockReleaseGap::RunRecordsMissing { task_id }.into());
     }
 

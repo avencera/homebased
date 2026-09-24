@@ -1,15 +1,15 @@
-//! Daemon-owned bounded delivery for durable supervisor notices.
+//! Daemon-owned bounded delivery for durable supervisor notices
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
 use ractor::ActorRef;
-use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, call};
+use super::keyed_locks::KeyedLocks;
 use super::resource_notice_sender::{
     ResourceNoticeDeliveryOutcome, ResourceNoticeSendError, deliver_one,
 };
@@ -18,9 +18,8 @@ use crate::resource::{NoticeId, SupervisorNoticeDelivery};
 const SCAN_INTERVAL: Duration = Duration::from_secs(15);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(15);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
-const IN_FLIGHT_SHARDS: usize = 64;
 
-/// Recover durable in-flight attempts, then scan and deliver eligible notices.
+/// Recover durable in-flight attempts, then scan and deliver eligible notices
 pub(super) async fn run(state: AppState) {
     let mut worker = DeliveryWorker::new(state.store.clone(), RetryPolicy::default());
 
@@ -233,25 +232,19 @@ impl Retry {
     }
 }
 
-struct InFlight([Semaphore; IN_FLIGHT_SHARDS]);
-
-impl Default for InFlight {
-    fn default() -> Self {
-        Self(std::array::from_fn(|_| Semaphore::new(1)))
-    }
-}
+/// Notices with a delivery in progress
+#[derive(Default)]
+struct InFlight(KeyedLocks<NoticeId>);
 
 impl InFlight {
+    /// Run `deliver` unless the same notice is already being delivered
     async fn deliver_if_idle<F, Fut, T>(&self, notice_id: NoticeId, deliver: F) -> Option<T>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        // shard collisions delay unrelated notices but cannot duplicate a delivery
-        let shard = (notice_id.as_uuid().as_u128() as usize) % IN_FLIGHT_SHARDS;
-        let _permit = self.0[shard].try_acquire().ok()?;
-        let result = deliver().await;
-        Some(result)
+        let _permit = self.0.try_lock(notice_id)?;
+        Some(deliver().await)
     }
 }
 
@@ -265,9 +258,11 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::*;
-    use crate::daemon::actors::StoreActor;
-    use crate::daemon::actors::call;
+    use super::{DeliveryWorker, InFlight, RetryPolicy};
+    use crate::daemon::actors::{StoreActor, StoreMsg, call};
+    use crate::daemon::resource_notice_sender::{
+        ResourceNoticeDeliveryOutcome, ResourceNoticeSendError,
+    };
     use crate::domain::ThreadId;
     use crate::machine::MachineId;
     use crate::resource::store::insert_supervisor_notice_in_transaction;
@@ -277,6 +272,7 @@ mod tests {
         SupervisorNoticePayload,
     };
     use crate::store::Store;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn startup_recovery_runs_before_dispatch() {

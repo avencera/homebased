@@ -57,6 +57,7 @@ web-check:
     cd web
     npm run check
     npm run lint
+    npm test
 
 # ------------------------------------------------------------------------------
 # test

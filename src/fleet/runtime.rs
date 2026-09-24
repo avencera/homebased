@@ -1,9 +1,9 @@
-//! Fleet runtime: discovery providers, probe rounds, and destination routing.
+//! Fleet runtime: discovery providers, probe rounds, and destination routing
 //!
 //! [`FleetRuntime::start`] returns at once. Providers and the probe loop run
 //! as background tasks, so discovery never delays the local socket. Follow-on
 //! cluster code routes work through [`FleetHandle::connect`], which resolves a
-//! machine UUID through the directory and confirms identity before use.
+//! machine UUID through the directory and confirms identity before use
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
@@ -27,24 +27,24 @@ use crate::fleet::directory::{
 use crate::fleet::discovery::mdns::{MdnsAnnouncement, MdnsProvider, MdnsTimings};
 use crate::fleet::discovery::tailscale::{TailscaleProvider, TailscaleTimings};
 use crate::fleet::discovery::{DiscoveryEvent, is_routable_peer_ip};
-use crate::fleet::http::ClusterClient;
-use crate::fleet::identity::{self, IdentityVerdict, ProbeObservation};
+use crate::fleet::http::{ClusterClient, TransportError};
+use crate::fleet::identity::{self, IdentityVerdict, ProbeObservation, ProbeSweep};
 use crate::fleet::probe::{DestinationError, ProbeError, VerifiedDestination, check_probed, probe};
 use crate::machine::{BootId, MachineId, MachineName};
 
-/// Probe loop timing.
+/// Probe loop timing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeTimings {
-    /// Time between full probe rounds.
+    /// Time between full probe rounds
     pub round_interval: Duration,
     /// Delay before the confirming round for suspect identities. Long enough
-    /// for a restarting daemon to come back on every address.
+    /// for a restarting daemon to come back on every address
     pub recheck_delay: Duration,
-    /// Concurrent probes in one round.
+    /// Concurrent probes in one round
     pub probe_concurrency: usize,
-    /// mDNS timing.
+    /// mDNS timing
     pub mdns: MdnsTimings,
-    /// Tailscale timing.
+    /// Tailscale timing
     pub tailscale: TailscaleTimings,
 }
 
@@ -60,35 +60,35 @@ impl Default for RuntimeTimings {
     }
 }
 
-/// State of the local machine UUID in the fleet.
+/// State of the local machine UUID in the fleet
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LocalIdentityStatus {
-    /// No other live daemon claims the local UUID.
+    /// No other live daemon claims the local UUID
     Consistent,
     /// Another live daemon claims the local UUID, such as a copied state
-    /// directory. Peers stop routing to this UUID.
+    /// directory. Peers stop routing to this UUID
     DuplicateMachineIdentity {
-        /// Other boot UUIDs.
+        /// Other boot UUIDs
         boots: BTreeSet<BootId>,
-        /// When the confirming round saw them.
+        /// When the confirming round saw them
         detected_at: DateTime<Utc>,
     },
 }
 
-/// Inputs to start the runtime.
+/// Inputs to start the runtime
 #[derive(Debug, Clone)]
 pub struct FleetStart {
-    /// Local identity, name, and protocol range.
+    /// Local identity, name, and protocol range
     pub local: LocalMachine,
-    /// Enabled fleet settings.
+    /// Enabled fleet settings
     pub settings: FleetSettings,
     /// Address the TCP listener bound, or `None` when it is off. Without it
-    /// the machine can discover peers but peers cannot reach it.
+    /// the machine can discover peers but peers cannot reach it
     pub listener: Option<SocketAddr>,
-    /// `fleet-peers.json` path.
+    /// `fleet-peers.json` path
     pub peers_path: PathBuf,
-    /// Timing.
+    /// Timing
     pub timings: RuntimeTimings,
 }
 
@@ -107,14 +107,14 @@ struct Shared {
     round: Mutex<()>,
 }
 
-/// Cheap, cloneable access to the running fleet.
+/// Cheap, cloneable access to the running fleet
 #[derive(Clone)]
 pub struct FleetHandle {
     shared: Arc<Shared>,
 }
 
 /// Owner of the background tasks. Dropping it without [`Self::shutdown`]
-/// leaves the tasks running until the process exits.
+/// leaves the tasks running until the process exits
 pub struct FleetRuntime {
     handle: FleetHandle,
     tasks: Vec<JoinHandle<()>>,
@@ -124,7 +124,7 @@ pub struct FleetRuntime {
 
 impl FleetRuntime {
     /// Load the directory, apply the configured addresses, and start
-    /// providers and the probe loop in the background.
+    /// providers and the probe loop in the background
     pub fn start(start: FleetStart) -> Result<Self, AppError> {
         let FleetStart {
             local,
@@ -172,13 +172,13 @@ impl FleetRuntime {
         })
     }
 
-    /// Handle for routes and cluster code.
+    /// Handle for routes and cluster code
     #[must_use]
     pub fn handle(&self) -> FleetHandle {
         self.handle.clone()
     }
 
-    /// Withdraw the mDNS announcement, stop tasks, and save the directory.
+    /// Withdraw the mDNS announcement, stop tasks, and save the directory
     pub async fn shutdown(self) {
         if let Some(mdns) = self.mdns {
             mdns.shutdown();
@@ -231,7 +231,7 @@ fn mdns_announcement(handle: &FleetHandle, listener: SocketAddr) -> Option<MdnsA
     })
 }
 
-/// Base URLs that peers can try for this listener.
+/// Base URLs that peers can try for this listener
 fn advertised_addresses(listener: SocketAddr) -> Vec<MachineAddress> {
     let port = listener.port();
     if !listener.ip().is_unspecified() {
@@ -274,48 +274,48 @@ async fn probe_loop(handle: FleetHandle) {
     }
 }
 
-/// Outcome of one probe round.
+/// Outcome of one probe round
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RoundReport {
-    /// Addresses probed.
+    /// Addresses probed
     pub probed: usize,
-    /// Addresses that answered.
+    /// Addresses that answered
     pub answered: usize,
-    /// Machines that needed a confirming round.
+    /// Machines that needed a confirming round
     pub suspects: Vec<MachineId>,
-    /// Machines confirmed as duplicates in this round.
+    /// Machines confirmed as duplicates in this round
     pub duplicates: Vec<MachineId>,
 }
 
 impl FleetHandle {
-    /// Local identity, name, and protocol range.
+    /// Local identity, name, and protocol range
     #[must_use]
     pub fn local(&self) -> &LocalMachine {
         &self.shared.local
     }
 
-    /// Body for `GET /v1/cluster/machine`.
+    /// Body for `GET /v1/cluster/machine`
     #[must_use]
     pub fn advertisement(&self) -> &MachineAdvertisement {
         &self.shared.advertisement
     }
 
-    /// Whether another live daemon claims the local machine UUID.
+    /// Whether another live daemon claims the local machine UUID
     pub async fn local_identity_status(&self) -> LocalIdentityStatus {
         self.shared.local_status.read().await.clone()
     }
 
-    /// Snapshot of known peers.
+    /// Snapshot of known peers
     pub async fn peers(&self) -> Vec<PeerView> {
         self.shared.directory.read().await.peers(Utc::now())
     }
 
-    /// Addresses that have not bound to a machine.
+    /// Addresses that have not bound to a machine
     pub async fn unresolved(&self) -> Vec<UnresolvedAddress> {
         self.shared.directory.read().await.unresolved(Utc::now())
     }
 
-    /// Resolve a machine name to the local machine or one peer UUID.
+    /// Resolve a machine name to the local machine or one peer UUID
     pub async fn resolve_name(&self, name: &MachineName) -> Result<NameTarget, AppError> {
         Ok(self
             .shared
@@ -325,7 +325,7 @@ impl FleetHandle {
             .resolve_name(name, Utc::now())?)
     }
 
-    /// Add an explicit address, persist it, and probe it soon.
+    /// Add an explicit address, persist it, and probe it soon
     pub async fn add_explicit(&self, address: MachineAddress) -> bool {
         let added = self.shared.directory.write().await.add_explicit(address);
         self.persist().await;
@@ -333,26 +333,26 @@ impl FleetHandle {
         added
     }
 
-    /// Remove an explicit address and persist the change.
+    /// Remove an explicit address and persist the change
     pub async fn remove_explicit(&self, address: &MachineAddress) -> bool {
         let removed = self.shared.directory.write().await.remove_explicit(address);
         self.persist().await;
         removed
     }
 
-    /// Forget a machine and persist the change.
+    /// Forget a machine and persist the change
     pub async fn forget_machine(&self, machine: MachineId) -> bool {
         let forgotten = self.shared.directory.write().await.forget_machine(machine);
         self.persist().await;
         forgotten
     }
 
-    /// Run a probe round now and wait for it.
+    /// Run a probe round now and wait for it
     pub async fn discover_now(&self) -> RoundReport {
         self.run_round().await
     }
 
-    /// Probe one address. The result is recorded like any other probe.
+    /// Probe one address. The result is recorded like any other probe
     pub async fn probe_address(
         &self,
         address: &MachineAddress,
@@ -367,12 +367,12 @@ impl FleetHandle {
         result
     }
 
-    /// Resolve a destination UUID to an address that answers for it now.
+    /// Resolve a destination UUID to an address that answers for it now
     ///
     /// Tries addresses in preference order and probes each one. An address
     /// that answers for another installation is rebound to that installation
     /// and skipped; the destination UUID never changes. Call this before each
-    /// retry cycle instead of reusing a saved address.
+    /// retry cycle instead of reusing a saved address
     pub async fn connect(&self, machine: MachineId) -> Result<VerifiedDestination, AppError> {
         let plan = self
             .shared
@@ -473,7 +473,7 @@ impl FleetHandle {
         let first = self.probe_all(candidates.clone()).await;
         let mut report = RoundReport {
             probed: candidates.len(),
-            answered: first.len(),
+            answered: first.answers.len(),
             ..RoundReport::default()
         };
         let duplicates = self.shared.directory.read().await.duplicates();
@@ -481,26 +481,24 @@ impl FleetHandle {
         if local_duplicate {
             known_duplicates.insert(self.shared.local.identity.machine);
         }
-        let suspects = identity::suspects(&first, &self.shared.local.identity, &known_duplicates);
+        let suspects = identity::suspects(
+            &first.answers,
+            &self.shared.local.identity,
+            &known_duplicates,
+        );
         if !suspects.is_empty() {
             report.suspects = suspects.iter().copied().collect();
             tokio::time::sleep(self.shared.timings.recheck_delay).await;
             let recheck = if local_duplicate {
                 candidates.clone()
             } else {
-                identity::recheck_addresses(&first, &suspects)
+                identity::recheck_addresses(&first.answers, &suspects)
                     .into_iter()
                     .collect()
             };
             let second = self.probe_all(recheck).await;
             report.duplicates = self
-                .decide(
-                    &suspects,
-                    &first,
-                    &second,
-                    local_duplicate,
-                    candidates.len(),
-                )
+                .decide(&suspects, &first, &second, local_duplicate)
                 .await;
         }
         self.shared.directory.write().await.prune(Utc::now());
@@ -511,24 +509,22 @@ impl FleetHandle {
     async fn decide(
         &self,
         suspects: &BTreeSet<MachineId>,
-        first: &[ProbeObservation],
-        second: &[ProbeObservation],
+        first: &ProbeSweep,
+        second: &ProbeSweep,
         local_duplicate: bool,
-        candidate_count: usize,
     ) -> Vec<MachineId> {
         let local = self.shared.local.identity;
         let now = Utc::now();
         let mut duplicates = Vec::new();
         for machine in suspects {
-            let verdict = identity::confirm(*machine, first, second, &local);
+            let verdict = identity::confirm(*machine, &first.answers, &second.answers, &local);
             if let IdentityVerdict::Duplicate { boots } = &verdict {
                 duplicates.push(*machine);
                 warn!(%machine, ?boots, "duplicate live machine identity");
             }
             if *machine == local.machine {
                 if local_duplicate {
-                    self.apply_local_recovery(first, second, candidate_count, now)
-                        .await;
+                    self.apply_local_recovery(first, second, now).await;
                 } else {
                     self.apply_local_verdict(verdict, now).await;
                 }
@@ -560,16 +556,14 @@ impl FleetHandle {
 
     async fn apply_local_recovery(
         &self,
-        first: &[ProbeObservation],
-        second: &[ProbeObservation],
-        candidate_count: usize,
+        first: &ProbeSweep,
+        second: &ProbeSweep,
         now: DateTime<Utc>,
     ) {
         let verdict = self.shared.local_recovery.lock().await.observe(
             first,
             second,
             &self.shared.local.identity,
-            candidate_count,
         );
         match verdict {
             identity::LocalRecoveryVerdict::Duplicate { boots } => {
@@ -588,8 +582,8 @@ impl FleetHandle {
     }
 
     /// Probe addresses concurrently, record every result, and return the
-    /// successful observations.
-    async fn probe_all(&self, addresses: Vec<MachineAddress>) -> Vec<ProbeObservation> {
+    /// answers and refusals
+    async fn probe_all(&self, addresses: Vec<MachineAddress>) -> ProbeSweep {
         let limit = Arc::new(tokio::sync::Semaphore::new(
             self.shared.timings.probe_concurrency.max(1),
         ));
@@ -617,21 +611,26 @@ impl FleetHandle {
             }
         }
         let mut directory = self.shared.directory.write().await;
-        let mut observations = Vec::new();
+        let mut sweep = ProbeSweep::default();
         for (address, result, at) in results {
-            match result {
+            let err = match result {
                 Ok(probed) => {
                     directory.record_probe(&address, &probed, at);
-                    observations.push(ProbeObservation {
+                    sweep.answers.push(ProbeObservation {
                         address,
                         header: probed.header(),
                         observed_at: at,
                     });
+                    continue;
                 }
-                Err(err) => directory.record_probe_failure(&address, err.to_string(), at),
+                Err(err) => err,
+            };
+            directory.record_probe_failure(&address, err.to_string(), at);
+            if matches!(err, ProbeError::Transport(TransportError::Refused { .. })) {
+                sweep.refused.push(address);
             }
         }
-        observations
+        sweep
     }
 
     async fn persist(&self) {
@@ -642,7 +641,7 @@ impl FleetHandle {
     }
 }
 
-/// Log the effective fleet setup once at start.
+/// Log the effective fleet setup once at start
 pub fn log_start(local: &LocalMachine, listener: Option<SocketAddr>) {
     info!(
         machine = %local.identity.machine,
@@ -655,11 +654,20 @@ pub fn log_start(local: &LocalMachine, listener: Option<SocketAddr>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fleet::advertisement::MachineHeader;
-    use crate::fleet::directory::PeerDirectory;
-    use crate::fleet::identity::LocalRecoveryVerdict;
+    use super::{FleetHandle, LocalIdentityStatus, RuntimeTimings, Shared};
+    use crate::fleet::advertisement::{Capabilities, MachineAdvertisement, MachineHeader};
+    use crate::fleet::directory::{LocalMachine, PeerDirectory};
+    use crate::fleet::http::ClusterClient;
+    use crate::fleet::identity::{
+        self, IdentityVerdict, LocalRecoveryVerdict, ProbeObservation, ProbeSweep,
+    };
     use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
+    use crate::machine::{BootId, MachineId, MachineName};
+    use chrono::Utc;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, Notify, RwLock};
 
     fn local() -> LocalMachine {
         LocalMachine {
@@ -747,15 +755,34 @@ mod tests {
             LocalIdentityStatus::DuplicateMachineIdentity { .. }
         ));
 
-        let absent = &[];
+        // timed out probes are not evidence that the clone is gone
+        let unanswered = &ProbeSweep::default();
         let now = Utc::now();
-        handle.apply_local_recovery(absent, absent, 1, now).await;
+        for _ in 0..3 {
+            handle
+                .apply_local_recovery(unanswered, unanswered, now)
+                .await;
+        }
         assert!(matches!(
             handle.local_identity_status().await,
             LocalIdentityStatus::DuplicateMachineIdentity { .. }
         ));
 
-        handle.apply_local_recovery(absent, absent, 1, now).await;
+        let clean = &ProbeSweep {
+            answers: vec![observation(
+                &local,
+                local.identity.boot,
+                "http://10.0.0.1:7677",
+            )],
+            refused: Vec::new(),
+        };
+        handle.apply_local_recovery(clean, clean, now).await;
+        assert!(matches!(
+            handle.local_identity_status().await,
+            LocalIdentityStatus::DuplicateMachineIdentity { .. }
+        ));
+
+        handle.apply_local_recovery(clean, clean, now).await;
         assert_eq!(
             handle.local_identity_status().await,
             LocalIdentityStatus::Consistent
@@ -785,7 +812,7 @@ mod tests {
                 .local_recovery
                 .lock()
                 .await
-                .observe(absent, absent, &local.identity, 1),
+                .observe(clean, clean, &local.identity),
             LocalRecoveryVerdict::Inconclusive
         );
     }

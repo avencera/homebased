@@ -1,4 +1,4 @@
-//! Replace the installed binary from a GitHub release.
+//! Replace the installed binary from a GitHub release
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,41 +6,41 @@ use std::time::Duration;
 
 use crate::error::AppError;
 
-/// Default GitHub repository that hosts release assets.
+/// Default GitHub repository that hosts release assets
 pub const DEFAULT_GIT: &str = "avencera/homebased";
-/// Binary name inside the release archive.
+/// Binary name inside the release archive
 pub const CRATE_NAME: &str = "homebased";
 
-/// Where an update will write `homebased` and which asset it will fetch.
+/// Where an update will write `homebased` and which asset it will fetch
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePlan {
-    /// Release tag, including the leading `v`.
+    /// Release tag, including the leading `v`
     pub tag: String,
-    /// Rustc target triple for the GitHub asset.
+    /// Rustc target triple for the GitHub asset
     pub target: String,
-    /// Directory that will hold the binary.
+    /// Directory that will hold the binary
     pub dest_dir: PathBuf,
-    /// Final binary path.
+    /// Final binary path
     pub dest: PathBuf,
-    /// Archive URL.
+    /// Archive URL
     pub url: String,
 }
 
-/// Inputs that resolve an [`UpdatePlan`].
+/// Inputs that resolve an [`UpdatePlan`]
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
-    /// `owner/repo`. Ignored when `base_url` is set.
+    /// `owner/repo`. Ignored when `base_url` is set
     pub git: String,
-    /// Explicit tag, or latest when `None`.
+    /// Explicit tag, or latest when `None`
     pub tag: Option<String>,
-    /// Install directory override.
+    /// Install directory override
     pub dest_dir: Option<PathBuf>,
-    /// Replaces `https://github.com/{git}` (tests).
+    /// Replaces `https://github.com/{git}` (tests)
     pub base_url: Option<String>,
 }
 
 /// Resolve tag, target, destination, and download URL. Downloads nothing when
-/// `tag` is already known.
+/// `tag` is already known
 pub fn plan(request: &UpdateRequest) -> Result<UpdatePlan, AppError> {
     let git = request.git.trim();
     if git.is_empty() {
@@ -80,7 +80,7 @@ pub fn plan(request: &UpdateRequest) -> Result<UpdatePlan, AppError> {
     })
 }
 
-/// Download the planned archive and replace the destination binary.
+/// Download the planned archive and replace the destination binary
 pub fn install(plan: &UpdatePlan) -> Result<(), AppError> {
     need("curl")?;
     need("tar")?;
@@ -93,7 +93,7 @@ pub fn install(plan: &UpdatePlan) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Rustc target whose GitHub asset this host should download.
+/// Rustc target whose GitHub asset this host should download
 pub fn target_triple() -> Result<&'static str, AppError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -106,7 +106,7 @@ pub fn target_triple() -> Result<&'static str, AppError> {
     }
 }
 
-/// Directory that receives the binary when `--to` is omitted.
+/// Directory that receives the binary when `--to` is omitted
 pub fn default_dest_dir() -> Result<PathBuf, AppError> {
     let fallback = local_bin_dir()?;
     let Ok(exe) = std::env::current_exe() else {
@@ -122,7 +122,7 @@ pub fn default_dest_dir() -> Result<PathBuf, AppError> {
         .unwrap_or(fallback))
 }
 
-/// Expand a user-supplied `--to` directory, including a leading `~`.
+/// Expand a user-supplied `--to` directory, including a leading `~`
 pub fn expand_dest(dest: &Path) -> Result<PathBuf, AppError> {
     let raw = dest.to_string_lossy();
     if raw == "~" {
@@ -134,7 +134,7 @@ pub fn expand_dest(dest: &Path) -> Result<PathBuf, AppError> {
     Ok(dest.to_path_buf())
 }
 
-/// Final URL of a GitHub `releases/latest` redirect.
+/// Final URL of a GitHub `releases/latest` redirect
 pub fn tag_from_latest_url(url: &str) -> Result<String, AppError> {
     let url = url.trim().trim_end_matches('/');
     match url.rsplit_once("/releases/tag/") {
@@ -222,21 +222,35 @@ fn find_executable(dir: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-/// Unlink then copy so a running binary can be replaced (macOS `ETXTBSY`).
+/// Stage beside the destination, then atomically replace a running binary
 pub fn replace_binary(src: &Path, dest: &Path) -> Result<(), AppError> {
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir)?;
+    let dir = dest.parent().ok_or_else(|| AppError::Internal {
+        message: format!("binary destination has no parent: {}", dest.display()),
+    })?;
+    std::fs::create_dir_all(dir)?;
+    let staged_path = dir.join(format!(".homebased-update-{}", uuid::Uuid::now_v7()));
+
+    let result = (|| {
+        let mut source = std::fs::File::open(src)?;
+        let mut staged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged_path)?;
+        std::io::copy(&mut source, &mut staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staged.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        staged.sync_all()?;
+        std::fs::rename(&staged_path, dest)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged_path);
     }
-    let _ = std::fs::remove_file(dest);
-    std::fs::copy(src, dest)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dest)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dest, perms)?;
-    }
-    Ok(())
+    result
 }
 
 fn is_cargo_build_path(exe: &Path) -> bool {
@@ -309,14 +323,20 @@ impl Drop for TempDir {
     }
 }
 
-/// Bound used by the CLI when waiting for `/v1/status` after restart.
+/// Bound used by the CLI when waiting for `/v1/status` after restart
 pub const STATUS_WAIT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DEFAULT_GIT, TempDir, UpdatePlan, UpdateRequest, asset_url, expand_dest, extract_archive,
+        find_executable, home_dir, is_cargo_build_path, plan, replace_binary, tag_from_latest_url,
+        target_triple,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn latest_url_yields_tag() {
@@ -412,6 +432,36 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"#!/bin/sh\n");
         let mode = fs::metadata(&dest).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111);
+    }
+
+    #[test]
+    fn replace_binary_failure_keeps_existing_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("homebased");
+        fs::write(&dest, b"old binary").unwrap();
+
+        let result = replace_binary(&dir.path().join("missing"), &dest);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"old binary");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replace_binary_preserves_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("homebased");
+        fs::copy("/bin/sleep", &dest).unwrap();
+        let mut child = Command::new(&dest).arg("30").spawn().unwrap();
+
+        let result = replace_binary(Path::new("/usr/bin/true"), &dest);
+        let old_process_running = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        result.unwrap();
+        assert!(old_process_running);
+        assert!(Command::new(&dest).status().unwrap().success());
     }
 
     #[test]

@@ -2,9 +2,20 @@
 
 use std::os::unix::fs::symlink;
 
-use super::*;
+use super::fixtures::{acceptance_input, resource, serving_fixture_with_spec};
+use crate::domain::TaskId;
+use crate::machine::MachineId;
 use crate::resource::ResourceTaskOwnershipRisk;
 use crate::resource::foreground::test_support::native_fake_command;
+use crate::resource::store::{ResourceStoreError, ResourceTaskAcceptance};
+use crate::spec::NormalizedSpec;
+use crate::store::Store;
+use crate::submission::RequestId;
+use serde_json::json;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use tempfile::tempdir;
 
 fn command_in(root: &Path, argv: &[&Path]) -> NormalizedSpec {
     serde_json::from_value(json!({

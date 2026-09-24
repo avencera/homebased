@@ -2,7 +2,7 @@
 //!
 //! The supervisor machine reads the resource from its fixed authority, saves one
 //! fixed-ID origin route with the full spec, its callback context, and the exact
-//! supervisor assignment and resource revision, and only then sends the launch.
+//! supervisor assignment and resource revision, and only then sends the launch
 //! The authority reads that saved route back as evidence before it accepts. A
 //! lost reply or restart repeats the same launch, and the authority answers an
 //! exact retry from its receipt, so no second trainer starts
@@ -11,10 +11,7 @@
 //! supervisor names only the attempt; the authority reads the attempt request
 //! and probes the held ownership lock itself
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -22,7 +19,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use super::AppState;
@@ -45,7 +41,7 @@ use crate::resource::background_launch::{
     ResourceBackgroundRejection, ResourceBackgroundRequest, ResourceBackgroundResponse,
 };
 use crate::resource::store::ResourceStoreError;
-use crate::resource::watcher::AttemptBinding;
+use crate::resource::trainer_publication::AttemptBinding;
 use crate::spec::{self, NormalizedSpec};
 use crate::store::{
     BackgroundLaunchAcceptance, BackgroundLaunchError, ResourceBackgroundRouteResult,
@@ -55,9 +51,6 @@ use crate::submission::{
     ResourceBackgroundRoutePhase, ResourceBackgroundRouteProof, SubmissionState,
     normalized_spec_sha256,
 };
-
-const LAUNCH_SHARDS: usize = 64;
-static LAUNCH_PERMITS: OnceLock<[Semaphore; LAUNCH_SHARDS]> = OnceLock::new();
 
 /// Saved route proof returned by the supervisor machine
 #[derive(Debug, Serialize, Deserialize)]
@@ -392,19 +385,6 @@ async fn route_proof(
 
 // ---- supervisor side ----
 
-async fn lock_request(request: RequestId) -> Result<SemaphorePermit<'static>, AppError> {
-    let permits = LAUNCH_PERMITS.get_or_init(|| std::array::from_fn(|_| Semaphore::new(1)));
-    let mut hasher = DefaultHasher::new();
-    request.hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % LAUNCH_SHARDS;
-    permits[shard]
-        .acquire()
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("background launch permit unavailable: {error}"),
-        })
-}
-
 /// Submit one first background launch to a remote authority, or answer its saved route
 ///
 /// A new request saves its fixed-ID route before the first send. A retry with
@@ -414,7 +394,7 @@ pub(super) async fn submit(
     state: &AppState,
     input: RemoteBackgroundSubmit,
 ) -> Result<ResourceBackgroundSubmitResponse, AppError> {
-    let _request_guard = lock_request(input.request_id).await?;
+    let _request_guard = state.locks.background_launches.lock(input.request_id).await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request: input.request_id,
         reply,
@@ -444,9 +424,7 @@ pub(super) async fn recover(state: AppState) {
         }
     };
     for route in routes {
-        let Ok(_request_guard) = lock_request(route.request).await else {
-            continue;
-        };
+        let _request_guard = state.locks.background_launches.lock(route.request).await;
         if let Err(error) = send_saved_launch(&state, &route).await {
             warn!(task = %route.task, "background launch recovery: {error}");
         }
@@ -470,7 +448,7 @@ fn check_retry(route: &OriginRoute, input: &RemoteBackgroundSubmit) -> Result<()
     };
     if binding.assignment.resource_id != input.resource
         || binding.execution_machine() != input.authority
-        || serde_json::to_value(saved_spec)? != serde_json::to_value(&input.spec)?
+        || *saved_spec != input.spec
     {
         return Err(conflict(
             "request id was retried with a different resource, authority, or spec",
@@ -684,7 +662,7 @@ async fn resolve(
 
 /// Bind one trainer attempt on the remote authority for this supervisor machine
 ///
-/// The request names the current supervisor assignment read from the authority.
+/// The request names the current supervisor assignment read from the authority
 /// An exact retry returns the saved association; another attempt conflicts
 pub(super) async fn bind_trainer_attempt(
     state: &AppState,

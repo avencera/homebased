@@ -7,9 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
-use crate::cancellation::{
-    CancellationOwner, ExecutionCancellationTarget, ResourceCancellationTarget,
-};
+use crate::cancellation::{CancellationOwner, CancellationRoute};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::cluster::{
@@ -336,10 +334,10 @@ async fn lookup(state: &AppState, id: TaskId) -> Result<Records, AppError> {
             local,
             OriginSummary {
                 task: route.task,
-                request_id: Some(route.request),
+                request_id: route.request,
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
-                thread: Some(route.thread),
+                thread: route.thread,
                 submission: route.submission,
                 last_execution_state: route.last_execution_state,
                 last_updated_at: route.last_updated_at,
@@ -412,15 +410,14 @@ async fn lookup(state: &AppState, id: TaskId) -> Result<Records, AppError> {
     Ok(records)
 }
 
-/// Resolve a task to its retained origin machine and original Codex thread.
+/// Resolve a task to its retained origin machine and original Codex thread
 pub(super) async fn message_origin_route(
     state: &AppState,
     id: TaskId,
 ) -> Result<(MachineId, crate::domain::ThreadId), AppError> {
     let records = lookup(state, id).await?;
     if let Some((machine, route)) = records.route(id)? {
-        let thread = route.thread.ok_or(AppError::RouteNotFound { task: id })?;
-        return Ok((*machine, thread));
+        return Ok((*machine, route.thread));
     }
 
     if !records.unchecked.is_empty() {
@@ -473,7 +470,7 @@ pub(super) async fn cancellation_owner(
         return absent(id, &records);
     };
 
-    let (origin, execution) = cancellation_owner_machines(&target);
+    let (origin, execution) = target.machines();
     let unchecked: Vec<_> = records
         .unchecked
         .iter()
@@ -495,41 +492,15 @@ fn cancellation_target(
     route_machine: MachineId,
     route: &OriginSummary,
 ) -> Result<CancellationOwner, AppError> {
-    if route.task != task || route.origin_machine != route_machine {
-        return Err(AppError::ClusterTaskConflict { task });
-    }
-
-    if matches!(&route.submission, SubmissionState::Rejected { .. }) {
-        return Err(AppError::TaskNotStarted { task });
-    }
-
-    if let SubmissionState::Resource { resource, phase } = &route.submission {
-        let Some(request_id) = route.request_id else {
-            return Err(AppError::ClusterTaskConflict { task });
-        };
-        return Ok(CancellationOwner::Resource(ResourceCancellationTarget {
-            request_id,
-            task_id: task,
-            resource_id: *resource,
-            origin_machine: route.origin_machine,
-            authority_machine: route.execution_machine,
-            phase: phase.clone(),
-        }));
-    }
-
-    Ok(CancellationOwner::Execution(ExecutionCancellationTarget {
+    let route = CancellationRoute {
+        task: route.task,
         request_id: route.request_id,
-        task,
         origin_machine: route.origin_machine,
         execution_machine: route.execution_machine,
-    }))
-}
-
-fn cancellation_owner_machines(target: &CancellationOwner) -> (MachineId, MachineId) {
-    match target {
-        CancellationOwner::Execution(target) => (target.origin_machine, target.execution_machine),
-        CancellationOwner::Resource(target) => (target.origin_machine, target.authority_machine),
-    }
+        submission: &route.submission,
+    };
+    CancellationOwner::from_route(task, route_machine, route)
+        .map_err(|refusal| refusal.into_error(task))
 }
 
 async fn read_peer(
@@ -821,15 +792,21 @@ fn absent<T>(id: TaskId, records: &Records) -> Result<T, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::ThreadId;
     use uuid::Uuid;
 
-    use super::*;
+    use super::{Records, cancellation_target};
+    use crate::cancellation::CancellationOwner;
+    use crate::daemon::cluster::OriginSummary;
+    use crate::domain::TaskId;
+    use crate::error::AppError;
+    use crate::machine::MachineId;
     use crate::resource::ResourceId;
-    use crate::submission::{RequestId, ResourceRoutePhase};
+    use crate::submission::{RequestId, ResourceRoutePhase, SubmissionState};
 
     fn origin_summary(
         task: TaskId,
-        request_id: Option<RequestId>,
+        request_id: RequestId,
         origin_machine: MachineId,
         execution_machine: MachineId,
         submission: SubmissionState,
@@ -839,7 +816,7 @@ mod tests {
             request_id,
             origin_machine,
             execution_machine,
-            thread: Some(crate::domain::ThreadId(Uuid::now_v7())),
+            thread: ThreadId(Uuid::now_v7()),
             submission,
             last_execution_state: None,
             last_updated_at: None,
@@ -858,7 +835,7 @@ mod tests {
         let authority_machine = MachineId::new();
         let route = origin_summary(
             task,
-            Some(request_id),
+            request_id,
             origin_machine,
             authority_machine,
             SubmissionState::Resource {
@@ -886,7 +863,7 @@ mod tests {
         let origin_machine = MachineId::new();
         let route = origin_summary(
             task,
-            Some(RequestId::new()),
+            RequestId::new(),
             origin_machine,
             MachineId::new(),
             SubmissionState::Resource {
@@ -906,33 +883,12 @@ mod tests {
     }
 
     #[test]
-    fn old_resource_route_without_request_id_cannot_become_an_execution_target() {
-        let task = TaskId::new();
-        let origin_machine = MachineId::new();
-        let route = origin_summary(
-            task,
-            None,
-            origin_machine,
-            MachineId::new(),
-            SubmissionState::Resource {
-                resource: ResourceId::new(),
-                phase: ResourceRoutePhase::Waiting,
-            },
-        );
-
-        assert!(matches!(
-            cancellation_target(task, origin_machine, &route),
-            Err(AppError::ClusterTaskConflict { .. })
-        ));
-    }
-
-    #[test]
     fn rejected_execution_route_cannot_become_a_cancellation_target() {
         let task = TaskId::new();
         let origin_machine = MachineId::new();
         let route = origin_summary(
             task,
-            Some(RequestId::new()),
+            RequestId::new(),
             origin_machine,
             MachineId::new(),
             SubmissionState::Rejected {
@@ -944,6 +900,51 @@ mod tests {
             cancellation_target(task, origin_machine, &route),
             Err(AppError::TaskNotStarted { task: found }) if found == task
         ));
+    }
+
+    #[test]
+    fn unresolved_background_launch_cannot_become_a_cancellation_target() {
+        use crate::resource::background_launch::{
+            BackgroundLaunchBinding, BackgroundSupervisorAssignment, ResourceBackgroundRejection,
+        };
+        use crate::resource::{AssignmentRevision, ResourceRevision, SupervisorAddress};
+        use crate::submission::ResourceBackgroundRoutePhase;
+
+        let task = TaskId::new();
+        let origin_machine = MachineId::new();
+        let authority_machine = MachineId::new();
+        let binding = BackgroundLaunchBinding {
+            assignment: BackgroundSupervisorAssignment {
+                authority_machine,
+                resource_id: ResourceId::new(),
+                supervisor: SupervisorAddress {
+                    machine: origin_machine,
+                    thread: ThreadId(Uuid::now_v7()),
+                },
+                assignment_revision: AssignmentRevision::new(1),
+            },
+            expected_state_revision: ResourceRevision::new(1),
+        };
+        // a cancellation must never fence the fixed launch identity before acceptance
+        for phase in [
+            ResourceBackgroundRoutePhase::AcceptanceUnknown,
+            ResourceBackgroundRoutePhase::Rejected {
+                reason: ResourceBackgroundRejection::ResourceNotFound,
+            },
+        ] {
+            let route = origin_summary(
+                task,
+                RequestId::new(),
+                origin_machine,
+                authority_machine,
+                SubmissionState::ResourceBackground { binding, phase },
+            );
+
+            assert!(matches!(
+                cancellation_target(task, origin_machine, &route),
+                Err(AppError::ClusterTaskConflict { task: found }) if found == task
+            ));
+        }
     }
 
     #[test]
@@ -961,7 +962,7 @@ mod tests {
             MachineId::new(),
             origin_summary(
                 task,
-                Some(RequestId::new()),
+                RequestId::new(),
                 origin_machine,
                 authority_machine,
                 submission.clone(),
@@ -971,7 +972,7 @@ mod tests {
             MachineId::new(),
             origin_summary(
                 task,
-                Some(RequestId::new()),
+                RequestId::new(),
                 origin_machine,
                 authority_machine,
                 submission,

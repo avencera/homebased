@@ -1,5 +1,7 @@
 //! Daemon-to-daemon identity and event routes under `/v1/cluster/*`
 
+use crate::daemon::actors::SupervisorMsg;
+use crate::fleet::http::ClusterClient;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -9,12 +11,14 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 
 use crate::cancellation::{
-    CancellationDelivery, CancellationReceipt, CancellationRequest, CancellationRequestIdentity,
-    CancellationTarget, ResourceCancellationRequestIdentity, ResourceCancellationTarget,
+    CancellationOwner, CancellationPlan, CancellationReceipt, CancellationRequest,
+    CancellationRequestIdentity, CancellationRoute, CancellationTarget,
+    ResourceCancellationRequestIdentity, ResourceCancellationTarget,
 };
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::api::views::{LogTail, TaskDetail};
+use crate::daemon::cancel_delivery::CancelResponse;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, TaskIdentity};
 use crate::error::AppError;
 use crate::events::{EventAcceptance, TaskEvent};
@@ -37,51 +41,51 @@ use crate::submission::{
 };
 use std::path::{Path as StdPath, PathBuf};
 
-/// Strict destination and version for a cluster read.
+/// Strict destination and version for a cluster read
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadQuery {
-    /// Public API version.
+    /// Public API version
     pub api_version: u32,
-    /// UUID of the intended receiver.
+    /// UUID of the intended receiver
     pub destination_machine: MachineId,
 }
 
-/// A remote request bound to one task and two machine identities.
+/// A remote request bound to one task and two machine identities
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubmitExecution {
     /// Public API schema version; missing values decode as zero for a versioned usage error
     #[serde(default)]
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Intended receiver.
+    /// Intended receiver
     pub destination_machine: MachineId,
-    /// Callback owner.
+    /// Callback owner
     pub origin_machine: MachineId,
-    /// Global task identity.
+    /// Global task identity
     pub task: TaskId,
-    /// Inline, normalized content; no origin environment is allowed.
+    /// Inline, normalized content; no origin environment is allowed
     pub spec: serde_json::Value,
     /// Unrecognized top-level fields make a bound request definitively invalid
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
-/// Pre-acceptance resolution request.
+/// Pre-acceptance resolution request
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbandonExecution {
     /// Public API schema version; missing values decode as zero for a versioned usage error
     #[serde(default)]
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Intended receiver.
+    /// Intended receiver
     pub destination_machine: MachineId,
-    /// Callback owner.
+    /// Callback owner
     pub origin_machine: MachineId,
-    /// Global task identity.
+    /// Global task identity
     pub task: TaskId,
 }
 
@@ -96,9 +100,8 @@ pub struct CancelExecution {
     pub protocol_version: u32,
     /// Immutable request and fixed owners
     pub request: CancellationRequestIdentity,
-    /// Typed target, absent on older peers
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<crate::cancellation::CancellationTarget>,
+    /// Typed route target proven by the requester
+    pub target: CancellationTarget,
 }
 
 /// Durable executor acknowledgement
@@ -113,88 +116,88 @@ pub struct CancelBody {
     pub receipt: CancellationReceipt,
 }
 
-/// Destination-checked request to cancel one pre-activation resource request.
+/// Destination-checked request to cancel one pre-activation resource request
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelResourceRequest {
-    /// Public API schema version; missing values decode as zero for a versioned usage error.
+    /// Public API schema version; missing values decode as zero for a versioned usage error
     #[serde(default)]
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Intended resource authority.
+    /// Intended resource authority
     pub destination_machine: MachineId,
-    /// Exact origin-owned cancellation identity and route target.
+    /// Exact origin-owned cancellation identity and route target
     pub request: ResourceCancellationRequestIdentity,
 }
 
-/// Durable authority response to a resource cancellation request.
+/// Durable authority response to a resource cancellation request
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelResourceBody {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Machine that handled the request.
+    /// Machine that handled the request
     pub destination_machine: MachineId,
-    /// Saved resource cancellation receipt.
+    /// Saved resource cancellation receipt
     pub receipt: ResourceCancellationReceipt,
 }
 
-/// Destination-checked request for the route origin to persist cancellation intent.
+/// Destination-checked request for the route origin to persist cancellation intent
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelOriginResourceRequest {
-    /// Public API schema version; missing values decode as zero for a versioned usage error.
+    /// Public API schema version; missing values decode as zero for a versioned usage error
     #[serde(default)]
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Intended origin daemon.
+    /// Intended origin daemon
     pub destination_machine: MachineId,
-    /// Machine that invoked task cancellation.
+    /// Machine that invoked task cancellation
     pub requester_machine: MachineId,
-    /// Resource-routed task whose origin owns the cancellation intent.
+    /// Resource-routed task whose origin owns the cancellation intent
     pub task: TaskId,
 }
 
-/// Result from the origin-owned resource cancellation-intent route.
+/// Result from the origin-owned resource cancellation-intent route
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelOriginResourceBody {
-    /// Public API schema version.
+    /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Machine that owns the saved origin route.
+    /// Machine that owns the saved origin route
     pub destination_machine: MachineId,
-    /// Durable intent, or an already-cancelled route result.
+    /// Durable intent, or an already-cancelled route result
     pub outcome: OriginResourceCancellationOutcome,
 }
 
-/// Typed response from the origin-owned resource cancellation-intent route.
+/// Typed response from the origin-owned resource cancellation-intent route
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OriginResourceCancellationOutcome {
-    /// Origin persisted or reused this stable cancellation request.
+    /// Origin persisted or reused this stable cancellation request
     Intent {
-        /// Saved cancellation request and current delivery state.
+        /// Saved cancellation request and current delivery state
         request: Box<CancellationRequest>,
     },
-    /// The resource route already retained a cancellation result.
+    /// The resource route already retained a cancellation result
     AlreadyCancelled,
 }
 
-/// Retained executor identity, or an absent lookup.
+/// Retained executor identity, or an absent lookup
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityBody {
     /// Public API schema version
     pub api_version: u32,
-    /// Cluster protocol version.
+    /// Cluster protocol version
     pub protocol_version: u32,
-    /// Retained state, if any.
+    /// Retained state, if any
     pub identity: Option<ExecutorIdentity>,
 }
 
@@ -256,25 +259,25 @@ pub struct EventBody {
     pub result: EventAcceptance,
 }
 
-/// An execution record held on this daemon only.
+/// An execution record held on this daemon only
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionView {
-    /// Task UUID.
+    /// Task UUID
     pub task: TaskId,
-    /// Machine that owns this execution record.
+    /// Machine that owns this execution record
     pub execution_machine: MachineId,
-    /// Actual stored process state.
+    /// Actual stored process state
     pub status: ProcessStatus,
 }
 
-/// One local execution lookup, including an absent record.
+/// One local execution lookup, including an absent record
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionBody {
-    /// Public API version.
+    /// Public API version
     pub api_version: u32,
-    /// Stored execution record, if present.
+    /// Stored execution record, if present
     pub execution: Option<ExecutionView>,
 }
 
@@ -296,16 +299,14 @@ pub struct CallbackFailureSummary {
 pub struct OriginSummary {
     /// Global task UUID
     pub task: TaskId,
-    /// Caller retry UUID, absent on older peers
-    #[serde(default)]
-    pub request_id: Option<RequestId>,
+    /// Caller retry UUID
+    pub request_id: RequestId,
     /// Callback owner
     pub origin_machine: MachineId,
     /// Fixed execution owner
     pub execution_machine: MachineId,
-    /// Original Codex thread, absent when an older peer does not expose it.
-    #[serde(default)]
-    pub thread: Option<crate::domain::ThreadId>,
+    /// Original Codex thread
+    pub thread: crate::domain::ThreadId,
     /// Submission state without origin-only callback context
     pub submission: SubmissionState,
     /// Last process state received from the executor
@@ -448,7 +449,7 @@ async fn receive_message(
     let protocol_version = body.protocol_version;
     let receipt = state.message_receiver.receive(&state, body).await?;
     Ok(Json(MessageResponse {
-        api_version: crate::domain::API_VERSION,
+        api_version: API_VERSION,
         protocol_version,
         destination_machine: state.machine.identity.machine,
         receipt,
@@ -472,7 +473,7 @@ async fn receive_supervisor_notice(
         .receive_supervisor_notice(&state, body)
         .await?;
     Ok(Json(SupervisorNoticeResponse {
-        api_version: crate::domain::API_VERSION,
+        api_version: API_VERSION,
         protocol_version,
         destination_machine: state.machine.identity.machine,
         receipt,
@@ -491,7 +492,7 @@ async fn accept_resource_request(
     check_api_version(request.api_version)?;
     check_protocol(request.protocol_version, request.origin_machine)?;
 
-    let proof = resource_route_proof(&state, &request).await?;
+    let proof = fetch_route_proof(&state, request.origin_machine, request.task_id).await?;
     let phase = validate_resource_route_proof(&request, authority_machine, proof)?;
     if let Some(reason) = rejected_resource_route_reason(&phase) {
         return Ok(resource_queue_response(
@@ -556,7 +557,7 @@ async fn reconcile_if_waiting(state: &AppState, request: &ResourceRequest) -> Re
     }
 
     call(&state.supervisor, |reply| {
-        crate::daemon::actors::SupervisorMsg::ReconcileResource {
+        SupervisorMsg::ReconcileResource {
             id: request.resource_id,
             reply,
         }
@@ -591,7 +592,7 @@ async fn cancel_resource_request(
     }))
 }
 
-/// Resolve one exact origin proof, apply the authority queue cancellation, and retain its receipt.
+/// Resolve one exact origin proof, apply the authority queue cancellation, and retain its receipt
 pub(super) async fn process_resource_cancellation(
     state: &AppState,
     identity: ResourceCancellationRequestIdentity,
@@ -614,7 +615,7 @@ pub(super) async fn process_resource_cancellation(
     {
         receipt
     } else {
-        let proof = resource_cancellation_route_proof(state, &identity).await?;
+        let proof = fetch_route_proof(state, identity.origin_machine, identity.task).await?;
         let proof =
             validate_resource_cancellation_route_proof(&identity, authority_machine, proof)?;
         call(&state.store, |reply| {
@@ -633,7 +634,7 @@ pub(super) async fn process_resource_cancellation(
             | ResourceCancellationOutcome::CancelledBeforeLaunch
     ) {
         call(&state.supervisor, |reply| {
-            crate::daemon::actors::SupervisorMsg::ReconcileResource {
+            SupervisorMsg::ReconcileResource {
                 id: identity.resource,
                 reply,
             }
@@ -644,11 +645,11 @@ pub(super) async fn process_resource_cancellation(
     Ok(receipt)
 }
 
-/// Ask the route origin to create or reuse its durable resource cancellation intent.
+/// Ask the route origin to create or reuse its durable resource cancellation intent
 pub(super) async fn forward_resource_cancellation_intent(
     state: &AppState,
     target: &ResourceCancellationTarget,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<CancelResponse, AppError> {
     let fleet = state.fleet.handle().ok_or(AppError::MachineUnavailable {
         machine: target.origin_machine,
         message: "fleet is disabled".into(),
@@ -661,7 +662,7 @@ pub(super) async fn forward_resource_cancellation_intent(
         requester_machine: state.machine.identity.machine,
         task: target.task_id,
     };
-    let response = crate::fleet::http::ClusterClient::default()
+    let response = ClusterClient::default()
         .post_json(
             &destination.address,
             "/v1/cluster/origin/resource-routes/cancel",
@@ -678,13 +679,8 @@ pub(super) async fn forward_resource_cancellation_intent(
             message: format!("origin cancellation response status {}", response.status),
         });
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&response.body).map_err(|error| AppError::MachineUnavailable {
-            machine: target.origin_machine,
-            message: format!("invalid origin cancellation response: {error}"),
-        })?;
     let body: CancelOriginResourceBody =
-        serde_json::from_value(value).map_err(|error| AppError::MachineUnavailable {
+        serde_json::from_slice(&response.body).map_err(|error| AppError::MachineUnavailable {
             machine: target.origin_machine,
             message: format!("invalid origin cancellation response: {error}"),
         })?;
@@ -698,18 +694,19 @@ pub(super) async fn forward_resource_cancellation_intent(
     }
     match body.outcome {
         OriginResourceCancellationOutcome::Intent { request } => {
-            if !saved_origin_resource_cancellation_matches(target, &request) {
+            // the requester's phase may be older than the origin's, so an intent
+            // that the origin saved after activation still matches
+            if !saved_resource_cancellation_matches(target, true, &request) {
                 return Err(AppError::ClusterTaskConflict {
                     task: target.task_id,
                 });
             }
-            Ok(super::cancel_delivery::response(&request))
+            Ok(CancelResponse::intent(&request))
         }
-        OriginResourceCancellationOutcome::AlreadyCancelled => Ok(serde_json::json!({
-            "api_version": API_VERSION,
-            "id": target.task_id,
-            "status": ProcessStatus::Cancelled,
-        })),
+        OriginResourceCancellationOutcome::AlreadyCancelled => Ok(CancelResponse::status(
+            target.task_id,
+            ProcessStatus::Cancelled,
+        )),
     }
 }
 
@@ -739,14 +736,18 @@ pub(super) async fn origin_resource_cancellation_intent(
     task: TaskId,
 ) -> Result<OriginResourceCancellationOutcome, AppError> {
     let origin_machine = state.machine.identity.machine;
-    let _intent_guard = super::api::lock_cancellation_intent(task).await?;
+    let _intent_guard = state.locks.cancellation_intents.lock(task).await;
     let route = call(&state.store, |reply| StoreMsg::OriginRoute {
         id: task,
         reply,
     })
     .await?
     .ok_or(AppError::TaskNotFound { id: task })?;
-    if route.task != task || route.origin_machine != origin_machine {
+    let owner =
+        CancellationOwner::from_route(task, origin_machine, CancellationRoute::from(&route))
+            .map_err(|refusal| refusal.into_error(task))?;
+    // this route only serves resource routes; an ordinary owner means the forwarder saw another route
+    if !matches!(owner, CancellationOwner::Resource(_)) {
         return Err(AppError::ClusterTaskConflict { task });
     }
     let saved = call(&state.store, |reply| StoreMsg::GetCancellationRequest {
@@ -762,46 +763,18 @@ pub(super) async fn origin_resource_cancellation_intent(
             request: Box::new(saved),
         }
     } else {
-        let target = match &route.submission {
-            SubmissionState::Resource { resource, phase } => match phase {
-                ResourceRoutePhase::AcceptanceUnknown | ResourceRoutePhase::Waiting => {
-                    CancellationTarget::Resource(ResourceCancellationTarget {
-                        request_id: route.request,
-                        task_id: route.task,
-                        resource_id: *resource,
-                        origin_machine: route.origin_machine,
-                        authority_machine: route.execution_machine,
-                        phase: phase.clone(),
-                    })
-                }
-                ResourceRoutePhase::Activated => CancellationTarget::Execution {
-                    request_id: Some(route.request),
-                },
-                ResourceRoutePhase::CancelledBeforeLaunch => {
-                    return Ok(OriginResourceCancellationOutcome::AlreadyCancelled);
-                }
-                ResourceRoutePhase::Rejected { .. } => {
-                    return Err(AppError::TaskNotStarted { task });
-                }
-            },
-            SubmissionState::AcceptanceUnknown
-            | SubmissionState::Accepted
-            | SubmissionState::ResourceAction { .. }
-            | SubmissionState::ResourceBackground { .. } => {
+        let plan = owner
+            .plan(origin_machine, task, uuid::Uuid::now_v7())
+            .map_err(|refusal| refusal.into_error(task))?;
+        let request = match plan {
+            CancellationPlan::AlreadyCancelled => {
+                return Ok(OriginResourceCancellationOutcome::AlreadyCancelled);
+            }
+            CancellationPlan::Deliver(request) => *request,
+            // the origin is the requester here, so it never forwards to itself
+            CancellationPlan::ForwardToOrigin(_) => {
                 return Err(AppError::ClusterTaskConflict { task });
             }
-            SubmissionState::Rejected { .. } => {
-                return Err(AppError::TaskNotStarted { task });
-            }
-        };
-        let request = CancellationRequest {
-            requester_machine: origin_machine,
-            cancellation: uuid::Uuid::now_v7(),
-            task: route.task,
-            origin_machine,
-            execution_machine: route.execution_machine,
-            target,
-            delivery: CancellationDelivery::Pending,
         };
         let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
             request,
@@ -819,74 +792,71 @@ fn saved_origin_resource_cancellation_matches_route(
     route: &crate::submission::OriginRoute,
     request: &CancellationRequest,
 ) -> bool {
-    if request.task != route.task
-        || request.origin_machine != route.origin_machine
-        || request.requester_machine != route.origin_machine
-        || request.execution_machine != route.execution_machine
-    {
+    let SubmissionState::Resource { resource, phase } = &route.submission else {
         return false;
-    }
-    match (&route.submission, &request.target) {
-        (SubmissionState::Resource { resource, .. }, CancellationTarget::Resource(target)) => {
-            target.request_id == route.request
-                && target.task_id == route.task
-                && target.resource_id == *resource
-                && target.origin_machine == route.origin_machine
-                && target.authority_machine == route.execution_machine
-        }
-        (
-            SubmissionState::Resource {
-                phase: ResourceRoutePhase::Activated,
-                ..
-            },
-            CancellationTarget::Execution {
-                request_id: Some(request_id),
-            },
-        ) => *request_id == route.request,
-        _ => false,
-    }
+    };
+    let expected = ResourceCancellationTarget {
+        request_id: route.request,
+        task_id: route.task,
+        resource_id: *resource,
+        origin_machine: route.origin_machine,
+        authority_machine: route.execution_machine,
+        phase: phase.clone(),
+    };
+    // only an activated route can own an execution-targeted intent
+    let execution_target_allowed = matches!(phase, ResourceRoutePhase::Activated);
+    saved_resource_cancellation_matches(&expected, execution_target_allowed, request)
 }
 
-fn saved_origin_resource_cancellation_matches(
-    target: &ResourceCancellationTarget,
+/// Check that a saved intent names exactly this resource route
+///
+/// The target phase is not compared, since the origin advances it after the
+/// intent is saved. An execution-targeted intent matches by request identity
+/// only when `execution_target_allowed`
+fn saved_resource_cancellation_matches(
+    expected: &ResourceCancellationTarget,
+    execution_target_allowed: bool,
     request: &CancellationRequest,
 ) -> bool {
-    if request.task != target.task_id
-        || request.origin_machine != target.origin_machine
-        || request.requester_machine != target.origin_machine
-        || request.execution_machine != target.authority_machine
+    if request.task != expected.task_id
+        || request.origin_machine != expected.origin_machine
+        || request.requester_machine != expected.origin_machine
+        || request.execution_machine != expected.authority_machine
     {
         return false;
     }
     match &request.target {
         CancellationTarget::Resource(saved) => {
-            saved.request_id == target.request_id
-                && saved.task_id == target.task_id
-                && saved.resource_id == target.resource_id
-                && saved.origin_machine == target.origin_machine
-                && saved.authority_machine == target.authority_machine
+            saved.request_id == expected.request_id
+                && saved.task_id == expected.task_id
+                && saved.resource_id == expected.resource_id
+                && saved.origin_machine == expected.origin_machine
+                && saved.authority_machine == expected.authority_machine
         }
-        CancellationTarget::Execution {
-            request_id: Some(request_id),
-        } => *request_id == target.request_id,
-        CancellationTarget::Execution { request_id: None }
-        | CancellationTarget::LegacyExecution => false,
+        CancellationTarget::Execution { request_id } => {
+            execution_target_allowed && *request_id == expected.request_id
+        }
     }
 }
 
-async fn resource_cancellation_route_proof(
+/// Read the origin's resource-route proof for one task
+///
+/// The local store answers when this machine is the origin; otherwise the
+/// origin machine is asked over the cluster route
+async fn fetch_route_proof(
     state: &AppState,
-    identity: &ResourceCancellationRequestIdentity,
+    origin_machine: MachineId,
+    task: TaskId,
 ) -> Result<Option<ResourceRouteProof>, AppError> {
-    if identity.origin_machine == state.machine.identity.machine {
+    if origin_machine == state.machine.identity.machine {
         let route = call(&state.store, |reply| StoreMsg::OriginRoute {
-            id: identity.task,
+            id: task,
             reply,
         })
         .await?;
         return Ok(route
             .as_ref()
-            .filter(|route| route.task == identity.task)
+            .filter(|route| route.task == task)
             .and_then(ResourceRouteProof::from_route));
     }
 
@@ -895,19 +865,15 @@ async fn resource_cancellation_route_proof(
         .fleet
         .handle()
         .ok_or_else(|| unavailable("origin resource-route proof is unavailable".into()))?;
-    let destination = fleet
-        .connect(identity.origin_machine)
-        .await
-        .map_err(|error| {
-            unavailable(format!(
-                "origin resource-route proof is unavailable: {error}"
-            ))
-        })?;
+    let destination = fleet.connect(origin_machine).await.map_err(|error| {
+        unavailable(format!(
+            "origin resource-route proof is unavailable: {error}"
+        ))
+    })?;
     let path = format!(
-        "/v1/cluster/origin/resource-routes/{}?api_version={API_VERSION}&destination_machine={}",
-        identity.task, identity.origin_machine,
+        "/v1/cluster/origin/resource-routes/{task}?api_version={API_VERSION}&destination_machine={origin_machine}",
     );
-    let response = crate::fleet::http::ClusterClient::default()
+    let response = ClusterClient::default()
         .get(&destination.address, &path)
         .await
         .map_err(|error| {
@@ -969,66 +935,6 @@ fn resource_cancellation_phase_is_forward(
         }
         ResourceRoutePhase::Activated | ResourceRoutePhase::Rejected { .. } => target == current,
     }
-}
-
-async fn resource_route_proof(
-    state: &AppState,
-    request: &ResourceQueueRequest,
-) -> Result<Option<ResourceRouteProof>, AppError> {
-    if request.origin_machine == state.machine.identity.machine {
-        let route = call(&state.store, |reply| StoreMsg::OriginRoute {
-            id: request.task_id,
-            reply,
-        })
-        .await?;
-
-        return Ok(route
-            .as_ref()
-            .filter(|route| route.task == request.task_id)
-            .and_then(ResourceRouteProof::from_route));
-    }
-
-    let unavailable = |message: String| AppError::RemoteSubmissionUnavailable { message };
-    let fleet = state
-        .fleet
-        .handle()
-        .ok_or_else(|| unavailable("origin resource-route proof is unavailable".into()))?;
-    let destination = fleet
-        .connect(request.origin_machine)
-        .await
-        .map_err(|error| {
-            unavailable(format!(
-                "origin resource-route proof is unavailable: {error}"
-            ))
-        })?;
-    let path = format!(
-        "/v1/cluster/origin/resource-routes/{}?api_version={API_VERSION}&destination_machine={}",
-        request.task_id, request.origin_machine,
-    );
-    let response = crate::fleet::http::ClusterClient::default()
-        .get(&destination.address, &path)
-        .await
-        .map_err(|error| {
-            unavailable(format!(
-                "origin resource-route proof is unavailable: {error}"
-            ))
-        })?;
-    if response.status != StatusCode::OK {
-        return Err(unavailable(format!(
-            "origin resource-route proof is unavailable: HTTP {}",
-            response.status
-        )));
-    }
-
-    let body: OriginResourceRouteProofBody = serde_json::from_slice(&response.body)
-        .map_err(|error| unavailable(format!("invalid origin resource-route proof: {error}")))?;
-    if body.api_version != API_VERSION {
-        return Err(unavailable(
-            "origin resource-route proof uses an unsupported API version".into(),
-        ));
-    }
-
-    Ok(body.proof)
 }
 
 fn validate_resource_route_proof(
@@ -1210,10 +1116,10 @@ async fn origin_summary(
         api_version: API_VERSION,
         origin: route.map(|route| OriginSummary {
             task: route.task,
-            request_id: Some(route.request),
+            request_id: route.request,
             origin_machine: route.origin_machine,
             execution_machine: route.execution_machine,
-            thread: Some(route.thread),
+            thread: route.thread,
             submission: route.submission,
             last_execution_state: route.last_execution_state,
             last_updated_at: route.last_updated_at,
@@ -1329,9 +1235,7 @@ async fn receive_event(
     })
     .await?;
     if matches!(result, EventAcceptance::Acknowledged { .. }) {
-        state
-            .supervisor
-            .cast(crate::daemon::actors::SupervisorMsg::DispatchInbox { id })?;
+        state.supervisor.cast(SupervisorMsg::DispatchInbox { id })?;
     }
     Ok(Json(EventBody {
         api_version: API_VERSION,
@@ -1400,9 +1304,7 @@ async fn submit_execution(
                     && record.origin_machine != record.execution_machine
                     && body.unknown.is_empty()
                     && record.spec.current().is_some_and(|stored| {
-                        normalized.as_ref().is_ok_and(|spec| {
-                            serde_json::to_value(stored).ok() == serde_json::to_value(spec).ok()
-                        })
+                        normalized.as_ref().is_ok_and(|spec| stored == spec)
                     }) => {}
             ExecutorIdentity::Rejected(record)
                 if record.origin_machine == body.origin_machine
@@ -1483,19 +1385,17 @@ async fn submit_execution(
     .map_err(|error| AppError::RemoteSubmissionUnavailable {
         message: format!("execution capability unavailable: {error}"),
     })?;
-    let identity = call(&state.supervisor, |reply| {
-        crate::daemon::actors::SupervisorMsg::LaunchRemote {
-            request: Box::new(crate::daemon::actors::supervisor::RemoteLaunch {
-                task: body.task,
-                origin: body.origin_machine,
-                execution: body.destination_machine,
-                spec,
-                cwd,
-                env,
-                binary,
-            }),
-            reply,
-        }
+    let identity = call(&state.supervisor, |reply| SupervisorMsg::LaunchRemote {
+        request: Box::new(crate::daemon::actors::supervisor::RemoteLaunch {
+            task: body.task,
+            origin: body.origin_machine,
+            execution: body.destination_machine,
+            spec,
+            cwd,
+            env,
+            binary,
+        }),
+        reply,
     })
     .await?;
     Ok((
@@ -1599,7 +1499,7 @@ async fn cancel_execution(
         .check_destination(body.request.execution_machine)?;
     check_api_version(body.api_version)?;
     check_protocol(body.protocol_version, body.request.requester_machine)?;
-    verify_cancellation_target(&state, &body.request, body.target.as_ref()).await?;
+    verify_cancellation_target(&body.request, &body.target)?;
     let mut receipt = call(&state.store, |reply| StoreMsg::ReceiveCancellation {
         request: body.request,
         reply,
@@ -1623,123 +1523,20 @@ async fn cancel_execution(
     }))
 }
 
-async fn verify_cancellation_target(
-    state: &AppState,
+fn verify_cancellation_target(
     request: &CancellationRequestIdentity,
-    target: Option<&crate::cancellation::CancellationTarget>,
+    target: &CancellationTarget,
 ) -> Result<(), AppError> {
-    match target {
-        Some(crate::cancellation::CancellationTarget::Execution { .. }) => Ok(()),
-        Some(crate::cancellation::CancellationTarget::Resource(target)) => {
-            if target.task_id != request.task
-                || target.origin_machine != request.origin_machine
-                || target.authority_machine != request.execution_machine
-            {
-                return Err(AppError::ClusterTaskConflict { task: request.task });
-            }
-            Err(AppError::ResourceCancellationUnavailable { task: request.task })
-        }
-        Some(crate::cancellation::CancellationTarget::LegacyExecution) | None => {
-            verify_untyped_cancellation_origin(state, request).await
-        }
-    }
-}
-
-async fn verify_untyped_cancellation_origin(
-    state: &AppState,
-    request: &CancellationRequestIdentity,
-) -> Result<(), AppError> {
-    let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {
-        id: request.task,
-        reply,
-    })
-    .await?;
-    if let Some(identity) = identity {
-        let (origin, execution) = match identity {
-            ExecutorIdentity::Accepted(record) => (record.origin_machine, record.execution_machine),
-            ExecutorIdentity::Rejected(record) => (record.origin_machine, record.execution_machine),
-        };
-        if origin != request.origin_machine || execution != request.execution_machine {
-            return Err(AppError::ClusterTaskConflict { task: request.task });
-        }
-    }
-
-    let route = if request.origin_machine == state.machine.identity.machine {
-        let route = call(&state.store, |reply| StoreMsg::OriginRoute {
-            id: request.task,
-            reply,
-        })
-        .await?;
-        route.map(|route| OriginSummary {
-            task: route.task,
-            request_id: Some(route.request),
-            origin_machine: route.origin_machine,
-            execution_machine: route.execution_machine,
-            thread: Some(route.thread),
-            submission: route.submission,
-            last_execution_state: route.last_execution_state,
-            last_updated_at: route.last_updated_at,
-            last_accepted_seq: route.last_accepted_seq,
-            last_settled_seq: route.last_settled_seq,
-            failed_events: Vec::new(),
-        })
-    } else {
-        remote_origin_summary(state, request).await?
+    let CancellationTarget::Resource(target) = target else {
+        return Ok(());
     };
-    validate_untyped_cancellation_route(request, route)
-}
-
-async fn remote_origin_summary(
-    state: &AppState,
-    request: &CancellationRequestIdentity,
-) -> Result<Option<OriginSummary>, AppError> {
-    let incomplete = || AppError::ClusterLookupIncomplete {
-        task: request.task,
-        unchecked: vec![request.origin_machine],
-    };
-    let fleet = state.fleet.handle().ok_or_else(incomplete)?;
-    let destination = fleet
-        .connect(request.origin_machine)
-        .await
-        .map_err(|_| incomplete())?;
-    let path = format!(
-        "/v1/cluster/origin/tasks/{}?api_version={API_VERSION}&destination_machine={}",
-        request.task, request.origin_machine,
-    );
-    let response = crate::fleet::http::ClusterClient::default()
-        .get(&destination.address, &path)
-        .await
-        .map_err(|_| incomplete())?;
-    if response.status != StatusCode::OK {
-        return Err(incomplete());
-    }
-    let body: OriginBody = serde_json::from_slice(&response.body).map_err(|_| incomplete())?;
-    if body.api_version != API_VERSION {
-        return Err(incomplete());
-    }
-    Ok(body.origin)
-}
-
-fn validate_untyped_cancellation_route(
-    request: &CancellationRequestIdentity,
-    route: Option<OriginSummary>,
-) -> Result<(), AppError> {
-    let Some(route) = route else {
-        return Err(AppError::ClusterTaskConflict { task: request.task });
-    };
-    if route.task != request.task
-        || route.origin_machine != request.origin_machine
-        || route.execution_machine != request.execution_machine
+    if target.task_id != request.task
+        || target.origin_machine != request.origin_machine
+        || target.authority_machine != request.execution_machine
     {
         return Err(AppError::ClusterTaskConflict { task: request.task });
     }
-    if matches!(route.submission, SubmissionState::Rejected { .. }) {
-        return Err(AppError::TaskNotStarted { task: request.task });
-    }
-    if matches!(route.submission, SubmissionState::Resource { .. }) {
-        return Err(AppError::ResourceCancellationUnavailable { task: request.task });
-    }
-    Ok(())
+    Err(AppError::ResourceCancellationUnavailable { task: request.task })
 }
 
 async fn machine(fleet: FleetHandle) -> Json<MachineAdvertisement> {
@@ -1812,27 +1609,39 @@ async fn task(
 
 #[cfg(test)]
 mod resource_queue_tests {
+    use crate::daemon::actors::StoreMsg;
+    use crate::resource::{
+        IdleProofGap, ResourceQueueAttentionReason, ResourceQueueReconcileOutcome,
+    };
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::daemon::actors::call;
-    use crate::daemon::actors::{SupervisorActor, SupervisorMsg};
-    use crate::domain::{TaskEnv, TaskId, ThreadId};
+    use super::{
+        accept_resource_request, rejected_resource_route_reason,
+        resource_queue_response_from_stored, resource_route_requires_retained_request,
+        retained_resource_request, validate_resource_route_proof,
+    };
+    use crate::daemon::actors::{SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+    use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
+    use crate::error::AppError;
     use crate::files::StreamSlots;
     use crate::fleet::FleetState;
     use crate::fleet::directory::LocalMachine;
     use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, SUPPORTED_PROTOCOLS};
     use crate::home::Home;
-    use crate::machine::{LocalIdentity, MachineName};
+    use crate::machine::{LocalIdentity, MachineId, MachineName};
     use crate::resource::{
         AssignmentRevision, CommandSpec, LoanId, Resource, ResourceId, ResourceQueueRequest,
-        ResourceRequestState, ResourceRevision, SupervisorAddress,
+        ResourceRequest, ResourceRequestState, ResourceRevision, SupervisorAddress,
     };
+    use crate::spec;
     use crate::submission::{
         CallbackContext, CallbackExecutable, NewResourceRoute, NormalizedSpecSha256, RequestId,
-        ResourceQueueOutcome,
+        ResourceQueueOutcome, ResourceRoutePhase, ResourceRouteProof, normalized_spec_sha256,
     };
+    use axum::Json;
+    use axum::extract::State;
     use ractor::Actor;
+    use serde::Deserialize;
     use serde_json::json;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -2021,92 +1830,6 @@ mod resource_queue_tests {
     }
 
     #[test]
-    fn origin_summary_decodes_without_the_new_request_id_field() {
-        let mut value = serde_json::to_value(OriginSummary {
-            task: TaskId::new(),
-            request_id: Some(RequestId::new()),
-            origin_machine: MachineId::new(),
-            execution_machine: MachineId::new(),
-            thread: None,
-            submission: SubmissionState::Accepted,
-            last_execution_state: None,
-            last_updated_at: None,
-            last_accepted_seq: 0,
-            last_settled_seq: 0,
-            failed_events: Vec::new(),
-        })
-        .unwrap();
-        value.as_object_mut().unwrap().remove("request_id");
-
-        let summary: OriginSummary = serde_json::from_value(value).unwrap();
-        assert_eq!(summary.request_id, None);
-    }
-
-    #[test]
-    fn old_generic_cancellation_shape_decodes_without_a_typed_target() {
-        let value = json!({
-            "api_version": API_VERSION,
-            "protocol_version": 1,
-            "request": {
-                "requester_machine": MachineId::new(),
-                "cancellation": Uuid::now_v7(),
-                "task": TaskId::new(),
-                "origin_machine": MachineId::new(),
-                "execution_machine": MachineId::new()
-            }
-        });
-
-        let request: CancelExecution = serde_json::from_value(value).unwrap();
-        assert_eq!(request.target, None);
-    }
-
-    #[test]
-    fn old_generic_cancellation_requires_a_matching_non_resource_route() {
-        let task = TaskId::new();
-        let origin_machine = MachineId::new();
-        let execution_machine = MachineId::new();
-        let request = CancellationRequestIdentity {
-            requester_machine: MachineId::new(),
-            cancellation: Uuid::now_v7(),
-            task,
-            origin_machine,
-            execution_machine,
-        };
-        let route = OriginSummary {
-            task,
-            request_id: Some(RequestId::new()),
-            origin_machine,
-            execution_machine,
-            thread: Some(ThreadId(Uuid::now_v7())),
-            submission: SubmissionState::Resource {
-                resource: ResourceId::new(),
-                phase: ResourceRoutePhase::Waiting,
-            },
-            last_execution_state: None,
-            last_updated_at: None,
-            last_accepted_seq: 0,
-            last_settled_seq: 0,
-            failed_events: Vec::new(),
-        };
-        assert!(matches!(
-            validate_untyped_cancellation_route(&request, Some(route.clone())),
-            Err(AppError::ResourceCancellationUnavailable { task: found }) if found == task
-        ));
-
-        let mut wrong_owner = route.clone();
-        wrong_owner.submission = SubmissionState::Accepted;
-        wrong_owner.execution_machine = MachineId::new();
-        assert!(matches!(
-            validate_untyped_cancellation_route(&request, Some(wrong_owner)),
-            Err(AppError::ClusterTaskConflict { .. })
-        ));
-
-        let mut ordinary = route;
-        ordinary.submission = SubmissionState::Accepted;
-        assert!(validate_untyped_cancellation_route(&request, Some(ordinary)).is_ok());
-    }
-
-    #[test]
     fn accepted_retry_receipt_stays_waiting_after_queue_state_changes() {
         let request = request();
         let authority_machine = request.destination_machine;
@@ -2194,10 +1917,13 @@ mod resource_queue_tests {
         let directory = tempdir().unwrap();
         let home = Home::resolve(Some(directory.path().join("state"))).unwrap();
         home.ensure().unwrap();
-        let (supervisor, supervisor_handle) =
-            SupervisorActor::spawn(None, SupervisorActor, home.clone())
-                .await
-                .unwrap();
+        let (supervisor, supervisor_handle) = SupervisorActor::spawn(
+            None,
+            SupervisorActor,
+            SupervisorArgs::new(home.clone(), None),
+        )
+        .await
+        .unwrap();
         let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
             .await
             .unwrap();
@@ -2256,11 +1982,9 @@ mod resource_queue_tests {
             resource: resource_id,
         })
         .unwrap();
-        call(&store, |reply| {
-            crate::daemon::actors::StoreMsg::InsertOriginRoute {
-                route: Box::new(route),
-                reply,
-            }
+        call(&store, |reply| StoreMsg::InsertOriginRoute {
+            route: Box::new(route),
+            reply,
         })
         .await
         .unwrap();
@@ -2284,6 +2008,7 @@ mod resource_queue_tests {
             machine,
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
+            locks: crate::daemon::DaemonLocks::default(),
         };
 
         let first = accept_resource_request(State(state.clone()), Json(request.clone()))
@@ -2300,19 +2025,17 @@ mod resource_queue_tests {
         .unwrap();
         assert!(matches!(
             first_inspection.reconcile_outcome,
-            Some(crate::resource::ResourceQueueReconcileOutcome::AttentionRequired {
+            Some(ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven {
-                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                reason: ResourceQueueAttentionReason::IdleNotProven {
+                    gap: IdleProofGap::NoIdleEvidence,
                 },
             }) if request.request_id == request_id
         ));
 
-        call(&store, |reply| {
-            crate::daemon::actors::StoreMsg::ResolveResourceRoute {
-                receipt: first.receipt.clone(),
-                reply,
-            }
+        call(&store, |reply| StoreMsg::ResolveResourceRoute {
+            receipt: first.receipt.clone(),
+            reply,
         })
         .await
         .unwrap();
@@ -2330,19 +2053,17 @@ mod resource_queue_tests {
         .unwrap();
         assert!(matches!(
             retry_inspection.reconcile_outcome,
-            Some(crate::resource::ResourceQueueReconcileOutcome::AttentionRequired {
+            Some(ResourceQueueReconcileOutcome::AttentionRequired {
                 request,
-                reason: crate::resource::ResourceQueueAttentionReason::IdleNotProven {
-                    gap: crate::resource::IdleProofGap::NoIdleEvidence,
+                reason: ResourceQueueAttentionReason::IdleNotProven {
+                    gap: IdleProofGap::NoIdleEvidence,
                 },
             }) if request.request_id == request_id
         ));
-        let requests = call(&store, |reply| {
-            crate::daemon::actors::StoreMsg::ResourceRequests {
-                authority_machine: authority,
-                resource_id,
-                reply,
-            }
+        let requests = call(&store, |reply| StoreMsg::ResourceRequests {
+            authority_machine: authority,
+            resource_id,
+            reply,
         })
         .await
         .unwrap();

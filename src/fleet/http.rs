@@ -1,4 +1,4 @@
-//! Minimal HTTP/1 client for daemon-to-daemon requests over TCP.
+//! Minimal HTTP/1 client for daemon-to-daemon requests over TCP
 
 use std::time::Duration;
 
@@ -12,13 +12,13 @@ use tokio::net::TcpStream;
 
 use crate::fleet::address::MachineAddress;
 
-/// Default time limit for one request, connect through body.
+/// Default time limit for one request, connect through body
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default upper bound on a JSON response body.
+/// Default upper bound on a JSON response body
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 
-/// Client for `/v1/cluster/*` routes on peer daemons.
+/// Client for `/v1/cluster/*` routes on peer daemons
 #[derive(Debug, Clone, Copy)]
 pub struct ClusterClient {
     timeout: Duration,
@@ -34,66 +34,73 @@ impl Default for ClusterClient {
     }
 }
 
-/// Status and body of a completed request.
+/// Status and body of a completed request
 #[derive(Debug, Clone)]
 pub struct ClusterResponse {
-    /// HTTP status.
+    /// HTTP status
     pub status: StatusCode,
-    /// Full body, at most the client's body limit.
+    /// Full body, at most the client's body limit
     pub body: Bytes,
 }
 
-/// Why a request produced no response.
+/// Why a request produced no response
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
-    /// TCP connect failed.
+    /// The host refused the TCP connection, so it is reachable but nothing
+    /// listens at that port
+    #[error("connect {address}: connection refused")]
+    Refused {
+        /// Destination
+        address: MachineAddress,
+    },
+    /// TCP connect failed for another reason, such as an unreachable host
     #[error("connect {address}: {message}")]
     Connect {
-        /// Destination.
+        /// Destination
         address: MachineAddress,
-        /// OS error text.
+        /// OS error text
         message: String,
     },
-    /// HTTP exchange failed after connect.
+    /// HTTP exchange failed after connect
     #[error("http {address}: {message}")]
     Http {
-        /// Destination.
+        /// Destination
         address: MachineAddress,
-        /// Protocol error text.
+        /// Protocol error text
         message: String,
     },
-    /// No complete response within the time limit.
+    /// No complete response within the time limit
     #[error("timed out after {timeout:?} waiting for {address}")]
     Timeout {
-        /// Destination.
+        /// Destination
         address: MachineAddress,
-        /// Limit that elapsed.
+        /// Limit that elapsed
         timeout: Duration,
     },
-    /// Body exceeded the limit.
+    /// Body exceeded the limit
     #[error("response from {address} exceeds {limit} bytes")]
     BodyTooLarge {
-        /// Destination.
+        /// Destination
         address: MachineAddress,
-        /// Byte limit.
+        /// Byte limit
         limit: usize,
     },
 }
 
 impl ClusterClient {
-    /// Client with a custom time limit and body limit.
+    /// Client with a custom time limit and body limit
     #[must_use]
     pub fn new(timeout: Duration, max_body: usize) -> Self {
         Self { timeout, max_body }
     }
 
-    /// Time limit for one request.
+    /// Time limit for one request
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    /// GET `path` on `address`.
+    /// GET `path` on `address`
     pub async fn get(
         &self,
         address: &MachineAddress,
@@ -102,7 +109,7 @@ impl ClusterClient {
         self.send(address, Method::GET, path, None).await
     }
 
-    /// POST a JSON body to `path` on `address`.
+    /// POST a JSON body to `path` on `address`
     pub async fn post_json<T: Serialize>(
         &self,
         address: &MachineAddress,
@@ -145,13 +152,17 @@ impl ClusterClient {
             message,
         };
         let authority = address.authority();
-        let stream =
-            TcpStream::connect(&authority)
-                .await
-                .map_err(|err| TransportError::Connect {
+        let stream = TcpStream::connect(&authority)
+            .await
+            .map_err(|err| match err.kind() {
+                std::io::ErrorKind::ConnectionRefused => TransportError::Refused {
+                    address: address.clone(),
+                },
+                _ => TransportError::Connect {
                     address: address.clone(),
                     message: err.to_string(),
-                })?;
+                },
+            })?;
         let (mut sender, conn) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|err| http_err(format!("handshake: {err}")))?;

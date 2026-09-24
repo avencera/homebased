@@ -1,11 +1,11 @@
 //! Typed resource, request, loan, and supervisor-notice domain models
 
+use crate::error::AppError;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use uuid::Uuid;
 
+use crate::digest::Sha256Digest;
 use crate::domain::{API_VERSION, ExitReason, ProcessStatus, TaskId, ThreadId};
 use crate::machine::MachineId;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
@@ -16,170 +16,23 @@ pub mod background_launch;
 pub mod bound_action;
 pub mod command_shape;
 pub mod foreground;
+mod id;
 pub mod operator_release;
 pub mod ownership_lock;
+mod release_checkpoint;
 pub mod release_watcher;
-#[expect(
-    dead_code,
-    reason = "StoreActor migration integration is outside this module's scope"
-)]
 pub(crate) mod store;
-pub mod watcher;
+pub mod trainer_publication;
 
-/// Stable identity of one physical GPU resource
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ResourceId(Uuid);
-
-impl ResourceId {
-    /// Allocate a new resource identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for ResourceId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Stable identity of one interruption loan
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct LoanId(Uuid);
-
-impl LoanId {
-    /// Allocate a new loan identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for LoanId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Stable identity of one required supervisor decision
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ActionId(Uuid);
-
-impl ActionId {
-    /// Allocate a new action identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for ActionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Stable identity of one durable supervisor notice
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NoticeId(Uuid);
-
-impl NoticeId {
-    /// Allocate a new notice identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for NoticeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Stable identity of one notice delivery attempt
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DeliveryAttemptId(Uuid);
-
-impl DeliveryAttemptId {
-    /// Allocate a new delivery attempt identity
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Wrap an existing UUID
-    #[must_use]
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID value
-    #[must_use]
-    pub const fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for DeliveryAttemptId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use id::{
+    ActionId, DeliveryAttemptId, IdentityParseError, LoanId, NilIdentity, NoticeId,
+    ReleaseStopReservationId, ResourceId,
+};
+pub(crate) use release_checkpoint::{
+    ReleaseCheckpointAction, ReleaseCheckpointBaseline, ReleaseCheckpointBinding,
+    ReleaseCheckpointCancellation, ReleaseCheckpointPhase, ReleaseCheckpointState,
+    ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome,
+};
 
 /// Authority-assigned FIFO position for a resource request
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -216,6 +69,15 @@ impl ResourceRevision {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Return the revision that follows this one, or `None` at the maximum value
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 }
 
@@ -326,15 +188,6 @@ impl ResourceRegistrationReceipt {
     }
 }
 
-/// Registration evidence saved for one existing resource
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SavedResourceRegistration {
-    /// Exact content of the first registration
-    Recorded(ResourceRegistrationReceipt),
-    /// Older row whose initial supervisor cannot be proven, so no retry can match it
-    LegacyUnproven,
-}
-
 /// Durable association between one authority-owned resource and one trainer task
 ///
 /// This immutable record keeps exact point-in-time trainer request and lock evidence
@@ -389,10 +242,7 @@ impl TrainerAttemptAssociation {
         verified_attempt: ownership_lock::VerifiedTrainerAttempt,
         normalized_spec_sha256: NormalizedSpecSha256,
     ) -> Result<Self, &'static str> {
-        if resource_id.as_uuid().is_nil()
-            || authority_machine.as_uuid().is_nil()
-            || task_id.0.is_nil()
-        {
+        if authority_machine.as_uuid().is_nil() || task_id.0.is_nil() {
             return Err("trainer attempt association identities must not be nil");
         }
 
@@ -407,7 +257,7 @@ impl TrainerAttemptAssociation {
 }
 
 /// A normalized specification restricted to finite command workloads
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct CommandSpec(NormalizedSpec);
 
@@ -416,6 +266,16 @@ impl CommandSpec {
     #[must_use]
     pub const fn as_normalized(&self) -> &NormalizedSpec {
         &self.0
+    }
+
+    /// Borrow the validated argv of the finite command workload
+    #[must_use]
+    pub fn command(&self) -> &crate::invocation::CommandLine {
+        match &self.0.workload {
+            NormalizedWorkload::Task(task) => &task.command,
+            // `TryFrom<NormalizedSpec>` is the only constructor and it rejects agent workloads
+            NormalizedWorkload::Agent(_) => unreachable!("a command spec holds a task workload"),
+        }
     }
 }
 
@@ -721,14 +581,16 @@ pub enum IdleBoundaryProof {
         /// Launch task that recorded no child spawn
         task_id: TaskId,
     },
-    /// An operator attested that the ended registered trainer no longer holds the GPU
+    /// An operator attested that an ended trainer no longer holds the GPU
     ///
-    /// This is a human trust decision saved with its receipt, not a process or
-    /// lock proof. The attestation cleared the registration
+    /// The trainer was the registered trainer, a first background launch task,
+    /// or a Restoring loan's return task. This is a human trust decision saved
+    /// with its receipt, not a process or lock proof. The attestation cleared
+    /// the registration
     OperatorAttestedGpuFree {
         /// Attestation whose receipt holds the observation and evidence
         operation_id: operator_release::OperatorAttestationId,
-        /// Registered trainer that the operator resolved
+        /// Trainer task that the operator resolved
         task_id: TaskId,
     },
 }
@@ -779,7 +641,6 @@ impl ReleaseWatcherTaskId {
 ///
 /// This record reserves the exact task identity before launch. It does not
 /// establish that the Homebased task is running or that the resource is free
-/// Every launch identity field is required so older partial bindings fail as stored-data errors
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseWatcherIntent {
@@ -797,36 +658,46 @@ pub struct ReleaseWatcherIntent {
     pub normalized_spec_sha256: NormalizedSpecSha256,
 }
 
-/// Persisted watcher identity that keeps older partial records readable
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SavedReleaseWatcherIntent {
-    /// Complete identity that can bind a new watcher action
-    Complete(ReleaseWatcherIntent),
-    /// Legacy identity retained for inspection but not trusted as release evidence
-    LegacyUnproven(serde_json::Value),
-}
-
-impl SavedReleaseWatcherIntent {
-    pub(crate) fn complete(&self) -> Option<&ReleaseWatcherIntent> {
-        match self {
-            Self::Complete(intent) => Some(intent),
-            Self::LegacyUnproven(_) => None,
-        }
+impl ReleaseWatcherIntent {
+    /// Check that the watcher identities are usable for the observed trainer
+    pub fn validate(&self) -> Result<(), InvalidReleaseWatcherIdentity> {
+        validate_release_watcher_identity(
+            self.observed_background_task,
+            self.request_id,
+            self.watcher_task_id.as_task_id(),
+        )
     }
 }
 
-/// Durable release identity captured before the watcher task can act
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointAction {
-    pub(crate) resource_id: ResourceId,
-    pub(crate) action_id: ActionId,
-    pub(crate) state_revision: ResourceRevision,
-    pub(crate) observed_background_task: TaskId,
+/// Release watcher identities that are nil or that share one UUID between two roles
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release watcher identities must be non-nil and distinct from each other and the trainer")]
+pub struct InvalidReleaseWatcherIdentity;
+
+/// Check the identities of one release watcher task before it is saved or launched
+///
+/// The retry identity, the watcher task, and the observed trainer are three
+/// different records, so no two of them may share a UUID
+pub fn validate_release_watcher_identity(
+    observed_background_task: TaskId,
+    request_id: RequestId,
+    watcher_task_id: TaskId,
+) -> Result<(), InvalidReleaseWatcherIdentity> {
+    if request_id.0.is_nil()
+        || watcher_task_id.0.is_nil()
+        || request_id.0 == watcher_task_id.0
+        || watcher_task_id == observed_background_task
+    {
+        return Err(InvalidReleaseWatcherIdentity);
+    }
+    Ok(())
 }
 
-/// Immutable identity of the saved trainer-attempt association
+/// Saved form of one trainer-attempt association
+///
+/// The association row and every checkpoint binding store this exact shape
+/// Decoding checks only the shape; [`TrainerAttemptAssociation::try_from`]
+/// checks the identities and the attempt evidence
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrainerAttemptAssociationProof {
@@ -834,8 +705,8 @@ pub(crate) struct TrainerAttemptAssociationProof {
     pub(crate) authority_machine: MachineId,
     pub(crate) task_id: TaskId,
     pub(crate) canonical_runtime_root: PathBuf,
-    pub(crate) attempt_binding: watcher::AttemptBinding,
-    pub(crate) request_sha256: String,
+    pub(crate) attempt_binding: trainer_publication::AttemptBinding,
+    pub(crate) request_sha256: ownership_lock::TrainerRequestDigest,
     pub(crate) ownership_lock_identity: OwnershipLockProof,
     pub(crate) normalized_spec_sha256: NormalizedSpecSha256,
 }
@@ -850,13 +721,34 @@ impl From<&TrainerAttemptAssociation> for TrainerAttemptAssociationProof {
             task_id: association.task_id(),
             canonical_runtime_root: evidence.canonical_runtime_root().to_path_buf(),
             attempt_binding: evidence.binding().clone(),
-            request_sha256: evidence.request_digest().to_hex(),
+            request_sha256: evidence.request_digest(),
             ownership_lock_identity: OwnershipLockProof {
                 device: lock.device(),
                 inode: lock.inode(),
             },
             normalized_spec_sha256: association.normalized_spec_sha256(),
         }
+    }
+}
+
+impl TryFrom<TrainerAttemptAssociationProof> for TrainerAttemptAssociation {
+    type Error = &'static str;
+
+    fn try_from(proof: TrainerAttemptAssociationProof) -> Result<Self, Self::Error> {
+        let lock = proof.ownership_lock_identity;
+        let verified_attempt = ownership_lock::VerifiedTrainerAttempt::from_persisted(
+            proof.canonical_runtime_root,
+            proof.attempt_binding,
+            proof.request_sha256,
+            ownership_lock::OwnershipLockIdentity::new(lock.device, lock.inode),
+        )?;
+        Self::from_components(
+            proof.resource_id,
+            proof.authority_machine,
+            proof.task_id,
+            verified_attempt,
+            proof.normalized_spec_sha256,
+        )
     }
 }
 
@@ -868,222 +760,10 @@ pub(crate) struct OwnershipLockProof {
     pub(crate) inode: u64,
 }
 
-/// Full authority-owned identity that scopes one checkpoint baseline and stop decision
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointBinding {
-    pub(crate) action: ReleaseCheckpointAction,
-    pub(crate) association: TrainerAttemptAssociationProof,
-    pub(crate) attempt_binding: watcher::AttemptBinding,
-    pub(crate) watcher_intent: ReleaseWatcherIntent,
-}
-
-impl ReleaseCheckpointBinding {
-    pub(crate) fn validate_for(
-        &self,
-        action: &ReleaseCheckpointAction,
-    ) -> Result<(), &'static str> {
-        validate_release_checkpoint_binding(action, self)
-    }
-}
-
-/// Checkpoint baseline captured from the saved trainer association
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointBaseline {
-    pub(crate) binding: ReleaseCheckpointBinding,
-    pub(crate) snapshot: watcher::RecoverySnapshot,
-}
-
-/// Stable identity of one reserved exact-task stop request
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct ReleaseStopReservationId(Uuid);
-
-impl ReleaseStopReservationId {
-    pub(crate) fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-/// Stop decision reserved after the authority verified its exact checkpoint
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointStopDecision {
-    pub(crate) binding: ReleaseCheckpointBinding,
-    pub(crate) reservation_id: ReleaseStopReservationId,
-    pub(crate) selected_checkpoint: watcher::VerifiedCheckpointPublication,
-}
-
-/// Exact trainer task cancellation committed with its saved stop decision
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointCancellation {
-    pub(crate) task_id: TaskId,
-    pub(crate) cancel_requested_at: DateTime<Utc>,
-}
-
-/// Durable checkpoint-evidence phase stored beside the resource loan
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ReleaseCheckpointPhase {
-    /// New release action with no watcher identity yet
-    WatcherBindingPending,
-    /// Exact watcher identity is bound to a persisted pre-action baseline
-    BaselineCaptured {
-        /// Saved baseline and all immutable owner identities
-        baseline: ReleaseCheckpointBaseline,
-    },
-    /// Exact-task stop request is durably reserved after checkpoint verification
-    StopReserved {
-        /// Baseline used to reject pre-existing publications
-        baseline: ReleaseCheckpointBaseline,
-        /// Fixed checkpoint selected by the authority
-        decision: Box<ReleaseCheckpointStopDecision>,
-    },
-    /// Exact trainer cancellation committed with the saved stop decision
-    CancellationCommitted {
-        /// Baseline used to reject pre-existing publications
-        baseline: ReleaseCheckpointBaseline,
-        /// Fixed checkpoint selected by the authority
-        decision: Box<ReleaseCheckpointStopDecision>,
-        /// Exact task cancellation marker committed in the same transaction
-        cancellation: ReleaseCheckpointCancellation,
-    },
-}
-
-/// Durable evidence state for one exact AwaitingRelease action
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReleaseCheckpointState {
-    pub(crate) action: ReleaseCheckpointAction,
-    pub(crate) phase: ReleaseCheckpointPhase,
-}
-
-impl ReleaseCheckpointState {
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        if self.action.resource_id.as_uuid().is_nil()
-            || self.action.action_id.as_uuid().is_nil()
-            || self.action.observed_background_task.0.is_nil()
-            || self.action.state_revision.get() == 0
-        {
-            return Err("release checkpoint action identity is invalid");
-        }
-
-        let baseline = match &self.phase {
-            ReleaseCheckpointPhase::WatcherBindingPending => return Ok(()),
-            ReleaseCheckpointPhase::BaselineCaptured { baseline }
-            | ReleaseCheckpointPhase::StopReserved { baseline, .. }
-            | ReleaseCheckpointPhase::CancellationCommitted { baseline, .. } => baseline,
-        };
-        validate_release_checkpoint_binding(&self.action, &baseline.binding)?;
-        if !baseline.snapshot.is_for(&baseline.binding.attempt_binding) {
-            return Err("checkpoint baseline belongs to a different trainer attempt");
-        }
-
-        let decision = match &self.phase {
-            ReleaseCheckpointPhase::StopReserved { decision, .. }
-            | ReleaseCheckpointPhase::CancellationCommitted { decision, .. } => decision,
-            ReleaseCheckpointPhase::WatcherBindingPending
-            | ReleaseCheckpointPhase::BaselineCaptured { .. } => return Ok(()),
-        };
-        if let ReleaseCheckpointPhase::CancellationCommitted { cancellation, .. } = &self.phase
-            && cancellation.task_id != self.action.observed_background_task
-        {
-            return Err("checkpoint cancellation differs from its observed trainer task");
-        }
-        {
-            validate_release_checkpoint_binding(&self.action, &decision.binding)?;
-            if decision.binding != baseline.binding
-                || decision.reservation_id.0.is_nil()
-                || decision.selected_checkpoint.binding != baseline.binding.attempt_binding
-                || baseline
-                    .snapshot
-                    .contains_generation(&decision.selected_checkpoint.generation_id)
-                || !is_sha256(&decision.selected_checkpoint.record_sha256)
-                || !is_sha256(&decision.selected_checkpoint.inventory_sha256)
-                || decision.selected_checkpoint.path
-                    != baseline
-                        .binding
-                        .association
-                        .canonical_runtime_root
-                        .join("published")
-                        .join(&decision.selected_checkpoint.generation_id)
-            {
-                return Err("checkpoint stop decision differs from its verified baseline");
-            }
-        }
-
-        Ok(())
-    }
-}
-
-fn validate_release_checkpoint_binding(
-    action: &ReleaseCheckpointAction,
-    binding: &ReleaseCheckpointBinding,
-) -> Result<(), &'static str> {
-    let intent = &binding.watcher_intent;
-    let association = &binding.association;
-    if binding.action != *action
-        || association.resource_id != action.resource_id
-        || association.task_id != action.observed_background_task
-        || association.authority_machine.as_uuid().is_nil()
-        || association.attempt_binding != binding.attempt_binding
-        || !association.canonical_runtime_root.is_absolute()
-        || !is_sha256(&association.request_sha256)
-        || intent.action_id != action.action_id
-        || intent.state_revision != action.state_revision
-        || intent.observed_background_task != action.observed_background_task
-        || intent.watcher_task_id.as_task_id().0.is_nil()
-        || intent.watcher_task_id.as_task_id() == action.observed_background_task
-        || intent.request_id.0.is_nil()
-        || intent.request_id.0 == intent.watcher_task_id.as_task_id().0
-    {
-        return Err("release checkpoint binding does not match the saved action");
-    }
-
-    binding
-        .attempt_binding
-        .validate()
-        .map_err(|_| "release checkpoint attempt binding is invalid")
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// Typed result of checking whether an exact-task stop can be reserved
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReleaseCheckpointStopOutcome {
-    /// A new stop decision and checkpoint identity were persisted
-    Reserved(ReleaseCheckpointStopDecision),
-    /// An exact retry returned the previously persisted decision
-    AlreadyReserved(ReleaseCheckpointStopDecision),
-    /// The exact task has not started yet
-    WaitingForTaskStart,
-    /// No complete new checkpoint is available yet
-    WaitingForCheckpoint,
-    /// A complete final result takes precedence over a checkpoint stop
-    CompletedResultAwaitingTaskExit,
-    /// The task already published its successful final result
-    AlreadyCompleted,
-    /// The saved task or publication state needs attention
-    Attention(watcher::WatcherAttention),
-}
-
 /// Proof provenance for the trainer release that opened a serving loan
-///
-/// The unverified value is the safe default for serving rows written before
-/// release-proof provenance was stored
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServingReleaseProvenance {
-    /// No verified release proof is recorded
-    #[default]
-    Unverified,
     /// The authority verified the exact trainer's completed-result publication
     CompletedTrainerResult {
         /// Release action whose authority-built proof was accepted
@@ -1091,7 +771,7 @@ pub enum ServingReleaseProvenance {
         /// Exact registered trainer task in the proof
         task_id: TaskId,
         /// SHA-256 digest of the published completed result
-        publication_sha256: String,
+        publication_sha256: Sha256Digest,
     },
     /// The authority derived a saved idle boundary before opening the loan
     ///
@@ -1110,9 +790,9 @@ pub enum ServingReleaseProvenance {
         /// Generation accepted by the trainer's `--resume` contract
         generation_id: String,
         /// SHA-256 digest of the selected checkpoint record
-        record_sha256: String,
+        record_sha256: Sha256Digest,
         /// SHA-256 digest of the selected checkpoint inventory
-        inventory_sha256: String,
+        inventory_sha256: Sha256Digest,
     },
     /// The authority proved that an ended trainer released its exact saved lock
     ///
@@ -1126,7 +806,7 @@ pub enum ServingReleaseProvenance {
         /// Task-layer outcome of the ended trainer
         outcome: ExitReason,
         /// Request digest of the trainer-attempt association that named the lock
-        attempt_request_sha256: String,
+        attempt_request_sha256: ownership_lock::TrainerRequestDigest,
     },
     /// An operator attested that the ended trainer of this release action no longer holds the GPU
     ///
@@ -1154,7 +834,7 @@ pub enum LoanPhase {
         observed_background_task: TaskId,
         /// Optional durable watcher task identity reserved for this action
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        watcher_intent: Option<SavedReleaseWatcherIntent>,
+        watcher_intent: Option<ReleaseWatcherIntent>,
     },
     /// One selected request is using the resource
     Serving {
@@ -1162,8 +842,7 @@ pub enum LoanPhase {
         return_context: ReturnContext,
         /// Selected request identity
         current_request_id: RequestId,
-        /// Durable proof that permits activation, if release was verified
-        #[serde(default)]
+        /// Durable proof that permits activation once its receipt matches
         release_provenance: ServingReleaseProvenance,
     },
     /// The queue is drained and the supervisor must decide what runs next
@@ -1235,6 +914,22 @@ pub enum LoanClosure {
         /// Supervisor's durable resolution reason
         reason: String,
     },
+    /// The bound return task ended without release proof, and an operator
+    /// attested that its GPU work is gone
+    ///
+    /// A direct-segment task ended before a confirmed start, or a native
+    /// foreground task ended or was lost while its loan stayed reserved. The
+    /// receipt's binding names which. This is a human trust decision saved
+    /// with its receipt, not a process or lock proof. The closure cleared the
+    /// background registration
+    OperatorAttestedRestoreEnded {
+        /// Return evidence retained after closure
+        return_context: ReturnContext,
+        /// Bound return task that ended
+        task_id: TaskId,
+        /// Attestation whose receipt holds the observation and evidence
+        operation_id: operator_release::OperatorAttestationId,
+    },
 }
 
 /// Exact supervisor authority presented with one release or return action
@@ -1261,7 +956,7 @@ pub struct SupervisorActionAuthority {
 }
 
 /// Supervisor's explicit choice after the ready queue drained
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReturnDecision {
     /// Close the interruption without starting background work
@@ -1274,7 +969,7 @@ pub enum ReturnDecision {
 }
 
 /// Fixed task identity and typed work for one return launch
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReturnLaunch {
     /// Stable caller retry identity for the return task
@@ -1289,7 +984,7 @@ pub struct ReturnLaunch {
 ///
 /// Each kind is valid for exactly one return context. Homebased does not infer
 /// the kind from a checkpoint or an optimization result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReturnWork {
     /// Resume the stopped run from its selected checkpoint
@@ -1657,6 +1352,16 @@ pub enum ResourceQueueReconcileOutcome {
         /// Launch task that keeps the resource reserved
         task_id: TaskId,
     },
+    /// A first background launch ended before registration with no release proof
+    ///
+    /// No request is queued, but the resource stays reserved until an operator
+    /// attests that the launch task's GPU work is gone
+    BackgroundLaunchReleaseUnproven {
+        /// Stable launch request identity
+        request_id: RequestId,
+        /// Launch task that keeps the resource reserved
+        task_id: TaskId,
+    },
     /// A running registered task now has one durable release action
     ReleaseRequired {
         /// Loan created for the resource interruption
@@ -1725,7 +1430,7 @@ pub enum ResourceQueueAttentionReason {
         /// Exact accepted command task that needs an owner decision
         task_id: TaskId,
     },
-    /// The saved Serving loan came from a legacy or otherwise unverified release
+    /// The saved Serving loan's release provenance does not match its saved receipts
     UnverifiedServingRelease,
     /// The exact trainer release proof is missing or did not pass validation
     ReleaseProofUnavailable {
@@ -1804,8 +1509,6 @@ pub enum RestoreAttentionReason {
     Lost,
     /// The task, route, identity, or receipt does not match the bound return action
     IdentityMismatch,
-    /// A legacy receipt has no saved execution mode, and the saved decision cannot prove one
-    ExecutionModeUnproven,
     /// The authority store could not evaluate the restore
     ReconcileFailed,
 }
@@ -1886,9 +1589,9 @@ pub struct SupervisorNoticeRequest {
 
 impl SupervisorNoticeRequest {
     /// Validate the strict versioned route and all stable identities
-    pub fn validate(&self) -> Result<(), crate::error::AppError> {
-        if self.api_version != crate::domain::API_VERSION {
-            return Err(crate::error::AppError::Usage {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.api_version != API_VERSION {
+            return Err(AppError::Usage {
                 message: "unsupported API version".into(),
             });
         }
@@ -1896,12 +1599,8 @@ impl SupervisorNoticeRequest {
         if self.source_machine.as_uuid().is_nil()
             || self.destination.machine.as_uuid().is_nil()
             || self.destination.thread.0.is_nil()
-            || self.notice_id.as_uuid().is_nil()
-            || self.loan_id.as_uuid().is_nil()
-            || self.action_id.as_uuid().is_nil()
-            || self.attempt_id.as_uuid().is_nil()
         {
-            return Err(crate::error::AppError::MessageInvalid {
+            return Err(AppError::MessageInvalid {
                 message: "supervisor notice identities must not be nil".into(),
             });
         }
@@ -1914,7 +1613,7 @@ impl SupervisorNoticeRequest {
             SupervisorNoticePayload::AttentionRequired { .. } => None,
         };
         if payload_task.is_some_and(|task_id| task_id.0.is_nil()) {
-            return Err(crate::error::AppError::MessageInvalid {
+            return Err(AppError::MessageInvalid {
                 message: "supervisor notice task identity must not be nil".into(),
             });
         }
@@ -1978,8 +1677,7 @@ mod tests {
         DeliveryAttemptId, LoanClosure, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
         ResourceQueueRequest, ResourceQueueResponse, ResourceRequest, ResourceRequestState,
         ResourceRevision, ReturnContext, ReturnDecision, ReturnDecisionRejection, ReturnLaunch,
-        ReturnWork, ServingReleaseProvenance, SupervisorAddress, SupervisorNoticePayload,
-        SupervisorNoticeRequest,
+        ReturnWork, SupervisorAddress, SupervisorNoticePayload, SupervisorNoticeRequest,
     };
     use crate::domain::ExitReason;
 
@@ -1995,30 +1693,6 @@ mod tests {
                 command: CommandLine::try_from_argv(vec!["echo".into(), "gpu".into()]).unwrap(),
             }),
         }
-    }
-
-    #[test]
-    fn serving_phase_without_release_provenance_decodes_as_unverified() {
-        let mut saved = serde_json::to_value(LoanPhase::Serving {
-            return_context: ReturnContext::Stopped {
-                task_id: TaskId::new(),
-                checkpoint_ref: "legacy-checkpoint".into(),
-                recovery_ref: "legacy-recovery".into(),
-            },
-            current_request_id: RequestId::new(),
-            release_provenance: ServingReleaseProvenance::Unverified,
-        })
-        .unwrap();
-        saved.as_object_mut().unwrap().remove("release_provenance");
-
-        let decoded: LoanPhase = serde_json::from_value(saved).unwrap();
-        assert!(matches!(
-            decoded,
-            LoanPhase::Serving {
-                release_provenance: ServingReleaseProvenance::Unverified,
-                ..
-            }
-        ));
     }
 
     fn agent_spec() -> NormalizedSpec {
@@ -2115,7 +1789,7 @@ mod tests {
         let request = queue_request(task_spec()).unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(encoded["api_version"], crate::domain::API_VERSION);
+        assert_eq!(encoded["api_version"], API_VERSION);
         assert_eq!(encoded["spec"]["workload"]["type"], "task");
         assert!(encoded["spec"].get("machine").is_none());
 
@@ -2162,7 +1836,7 @@ mod tests {
         let encoded = serde_json::to_value(&response).unwrap();
 
         assert_eq!(response.destination_machine, receipt.authority_machine);
-        assert_eq!(encoded["api_version"], crate::domain::API_VERSION);
+        assert_eq!(encoded["api_version"], API_VERSION);
         assert_eq!(
             serde_json::from_value::<ResourceQueueResponse>(encoded.clone()).unwrap(),
             response
@@ -2473,8 +2147,12 @@ mod tests {
 
     #[test]
     fn supervisor_notice_request_rejects_nil_identity_and_unsupported_version() {
+        let mut wire = serde_json::to_value(supervisor_notice_request()).unwrap();
+        wire["attempt_id"] = json!(Uuid::nil());
+        assert!(serde_json::from_value::<SupervisorNoticeRequest>(wire).is_err());
+
         let mut request = supervisor_notice_request();
-        request.attempt_id = DeliveryAttemptId::from_uuid(Uuid::nil());
+        request.destination.thread = ThreadId(Uuid::nil());
         assert!(request.validate().is_err());
 
         let mut request = supervisor_notice_request();

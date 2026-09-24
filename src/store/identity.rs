@@ -1,4 +1,4 @@
-//! Durable origin and executor task identities.
+//! Durable origin and executor task identities
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -18,16 +18,16 @@ use crate::submission::{
     SubmissionState,
 };
 
-/// A durable identity operation failed without changing its existing owner.
+/// A durable identity operation failed without changing its existing owner
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    /// The UUID already identifies different content or a different owner.
+    /// The UUID already identifies different content or a different owner
     #[error("identity conflict")]
     Conflict,
-    /// The requested origin route does not exist.
+    /// The requested origin route does not exist
     #[error("origin route not found")]
     RouteNotFound,
-    /// Storage or stored data failed.
+    /// Storage or stored data failed
     #[error(transparent)]
     Storage(#[from] AppError),
 }
@@ -102,6 +102,35 @@ pub(super) fn executor_identity_on(
     conn: &rusqlite::Connection,
     task: TaskId,
 ) -> Result<Option<ExecutorIdentity>, IdentityError> {
+    Ok(executor_identity_with_json_on(conn, task)?.map(|(identity, _)| identity))
+}
+
+/// Whether the saved origin column of one executor identity names this origin
+///
+/// The column indexes the origin outside the identity JSON, so resource
+/// acceptance checks that both copies agree
+pub(super) fn identity_origin_column_is_on(
+    conn: &rusqlite::Connection,
+    task: TaskId,
+    origin_machine: MachineId,
+) -> Result<bool, rusqlite::Error> {
+    let saved: Option<String> = conn
+        .query_row(
+            "SELECT origin_machine FROM executor_identities WHERE task_id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(saved.is_some_and(|saved| saved == origin_machine.to_string()))
+}
+
+/// Read one executor identity with the exact saved JSON it was decoded from
+///
+/// A release proof keeps the JSON so its commit can detect any later rewrite
+pub(super) fn executor_identity_with_json_on(
+    conn: &rusqlite::Connection,
+    task: TaskId,
+) -> Result<Option<(ExecutorIdentity, String)>, IdentityError> {
     let data: Option<String> = conn
         .query_row(
             "SELECT identity_json FROM executor_identities WHERE task_id=?1",
@@ -110,7 +139,51 @@ pub(super) fn executor_identity_on(
         )
         .optional()
         .map_err(storage)?;
-    data.as_deref().map(decode_identity).transpose()
+    data.map(|json| Ok((decode_identity(&json)?, json)))
+        .transpose()
+}
+
+/// Read acceptance-unknown routes of one resource submission type in request order
+///
+/// The SQL filter only selects candidates. Each decoded route must still name its
+/// row identities and be unknown by `is_unknown`, or the whole scan is a conflict
+fn acceptance_unknown_routes_on(
+    conn: &rusqlite::Connection,
+    submission_type: &str,
+    is_unknown: fn(&SubmissionState) -> bool,
+) -> Result<Vec<OriginRoute>, IdentityError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id,task_id,route_json FROM origin_routes
+             WHERE CASE WHEN json_valid(route_json) THEN
+                json_extract(route_json, '$.submission.type') = ?1
+                AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
+             ELSE 0 END
+             ORDER BY request_id",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([submission_type], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut routes = Vec::new();
+    for row in rows {
+        let (request, task, json) = row.map_err(storage)?;
+        let route = decode_route(&json)?;
+        if route.request.0.to_string() != request
+            || route.task.to_string() != task
+            || !is_unknown(&route.submission)
+        {
+            return Err(IdentityError::Conflict);
+        }
+        routes.push(route);
+    }
+    Ok(routes)
 }
 
 fn validate_route(route: &OriginRoute) -> Result<(), IdentityError> {
@@ -127,7 +200,7 @@ fn same_route_identity(left: &OriginRoute, right: &OriginRoute) -> Result<bool, 
     }
 
     // direct retries retain the first route's generated task, destination, and callback context
-    let same_spec = encode(&left.spec)? == encode(&right.spec)?;
+    let same_spec = left.spec == right.spec;
     let same_thread = left.thread == right.thread;
     match (&left.submission, &right.submission) {
         (
@@ -277,7 +350,7 @@ fn storage(error: rusqlite::Error) -> IdentityError {
 }
 
 impl Store {
-    /// Insert an origin route once; an identical request returns the saved route.
+    /// Insert an origin route once; an identical request returns the saved route
     pub fn insert_origin_route(
         &mut self,
         route: &OriginRoute,
@@ -338,7 +411,7 @@ impl Store {
         Ok(route.clone())
     }
 
-    /// Read a saved origin route by caller request UUID.
+    /// Read a saved origin route by caller request UUID
     pub fn origin_route_by_request(
         &self,
         request: RequestId,
@@ -363,7 +436,7 @@ impl Store {
             })
     }
 
-    /// Read a saved origin route by global task UUID.
+    /// Read a saved origin route by global task UUID
     pub fn origin_route_by_task(&self, task: TaskId) -> Result<Option<OriginRoute>, IdentityError> {
         let data: Option<String> = self
             .conn
@@ -416,45 +489,15 @@ impl Store {
 
     /// Find unresolved resource origin routes for one startup recovery pass
     pub fn unknown_resource_origin_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT request_id,task_id,route_json FROM origin_routes
-                 WHERE CASE WHEN json_valid(route_json) THEN
-                    json_extract(route_json, '$.submission.type') = 'resource'
-                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
-                 ELSE 0 END
-                 ORDER BY request_id",
-            )
-            .map_err(storage)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(storage)?;
-        let mut routes = Vec::new();
-        for row in rows {
-            let (request, task, json) = row.map_err(storage)?;
-            let route = decode_route(&json)?;
-            if route.request.0.to_string() != request || route.task.to_string() != task {
-                return Err(IdentityError::Conflict);
-            }
-            if !matches!(
-                route.submission,
+        acceptance_unknown_routes_on(&self.conn, "resource", |submission| {
+            matches!(
+                submission,
                 SubmissionState::Resource {
                     phase: ResourceRoutePhase::AcceptanceUnknown,
                     ..
                 }
-            ) {
-                return Err(IdentityError::Conflict);
-            }
-            routes.push(route);
-        }
-        Ok(routes)
+            )
+        })
     }
 
     /// Read the one saved action-bound route for a resource action
@@ -467,45 +510,15 @@ impl Store {
 
     /// Find action-bound routes whose authority acceptance was unknown at startup
     pub fn unknown_resource_action_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT request_id,task_id,route_json FROM origin_routes
-                 WHERE CASE WHEN json_valid(route_json) THEN
-                    json_extract(route_json, '$.submission.type') = 'resource_action'
-                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
-                 ELSE 0 END
-                 ORDER BY request_id",
+        acceptance_unknown_routes_on(&self.conn, "resource_action", |submission| {
+            matches!(
+                submission,
+                SubmissionState::ResourceAction {
+                    phase: ResourceActionRoutePhase::AcceptanceUnknown,
+                    ..
+                }
             )
-            .map_err(storage)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(storage)?;
-        let mut routes = Vec::new();
-        for row in rows {
-            let (request, task, json) = row.map_err(storage)?;
-            let route = decode_route(&json)?;
-            if route.request.0.to_string() != request
-                || route.task.to_string() != task
-                || !matches!(
-                    route.submission,
-                    SubmissionState::ResourceAction {
-                        phase: ResourceActionRoutePhase::AcceptanceUnknown,
-                        ..
-                    }
-                )
-            {
-                return Err(IdentityError::Conflict);
-            }
-            routes.push(route);
-        }
-        Ok(routes)
+        })
     }
 
     /// Apply a definitive authority result to one action-bound route
@@ -578,51 +591,21 @@ impl Store {
 
     /// Find remote first background launch routes whose acceptance was unknown at startup
     pub fn unknown_resource_background_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT request_id,task_id,route_json FROM origin_routes
-                 WHERE CASE WHEN json_valid(route_json) THEN
-                    json_extract(route_json, '$.submission.type') = 'resource_background'
-                    AND json_extract(route_json, '$.submission.phase.type') = 'acceptance_unknown'
-                 ELSE 0 END
-                 ORDER BY request_id",
+        acceptance_unknown_routes_on(&self.conn, "resource_background", |submission| {
+            matches!(
+                submission,
+                SubmissionState::ResourceBackground {
+                    phase: ResourceBackgroundRoutePhase::AcceptanceUnknown,
+                    ..
+                }
             )
-            .map_err(storage)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(storage)?;
-        let mut routes = Vec::new();
-        for row in rows {
-            let (request, task, json) = row.map_err(storage)?;
-            let route = decode_route(&json)?;
-            if route.request.0.to_string() != request
-                || route.task.to_string() != task
-                || !matches!(
-                    route.submission,
-                    SubmissionState::ResourceBackground {
-                        phase: ResourceBackgroundRoutePhase::AcceptanceUnknown,
-                        ..
-                    }
-                )
-            {
-                return Err(IdentityError::Conflict);
-            }
-            routes.push(route);
-        }
-        Ok(routes)
+        })
     }
 
     /// Apply a definitive authority result to one remote first background launch route
     ///
     /// An acceptance must carry the exact saved binding and identities. An accepted
-    /// route is never replaced, and an identical retry leaves the route unchanged.
+    /// route is never replaced, and an identical retry leaves the route unchanged
     /// A refusal only replaces an unresolved phase, since a first queued event may
     /// already have accepted the route
     pub fn resolve_resource_background_route(
@@ -688,7 +671,7 @@ impl Store {
         Ok(route)
     }
 
-    /// Set a definitive submission result only while acceptance is unknown.
+    /// Set a definitive submission result only while acceptance is unknown
     pub fn resolve_origin_route(
         &mut self,
         task: TaskId,
@@ -733,7 +716,7 @@ impl Store {
         }
     }
 
-    /// Apply a definitive resource queue response without changing a later phase.
+    /// Apply a definitive resource queue response without changing a later phase
     pub fn resolve_resource_route(
         &mut self,
         receipt: &ResourceQueueReceipt,
@@ -797,7 +780,7 @@ impl Store {
         Ok(route)
     }
 
-    /// Apply a definitive authority cancellation receipt before task activation.
+    /// Apply a definitive authority cancellation receipt before task activation
     pub fn cancel_resource_route_before_launch(
         &mut self,
         receipt: &ResourceCancellationReceipt,
@@ -860,24 +843,15 @@ impl Store {
         Ok(route)
     }
 
-    /// Read accepted identity or rejection tombstone by task UUID.
+    /// Read accepted identity or rejection tombstone by task UUID
     pub fn executor_identity(
         &self,
         task: TaskId,
     ) -> Result<Option<ExecutorIdentity>, IdentityError> {
-        let data: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        data.as_deref().map(decode_identity).transpose()
+        executor_identity_on(&self.conn, task)
     }
 
-    /// Atomically accept a task UUID, or return its existing identity.
+    /// Atomically accept a task UUID, or return its existing identity
     pub fn accept_execution(
         &mut self,
         record: &ExecutionRecord,
@@ -889,20 +863,11 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let data: Option<String> = tx
-            .query_row(
-                "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                [record.task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        if let Some(data) = data {
-            let existing = decode_identity(&data)?;
+        if let Some(existing) = executor_identity_on(&tx, record.task)? {
             if let ExecutorIdentity::Accepted(saved) = &existing
                 && (saved.origin_machine != record.origin_machine
                     || saved.execution_machine != record.execution_machine
-                    || encode(&saved.spec)? != encode(&record.spec)?)
+                    || saved.spec != record.spec)
             {
                 return Err(IdentityError::Conflict);
             }
@@ -939,7 +904,7 @@ impl Store {
         Ok(accepted)
     }
 
-    /// Store a definitive rejection, or return the identity that won the race.
+    /// Store a definitive rejection, or return the identity that won the race
     pub fn reject_execution(
         &mut self,
         tombstone: &RejectionTombstone,
@@ -953,21 +918,12 @@ impl Store {
         Ok(identity)
     }
 
-    /// Retain a rejection inside a caller-owned transaction.
+    /// Retain a rejection inside a caller-owned transaction
     pub(crate) fn reject_execution_in(
         tx: &rusqlite::Transaction<'_>,
         tombstone: &RejectionTombstone,
     ) -> Result<ExecutorIdentity, IdentityError> {
-        let data: Option<String> = tx
-            .query_row(
-                "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                [tombstone.task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        if let Some(data) = data {
-            let existing = decode_identity(&data)?;
+        if let Some(existing) = executor_identity_on(tx, tombstone.task)? {
             let (origin, execution) = match &existing {
                 ExecutorIdentity::Accepted(row) => (row.origin_machine, row.execution_machine),
                 ExecutorIdentity::Rejected(row) => (row.origin_machine, row.execution_machine),
@@ -993,7 +949,7 @@ impl Store {
         Ok(rejected)
     }
 
-    /// Abandon an unaccepted UUID without making an absent lookup a rejection.
+    /// Abandon an unaccepted UUID without making an absent lookup a rejection
     pub fn abandon_before_acceptance(
         &mut self,
         task: TaskId,
@@ -1008,7 +964,7 @@ impl Store {
         })
     }
 
-    /// Cancel an unaccepted UUID; a prior accepted identity is unchanged.
+    /// Cancel an unaccepted UUID; a prior accepted identity is unchanged
     pub fn cancel_before_acceptance(
         &mut self,
         task: TaskId,
@@ -1023,7 +979,7 @@ impl Store {
         })
     }
 
-    /// Retain the latest process state for an accepted task after detail cleanup.
+    /// Retain the latest process state for an accepted task after detail cleanup
     pub fn update_execution_state(
         &mut self,
         task: TaskId,
@@ -1033,16 +989,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let data: Option<String> = tx
-            .query_row(
-                "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        let mut identity: ExecutorIdentity =
-            decode(data.as_deref().ok_or(IdentityError::RouteNotFound)?)?;
+        let mut identity = executor_identity_on(&tx, task)?.ok_or(IdentityError::RouteNotFound)?;
         match &mut identity {
             ExecutorIdentity::Accepted(record) => record.state = state,
             ExecutorIdentity::Rejected(_) => return Err(IdentityError::Conflict),
@@ -1059,17 +1006,28 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::{EventPayload, TaskEvent};
+    use crate::resource::bound_action::ResourceActionLaunch;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
 
     use tempfile::tempdir;
 
-    use super::*;
-    use crate::domain::TaskEnv;
+    use super::{IdentityError, ResourceActionRouteResult, encode};
+    use crate::domain::{ProcessStatus, TaskEnv, TaskId};
+    use crate::machine::MachineId;
+    use crate::resource::bound_action::ActionTaskReceipt;
     use crate::resource::{
-        AssignmentRevision, Resource, ResourceId, ResourceRevision, SupervisorAddress,
+        ActionId, AssignmentRevision, Resource, ResourceId, ResourceRevision, SupervisorAddress,
     };
-    use crate::submission::{CallbackContext, ResourceCancellationOutcome};
+    use crate::store::Store;
+    use crate::submission::{
+        CallbackContext, ExecutionRecord, ExecutorIdentity, OriginRoute, PreAcceptanceRejection,
+        RequestId, ResourceActionRoutePhase, ResourceCancellationOutcome,
+        ResourceCancellationReceipt, ResourceQueueOutcome, ResourceQueueReceipt,
+        ResourceRoutePhase, SubmissionState,
+    };
+    use rusqlite::params;
 
     fn spec() -> crate::spec::NormalizedSpec {
         serde_json::from_value(serde_json::json!({
@@ -1203,14 +1161,11 @@ mod tests {
     }
 
     #[test]
-    fn old_direct_route_json_remains_readable_and_recoverable() {
+    fn saved_direct_route_json_is_readable_and_recoverable() {
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let route = route();
-        let mut json = serde_json::to_value(&route).unwrap();
-        json["spec"] = serde_json::to_value(route.spec.current().unwrap()).unwrap();
-        json["callback"]["codex"] = serde_json::json!("/bin/echo");
-        json.as_object_mut().unwrap().remove("last_updated_at");
+        let json = serde_json::to_value(&route).unwrap();
         store
             .conn
             .execute(
@@ -1273,12 +1228,12 @@ mod tests {
         let activated = resource_route();
         store.insert_origin_route(&activated).unwrap();
         store
-            .accept_inbound_event(&crate::events::TaskEvent {
+            .accept_inbound_event(&TaskEvent {
                 task: activated.task,
                 seq: std::num::NonZeroU64::new(1).unwrap(),
                 origin_machine: activated.origin_machine,
                 execution_machine: activated.execution_machine,
-                payload: crate::events::EventPayload::State {
+                payload: EventPayload::State {
                     status: ProcessStatus::Queued,
                 },
             })
@@ -1445,12 +1400,12 @@ mod tests {
             }
         ));
         store
-            .accept_inbound_event(&crate::events::TaskEvent {
+            .accept_inbound_event(&TaskEvent {
                 task: route.task,
                 seq: std::num::NonZeroU64::new(1).unwrap(),
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
-                payload: crate::events::EventPayload::State {
+                payload: EventPayload::State {
                     status: ProcessStatus::Queued,
                 },
             })
@@ -1558,12 +1513,12 @@ mod tests {
             Err(IdentityError::Conflict)
         ));
         assert!(matches!(
-            store.accept_inbound_event(&crate::events::TaskEvent {
+            store.accept_inbound_event(&TaskEvent {
                 task: route.task,
                 seq: std::num::NonZeroU64::new(1).unwrap(),
                 origin_machine: route.origin_machine,
                 execution_machine: route.execution_machine,
-                payload: crate::events::EventPayload::State {
+                payload: EventPayload::State {
                     status: ProcessStatus::Queued,
                 },
             }),
@@ -1872,7 +1827,7 @@ mod tests {
         ));
     }
 
-    fn action_route(launch: crate::resource::bound_action::ResourceActionLaunch) -> OriginRoute {
+    fn action_route(launch: ResourceActionLaunch) -> OriginRoute {
         let spec = spec();
         let binding = crate::submission::ResourceActionRouteBinding {
             kind: launch.kind(),
@@ -1880,7 +1835,7 @@ mod tests {
                 authority_machine: MachineId::new(),
                 resource_id: ResourceId::new(),
                 loan_id: crate::resource::LoanId::new(),
-                action_id: crate::resource::ActionId::new(),
+                action_id: ActionId::new(),
                 expected_state_revision: ResourceRevision::new(4),
                 supervisor: SupervisorAddress {
                     machine: MachineId::new(),
@@ -1908,11 +1863,9 @@ mod tests {
     }
 
     fn watcher_route() -> OriginRoute {
-        action_route(
-            crate::resource::bound_action::ResourceActionLaunch::ReleaseWatcher {
-                observed_background_task: TaskId::new(),
-            },
-        )
+        action_route(ResourceActionLaunch::ReleaseWatcher {
+            observed_background_task: TaskId::new(),
+        })
     }
 
     fn action_receipt(route: &OriginRoute) -> ActionTaskReceipt {

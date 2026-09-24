@@ -12,6 +12,7 @@
 	import { formatCentralTimestamp, shortId } from '$lib/format';
 	import {
 		asRecord,
+		backgroundLaunchText,
 		currentRequestId,
 		detailStatus,
 		loanActionId,
@@ -438,6 +439,8 @@
 			return 'Waiting for the supervisor to decide what runs next';
 		if (phaseType === 'restoring') return 'Return task holds the reservation';
 		if (current.background_task) return `Training task ${current.background_task.status}`;
+		const launchText = backgroundLaunchText(current.background_launch);
+		if (launchText !== null) return launchText;
 		if (current.resource.registered_background_task === null)
 			return 'No training task is registered';
 		return 'Registered training task state is unavailable';
@@ -465,6 +468,9 @@
 				}
 				if (current.background_task) {
 					return `${current.background_task.display_name} · ${current.background_task.status}`;
+				}
+				if (current.background_launch) {
+					return `Launch task ${current.background_launch.task_id} · ${current.background_launch.status}`;
 				}
 				if (current.resource.registered_background_task === null && !current.loan) {
 					return 'No task or loan is reported';
@@ -910,6 +916,9 @@
 					<p class="mt-3 rounded border border-border/70 bg-muted/40 p-2 text-muted-foreground">
 						Return task holds the reservation. A trainer releases it on a confirmed start; a native
 						foreground command releases it after a successful, confirmed exit.
+					</p>
+					<p class="mt-2 font-mono text-[11px] break-all">
+						return_execution_mode: {detail.return_execution_mode ?? 'unknown — do not guess'}
 					</p>
 				{/if}
 				{#if operatorRelease}

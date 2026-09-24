@@ -1,5 +1,6 @@
 //! Ordered executor outbox delivery and recovery
 
+use crate::fleet::probe::VerifiedDestination;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
@@ -76,7 +77,7 @@ struct ErrorDetail {
 }
 
 /// Resume pending events at startup and scan for later committed events
-pub async fn run(
+pub(crate) async fn run(
     store: ActorRef<StoreMsg>,
     supervisor: ActorRef<SupervisorMsg>,
     local: MachineId,
@@ -347,7 +348,7 @@ enum RemoteResult {
 async fn send_remote(
     client: &ClusterClient,
     fleet: &FleetHandle,
-    verified: &crate::fleet::probe::VerifiedDestination,
+    verified: &VerifiedDestination,
     event: &TaskEvent,
 ) -> Result<RemoteResult, AppError> {
     let request = ReceiveEvent {
@@ -388,7 +389,7 @@ async fn send_remote(
 async fn classify_error(
     client: &ClusterClient,
     fleet: &FleetHandle,
-    verified: &crate::fleet::probe::VerifiedDestination,
+    verified: &VerifiedDestination,
     event: &TaskEvent,
     response: ClusterResponse,
 ) -> Result<RemoteResult, AppError> {
@@ -436,7 +437,8 @@ async fn classify_error(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{MAX_BACKOFF, Retry, backoff};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn retry_delay_is_bounded() {

@@ -1,21 +1,44 @@
 //! First background launch binding, confirmed-start registration, and the idle boundary
 
-use super::*;
+use super::fixtures::{acquire_test_lock, resource, saved_trainer_association_json, spec};
+use crate::domain::{
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, ThreadId,
+};
+use crate::invocation::CommandLine;
+use crate::machine::MachineId;
 use crate::resource::background_launch::{
     BackgroundLaunchBinding, BackgroundSupervisorAssignment, RemoteBackgroundLaunchReceipt,
 };
 use crate::resource::command_shape::test_support::FakeTrainer;
 use crate::resource::ownership_lock::test_support::start_fake_lock_process;
 use crate::resource::ownership_lock::{
-    OwnershipLockIdentityMismatchReason, OwnershipLockProbe, OwnershipLockProbeError,
-    probe_segment_ownership_lock,
+    OwnershipLockIdentity, OwnershipLockIdentityMismatchReason, OwnershipLockProbe,
+    OwnershipLockProbeError, TrainerRequestDigest, VerifiedTrainerAttempt,
+    build_trainer_attempt_registration_evidence, probe_segment_ownership_lock,
+    test_support as trainer_attempt_test_support,
 };
-use crate::resource::{IdleBoundaryProof, IdleProofGap};
+use crate::resource::store::{
+    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
+    TrainerAttemptAssociationStoreError,
+};
+use crate::resource::{
+    AssignmentRevision, IdleBoundaryProof, IdleProofGap, Loan, LoanPhase, LoanState, Resource,
+    ResourceQueueAttentionReason, ResourceQueueReconcileOutcome, ResourceRevision, ReturnContext,
+    ServingReleaseProvenance,
+};
+use crate::spec::{NormalizedSpec, NormalizedTaskWorkload, NormalizedWorkload};
+use crate::store::resource::task_has_any_event;
 use crate::store::resource::trainer_lock::TrainerLockReleaseGap;
 use crate::store::{
     BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
-    BackgroundLaunchPhase, RemoteBackgroundLaunchInput,
+    BackgroundLaunchPhase, ExecutorIdentity, RemoteBackgroundLaunchInput, Store,
 };
+use crate::submission::{CallbackExecutable, RequestId, normalized_spec_sha256};
+use rusqlite::params;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
+use uuid::Uuid;
 
 pub(super) struct LaunchFixture {
     _directory: tempfile::TempDir,
@@ -192,8 +215,8 @@ fn launch_refuses_unverifiable_ownership_and_other_threads_before_writing() {
 
     // a shell wrapper can start work outside its foreground process group
     let mut wrapper = fixture.trainer_spec();
-    wrapper.workload = NormalizedWorkload::Task(crate::spec::NormalizedTaskWorkload {
-        command: crate::invocation::CommandLine::try_from_argv(vec![
+    wrapper.workload = NormalizedWorkload::Task(NormalizedTaskWorkload {
+        command: CommandLine::try_from_argv(vec![
             "/bin/sh".into(),
             "-c".into(),
             "python3 -m ops.run_segment run &".into(),
@@ -202,12 +225,9 @@ fn launch_refuses_unverifiable_ownership_and_other_threads_before_writing() {
     });
     // a script named like the trainer module path is not the maintained invocation
     let mut shebang = fixture.trainer_spec();
-    shebang.workload = NormalizedWorkload::Task(crate::spec::NormalizedTaskWorkload {
-        command: crate::invocation::CommandLine::try_from_argv(vec![
-            "python3".into(),
-            "ops/run_segment.py".into(),
-        ])
-        .unwrap(),
+    shebang.workload = NormalizedWorkload::Task(NormalizedTaskWorkload {
+        command: CommandLine::try_from_argv(vec!["python3".into(), "ops/run_segment.py".into()])
+            .unwrap(),
     });
     for spec in [wrapper, shebang] {
         assert!(matches!(
@@ -395,7 +415,7 @@ fn launch_that_never_spawned_proves_idle_and_serves_the_queue() {
         .unwrap();
     assert!(matches!(
         fixture.store.accept_assigned_resource_task(input),
-        Err(ResourceStoreError::Conflict)
+        Err(ResourceStoreError::Conflict(_))
     ));
 }
 
@@ -648,7 +668,7 @@ fn predecessor_without_exit_proof_keeps_the_background_slot() {
 fn bind_real_trainer_lock(fixture: &mut LaunchFixture, task: TaskId) -> PathBuf {
     let runtime_root = fixture.trainer.runtime_root.clone();
     let binding = trainer_attempt_test_support::attempt_binding("attempt-1");
-    crate::resource::watcher::tests::write_request_for_test(&runtime_root, &binding);
+    crate::resource::trainer_publication::tests::write_request_for_test(&runtime_root, &binding);
     let lock_path = runtime_root.join(".segment.lock");
     let running_worker = acquire_test_lock(&lock_path, true);
     let evidence = build_trainer_attempt_registration_evidence(&runtime_root, &binding).unwrap();

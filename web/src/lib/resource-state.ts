@@ -1,4 +1,9 @@
-import type { ResourceDetail, ResourceOverviewItem, ResourceTaskSummary } from './resources';
+import type {
+	BackgroundLaunchReservation,
+	ResourceDetail,
+	ResourceOverviewItem,
+	ResourceTaskSummary
+} from './resources';
 
 export type ResourceTone = 'green' | 'blue' | 'amber' | 'red' | 'neutral';
 
@@ -91,7 +96,8 @@ export function overviewStatus(
 		item.loan,
 		item.queued_count,
 		item.current_task,
-		item.attention
+		item.attention,
+		item.background_launch
 	);
 }
 
@@ -103,8 +109,28 @@ export function detailStatus(detail: ResourceDetail): ResourceStatus {
 		detail.loan,
 		queued,
 		detail.current_task ?? detail.background_task,
-		detail.attention
+		detail.attention,
+		detail.background_launch
 	);
+}
+
+/** Explain why a first background launch still reserves the resource. */
+export function backgroundLaunchText(
+	launch: BackgroundLaunchReservation | undefined
+): string | null {
+	if (!launch) return null;
+	switch (launch.status) {
+		case 'queued':
+			return 'The first background launch is queued';
+		case 'started_unregistered':
+			return 'The first background launch started and is not registered yet';
+		case 'release_unproven':
+			return 'The first background launch ended before registration. GPU release is not proven until an operator confirms that no trainer GPU work remains.';
+		case 'identity_mismatch':
+			return 'The first background launch records do not match its receipt';
+		default:
+			return `The first background launch reserves the GPU (${launch.status})`;
+	}
 }
 
 /** Human-readable task lifecycle state, with unknown states kept explicit. */
@@ -121,9 +147,17 @@ function deriveStatus(
 	loan: ResourceDetail['loan'] | ResourceOverviewItem['loan'],
 	queuedCount: number,
 	currentTask: ResourceTaskSummary | null,
-	attention: ResourceOverviewItem['attention']
+	attention: ResourceOverviewItem['attention'],
+	backgroundLaunch: BackgroundLaunchReservation | undefined
 ): ResourceStatus {
 	const stateType = tagOf(loan?.state);
+	if (attention?.code === 'background_launch_release_unproven') {
+		return {
+			label: 'Operator release required',
+			message: attention.message,
+			tone: 'amber'
+		};
+	}
 	if (attention || stateType === 'needs_attention') {
 		return {
 			label: 'Attention',
@@ -205,6 +239,13 @@ function deriveStatus(
 			message: 'The registered training task is not available',
 			tone: 'amber'
 		};
+	}
+	// an unregistered launch still holds the GPU, so it is never shown as available
+	const launchText = backgroundLaunchText(backgroundLaunch);
+	if (launchText !== null) {
+		return backgroundLaunch?.status === 'release_unproven'
+			? { label: 'Operator release required', message: launchText, tone: 'amber' }
+			: { label: 'Active / reserved', message: launchText, tone: 'blue' };
 	}
 	if (queuedCount > 0) {
 		return {

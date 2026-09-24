@@ -1,11 +1,11 @@
 //! Optional TCP listener: dashboard assets, the read-only API, the three typed
-//! resource controls, and, when the fleet is enabled, the `/v1/cluster/*` routes.
+//! resource controls, and, when the fleet is enabled, the `/v1/cluster/*` routes
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
 //! is reachable from any web page the user has open, so this router never
 //! exposes task submit or cancel. The only browser write is
 //! `POST /v1/resources/{id}/actions`, which requires the exact dashboard
-//! `Origin`, a JSON body within a small limit, and no CORS response headers.
+//! `Origin`, a JSON body within a small limit, and no CORS response headers
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -30,16 +30,16 @@ use serde_json::json;
 /// Largest JSON body accepted by the dashboard resource-action route
 const BROWSER_ACTION_MAX_BYTES: usize = 16 * 1024;
 
-/// Usual dashboard port when an operator opts in.
+/// Usual dashboard port when an operator opts in
 pub const DEFAULT_PORT: u16 = 7677;
 
-/// Where the dashboard listens.
+/// Where the dashboard listens
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WebListen {
-    /// No TCP listener.
+    /// No TCP listener
     #[default]
     Off,
-    /// Bind this address. Port `0` picks a free port.
+    /// Bind this address. Port `0` picks a free port
     Addr(SocketAddr),
 }
 
@@ -70,7 +70,7 @@ impl fmt::Display for WebListen {
 }
 
 /// Bind the dashboard listener. A failure is logged and swallowed: the
-/// supervisor must keep running when the port is busy.
+/// supervisor must keep running when the port is busy
 pub async fn bind(listen: WebListen) -> Option<TcpListener> {
     let WebListen::Addr(addr) = listen else {
         return None;
@@ -84,13 +84,13 @@ pub async fn bind(listen: WebListen) -> Option<TcpListener> {
     }
 }
 
-/// Base URL for a bound address.
+/// Base URL for a bound address
 #[must_use]
 pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read-only API, the typed resource controls, and the embedded single-page app.
+/// Read-only API, the typed resource controls, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -116,7 +116,7 @@ fn browser_action_routes() -> Router<AppState> {
 
 /// Refuse a browser write unless it comes from this dashboard's own origin
 ///
-/// The Host guard runs first, so the Host value is one this listener serves.
+/// The Host guard runs first, so the Host value is one this listener serves
 /// Browsers always send `Origin` on a cross-origin POST, and a missing value is
 /// refused too, so a page on another origin cannot use this route
 async fn same_origin_guard(request: Request, next: Next) -> Response {
@@ -155,14 +155,14 @@ fn check_same_origin(headers: &HeaderMap) -> Result<(), &'static str> {
 }
 
 /// Output of `npm run build` in `web/`. Empty until the dashboard is built;
-/// `build.rs` creates the directory so the crate always compiles.
+/// `build.rs` creates the directory so the crate always compiles
 #[derive(RustEmbed)]
 #[folder = "web/build/"]
 struct Assets;
 
 const INDEX: &str = "index.html";
 
-/// SvelteKit writes fingerprinted files here, so they can be cached forever.
+/// SvelteKit writes fingerprinted files here, so they can be cached forever
 const IMMUTABLE_PREFIX: &str = "_app/immutable/";
 
 async fn asset(uri: Uri) -> Response {
@@ -228,8 +228,9 @@ fn not_built() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
+    use super::{DEFAULT_PORT, WebListen, bind};
+    use crate::error::AppError;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
     fn parses_off_and_addresses() {

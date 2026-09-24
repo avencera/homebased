@@ -1,21 +1,55 @@
 //! Bound release-watcher poll, launch, restart, and end-to-end release tests
 
+use crate::domain::TaskRow;
+use crate::resource::SupervisorActionAuthority;
+use crate::resource::bound_action::{
+    ActionTaskAcceptance, ActionTaskIdentity, ResourceActionOperation, ResourceActionOutcome,
+    ResourceActionRejection,
+};
+use crate::store::{AcceptedActionTask, RemoteReleaseWatcherAcceptanceInput, ResourceActionError};
 use std::time::Duration;
 
 use tokio::net::UnixListener;
 
-use super::*;
+use super::fixtures::{
+    TrainerAssociationFixture, accept_watcher, fake_resource_task_spec, gated_resource_task_spec,
+    machine_other_than, open_release_for_test, prepare_release_checkpoint_baseline,
+    release_completion_fixture_with, release_watcher_intent, remote_task, resource,
+    return_notice_count, saved_release_association, spec, start_release_watcher_for_test,
+    stop_test_supervisor, test_release_association, wait_for_awaiting_return,
+    watcher_acceptance_counts, watcher_spec, watcher_task_and_callback,
+};
 use crate::daemon::AppState;
 use crate::daemon::actors::resource::{ReleaseWatcherAttentionReason, ReleaseWatcherStatus};
+use crate::daemon::actors::supervisor::SUPERVISOR_TEST_LOCK;
+use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+use crate::domain::{ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId};
 use crate::files::StreamSlots;
 use crate::fleet::FleetState;
 use crate::fleet::directory::LocalMachine;
 use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
-use crate::machine::{LocalIdentity, MachineName};
+use crate::home::{Home, LockMode, flock_exclusive};
+use crate::machine::{LocalIdentity, MachineId, MachineName, load_or_create_machine_id};
 use crate::resource::release_watcher::{
-    RELEASE_WATCHER_POLL_PATH, ReleaseWatcherPollAttention, ReleaseWatcherPollOutcome,
-    ReleaseWatcherPollRequest,
+    RELEASE_WATCHER_POLL_PATH, ReleaseWatcherCommand, ReleaseWatcherPollAttention,
+    ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest,
 };
+use crate::resource::store::{
+    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ReleaseWatcherAcceptanceInput,
+};
+use crate::resource::trainer_publication::AttemptBinding;
+use crate::resource::{
+    ActionId, LoanPhase, LoanState, ReleaseCheckpointStopOutcome, ReleaseWatcherIntent,
+    ReleaseWatcherTaskId, Resource, ResourceId, ResourceRevision, ServingReleaseProvenance,
+    SupervisorAddress, SupervisorNotice,
+};
+use crate::store::{ExecutorIdentity, NewTask, Store, new_queued_task};
+use crate::submission::{CallbackContext, CallbackExecutable, RequestId, normalized_spec_sha256};
+use ractor::Actor;
+use rusqlite::params;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
 
 const WATCHER_TASK_NAME: &str = "resource release watcher";
 
@@ -50,7 +84,7 @@ impl PollFixture {
             .to_path_buf();
         let binding = association.verified_attempt().binding().clone();
         if old_generation {
-            crate::resource::watcher::tests::write_generation_for_test(
+            crate::resource::trainer_publication::tests::write_generation_for_test(
                 &runtime_root,
                 &binding,
                 "generation-before-baseline",
@@ -128,7 +162,7 @@ impl PollFixture {
     }
 
     fn write_generation(&self, generation_id: &str, update_count: u64) {
-        crate::resource::watcher::tests::write_generation_for_test(
+        crate::resource::trainer_publication::tests::write_generation_for_test(
             &self.runtime_root,
             &self.binding,
             generation_id,
@@ -222,11 +256,11 @@ fn final_result_before_stop_waits_for_trainer_exit_without_cancelling() {
     let mut fixture = PollFixture::new();
     fixture.start_watcher();
     let command = fixture.command();
-    crate::resource::watcher::tests::write_request_for_test(
+    crate::resource::trainer_publication::tests::write_request_for_test(
         &fixture.runtime_root,
         &fixture.binding,
     );
-    crate::resource::watcher::tests::write_completed_result_for_test(
+    crate::resource::trainer_publication::tests::write_completed_result_for_test(
         &fixture.runtime_root,
         &fixture.binding,
     );
@@ -429,6 +463,99 @@ fn local_watcher_with_a_changed_route_is_refused_without_a_marker() {
 }
 
 #[test]
+fn watcher_whose_initial_event_changed_is_not_running_and_leaves_no_marker() {
+    let changed_outbox: fn(&Store, TaskId) = |store, watcher| {
+        store
+            .conn
+            .execute(
+                "UPDATE executor_outbox SET notification_required = 1
+                 WHERE task_id = ?1 AND seq = 1",
+                [watcher.to_string()],
+            )
+            .unwrap();
+    };
+    let receipt_with_wrong_digest: fn(&Store, TaskId) = |store, watcher| {
+        store
+            .conn
+            .execute(
+                "DELETE FROM executor_outbox WHERE task_id = ?1 AND seq = 1",
+                [watcher.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO executor_event_receipts
+                 (task_id, seq, event_digest, result_json, terminal_callback)
+                 VALUES (?1, 1, 'not-the-queued-event', '\"acknowledged\"', 0)",
+                [watcher.to_string()],
+            )
+            .unwrap();
+    };
+    for tamper in [changed_outbox, receipt_with_wrong_digest] {
+        let mut fixture = PollFixture::new();
+        fixture.start_watcher();
+        fixture.write_generation("generation-after-baseline", 20);
+        tamper(&fixture.store, fixture.intent.watcher_task_id.as_task_id());
+        let command = fixture.command();
+
+        assert_eq!(
+            fixture.poll(command),
+            ReleaseWatcherPollOutcome::WatcherNotRunning
+        );
+        assert!(fixture.trainer_cancel_marker().is_none());
+    }
+}
+
+#[test]
+fn corrupt_checkpoint_state_is_attention_instead_of_a_retryable_error() {
+    let mut fixture = PollFixture::new();
+    fixture.start_watcher();
+    fixture
+        .store
+        .conn
+        .execute(
+            "UPDATE resource_release_checkpoint_states
+             SET state_json = json_set(state_json, '$.action.state_revision', 'corrupt')
+             WHERE action_id = ?1",
+            [fixture.notice.action_id.as_uuid().to_string()],
+        )
+        .unwrap();
+    let command = fixture.command();
+
+    assert_eq!(
+        fixture.poll(command),
+        attention(ReleaseWatcherPollAttention::CorruptRecord)
+    );
+    assert!(fixture.trainer_cancel_marker().is_none());
+}
+
+#[test]
+fn corrupt_resource_or_loan_row_is_attention_instead_of_a_retryable_error() {
+    let corrupt_loan_state =
+        "UPDATE loans SET state_json = json_set(state_json, '$.phase', 'corrupt')
+         WHERE resource_id = ?1";
+    let malformed_thread = "UPDATE resources SET supervisor_thread = 'not-a-uuid' WHERE id = ?1";
+    for tamper in [corrupt_loan_state, malformed_thread] {
+        let mut fixture = PollFixture::new();
+        fixture.start_watcher();
+        fixture
+            .store
+            .conn
+            .execute(tamper, [fixture.resource.id.as_uuid().to_string()])
+            .unwrap();
+        let command = fixture.command();
+
+        assert_eq!(
+            fixture.poll(command),
+            attention(ReleaseWatcherPollAttention::CorruptRecord),
+            "{tamper}"
+        );
+        assert!(fixture.trainer_cancel_marker().is_none());
+    }
+}
+
+#[test]
 fn caller_command_that_differs_from_the_canonical_watcher_is_rejected() {
     let mut fixture = PollFixture::new();
     let spec = watcher_spec(&fixture.resource, &fixture.intent);
@@ -512,8 +639,8 @@ async fn wait_for_task(
     store: &ractor::ActorRef<StoreMsg>,
     task_id: TaskId,
     timeout: Duration,
-    done: impl Fn(&crate::domain::TaskRow) -> bool,
-) -> crate::domain::TaskRow {
+    done: impl Fn(&TaskRow) -> bool,
+) -> TaskRow {
     tokio::time::timeout(timeout, async {
         loop {
             if let Some(row) = call(store, |reply| StoreMsg::GetTask { id: task_id, reply })
@@ -587,9 +714,13 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
     let resource_id = fixture.resource.id;
     let trainer_task_id = fixture.task_id;
 
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
-        .await
-        .unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
         .await
         .unwrap();
@@ -655,6 +786,7 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
         machine,
         fleet: FleetState::Disabled,
         message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
+        locks: crate::daemon::DaemonLocks::default(),
     };
     let listener = UnixListener::bind(home.sock_path()).unwrap();
     let router = crate::daemon::api::socket_router(state.clone());
@@ -671,7 +803,7 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
         .cancel_requested_at
         .is_none()
     );
-    crate::resource::watcher::tests::write_generation_for_test(
+    crate::resource::trainer_publication::tests::write_generation_for_test(
         &fixture.runtime_root,
         &binding,
         "generation-after-baseline",
@@ -802,9 +934,13 @@ async fn restart_before_acceptance_launches_the_saved_watcher_once_and_later_onl
     let database = fixture.database.clone();
     assert_eq!(watcher_task_count(&database), 0);
 
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
-        .await
-        .unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
         .await
         .unwrap();
@@ -826,9 +962,13 @@ async fn restart_before_acceptance_launches_the_saved_watcher_once_and_later_onl
     assert_eq!(watcher_task_count(&database), 1);
     stop_test_supervisor(supervisor, handle).await;
 
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
-        .await
-        .unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
         .await
         .unwrap();
@@ -936,9 +1076,13 @@ async fn accepted_queued_watcher_after_restart_is_uncertain_and_never_spawned() 
     let resource_id = fixture.resource.id;
     let database = fixture.database.clone();
 
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
-        .await
-        .unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
         .await
         .unwrap();
@@ -1021,7 +1165,7 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
                 &remote_task(background_task, &trainer_spec),
                 &trainer_spec,
                 authority,
-                PathBuf::from("/bin/echo"),
+                PathBuf::from("/bin/echo").into(),
             )
             .unwrap();
         store
@@ -1052,9 +1196,13 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
     )
     .unwrap();
 
-    let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, home.clone())
-        .await
-        .unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
     let status = wait_for_watcher_status(&supervisor, resource_id, |_| true).await;
     let ReleaseWatcherStatus::AwaitingRemoteSupervisor {
         watcher_task_id,
@@ -1078,7 +1226,7 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
         saved.loan.clone().map(|loan| loan.state),
         Some(LoanState::Active {
             phase: LoanPhase::AwaitingRelease {
-                watcher_intent: Some(SavedReleaseWatcherIntent::Complete(intent)),
+                watcher_intent: Some(intent),
                 ..
             }
         }) if intent.watcher_task_id.as_task_id() == watcher_task_id
@@ -1094,7 +1242,7 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
     else {
         unreachable!();
     };
-    let action = crate::resource::SupervisorActionAuthority {
+    let action = SupervisorActionAuthority {
         authority_machine: authority,
         resource_id,
         loan_id: loan.id,
@@ -1119,35 +1267,29 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
             .unwrap()
         }
     };
-    let crate::resource::bound_action::ResourceActionOutcome::Prepared { task } = send(
-        crate::resource::bound_action::ResourceActionOperation::PrepareReleaseWatcher {
+    let ResourceActionOutcome::Prepared { task } =
+        send(ResourceActionOperation::PrepareReleaseWatcher {
             observed_background_task: background_task,
-        },
-    )
-    .await
+        })
+        .await
     else {
         panic!("the authority must prepare the bound watcher");
     };
     assert_eq!(task.task_id, watcher_task_id);
     assert!(task.digest_matches());
     assert_eq!(task.spec.thread, thread);
-    let launch = crate::resource::bound_action::ResourceActionOperation::LaunchReleaseWatcher {
+    let launch = ResourceActionOperation::LaunchReleaseWatcher {
         observed_background_task: background_task,
-        task: crate::resource::bound_action::ActionTaskIdentity {
+        task: ActionTaskIdentity {
             request_id: task.request_id,
             task_id: task.task_id,
             normalized_spec_sha256: task.normalized_spec_sha256,
         },
     };
-    let crate::resource::bound_action::ResourceActionOutcome::Accepted { acceptance, .. } =
-        send(launch.clone()).await
-    else {
+    let ResourceActionOutcome::Accepted { acceptance, .. } = send(launch.clone()).await else {
         panic!("the first launch must be accepted");
     };
-    assert_eq!(
-        acceptance,
-        crate::resource::bound_action::ActionTaskAcceptance::Inserted
-    );
+    assert_eq!(acceptance, ActionTaskAcceptance::Inserted);
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
         .await
         .unwrap();
@@ -1155,14 +1297,12 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
         row.status() == ProcessStatus::Running
     })
     .await;
-    let crate::resource::bound_action::ResourceActionOutcome::Accepted { acceptance, .. } =
-        send(launch).await
-    else {
+    let ResourceActionOutcome::Accepted { acceptance, .. } = send(launch).await else {
         panic!("an exact retry must observe the accepted watcher");
     };
     assert_eq!(
         acceptance,
-        crate::resource::bound_action::ActionTaskAcceptance::Existing {
+        ActionTaskAcceptance::Existing {
             state: ProcessStatus::Running
         }
     );
@@ -1180,7 +1320,7 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
 /// Release action whose supervisor thread runs on another machine
 struct RemoteWatcherFixture {
     poll: PollFixture,
-    authority: crate::resource::SupervisorActionAuthority,
+    authority: SupervisorActionAuthority,
 }
 
 impl RemoteWatcherFixture {
@@ -1197,7 +1337,7 @@ impl RemoteWatcherFixture {
                 ],
             )
             .unwrap();
-        let authority = crate::resource::SupervisorActionAuthority {
+        let authority = SupervisorActionAuthority {
             authority_machine: poll.authority,
             resource_id: poll.resource.id,
             loan_id: poll.notice.loan_id,
@@ -1212,18 +1352,18 @@ impl RemoteWatcherFixture {
         Self { poll, authority }
     }
 
-    fn identity(&self) -> crate::resource::bound_action::ActionTaskIdentity {
-        crate::resource::bound_action::ActionTaskIdentity {
+    fn identity(&self) -> ActionTaskIdentity {
+        ActionTaskIdentity {
             request_id: self.poll.intent.request_id,
             task_id: self.poll.intent.watcher_task_id.as_task_id(),
             normalized_spec_sha256: self.poll.intent.normalized_spec_sha256,
         }
     }
 
-    fn input(&self) -> crate::store::RemoteReleaseWatcherAcceptanceInput {
+    fn input(&self) -> RemoteReleaseWatcherAcceptanceInput {
         let spec = watcher_spec(&self.poll.resource, &self.poll.intent);
         let row = remote_task(self.poll.intent.watcher_task_id.as_task_id(), &spec);
-        crate::store::RemoteReleaseWatcherAcceptanceInput {
+        RemoteReleaseWatcherAcceptanceInput {
             authority: self.authority,
             observed_background_task: self.poll.background_task,
             task: self.identity(),
@@ -1234,8 +1374,8 @@ impl RemoteWatcherFixture {
 
     fn accept(
         &mut self,
-        input: crate::store::RemoteReleaseWatcherAcceptanceInput,
-    ) -> Result<crate::store::AcceptedActionTask, crate::store::ResourceActionError> {
+        input: RemoteReleaseWatcherAcceptanceInput,
+    ) -> Result<AcceptedActionTask, ResourceActionError> {
         self.poll
             .store
             .accept_remote_release_watcher_for_authority(input)
@@ -1294,11 +1434,9 @@ impl RemoteWatcherFixture {
     }
 }
 
-fn rejected(
-    result: Result<crate::store::AcceptedActionTask, crate::store::ResourceActionError>,
-) -> crate::resource::bound_action::ResourceActionRejection {
+fn rejected(result: Result<AcceptedActionTask, ResourceActionError>) -> ResourceActionRejection {
     match result {
-        Err(crate::store::ResourceActionError::Rejected(reason)) => reason,
+        Err(ResourceActionError::Rejected(reason)) => reason,
         other => panic!("expected a typed rejection, found {other:?}"),
     }
 }
@@ -1365,7 +1503,7 @@ fn remote_watcher_acceptance_saves_one_receipt_and_remote_identity_without_a_loc
     changed.task.normalized_spec_sha256 = normalized_spec_sha256(&spec()).unwrap();
     assert_eq!(
         rejected(fixture.accept(changed)),
-        crate::resource::bound_action::ResourceActionRejection::ConflictingRetry
+        ResourceActionRejection::ConflictingRetry
     );
     assert_eq!(fixture.receipt_count(), 1);
 }
@@ -1564,7 +1702,7 @@ fn accepted_remote_watcher_keeps_polling_after_its_supervisor_is_replaced() {
         // an exact acceptance retry observes the saved watcher and inserts nothing
         assert!(matches!(
             fixture.accept(fixture.input()).unwrap().acceptance,
-            crate::resource::bound_action::ActionTaskAcceptance::Existing { .. }
+            ActionTaskAcceptance::Existing { .. }
         ));
         assert_eq!(fixture.receipt_count(), 1);
     }

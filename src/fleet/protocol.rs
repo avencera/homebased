@@ -1,15 +1,15 @@
-//! Cluster protocol versions and compatibility.
+//! Cluster protocol versions and compatibility
 //!
 //! The cluster protocol version is separate from the public JSON
 //! `api_version` and from the event payload version. Each machine advertises
 //! the inclusive range it accepts; two machines interoperate when the ranges
-//! overlap, and they speak the highest shared version.
+//! overlap, and they speak the highest shared version
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// One cluster protocol version.
+/// One cluster protocol version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClusterProtocolVersion(pub u32);
@@ -20,18 +20,17 @@ impl fmt::Display for ClusterProtocolVersion {
     }
 }
 
-/// Version this build speaks by default.
+/// Version this build speaks by default
 pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(2);
 
-/// Range this build accepts. Version 1 keeps the old cancellation wire shape
-/// available during rolling updates
+/// Range this build accepts
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {
-    min: ClusterProtocolVersion(1),
+    min: CLUSTER_PROTOCOL_VERSION,
     max: CLUSTER_PROTOCOL_VERSION,
 };
 
 /// Inclusive range of accepted cluster protocol versions. `min <= max` holds
-/// for every value built by [`ProtocolRange::new`] or decoded from JSON.
+/// for every value built by [`ProtocolRange::new`] or decoded from JSON
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct ProtocolRange {
     min: ClusterProtocolVersion,
@@ -39,25 +38,25 @@ pub struct ProtocolRange {
 }
 
 impl ProtocolRange {
-    /// Build a range. `None` when `min > max`.
+    /// Build a range. `None` when `min > max`
     #[must_use]
     pub fn new(min: ClusterProtocolVersion, max: ClusterProtocolVersion) -> Option<Self> {
         (min <= max).then_some(Self { min, max })
     }
 
-    /// Lowest accepted version.
+    /// Lowest accepted version
     #[must_use]
     pub fn min(&self) -> ClusterProtocolVersion {
         self.min
     }
 
-    /// Highest accepted version.
+    /// Highest accepted version
     #[must_use]
     pub fn max(&self) -> ClusterProtocolVersion {
         self.max
     }
 
-    /// Highest version both ranges accept.
+    /// Highest version both ranges accept
     #[must_use]
     pub fn negotiate(&self, remote: &ProtocolRange) -> Compatibility {
         let high = self.max.min(remote.max);
@@ -95,28 +94,28 @@ impl<'de> Deserialize<'de> for ProtocolRange {
     }
 }
 
-/// Result of comparing two protocol ranges.
+/// Result of comparing two protocol ranges
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Compatibility {
-    /// The machines share at least one version.
+    /// The machines share at least one version
     Compatible {
-        /// Highest shared version; use it for requests.
+        /// Highest shared version; use it for requests
         version: ClusterProtocolVersion,
     },
     /// No shared version. The machine stays visible, but remote operations
-    /// return a typed compatibility error.
+    /// return a typed compatibility error
     Incompatible {
-        /// Local accepted range.
+        /// Local accepted range
         local: ProtocolRange,
-        /// Remote accepted range.
+        /// Remote accepted range
         remote: ProtocolRange,
     },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ClusterProtocolVersion, Compatibility, ProtocolRange};
 
     fn range(min: u32, max: u32) -> ProtocolRange {
         ProtocolRange::new(ClusterProtocolVersion(min), ClusterProtocolVersion(max)).unwrap()

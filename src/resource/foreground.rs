@@ -9,9 +9,9 @@
 //!   and neither its name nor its resolved target names a known shell,
 //!   interpreter, program launcher, detach tool, container client, or remote
 //!   client. Those programs hide the real workload in their arguments or in code
-//!   that Homebased does not inspect, or they can move it out of the group.
-//! - The maintained direct-segment trainer, only for background return work.
-//!   Its ownership lock, not its process group, is the release witness.
+//!   that Homebased does not inspect, or they can move it out of the group
+//! - The maintained direct-segment trainer, only for background return work
+//!   Its ownership lock, not its process group, is the release witness
 //!
 //! The rule is conservative, not complete. A native executable can still start
 //! work in another session, and a copied or hard-linked launcher keeps no
@@ -370,7 +370,13 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::*;
+    use super::{CommandOwnershipContract, foreground_argv, inspect_foreground_entry_point};
+    use crate::invocation::CommandLine;
+    use crate::resource::ResourceTaskOwnershipRisk::{
+        self, ContainerClient, DetachedLauncher, Interpreter, ProgramLauncher, RemoteShell,
+        ShellWrapper,
+    };
+    use std::path::Path;
 
     fn argv(parts: &[&str]) -> CommandLine {
         CommandLine::try_from_argv(parts.iter().map(|part| (*part).to_owned()).collect()).unwrap()

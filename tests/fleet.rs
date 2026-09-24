@@ -1,5 +1,5 @@
 //! Multi-daemon fleet foundation tests: real `daemon serve` processes with
-//! separate state directories, probed by an in-process fleet runtime.
+//! separate state directories, probed by an in-process fleet runtime
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -33,7 +33,7 @@ use homebased::submission::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-/// One `homebased daemon serve` process on a fixed loopback port.
+/// One `homebased daemon serve` process on a fixed loopback port
 struct Daemon {
     _dir: TempDir,
     home: PathBuf,
@@ -271,7 +271,7 @@ async fn post_execution(
             "/v1/cluster/executions",
             &serde_json::json!({
                 "api_version": 1,
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(),
                 "task": task,
@@ -284,7 +284,7 @@ async fn post_execution(
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     if status == 200 {
         assert_eq!(body["api_version"], 1);
-        assert_eq!(body["protocol_version"], 1);
+        assert_eq!(body["protocol_version"], 2);
     }
     (status, body)
 }
@@ -1022,12 +1022,12 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     let origin = Daemon::start("reject-origin", true);
     let executor = Daemon::start("reject-executor", true);
     wait_for_probe(&executor.address()).await;
-    let legacy_probe = ClusterClient::default()
+    let probe = ClusterClient::default()
         .get(&executor.address(), "/v1/cluster/machine")
         .await
         .unwrap();
-    assert_eq!(legacy_probe.status.as_u16(), 200);
-    let advertisement: Value = serde_json::from_slice(&legacy_probe.body).unwrap();
+    assert_eq!(probe.status.as_u16(), 200);
+    let advertisement: Value = serde_json::from_slice(&probe.body).unwrap();
     assert_eq!(advertisement["api_version"], 1);
 
     let task = TaskId::new();
@@ -1037,7 +1037,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 1, "destination_machine": origin.machine_id(),
+                "api_version": 1, "protocol_version": 2, "destination_machine": origin.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task, "spec": spec
             }),
         )
@@ -1081,7 +1081,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     for api_version in [Some(99), None] {
         let task = TaskId::new();
         let mut request = serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "destination_machine": executor.machine_id(),
             "origin_machine": origin.machine_id(),
             "task": task,
@@ -1117,7 +1117,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions/abandon",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 1, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task
             }),
         )
@@ -1126,7 +1126,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     assert_eq!(abandon.status.as_u16(), 200);
     let abandon_body: Value = serde_json::from_slice(&abandon.body).unwrap();
     assert_eq!(abandon_body["api_version"], 1);
-    assert_eq!(abandon_body["protocol_version"], 1);
+    assert_eq!(abandon_body["protocol_version"], 2);
     let (status, body) = post_execution(&executor, &origin, task, &spec).await;
     assert_eq!(status, 200);
     assert_eq!(body["identity"]["type"], "rejected");
@@ -1159,7 +1159,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 1, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": leaked_context,
                 "spec": remote_spec(&executor, vec!["/bin/echo", "never"]),
                 "callback_context": { "cwd": "/origin-only" }
@@ -1271,7 +1271,7 @@ async fn remote_acceptance_and_abandon_have_one_winner() {
     let client = ClusterClient::default();
     let address = executor.address();
     let abandon_body = serde_json::json!({
-        "api_version": 1, "protocol_version": 1, "destination_machine": executor.machine_id(),
+        "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
         "origin_machine": origin.machine_id(), "task": task
     });
     let abandon = client.post_json(&address, "/v1/cluster/executions/abandon", &abandon_body);
@@ -1306,7 +1306,7 @@ async fn lost_remote_response_retries_without_second_child() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 1, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task, "spec": spec
             }),
         )
@@ -1396,7 +1396,7 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
             &origin.address(),
             "/v1/cluster/events",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 1,
+                "api_version": 1, "protocol_version": 2,
                 "destination_machine": origin.machine_id(), "event": event
             }),
         )
@@ -1405,7 +1405,7 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
     assert_eq!(response.status.as_u16(), 200);
     let acknowledgement: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(acknowledgement["api_version"], 1);
-    assert_eq!(acknowledgement["protocol_version"], 1);
+    assert_eq!(acknowledgement["protocol_version"], 2);
     origin.stop();
     add_peer(&executor, &origin);
     std::thread::sleep(Duration::from_secs(2));
@@ -1664,7 +1664,7 @@ async fn wait_for_probe(address: &MachineAddress) {
 }
 
 /// In-process observer with its own identity and peer file. Its background
-/// tasks end with the test's tokio runtime.
+/// tasks end with the test's tokio runtime
 struct Observer {
     _dir: TempDir,
     _runtime: FleetRuntime,
@@ -1888,7 +1888,7 @@ fn config_validate_reports_fleet_and_rejects_bad_files() {
 }
 
 /// Uses real multicast on the host network, so it is opt-in:
-/// `cargo test --test fleet -- --ignored mdns`.
+/// `cargo test --test fleet -- --ignored mdns`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "uses host multicast networking"]
 async fn mdns_discovers_a_lan_peer() {
@@ -2540,14 +2540,6 @@ async fn third_machine_refuses_to_cancel_without_the_origin_route() {
     }));
     origin.stop();
 
-    let (status, legacy) = post_legacy_cancel_wire(
-        &executor,
-        cancel_identity(&viewer, &origin, &executor, task),
-    )
-    .await;
-    assert_ne!(status, 200, "{legacy}");
-    assert_eq!(legacy["error"]["code"], "cluster_lookup_incomplete");
-
     let (ok, local_body) = inspect_cli(&executor, "cancel", task);
     assert!(!ok, "{local_body}");
     assert_eq!(local_body["error"]["code"], "cluster_lookup_incomplete");
@@ -2599,7 +2591,7 @@ async fn post_cancel_wire(executor: &Daemon, request: CancellationRequestIdentit
                 "api_version": 1,
                 "protocol_version": 2,
                 "request": request,
-                "target": {"type": "execution", "request_id": null},
+                "target": {"type": "execution", "request_id": RequestId::new()},
             }),
         )
         .await
@@ -2609,31 +2601,6 @@ async fn post_cancel_wire(executor: &Daemon, request: CancellationRequestIdentit
     if status == 200 {
         assert_eq!(body["api_version"], 1);
         assert_eq!(body["protocol_version"], 2);
-    }
-    (status, body)
-}
-
-async fn post_legacy_cancel_wire(
-    executor: &Daemon,
-    request: CancellationRequestIdentity,
-) -> (u16, Value) {
-    let response = ClusterClient::default()
-        .post_json(
-            &executor.address(),
-            "/v1/cluster/executions/cancel",
-            &serde_json::json!({
-                "api_version": 1,
-                "protocol_version": 1,
-                "request": request,
-            }),
-        )
-        .await
-        .unwrap();
-    let status = response.status.as_u16();
-    let body: Value = serde_json::from_slice(&response.body).unwrap();
-    if status == 200 {
-        assert_eq!(body["api_version"], 1);
-        assert_eq!(body["protocol_version"], 1);
     }
     (status, body)
 }
@@ -2802,7 +2769,12 @@ async fn cancellation_rejects_wrong_destination_and_version_without_tombstone() 
         .post_json(
             &executor.address(),
             "/v1/cluster/executions/cancel",
-            &serde_json::json!({ "api_version": 1, "protocol_version": 99, "request": request }),
+            &serde_json::json!({
+                "api_version": 1,
+                "protocol_version": 99,
+                "request": request,
+                "target": {"type": "execution", "request_id": RequestId::new()},
+            }),
         )
         .await
         .unwrap();
@@ -3124,7 +3096,7 @@ async fn task_log_never_reads_a_guessed_directory_without_the_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_message_retry_accepts_protocol_change_and_reuses_receipt() {
+async fn direct_message_retry_reuses_receipt() {
     use std::os::unix::fs::PermissionsExt;
 
     let mut receiver = Daemon::start("message-protocol-receiver", true);
@@ -3158,9 +3130,9 @@ async fn direct_message_retry_accepts_protocol_change_and_reuses_receipt() {
     .unwrap();
 
     let message_id = MessageId::new();
-    let mut request = serde_json::json!({
+    let request = serde_json::json!({
         "api_version": 1,
-        "protocol_version": 1,
+        "protocol_version": 2,
         "message_id": message_id,
         "destination_machine": receiver.machine_id(),
         "source": {
@@ -3183,11 +3155,10 @@ async fn direct_message_retry_accepts_protocol_change_and_reuses_receipt() {
         .unwrap()
         .message_delivery(message_id)
         .unwrap();
-    assert_eq!(first_attempt.attempt.unwrap().request.protocol_version, 1);
+    assert_eq!(first_attempt.attempt.unwrap().request.protocol_version, 2);
     assert!(first_attempt.receipt.is_none());
 
     fs::remove_file(fail_marker).unwrap();
-    request["protocol_version"] = serde_json::json!(2);
     let (status, delivered) = post_message(&receiver, &request).await;
     assert_eq!(status, 200, "{delivered}");
     assert_eq!(delivered["protocol_version"], 2);
@@ -3199,11 +3170,9 @@ async fn direct_message_retry_accepts_protocol_change_and_reuses_receipt() {
     assert_eq!(delivery.attempt.unwrap().request.protocol_version, 2);
     assert_eq!(delivery.receipt.unwrap().protocol_version, 2);
 
-    request["protocol_version"] = serde_json::json!(1);
     let (status, retried) = post_message(&receiver, &request).await;
     assert_eq!(status, 200, "{retried}");
-    assert_eq!(retried["protocol_version"], 1);
-    assert_eq!(retried["receipt"]["protocol_version"], 1);
+    assert_eq!(retried["receipt"], delivered["receipt"]);
     let saved = Store::open(&receiver.home.join("homebased.sqlite"))
         .unwrap()
         .message_delivery(message_id)
@@ -4111,7 +4080,10 @@ impl FleetTrainer {
     }
 
     /// Write the running attempt's request and hold its ownership lock
-    fn hold_attempt(&self, binding: &homebased::resource::watcher::AttemptBinding) -> fs::File {
+    fn hold_attempt(
+        &self,
+        binding: &homebased::resource::trainer_publication::AttemptBinding,
+    ) -> fs::File {
         let attempt = self.runtime_root.join("attempts").join(&binding.attempt_id);
         fs::create_dir_all(&attempt).unwrap();
         let request = serde_json::json!({
@@ -4152,8 +4124,8 @@ impl FleetTrainer {
     }
 }
 
-fn attempt_binding(attempt: &str) -> homebased::resource::watcher::AttemptBinding {
-    homebased::resource::watcher::AttemptBinding {
+fn attempt_binding(attempt: &str) -> homebased::resource::trainer_publication::AttemptBinding {
+    homebased::resource::trainer_publication::AttemptBinding {
         campaign_id: "campaign-a".into(),
         campaign_revision_id: "revision-a".into(),
         task_id: "trainer-task-a".into(),
@@ -4278,7 +4250,7 @@ impl RemoteBackground {
     async fn bind_attempt(
         &self,
         task: TaskId,
-        attempt: &homebased::resource::watcher::AttemptBinding,
+        attempt: &homebased::resource::trainer_publication::AttemptBinding,
     ) -> Result<Value, homebased::error::AppError> {
         socket(&self.supervisor)
             .post(

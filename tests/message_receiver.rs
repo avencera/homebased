@@ -201,11 +201,7 @@ fn write_session(user_home: &Path, name: &str, thread: ThreadId, cwd: &Path) {
             "cwd": cwd,
         }
     });
-    fs::write(
-        path,
-        format!("{}\n{{\"type\":\"event_msg\"}}\n", first_line),
-    )
-    .unwrap();
+    fs::write(path, format!("{first_line}\n{{\"type\":\"event_msg\"}}\n")).unwrap();
 }
 
 fn request(id: MessageId, destination: MachineId, recipient: Value, body: &str) -> Value {
@@ -587,12 +583,10 @@ fn receiver_queues_resource_notice_by_attempt_on_the_exact_thread() {
     unknown["unknown"] = json!(true);
     assert!((400..500).contains(&daemon.send_notice(&unknown).status));
 
-    let invalid = notice_request(
-        daemon.machine_id(),
-        exact_thread,
-        DeliveryAttemptId::from_uuid(Uuid::nil()),
-    );
-    assert_eq!(daemon.send_notice(&invalid).status, 400);
+    let mut invalid = notice_request(daemon.machine_id(), exact_thread, DeliveryAttemptId::new());
+    invalid["attempt_id"] = json!(Uuid::nil());
+    // a nil identity cannot decode, so the body is refused before validation
+    assert_eq!(daemon.send_notice(&invalid).status, 422);
     assert_eq!(daemon.queue_calls().len(), 3);
 }
 

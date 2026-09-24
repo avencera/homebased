@@ -1,4 +1,4 @@
-//! SQLite source of truth: task state, sequenced events, and callback results.
+//! SQLite source of truth: task state, sequenced events, and callback results
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -38,7 +38,9 @@ pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
 pub(crate) use resource::VerifiedReleaseProof;
 #[cfg(test)]
-pub(crate) use resource::test_support::mark_request_assigned_for_race;
+pub(crate) use resource::test_support::{
+    mark_request_assigned_for_race, unreceipted_release_provenance,
+};
 pub(crate) use resource::{
     AcceptedActionTask, EndedRestoreResolution, PreparedReturnTask,
     RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
@@ -57,10 +59,15 @@ pub(crate) use resource::{
     ResourceReadModel, SupervisorReplacement, open_action_id,
 };
 
+/// Released version 2 schema
+///
+/// Fresh databases apply this schema and then the version 2 migration, so new
+/// and upgraded databases share one path to the current schema
+///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
-/// in SQLite's signed INTEGER without a lossy cast.
-const SCHEMA: &str = r"
+/// in SQLite's signed INTEGER without a lossy cast
+const BASE_SCHEMA: &str = r"
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
@@ -79,9 +86,7 @@ CREATE TABLE tasks (
     pid INTEGER,
     cancel_requested_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    project_root TEXT,
-    process_group_exit_evidence TEXT
+    updated_at TEXT NOT NULL
 );
 
 CREATE INDEX tasks_status ON tasks(status);
@@ -97,6 +102,24 @@ CREATE TABLE reports (
     PRIMARY KEY (task_id, seq),
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
+";
+
+/// Schema version 1 had no `name` column
+const MIGRATE_1_TO_2: &str = r"
+ALTER TABLE tasks ADD COLUMN name TEXT;
+";
+
+/// Schema version of the v0.4.0 release
+const RELEASED_V0_4_SCHEMA_VERSION: i64 = 27;
+
+/// Everything added after the released version 2 schema, except the resource
+/// tables that `RESOURCE_SCHEMA` owns
+///
+/// Versions 3 through 26 were never released, so a version 2 database moves to
+/// the current schema in one step
+const MIGRATE_2_TO_CURRENT: &str = r"
+ALTER TABLE tasks ADD COLUMN project_root TEXT;
+ALTER TABLE tasks ADD COLUMN process_group_exit_evidence TEXT;
 
 CREATE TABLE report_notification_intents (
     task_id TEXT NOT NULL,
@@ -182,12 +205,28 @@ CREATE TABLE cancellation_requests (
     task_id TEXT PRIMARY KEY,
     request_json TEXT NOT NULL
 );
+
 CREATE TABLE executor_cancellations (
     cancellation_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     receipt_json TEXT NOT NULL
 );
 CREATE INDEX executor_cancellations_task ON executor_cancellations(task_id);
+
+CREATE TABLE message_attempts (
+    message_id TEXT PRIMARY KEY,
+    attempt_json TEXT NOT NULL
+);
+
+CREATE TABLE message_receipts (
+    message_id TEXT PRIMARY KEY REFERENCES message_attempts(message_id),
+    receipt_json TEXT NOT NULL
+);
+
+CREATE TABLE outbound_message_bindings (
+    message_id TEXT PRIMARY KEY,
+    binding_json TEXT NOT NULL
+);
 ";
 
 const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
@@ -196,263 +235,71 @@ const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeo
     process_group_exit_evidence
  FROM tasks";
 
-const MIGRATE_16_TO_17: &str = r"
-ALTER TABLE tasks ADD COLUMN process_group_exit_evidence TEXT;
-";
-
-fn migrate_16_to_17(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let column_exists: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM pragma_table_info('tasks')
-            WHERE name = 'process_group_exit_evidence'
-        )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !column_exists {
-        conn.execute_batch(MIGRATE_16_TO_17)?;
-    }
-    Ok(())
-}
-
-const MIGRATE_18_TO_19: &str = r"
-CREATE TABLE trainer_attempt_associations_v19 (
-    task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id),
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    authority_machine TEXT NOT NULL,
-    association_json TEXT NOT NULL CHECK (
-        json_valid(association_json)
-        AND COALESCE(json_type(association_json) = 'object', 0)
-        AND COALESCE(json_extract(association_json, '$.resource_id') = resource_id, 0)
-        AND COALESCE(json_extract(association_json, '$.authority_machine') = authority_machine, 0)
-        AND COALESCE(json_extract(association_json, '$.task_id') = task_id, 0)
-        AND COALESCE(json_type(association_json, '$.canonical_runtime_root') = 'text', 0)
-        AND COALESCE(json_type(association_json, '$.attempt_binding') = 'object', 0)
-        AND COALESCE(json_type(association_json, '$.request_sha256') = 'text', 0)
-        AND COALESCE(json_type(association_json, '$.ownership_lock_identity') = 'object', 0)
-        AND COALESCE(json_type(association_json, '$.normalized_spec_sha256') = 'text', 0)
-    )
-);
-INSERT INTO trainer_attempt_associations_v19 (
-    task_id, resource_id, authority_machine, association_json
-)
-SELECT task_id, resource_id, authority_machine, association_json
-FROM trainer_attempt_associations;
-DROP TABLE trainer_attempt_associations;
-ALTER TABLE trainer_attempt_associations_v19 RENAME TO trainer_attempt_associations;
-";
-
-const MIGRATE_20_TO_21: &str = r"
-CREATE TABLE resource_release_checkpoint_states_v21 (
-    action_id TEXT PRIMARY KEY,
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    state_json TEXT NOT NULL CHECK (
-        json_valid(state_json)
-        AND COALESCE(json_type(state_json) = 'object', 0)
-        AND COALESCE(json_type(state_json, '$.action') = 'object', 0)
-        AND COALESCE(json_type(state_json, '$.phase') = 'object', 0)
-        AND COALESCE(json_extract(state_json, '$.action.action_id') = action_id, 0)
-        AND COALESCE(json_extract(state_json, '$.action.resource_id') = resource_id, 0)
-        AND COALESCE(json_extract(state_json, '$.phase.type') IN (
-            'watcher_binding_pending', 'baseline_captured', 'stop_reserved', 'cancellation_committed'
-        ), 0)
-    )
-);
-INSERT INTO resource_release_checkpoint_states_v21 (action_id, resource_id, state_json)
-SELECT action_id, resource_id, state_json FROM resource_release_checkpoint_states;
-DROP TABLE resource_release_checkpoint_states;
-ALTER TABLE resource_release_checkpoint_states_v21 RENAME TO resource_release_checkpoint_states;
-CREATE INDEX resource_release_checkpoint_states_resource
-    ON resource_release_checkpoint_states(resource_id, action_id);
-";
-
-/// Restore closure receipts gained the native foreground end basis in version 26
+/// Operator attestation receipts gained the Restoring return outcomes after v0.4.0
 ///
-/// SQLite cannot change a CHECK constraint in place, so the table is rebuilt.
-/// Existing receipts keep their bytes
-const MIGRATE_25_TO_26: &str = r"
-CREATE TABLE resource_restore_closures_v26 (
-    action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
+/// SQLite cannot change a CHECK constraint in place, so the table is rebuilt
+/// Existing receipts keep their bytes, and `RESOURCE_SCHEMA` recreates the
+/// resource index that the dropped table owned
+const MIGRATE_27_TO_28: &str = r"
+CREATE TABLE resource_operator_attestations_v28 (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
     task_id TEXT NOT NULL UNIQUE,
+    preceding_loan TEXT,
+    preceding_launch TEXT,
     receipt_json TEXT NOT NULL CHECK (
         json_valid(receipt_json)
         AND COALESCE(json_type(receipt_json) = 'object', 0)
-        AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
-            'confirmed_running', 'foreground_ended', 'supervisor_resolved_end'
+        AND COALESCE(json_extract(receipt_json, '$.attestation.operation_id') = operation_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.resource_id') = resource_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.attestation.task_id') = task_id, 0)
+        AND COALESCE(
+            json_extract(receipt_json, '$.attestation.confirmation') = 'operator_confirmed_gpu_free',
+            0
+        )
+        AND COALESCE(length(trim(json_extract(receipt_json, '$.attestation.observation'))) > 0, 0)
+        AND COALESCE(json_type(receipt_json, '$.evidence') = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.outcome.type') IN (
+            'release_resolved_serving', 'release_resolved_return_required',
+            'idle_serving', 'idle_boundary',
+            'restore_closed_serving', 'restore_closed_idle_boundary'
         ), 0)
     )
 );
-INSERT INTO resource_restore_closures_v26 (action_id, task_id, receipt_json)
-SELECT action_id, task_id, receipt_json FROM resource_restore_closures;
-DROP TABLE resource_restore_closures;
-ALTER TABLE resource_restore_closures_v26 RENAME TO resource_restore_closures;
+INSERT INTO resource_operator_attestations_v28
+    (operation_id, resource_id, task_id, preceding_loan, preceding_launch, receipt_json)
+SELECT operation_id, resource_id, task_id, preceding_loan, preceding_launch, receipt_json
+FROM resource_operator_attestations ORDER BY rowid;
+DROP TABLE resource_operator_attestations;
+ALTER TABLE resource_operator_attestations_v28 RENAME TO resource_operator_attestations;
 ";
 
-/// Schema version 1 had no `name` column.
-const MIGRATE_1_TO_2: &str = r"
-ALTER TABLE tasks ADD COLUMN name TEXT;
-";
-
-const MIGRATE_2_TO_3: &str = r"
-CREATE TABLE origin_routes (
-    request_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL UNIQUE,
-    execution_machine TEXT NOT NULL,
-    spec_json TEXT NOT NULL,
-    route_json TEXT NOT NULL
-);
-CREATE TABLE executor_identities (
-    task_id TEXT PRIMARY KEY,
-    origin_machine TEXT NOT NULL,
-    identity_json TEXT NOT NULL
-);
-";
-
-const MIGRATE_3_TO_4: &str = r"
-CREATE TABLE executor_outbox (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    origin_machine TEXT NOT NULL,
-    execution_machine TEXT NOT NULL,
-    event_json TEXT NOT NULL,
-    notification_required INTEGER NOT NULL CHECK (notification_required IN (0, 1)),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'acknowledged')),
-    PRIMARY KEY (task_id, seq)
-);
-CREATE TABLE executor_event_cursors (
-    task_id TEXT PRIMARY KEY,
-    last_seq INTEGER NOT NULL CHECK (last_seq >= 0)
-);
-CREATE TABLE origin_inbox (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    origin_machine TEXT NOT NULL,
-    execution_machine TEXT NOT NULL,
-    event_json TEXT NOT NULL,
-    notification_required INTEGER NOT NULL CHECK (notification_required IN (0, 1)),
-    delivery_json TEXT NOT NULL,
-    PRIMARY KEY (task_id, seq)
-);
-CREATE INDEX executor_outbox_pending ON executor_outbox(state, task_id, seq);
-CREATE INDEX origin_inbox_order ON origin_inbox(task_id, seq);
-";
-
-const MIGRATE_4_TO_5: &str = r"
-CREATE TABLE executor_event_routes (
-    task_id TEXT PRIMARY KEY,
-    state TEXT NOT NULL CHECK (state = 'orphaned'),
-    reason TEXT NOT NULL
-);
-";
-
-const MIGRATE_5_TO_6: &str = r"
-CREATE TABLE cancellation_requests (
-    task_id TEXT PRIMARY KEY,
-    request_json TEXT NOT NULL
-);
-CREATE TABLE executor_cancellations (
-    cancellation_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
-    receipt_json TEXT NOT NULL
-);
-CREATE INDEX executor_cancellations_task ON executor_cancellations(task_id);
-";
-
-const MIGRATE_8_TO_9: &str = r"
-ALTER TABLE tasks ADD COLUMN project_root TEXT;
-";
-
-const MIGRATE_10_TO_11: &str = r"
-CREATE TABLE IF NOT EXISTS report_notification_intents (
-    task_id TEXT NOT NULL,
-    report_seq INTEGER NOT NULL,
-    requested_at TEXT NOT NULL,
-    PRIMARY KEY (task_id, report_seq),
-    FOREIGN KEY (task_id, report_seq) REFERENCES reports(task_id, seq)
-);
-";
-
-const MESSAGE_SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS message_attempts (
-    message_id TEXT PRIMARY KEY,
-    attempt_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS message_receipts (
-    message_id TEXT PRIMARY KEY REFERENCES message_attempts(message_id),
-    receipt_json TEXT NOT NULL
-);
-";
-
-const MIGRATE_12_TO_13: &str = r"
-CREATE TABLE IF NOT EXISTS outbound_message_bindings (
-    message_id TEXT PRIMARY KEY,
-    binding_json TEXT NOT NULL
-);
-";
-
-const MIGRATE_13_TO_14: &str = r"
-UPDATE executor_outbox
-SET acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE state = 'acknowledged' AND acknowledged_at IS NULL;
-
-UPDATE origin_inbox
-SET settled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE settled_at IS NULL
-  AND json_extract(delivery_json, '$.type') IN ('not_required', 'delivered', 'delivery_failed');
-
-CREATE INDEX IF NOT EXISTS executor_outbox_retention ON executor_outbox(acknowledged_at, task_id, seq);
-CREATE INDEX IF NOT EXISTS origin_inbox_retention ON origin_inbox(settled_at, task_id, seq);
-
-CREATE TABLE IF NOT EXISTS executor_event_receipts (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_digest TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
-    PRIMARY KEY (task_id, seq)
-);
-
-CREATE TABLE IF NOT EXISTS origin_event_receipts (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_digest TEXT NOT NULL,
-    delivery_json TEXT NOT NULL,
-    terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
-    PRIMARY KEY (task_id, seq)
-);
-";
-
-fn migrate_13_to_14(connection: &Connection) -> Result<(), rusqlite::Error> {
-    for (table, column, statement) in [
-        (
-            "executor_outbox",
-            "acknowledged_at",
-            "ALTER TABLE executor_outbox ADD COLUMN acknowledged_at TEXT;",
-        ),
-        (
-            "origin_inbox",
-            "settled_at",
-            "ALTER TABLE origin_inbox ADD COLUMN settled_at TEXT;",
-        ),
-    ] {
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info(?1) WHERE name=?2
-             )",
-            params![table, column],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            connection.execute_batch(statement)?;
-        }
-    }
-
-    connection.execute_batch(MIGRATE_13_TO_14)
+/// Move a released version 2 database to the current schema
+fn migrate_2_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_2_TO_CURRENT)?;
+    conn.execute_batch(RESOURCE_SCHEMA)
 }
 
-/// Open or create the database.
+/// Move a v0.4.0 database to the current schema
+fn migrate_27_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_27_TO_28)?;
+    conn.execute_batch(RESOURCE_SCHEMA)
+}
+
+/// Why `Store::open` refuses a database version
+fn unsupported_schema_version(version: i64) -> AppError {
+    let message = if (3..RELEASED_V0_4_SCHEMA_VERSION).contains(&version) {
+        format!(
+            "schema user_version={version} came from an unreleased development build and has no \
+             migration; move the database aside to start over"
+        )
+    } else {
+        format!("unsupported schema user_version={version}")
+    };
+    AppError::Internal { message }
+}
+
+/// Open or create the database
 pub struct Store {
     conn: Connection,
     tasks_dir: std::path::PathBuf,
@@ -571,7 +418,10 @@ pub(super) fn validate_local_task_acceptance(
         || callback.env != row.env
         || callback.cwd != row.cwd
         || !row.cwd.is_absolute()
-        || callback.codex.path().is_none_or(|path| !path.is_absolute())
+        || callback
+            .codex
+            .path()
+            .is_some_and(|path| !path.is_absolute())
     {
         return Err(AppError::Internal {
             message: "local task and accepted origin spec do not match".into(),
@@ -651,7 +501,7 @@ pub(crate) struct RemoteOriginTask {
     /// Authority machine that executes the task
     pub(crate) execution_machine: MachineId,
     /// Supervisor thread named by the spec
-    pub(crate) thread: crate::domain::ThreadId,
+    pub(crate) thread: ThreadId,
     /// Whether the task is the release watcher that its own action reserved
     pub(crate) reserved_watcher: bool,
 }
@@ -762,32 +612,32 @@ pub(crate) fn insert_remote_origin_task_records_on(
     Ok(())
 }
 
-/// Both machine owners of one accepted execution.
+/// Both machine owners of one accepted execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskOwners {
-    /// Machine that owns callbacks for the task.
+    /// Machine that owns callbacks for the task
     pub origin_machine: MachineId,
-    /// Machine that runs the task.
+    /// Machine that runs the task
     pub execution_machine: MachineId,
 }
 
-/// Dashboard metadata read with a task row.
+/// Dashboard metadata read with a task row
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPresentation {
-    /// Task identity.
+    /// Task identity
     pub id: TaskId,
-    /// Nearest Git worktree root, captured when the executor accepted the task.
+    /// Nearest Git worktree root, captured when the executor accepted the task
     pub project_root: Option<PathBuf>,
-    /// Owners from an accepted executor identity. Rejected and legacy tasks have none.
+    /// Owners from an accepted executor identity. Rejected and legacy tasks have none
     pub owners: Option<TaskOwners>,
-    /// Typed origin-inbox ownership or legacy status for this task row.
+    /// Typed origin-inbox ownership or legacy status for this task row
     pub terminal_callback: TerminalCallbackProjection,
-    /// Whether this task's inactivity reminder reached the origin queue.
+    /// Whether this task's inactivity reminder reached the origin queue
     pub attention_delivered: bool,
 }
 
 impl Store {
-    /// Open the SQLite file at `path`, applying the initial schema when empty.
+    /// Open the SQLite file at `path`, applying the initial schema when empty
     pub fn open(path: &Path) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -799,127 +649,19 @@ impl Store {
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                transaction.execute_batch(SCHEMA)?;
-            }
-            1 => {
-                transaction.execute_batch(MIGRATE_1_TO_2)?;
-                transaction.execute_batch(MIGRATE_2_TO_3)?;
-                transaction.execute_batch(MIGRATE_3_TO_4)?;
-                transaction.execute_batch(MIGRATE_4_TO_5)?;
-                transaction.execute_batch(MIGRATE_5_TO_6)?;
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            2 => {
-                transaction.execute_batch(MIGRATE_2_TO_3)?;
-                transaction.execute_batch(MIGRATE_3_TO_4)?;
-                transaction.execute_batch(MIGRATE_4_TO_5)?;
-                transaction.execute_batch(MIGRATE_5_TO_6)?;
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            3 => {
-                transaction.execute_batch(MIGRATE_3_TO_4)?;
-                transaction.execute_batch(MIGRATE_4_TO_5)?;
-                transaction.execute_batch(MIGRATE_5_TO_6)?;
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            4 => {
-                transaction.execute_batch(MIGRATE_4_TO_5)?;
-                transaction.execute_batch(MIGRATE_5_TO_6)?;
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            5 => {
-                transaction.execute_batch(MIGRATE_5_TO_6)?;
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            6..=8 => {
-                transaction.execute_batch(MIGRATE_8_TO_9)?;
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            9 => {
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            10 => {
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            11 => {
-                transaction.execute_batch(MIGRATE_10_TO_11)?;
-            }
-            12 => {
-                transaction.execute_batch(MIGRATE_12_TO_13)?;
-            }
-            13 => {
-                migrate_13_to_14(&transaction)?;
-            }
-            14 => {
-                // resource schema hook below installs the v16 receipt table
-            }
-            15 => {
-                // resource schema hook below installs the v16 cancellation receipt table
-            }
-            16 => {}
-            17 => {
-                // resource schema hook below installs durable trainer associations
-            }
-            18 => {
-                transaction.execute_batch(MIGRATE_18_TO_19)?;
-            }
-            19 => {}
-            20 => {
-                transaction.execute_batch(MIGRATE_20_TO_21)?;
-            }
-            21 => {
-                // resource schema hook below installs the return decision, closure, and
-                // remote action-task receipts
-            }
-            22 => {
-                // resource schema hook below installs resource control operations
-                transaction.execute_batch(MIGRATE_25_TO_26)?;
-            }
-            23 => {
-                // resource schema hook below installs background launch and idle opening receipts
-                transaction.execute_batch(MIGRATE_25_TO_26)?;
-            }
-            24 => {
-                // resource schema hook below installs and backfills registration receipts
-                transaction.execute_batch(MIGRATE_25_TO_26)?;
-            }
-            25 => {
-                transaction.execute_batch(MIGRATE_25_TO_26)?;
-            }
-            26 => {
-                // resource schema hook below installs operator attestation receipts
-            }
-            v if v == SCHEMA_VERSION => {}
-            other => {
-                return Err(AppError::Internal {
-                    message: format!("unsupported schema user_version={other}"),
-                });
-            }
-        }
-        if version < SCHEMA_VERSION {
-            if version > 0 {
-                migrate_16_to_17(&transaction)?;
-            }
-            transaction.execute_batch(RESOURCE_SCHEMA)?;
-            if version > 0 {
-                crate::resource::store::backfill_resource_registration_receipts(&transaction)
-                    .map_err(|error| AppError::Internal {
-                        message: format!("resource registration receipt migration: {error}"),
-                    })?;
-            }
-            transaction.execute_batch(MESSAGE_SCHEMA)?;
-            if version < 12 {
-                transaction.execute_batch(MIGRATE_12_TO_13)?;
-            }
-            if version > 0 && version < 13 {
-                migrate_13_to_14(&transaction)?;
+        if version != SCHEMA_VERSION {
+            match version {
+                0 => {
+                    transaction.execute_batch(BASE_SCHEMA)?;
+                    migrate_2_to_current(&transaction)?;
+                }
+                1 => {
+                    transaction.execute_batch(MIGRATE_1_TO_2)?;
+                    migrate_2_to_current(&transaction)?;
+                }
+                2 => migrate_2_to_current(&transaction)?,
+                RELEASED_V0_4_SCHEMA_VERSION => migrate_27_to_current(&transaction)?,
+                other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -928,7 +670,7 @@ impl Store {
         Ok(Self { conn, tasks_dir })
     }
 
-    /// Insert a queued task.
+    /// Insert a queued task
     pub fn insert_task(&self, row: &TaskRow) -> Result<(), AppError> {
         self.insert_task_with_project_root(row, None)
     }
@@ -947,12 +689,12 @@ impl Store {
         row: &TaskRow,
         spec: &NormalizedSpec,
         machine: MachineId,
-        codex: std::path::PathBuf,
+        codex: CallbackExecutable,
     ) -> Result<(), AppError> {
         let callback = CallbackContext {
             env: row.env.clone(),
             cwd: row.cwd.clone(),
-            codex: CallbackExecutable::available(codex),
+            codex,
         };
         self.immediate(|| {
             insert_local_task_records_on(
@@ -998,13 +740,7 @@ impl Store {
                         record.has_valid_spec_owners()
                             && record.origin_machine == origin
                             && record.execution_machine == execution
-                            && match record.current_spec() {
-                                Some(saved_spec) => {
-                                    serde_json::to_value(saved_spec)?
-                                        == serde_json::to_value(spec)?
-                                }
-                                None => false,
-                            }
+                            && record.current_spec() == Some(spec)
                     }
                     ExecutorIdentity::Rejected(record) => record.origin_machine == origin
                         && record.execution_machine == execution,
@@ -1042,11 +778,11 @@ impl Store {
         })
     }
 
-    /// Migrate pre-Fleet task rows to local origin and executor identities.
+    /// Migrate pre-Fleet task rows to local origin and executor identities
     ///
     /// The immediate transaction serializes with runner completion so either
     /// completion emits the first typed event, or migration retains its terminal
-    /// callback as that first event.
+    /// callback as that first event
     pub fn migrate_legacy_local(&mut self, machine: MachineId) -> Result<(), AppError> {
         self.migrate_legacy_local_with(machine, |path, cwd| {
             crate::invocation::resolve_agent_binary(crate::domain::AgentKind::Codex, path, cwd)
@@ -1329,7 +1065,7 @@ impl Store {
                     && record.origin_machine == route.origin_machine
                     && record.execution_machine == route.execution_machine
                     && record.has_valid_spec_owners()
-                    && serde_json::to_value(&record.spec)? == serde_json::to_value(&route.spec)?
+                    && record.spec == route.spec
                     && accepted_submission
             }
             (ExecutorIdentity::Accepted(record), None) => {
@@ -1346,7 +1082,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Fetch one task.
+    /// Fetch one task
     pub fn get_task(&self, id: TaskId) -> Result<Option<TaskRow>, AppError> {
         let mut stmt = self.conn.prepare(&format!("{TASK_SELECT} WHERE id = ?1"))?;
         let row = stmt
@@ -1355,22 +1091,12 @@ impl Store {
         Ok(row)
     }
 
-    /// Require a task row.
+    /// Require a task row
     pub fn require_task(&self, id: TaskId) -> Result<TaskRow, AppError> {
         self.get_task(id)?.ok_or(AppError::TaskNotFound { id })
     }
 
-    /// Read process-group evidence for one exact task identity.
-    pub(crate) fn process_group_exit_evidence(
-        &self,
-        id: TaskId,
-    ) -> Result<Option<ProcessGroupExitEvidence>, AppError> {
-        Ok(self
-            .get_task(id)?
-            .map(|row| row.process_group_exit_evidence()))
-    }
-
-    /// List tasks, optionally filtered.
+    /// List tasks, optionally filtered
     pub fn list_tasks(
         &self,
         statuses: &[ProcessStatus],
@@ -1405,7 +1131,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// Read project roots and complete accepted machine-owner pairs for task IDs.
+    /// Read project roots and complete accepted machine-owner pairs for task IDs
     pub fn task_presentations(
         &self,
         ids: &[TaskId],
@@ -1487,7 +1213,7 @@ impl Store {
         Ok(presentations)
     }
 
-    /// Whether a terminal callback still waits for its inbox result to settle.
+    /// Whether a terminal callback still waits for its inbox result to settle
     pub fn has_pending_terminal_callbacks(&self) -> Result<bool, AppError> {
         let rows = self.list_tasks(
             &[
@@ -1722,7 +1448,7 @@ impl Store {
             }
         }
 
-        // Legacy delivered rows keep their marker after event payload compaction.
+        // legacy delivered rows keep their marker after event payload compaction
         Ok(row.attention.is_delivered())
     }
 
@@ -1754,12 +1480,12 @@ impl Store {
         )?)
     }
 
-    /// Non-terminal tasks.
+    /// Non-terminal tasks
     pub fn non_terminal(&self) -> Result<Vec<TaskRow>, AppError> {
         self.list_tasks(&[ProcessStatus::Queued, ProcessStatus::Running], None)
     }
 
-    /// Count of queued or running tasks.
+    /// Count of queued or running tasks
     pub fn in_flight_count(&self) -> Result<usize, AppError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE status IN ('queued', 'running')",
@@ -1769,7 +1495,7 @@ impl Store {
         Ok(count as usize)
     }
 
-    /// Compare-and-swap process status. `None` means the CAS did not match.
+    /// Compare-and-swap process status. `None` means the CAS did not match
     pub fn cas_status(
         &self,
         id: TaskId,
@@ -1795,7 +1521,7 @@ impl Store {
         })
     }
 
-    /// CAS status and store an exit reason.
+    /// CAS status and store an exit reason
     pub fn cas_exit(
         &self,
         id: TaskId,
@@ -1810,7 +1536,7 @@ impl Store {
         self.cas_exit_with_evidence(id, from, reason, evidence)
     }
 
-    /// CAS terminal state and persist evidence from the task-run worker or its exit-file recovery.
+    /// CAS terminal state and persist evidence from the task-run worker or its exit-file recovery
     pub(crate) fn cas_exit_with_evidence(
         &self,
         id: TaskId,
@@ -1914,7 +1640,7 @@ impl Store {
         }
     }
 
-    /// Record the worker pid.
+    /// Record the worker pid
     pub fn set_pid(&self, id: TaskId, pid: i32) -> Result<(), AppError> {
         let now = fmt_time(Utc::now());
         self.conn.execute(
@@ -1924,7 +1650,7 @@ impl Store {
         Ok(())
     }
 
-    /// Mark cancel requested. Terminal tasks are unchanged (idempotent).
+    /// Mark cancel requested. Terminal tasks are unchanged (idempotent)
     pub fn request_cancel(&self, id: TaskId) -> Result<CancelResult, AppError> {
         self.immediate(|| {
             self.require_task(id)?;
@@ -1950,7 +1676,7 @@ impl Store {
         })
     }
 
-    /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error.
+    /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error
     fn immediate<T>(&self, body: impl FnOnce() -> Result<T, AppError>) -> Result<T, AppError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match body() {
@@ -1996,8 +1722,8 @@ impl Store {
         })
     }
 
-    /// Drop a claim that did not deliver, so a later attempt can take it.
-    /// Also the release valve for a claim stranded by a dead daemon.
+    /// Drop a claim that did not deliver, so a later attempt can take it
+    /// Also the release valve for a claim stranded by a dead daemon
     pub fn release_attention(&self, id: TaskId) -> Result<(), AppError> {
         self.conn.execute(
             "UPDATE tasks SET attention_state = 'pending', updated_at = ?1
@@ -2007,7 +1733,7 @@ impl Store {
         Ok(())
     }
 
-    /// Append a report. Enforces cap, summary length, and terminal rejection.
+    /// Append a report. Enforces cap, summary length, and terminal rejection
     pub fn append_report(
         &self,
         id: TaskId,
@@ -2083,7 +1809,7 @@ impl Store {
         })
     }
 
-    /// Reports in seq order.
+    /// Reports in seq order
     pub fn reports(&self, id: TaskId) -> Result<Vec<TaskReport>, AppError> {
         reports_from(&self.conn, id)
     }
@@ -2165,14 +1891,14 @@ fn reports_from(conn: &Connection, id: TaskId) -> Result<Vec<TaskReport>, AppErr
         .collect()
 }
 
-/// Result of `request_cancel`.
+/// Result of `request_cancel`
 #[derive(Debug)]
 pub enum CancelResult {
-    /// Already terminal: no change.
+    /// Already terminal: no change
     AlreadyTerminal(TaskRow),
-    /// Queued task flipped to Cancelled.
+    /// Queued task flipped to Cancelled
     CancelledQueued(TaskRow),
-    /// Running task: caller must SIGTERM the worker group.
+    /// Running task: caller must SIGTERM the worker group
     SignalWorker(TaskRow),
 }
 
@@ -2181,7 +1907,7 @@ fn fmt_time(ts: DateTime<Utc>) -> String {
 }
 
 /// Whole seconds as decimal text. `u64` is wider than SQLite's INTEGER, and
-/// the inactivity timer has no product maximum.
+/// the inactivity timer has no product maximum
 fn fmt_timeout(timeout: Duration) -> String {
     timeout.as_secs().to_string()
 }
@@ -2300,27 +2026,27 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     })
 }
 
-/// Inputs for a newly queued task.
+/// Inputs for a newly queued task
 pub struct NewTask {
-    /// Task id.
+    /// Task id
     pub id: TaskId,
-    /// Submitted name. `None` only for rows stored before name was required.
+    /// Submitted name. `None` only for rows stored before name was required
     pub name: Option<TaskName>,
-    /// Submitting thread.
+    /// Submitting thread
     pub thread: ThreadId,
-    /// Workload configuration.
+    /// Workload configuration
     pub workload: Workload,
-    /// Working directory.
+    /// Working directory
     pub cwd: std::path::PathBuf,
-    /// Output-inactivity timeout.
+    /// Output-inactivity timeout
     pub timeout: Duration,
-    /// Captured env.
+    /// Captured env
     pub env: TaskEnv,
-    /// Resolved binary.
+    /// Resolved binary
     pub binary: std::path::PathBuf,
 }
 
-/// Build a queued row for insert.
+/// Build a queued row for insert
 #[must_use]
 pub fn new_queued_task(new: NewTask) -> TaskRow {
     let now = Utc::now();
@@ -2343,17 +2069,17 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
     }
 }
 
-/// JSON view of `exit.json`.
+/// JSON view of `exit.json`
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExitJson {
-    /// Exit reason.
+    /// Exit reason
     pub reason: ExitReason,
-    /// Evidence for the task-run worker's child process group.
+    /// Evidence for the task-run worker's child process group
     #[serde(default)]
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
 }
 
-/// Parse `exit.json` if present.
+/// Parse `exit.json` if present
 pub fn read_exit_json(path: &Path) -> Result<Option<ExitJson>, AppError> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -2366,7 +2092,7 @@ pub fn read_exit_json(path: &Path) -> Result<Option<ExitJson>, AppError> {
     }
 }
 
-/// Write `exit.json` via temp + rename.
+/// Write `exit.json` via temp + rename
 pub fn write_exit_json(path: &Path, reason: &ExitReason) -> Result<(), AppError> {
     write_exit_json_with_evidence(path, reason, ProcessGroupExitEvidence::Unconfirmed)
 }
@@ -2388,14 +2114,34 @@ pub(crate) fn write_exit_json_with_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::domain::{
-        Agent, AgentKind, AgentWorkload, AttentionState, TaskWorkload, TransitionError, Workload,
+    use super::{
+        BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION, Store, new_queued_task,
+        read_exit_json, write_exit_json_with_evidence,
     };
-    use crate::events::DeliveryOutcome;
+    use crate::callback::EventKind;
+    use crate::daemon::api::views::TaskSummary;
+    use crate::domain::{
+        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ExitReason,
+        ProcessGroupExitEvidence, ProcessStatus, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES,
+        TaskEnv, TaskId, TaskName, TaskRow, TaskState, TaskWorkload, TerminalCallbackProjection,
+        ThreadId, TransitionError, Workload,
+    };
+    use crate::error::AppError;
+    use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, OutboxState};
     use crate::invocation::CommandLine;
+    use crate::machine::MachineId;
+    use crate::spec::NormalizedSpec;
+    use crate::submission::{
+        CallbackContext, CallbackExecutable, ExecutorIdentity, OriginRoute, PersistedSpec,
+        RequestId, SubmissionState,
+    };
+    use chrono::Utc;
+    use rusqlite::{Connection, OptionalExtension, params};
     use serde_json::json;
+    use std::num::NonZeroU64;
+    use std::path::Path;
     use std::str::FromStr;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn agent_row(id: TaskId) -> TaskRow {
@@ -2458,7 +2204,12 @@ mod tests {
         row.name = Some(TaskName::parse("local task").unwrap());
         let spec = local_spec(&row);
         store
-            .insert_local_task(&row, &spec, MachineId::new(), Path::new("/bin/true").into())
+            .insert_local_task(
+                &row,
+                &spec,
+                MachineId::new(),
+                CallbackExecutable::available("/bin/true".into()),
+            )
             .unwrap();
     }
 
@@ -2575,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn old_exit_json_and_database_rows_remain_unconfirmed() {
+    fn released_exit_json_and_database_rows_remain_unconfirmed() {
         let directory = tempdir().unwrap();
         let exit_path = directory.path().join("exit.json");
         std::fs::write(&exit_path, r#"{"reason":{"kind":"exit","code":0}}"#).unwrap();
@@ -2586,31 +2337,42 @@ mod tests {
             ProcessGroupExitEvidence::Unconfirmed
         );
 
-        let path = directory.path().join("old-db");
+        let path = directory.path().join("v2-db");
         let id = TaskId::new();
         {
-            let store = Store::open(&path).unwrap();
-            store.insert_task(&agent_row(id)).unwrap();
-            store
-                .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "UPDATE tasks SET process_group_exit_evidence = NULL WHERE id = ?1",
-                    [id.to_string()],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "ALTER TABLE tasks DROP COLUMN process_group_exit_evidence;
-                     PRAGMA user_version = 16;",
-                )
-                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(BASE_SCHEMA).unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (
+                    id, thread_id, name, workload_json, cwd, timeout_secs,
+                    env_path, env_home, binary, status, exit_reason,
+                    callback_status, attention_state, timeout_notified_at,
+                    pid, cancel_requested_at, created_at, updated_at
+                ) VALUES (?1,?2,NULL,?3,'/tmp','14400','/bin','/home/u','/bin/echo',
+                    'cancelled',?4,'pending','pending',NULL,NULL,NULL,?5,?5)",
+                params![
+                    id.to_string(),
+                    "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+                    serde_json::to_string(&Workload::Task(TaskWorkload {
+                        command: CommandLine::try_from_argv(vec!["echo".into(), "hi".into()])
+                            .unwrap(),
+                    }))
+                    .unwrap(),
+                    serde_json::to_string(&ExitReason::Cancelled).unwrap(),
+                    "2024-01-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
         }
 
         let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_resource_tables_installed(&store);
         let row = store.require_task(id).unwrap();
         assert_eq!(row.status(), ProcessStatus::Cancelled);
         assert_eq!(row.exit_reason(), Some(&ExitReason::Cancelled));
@@ -2680,7 +2442,12 @@ mod tests {
     fn insert_local_at(store: &Store, id: TaskId, cwd: &Path, machine: MachineId) {
         let (row, spec) = row_at(id, cwd);
         store
-            .insert_local_task(&row, &spec, machine, Path::new("/bin/true").into())
+            .insert_local_task(
+                &row,
+                &spec,
+                machine,
+                CallbackExecutable::available("/bin/true".into()),
+            )
             .unwrap();
     }
 
@@ -2721,7 +2488,7 @@ mod tests {
                 &row,
                 &spec,
                 MachineId::new(),
-                Path::new("/bin/true").into(),
+                CallbackExecutable::available("/bin/true".into()),
             ),
             Err(AppError::ClusterTaskConflict { task: conflict }) if conflict == task
         ));
@@ -2821,7 +2588,7 @@ mod tests {
                 .outbound_event_at_or_after(id, NonZeroU64::MIN)
                 .unwrap()
                 .unwrap();
-            assert_eq!(outbox.state, crate::events::OutboxState::Acknowledged);
+            assert_eq!(outbox.state, OutboxState::Acknowledged);
             assert!(outbox.notification_required);
             assert_eq!(outbox.event.seq.get(), 1);
             let EventPayload::Callback { event, state } = &outbox.event.payload else {
@@ -2870,7 +2637,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .state,
-                crate::events::OutboxState::Acknowledged
+                OutboxState::Acknowledged
             );
         }
     }
@@ -2911,7 +2678,7 @@ mod tests {
                 store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
                 TerminalCallbackProjection::Legacy(status)
             );
-            let summary = crate::daemon::api::views::TaskSummary::from_row(
+            let summary = TaskSummary::from_row(
                 &store.require_task(id).unwrap(),
                 Some(&store.task_presentations(&[id]).unwrap()[&id]),
             );
@@ -3277,7 +3044,7 @@ mod tests {
         assert_eq!(local.project_root, None);
         assert_eq!(local.owners.unwrap().origin_machine, local_machine);
         assert_eq!(local.owners.unwrap().execution_machine, local_machine);
-        let local_json = serde_json::to_value(crate::daemon::api::views::TaskSummary::from_row(
+        let local_json = serde_json::to_value(TaskSummary::from_row(
             &store.require_task(local_id).unwrap(),
             Some(local),
         ))
@@ -3291,7 +3058,7 @@ mod tests {
         assert_eq!(remote.project_root.as_deref(), remote_cwd.parent());
         assert_eq!(remote.owners.unwrap().origin_machine, origin_machine);
         assert_eq!(remote.owners.unwrap().execution_machine, execution_machine);
-        let remote_json = serde_json::to_value(crate::daemon::api::views::TaskSummary::from_row(
+        let remote_json = serde_json::to_value(TaskSummary::from_row(
             &store.require_task(remote_id).unwrap(),
             Some(remote),
         ))
@@ -3303,11 +3070,8 @@ mod tests {
 
         let legacy = presentations.get(&legacy_id).unwrap();
         assert_eq!(legacy.owners, None);
-        let legacy_json = serde_json::to_value(crate::daemon::api::views::TaskSummary::from_row(
-            &legacy_row,
-            Some(legacy),
-        ))
-        .unwrap();
+        let legacy_json =
+            serde_json::to_value(TaskSummary::from_row(&legacy_row, Some(legacy))).unwrap();
         assert!(legacy_json.get("origin_machine").is_none());
         assert!(legacy_json.get("execution_machine").is_none());
     }
@@ -3428,17 +3192,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![false, false, false, true, true]
         );
-        let crate::events::EventPayload::Report { report } = &events[2].event.payload else {
+        let EventPayload::Report { report } = &events[2].event.payload else {
             panic!("silent report payload")
         };
         assert_eq!(report.summary, "silent");
-        let crate::events::EventPayload::Callback { event, .. } = &events[3].event.payload else {
+        let EventPayload::Callback { event, .. } = &events[3].event.payload else {
             panic!("notify payload")
         };
         assert_eq!(event.reports.len(), 1);
         assert_eq!(event.reports[0].summary, "notify");
-        let crate::events::EventPayload::Callback { event, state } = &events[4].event.payload
-        else {
+        let EventPayload::Callback { event, state } = &events[4].event.payload else {
             panic!("terminal payload")
         };
         assert_eq!(*state, Some(ProcessStatus::Succeeded));
@@ -3506,7 +3269,12 @@ mod tests {
         let spec = local_spec(&row);
         assert!(
             store
-                .insert_local_task(&row, &spec, MachineId::new(), Path::new("/bin/true").into())
+                .insert_local_task(
+                    &row,
+                    &spec,
+                    MachineId::new(),
+                    CallbackExecutable::available("/bin/true".into())
+                )
                 .is_err()
         );
         assert!(store.get_task(id).unwrap().is_none());
@@ -3540,10 +3308,10 @@ mod tests {
             .unwrap();
         let events = store.pending_outbound_events(lost).unwrap();
         assert_eq!(events.len(), 3);
-        let crate::events::EventPayload::Callback { event, .. } = &events[2].event.payload else {
+        let EventPayload::Callback { event, .. } = &events[2].event.payload else {
             panic!("loss payload")
         };
-        assert_eq!(event.event, crate::callback::EventKind::TaskLost);
+        assert_eq!(event.event, EventKind::TaskLost);
         let spawn_failed = TaskId::new();
         insert_local(&store, spawn_failed);
         store
@@ -3561,7 +3329,7 @@ mod tests {
             panic!("spawn failure payload")
         };
         assert_eq!(*state, Some(ProcessStatus::Failed));
-        assert_eq!(event.event, crate::callback::EventKind::TaskFailed);
+        assert_eq!(event.event, EventKind::TaskFailed);
     }
 
     #[test]
@@ -3583,7 +3351,7 @@ mod tests {
         let EventPayload::Callback { event, state } = &events[3].event.payload else {
             panic!("reminder payload")
         };
-        assert_eq!(event.event, crate::callback::EventKind::TaskCheckDue);
+        assert_eq!(event.event, EventKind::TaskCheckDue);
         assert_eq!(event.reports[0].summary, "waiting");
         assert_eq!(*state, None);
     }
@@ -3655,6 +3423,27 @@ CREATE TABLE reports (
 ";
 
     #[test]
+    fn unreleased_development_schema_is_refused() {
+        for version in [3, RELEASED_V0_4_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("db");
+            Connection::open(&path)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let Err(AppError::Internal { message }) = Store::open(&path) else {
+                panic!("schema user_version={version} must be refused");
+            };
+            assert!(
+                message.contains(&format!("user_version={version}")),
+                "{message}"
+            );
+            let unreleased = version < RELEASED_V0_4_SCHEMA_VERSION;
+            assert_eq!(message.contains("unreleased"), unreleased, "{message}");
+        }
+    }
+
+    #[test]
     fn migrate_from_empty() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
@@ -3665,256 +3454,6 @@ CREATE TABLE reports (
         assert_eq!(version, SCHEMA_VERSION);
         assert_resource_tables_installed(&store);
         assert_foreign_keys_enabled(&store);
-    }
-
-    #[test]
-    fn migrate_schema_21_installs_return_receipts_and_keeps_loans() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let loan_state = serde_json::json!({
-            "type": "active",
-            "phase": {
-                "type": "awaiting_return",
-                "action_id": uuid::Uuid::now_v7(),
-                "return_context": { "type": "idle" },
-            },
-        })
-        .to_string();
-        {
-            let store = Store::open(&path).unwrap();
-            let resource = uuid::Uuid::now_v7().to_string();
-            let machine = uuid::Uuid::now_v7().to_string();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO resources (
-                        id, display_name, authority_machine, supervisor_machine,
-                        supervisor_thread, assignment_revision, state_revision
-                     ) VALUES (?1, 'gpu', ?2, ?2, ?3, 0, 1)",
-                    params![resource, machine, uuid::Uuid::now_v7().to_string()],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
-                    params![uuid::Uuid::now_v7().to_string(), resource, loan_state],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE resource_restore_closures;
-                     DROP TABLE resource_return_decisions;
-                     PRAGMA user_version = 21;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        let saved: String = store
-            .conn
-            .query_row("SELECT state_json FROM loans", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(saved, loan_state);
-    }
-
-    #[test]
-    fn migrate_schema_25_restore_closures_accept_the_foreground_end_basis() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let (resource, loan) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        // each closure needs its parent return decision
-        let insert = |conn: &Connection, basis: &str| {
-            let (action, task) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-            let decision = serde_json::json!({
-                "authority": { "action_id": action, "resource_id": resource, "loan_id": loan },
-                "decision": { "type": "no_resume", "reason": "fixture" },
-                "result": { "type": "restore_bound" },
-            })
-            .to_string();
-            conn.execute(
-                "INSERT INTO resource_return_decisions (action_id, resource_id, loan_id, receipt_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    action.to_string(),
-                    resource.to_string(),
-                    loan.to_string(),
-                    decision
-                ],
-            )
-            .unwrap();
-            let receipt = serde_json::json!({
-                "action_id": action,
-                "task_id": task,
-                "basis": { "type": basis },
-            })
-            .to_string();
-            conn.execute(
-                "INSERT INTO resource_restore_closures (action_id, task_id, receipt_json)
-                 VALUES (?1, ?2, ?3)",
-                params![action.to_string(), task.to_string(), receipt],
-            )
-            .map(|_| receipt)
-        };
-        let saved = {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO resources (
-                        id, display_name, authority_machine, supervisor_machine,
-                        supervisor_thread, assignment_revision, state_revision
-                     ) VALUES (?1, 'gpu', ?2, ?2, ?3, 0, 1)",
-                    params![
-                        resource.to_string(),
-                        uuid::Uuid::now_v7().to_string(),
-                        uuid::Uuid::now_v7().to_string()
-                    ],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
-                    params![
-                        loan.to_string(),
-                        resource.to_string(),
-                        serde_json::json!({
-                            "type": "closed",
-                            "result": {
-                                "type": "no_resume",
-                                "return_context": { "type": "idle" },
-                                "reason": "fixture",
-                            },
-                        })
-                        .to_string()
-                    ],
-                )
-                .unwrap();
-            // restore the version 25 constraint that predates the foreground end basis
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE resource_restore_closures;
-                     CREATE TABLE resource_restore_closures (
-                         action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
-                         task_id TEXT NOT NULL UNIQUE,
-                         receipt_json TEXT NOT NULL CHECK (
-                             json_valid(receipt_json)
-                             AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
-                                 'confirmed_running', 'supervisor_resolved_end'
-                             ), 0)
-                         )
-                     );
-                     PRAGMA user_version = 25;",
-                )
-                .unwrap();
-            assert!(insert(&store.conn, "foreground_ended").is_err());
-            insert(&store.conn, "confirmed_running").unwrap()
-        };
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let kept: String = store
-            .conn
-            .query_row(
-                "SELECT receipt_json FROM resource_restore_closures",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, saved);
-        insert(&store.conn, "foreground_ended").unwrap();
-        assert!(insert(&store.conn, "guessed_release").is_err());
-    }
-
-    #[test]
-    fn migrate_schema_20_checkpoint_phase_constraint_for_cancellation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP INDEX resource_release_checkpoint_states_resource;
-                     ALTER TABLE resource_release_checkpoint_states
-                         RENAME TO resource_release_checkpoint_states_v21;
-                     CREATE TABLE resource_release_checkpoint_states (
-                         action_id TEXT PRIMARY KEY,
-                         resource_id TEXT NOT NULL REFERENCES resources(id),
-                         state_json TEXT NOT NULL CHECK (
-                             json_valid(state_json)
-                             AND COALESCE(json_type(state_json) = 'object', 0)
-                             AND COALESCE(json_type(state_json, '$.action') = 'object', 0)
-                             AND COALESCE(json_type(state_json, '$.phase') = 'object', 0)
-                             AND COALESCE(json_extract(state_json, '$.action.action_id') = action_id, 0)
-                             AND COALESCE(json_extract(state_json, '$.action.resource_id') = resource_id, 0)
-                             AND COALESCE(json_extract(state_json, '$.phase.type') IN (
-                                 'watcher_binding_pending', 'baseline_captured', 'stop_reserved'
-                             ), 0)
-                         )
-                     );
-                     INSERT INTO resource_release_checkpoint_states
-                         (action_id, resource_id, state_json)
-                     SELECT action_id, resource_id, state_json
-                     FROM resource_release_checkpoint_states_v21;
-                     DROP TABLE resource_release_checkpoint_states_v21;
-                     CREATE INDEX resource_release_checkpoint_states_resource
-                         ON resource_release_checkpoint_states(resource_id, action_id);
-                     PRAGMA user_version = 20;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let resource = uuid::Uuid::now_v7().to_string();
-        let machine = uuid::Uuid::now_v7().to_string();
-        store
-            .conn
-            .execute(
-                "INSERT INTO resources (
-                    id, display_name, authority_machine, supervisor_machine,
-                    supervisor_thread, assignment_revision, state_revision,
-                    registered_background_task
-                 ) VALUES (?1, 'gpu-migration', ?2, ?2, ?3, 0, 0, NULL)",
-                params![resource, machine, uuid::Uuid::now_v7().to_string()],
-            )
-            .unwrap();
-        let action = "checkpoint-cancellation-migration";
-        store
-            .conn
-            .execute(
-                "INSERT INTO resource_release_checkpoint_states
-                    (action_id, resource_id, state_json)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    action,
-                    resource,
-                    serde_json::json!({
-                        "action": { "action_id": action, "resource_id": resource },
-                        "phase": { "type": "cancellation_committed" }
-                    })
-                    .to_string(),
-                ],
-            )
-            .unwrap();
     }
 
     fn assert_resource_tables_installed(store: &Store) {
@@ -3968,809 +3507,12 @@ CREATE TABLE reports (
         assert_eq!(task_primary_key, 1);
     }
 
-    #[test]
-    fn migrate_version_14_installs_release_receipts_and_preserves_resource_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let resource_id = uuid::Uuid::now_v7();
-        let authority = uuid::Uuid::now_v7();
-        let supervisor_thread = uuid::Uuid::now_v7();
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO resources (
-                        id, display_name, authority_machine, supervisor_machine,
-                        supervisor_thread, assignment_revision, state_revision,
-                        registered_background_task
-                    ) VALUES (?1, 'gpu-preserved', ?2, ?2, ?3, 4, 9, NULL)",
-                    params![
-                        resource_id.to_string(),
-                        authority.to_string(),
-                        supervisor_thread.to_string(),
-                    ],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE resource_release_completions;
-                     PRAGMA user_version = 14;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        let preserved: (String, i64, i64) = store
-            .conn
-            .query_row(
-                "SELECT display_name, assignment_revision, state_revision
-                 FROM resources WHERE id = ?1",
-                [resource_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(preserved, ("gpu-preserved".into(), 4, 9));
-    }
-
-    #[test]
-    fn migrate_version_15_installs_resource_cancellation_receipts() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let resource_id = uuid::Uuid::now_v7();
-        let authority = uuid::Uuid::now_v7();
-        let supervisor_thread = uuid::Uuid::now_v7();
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO resources (
-                        id, display_name, authority_machine, supervisor_machine,
-                        supervisor_thread, assignment_revision, state_revision,
-                        registered_background_task
-                    ) VALUES (?1, 'gpu-before-migration', ?2, ?2, ?3, 2, 5, NULL)",
-                    params![
-                        resource_id.to_string(),
-                        authority.to_string(),
-                        supervisor_thread.to_string(),
-                    ],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE resource_cancellation_receipts;
-                     PRAGMA user_version = 15;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        let preserved: (String, i64, i64) = store
-            .conn
-            .query_row(
-                "SELECT display_name, assignment_revision, state_revision
-                 FROM resources WHERE id = ?1",
-                [resource_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(preserved, ("gpu-before-migration".into(), 2, 5));
-    }
-
-    #[test]
-    fn migrate_version_10_adds_notice_and_notification_intent_storage() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("db");
-        let resource_id = crate::resource::ResourceId::new();
-        let authority = MachineId::new();
-        let resource = crate::resource::Resource::new(
-            resource_id,
-            "gpu-0".into(),
-            authority,
-            crate::resource::SupervisorAddress {
-                machine: MachineId::new(),
-                thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
-            },
-            crate::resource::AssignmentRevision::new(2),
-            crate::resource::ResourceRevision::new(7),
-            None,
-        );
-        let loan_id = crate::resource::LoanId::new();
-        let task_id = TaskId::new();
-        let request_id = RequestId::new();
-        let queued_task_id = TaskId::new();
-        let origin_machine = MachineId::new();
-        let resource_row = (
-            resource.id.as_uuid().to_string(),
-            resource.display_name.clone(),
-            resource.authority_machine().as_uuid().to_string(),
-            resource.supervisor.machine.as_uuid().to_string(),
-            resource.supervisor.thread.to_string(),
-            resource.assignment_revision.get() as i64,
-            resource.state_revision.get() as i64,
-        );
-        let loan_state = "{\"type\":\"active\"}";
-        let queued_task = task_row(queued_task_id);
-        let request_spec = local_spec(&queued_task);
-        let expected_request: (String, String, String, String, String, String);
-
-        {
-            let mut store = Store::open(&path).unwrap();
-            insert_local(&store, task_id);
-            crate::resource::store::register_resource_for_authority(
-                &mut store.conn,
-                authority,
-                &resource,
-            )
-            .unwrap();
-            crate::resource::store::accept_request_for_authority(
-                &mut store.conn,
-                authority,
-                request_id,
-                queued_task_id,
-                resource_id,
-                origin_machine,
-                request_spec,
-            )
-            .unwrap();
-            expected_request = store
-                .conn
-                .query_row(
-                    "SELECT request_id, task_id, resource_id, origin_machine, spec_json, state_json
-                     FROM resource_requests WHERE request_id = ?1",
-                    [request_id.0.to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    },
-                )
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, ?3)",
-                    params![
-                        loan_id.as_uuid().to_string(),
-                        resource_id.as_uuid().to_string(),
-                        loan_state
-                    ],
-                )
-                .unwrap();
-        }
-
-        {
-            let legacy = Connection::open(&path).unwrap();
-            legacy
-                .execute_batch("DROP TABLE resource_supervisor_notices;")
-                .unwrap();
-            legacy.pragma_update(None, "user_version", 10i64).unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        let has_notification_intents: bool = store
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_notification_intents')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_notification_intents);
-        assert_foreign_keys_enabled(&store);
-        let saved_resource = store
-            .conn
-            .query_row(
-                "SELECT id, display_name, authority_machine, supervisor_machine,
-                        supervisor_thread, assignment_revision, state_revision
-                 FROM resources WHERE id = ?1",
-                [resource_id.as_uuid().to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(saved_resource, resource_row);
-        let saved_loan_state: String = store
-            .conn
-            .query_row(
-                "SELECT state_json FROM loans WHERE id = ?1",
-                [loan_id.as_uuid().to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(saved_loan_state, loan_state);
-        let saved_request = store
-            .conn
-            .query_row(
-                "SELECT request_id, task_id, resource_id, origin_machine, spec_json, state_json
-                 FROM resource_requests WHERE request_id = ?1",
-                [request_id.0.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(saved_request, expected_request);
-        assert_eq!(store.require_task(task_id).unwrap().id, task_id);
-        assert!(store.origin_route_by_task(task_id).unwrap().is_some());
-    }
-
-    #[test]
-    fn version_10_keeps_an_offline_legacy_notify_intent_before_terminal_callback() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            store.insert_task(&task_row(id)).unwrap();
-            store
-                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-                .unwrap();
-            store
-                .append_report_with_notification(
-                    id,
-                    ReportOutcome::Blocked,
-                    "already notified before upgrade",
-                    false,
-                )
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "UPDATE reports SET notified_at=?1 WHERE task_id=?2 AND seq=1",
-                    params![fmt_time(Utc::now()), id.to_string()],
-                )
-                .unwrap();
-            store
-                .append_report_with_notification(
-                    id,
-                    ReportOutcome::Succeeded,
-                    "notify while daemon was down",
-                    true,
-                )
-                .unwrap();
-            store
-                .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
-                .unwrap();
-        }
-
-        {
-            let legacy = Connection::open(&path).unwrap();
-            legacy
-                .execute_batch("DROP TABLE resource_supervisor_notices;")
-                .unwrap();
-            legacy.pragma_update(None, "user_version", 10i64).unwrap();
-        }
-
-        let mut store = Store::open(&path).unwrap();
-        assert_resource_tables_installed(&store);
-        let intent_count: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM report_notification_intents WHERE task_id=?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(intent_count, 1);
-
-        let machine = MachineId::new();
-        store.migrate_legacy_local(machine).unwrap();
-        let route = store.origin_route_by_task(id).unwrap().unwrap();
-        let request = route.request;
-        assert_eq!(route.last_accepted_seq, 2);
-        let first = store
-            .outbound_event_at_or_after(id, NonZeroU64::MIN)
-            .unwrap()
-            .unwrap();
-        let EventPayload::Callback {
-            event: interim,
-            state: None,
-        } = first.event.payload
-        else {
-            panic!("migrated interim notification payload")
-        };
-        assert_eq!(first.event.seq.get(), 1);
-        assert_eq!(interim.event, crate::callback::EventKind::TaskReported);
-        assert_eq!(interim.reports[0].seq, 2);
-        let terminal = store
-            .outbound_event_at_or_after(id, NonZeroU64::new(2).unwrap())
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.event.seq.get(), 2);
-        assert!(matches!(
-            terminal.event.payload,
-            EventPayload::Callback {
-                state: Some(ProcessStatus::Succeeded),
-                ..
-            }
-        ));
-        assert_eq!(store.inbound_events(id).unwrap().len(), 2);
-        assert!(store.pending_outbound_events(id).unwrap().is_empty());
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM report_notification_intents WHERE task_id=?1",
-                    [id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0
-        );
-
-        store.migrate_legacy_local(machine).unwrap();
-        assert_eq!(
-            store.origin_route_by_task(id).unwrap().unwrap().request,
-            request
-        );
-        assert_eq!(store.inbound_events(id).unwrap().len(), 2);
-        drop(store);
-
-        let reopened = Store::open(&path).unwrap();
-        assert_eq!(reopened.inbound_events(id).unwrap().len(), 2);
-        assert_eq!(
-            reopened
-                .origin_route_by_task(id)
-                .unwrap()
-                .unwrap()
-                .last_accepted_seq,
-            2
-        );
-    }
-
-    #[test]
-    fn version_11_upgrade_installs_notification_intents_and_resource_notices() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            store.insert_task(&task_row(id)).unwrap();
-        }
-        {
-            let legacy = Connection::open(&path).unwrap();
-            legacy
-                .execute_batch(
-                    "DROP TABLE report_notification_intents;
-                     DROP TABLE resource_supervisor_notices;",
-                )
-                .unwrap();
-            legacy.pragma_update(None, "user_version", 11i64).unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.require_task(id).unwrap().id, id);
-        assert_resource_tables_installed(&store);
-        let has_notification_intents: bool = store
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_notification_intents')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_notification_intents);
-        let has_outbound_bindings: bool = store
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbound_message_bindings')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_outbound_bindings);
-    }
-
-    #[test]
-    fn version_12_upgrade_adds_outbound_bindings_and_preserves_existing_tables() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("db");
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .conn
-                .execute("CREATE TABLE migration_sentinel (value TEXT NOT NULL)", [])
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO migration_sentinel (value) VALUES ('preserved')",
-                    [],
-                )
-                .unwrap();
-            store
-                .conn
-                .execute("DROP TABLE outbound_message_bindings", [])
-                .unwrap();
-            store
-                .conn
-                .pragma_update(None, "user_version", 12_i64)
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        for table in [
-            "resources",
-            "resource_requests",
-            "message_attempts",
-            "message_receipts",
-            "outbound_message_bindings",
-        ] {
-            let exists: bool = store
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "{table} missing after v12 migration");
-        }
-        let preserved: String = store
-            .conn
-            .query_row("SELECT value FROM migration_sentinel", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(preserved, "preserved");
-    }
-
-    #[test]
-    fn version_13_upgrade_adds_retention_receipts_and_backfills_settlement_time() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("db");
-        let id = TaskId::new();
-        {
-            let mut store = Store::open(&path).unwrap();
-            insert_local(&store, id);
-            store
-                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-                .unwrap();
-            store
-                .append_report_with_notification(id, ReportOutcome::Blocked, "waiting", true)
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO outbound_message_bindings (message_id,binding_json)
-                     VALUES ('retained-message','{}')",
-                    [],
-                )
-                .unwrap();
-            for seq in 1..=3 {
-                let outbox = store
-                    .outbound_event_at_or_after(id, NonZeroU64::new(seq).unwrap())
-                    .unwrap()
-                    .unwrap();
-                store.accept_inbound_event(&outbox.event).unwrap();
-                store
-                    .mark_outbound_acknowledged(id, outbox.event.seq)
-                    .unwrap();
-            }
-            store
-                .conn
-                .execute_batch(
-                    "DROP INDEX executor_outbox_retention;
-                     DROP INDEX origin_inbox_retention;
-                     DROP TABLE executor_event_receipts;
-                     DROP TABLE origin_event_receipts;
-                     ALTER TABLE executor_outbox DROP COLUMN acknowledged_at;
-                     ALTER TABLE origin_inbox DROP COLUMN settled_at;
-                     PRAGMA user_version=13;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        let retained_binding: String = store
-            .conn
-            .query_row(
-                "SELECT binding_json FROM outbound_message_bindings
-                 WHERE message_id='retained-message'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(retained_binding, "{}");
-        let acked: Vec<Option<String>> = store
-            .conn
-            .prepare("SELECT acknowledged_at FROM executor_outbox WHERE task_id=?1 ORDER BY seq")
-            .unwrap()
-            .query_map([id.to_string()], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(acked.len(), 3);
-        assert!(acked.iter().all(Option::is_some));
-        let settled: Vec<Option<String>> = store
-            .conn
-            .prepare("SELECT settled_at FROM origin_inbox WHERE task_id=?1 ORDER BY seq")
-            .unwrap()
-            .query_map([id.to_string()], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(settled.len(), 3);
-        assert!(settled[0].is_some());
-        assert!(settled[1].is_some());
-        assert_eq!(settled[2], None);
-        for time in acked.iter().flatten().chain(settled.iter().flatten()) {
-            let recent: bool = store
-                .conn
-                .query_row(
-                    "SELECT julianday(?1) >= julianday('now','-1 minute')",
-                    [time],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(recent, "migration time was not backfilled: {time}");
-        }
-        assert!(store.pending_inbox_tasks().unwrap().contains(&id));
-        for table in ["executor_event_receipts", "origin_event_receipts"] {
-            let exists: bool = store
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "{table} missing after v13 migration");
-        }
-    }
-
-    #[test]
-    fn invalid_legacy_notification_intents_roll_back_the_full_migration() {
-        for duplicate in [false, true] {
-            let directory = tempdir().unwrap();
-            let path = directory.path().join("db");
-            let migrated_first = TaskId(uuid::Uuid::from_u128(1));
-            let malformed_second = TaskId(uuid::Uuid::from_u128(2));
-            {
-                let store = Store::open(&path).unwrap();
-                insert_legacy_terminal(&store, migrated_first, CallbackStatus::Pending);
-                insert_legacy_terminal(&store, malformed_second, CallbackStatus::Pending);
-                if duplicate {
-                    store
-                        .conn
-                        .execute(
-                            "INSERT INTO reports (task_id,seq,outcome,summary,reported_at,notified_at)
-                             VALUES (?1,1,'blocked','report with duplicate intent',?2,NULL)",
-                            params![malformed_second.to_string(), fmt_time(Utc::now())],
-                        )
-                        .unwrap();
-                }
-            }
-
-            {
-                let legacy = Connection::open(&path).unwrap();
-                legacy
-                    .execute_batch(
-                        "PRAGMA foreign_keys=OFF;
-                         DROP TABLE report_notification_intents;
-                         CREATE TABLE report_notification_intents (
-                             task_id TEXT NOT NULL,
-                             report_seq INTEGER NOT NULL,
-                             requested_at TEXT NOT NULL
-                         );",
-                    )
-                    .unwrap();
-                let intent_seq = if duplicate { 1 } else { 999 };
-                legacy
-                    .execute(
-                        "INSERT INTO report_notification_intents (task_id,report_seq,requested_at)
-                         VALUES (?1,?2,'2026-01-01T00:00:00Z')",
-                        params![malformed_second.to_string(), intent_seq],
-                    )
-                    .unwrap();
-                if duplicate {
-                    legacy
-                        .execute(
-                            "INSERT INTO report_notification_intents (task_id,report_seq,requested_at)
-                             VALUES (?1,?2,'2026-01-01T00:00:01Z')",
-                            params![malformed_second.to_string(), intent_seq],
-                        )
-                        .unwrap();
-                }
-            }
-
-            let mut store = Store::open(&path).unwrap();
-            assert!(store.migrate_legacy_local(MachineId::new()).is_err());
-            for id in [migrated_first, malformed_second] {
-                assert!(store.executor_identity(id).unwrap().is_none());
-                assert!(store.origin_route_by_task(id).unwrap().is_none());
-                assert!(store.inbound_events(id).unwrap().is_empty());
-                assert!(store.pending_outbound_events(id).unwrap().is_empty());
-                let outbox_count: i64 = store
-                    .conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM executor_outbox WHERE task_id=?1",
-                        [id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(outbox_count, 0);
-            }
-            let intent_count: i64 = store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM report_notification_intents WHERE task_id=?1",
-                    [malformed_second.to_string()],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(intent_count, if duplicate { 2 } else { 1 });
-        }
-    }
-
     fn assert_foreign_keys_enabled(store: &Store) {
         let enabled: bool = store
             .conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert!(enabled);
-    }
-
-    #[test]
-    fn migrate_version_6_installs_resources_without_losing_fleet_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let task_id = TaskId::new();
-
-        {
-            let store = Store::open(&path).unwrap();
-            insert_local(&store, task_id);
-            assert!(store.origin_route_by_task(task_id).unwrap().is_some());
-            assert!(store.is_event_task(task_id).unwrap());
-            assert_eq!(store.pending_outbound_events(task_id).unwrap().len(), 1);
-        }
-
-        {
-            let legacy = Connection::open(&path).unwrap();
-            legacy
-                .execute_batch(
-                    "DROP TABLE loans;
-                     DROP TABLE resource_request_preventions;
-                     DROP TABLE resource_requests;
-                     DROP TABLE resources;
-                     DROP TABLE message_receipts;
-                     DROP TABLE message_attempts;
-                     ALTER TABLE tasks DROP COLUMN project_root;",
-                )
-                .unwrap();
-            legacy.pragma_update(None, "user_version", 6i64).unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        assert_foreign_keys_enabled(&store);
-        assert_eq!(store.require_task(task_id).unwrap().id, task_id);
-        assert!(store.origin_route_by_task(task_id).unwrap().is_some());
-        assert!(matches!(
-            store.executor_identity(task_id).unwrap(),
-            Some(ExecutorIdentity::Accepted(record)) if record.task == task_id
-        ));
-        assert_eq!(store.pending_outbound_events(task_id).unwrap().len(), 1);
-        drop(store);
-
-        let reopened = Store::open(&path).unwrap();
-        assert_resource_tables_installed(&reopened);
-        assert_foreign_keys_enabled(&reopened);
-        assert_eq!(reopened.require_task(task_id).unwrap().id, task_id);
-        assert!(reopened.origin_route_by_task(task_id).unwrap().is_some());
-        assert_eq!(reopened.pending_outbound_events(task_id).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn project_metadata_migrates_versions_7_and_8_without_losing_rows() {
-        for version in [7_i64, 8] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("db");
-            let task_id = TaskId::new();
-            {
-                let store = Store::open(&path).unwrap();
-                store.insert_task(&task_row(task_id)).unwrap();
-            }
-
-            {
-                let legacy = Connection::open(&path).unwrap();
-                legacy
-                    .execute_batch("ALTER TABLE tasks DROP COLUMN project_root;")
-                    .unwrap();
-                if version == 7 {
-                    legacy
-                        .execute_batch(
-                            "DROP TABLE loans;
-                             DROP TABLE resource_request_preventions;
-                             DROP TABLE resource_requests;
-                             DROP TABLE resources;
-                             DROP TABLE message_receipts;
-                             DROP TABLE message_attempts;",
-                        )
-                        .unwrap();
-                }
-                legacy.pragma_update(None, "user_version", version).unwrap();
-            }
-
-            let store = Store::open(&path).unwrap();
-            let stored_version: i64 = store
-                .conn
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .unwrap();
-            assert_eq!(stored_version, SCHEMA_VERSION);
-            assert_eq!(store.require_task(task_id).unwrap().id, task_id);
-            assert_eq!(
-                store.task_presentations(&[task_id]).unwrap()[&task_id].project_root,
-                None
-            );
-            assert_resource_tables_installed(&store);
-            let has_message_attempts: bool = store
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attempts')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(has_message_attempts);
-        }
     }
 
     #[test]
@@ -4918,7 +3660,7 @@ CREATE TABLE reports (
         assert!(store.reports(id).unwrap()[0].notified_at.is_some());
         assert!(!store.has_pending_terminal_callbacks().unwrap());
         assert_eq!(
-            serde_json::to_value(crate::daemon::api::views::TaskSummary::from_row(
+            serde_json::to_value(TaskSummary::from_row(
                 &store.require_task(id).unwrap(),
                 Some(&store.task_presentations(&[id]).unwrap()[&id]),
             ))
@@ -5022,7 +3764,7 @@ CREATE TABLE reports (
             TerminalCallbackProjection::OriginInbox(CallbackStatus::Failed)
         );
         assert_eq!(
-            serde_json::to_value(crate::daemon::api::views::TaskSummary::from_row(
+            serde_json::to_value(TaskSummary::from_row(
                 &store.require_task(terminal_failure_id).unwrap(),
                 Some(
                     &store.task_presentations(&[terminal_failure_id]).unwrap()
@@ -5057,7 +3799,7 @@ CREATE TABLE reports (
         else {
             panic!("inactivity callback payload")
         };
-        assert_eq!(attention.event, crate::callback::EventKind::TaskCheckDue);
+        assert_eq!(attention.event, EventKind::TaskCheckDue);
         let EventPayload::Callback {
             event: terminal,
             state,
@@ -5066,7 +3808,7 @@ CREATE TABLE reports (
             panic!("terminal callback payload")
         };
         assert_eq!(*state, Some(ProcessStatus::Succeeded));
-        assert_eq!(terminal.event, crate::callback::EventKind::TaskSucceeded);
+        assert_eq!(terminal.event, EventKind::TaskSucceeded);
         assert!(store.require_task(id).unwrap().attention.is_delivered());
     }
 

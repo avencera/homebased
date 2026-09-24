@@ -1,15 +1,19 @@
 //! Read-only detection of newly published trainer recovery generations
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
-use std::ops::Range;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{ExitReason, TaskState};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
+
+use super::ownership_lock::TrainerRequestDigest;
+use crate::digest::Sha256Digest;
+use crate::domain::{ExitReason, TaskState};
 
 const PUBLICATIONS_DIRECTORY: &str = "published";
 const RECOVERY_RECORD: &str = "segment-record.json";
@@ -156,8 +160,8 @@ pub(crate) struct VerifiedCheckpointPublication {
     pub(crate) path: PathBuf,
     pub(crate) generation_id: String,
     pub(crate) committed_update_count: u64,
-    pub(crate) record_sha256: String,
-    pub(crate) inventory_sha256: String,
+    pub(crate) record_sha256: Sha256Digest,
+    pub(crate) inventory_sha256: Sha256Digest,
 }
 
 impl VerifiedCheckpointPublication {
@@ -182,9 +186,9 @@ pub struct PublishedTerminalResult {
     /// Output paths bound by the result receipt
     pub output_paths: Vec<String>,
     /// SHA-256 digest of the exact request bytes validated for this result
-    pub request_sha256: String,
+    pub request_sha256: TrainerRequestDigest,
     /// SHA-256 digest of the terminal record, request, and verified output inventory
-    pub publication_sha256: String,
+    pub publication_sha256: Sha256Digest,
 }
 
 /// Complete publication evidence observed during one release-watch decision
@@ -311,9 +315,9 @@ pub enum WatcherError {
 
 /// Capture complete recovery generation identities for one exact attempt
 ///
-/// Missing runtime or publication directories produce an empty baseline.
+/// Missing runtime or publication directories produce an empty baseline
 /// Malformed candidate publications and unsafe symlinks return an error so the
-/// caller can retain the resource and request attention.
+/// caller can retain the resource and request attention
 pub fn snapshot(
     runtime_root: &Path,
     expected_binding: &AttemptBinding,
@@ -333,7 +337,7 @@ pub fn snapshot(
 /// Find the first deterministic complete publication not present in the baseline
 ///
 /// Results are ordered by generation identity. A returned publication only
-/// identifies a checkpoint; it does not establish process exit or release a GPU.
+/// identifies a checkpoint; it does not establish process exit or release a GPU
 pub fn find_new(
     runtime_root: &Path,
     expected_binding: &AttemptBinding,
@@ -380,7 +384,7 @@ pub(crate) fn revalidate_checkpoint_publication(
 ///
 /// A result is accepted only when the publication, persisted request, and
 /// attempt-local terminal file agree on the exact trainer identity. The
-/// publication inventory is checked against the files on disk.
+/// publication inventory is checked against the files on disk
 pub fn find_completed_result(
     runtime_root: &Path,
     expected_binding: &AttemptBinding,
@@ -489,7 +493,7 @@ pub fn find_completed_result(
     )?;
     validate_result_files(&result_path, &terminal.terminal.outcome.result.outputs)?;
 
-    let request_sha256 = hex_digest(&Sha256::digest(&request_bytes));
+    let request_sha256 = TrainerRequestDigest::of(&request_bytes);
     let publication_sha256 = completed_publication_sha256(
         &result_path,
         &request_bytes,
@@ -761,7 +765,6 @@ fn validate_result_receipt(result: &ResultReceiptProjection) -> Result<(), Strin
     let mut previous_path: Option<&str> = None;
     for entry in &result.outputs.entries {
         validate_artifact_path(&entry.path)?;
-        validate_digest(&entry.digest)?;
         if entry.kind != "file" {
             return Err("direct result inventory contains a non-file artifact".into());
         }
@@ -847,8 +850,8 @@ pub(crate) enum AttemptRequestValidationError {
 
 /// Validate a request with the same strict projection used for terminal results
 ///
-/// This also runs the request configuration scanner used by completed-result
-/// validation. That scanner rejects duplicate top-level and input-view fields.
+/// The strict projection rejects duplicate top-level and input-view fields. This
+/// also computes the configuration digest used by completed-result validation
 pub(crate) fn validate_attempt_request(
     request_bytes: &[u8],
     expected_binding: &AttemptBinding,
@@ -907,15 +910,12 @@ fn validate_metric_unit(unit: &serde_json::Value) -> Result<(), String> {
 }
 
 fn validate_result_evidence(evidence: &ResultEvidenceProjection) -> Result<(), String> {
-    validate_digest(&evidence.score_contract)?;
-    validate_digest(&evidence.membership_digest)?;
     if evidence.source_exposures.is_empty() || evidence.update_points.is_empty() {
         return Err("result evidence is missing source or update evidence".into());
     }
     let mut source_digests = BTreeSet::new();
     for exposure in &evidence.source_exposures {
-        validate_digest(&exposure.source_digest)?;
-        if exposure.samples == 0 || !source_digests.insert(exposure.source_digest.as_str()) {
+        if exposure.samples == 0 || !source_digests.insert(exposure.source_digest) {
             return Err("result evidence has an invalid source exposure".into());
         }
     }
@@ -932,7 +932,6 @@ fn validate_result_evidence(evidence: &ResultEvidenceProjection) -> Result<(), S
             return Err("result evidence artifact has an invalid schema or size".into());
         }
         validate_artifact_path(&artifact.path)?;
-        validate_digest(&artifact.digest)?;
     }
 
     Ok(())
@@ -940,7 +939,6 @@ fn validate_result_evidence(evidence: &ResultEvidenceProjection) -> Result<(), S
 
 fn validate_validation_receipt(receipt: &ValidationReceiptProjection) -> Result<(), String> {
     validate_identifier(&receipt.validator_id)?;
-    let _validated_at = receipt.validated_at;
     if receipt.validator_version.is_empty()
         || receipt.validator_version.len() > 32
         || !receipt.validator_version.bytes().all(|byte| {
@@ -949,7 +947,7 @@ fn validate_validation_receipt(receipt: &ValidationReceiptProjection) -> Result<
     {
         return Err("result validation receipt has an invalid validator version".into());
     }
-    validate_digest(&receipt.evidence_digest)
+    Ok(())
 }
 
 fn unique_values(values: &[u64]) -> bool {
@@ -958,9 +956,6 @@ fn unique_values(values: &[u64]) -> bool {
 
 fn validate_worker_identity(worker: &WorkerIdentityProjection) -> Result<(), String> {
     validate_identifier(&worker.worker_id)?;
-    validate_digest(&worker.executable_digest)?;
-    validate_digest(&worker.source_digest)?;
-    validate_digest(&worker.environment_digest)?;
     Ok(())
 }
 
@@ -1033,7 +1028,7 @@ fn completed_publication_sha256(
     request_bytes: &[u8],
     terminal_bytes: &[u8],
     inventory: &ArtifactInventoryProjection,
-) -> String {
+) -> Sha256Digest {
     let mut digest = Sha256::new();
     digest.update(b"trainer-completed-publication-v1\0");
 
@@ -1044,10 +1039,12 @@ fn completed_publication_sha256(
     }
 
     for entry in &inventory.entries {
+        // the publication digest covers each entry digest as its hex text
+        let entry_digest = entry.digest.to_hex();
         for value in [
             entry.path.as_bytes(),
             entry.kind.as_bytes(),
-            entry.digest.as_bytes(),
+            entry_digest.as_bytes(),
         ] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value);
@@ -1055,7 +1052,7 @@ fn completed_publication_sha256(
         digest.update(entry.size.to_be_bytes());
     }
 
-    hex_digest(&digest.finalize())
+    Sha256Digest::from(digest)
 }
 
 fn verify_output_file(
@@ -1105,8 +1102,7 @@ fn verify_output_file(
         }
         digest.update(&buffer[..count]);
     }
-    let actual_digest = digest.finalize();
-    if hex_digest(&actual_digest) != entry.digest {
+    if Sha256Digest::from(digest) != entry.digest {
         return Err(malformed_publication(
             &path,
             "result output digest differs from its inventory",
@@ -1215,173 +1211,66 @@ fn validate_artifact_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_digest(digest: &str) -> Result<(), String> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("trainer digest must be a lower-case SHA-256 digest".into());
-    }
-
-    Ok(())
+/// Request members that the trainer's configuration digest covers
+///
+/// Each member keeps its exact source bytes, so the digest matches the trainer's
+/// hash of the persisted request without re-encoding any value
+#[derive(Deserialize)]
+struct ConfigurationMembers<'a> {
+    #[serde(borrow)]
+    adapter: &'a RawValue,
+    #[serde(borrow)]
+    start_mode: &'a RawValue,
+    #[serde(borrow)]
+    payload: &'a RawValue,
+    #[serde(borrow)]
+    input_view: InputViewConfigurationMembers<'a>,
+    #[serde(borrow)]
+    inputs: &'a RawValue,
+    #[serde(borrow)]
+    expected_outputs: &'a RawValue,
+    #[serde(borrow)]
+    resources: &'a RawValue,
 }
 
-fn configuration_digest(request: &[u8]) -> Result<String, String> {
-    let request_fields = json_object_ranges(request, 0)?;
-    let input_view_range = request_fields
-        .get("input_view")
-        .ok_or_else(|| "persisted request has no input view".to_owned())?;
-    let input_view_fields = json_object_ranges(request, input_view_range.start)?;
-    let mut canonical = Vec::new();
-    canonical.push(b'[');
-    append_json_field(request, &request_fields, "adapter", &mut canonical)?;
-    canonical.push(b',');
-    append_json_field(request, &request_fields, "start_mode", &mut canonical)?;
-    canonical.push(b',');
-    append_json_field(request, &request_fields, "payload", &mut canonical)?;
-    canonical.extend_from_slice(b",{\"schema_version\":");
-    append_json_field(
-        request,
-        &input_view_fields,
-        "schema_version",
-        &mut canonical,
-    )?;
-    canonical.extend_from_slice(b",\"revision_id\":");
-    append_json_field(request, &input_view_fields, "revision_id", &mut canonical)?;
-    canonical.push(b'}');
-    canonical.push(b',');
-    append_json_field(request, &request_fields, "inputs", &mut canonical)?;
-    canonical.push(b',');
-    append_json_field(request, &request_fields, "expected_outputs", &mut canonical)?;
-    canonical.push(b',');
-    append_json_field(request, &request_fields, "resources", &mut canonical)?;
-    canonical.push(b']');
-
-    Ok(hex_digest(&Sha256::digest(canonical)))
+/// Input-view members that the trainer's configuration digest covers
+#[derive(Deserialize)]
+struct InputViewConfigurationMembers<'a> {
+    #[serde(borrow)]
+    schema_version: &'a RawValue,
+    #[serde(borrow)]
+    revision_id: &'a RawValue,
 }
 
-fn append_json_field(
-    document: &[u8],
-    fields: &BTreeMap<String, Range<usize>>,
-    name: &str,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    let range = fields
-        .get(name)
-        .ok_or_else(|| format!("persisted request has no {name} field"))?;
-    output.extend_from_slice(&document[range.clone()]);
-    Ok(())
-}
+/// Hash the configuration members of one persisted request in the trainer's order
+///
+/// Serde refuses a duplicate member, so no member can have two candidate values
+fn configuration_digest(request: &[u8]) -> Result<Sha256Digest, String> {
+    let members: ConfigurationMembers<'_> =
+        serde_json::from_slice(request).map_err(|error| error.to_string())?;
+    let input_view = &members.input_view;
+    let canonical = [
+        "[",
+        members.adapter.get(),
+        ",",
+        members.start_mode.get(),
+        ",",
+        members.payload.get(),
+        ",{\"schema_version\":",
+        input_view.schema_version.get(),
+        ",\"revision_id\":",
+        input_view.revision_id.get(),
+        "},",
+        members.inputs.get(),
+        ",",
+        members.expected_outputs.get(),
+        ",",
+        members.resources.get(),
+        "]",
+    ]
+    .concat();
 
-fn json_object_ranges(
-    document: &[u8],
-    object_start: usize,
-) -> Result<BTreeMap<String, Range<usize>>, String> {
-    let mut position = skip_json_whitespace(document, object_start);
-    if document.get(position) != Some(&b'{') {
-        return Err("expected a JSON object in the persisted request".into());
-    }
-    position += 1;
-    let mut fields = BTreeMap::new();
-
-    loop {
-        position = skip_json_whitespace(document, position);
-        if document.get(position) == Some(&b'}') {
-            return Ok(fields);
-        }
-        if document.get(position) != Some(&b'"') {
-            return Err("invalid JSON object key in the persisted request".into());
-        }
-        let key_end = json_string_end(document, position)?;
-        let key: String = serde_json::from_slice(&document[position..key_end])
-            .map_err(|_| "invalid JSON object key in the persisted request".to_owned())?;
-        position = skip_json_whitespace(document, key_end);
-        if document.get(position) != Some(&b':') {
-            return Err("invalid JSON object separator in the persisted request".into());
-        }
-        let value_start = skip_json_whitespace(document, position + 1);
-        let value_end = json_value_end(document, value_start)?;
-        if fields.insert(key, value_start..value_end).is_some() {
-            return Err("persisted request contains a duplicate JSON field".into());
-        }
-        position = skip_json_whitespace(document, value_end);
-        match document.get(position) {
-            Some(b',') => position += 1,
-            Some(b'}') => return Ok(fields),
-            _ => return Err("invalid JSON object in the persisted request".into()),
-        }
-    }
-}
-
-fn json_value_end(document: &[u8], start: usize) -> Result<usize, String> {
-    match document.get(start) {
-        Some(b'"') => json_string_end(document, start),
-        Some(b'{') | Some(b'[') => {
-            let mut delimiters = vec![if document[start] == b'{' { b'}' } else { b']' }];
-            let mut position = start + 1;
-            while let Some(byte) = document.get(position) {
-                match byte {
-                    b'"' => position = json_string_end(document, position)?,
-                    b'{' => {
-                        delimiters.push(b'}');
-                        position += 1;
-                    }
-                    b'[' => {
-                        delimiters.push(b']');
-                        position += 1;
-                    }
-                    b'}' | b']' => {
-                        if delimiters.pop() != Some(*byte) {
-                            return Err("invalid JSON container in the persisted request".into());
-                        }
-                        position += 1;
-                        if delimiters.is_empty() {
-                            return Ok(position);
-                        }
-                    }
-                    _ => position += 1,
-                }
-            }
-            Err("unterminated JSON container in the persisted request".into())
-        }
-        Some(_) => {
-            let mut position = start;
-            while document.get(position).is_some_and(|byte| {
-                !byte.is_ascii_whitespace() && !matches!(byte, b',' | b'}' | b']')
-            }) {
-                position += 1;
-            }
-            if position == start {
-                return Err("invalid JSON value in the persisted request".into());
-            }
-            Ok(position)
-        }
-        None => Err("missing JSON value in the persisted request".into()),
-    }
-}
-
-fn json_string_end(document: &[u8], start: usize) -> Result<usize, String> {
-    let mut position = start + 1;
-    while let Some(byte) = document.get(position) {
-        match byte {
-            b'\\' => position += 2,
-            b'"' => return Ok(position + 1),
-            _ => position += 1,
-        }
-    }
-    Err("unterminated JSON string in the persisted request".into())
-}
-
-fn skip_json_whitespace(document: &[u8], mut position: usize) -> usize {
-    while document.get(position).is_some_and(u8::is_ascii_whitespace) {
-        position += 1;
-    }
-    position
-}
-
-fn hex_digest(digest: &[u8]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    Ok(Sha256Digest::of(canonical))
 }
 
 fn read_matching_generations(
@@ -1522,7 +1411,7 @@ fn read_matching_generations(
             &path,
             &publication.recovery.inventory,
             expected_binding,
-            &publication.recovery.state_digest,
+            publication.recovery.state_digest,
         )?;
 
         let final_record_metadata = metadata(&record_path)?;
@@ -1542,8 +1431,8 @@ fn read_matching_generations(
             path,
             generation_id: publication.recovery.generation_id,
             committed_update_count: publication.recovery.position.update_count,
-            record_sha256: hex_digest(&Sha256::digest(&record)),
-            inventory_sha256: hex_digest(&Sha256::digest(&inventory_bytes)),
+            record_sha256: Sha256Digest::of(&record),
+            inventory_sha256: Sha256Digest::of(&inventory_bytes),
         });
     }
 
@@ -1551,26 +1440,30 @@ fn read_matching_generations(
     Ok(generations)
 }
 
+/// Borrow the exact source bytes of the request member of one recovery record
 fn request_document(record: &[u8]) -> Result<&[u8], String> {
-    let fields = json_object_ranges(record, 0)?;
-    let request = fields
-        .get("request")
-        .ok_or_else(|| "recovery publication has no request".to_owned())?;
-    Ok(&record[request.clone()])
+    #[derive(Deserialize)]
+    struct RecordRequest<'a> {
+        #[serde(borrow)]
+        request: &'a RawValue,
+    }
+
+    let record: RecordRequest<'_> =
+        serde_json::from_slice(record).map_err(|error| error.to_string())?;
+    Ok(record.request.get().as_bytes())
 }
 
 fn validate_checkpoint_inventory(
     path: &Path,
     inventory: &ArtifactInventoryProjection,
     expected_binding: &AttemptBinding,
-    state_digest: &str,
+    state_digest: Sha256Digest,
 ) -> Result<(), WatcherError> {
     let mut previous_path: Option<&str> = None;
     let mut paths = BTreeSet::new();
     for entry in &inventory.entries {
         validate_artifact_path(&entry.path)
             .map_err(|reason| malformed_publication(path, reason))?;
-        validate_digest(&entry.digest).map_err(|reason| malformed_publication(path, reason))?;
         if entry.kind != "file"
             || previous_path.is_some_and(|previous| previous >= entry.path.as_str())
             || !paths.insert(entry.path.as_str())
@@ -1744,7 +1637,7 @@ struct RecoveryMetadataProjection {
     compatibility: RecoveryCompatibilityProjection,
     worker: WorkerIdentityProjection,
     inventory: ArtifactInventoryProjection,
-    state_digest: String,
+    state_digest: Sha256Digest,
     position: RecoveryPositionProjection,
     cause: String,
 }
@@ -1753,8 +1646,8 @@ struct RecoveryMetadataProjection {
 #[serde(deny_unknown_fields)]
 struct RecoveryCompatibilityProjection {
     schema_id: String,
-    config_digest: String,
-    source_digest: String,
+    config_digest: Sha256Digest,
+    source_digest: Sha256Digest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1845,7 +1738,7 @@ struct ResultReceiptProjection {
     schema_version: u64,
     binding: AttemptBinding,
     worker: WorkerIdentityProjection,
-    config_digest: String,
+    config_digest: Sha256Digest,
     expected_outputs: Vec<OutputDeclarationProjection>,
     outputs: ArtifactInventoryProjection,
     metrics: Vec<MetricProjection>,
@@ -1857,9 +1750,9 @@ struct ResultReceiptProjection {
 #[serde(deny_unknown_fields)]
 struct WorkerIdentityProjection {
     worker_id: String,
-    executable_digest: String,
-    source_digest: String,
-    environment_digest: String,
+    executable_digest: Sha256Digest,
+    source_digest: Sha256Digest,
+    environment_digest: Sha256Digest,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -1883,7 +1776,7 @@ struct InventoryEntryProjection {
     path: String,
     kind: String,
     size: u64,
-    digest: String,
+    digest: Sha256Digest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1897,11 +1790,25 @@ struct MetricProjection {
     uncertainty: f64,
 }
 
+/// Decode a field only to check its form, keeping no value
+///
+/// Some published fields must be well formed although no rule reads them, so
+/// the projection records that the form was checked instead of holding a value
+fn decode_form<'de, D, T>(deserializer: D) -> Result<PhantomData<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(|_| PhantomData)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResultEvidenceProjection {
-    score_contract: String,
-    membership_digest: String,
+    #[serde(deserialize_with = "decode_form")]
+    score_contract: PhantomData<Sha256Digest>,
+    #[serde(deserialize_with = "decode_form")]
+    membership_digest: PhantomData<Sha256Digest>,
     source_exposures: Vec<SourceExposureProjection>,
     update_points: Vec<u64>,
     probe_points: Vec<u64>,
@@ -1912,7 +1819,7 @@ struct ResultEvidenceProjection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceExposureProjection {
-    source_digest: String,
+    source_digest: Sha256Digest,
     samples: u64,
 }
 
@@ -1921,7 +1828,8 @@ struct SourceExposureProjection {
 struct EvidenceArtifactProjection {
     schema: EvidenceSchemaProjection,
     path: String,
-    digest: String,
+    #[serde(deserialize_with = "decode_form")]
+    digest: PhantomData<Sha256Digest>,
     size: u64,
 }
 
@@ -1937,8 +1845,10 @@ struct EvidenceSchemaProjection {
 struct ValidationReceiptProjection {
     validator_id: String,
     validator_version: String,
-    evidence_digest: String,
-    validated_at: u64,
+    #[serde(deserialize_with = "decode_form")]
+    evidence_digest: PhantomData<Sha256Digest>,
+    #[serde(deserialize_with = "decode_form")]
+    validated_at: PhantomData<u64>,
 }
 
 #[cfg(test)]
@@ -1946,10 +1856,11 @@ pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::domain::{ExitReason, TaskState};
     use serde_json::{Value, json};
-    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    use crate::digest::Sha256Digest;
+    use crate::domain::{ExitReason, TaskState};
 
     use super::{
         AttemptBinding, PublishedRecoveryGeneration, WatchObservation, WatcherAttention,
@@ -2102,7 +2013,7 @@ pub(crate) mod tests {
     }
 
     fn digest(bytes: &[u8]) -> String {
-        super::hex_digest(&Sha256::digest(bytes))
+        Sha256Digest::of(bytes).to_hex()
     }
 
     fn worker_identity() -> Value {
@@ -2664,7 +2575,6 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_terminal_evidence_requires_attention() {
         use std::os::unix::fs::symlink;
@@ -2821,7 +2731,6 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_publication_root_requires_attention() {
         use std::os::unix::fs::symlink;
@@ -2839,7 +2748,6 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_generation_directory_requires_attention() {
         use std::os::unix::fs::symlink;
@@ -2857,7 +2765,6 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_record_file_requires_attention() {
         use std::os::unix::fs::symlink;
@@ -2886,5 +2793,40 @@ pub(crate) mod tests {
             snapshot(&runtime_root, &expected),
             Err(WatcherError::Symlink { .. })
         ));
+    }
+
+    #[test]
+    fn configuration_digest_hashes_the_exact_member_bytes() {
+        let request = br#"{ "schema_version" : 1, "resources":{"accelerator" :"cuda"},
+            "adapter" : {"kind":"speakrs"} , "start_mode":{ "kind": "fresh" },
+            "payload": {"epochs": 4.0, "rate": 1e-3},
+            "input_view": {"root": "/in", "revision_id" : "revision-a", "schema_version": 1},
+            "inputs": [ ], "expected_outputs": [{"path":"a.bin","kind":"file"}] }"#;
+        let expected = concat!(
+            r#"[{"kind":"speakrs"},{ "kind": "fresh" },{"epochs": 4.0, "rate": 1e-3},"#,
+            r#"{"schema_version":1,"revision_id":"revision-a"},[ ],"#,
+            r#"[{"path":"a.bin","kind":"file"}],{"accelerator" :"cuda"}]"#,
+        );
+
+        assert_eq!(
+            super::configuration_digest(request).unwrap(),
+            Sha256Digest::of(expected)
+        );
+    }
+
+    #[test]
+    fn configuration_digest_refuses_duplicate_members() {
+        let request = request_value(&expected_binding());
+        let document = serde_json::to_string(&request).unwrap();
+        let duplicate_top = document.replacen('{', r#"{"payload":{},"#, 1);
+        let duplicate_view = document.replacen(
+            r#""input_view":{"#,
+            r#""input_view":{"revision_id":"other","#,
+            1,
+        );
+
+        assert!(super::configuration_digest(document.as_bytes()).is_ok());
+        assert!(super::configuration_digest(duplicate_top.as_bytes()).is_err());
+        assert!(super::configuration_digest(duplicate_view.as_bytes()).is_err());
     }
 }

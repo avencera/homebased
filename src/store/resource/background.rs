@@ -2,10 +2,10 @@
 //!
 //! A first background launch binds its stable request, preallocated task, full
 //! normalized spec, callback route, accepted executor identity, queued row, and
-//! first event in one IMMEDIATE transaction with an immutable launch receipt.
+//! first event in one IMMEDIATE transaction with an immutable launch receipt
 //! The receipt does not register the task. The queue owner registers it only
 //! after the task layer records a confirmed start, so a queued row is never
-//! mistaken for live background work.
+//! mistaken for live background work
 //!
 //! The latest launch receipt and the latest loan form the resource history that
 //! the idle boundary reads. An unregistered resource serves queued work only
@@ -29,8 +29,7 @@ use crate::machine::MachineId;
 use crate::resource::background_launch::{BackgroundLaunchBinding, RemoteBackgroundLaunchReceipt};
 use crate::resource::command_shape::{DirectSegmentCommandShape, DirectSegmentCommandShapeError};
 use crate::resource::store::{
-    ResourceStoreError, oldest_queued_request_for_authority, select_non_closed_loan,
-    select_resource,
+    ConflictReason, ResourceStoreError, oldest_queued_request_for_authority, select_non_closed_loan,
 };
 use crate::resource::{
     BackgroundCommandContract, IdleBoundaryDecision, IdleBoundaryProof, IdleProofGap, Loan,
@@ -40,6 +39,7 @@ use crate::resource::{
 };
 use crate::spec::NormalizedSpec;
 use crate::store::IdentityError;
+use crate::store::identity::{executor_identity_on, origin_route_by_request_on};
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutorIdentity, NormalizedSpecSha256, RequestId,
     normalized_spec_sha256,
@@ -49,6 +49,7 @@ use super::trainer_lock::{
     EndedTaskWitness, HeldTrainerRelease, TrainerLockReleaseError, TrainerLockReleaseGap,
     ended_task_witness, hold_released_trainer_lock,
 };
+use super::{encode_resource_json, select_authority_resource};
 
 /// Fixed identities and executor context for one first background launch
 #[derive(Debug, Clone)]
@@ -344,6 +345,20 @@ impl BackgroundLaunchView {
         )
         .then_some(self.task_id)
     }
+
+    /// Whether the launch ended before registration with no automatic release proof
+    ///
+    /// The maintained trainer starts its worker in another session, and an
+    /// unregistered task cannot bind the trainer attempt whose lock would prove
+    /// that worker's exit. Only a saved operator attestation releases it
+    pub(crate) fn awaits_operator_release(&self) -> bool {
+        matches!(
+            self.phase,
+            BackgroundLaunchPhase::EndedBeforeRegistration {
+                release: EndedLaunchRelease::ConfirmedExited | EndedLaunchRelease::Unproven,
+            }
+        )
+    }
 }
 
 /// Proof that no earlier background task can still hold the GPU
@@ -392,7 +407,7 @@ impl crate::store::Store {
         authority_machine: MachineId,
         resource_id: ResourceId,
     ) -> Result<Option<BackgroundLaunchView>, ResourceStoreError> {
-        let resource = authority_resource(&self.conn, authority_machine, resource_id)?;
+        let resource = select_authority_resource(&self.conn, authority_machine, resource_id)?;
         current_launch_on(&self.conn, &resource)
     }
 
@@ -418,7 +433,7 @@ impl crate::store::Store {
         ids.into_iter()
             .map(|id| {
                 id.parse()
-                    .map_err(|_| stored_error("background launch task"))
+                    .map_err(|error| ResourceStoreError::corrupt("background launch task", error))
             })
             .collect()
     }
@@ -437,7 +452,7 @@ fn accept_background_launch_for_authority(
             tx.commit()?;
             return Ok(existing);
         }
-        let resource = authority_resource(&tx, input.authority_machine, input.resource_id)?;
+        let resource = select_authority_resource(&tx, input.authority_machine, input.resource_id)?;
         if let Some(unsupported) = remote_supervisor(&resource) {
             return Ok(unsupported);
         }
@@ -452,7 +467,7 @@ fn accept_background_launch_for_authority(
         tx.commit()?;
         return Ok(existing);
     }
-    let resource = authority_resource(&tx, input.authority_machine, input.resource_id)?;
+    let resource = select_authority_resource(&tx, input.authority_machine, input.resource_id)?;
     if let Some(unsupported) = remote_supervisor(&resource) {
         return Ok(unsupported);
     }
@@ -465,7 +480,7 @@ fn accept_background_launch_for_authority(
     let clearance = require_launch_slot(&tx, input.authority_machine, &resource)?;
 
     let task_id = input.task_id;
-    if launch_identity_is_used(&tx, input.request_id, task_id)? {
+    if super::task_identity_is_used(&tx, input.request_id, task_id)? {
         return Err(BackgroundLaunchError::IdentityConflict { task_id });
     }
     let callback = CallbackContext {
@@ -535,7 +550,7 @@ fn accept_remote_background_launch_for_authority(
             return Ok(existing);
         }
         let resource =
-            authority_resource(&tx, assignment.authority_machine, assignment.resource_id)?;
+            select_authority_resource(&tx, assignment.authority_machine, assignment.resource_id)?;
         check_remote_assignment(&resource, &expected.binding, &spec)?;
         tx.commit()?;
     }
@@ -548,10 +563,11 @@ fn accept_remote_background_launch_for_authority(
         tx.commit()?;
         return Ok(existing);
     }
-    let resource = authority_resource(&tx, assignment.authority_machine, assignment.resource_id)?;
+    let resource =
+        select_authority_resource(&tx, assignment.authority_machine, assignment.resource_id)?;
     check_remote_assignment(&resource, &expected.binding, &spec)?;
     let clearance = require_launch_slot(&tx, assignment.authority_machine, &resource)?;
-    if launch_identity_is_used(&tx, request_id, task_id)? {
+    if super::task_identity_is_used(&tx, request_id, task_id)? {
         return Err(BackgroundLaunchError::IdentityConflict { task_id });
     }
     crate::store::insert_remote_origin_task_records_on(
@@ -678,7 +694,9 @@ fn record_launch_on(
             AdvanceError::Exhausted => BackgroundLaunchError::RevisionExhausted {
                 revision: resource.state_revision,
             },
-            AdvanceError::Changed => BackgroundLaunchError::Resource(ResourceStoreError::Conflict),
+            AdvanceError::Changed => BackgroundLaunchError::Resource(ResourceStoreError::Conflict(
+                ConflictReason::ResourceRevisionChanged,
+            )),
             AdvanceError::Storage(error) => BackgroundLaunchError::Storage(error),
         })?;
     let receipt = BackgroundLaunchReceipt {
@@ -730,7 +748,7 @@ fn replay_on(
     };
     let Some(receipt) = receipt_by_request_on(conn, input.request_id)? else {
         // an ordinary task or another resource path already owns this request identity
-        if super::super::identity::origin_route_by_request_on(conn, input.request_id)?.is_some()
+        if origin_route_by_request_on(conn, input.request_id)?.is_some()
             || super::resource_request_identity_exists(conn, input.request_id, input.task_id)?
         {
             return Err(conflict);
@@ -765,7 +783,7 @@ fn replay_remote_on(
         Some(saved) => saved,
         // another launch owns the task identity, or another path owns the request
         None if receipt_by_task_on(conn, expected.task_id)?.is_some()
-            || super::super::identity::origin_route_by_request_on(conn, request_id)?.is_some()
+            || origin_route_by_request_on(conn, request_id)?.is_some()
             || super::resource_request_identity_exists(conn, request_id, expected.task_id)? =>
         {
             return Err(conflict);
@@ -881,25 +899,9 @@ fn predecessor_lock_error(
     }
 }
 
-fn launch_identity_is_used(
-    conn: &Connection,
-    request_id: RequestId,
-    task_id: TaskId,
-) -> Result<bool, BackgroundLaunchError> {
-    Ok(
-        super::resource_request_identity_exists(conn, request_id, task_id)?
-            || crate::store::release_watcher_task_id_is_reserved(conn, task_id)?
-            || crate::store::task_by_id_on(conn, task_id)?.is_some()
-            || super::super::identity::origin_route_by_request_on(conn, request_id)?.is_some()
-            || super::super::identity::origin_route_by_task_on(conn, task_id)?.is_some()
-            || super::super::identity::executor_identity_on(conn, task_id)?.is_some()
-            || super::task_has_any_event(conn, task_id)?,
-    )
-}
-
 /// Promote a started first background launch to the registered background task
 ///
-/// The task layer must record a running row and a running accepted identity.
+/// The task layer must record a running row and a running accepted identity
 /// The registration compares the prior registration saved in the receipt, so a
 /// stale launch cannot replace a newer background task
 pub(crate) fn promote_started_background_launch_on(
@@ -918,7 +920,12 @@ pub(crate) fn promote_started_background_launch_on(
 
     let state_revision =
         advance_resource_on(tx, resource, Some(receipt.task_id)).map_err(|error| match error {
-            AdvanceError::Exhausted | AdvanceError::Changed => ResourceStoreError::Conflict,
+            AdvanceError::Exhausted => {
+                ResourceStoreError::Conflict(ConflictReason::RevisionExhausted)
+            }
+            AdvanceError::Changed => {
+                ResourceStoreError::Conflict(ConflictReason::ResourceRevisionChanged)
+            }
             AdvanceError::Storage(error) => ResourceStoreError::Storage(error),
         })?;
     let mut promoted = resource.clone();
@@ -936,6 +943,23 @@ pub(crate) fn pending_background_launch_on(
     Ok(current_launch_on(conn, resource)?
         .as_ref()
         .and_then(BackgroundLaunchView::pending_task))
+}
+
+/// Return the latest first background launch and the registration it replaces
+pub(super) fn current_launch_and_predecessor_on(
+    conn: &Connection,
+    resource: &Resource,
+) -> Result<Option<(BackgroundLaunchView, Option<TaskId>)>, ResourceStoreError> {
+    Ok(
+        current_launch_record_on(conn, resource)?.map(|(receipt, phase)| {
+            let view = BackgroundLaunchView {
+                request_id: receipt.request_id,
+                task_id: receipt.task_id,
+                phase,
+            };
+            (view, receipt.replaces_task)
+        }),
+    )
 }
 
 /// Decide whether saved history proves that an unregistered resource is idle
@@ -1020,6 +1044,22 @@ fn loan_idle_decision(
                 task_id: *task_id,
             })
         }
+        // only the exact saved attestation receipt that closed this loan is evidence
+        LoanClosure::OperatorAttestedRestoreEnded {
+            task_id,
+            operation_id,
+            ..
+        } => {
+            if super::operator_release::operator_restore_closure_matches_on(conn, resource, &loan)?
+            {
+                Proven(IdleBoundaryProof::OperatorAttestedGpuFree {
+                    operation_id: *operation_id,
+                    task_id: *task_id,
+                })
+            } else {
+                Unproven(IdleProofGap::InconsistentHistory)
+            }
+        }
         // these closures keep or register a background task
         LoanClosure::Resumed { .. } | LoanClosure::NotStopped { .. } => {
             Unproven(IdleProofGap::InconsistentHistory)
@@ -1039,11 +1079,15 @@ pub(crate) fn open_idle_serving_loan_on(
     mut request: ResourceRequest,
     proof: IdleBoundaryProof,
 ) -> Result<(Loan, ResourceRequest), ResourceStoreError> {
-    if resource.registered_background_task.is_some()
-        || request.resource_id != resource.id
-        || request.state != ResourceRequestState::Queued
-    {
-        return Err(ResourceStoreError::Conflict);
+    if resource.registered_background_task.is_some() {
+        return Err(ResourceStoreError::Conflict(
+            ConflictReason::ResourceAssignmentChanged,
+        ));
+    }
+    if request.resource_id != resource.id || request.state != ResourceRequestState::Queued {
+        return Err(ResourceStoreError::Conflict(
+            ConflictReason::RequestStateChanged,
+        ));
     }
     let loan = Loan {
         id: LoanId::new(),
@@ -1063,7 +1107,7 @@ pub(crate) fn open_idle_serving_loan_on(
         params![
             loan.id.as_uuid().to_string(),
             resource.id.as_uuid().to_string(),
-            encode(&loan.state)?,
+            encode_resource_json(&loan.state)?,
         ],
     )?;
 
@@ -1073,17 +1117,22 @@ pub(crate) fn open_idle_serving_loan_on(
          WHERE request_id = ?2 AND resource_id = ?3
            AND json_extract(state_json, '$.type') = 'queued'",
         params![
-            encode(&request.state)?,
+            encode_resource_json(&request.state)?,
             request.request_id.0.to_string(),
             resource.id.as_uuid().to_string(),
         ],
     )?;
     if changed != 1 {
-        return Err(ResourceStoreError::Conflict);
+        return Err(ResourceStoreError::Conflict(
+            ConflictReason::RequestStateChanged,
+        ));
     }
 
     let state_revision = advance_resource_on(tx, resource, None).map_err(|error| match error {
-        AdvanceError::Exhausted | AdvanceError::Changed => ResourceStoreError::Conflict,
+        AdvanceError::Exhausted => ResourceStoreError::Conflict(ConflictReason::RevisionExhausted),
+        AdvanceError::Changed => {
+            ResourceStoreError::Conflict(ConflictReason::ResourceRevisionChanged)
+        }
         AdvanceError::Storage(error) => ResourceStoreError::Storage(error),
     })?;
     let receipt = IdleOpeningReceipt {
@@ -1100,7 +1149,7 @@ pub(crate) fn open_idle_serving_loan_on(
         params![
             loan.id.as_uuid().to_string(),
             resource.id.as_uuid().to_string(),
-            encode(&receipt)?,
+            encode_resource_json(&receipt)?,
         ],
     )?;
 
@@ -1126,8 +1175,8 @@ pub(crate) fn idle_opening_matches_on(
     let Some(saved) = saved else {
         return Ok(false);
     };
-    let receipt: IdleOpeningReceipt =
-        serde_json::from_str(&saved).map_err(|_| stored_error("idle opening receipt"))?;
+    let receipt: IdleOpeningReceipt = serde_json::from_str(&saved)
+        .map_err(|error| ResourceStoreError::corrupt("idle opening receipt", error))?;
 
     Ok(receipt.loan_id == loan.id
         && receipt.resource_id == resource.id
@@ -1139,7 +1188,8 @@ pub(crate) fn idle_opening_matches_on(
         && resource.registered_background_task.is_none())
 }
 
-fn current_launch_on(
+/// Read the latest first background launch of one resource with its derived phase
+pub(super) fn current_launch_on(
     conn: &Connection,
     resource: &Resource,
 ) -> Result<Option<BackgroundLaunchView>, ResourceStoreError> {
@@ -1167,8 +1217,8 @@ fn current_launch_record_on(
     let Some(saved) = saved else {
         return Ok(None);
     };
-    let receipt: BackgroundLaunchReceipt =
-        serde_json::from_str(&saved).map_err(|_| stored_error("background launch receipt"))?;
+    let receipt: BackgroundLaunchReceipt = serde_json::from_str(&saved)
+        .map_err(|error| ResourceStoreError::corrupt("background launch receipt", error))?;
     if receipt.resource_id != resource.id
         || receipt.authority_machine != resource.authority_machine()
     {
@@ -1189,7 +1239,8 @@ fn current_launch_record_on(
 
     let Some(row) = bound_launch_row_on(conn, &receipt).map_err(|error| match error {
         BackgroundLaunchError::Resource(error) => error,
-        _ => stored_error("background launch records"),
+        BackgroundLaunchError::Storage(error) => ResourceStoreError::Storage(error),
+        error => ResourceStoreError::corrupt("background launch records", error),
     })?
     else {
         return Ok(Some((receipt, BackgroundLaunchPhase::IdentityMismatch)));
@@ -1247,18 +1298,13 @@ fn bound_launch_row_on(
     let Some(row) = crate::store::task_by_id_on(conn, task_id)? else {
         return Ok(None);
     };
-    let Some(ExecutorIdentity::Accepted(record)) =
-        super::super::identity::executor_identity_on(conn, task_id)?
-    else {
+    let Some(ExecutorIdentity::Accepted(record)) = executor_identity_on(conn, task_id)? else {
         return Ok(None);
     };
     let Some(spec) = record.current_spec() else {
         return Ok(None);
     };
-    let identity_matches = record.task == task_id
-        && record.origin_machine == origin
-        && record.execution_machine == authority
-        && record.has_valid_spec_owners()
+    let identity_matches = record.is_owned_by(task_id, origin, authority)
         && record.state == row.status()
         && normalized_spec_sha256(spec)? == receipt.normalized_spec_sha256
         && row.thread == spec.thread
@@ -1266,7 +1312,7 @@ fn bound_launch_row_on(
     if !identity_matches {
         return Ok(None);
     }
-    let local_route = super::super::identity::origin_route_by_request_on(conn, receipt.request_id)?;
+    let local_route = origin_route_by_request_on(conn, receipt.request_id)?;
     let route_matches = match receipt.origin {
         BackgroundLaunchOrigin::CoLocated => local_route.is_some_and(|route| {
             route.task == task_id
@@ -1357,9 +1403,9 @@ pub(super) fn latest_launch_request_on(
         .optional()?;
     saved
         .map(|id| {
-            uuid::Uuid::parse_str(&id)
-                .map(RequestId)
-                .map_err(|_| stored_error("background launch request identity"))
+            uuid::Uuid::parse_str(&id).map(RequestId).map_err(|error| {
+                ResourceStoreError::corrupt("background launch request identity", error)
+            })
         })
         .transpose()
 }
@@ -1378,31 +1424,17 @@ pub(super) fn latest_loan_on(
     let Some((id, state)) = saved else {
         return Ok(None);
     };
-    let id = uuid::Uuid::parse_str(&id).map_err(|_| stored_error("loan identity"))?;
-    let state: LoanState = serde_json::from_str(&state).map_err(|_| stored_error("loan state"))?;
+    let id = id
+        .parse::<LoanId>()
+        .map_err(|error| ResourceStoreError::corrupt("loan identity", error))?;
+    let state: LoanState = serde_json::from_str(&state)
+        .map_err(|error| ResourceStoreError::corrupt("loan state", error))?;
 
     Ok(Some(Loan {
-        id: LoanId::from_uuid(id),
+        id,
         resource_id,
         state,
     }))
-}
-
-fn authority_resource(
-    conn: &Connection,
-    authority_machine: MachineId,
-    resource_id: ResourceId,
-) -> Result<Resource, ResourceStoreError> {
-    let resource =
-        select_resource(conn, resource_id)?.ok_or(ResourceStoreError::ResourceNotFound)?;
-    if resource.authority_machine() != authority_machine {
-        return Err(ResourceStoreError::WrongAuthority {
-            expected: resource.authority_machine(),
-            found: authority_machine,
-        });
-    }
-
-    Ok(resource)
 }
 
 pub(super) enum AdvanceError {
@@ -1430,6 +1462,10 @@ pub(super) fn advance_resource_on(
         .map(ResourceRevision::new)
         .ok_or(AdvanceError::Exhausted)?;
     let sql_integer = |value: u64| i64::try_from(value).map_err(|_| AdvanceError::Exhausted);
+    // SQLite cannot hold a larger assignment, so no saved row can match the compare
+    let Ok(assignment_revision) = i64::try_from(resource.assignment_revision.get()) else {
+        return Err(AdvanceError::Changed);
+    };
     let changed = tx.execute(
         "UPDATE resources SET state_revision = ?1, registered_background_task = ?2
          WHERE id = ?3 AND authority_machine = ?4 AND state_revision = ?5
@@ -1443,7 +1479,7 @@ pub(super) fn advance_resource_on(
             sql_integer(resource.state_revision.get())?,
             resource.supervisor.machine.as_uuid().to_string(),
             resource.supervisor.thread.to_string(),
-            sql_integer(resource.assignment_revision.get())?,
+            assignment_revision,
             resource
                 .registered_background_task
                 .map(|task| task.to_string()),
@@ -1454,18 +1490,4 @@ pub(super) fn advance_resource_on(
     }
 
     Ok(next)
-}
-
-fn encode<T: Serialize>(value: &T) -> Result<String, ResourceStoreError> {
-    serde_json::to_string(value).map_err(|error| {
-        ResourceStoreError::Storage(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-    })
-}
-
-fn stored_error(what: &str) -> ResourceStoreError {
-    ResourceStoreError::Storage(rusqlite::Error::InvalidColumnType(
-        0,
-        format!("invalid stored {what}"),
-        rusqlite::types::Type::Text,
-    ))
 }

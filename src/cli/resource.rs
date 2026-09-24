@@ -1,5 +1,7 @@
 //! Resource CLI commands over the daemon Unix socket
 
+use crate::resource::CommandSpecError;
+use crate::resource::trainer_publication::AttemptBinding;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -114,7 +116,7 @@ pub enum ResourceCommand {
     },
     /// Make an explicit return choice for a pending action
     ///
-    /// Works on the same machine as the resource authority or on another machine.
+    /// Works on the same machine as the resource authority or on another machine
     /// A retry with the same identities replays the saved result and never starts
     /// the task again; a different choice for the same action is a conflict
     Return {
@@ -144,7 +146,7 @@ pub enum ResourceCommand {
     },
     /// Resolve a return task that ended before its start was confirmed
     ///
-    /// Works on the same machine as the resource authority or on another machine.
+    /// Works on the same machine as the resource authority or on another machine
     /// A retry with the same task and reason replays the saved closure
     Resolve {
         /// Full loan UUID
@@ -540,6 +542,38 @@ fn operator_gpu_free_attestation_schema() -> Value {
                             "loan_id": uuid,
                             "action_id": uuid
                         }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type", "request_id"],
+                        "description": "No loan; task_id is the launch task of background_launch with status release_unproven",
+                        "properties": {
+                            "type": { "const": "first_background_launch" },
+                            "request_id": uuid
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type", "loan_id", "action_id"],
+                        "description": "Restoring loan; task_id is its resume_task_id, a direct-segment return task that ended before its confirmed start",
+                        "properties": {
+                            "type": { "const": "restoring_return" },
+                            "loan_id": uuid,
+                            "action_id": uuid
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type", "loan_id", "action_id"],
+                        "description": "Restoring loan; task_id is its resume_task_id, a native foreground return task that ended or is lost without a confirmed process-group exit",
+                        "properties": {
+                            "type": { "const": "restoring_foreground_return" },
+                            "loan_id": uuid,
+                            "action_id": uuid
+                        }
                     }
                 ]
             },
@@ -598,12 +632,9 @@ async fn operator_release(ctx: &Ctx, path: &str) -> Result<ExitCode, AppError> {
         )
     })?;
     let human = if replayed {
-        format!(
-            "saved operator attestation receipt {} was replayed",
-            operation
-        )
+        format!("saved operator attestation receipt {operation} was replayed")
     } else {
-        format!("operator attestation receipt {} was saved", operation)
+        format!("operator attestation receipt {operation} was saved")
     };
     emit(ctx, value, Some(&operation.to_string()), Some(&human))?;
     Ok(ExitCode::SUCCESS)
@@ -667,8 +698,7 @@ fn check_operator_release_response(
 
 async fn register(ctx: &Ctx, path: &str) -> Result<ExitCode, AppError> {
     let spec: ResourceRegistrationSpec = load_json(path)?;
-    validate_registration(&spec)?;
-    let resource_id = ResourceId::from_uuid(spec.id);
+    let resource_id = validate_registration(&spec)?;
     let body = ResourceRegisterBody {
         api_version: API_VERSION,
         spec: ResourceRegistration {
@@ -697,10 +727,10 @@ async fn register(ctx: &Ctx, path: &str) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn validate_registration(spec: &ResourceRegistrationSpec) -> Result<(), AppError> {
-    if spec.id.is_nil() {
-        return Err(invalid_resource_spec("/id", "resource id must not be nil"));
-    }
+/// Check a registration spec and return its resource identity
+fn validate_registration(spec: &ResourceRegistrationSpec) -> Result<ResourceId, AppError> {
+    let resource_id = ResourceId::from_uuid(spec.id)
+        .map_err(|_| invalid_resource_spec("/id", "resource id must not be nil"))?;
     if spec.display_name.trim().is_empty() {
         return Err(invalid_resource_spec(
             "/display_name",
@@ -719,7 +749,7 @@ fn validate_registration(spec: &ResourceRegistrationSpec) -> Result<(), AppError
             "supervisor machine and thread ids must not be nil",
         ));
     }
-    Ok(())
+    Ok(resource_id)
 }
 
 fn invalid_resource_spec(pointer: &str, message: &str) -> AppError {
@@ -728,6 +758,13 @@ fn invalid_resource_spec(pointer: &str, message: &str) -> AppError {
         value: Value::Null,
         message: message.into(),
     }
+}
+
+/// Wrap the `RESOURCE_ID` argument, refusing the nil UUID
+fn resource_id_arg(value: Uuid) -> Result<ResourceId, AppError> {
+    ResourceId::from_uuid(value).map_err(|_| AppError::Usage {
+        message: "RESOURCE_ID must not be nil".into(),
+    })
 }
 
 fn validate_uuid(field: &str, value: Uuid) -> Result<(), AppError> {
@@ -740,14 +777,14 @@ fn validate_uuid(field: &str, value: Uuid) -> Result<(), AppError> {
 }
 
 async fn show(ctx: &Ctx, resource_id: Uuid) -> Result<ExitCode, AppError> {
-    validate_uuid("RESOURCE_ID", resource_id)?;
+    let id = resource_id_arg(resource_id)?;
     let client = Client::new(ctx.home.sock_path());
     let value = client
         .get(&format!("/v1/resources/{resource_id}"))
         .await
-        .map_err(|error| read_resource_error(ResourceId::from_uuid(resource_id), error))?;
+        .map_err(|error| read_resource_error(id, error))?;
     check_version(&value)?;
-    check_read_resource(&value, ResourceId::from_uuid(resource_id))?;
+    check_read_resource(&value, id)?;
     emit(ctx, value, Some(&resource_id.to_string()), None)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -760,8 +797,7 @@ async fn supervisor(ctx: &Ctx, command: SupervisorCommand) -> Result<ExitCode, A
             thread,
             expected_revision,
         } => {
-            validate_uuid("RESOURCE_ID", resource_id)?;
-            let id = ResourceId::from_uuid(resource_id);
+            let id = resource_id_arg(resource_id)?;
             if machine.as_uuid().is_nil() || thread.0.is_nil() {
                 return Err(AppError::Usage {
                     message: "supervisor machine and thread ids must not be nil".into(),
@@ -822,11 +858,10 @@ async fn bind_trainer_attempt(
     task_id: TaskId,
     path: &str,
 ) -> Result<ExitCode, AppError> {
-    validate_uuid("RESOURCE_ID", resource_uuid)?;
+    let resource_id = resource_id_arg(resource_uuid)?;
     validate_uuid("--task-id", task_id.0)?;
 
-    let attempt_binding: crate::resource::watcher::AttemptBinding = load_json(path)?;
-    let resource_id = ResourceId::from_uuid(resource_uuid);
+    let attempt_binding: AttemptBinding = load_json(path)?;
     let retry_identity = trainer_attempt_retry_identity(resource_uuid, task_id, &attempt_binding)?;
     let body = TrainerAttemptBody {
         api_version: API_VERSION,
@@ -857,7 +892,7 @@ async fn bind_trainer_attempt(
 fn trainer_attempt_retry_identity(
     resource_uuid: Uuid,
     task_id: TaskId,
-    attempt_binding: &crate::resource::watcher::AttemptBinding,
+    attempt_binding: &AttemptBinding,
 ) -> Result<String, AppError> {
     let binding_json = serde_json::to_string(attempt_binding)?;
     Ok(format!(
@@ -894,7 +929,7 @@ fn check_trainer_attempt_response(
     response: &TrainerAttemptResponse,
     expected_resource: ResourceId,
     expected_task: TaskId,
-    expected_binding: &crate::resource::watcher::AttemptBinding,
+    expected_binding: &AttemptBinding,
     retry_identity: &str,
 ) -> Result<(), AppError> {
     if response.api_version == API_VERSION
@@ -925,7 +960,7 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
             expected_revision,
             operation_id,
         } => {
-            validate_uuid("RESOURCE_ID", resource_id)?;
+            let id = resource_id_arg(resource_id)?;
             validate_uuid("REQUEST_ID", request_id)?;
             validate_uuid("--operation-id", operation_id)?;
             if expected_revision == 0 {
@@ -933,7 +968,6 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
                     message: "--expected-revision must be greater than zero".into(),
                 });
             }
-            let id = ResourceId::from_uuid(resource_id);
             let body = RequestCancelBody {
                 api_version: API_VERSION,
                 operation_id,
@@ -969,7 +1003,7 @@ async fn submit_command(
     path: &str,
     background: bool,
 ) -> Result<ExitCode, AppError> {
-    validate_uuid("RESOURCE_ID", resource_uuid)?;
+    let resource_id = resource_id_arg(resource_uuid)?;
     validate_uuid("--request-id", request_uuid)?;
     let spec = load_resource_task_spec(path)?;
     let callback_cwd = std::env::current_dir()?;
@@ -978,7 +1012,6 @@ async fn submit_command(
             message: "the callback working directory must be absolute".into(),
         });
     }
-    let resource_id = ResourceId::from_uuid(resource_uuid);
     let request_id = RequestId(request_uuid);
     let body = ResourceSubmitBody {
         api_version: API_VERSION,
@@ -1120,8 +1153,8 @@ fn load_resource_task_spec(path: &str) -> Result<NormalizedSpec, AppError> {
     let normalized = spec::normalize(&spec)?;
     CommandSpec::try_from(normalized.clone()).map_err(|error| AppError::InvalidSpec {
         pointer: match error {
-            crate::resource::CommandSpecError::ExplicitMachine => "/machine".into(),
-            crate::resource::CommandSpecError::AgentWorkload => "/workload/type".into(),
+            CommandSpecError::ExplicitMachine => "/machine".into(),
+            CommandSpecError::AgentWorkload => "/workload/type".into(),
         },
         value: Value::Null,
         message: error.to_string(),
@@ -1130,16 +1163,16 @@ fn load_resource_task_spec(path: &str) -> Result<NormalizedSpec, AppError> {
 }
 
 async fn requests(ctx: &Ctx, resource_id: Uuid) -> Result<ExitCode, AppError> {
-    validate_uuid("RESOURCE_ID", resource_id)?;
+    let id = resource_id_arg(resource_id)?;
     let client = Client::new(ctx.home.sock_path());
     let detail: ResourceDetail = client
         .get_json(&format!("/v1/resources/{resource_id}"))
         .await
-        .map_err(|error| read_resource_error(ResourceId::from_uuid(resource_id), error))?;
+        .map_err(|error| read_resource_error(id, error))?;
     if detail.api_version != API_VERSION {
         return Err(invalid_daemon_response("unexpected resource API version"));
     }
-    if detail.resource.id != ResourceId::from_uuid(resource_id) {
+    if detail.resource.id != id {
         return Err(invalid_daemon_response(
             "resource request list returned another resource identity",
         ));
@@ -1889,7 +1922,7 @@ fn check_read_resource(value: &Value, expected: ResourceId) -> Result<(), AppErr
         .pointer("/resource/id")
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
-        .map(ResourceId::from_uuid);
+        .and_then(|id| ResourceId::from_uuid(id).ok());
     if found == Some(expected) {
         return Ok(());
     }
@@ -1908,7 +1941,7 @@ fn check_mutation_resource(
         .pointer("/resource/id")
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
-        .map(ResourceId::from_uuid);
+        .and_then(|id| ResourceId::from_uuid(id).ok());
     if found == Some(expected) {
         return Ok(());
     }
@@ -2007,11 +2040,42 @@ fn render_output(
 
 #[cfg(test)]
 mod tests {
+    use crate::resource::operator_release::OperatorObservation;
+    use crate::resource::trainer_publication::AttemptBinding;
+    use crate::resource::{AssignmentRevision, Resource};
     use clap::Parser;
     use serde_json::json;
 
-    use super::*;
-    use crate::cli::{Cli, Command};
+    use super::{
+        BackgroundCommand, RequestCommand, ResourceCommand, ResourceSubmitBody, SupervisorCommand,
+        check_action_outcome, check_background_response, check_operator_release_response,
+        check_trainer_attempt_response, decode_spec_value, load_json, mutation_error,
+        operator_gpu_free_attestation_schema, render_output, resource_registration_schema,
+        resource_return_work_schema, resource_task_schema, resource_trainer_attempt_binding_schema,
+        trainer_attempt_error, trainer_attempt_retry_identity,
+    };
+    use crate::cli::{Cli, Command, OutputMode};
+    use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
+    use crate::error::AppError;
+    use crate::machine::MachineId;
+    use crate::resource::api::{
+        BrowserResourceAction, OperatorReleaseResponse, RequestCancelBody, ResourceActionBody,
+        ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse, ResourceRegisterBody,
+        ResourceRegistration, SupervisorReplacementBody, TrainerAttemptResponse,
+    };
+    use crate::resource::bound_action::{
+        LocalReturnAcceptance, ResourceActionChoice, ResourceActionKind,
+        ResourceActionSubmitOutcome, ResourceActionSubmitRequest,
+    };
+    use crate::resource::operator_release::OperatorGpuFreeAttestation;
+    use crate::resource::{
+        ActionId, CommandSpec, ResourceId, ResourceRevision, ReturnDecision, ReturnLaunch,
+        ReturnWork, SupervisorActionAuthority, SupervisorAddress,
+    };
+    use crate::spec::{self, NormalizedSpec};
+    use crate::submission::RequestId;
+    use serde_json::Value;
+    use uuid::Uuid;
 
     fn uuid(value: &str) -> Uuid {
         Uuid::parse_str(value).unwrap()
@@ -2025,7 +2089,7 @@ mod tests {
             task_id: TaskId::new(),
             expected_state_revision: ResourceRevision::new(5),
             state_binding: crate::resource::operator_release::OperatorStateBinding::NoLoan,
-            observation: crate::resource::operator_release::OperatorObservation::try_from(
+            observation: OperatorObservation::try_from(
                 "checked the authority GPU and found no trainer process".to_owned(),
             )
             .unwrap(),
@@ -2109,6 +2173,80 @@ mod tests {
     }
 
     #[test]
+    fn operator_release_schema_lists_exactly_the_bindings_the_authority_decodes() {
+        use crate::resource::operator_release::OperatorStateBinding;
+
+        let schema = serde_json::to_value(operator_gpu_free_attestation_schema()).unwrap();
+        let variants = schema
+            .pointer("/properties/state_binding/oneOf")
+            .and_then(Value::as_array)
+            .unwrap();
+        let (loan, action, request) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let mut documented = Vec::new();
+        for variant in variants {
+            let tag = variant
+                .pointer("/properties/type/const")
+                .and_then(Value::as_str)
+                .unwrap();
+            documented.push(tag.to_owned());
+            // build the document from the schema's own required fields
+            let mut binding = json!({ "type": tag });
+            for field in variant["required"].as_array().unwrap() {
+                let field = field.as_str().unwrap();
+                let value = match field {
+                    "type" => continue,
+                    "loan_id" => loan,
+                    "action_id" => action,
+                    "request_id" => request,
+                    other => panic!("unexpected binding field {other}"),
+                };
+                binding[field] = json!(value);
+            }
+            let mut document = serde_json::to_value(operator_attestation()).unwrap();
+            document["state_binding"] = binding.clone();
+            let decoded = decode_spec_value::<OperatorGpuFreeAttestation>(&document).unwrap();
+            assert!(decoded.validate().is_ok(), "{tag}");
+            assert_eq!(
+                serde_json::to_value(decoded.state_binding).unwrap(),
+                binding
+            );
+
+            // every binding refuses extra fields, so a typo cannot drop an identity
+            binding["unexpected"] = json!(true);
+            document["state_binding"] = binding;
+            assert!(
+                decode_spec_value::<OperatorGpuFreeAttestation>(&document).is_err(),
+                "{tag}"
+            );
+        }
+        assert_eq!(
+            documented,
+            [
+                "no_loan",
+                "awaiting_release",
+                "first_background_launch",
+                "restoring_return",
+                "restoring_foreground_return"
+            ]
+        );
+
+        // a nil launch or restore identity is refused before any request is sent
+        let mut attestation = operator_attestation();
+        attestation.state_binding = OperatorStateBinding::FirstBackgroundLaunch {
+            request_id: RequestId(Uuid::nil()),
+        };
+        assert!(attestation.validate().is_err());
+        for binding in [
+            json!({"type": "restoring_return", "loan_id": Uuid::nil(), "action_id": action}),
+            json!({"type": "restoring_foreground_return", "loan_id": loan, "action_id": Uuid::nil()}),
+        ] {
+            let mut document = serde_json::to_value(operator_attestation()).unwrap();
+            document["state_binding"] = binding;
+            assert!(decode_spec_value::<OperatorGpuFreeAttestation>(&document).is_err());
+        }
+    }
+
+    #[test]
     fn operator_release_response_requires_the_saved_document_and_version() {
         let attestation = operator_attestation();
         let response = operator_release_response(attestation.clone(), API_VERSION, true);
@@ -2118,10 +2256,7 @@ mod tests {
         assert_eq!(response_value["replayed"], true);
 
         let mismatched_document = OperatorGpuFreeAttestation {
-            observation: crate::resource::operator_release::OperatorObservation::try_from(
-                "changed observation".to_owned(),
-            )
-            .unwrap(),
+            observation: OperatorObservation::try_from("changed observation".to_owned()).unwrap(),
             ..attestation.clone()
         };
         let mismatch =
@@ -2372,8 +2507,7 @@ mod tests {
         else {
             panic!("bind-attempt must preserve its distinct resource and task identities");
         };
-        let binding: crate::resource::watcher::AttemptBinding =
-            decode_spec_value(&binding_value).unwrap();
+        let binding: AttemptBinding = decode_spec_value(&binding_value).unwrap();
 
         assert_eq!(resource_id, uuid(resource));
         assert_eq!(task_id, TaskId(uuid(homebased_task)));
@@ -2384,8 +2518,10 @@ mod tests {
 
     #[test]
     fn trainer_attempt_response_requires_exact_version_and_identities() {
-        let resource_id = ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000061"));
-        let other_resource = ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000062"));
+        let resource_id =
+            ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000061")).unwrap();
+        let other_resource =
+            ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000062")).unwrap();
         let task_id = TaskId(uuid("019b4f42-0000-7000-8000-000000000063"));
         let other_task = TaskId(uuid("019b4f42-0000-7000-8000-000000000064"));
         let binding = test_attempt_binding();
@@ -2404,7 +2540,7 @@ mod tests {
             .is_ok()
         );
 
-        let different_binding = crate::resource::watcher::AttemptBinding {
+        let different_binding = AttemptBinding {
             attempt_id: "attempt-2".into(),
             ..binding.clone()
         };
@@ -2449,26 +2585,21 @@ mod tests {
             "attempt_number": 1,
             "ownership_token": "ownership-1"
         });
-        assert!(decode_spec_value::<crate::resource::watcher::AttemptBinding>(&binding).is_ok());
+        assert!(decode_spec_value::<AttemptBinding>(&binding).is_ok());
 
         let mut unknown_field = binding.clone();
         unknown_field["unexpected"] = json!(true);
-        assert!(
-            decode_spec_value::<crate::resource::watcher::AttemptBinding>(&unknown_field).is_err()
-        );
+        assert!(decode_spec_value::<AttemptBinding>(&unknown_field).is_err());
 
         let mut invalid_identifier = binding;
         invalid_identifier["task_id"] = json!("Trainer-Task-1");
-        assert!(
-            decode_spec_value::<crate::resource::watcher::AttemptBinding>(&invalid_identifier)
-                .is_err()
-        );
+        assert!(decode_spec_value::<AttemptBinding>(&invalid_identifier).is_err());
     }
 
     #[test]
     fn trainer_attempt_transport_error_recommends_the_exact_retry_identity() {
         let resource_uuid = uuid("019b4f42-0000-7000-8000-000000000071");
-        let resource_id = ResourceId::from_uuid(resource_uuid);
+        let resource_id = ResourceId::from_uuid(resource_uuid).unwrap();
         let task_id = TaskId(uuid("019b4f42-0000-7000-8000-000000000072"));
         let binding = test_attempt_binding();
         let retry_identity =
@@ -2674,8 +2805,8 @@ mod tests {
         );
     }
 
-    fn test_attempt_binding() -> crate::resource::watcher::AttemptBinding {
-        crate::resource::watcher::AttemptBinding {
+    fn test_attempt_binding() -> AttemptBinding {
+        AttemptBinding {
             campaign_id: "campaign-1".into(),
             campaign_revision_id: "revision-1".into(),
             task_id: "trainer-task-1".into(),
@@ -2689,12 +2820,12 @@ mod tests {
         api_version: u32,
         resource_id: ResourceId,
         task_id: TaskId,
-        attempt_binding: crate::resource::watcher::AttemptBinding,
+        attempt_binding: AttemptBinding,
     ) -> TrainerAttemptResponse {
         let machine = MachineId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000065"));
         TrainerAttemptResponse {
             api_version,
-            resource: crate::resource::Resource::new(
+            resource: Resource::new(
                 resource_id,
                 "gpu-a".into(),
                 machine,
@@ -2702,7 +2833,7 @@ mod tests {
                     machine,
                     thread: ThreadId(uuid("019b4f42-0000-7000-8000-000000000066")),
                 },
-                crate::resource::AssignmentRevision::new(1),
+                AssignmentRevision::new(1),
                 ResourceRevision::new(1),
                 Some(task_id),
             ),
@@ -2753,7 +2884,7 @@ mod tests {
         let body = ResourceRegisterBody {
             api_version: API_VERSION,
             spec: ResourceRegistration {
-                id: ResourceId::from_uuid(id),
+                id: ResourceId::from_uuid(id).unwrap(),
                 display_name: "gpu-a".into(),
                 supervisor: SupervisorAddress {
                     machine: MachineId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000014")),
@@ -2774,7 +2905,8 @@ mod tests {
             action: BrowserResourceAction::Renotify {
                 notice_id: crate::resource::NoticeId::from_uuid(uuid(
                     "019b4f42-0000-7000-8000-000000000017",
-                )),
+                ))
+                .unwrap(),
             },
         };
         let action = serde_json::to_value(body).unwrap();
@@ -2818,7 +2950,8 @@ mod tests {
 
     #[test]
     fn background_response_keeps_resource_request_and_task_identities_separate() {
-        let resource_id = ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000043"));
+        let resource_id =
+            ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000043")).unwrap();
         let request_id = RequestId(uuid("019b4f42-0000-7000-8000-000000000044"));
         let task_id = TaskId(uuid("019b4f42-0000-7000-8000-000000000045"));
         let machine = MachineId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000046"));
@@ -2826,7 +2959,7 @@ mod tests {
             api_version: API_VERSION,
             request_id,
             task_id,
-            resource: crate::resource::Resource::new(
+            resource: Resource::new(
                 resource_id,
                 "gpu-a".into(),
                 machine,
@@ -2834,7 +2967,7 @@ mod tests {
                     machine,
                     thread: ThreadId(uuid("019b4f42-0000-7000-8000-000000000047")),
                 },
-                crate::resource::AssignmentRevision::new(1),
+                AssignmentRevision::new(1),
                 ResourceRevision::new(2),
                 None,
             ),
@@ -2876,7 +3009,7 @@ mod tests {
 
     #[test]
     fn mutation_errors_keep_conflicts_and_mark_transport_failures_unknown() {
-        let resource = ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000008"));
+        let resource = ResourceId::from_uuid(uuid("019b4f42-0000-7000-8000-000000000008")).unwrap();
         let operation = uuid("019b4f42-0000-7000-8000-000000000009");
         let conflict = mutation_error(
             resource,
@@ -2941,7 +3074,7 @@ mod tests {
                 },
                 thread: ThreadId(Uuid::now_v7()),
             },
-            assignment_revision: crate::resource::AssignmentRevision::new(1),
+            assignment_revision: AssignmentRevision::new(1),
         }
     }
 

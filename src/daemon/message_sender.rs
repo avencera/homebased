@@ -1,5 +1,6 @@
-//! Local message-send routing to the receiver on the selected Fleet machine.
+//! Local message-send routing to the receiver on the selected Fleet machine
 
+use crate::message::MessageReceipt;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -18,10 +19,10 @@ use crate::message::{
 };
 
 const MESSAGE_PATH: &str = "/v1/cluster/messages";
-// The receiver's queue retries, cleanup, and settlement take at most 104 seconds
+// the receiver's queue retries, cleanup, and settlement take at most 104 seconds
 const MESSAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Resolve and deliver one message without changing its selected machine or message identity.
+/// Resolve and deliver one message without changing its selected machine or message identity
 pub(crate) async fn send(
     state: &AppState,
     request: MessageSendRequest,
@@ -181,7 +182,7 @@ fn decode_remote_receipt(
     body: &[u8],
     destination: MachineId,
     request: &MessageRequest,
-) -> Result<crate::message::MessageReceipt, AppError> {
+) -> Result<MessageReceipt, AppError> {
     if !status.is_success() {
         return Err(crate::client::map_error(status, body));
     }
@@ -235,7 +236,7 @@ fn decode_remote_receipt(
 }
 
 fn validate_receipt(
-    receipt: &crate::message::MessageReceipt,
+    receipt: &MessageReceipt,
     request: &MessageSendRequest,
     destination: MachineId,
     protocol_version: u32,
@@ -271,13 +272,15 @@ fn unknown_outcome(request: &MessageRequest, machine: MachineId, message: String
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use super::*;
-    use crate::daemon::cluster::OriginSummary;
-    use crate::domain::ThreadId;
+    use super::decode_remote_receipt;
+    use crate::domain::{API_VERSION, ThreadId};
+    use crate::error::AppError;
     use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
-    use crate::message::{MessageId, MessageReceipt};
+    use crate::machine::MachineId;
+    use crate::message::{
+        MessageId, MessageReceipt, MessageRequest, MessageResponse, MessageSource, Recipient,
+    };
+    use axum::http::StatusCode;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -357,26 +360,5 @@ mod tests {
             error.input()["message_id"],
             json!(request.message_id.to_string())
         );
-    }
-
-    #[test]
-    fn origin_summary_accepts_a_peer_that_does_not_send_the_thread() {
-        let task = crate::domain::TaskId::new();
-        let origin = MachineId::new();
-        let execution = MachineId::new();
-        let value = json!({
-            "task": task,
-            "origin_machine": origin,
-            "execution_machine": execution,
-            "submission": { "type": "acceptance_unknown" },
-            "last_execution_state": null,
-            "last_updated_at": null,
-            "last_accepted_seq": 0,
-            "last_settled_seq": 0,
-            "failed_events": [],
-        });
-        let summary: OriginSummary = serde_json::from_value(value).unwrap();
-        assert_eq!(summary.task, task);
-        assert_eq!(summary.thread, None);
     }
 }

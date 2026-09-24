@@ -4,13 +4,24 @@
 //! saved lock held free through the transition can release the resource. The
 //! release names the outcome and never permits a same-run resume
 
-use super::*;
-use crate::resource::store::CompleteReleaseError;
+use super::fixtures::{
+    TrainerAssociationFixture, release_completion_fixture, saved_trainer_association_json, spec,
+};
+use crate::domain::{ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId};
+use crate::machine::MachineId;
+use crate::resource::ownership_lock::TrainerRequestDigest;
+use crate::resource::store::{
+    CompleteReleaseError, ReleaseCompletionResult, ResourceSnapshot, ResourceTaskAcceptance,
+    ResourceTaskAcceptanceInput,
+};
 use crate::resource::{
-    CommandSpec, LoanClosure, ReturnDecisionRejection, ReturnLaunch, ReturnWork,
+    ActionId, CommandSpec, LoanClosure, LoanPhase, LoanState, ResourceQueueReconcileOutcome,
+    ResourceRequest, ResourceRequestState, ResourceRevision, ReturnContext,
+    ReturnDecisionRejection, ReturnLaunch, ReturnWork, ServingReleaseProvenance,
     SupervisorActionAuthority, SupervisorNoticePayload,
 };
-use crate::store::ReturnDecisionError;
+use crate::store::{ReturnDecisionError, Store};
+use crate::submission::{RequestId, normalized_spec_sha256};
 
 fn queue(fixture: &mut TrainerAssociationFixture) -> ResourceRequest {
     fixture
@@ -82,13 +93,13 @@ fn request_state(
         .state
 }
 
-fn saved_request_digest(fixture: &TrainerAssociationFixture) -> String {
+fn saved_request_digest(fixture: &TrainerAssociationFixture) -> TrainerRequestDigest {
     let association: serde_json::Value = serde_json::from_str(&saved_trainer_association_json(
         &fixture.store,
         fixture.task_id,
     ))
     .unwrap();
-    association["request_sha256"].as_str().unwrap().to_owned()
+    TrainerRequestDigest::from_hex(association["request_sha256"].as_str().unwrap()).unwrap()
 }
 
 #[test]
@@ -97,7 +108,7 @@ fn failed_trainer_with_its_released_lock_serves_the_oldest_request() {
         release_completion_fixture();
     let second = queue(&mut fixture);
     // artifacts on disk do not change the basis of a failed run
-    crate::resource::watcher::tests::write_generation_for_test(
+    crate::resource::trainer_publication::tests::write_generation_for_test(
         &fixture.runtime_root,
         &binding,
         "generation-before-failure",
