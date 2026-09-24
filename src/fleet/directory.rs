@@ -629,15 +629,20 @@ impl PeerDirectory {
     }
 
     /// Addresses that have not bound to any machine.
+    ///
+    /// Tailscale reports every tailnet device, and most of them never run
+    /// homebased, so an address known only from Tailscale is still probed but
+    /// not reported.
     #[must_use]
     pub fn unresolved(&self, now: DateTime<Utc>) -> Vec<UnresolvedAddress> {
         self.addresses
             .iter()
             .filter(|(_, record)| record.binding == AddressBinding::Unverified)
             .filter_map(|(address, record)| {
-                Some(UnresolvedAddress {
+                let source = record.source(now)?;
+                (source != AddressSource::Tailscale).then(|| UnresolvedAddress {
                     address: address.clone(),
-                    source: record.source(now)?,
+                    source,
                     last_failure: record.last_failure.clone(),
                 })
             })
@@ -1185,6 +1190,45 @@ mod tests {
         assert!(!path.exists());
         let aside = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(aside, 1);
+    }
+
+    #[test]
+    fn tailscale_only_candidates_are_probed_but_not_reported_unresolved() {
+        let now = Utc::now();
+        let later = now + Duration::seconds(60);
+        let mut dir = PeerDirectory::new(local());
+        dir.set_configured(&[addr("http://code:7677")]);
+        dir.record_sighting(sighting(
+            "http://100.64.0.3:7677",
+            SightingProvider::Tailscale,
+            later,
+        ));
+        dir.record_sighting(sighting(
+            "http://192.168.1.30:7677",
+            SightingProvider::Mdns,
+            later,
+        ));
+        for raw in [
+            "http://code:7677",
+            "http://100.64.0.3:7677",
+            "http://192.168.1.30:7677",
+        ] {
+            dir.record_probe_failure(&addr(raw), "connection refused".into(), now);
+        }
+
+        let unresolved: Vec<String> = dir
+            .unresolved(now)
+            .iter()
+            .map(|entry| entry.address.to_string())
+            .collect();
+        assert_eq!(
+            unresolved,
+            vec!["http://192.168.1.30:7677", "http://code:7677"]
+        );
+        assert!(
+            dir.probe_candidates(now)
+                .contains(&addr("http://100.64.0.3:7677"))
+        );
     }
 
     #[test]
