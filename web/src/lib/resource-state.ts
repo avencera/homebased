@@ -2,7 +2,8 @@ import type {
 	BackgroundLaunchReservation,
 	ResourceDetail,
 	ResourceOverviewItem,
-	ResourceTaskSummary
+	ResourceTaskSummary,
+	QueuePlacement
 } from './resources';
 
 export type ResourceTone = 'green' | 'blue' | 'amber' | 'red' | 'neutral';
@@ -122,7 +123,7 @@ export interface ResourceQueue {
 	current: ResourceTaskSummary | null;
 	/** Registered background task that holds the resource while no loan serves it. */
 	background: ResourceTaskSummary | null;
-	/** Queued requests in authority FIFO order. */
+	/** Queued requests in the server-provided serving order. */
 	queue: ResourceDetail['requests'];
 }
 
@@ -133,10 +134,25 @@ export function resourceQueue(detail: ResourceDetail): ResourceQueue {
 		status: detailStatus(detail),
 		current: detail.current_task,
 		background: detail.background_task,
-		queue: detail.requests
-			.filter((request) => tagOf(request.state) === 'queued')
-			.toSorted((left, right) => left.acceptance_sequence - right.acceptance_sequence)
+		queue: detail.requests.filter((request) => tagOf(request.state) === 'queued')
 	};
+}
+
+/** Return the anchor placement for moving a queued request one place. */
+export function queueMovePlacement(
+	queue: readonly ResourceDetail['requests'][number][],
+	index: number,
+	direction: 'up' | 'down'
+): QueuePlacement | null {
+	if (!Number.isInteger(index) || index < 0 || index >= queue.length) return null;
+
+	if (direction === 'up') {
+		const previous = queue[index - 1];
+		return previous ? { type: 'before', request_id: previous.request_id } : null;
+	}
+
+	const next = queue[index + 1];
+	return next ? { type: 'after', request_id: next.request_id } : null;
 }
 
 /** Whether a resource runs or waits on work, so it earns space next to the task list. */

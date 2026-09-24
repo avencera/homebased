@@ -73,16 +73,11 @@
 	</div>
 {/snippet}
 
-<section
-	aria-label="Resource queues"
-	class={cn(
-		'grid auto-rows-[minmax(100%,auto)] grid-cols-[repeat(auto-fit,minmax(20rem,1fr))] gap-3',
-		className
-	)}
->
+<section aria-label="Resource queues" class={cn('flex flex-col gap-3', className)}>
 	{#each queues as item (item.resource.id)}
 		{@const authority = machineName(item.resource.authority_machine)}
-		<article class="flex flex-col rounded border border-border bg-card">
+		<!-- cards fill the box when short and grow with a long queue, which the box scrolls -->
+		<article class="flex shrink-0 grow flex-col rounded border border-border bg-card">
 			<header
 				class="flex items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px]"
 			>
@@ -104,7 +99,8 @@
 				</span>
 			</header>
 
-			<div class="flex flex-1 flex-col gap-3 px-3 py-2.5">
+			<!-- phones leave room to scroll the last item above the floating browser toolbar -->
+			<div class="flex flex-1 flex-col gap-3 px-3 pt-2.5 pb-2.5 max-sm:pb-20">
 				{#if item.current}
 					{@render holder('now', item.current, item.resource.authority_machine)}
 				{/if}

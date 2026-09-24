@@ -102,8 +102,8 @@
 	}
 </script>
 
-<!-- phones keep room at the bottom for the floating browser toolbar -->
-<div class="mx-auto flex h-dvh max-w-7xl flex-col overflow-hidden px-3 pt-3 pb-20 sm:px-4 sm:py-4">
+<!-- pinned to the viewport so the document never scrolls; only the boxes do -->
+<div class="fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden p-3 sm:p-4">
 	<header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 sm:gap-x-4">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
 		<span class="flex items-center gap-1.5" title={store.online ? 'socket up' : 'socket down'}>

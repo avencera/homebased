@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { detailStatus, overviewStatus } from './resource-state.ts';
+import {
+	detailStatus,
+	overviewStatus,
+	queueMovePlacement,
+	resourceQueue
+} from './resource-state.ts';
 import type { ResourceDetail, ResourceOverviewItem } from './resources';
 
 const resource: ResourceOverviewItem['resource'] = {
@@ -30,6 +35,18 @@ const item = (overrides: Partial<ResourceOverviewItem>): ResourceOverviewItem =>
 	current_task: null,
 	attention: null,
 	...overrides
+});
+
+const queuedRequest = (
+	requestId: string,
+	acceptanceSequence: number
+): ResourceDetail['requests'][number] => ({
+	request_id: requestId,
+	task_id: `task-${requestId}`,
+	acceptance_sequence: acceptanceSequence,
+	origin_machine: resource.authority_machine,
+	display_name: requestId,
+	state: { type: 'queued' }
 });
 
 test('an early-ended first launch with an empty queue is not available', () => {
@@ -69,4 +86,31 @@ test('detail status reads the same launch reservation', () => {
 	};
 	assert.equal(detailStatus(detail).label, 'Operator release required');
 	assert.equal(detailStatus({ ...detail, background_launch: undefined }).label, 'Available');
+});
+
+test('resource queues keep the server serving order', () => {
+	const first = queuedRequest('first', 9);
+	const second = queuedRequest('second', 2);
+	const detail: ResourceDetail = {
+		api_version: 1,
+		resource,
+		loan: null,
+		requests: [first, second],
+		notices: [],
+		current_task: null,
+		background_task: null,
+		attention: null
+	};
+
+	assert.deepEqual(resourceQueue(detail).queue, [first, second]);
+});
+
+test('one-place queue moves target the adjacent request', () => {
+	const queue = [queuedRequest('first', 1), queuedRequest('second', 2), queuedRequest('third', 3)];
+
+	assert.deepEqual(queueMovePlacement(queue, 1, 'up'), { type: 'before', request_id: 'first' });
+	assert.deepEqual(queueMovePlacement(queue, 1, 'down'), { type: 'after', request_id: 'third' });
+	assert.equal(queueMovePlacement(queue, 0, 'up'), null);
+	assert.equal(queueMovePlacement(queue, queue.length - 1, 'down'), null);
+	assert.equal(queueMovePlacement(queue, -1, 'down'), null);
 });

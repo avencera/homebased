@@ -148,9 +148,17 @@ export type PendingAction = Schema.Schema.Type<typeof PendingActionSchema>;
 /** Pending actions and authority failures returned for one supervisor. */
 export type PendingActionResult = Schema.Schema.Type<typeof PendingActionsSchema>;
 
-/** The three operations permitted from the browser dashboard. */
+/** Place for a queued request relative to the other queued requests. */
+export type QueuePlacement =
+	| { type: 'front' }
+	| { type: 'back' }
+	| { type: 'before'; request_id: string }
+	| { type: 'after'; request_id: string };
+
+/** The operations permitted from the browser dashboard. */
 export type BrowserResourceAction =
 	| { type: 'cancel_queued'; request_id: string }
+	| { type: 'move_queued'; request_id: string; placement: QueuePlacement }
 	| { type: 'stop_active'; task_id: string }
 	| { type: 'renotify'; notice_id: string };
 

@@ -2,14 +2,13 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import { Schema } from 'effect';
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
-	import { ApiError, asApiError } from '$lib/api';
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import { ResourceDetailStore } from '$lib/daemon.svelte';
 	import { formatCentralTimestamp, shortId } from '$lib/format';
+	import { ResourceOperationManager } from '$lib/resource-operations.svelte';
 	import {
 		asRecord,
 		backgroundLaunchText,
@@ -22,39 +21,31 @@
 		numberField,
 		stringField,
 		tagOf,
+		queueMovePlacement,
 		type ResourceStatus
 	} from '$lib/resource-state';
 	import {
-		submitResourceAction,
 		type BrowserResourceAction,
 		type PendingAction,
 		type ResourceDetail,
 		type ResourceTaskSummary
 	} from '$lib/resources';
 
-	interface PendingOperation {
-		resourceId: string;
-		operationId: string;
-		expectedRevision: number;
-		action: BrowserResourceAction;
-	}
-
-	type OperationFailure =
-		{ type: 'unknown' } | { type: 'stale_revision' } | { type: 'definitive_refusal' };
-
-	const StoredOperationSchema = Schema.Struct({
-		resourceId: Schema.String,
-		operationId: Schema.String,
-		expectedRevision: Schema.Finite,
-		action: Schema.Union(
-			Schema.Struct({ type: Schema.Literal('cancel_queued'), request_id: Schema.String }),
-			Schema.Struct({ type: Schema.Literal('stop_active'), task_id: Schema.String }),
-			Schema.Struct({ type: Schema.Literal('renotify'), notice_id: Schema.String })
-		)
-	});
-
 	const store = new ResourceDetailStore(() => page.params.id ?? '');
+	const operationManager = new ResourceOperationManager();
 	const detail = $derived(store.detail);
+	const currentResourceId = $derived(page.params.id ?? '');
+	const operationState = $derived(operationManager.stateFor(currentResourceId));
+	const operation = $derived(operationState.operation);
+	const operationBusy = $derived(operationState.busy);
+	const operationMessage = $derived(operationState.message);
+	const operationError = $derived(operationState.error);
+	const operationEffects = {
+		refresh: () => store.refresh(),
+		readError: () => store.error,
+		showAuthoritative: (updated: ResourceDetail) => store.showAuthoritative(updated),
+		refreshAfterSuccess: () => store.refreshPending()
+	};
 	const status = $derived.by((): ResourceStatus | null => {
 		if (!detail) return null;
 		if (!store.error) return detailStatus(detail);
@@ -99,49 +90,7 @@
 		idleBoundary: boolean;
 	}
 
-	let operation = $state<PendingOperation | null>(null);
-	let operationBusy = $state(false);
-	let operationMessage = $state<string | null>(null);
-	let operationError = $state<string | null>(null);
-	let operationResourceId = '';
-
-	$effect(() => loadSavedOperation(page.params.id ?? ''));
-
-	function loadSavedOperation(resourceId: string) {
-		if (!resourceId || resourceId === operationResourceId) return;
-		operationResourceId = resourceId;
-		operation = readOperation(resourceId);
-		operationBusy = false;
-		operationError = null;
-		operationMessage = operation
-			? 'An earlier action has no confirmed result. Retry uses the same operation ID.'
-			: null;
-	}
-
-	function readOperation(resourceId: string): PendingOperation | null {
-		try {
-			const raw = sessionStorage.getItem(operationStorageKey(resourceId));
-			if (!raw) return null;
-			const value: unknown = JSON.parse(raw);
-			const saved = Schema.decodeUnknownSync(StoredOperationSchema)(value);
-			if (saved.resourceId !== resourceId) {
-				sessionStorage.removeItem(operationStorageKey(resourceId));
-				return null;
-			}
-			return saved;
-		} catch {
-			try {
-				sessionStorage.removeItem(operationStorageKey(resourceId));
-			} catch {
-				return null;
-			}
-			return null;
-		}
-	}
-
-	function operationStorageKey(resourceId: string): string {
-		return `homebased:resource-operation:${resourceId}`;
-	}
+	$effect(() => operationManager.load(currentResourceId));
 
 	async function openTaskLogs(event: MouseEvent, taskId: string) {
 		if (
@@ -159,141 +108,19 @@
 		window.location.hash = 'output-log';
 	}
 
-	function saveOperation(next: PendingOperation) {
-		operation = next;
-		try {
-			sessionStorage.setItem(operationStorageKey(next.resourceId), JSON.stringify(next));
-		} catch {
-			operationMessage = 'The operation ID is held in this page but could not be saved for reload.';
-		}
-	}
-
-	function clearOperation(resourceId: string) {
-		operation = null;
-		try {
-			sessionStorage.removeItem(operationStorageKey(resourceId));
-		} catch {
-			// the server outcome is known, so unavailable browser storage does not block the UI
-		}
-	}
-
-	function makeUuid(): string {
-		if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-			return crypto.randomUUID();
-		}
-		const bytes = new Uint8Array(16);
-		if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-			crypto.getRandomValues(bytes);
-		} else {
-			for (let index = 0; index < bytes.length; index += 1) {
-				bytes[index] = Math.floor(Math.random() * 256);
-			}
-		}
-		bytes[6] = (bytes[6] & 0x0f) | 0x40;
-		bytes[8] = (bytes[8] & 0x3f) | 0x80;
-		const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0'));
-		return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex
-			.slice(6, 8)
-			.join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
-	}
-
-	function actionLabel(action: BrowserResourceAction): string {
-		switch (action.type) {
-			case 'cancel_queued':
-				return 'Cancel queued request';
-			case 'stop_active':
-				return 'Stop active test';
-			case 'renotify':
-				return 'Retry failed notification';
-		}
-	}
-
 	async function beginAction(action: BrowserResourceAction) {
-		if (!detail || store.error || operation || operationBusy) return;
-		const next = {
-			resourceId: detail.resource.id,
-			operationId: makeUuid(),
-			expectedRevision: detail.resource.state_revision,
-			action
-		};
-		operationError = null;
-		operationMessage = null;
-		saveOperation(next);
-		await sendOperation(next);
+		if (!detail || store.error) return;
+		await operationManager.begin(
+			detail.resource.id,
+			detail.resource.state_revision,
+			action,
+			operationEffects
+		);
 	}
 
 	async function retryOperation() {
-		if (!detail || !operation || operationBusy) return;
-		if (operation.resourceId !== detail.resource.id) return;
-		operationError = null;
-		operationMessage = null;
-		await sendOperation(operation);
-	}
-
-	async function sendOperation(pending: PendingOperation) {
-		const currentDetail = detail;
-		if (!currentDetail || pending.resourceId !== currentDetail.resource.id) return;
-		operationBusy = true;
-		try {
-			const updated = await submitResourceAction(
-				pending.resourceId,
-				pending.expectedRevision,
-				pending.operationId,
-				pending.action
-			);
-			store.showAuthoritative(updated);
-			clearOperation(pending.resourceId);
-			operationError = null;
-			operationMessage = `${actionLabel(pending.action)} returned authoritative resource detail.`;
-			await store.refreshPending();
-		} catch (cause) {
-			const error = asApiError(cause);
-			const failure = classifyOperationFailure(error);
-			if (failure.type === 'unknown') {
-				operationMessage =
-					'The outcome is unknown. Details are refreshing; retry will send the same request with the same operation ID.';
-				operationError = null;
-				await store.refresh();
-				if (store.error !== null) {
-					operationMessage = `${operationMessage} The latest resource read failed.`;
-				}
-				return;
-			}
-
-			clearOperation(pending.resourceId);
-			operationMessage = null;
-			await store.refresh();
-			const recovery =
-				failure.type === 'stale_revision'
-					? 'The resource revision changed. Choose the action again to use the refreshed revision.'
-					: 'The action was refused. Review the refreshed resource details before choosing an action again.';
-			const refreshFailure = store.error
-				? ` The detail refresh failed: ${store.error.message}`
-				: '';
-			operationError = `${error.code}: ${error.message}. ${recovery}${refreshFailure}`;
-		} finally {
-			operationBusy = false;
-		}
-	}
-
-	function classifyOperationFailure(error: ApiError): OperationFailure {
-		if (error.code === 'resource_stale_revision') return { type: 'stale_revision' };
-		if (isUnknownOutcome(error)) return { type: 'unknown' };
-		return { type: 'definitive_refusal' };
-	}
-
-	function isUnknownOutcome(error: ApiError): boolean {
-		return (
-			error.httpStatus === null ||
-			error.httpStatus >= 500 ||
-			error.code === 'invalid_response' ||
-			error.code === 'invalid_json' ||
-			[
-				'resource_outcome_unknown',
-				'resource_operation_unavailable',
-				'resource_authority_unavailable'
-			].includes(error.code)
-		);
+		if (!detail || !operation) return;
+		await operationManager.retry(detail.resource.id, operationEffects);
 	}
 
 	function statusToneClass(tone: 'green' | 'blue' | 'amber' | 'red' | 'neutral'): string {
@@ -409,9 +236,11 @@
 						? 'Blocked until the resource attention is resolved.'
 						: detail?.background_task?.status === 'running'
 							? 'Waiting for supervised training to release the GPU.'
-							: 'Waiting for the resource authority to open this FIFO request.';
+							: 'Waiting for the resource authority to serve this queued request.';
 		}
-		return index === 0 ? reason : `After earlier FIFO request ${index}; ${reason}`;
+		return index === 0
+			? reason
+			: `After ${index} earlier queued request${index === 1 ? '' : 's'}; ${reason}`;
 	}
 
 	function trainerStateText(current: ResourceDetail): string {
@@ -678,7 +507,7 @@
 			<p class="min-w-0 flex-1">{operationError}</p>
 			<button
 				type="button"
-				onclick={() => (operationError = null)}
+				onclick={() => operationManager.dismissError(currentResourceId)}
 				class="shrink-0 rounded border border-red-700/30 px-2 py-0.5 hover:bg-red-500/10"
 			>
 				Dismiss
@@ -1045,7 +874,7 @@
 		<section class="mt-3 rounded border border-border bg-card p-3">
 			<div class="flex flex-wrap items-baseline justify-between gap-2">
 				<h2 class="text-[11px] tracking-wide text-muted-foreground uppercase">
-					ready queue · authority FIFO
+					ready queue · serving order
 				</h2>
 				<span class="text-muted-foreground">{queuedRequests.length} waiting</span>
 			</div>
@@ -1086,16 +915,94 @@
 									>
 								</div>
 							</div>
-							<button
-								type="button"
-								onclick={() =>
-									void beginAction({ type: 'cancel_queued', request_id: request.request_id })}
-								disabled={store.error !== null || operation !== null || operationBusy}
-								class="shrink-0 rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-								title="Cancel only this queued request; keep any active return obligation"
-							>
-								Cancel queued request
-							</button>
+							<div class="flex shrink-0 flex-wrap justify-end gap-1">
+								<button
+									type="button"
+									onclick={() => {
+										const placement = queueMovePlacement(queuedRequests, index, 'up');
+										if (placement) {
+											void beginAction({
+												type: 'move_queued',
+												request_id: request.request_id,
+												placement
+											});
+										}
+									}}
+									disabled={index === 0 ||
+										store.error !== null ||
+										operation !== null ||
+										operationBusy}
+									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+									title="Move before the previous queued request"
+								>
+									Move up
+								</button>
+								<button
+									type="button"
+									onclick={() => {
+										const placement = queueMovePlacement(queuedRequests, index, 'down');
+										if (placement) {
+											void beginAction({
+												type: 'move_queued',
+												request_id: request.request_id,
+												placement
+											});
+										}
+									}}
+									disabled={index === queuedRequests.length - 1 ||
+										store.error !== null ||
+										operation !== null ||
+										operationBusy}
+									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+									title="Move after the next queued request"
+								>
+									Move down
+								</button>
+								<button
+									type="button"
+									onclick={() =>
+										void beginAction({
+											type: 'move_queued',
+											request_id: request.request_id,
+											placement: { type: 'front' }
+										})}
+									disabled={index === 0 ||
+										store.error !== null ||
+										operation !== null ||
+										operationBusy}
+									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+									title="Move to the front of the queue"
+								>
+									Move to front
+								</button>
+								<button
+									type="button"
+									onclick={() =>
+										void beginAction({
+											type: 'move_queued',
+											request_id: request.request_id,
+											placement: { type: 'back' }
+										})}
+									disabled={index === queuedRequests.length - 1 ||
+										store.error !== null ||
+										operation !== null ||
+										operationBusy}
+									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+									title="Move to the back of the queue"
+								>
+									Move to back
+								</button>
+								<button
+									type="button"
+									onclick={() =>
+										void beginAction({ type: 'cancel_queued', request_id: request.request_id })}
+									disabled={store.error !== null || operation !== null || operationBusy}
+									class="rounded border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+									title="Cancel only this queued request; keep any active return obligation"
+								>
+									Cancel queued request
+								</button>
+							</div>
 						</li>
 					{/each}
 				</ol>
