@@ -45,6 +45,8 @@ pub struct FleetMachine {
     pub machine: MachineId,
     /// Display name
     pub name: MachineName,
+    /// Homebased version of the machine's daemon, from the last probe for a peer
+    pub version: String,
     /// Where a browser opens this machine's dashboard
     pub location: MachineLocation,
     /// Result of reading this machine's tasks
@@ -127,6 +129,7 @@ async fn fleet_tasks(
     let mut machines = vec![FleetMachine {
         machine: local,
         name: state.machine.name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         location: MachineLocation::Local,
         read: MachineRead::Online,
     }];
@@ -142,6 +145,7 @@ async fn fleet_tasks(
         machines.push(FleetMachine {
             machine: peer.machine,
             name: peer.name.clone(),
+            version: peer.version.clone(),
             location: MachineLocation::Peer {
                 address: peer.addresses.first().map(|ranked| ranked.address.clone()),
             },

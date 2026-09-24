@@ -152,6 +152,8 @@ export type MachineRead = { state: 'online' } | { state: 'unavailable'; message:
 export interface FleetMachine {
 	machine: string;
 	name: string;
+	/** Homebased version of the daemon, from the last probe for a peer. */
+	version: string;
 	location: MachineLocation;
 	read: MachineRead;
 }
@@ -353,6 +355,7 @@ const FleetTaskListSchema = Schema.Struct({
 		Schema.Struct({
 			machine: Schema.String,
 			name: Schema.String,
+			version: Schema.String,
 			location: Schema.Union(
 				Schema.Struct({ type: Schema.Literal('local') }),
 				Schema.Struct({ type: Schema.Literal('peer'), address: Schema.NullOr(Schema.String) })

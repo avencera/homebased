@@ -67,7 +67,7 @@ curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine and whether it answered, and `tasks` has one entry per task with the machine that runs it. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
 
 ## Task directory
 

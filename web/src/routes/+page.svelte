@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+	import { machineHue } from '$lib/colors';
 	import {
 		IN_FLIGHT_STATUSES,
 		PROCESS_STATUSES,
@@ -13,6 +14,7 @@
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import ResourceQueuePanel from '$lib/components/ResourceQueuePanel.svelte';
+	import Capsule from '$lib/components/Capsule.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
 	import { DaemonStore, ResourceQueueStore } from '$lib/daemon.svelte';
 	import { isBusy } from '$lib/resource-state';
@@ -129,6 +131,37 @@
 		{#if store.status}
 			<span class="hidden font-mono text-muted-foreground sm:inline" title={store.status.socket}>
 				v{store.status.version} &middot; pid {store.status.pid}
+			</span>
+		{/if}
+		{#if store.machines.length > 0}
+			<span
+				class="flex max-w-full flex-wrap items-center gap-x-2 gap-y-1"
+				aria-label="Fleet machine versions"
+			>
+				{#each store.machines as machine (machine.machine)}
+					{@const offline = machine.read.state === 'unavailable'}
+					{@const mismatch = store.status !== null && machine.version !== store.status.version}
+					<span class={cn('inline-flex items-center gap-1', offline && 'opacity-50')}>
+						<Capsule
+							hue={machineHue(machine.name)}
+							dot
+							title={offline ? `${machine.name} is offline` : machine.name}
+						>
+							{machine.name}
+						</Capsule>
+						<span
+							class={cn(
+								'font-mono text-[11px]',
+								mismatch ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground'
+							)}
+							title={mismatch
+								? `Runs a different Homebased version than this dashboard (v${store.status?.version})`
+								: `Homebased v${machine.version}`}
+						>
+							v{machine.version}
+						</span>
+					</span>
+				{/each}
 			</span>
 		{/if}
 		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
