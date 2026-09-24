@@ -20,13 +20,16 @@ use tokio::time;
 use tracing::{info, warn};
 
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity, TaskRow,
+    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
+    TaskRow, TaskState, Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
 use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
 use crate::report::REPORT_TRAILER;
 use crate::store::{self, Store};
+
+mod container;
 
 const KILL_GRACE: Duration = Duration::from_secs(10);
 const KILL_REAP_GRACE: Duration = Duration::from_secs(2);
@@ -141,17 +144,30 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     })?;
     home.ensure()?;
     let store = Store::open(&home.db_path())?;
-    if store
+    let started = store
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)?
-        .is_none()
-    {
+        .is_some();
+    let row = store.require_task(id)?;
+    // a container keeps running under dockerd after its worker stops, so a running
+    // container task whose lock this worker holds is adopted, never relaunched
+    let adopt_container = !started
+        && matches!(row.workload, Workload::Container(_))
+        && matches!(row.state, TaskState::Running { .. });
+    if !started && !adopt_container {
         info!(%id, "CAS Queued→Running failed; exiting without spawn");
         return Ok(());
     }
     let pid = std::process::id() as i32;
     store.set_pid(id, pid)?;
-    let row = store.require_task(id)?;
     let paths = home.task_paths(id);
+    if let Workload::Container(workload) = &row.workload {
+        let entry = if adopt_container {
+            container::Entry::Adopt
+        } else {
+            container::Entry::Launch
+        };
+        return container::run(&store, &row, workload, &paths, entry, &mut sigterm).await;
+    }
     let exit = match invocation_from_workload_for_identity(
         &row.workload,
         &row.binary,
@@ -202,22 +218,32 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         }
     };
 
-    store::write_exit_json_with_evidence(
-        &paths.exit_json,
-        &exit.reason,
-        exit.process_group_exit_evidence,
-    )?;
-    match store.cas_exit_with_evidence(
+    record_exit(
+        &store,
         id,
-        ProcessStatus::Running,
+        &paths,
         &exit.reason,
-        exit.process_group_exit_evidence,
-    )? {
-        Some(_) => {}
-        None => {
-            let current = store.require_task(id)?;
-            warn!(%id, status = %current.status(), "cas_exit failed");
-        }
+        exit.process_group_exit_evidence.into(),
+    )
+}
+
+/// Write `exit.json`, then commit the terminal state it describes
+///
+/// The file lets the daemon apply the exit if this worker stops before the commit
+fn record_exit(
+    store: &Store,
+    id: TaskId,
+    paths: &TaskPaths,
+    reason: &ExitReason,
+    evidence: TaskExitEvidence,
+) -> Result<(), AppError> {
+    store::write_exit_json_with_evidence(&paths.exit_json, reason, evidence.clone())?;
+    if store
+        .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence)?
+        .is_none()
+    {
+        let current = store.require_task(id)?;
+        warn!(%id, status = %current.status(), "cas_exit failed");
     }
     Ok(())
 }
@@ -567,6 +593,7 @@ mod tests {
             exit_json: dir.path().join("exit.json"),
             callback_log: dir.path().join("callback.log"),
             delivery_lock: dir.path().join("delivery.lock"),
+            container_cid: dir.path().join("container.cid"),
             dir: dir.path().to_path_buf(),
         };
         std::fs::create_dir_all(&paths.dir).unwrap();

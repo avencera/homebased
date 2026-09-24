@@ -14,7 +14,7 @@ use crate::resource::store::{
     reconcile_assigned_resource_task_for_authority as persist_assigned_task_reconciliation,
 };
 use crate::resource::{ResourceId, ResourceRequest, ResourceRequestState};
-use crate::spec::NormalizedSpec;
+use crate::spec::{NormalizedSpec, NormalizedWorkload};
 use crate::store::identity::{
     executor_identity_on, identity_origin_column_is_on, origin_route_by_request_on,
     origin_route_by_task_on,
@@ -207,12 +207,16 @@ impl Store {
 /// Build the queued task row for a first acceptance on this executor
 ///
 /// A bare program name resolves from the executor PATH only here, so the resolved
-/// entry point must pass the foreground contract before any row exists
+/// entry point must pass the foreground contract before any row exists. A
+/// container runs through the resolved `docker` CLI, which Homebased drives
+/// itself, so its mount sources are checked instead
 fn new_resource_task_row(
     input: &ResourceTaskAcceptanceInput,
     normalized_spec: &NormalizedSpec,
 ) -> Result<TaskRow, ResourceStoreError> {
     crate::spec::check_cwd(&normalized_spec.cwd).map_err(ResourceStoreError::TaskPreparation)?;
+    crate::spec::check_workload_host(&normalized_spec.workload)
+        .map_err(ResourceStoreError::TaskPreparation)?;
     let workload = crate::invocation::persist_workload(&normalized_spec.workload);
     let binary = crate::invocation::resolve_workload_binary(
         &normalized_spec.workload,
@@ -220,8 +224,10 @@ fn new_resource_task_row(
         &normalized_spec.cwd,
     )
     .map_err(ResourceStoreError::TaskPreparation)?;
-    crate::resource::foreground::inspect_foreground_entry_point(&binary)
-        .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })?;
+    if !matches!(normalized_spec.workload, NormalizedWorkload::Container(_)) {
+        crate::resource::foreground::inspect_foreground_entry_point(&binary)
+            .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })?;
+    }
     let row = crate::store::new_queued_task(NewTask {
         id: input.task_id,
         name: Some(normalized_spec.name.clone()),

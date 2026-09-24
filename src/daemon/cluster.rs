@@ -1195,6 +1195,7 @@ async fn preview_execution(
     let spec = spec::parse_normalized_value(&body.spec)?;
     let cwd = expand_executor_cwd(&spec.cwd)?;
     spec::check_cwd(&cwd)?;
+    spec::check_workload_host(&spec.workload)?;
     let env = TaskEnv::capture();
     let feed = state.home.root().join("tasks/<task-id>/prompt.feed.txt");
     let invocation = invocation_from_normalized_for_identity(
@@ -1346,6 +1347,13 @@ async fn submit_execution(
         },
         _ => None,
     };
+    // a container needs its mount sources on this machine, like its cwd
+    let reason = reason.or_else(|| match &normalized {
+        Ok(spec) if spec::check_workload_host(&spec.workload).is_err() => {
+            Some("container_host_inputs_unavailable")
+        }
+        _ => None,
+    });
     if let Some(reason) = reason {
         let tombstone = RejectionTombstone {
             task: body.task,

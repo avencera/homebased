@@ -2068,7 +2068,9 @@ fn queue_attention(reason: &ResourceQueueAttentionReason) -> (String, Option<Tas
             Some(*task_id),
         ),
         Reason::AssignedTaskExitUnconfirmed { task_id } => (
-            "the assigned command ended without a confirmed process-group exit".into(),
+            "the assigned task ended without a confirmed exit: a command needs its process-group \
+             exit, and a container needs its removal"
+                .into(),
             Some(*task_id),
         ),
         Reason::AssignedTaskIdentityMismatch { task_id } => (
@@ -2131,6 +2133,14 @@ fn restore_attention(reason: RestoreAttentionReason) -> String {
             "the native foreground return task ended ({state}), but its process-group exit is \
              not confirmed; the resource stays reserved until an operator inspects the authority \
              GPU and attests with the restoring_foreground_return binding"
+        ),
+        RestoreAttentionReason::ContainerEnded { state } => {
+            format!("the container return task ended ({state}) without success")
+        }
+        RestoreAttentionReason::ContainerExitUnconfirmed { state } => format!(
+            "the container return task ended ({state}), but Homebased did not confirm that its \
+             container exited and was removed; the resource stays reserved until an operator \
+             inspects the authority GPU and attests with the restoring_foreground_return binding"
         ),
         RestoreAttentionReason::Lost => "the return task is lost; the resource stays reserved \
              until an operator inspects the authority GPU and attests with the Restoring binding \

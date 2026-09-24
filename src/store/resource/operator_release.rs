@@ -29,7 +29,7 @@ use super::background::{
 };
 use super::restore::{direct_segment_return_of_registered_trainer_on, restoring_return_of_mode_on};
 use super::{LoanActionPhase, replace_loan_in_action_phase_on};
-use crate::domain::{TaskId, TaskState};
+use crate::domain::{TaskId, TaskState, Workload};
 use crate::machine::MachineId;
 use crate::resource::operator_release::{
     AttestedTrainerAssociation, AttestedTrainerEnd, AttestedTrainerLaunch, OperatorAttestationId,
@@ -431,10 +431,11 @@ fn bound_first_launch(
 /// Compare the named Restoring loan with the current loan and snapshot its task evidence
 ///
 /// The loan must still be Restoring under the named action and bind the named
-/// task, and the saved decision must bind that task with the execution mode
-/// that the binding names. A native foreground task is never registered, so a
-/// registration that names it is inconsistent history. Returns the loan, its
-/// return context, and the evidence snapshot
+/// task, and the saved decision must bind that task with an execution mode that
+/// the binding names. The foreground binding names both modes that hold the
+/// loan while they run: native foreground and container. Such a task is never
+/// registered, so a registration that names it is inconsistent history.
+/// Returns the loan, its return context, and the evidence snapshot
 fn bound_restoring_return(
     conn: &Connection,
     resource: &Resource,
@@ -443,11 +444,14 @@ fn bound_restoring_return(
     action_id: ActionId,
 ) -> Result<(Loan, ReturnContext, OperatorGpuFreeEvidence), OperatorGpuFreeError> {
     let task_id = attestation.task_id;
-    let mode = match attestation.state_binding {
-        OperatorStateBinding::RestoringReturn { .. } => ReturnExecutionMode::DirectSegmentTrainer,
-        OperatorStateBinding::RestoringForegroundReturn { .. } => {
-            ReturnExecutionMode::NativeForeground
+    let modes: &[ReturnExecutionMode] = match attestation.state_binding {
+        OperatorStateBinding::RestoringReturn { .. } => {
+            &[ReturnExecutionMode::DirectSegmentTrainer]
         }
+        OperatorStateBinding::RestoringForegroundReturn { .. } => &[
+            ReturnExecutionMode::NativeForeground,
+            ReturnExecutionMode::Container,
+        ],
         OperatorStateBinding::NoLoan
         | OperatorStateBinding::AwaitingRelease { .. }
         | OperatorStateBinding::FirstBackgroundLaunch { .. } => {
@@ -487,7 +491,7 @@ fn bound_restoring_return(
         }
         .into());
     }
-    if mode == ReturnExecutionMode::NativeForeground
+    if modes.iter().all(|mode| mode.holds_loan_while_running())
         && resource.registered_background_task == Some(task_id)
     {
         return Err(OperatorGpuFreeRefusal::InconsistentHistory { task_id }.into());
@@ -495,9 +499,16 @@ fn bound_restoring_return(
     let return_context = return_context.clone();
     // a queued or running return task still owns the GPU
     let trainer_end = ended_trainer(conn, task_id)?;
-    let Some((request_id, digest)) =
-        restoring_return_of_mode_on(conn, resource, &loan, action_id, task_id, mode)?
-    else {
+    let mut bound = None;
+    for mode in modes {
+        if let Some(found) =
+            restoring_return_of_mode_on(conn, resource, &loan, action_id, task_id, *mode)?
+        {
+            bound = Some((*mode, found));
+            break;
+        }
+    }
+    let Some((mode, (request_id, digest))) = bound else {
         return Err(OperatorGpuFreeRefusal::TrainerLaunchUnproven { task_id }.into());
     };
     let trainer_launch = match mode {
@@ -506,6 +517,10 @@ fn bound_restoring_return(
             request_id,
         },
         ReturnExecutionMode::NativeForeground => AttestedTrainerLaunch::NativeForegroundReturn {
+            action_id,
+            request_id,
+        },
+        ReturnExecutionMode::Container => AttestedTrainerLaunch::ContainerReturn {
             action_id,
             request_id,
         },
@@ -533,6 +548,8 @@ fn ended_trainer(
         TaskState::Finished { reason } => Ok(AttestedTrainerEnd::Finished {
             outcome: reason.clone(),
             process_group_exit: row.process_group_exit_evidence(),
+            container_exit: matches!(row.workload, Workload::Container(_))
+                .then(|| row.container_exit_evidence.clone()),
         }),
         TaskState::Lost => Ok(AttestedTrainerEnd::Lost),
     }

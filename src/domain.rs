@@ -16,9 +16,9 @@ pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`
 ///
-/// Released versions 1, 2, and 27 migrate in place to this version
+/// Released versions 1, 2, 27, and 28 migrate in place to this version
 /// Unreleased development versions 3 through 26 are refused
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 29;
 
 /// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;
@@ -429,8 +429,8 @@ pub enum ExitReason {
 
 /// Evidence about the child process group owned by one live task-run worker
 /// This is separate from `ExitReason`: a terminal task can still have an
-/// unconfirmed process group. It does not cover detached containers or
-/// processes in another session
+/// unconfirmed process group. It does not cover containers or processes in
+/// another session; [`ContainerExitEvidence`] is the witness of a container task
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessGroupExitEvidence {
@@ -464,6 +464,134 @@ impl ProcessGroupExitEvidence {
             Some(_) => Self::Unconfirmed,
         }
     }
+}
+
+/// Full identity of one Docker container, as Docker Engine reports it
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ContainerId(String);
+
+impl ContainerId {
+    /// Validate a full 64-character lowercase hexadecimal container ID
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        let raw = raw.trim();
+        if raw.len() == 64
+            && raw
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(AppError::Internal {
+                message: format!("invalid container id {raw:?}"),
+            })
+        }
+    }
+
+    /// Full container ID
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContainerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContainerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Evidence about the Docker container that one container task owns
+///
+/// The container runs under `dockerd`, outside the task-run process group, so
+/// its own state is the witness. Homebased confirms the witness only after it
+/// saved the container ID, read the exited container's exit code, removed the
+/// container, and then saw that the same ID no longer exists
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerExitEvidence {
+    /// Homebased did not prove that the container stopped and was removed
+    #[default]
+    Unconfirmed,
+    /// No container process ran: none was created, or the created container
+    /// was removed before it started
+    NeverStarted,
+    /// The exact container exited with this code, and Homebased removed it
+    Confirmed {
+        /// Saved container ID
+        container_id: ContainerId,
+        /// Exit code read before removal
+        exit_code: i32,
+    },
+}
+
+impl ContainerExitEvidence {
+    /// SQLite storage form. `None` stores the conservative default
+    pub fn to_storage(&self) -> Result<Option<String>, serde_json::Error> {
+        match self {
+            Self::Unconfirmed => Ok(None),
+            evidence => serde_json::to_string(evidence).map(Some),
+        }
+    }
+
+    /// Parse the storage form. Unknown values remain conservative
+    #[must_use]
+    pub fn from_storage(value: Option<&str>) -> Self {
+        value
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Terminal evidence that a task-run worker records with its exit reason
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskExitEvidence {
+    /// Evidence for the worker's child process group
+    pub process_group: ProcessGroupExitEvidence,
+    /// Evidence for the container of a container task
+    pub container: ContainerExitEvidence,
+}
+
+/// Evidence that only the worker's child process group carries
+impl From<ProcessGroupExitEvidence> for TaskExitEvidence {
+    fn from(process_group: ProcessGroupExitEvidence) -> Self {
+        Self {
+            process_group,
+            container: ContainerExitEvidence::Unconfirmed,
+        }
+    }
+}
+
+/// Evidence that the work a terminal task started has stopped
+///
+/// The workload selects the witness. A command or agent task's work is its
+/// task-run process group. A container task's work is its container, and the
+/// worker's own process group proves nothing about it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkExitEvidence {
+    /// The task layer did not prove that the work stopped
+    Unconfirmed,
+    /// The task ended before it started any work
+    NoWorkStarted,
+    /// The task-run worker confirmed that its owned process group exited
+    ProcessGroupExited,
+    /// Homebased read the container's exit code, removed it, and saw it absent
+    ContainerRemoved {
+        /// Removed container
+        container_id: ContainerId,
+        /// Exit code read before removal
+        exit_code: i32,
+    },
 }
 
 /// Compatibility projection of the terminal event's origin-inbox result
@@ -703,6 +831,8 @@ pub enum Workload {
     Agent(AgentWorkload),
     /// Arbitrary non-interactive command
     Task(TaskWorkload),
+    /// Docker container that Homebased starts, watches, and removes
+    Container(Box<crate::container::ContainerWorkload>),
 }
 
 /// Lifecycle of one task, derived from the `status`, `exit_reason` and `pid`
@@ -806,6 +936,8 @@ pub struct TaskRow {
     pub state: TaskState,
     /// Durable evidence for the task-run worker's child process group
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
+    /// Durable evidence for a container task's container
+    pub container_exit_evidence: ContainerExitEvidence,
     /// Terminal callback delivery. A second axis: it outlives the process state
     pub callback_status: CallbackStatus,
     /// Attention-reminder delivery state
@@ -838,6 +970,42 @@ impl TaskRow {
             TaskState::Finished { .. } => self.process_group_exit_evidence,
             TaskState::Queued | TaskState::Running { .. } | TaskState::Lost => {
                 ProcessGroupExitEvidence::Unconfirmed
+            }
+        }
+    }
+
+    /// Evidence that the work this task started has stopped
+    ///
+    /// Unconfirmed until the task finishes with an exit reason. A container
+    /// task reads its container evidence; every other task reads its process
+    /// group evidence
+    #[must_use]
+    pub fn work_exit_evidence(&self) -> WorkExitEvidence {
+        let TaskState::Finished { .. } = &self.state else {
+            return WorkExitEvidence::Unconfirmed;
+        };
+        // the task layer records NoChildSpawned only when no worker child and no
+        // container call ran
+        if self.process_group_exit_evidence == ProcessGroupExitEvidence::NoChildSpawned {
+            return WorkExitEvidence::NoWorkStarted;
+        }
+        if let Workload::Container(_) = &self.workload {
+            return match &self.container_exit_evidence {
+                ContainerExitEvidence::Unconfirmed => WorkExitEvidence::Unconfirmed,
+                ContainerExitEvidence::NeverStarted => WorkExitEvidence::NoWorkStarted,
+                ContainerExitEvidence::Confirmed {
+                    container_id,
+                    exit_code,
+                } => WorkExitEvidence::ContainerRemoved {
+                    container_id: container_id.clone(),
+                    exit_code: *exit_code,
+                },
+            };
+        }
+        match self.process_group_exit_evidence {
+            ProcessGroupExitEvidence::ConfirmedExited => WorkExitEvidence::ProcessGroupExited,
+            ProcessGroupExitEvidence::Unconfirmed | ProcessGroupExitEvidence::NoChildSpawned => {
+                WorkExitEvidence::Unconfirmed
             }
         }
     }
@@ -883,6 +1051,7 @@ pub fn workload_display_name(workload: &Workload) -> String {
                 parts.join(" ")
             }
         }
+        Workload::Container(container) => format!("container {}", container.image.short_name()),
     }
 }
 
@@ -971,9 +1140,10 @@ impl From<&ExitReason> for ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AgentKind, AgentWorkload, AttentionState, ExitReason, ProcessStatus, TaskId,
-        TaskIdentity, TaskName, TaskNameError, TaskState, TaskWorkload, ThreadId, TransitionError,
-        Workload, check_report_allowed, check_status_transition, display_name,
+        Agent, AgentKind, AgentWorkload, AttentionState, ContainerExitEvidence, ContainerId,
+        ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity, TaskName,
+        TaskNameError, TaskRow, TaskState, TaskWorkload, ThreadId, TransitionError,
+        WorkExitEvidence, Workload, check_report_allowed, check_status_transition, display_name,
         workload_display_name,
     };
     use crate::error::AppError;
@@ -1095,6 +1265,104 @@ mod tests {
         );
         let err = TaskState::from_storage(ProcessStatus::Succeeded, None, None).unwrap_err();
         assert!(matches!(err, AppError::Internal { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_container_task_is_released_only_by_its_container_witness() {
+        let container = Workload::Container(Box::new(
+            crate::container::ContainerWorkload::from_value(&serde_json::json!({
+                "image": format!("sha256:{}", "0".repeat(64)),
+                "memory": "1g"
+            }))
+            .unwrap(),
+        ));
+        let command = Workload::Task(TaskWorkload {
+            command: crate::invocation::CommandLine::try_from_argv(vec!["/bin/true".into()])
+                .unwrap(),
+        });
+        let id = ContainerId::parse(&"f".repeat(64)).unwrap();
+        let confirmed = ContainerExitEvidence::Confirmed {
+            container_id: id.clone(),
+            exit_code: 0,
+        };
+        let finished = TaskState::Finished {
+            reason: ExitReason::Exit { code: 0 },
+        };
+        let cases = [
+            (
+                &container,
+                finished.clone(),
+                ProcessGroupExitEvidence::ConfirmedExited,
+                ContainerExitEvidence::Unconfirmed,
+                WorkExitEvidence::Unconfirmed,
+            ),
+            (
+                &container,
+                finished.clone(),
+                ProcessGroupExitEvidence::Unconfirmed,
+                confirmed.clone(),
+                WorkExitEvidence::ContainerRemoved {
+                    container_id: id,
+                    exit_code: 0,
+                },
+            ),
+            (
+                &container,
+                finished.clone(),
+                ProcessGroupExitEvidence::Unconfirmed,
+                ContainerExitEvidence::NeverStarted,
+                WorkExitEvidence::NoWorkStarted,
+            ),
+            (
+                &container,
+                TaskState::Running { pid: Some(1) },
+                ProcessGroupExitEvidence::Unconfirmed,
+                confirmed.clone(),
+                WorkExitEvidence::Unconfirmed,
+            ),
+            (
+                &command,
+                finished.clone(),
+                ProcessGroupExitEvidence::ConfirmedExited,
+                confirmed,
+                WorkExitEvidence::ProcessGroupExited,
+            ),
+            (
+                &command,
+                finished,
+                ProcessGroupExitEvidence::NoChildSpawned,
+                ContainerExitEvidence::Unconfirmed,
+                WorkExitEvidence::NoWorkStarted,
+            ),
+        ];
+        for (workload, state, process_group, container_evidence, expected) in cases {
+            let row = TaskRow {
+                id: TaskId::new(),
+                name: None,
+                thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+                workload: workload.clone(),
+                cwd: "/tmp".into(),
+                timeout: std::time::Duration::from_secs(1800),
+                env: crate::domain::TaskEnv {
+                    path: "/bin".into(),
+                    home: "/tmp".into(),
+                },
+                binary: "/usr/bin/docker".into(),
+                state,
+                process_group_exit_evidence: process_group,
+                container_exit_evidence: container_evidence,
+                callback_status: crate::domain::CallbackStatus::Pending,
+                attention: AttentionState::Pending,
+                cancel_requested_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            assert_eq!(row.work_exit_evidence(), expected);
+        }
+        assert_eq!(
+            workload_display_name(&container),
+            format!("container sha256:{}", "0".repeat(12))
+        );
     }
 
     #[test]

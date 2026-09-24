@@ -62,7 +62,37 @@ export type WorkloadView =
 			/** Reasoning effort from the agent argv, when the caller set one. */
 			reasoning?: string | null;
 	  }
-	| { type: 'task'; command: readonly string[] };
+	| { type: 'task'; command: readonly string[] }
+	| {
+			type: 'container';
+			/** Image pinned by digest. */
+			image: string;
+			/** Argv head that replaces the image entrypoint, when set. */
+			entrypoint?: readonly string[];
+			/** Arguments after the image. */
+			args: readonly string[];
+			/** "all" or device indices, when set. */
+			gpus?: 'all' | readonly number[];
+	  };
+
+/** Witness that a container task's container stopped and was removed. */
+export type ContainerExitEvidence =
+	| { type: 'unconfirmed' }
+	| { type: 'never_started' }
+	| { type: 'confirmed'; container_id: string; exit_code: number };
+
+/** Container that a container task owns, as the task layer saved it. */
+export interface ContainerDetail {
+	/** Fixed container name. */
+	name: string;
+	image: string;
+	/** Container ID, once the worker saved it. */
+	container_id?: string;
+	/** When a worker first saw the container start. */
+	started_at?: string;
+	/** Unconfirmed until the task ends. */
+	exit_evidence: ContainerExitEvidence;
+}
 
 /** Inactivity-reminder state for the check timeout. */
 export type CheckTimeoutStatus = 'pending' | 'sent';
@@ -177,6 +207,8 @@ export interface TaskDetail extends TaskSummary {
 	/** Task directory. */
 	evidence: string;
 	last_event: TaskEvent | null;
+	/** Container and its witness. Present only for container tasks. */
+	container?: ContainerDetail;
 }
 
 const ProcessStatusSchema = Schema.Literal(
@@ -204,8 +236,31 @@ const WorkloadSchema = Schema.Union(
 		model: Schema.NullOr(Schema.String),
 		reasoning: Schema.optional(Schema.NullOr(Schema.String))
 	}),
-	Schema.Struct({ type: Schema.Literal('task'), command: Schema.Array(Schema.String) })
+	Schema.Struct({ type: Schema.Literal('task'), command: Schema.Array(Schema.String) }),
+	Schema.Struct({
+		type: Schema.Literal('container'),
+		image: Schema.String,
+		entrypoint: Schema.optional(Schema.Array(Schema.String)),
+		args: Schema.Array(Schema.String),
+		gpus: Schema.optional(Schema.Union(Schema.Literal('all'), Schema.Array(Schema.Finite)))
+	})
 );
+const ContainerExitEvidenceSchema = Schema.Union(
+	Schema.Struct({ type: Schema.Literal('unconfirmed') }),
+	Schema.Struct({ type: Schema.Literal('never_started') }),
+	Schema.Struct({
+		type: Schema.Literal('confirmed'),
+		container_id: Schema.String,
+		exit_code: Schema.Finite
+	})
+);
+const ContainerDetailSchema = Schema.Struct({
+	name: Schema.String,
+	image: Schema.String,
+	container_id: Schema.optional(Schema.String),
+	started_at: Schema.optional(Schema.String),
+	exit_evidence: ContainerExitEvidenceSchema
+});
 const TaskSummarySchema = Schema.Struct({
 	id: Schema.String,
 	name: Schema.optional(Schema.NullOr(Schema.String)),
@@ -255,7 +310,8 @@ const TaskDetailSchema = Schema.Struct({
 	reports: Schema.Array(TaskReportSchema),
 	output_log: Schema.String,
 	evidence: Schema.String,
-	last_event: Schema.NullOr(TaskEventSchema)
+	last_event: Schema.NullOr(TaskEventSchema),
+	container: Schema.optional(ContainerDetailSchema)
 });
 const TaskListSchema = Schema.Struct({ tasks: Schema.Array(TaskSummarySchema) });
 const LogTailSchema = Schema.Struct({

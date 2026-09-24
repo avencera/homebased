@@ -359,8 +359,8 @@ pub enum ResourceRouteError {
     /// Resource work must use the resource authority, not an explicit spec machine
     #[error("resource route spec must not name an execution machine")]
     ExplicitMachine,
-    /// Resource routes accept only bounded command workloads
-    #[error("resource route requires a command workload")]
+    /// Resource routes accept only bounded command or container workloads
+    #[error("resource route requires a command or container workload")]
     NonCommandWorkload,
     /// The route and normalized spec must retain one exact thread identity
     #[error("resource route thread does not match its normalized spec")]
@@ -775,7 +775,7 @@ impl OriginRoute {
         }
     }
 
-    /// Shared checks for routes that carry one bounded command without a spec machine
+    /// Shared checks for routes that carry one bounded command or container without a spec machine
     fn validate_command_route(&self) -> Result<(), ResourceRouteError> {
         let Some(spec) = self.spec.current() else {
             return Err(ResourceRouteError::NonCommandWorkload);
@@ -783,7 +783,7 @@ impl OriginRoute {
         if spec.machine.is_some() {
             return Err(ResourceRouteError::ExplicitMachine);
         }
-        if !matches!(&spec.workload, crate::spec::NormalizedWorkload::Task(_)) {
+        if matches!(&spec.workload, crate::spec::NormalizedWorkload::Agent(_)) {
             return Err(ResourceRouteError::NonCommandWorkload);
         }
         if self.thread != spec.thread {

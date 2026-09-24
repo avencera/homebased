@@ -17,7 +17,9 @@ use crate::cancellation::{
     CancellationOwner, CancellationPlan, CancellationRoute, CancellationTarget,
 };
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
-use crate::daemon::api::views::{LogTail, StatusBody, TaskDetail, TaskList, TaskSummary};
+use crate::daemon::api::views::{
+    ContainerDetail, LogTail, StatusBody, TaskDetail, TaskList, TaskSummary,
+};
 use crate::daemon::cancel_delivery::CancelResponse;
 use crate::daemon::{AppState, web};
 use crate::domain::{
@@ -269,6 +271,7 @@ pub(super) fn local_dry_run(
     env: TaskEnv,
 ) -> Result<DryRunResponse, AppError> {
     spec::check_cwd(&spec.cwd)?;
+    spec::check_workload_host(&spec.workload)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
     let invocation = invocation_from_normalized_for_identity(
         &spec.workload,
@@ -297,7 +300,7 @@ fn agent_feed_placeholder(
         NormalizedWorkload::Agent(_) => {
             Some(root.join("tasks").join("<task-id>").join("prompt.feed.txt"))
         }
-        NormalizedWorkload::Task(_) => None,
+        NormalizedWorkload::Task(_) | NormalizedWorkload::Container(_) => None,
     }
 }
 
@@ -365,6 +368,12 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
     let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let last_event = last_event_for_row(&row, &reports, evidence.clone());
+    let container = if matches!(row.workload, Workload::Container(_)) {
+        let record = call(&state.store, |reply| StoreMsg::TaskContainer { id, reply }).await?;
+        ContainerDetail::from_row(&row, record.as_ref())
+    } else {
+        None
+    };
     Ok(TaskDetail {
         api_version: API_VERSION,
         summary: TaskSummary::from_row(&row, presentations.get(&id)),
@@ -372,6 +381,7 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
         output_log: state.home.task_paths(id).output,
         evidence,
         last_event,
+        container,
     })
 }
 
@@ -540,6 +550,7 @@ pub(super) async fn accept_task(
         });
     }
     spec::check_cwd(&spec.cwd)?;
+    spec::check_workload_host(&spec.workload)?;
     let binary = resolve_workload_binary(&spec.workload, &body.env.path, &spec.cwd)?;
     let id = TaskId::new();
     let paths = state.home.prepare_task(id)?;

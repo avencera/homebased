@@ -72,6 +72,11 @@ test *args="":
 smoke-cli *args="":
     cargo test --test cli_smoke -- --ignored --nocapture {{args}}
 
+# Real Docker Engine and a pulled busybox image. Opt-in; not part of ci.
+[group('test')]
+test-docker *args="":
+    cargo test docker -- --ignored --test-threads=1 {{args}}
+
 # ------------------------------------------------------------------------------
 # lint
 # ------------------------------------------------------------------------------

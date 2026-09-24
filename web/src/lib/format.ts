@@ -1,6 +1,12 @@
 // Display helpers. Everything here is pure so the components stay declarative.
 
-import { isInFlight, type ExitReason, type TaskSummary, type WorkloadView } from './api';
+import {
+	isInFlight,
+	type ContainerExitEvidence,
+	type ExitReason,
+	type TaskSummary,
+	type WorkloadView
+} from './api';
 
 /** Home directories the daemon can run under, matched so paths can show `~`. */
 const HOME_PREFIX = /^(\/home\/[^/]+|\/Users\/[^/]+|\/root)(?=\/|$)/;
@@ -76,11 +82,43 @@ export function workloadLabel(task: Pick<TaskSummary, 'workload'>): string {
 
 /** Format a workload view for display. */
 export function formatWorkload(workload: WorkloadView): string {
-	if (workload.type === 'agent') {
-		const name = workload.model ? `${workload.agent}:${workload.model}` : workload.agent;
-		return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
+	switch (workload.type) {
+		case 'agent': {
+			const name = workload.model ? `${workload.agent}:${workload.model}` : workload.agent;
+			return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
+		}
+		case 'container':
+			return `container ${imageName(workload.image)}`;
+		case 'task':
+			return formatCommandPreview(workload.command);
 	}
-	const [program, ...args] = workload.command;
+}
+
+/** Repository name of a pinned image, or the start of its image ID. */
+export function imageName(image: string): string {
+	const at = image.indexOf('@');
+	return at >= 0 ? image.slice(0, at) : image.slice(0, 'sha256:'.length + 12);
+}
+
+/** Argv the container runs after its image: entrypoint head, then args. */
+export function containerArgv(workload: Extract<WorkloadView, { type: 'container' }>): string[] {
+	return [...(workload.entrypoint ?? []), ...workload.args];
+}
+
+/** One line per container witness state. */
+export function containerEvidenceText(evidence: ContainerExitEvidence): string {
+	switch (evidence.type) {
+		case 'unconfirmed':
+			return 'unconfirmed';
+		case 'never_started':
+			return 'never started';
+		case 'confirmed':
+			return `exited ${evidence.exit_code}, removed`;
+	}
+}
+
+function formatCommandPreview(command: readonly string[]): string {
+	const [program, ...args] = command;
 	if (!program) return 'task';
 	if (args.length === 0) return program;
 	const preview = args.slice(0, 2).join(' ');

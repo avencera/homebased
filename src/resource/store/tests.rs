@@ -35,7 +35,7 @@ use super::test_support::{
     cancel_request_before_activation_for_authority, open_release_loan_for_authority,
     retarget_supervisor_notice,
 };
-use crate::domain::{ExitReason, ProcessGroupExitEvidence, TaskId, ThreadId};
+use crate::domain::{ExitReason, TaskId, ThreadId, WorkExitEvidence};
 use crate::machine::{MachineId, MachineName};
 use crate::resource::{
     AcceptanceSequence, ActionId, AssignmentRevision, CommandSpecError, DeliveryAttemptId, Loan,
@@ -146,18 +146,14 @@ fn no_child_evidence_proves_release_only_for_pre_spawn_outcomes() {
     };
     // no child ran, so the command shape cannot have left work behind
     assert_eq!(
-        resource_task_release_proof(
-            &request,
-            &spawn_failed,
-            ProcessGroupExitEvidence::NoChildSpawned
-        ),
+        resource_task_release_proof(&request, &spawn_failed, WorkExitEvidence::NoWorkStarted),
         Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterSpawnFailure)
     );
     assert_eq!(
         resource_task_release_proof(
             &request,
             &ExitReason::Cancelled,
-            ProcessGroupExitEvidence::NoChildSpawned
+            WorkExitEvidence::NoWorkStarted
         ),
         Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterQueuedCancel)
     );
@@ -166,11 +162,7 @@ fn no_child_evidence_proves_release_only_for_pre_spawn_outcomes() {
         ExitReason::Signal { signal: 9 },
     ] {
         assert_eq!(
-            resource_task_release_proof(
-                &request,
-                &outcome,
-                ProcessGroupExitEvidence::NoChildSpawned
-            ),
+            resource_task_release_proof(&request, &outcome, WorkExitEvidence::NoWorkStarted),
             Err(AssignedResourceTaskAttention::InvalidNoChildSpawnEvidence)
         );
     }
@@ -227,7 +219,7 @@ fn assigned_task_release_proof_rejects_commands_that_can_outlive_the_group() {
             resource_task_release_proof(
                 &request,
                 &ExitReason::Exit { code: 0 },
-                ProcessGroupExitEvidence::ConfirmedExited,
+                WorkExitEvidence::ProcessGroupExited,
             ),
             Err(AssignedResourceTaskAttention::OwnershipUncertain(risk))
         );

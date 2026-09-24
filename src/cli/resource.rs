@@ -399,21 +399,29 @@ fn resource_task_schema() -> Result<Value, AppError> {
     properties.insert(
         "workload".into(),
         json!({
-            "title": "ResourceCommandWorkload",
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["type", "command"],
-            "properties": {
-                "type": { "const": "task" },
-                "command": command_schema
-            }
+            "description": "Finite command, or a container with gpus. Container work is accepted for queued requests and for evaluation_or_next_epoch, new_background_work, and after_ended_run returns.",
+            "oneOf": [
+                {
+                    "title": "ResourceCommandWorkload",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "command"],
+                    "properties": {
+                        "type": { "const": "task" },
+                        "command": command_schema
+                    }
+                },
+                crate::container::spec::container_workload_schema(true)
+            ]
         }),
     );
     if let Some(object) = schema.as_object_mut() {
         object.insert("title".into(), Value::from("ResourceTaskSubmitSpec"));
         object.insert(
             "description".into(),
-            Value::from("SubmitSpec with only a finite command workload and no execution machine."),
+            Value::from(
+                "SubmitSpec with a finite command or container workload and no execution machine.",
+            ),
         );
     }
     Ok(schema)
@@ -1155,6 +1163,7 @@ fn load_resource_task_spec(path: &str) -> Result<NormalizedSpec, AppError> {
         pointer: match error {
             CommandSpecError::ExplicitMachine => "/machine".into(),
             CommandSpecError::AgentWorkload => "/workload/type".into(),
+            CommandSpecError::ContainerWithoutGpus => "/workload/gpus".into(),
         },
         value: Value::Null,
         message: error.to_string(),
@@ -2755,9 +2764,27 @@ mod tests {
         );
         assert_eq!(
             schema
-                .pointer("/$defs/ResourceTaskSubmitSpec/properties/workload/properties/type/const")
+                .pointer(
+                    "/$defs/ResourceTaskSubmitSpec/properties/workload/oneOf/0/properties/type/const"
+                )
                 .unwrap(),
             "task"
+        );
+        assert_eq!(
+            schema
+                .pointer(
+                    "/$defs/ResourceTaskSubmitSpec/properties/workload/oneOf/1/properties/type/const"
+                )
+                .unwrap(),
+            "container"
+        );
+        assert!(
+            schema
+                .pointer("/$defs/ResourceTaskSubmitSpec/properties/workload/oneOf/1/required")
+                .and_then(Value::as_array)
+                .unwrap()
+                .contains(&json!("gpus")),
+            "resource containers must name their gpus"
         );
         assert!(
             schema

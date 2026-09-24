@@ -227,7 +227,7 @@ async fn exact_trainer_terminal_event_reconciles_without_a_client_wake() {
         id: trainer_task_id,
         from: ProcessStatus::Running,
         reason: ExitReason::Exit { code: 0 },
-        process_group_exit_evidence: ProcessGroupExitEvidence::ConfirmedExited,
+        evidence: crate::domain::ProcessGroupExitEvidence::ConfirmedExited.into(),
         reply,
     })
     .await

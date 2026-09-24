@@ -11,8 +11,7 @@ use crate::cancellation::{
 };
 use crate::daemon::actors::send_reply;
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskReport, TaskRow,
-    ThreadId,
+    ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
 use crate::error::AppError;
 use std::num::NonZeroU64;
@@ -842,7 +841,7 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         from: ProcessStatus,
         reason: ExitReason,
-        process_group_exit_evidence: ProcessGroupExitEvidence,
+        evidence: TaskExitEvidence,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
     /// Record the worker pid
@@ -850,6 +849,17 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         pid: i32,
         reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Count one adopting worker for a running container task, within `limit`
+    ClaimContainerAdoption {
+        id: TaskId,
+        limit: u32,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Read the saved container lifecycle of one task
+    TaskContainer {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::store::TaskContainerRecord>, AppError>>,
     },
     /// Request cancel
     RequestCancel {
@@ -1521,13 +1531,17 @@ impl Actor for StoreActor {
                 id,
                 from,
                 reason,
-                process_group_exit_evidence,
+                evidence,
                 reply,
             } => send_reply(
                 reply,
-                state.cas_exit_with_evidence(id, from, &reason, process_group_exit_evidence),
+                state.cas_exit_with_evidence(id, from, &reason, evidence),
             ),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
+            StoreMsg::ClaimContainerAdoption { id, limit, reply } => {
+                send_reply(reply, state.claim_task_container_adoption(id, limit));
+            }
+            StoreMsg::TaskContainer { id, reply } => send_reply(reply, state.task_container(id)),
             StoreMsg::RequestCancel { id, reply } => send_reply(reply, state.request_cancel(id)),
             StoreMsg::ProduceAttentionEvent { id, reply } => {
                 send_reply(reply, state.produce_attention_event(id));

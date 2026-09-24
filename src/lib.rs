@@ -7,6 +7,7 @@ pub mod cancellation;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod container;
 pub mod daemon;
 pub mod digest;
 pub mod domain;

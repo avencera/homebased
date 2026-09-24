@@ -21,7 +21,7 @@ pub use super::id::OperatorAttestationId;
 use super::ownership_lock::TrainerRequestDigest;
 use super::{ActionId, Loan, LoanId, ResourceId, ResourceRequest, ResourceRevision};
 use super::{SupervisorNotice, TaskId};
-use crate::domain::{ExitReason, ProcessGroupExitEvidence, ProcessStatus};
+use crate::domain::{ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence, ProcessStatus};
 use crate::machine::MachineId;
 use crate::submission::{NormalizedSpecSha256, RequestId};
 
@@ -252,6 +252,11 @@ pub enum AttestedTrainerEnd {
         /// return it is the saved task-layer fact, often `unconfirmed`; the
         /// attestation does not upgrade it to a confirmed exit
         process_group_exit: ProcessGroupExitEvidence,
+        /// Container evidence as saved, for a container task only
+        ///
+        /// The attestation does not upgrade it to confirmed evidence
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container_exit: Option<ContainerExitEvidence>,
     },
     /// The wrapper was lost with no exit reason
     Lost,
@@ -278,6 +283,16 @@ pub enum AttestedTrainerLaunch {
     /// The saved decision accepted the task as native foreground work, which
     /// holds the GPU only through its own process group
     NativeForegroundReturn {
+        /// Return action that bound the task
+        action_id: ActionId,
+        /// Stable return request identity
+        request_id: RequestId,
+    },
+    /// Container return decision that bound the task
+    ///
+    /// The saved decision accepted the task as a container, which holds the
+    /// GPU through the container that Homebased started
+    ContainerReturn {
         /// Return action that bound the task
         action_id: ActionId,
         /// Stable return request identity

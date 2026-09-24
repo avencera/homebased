@@ -70,7 +70,11 @@ const BackgroundLaunchSchema = Schema.Struct({
 	status: Schema.String
 });
 
-const ReturnExecutionModeSchema = Schema.Literal('direct_segment_trainer', 'native_foreground');
+const ReturnExecutionModeSchema = Schema.Literal(
+	'direct_segment_trainer',
+	'native_foreground',
+	'container'
+);
 
 const ResourceOverviewItemSchema = Schema.Struct({
 	resource: ResourceSchema,

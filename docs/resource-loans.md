@@ -189,6 +189,45 @@ executable before submitting.
 }
 ```
 
+For work in a pinned Docker image, such as checkpoint evaluation, use a
+`container` workload instead of a `docker` command. Its `gpus` field is
+required for resource work:
+
+```json
+{
+  "api_version": 1,
+  "thread": "77777777-7777-4777-8777-777777777777",
+  "name": "evaluate checkpoint",
+  "cwd": "/path/to/job",
+  "timeout": "1h",
+  "workload": {
+    "type": "container",
+    "image": "registry.example/eval@sha256:<64-hex-digest>",
+    "entrypoint": ["/usr/bin/python3", "-m", "eval"],
+    "args": ["--checkpoint", "/data/checkpoint"],
+    "gpus": "all",
+    "memory": "24g",
+    "mounts": [
+      { "source": "/path/to/checkpoint", "target": "/data/checkpoint", "read_only": true },
+      { "source": "/path/to/output", "target": "/out" }
+    ]
+  }
+}
+```
+
+The image must already be on the authority; Homebased does not pull it. Each
+mount source must exist on the authority. Docker and containerd sockets, and
+directories that contain them, are refused. The container runs under
+`dockerd`, outside the task's process group, so the witness is the container
+itself. The authority releases the GPU only after Homebased saved the container
+ID before the start, read the exited container's exit code, removed the
+container, and saw that the same ID no longer exists. If the worker that
+watches the container stops, the container keeps running, the task stays
+`running`, and the daemon starts a worker that adopts the container. If Docker
+is unavailable or the exit code cannot be read, the evidence stays
+unconfirmed, the GPU stays reserved, and the supervisor gets an attention
+notice. `resource background submit` does not accept a container.
+
 Submit with a new, stable request UUID:
 
 ```sh
@@ -299,13 +338,16 @@ the current `resource show` result first. Use its exact resource authority and
 | `loan` is `awaiting_release` | `{"type":"awaiting_release","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `registered_background_task` |
 | No `loan`; `background_launch.status` is `release_unproven` | `{"type":"first_background_launch","request_id":"<background_launch.request_id>"}` | `background_launch.task_id` |
 | `loan` is `restoring`; `return_execution_mode` is `direct_segment_trainer` | `{"type":"restoring_return","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `phase.resume_task_id` |
-| `loan` is `restoring`; `return_execution_mode` is `native_foreground` | `{"type":"restoring_foreground_return","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `phase.resume_task_id` |
+| `loan` is `restoring`; `return_execution_mode` is `native_foreground` or `container` | `{"type":"restoring_foreground_return","loan_id":"<loan.id>","action_id":"<phase.action_id>"}` | `phase.resume_task_id` |
 
 Other loan phases cannot be resolved by this command. A native foreground
 return task that succeeded with a confirmed process-group exit closes its loan
-automatically. If it failed with a confirmed exit, use `resource resolve`. Use
+automatically. A container return task that exited with code 0 and whose
+removal Homebased confirmed also closes its loan automatically. If either
+failed with confirmed evidence, use `resource resolve`. Use
 `restoring_foreground_return` only when that proof is missing, for example
-when the task is lost or its process-group exit is not confirmed. The two
+when the task is lost, its process-group exit is not confirmed, or its
+container evidence is not confirmed. The two
 Restoring bindings are not interchangeable. Read `resource show` and use its
 exact `return_execution_mode` value to choose the binding. If that field is
 absent or unknown, stop; do not infer the mode from the return decision, task
@@ -397,9 +439,14 @@ accepted task record, and immutable inputs must still match. Use
 `evaluation_or_next_epoch` only with `already_completed`,
 `new_background_work` only with `idle`, and `after_ended_run` only with
 `ended_without_result`. `resource schema` prints all fields.
-For these three choices, the work must be a native foreground executable or the
-maintained direct-segment trainer command. A Python evaluation script or a
-wrapper command is not accepted.
+For these three choices, the work must be a native foreground executable, the
+maintained direct-segment trainer command, or a `container` workload with
+`gpus`. A Python evaluation script or a wrapper command is not accepted as a
+command; run it in a pinned image as a `container` instead:
+
+```json
+{"type":"evaluation_or_next_epoch","completed_task":"<task-uuid-from-context>","spec":{"api_version":1,"thread":"33333333-3333-4333-8333-333333333333","name":"evaluate epoch","cwd":"/path/to/trainer","workload":{"type":"container","image":"registry.example/eval@sha256:<64-hex-digest>","args":["--checkpoint","/data/checkpoint"],"gpus":"all","memory":"24g","mounts":[{"source":"/path/to/checkpoint","target":"/data/checkpoint","read_only":true}]}}}
+```
 
 For a remote or co-located supervisor, submit one choice and stable launch identities:
 
@@ -425,7 +472,10 @@ start is confirmed, and it becomes the registered training task. A native
 foreground command never becomes the registered training task. Its `restoring`
 loan keeps the GPU reserved while it runs, and new requests wait. When it exits
 with code 0 and a confirmed process-group exit, the loan closes and the oldest
-queued request runs. Any other end keeps the GPU reserved for `resolve`.
+queued request runs. Any other end keeps the GPU reserved for `resolve`. A
+container return task has the `container` execution mode and behaves the same
+way, but its witness is the removed container: the loan closes only when the
+container exits with code 0 and Homebased confirms that it is removed.
 
 The co-located return path uses the authority's local decision owner. A remote
 return keeps the callback route on the supervisor machine. Only the first
@@ -438,9 +488,11 @@ command is refused because the authority starts that watcher itself.
 Use `resolve` only when pending shows `restoring` with the exact loan and return
 task, and the authority has confirmed that the task ended. This applies to a
 direct-segment trainer that ended before its start was confirmed, and to a
-native foreground task that ended without success. A native foreground task
-needs confirmed process-group exit. A direct-segment trainer also needs proof
-that its exact ownership lock is free:
+native foreground or container task that ended without success. A native
+foreground task needs confirmed process-group exit. A container task needs
+confirmed container evidence: its exit code was read and its removal was
+confirmed, or the container never started. A direct-segment trainer also needs
+proof that its exact ownership lock is free:
 
 ```sh
 homebased --json resource resolve <loan-uuid> \
@@ -453,9 +505,9 @@ The authority checks the task and release evidence. This is not a way to force
 the GPU free while a task is running or uncertain. A lost task, a task whose
 process-group exit is not confirmed, or a task whose identity changed stays
 reserved. If a direct-segment return task has no lock proof, only an operator
-can release it with the `restoring_return` binding. If a native foreground
-return task is lost or has no confirmed process-group exit, only an operator
-can release it with the `restoring_foreground_return` binding. See
+can release it with the `restoring_return` binding. If a native foreground or
+container return task is lost or has no confirmed exit evidence, only an
+operator can release it with the `restoring_foreground_return` binding. See
 [Resolve an unproven ended trainer](#resolve-an-unproven-ended-trainer).
 
 ### Retry a failed notice

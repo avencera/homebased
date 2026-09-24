@@ -181,6 +181,8 @@ pub struct TaskPaths {
     pub callback_log: PathBuf,
     /// Process-shared callback delivery lock.
     pub delivery_lock: PathBuf,
+    /// Container ID that Docker writes when it creates a container task's container.
+    pub container_cid: PathBuf,
 }
 
 /// Files inside `messages/<id>/`.
@@ -215,6 +217,7 @@ impl TaskPaths {
             exit_json: dir.join("exit.json"),
             callback_log: dir.join("callback.log"),
             delivery_lock: dir.join(DELIVERY_LOCK),
+            container_cid: dir.join("container.cid"),
             dir,
         }
     }

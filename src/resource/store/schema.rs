@@ -49,8 +49,17 @@ CREATE TABLE IF NOT EXISTS resource_requests (
         AND COALESCE(json_type(spec_json, '$.cwd') = 'text', 0)
         AND COALESCE(json_type(spec_json, '$.timeout') = 'text', 0)
         AND COALESCE(json_type(spec_json, '$.workload') = 'object', 0)
-        AND COALESCE(json_extract(spec_json, '$.workload.type') = 'task', 0)
-        AND COALESCE(json_type(spec_json, '$.workload.command') = 'array', 0)
+        AND COALESCE(
+            (
+                json_extract(spec_json, '$.workload.type') = 'task'
+                AND json_type(spec_json, '$.workload.command') = 'array'
+            ) OR (
+                json_extract(spec_json, '$.workload.type') = 'container'
+                AND json_type(spec_json, '$.workload.image') = 'text'
+                AND json_type(spec_json, '$.workload.gpus') IS NOT NULL
+            ),
+            0
+        )
     ),
     state_json TEXT NOT NULL CHECK (
         json_valid(state_json)
@@ -199,7 +208,7 @@ CREATE TABLE IF NOT EXISTS resource_restore_closures (
         AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
         AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
         AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
-            'confirmed_running', 'foreground_ended', 'supervisor_resolved_end'
+            'confirmed_running', 'foreground_ended', 'container_ended', 'supervisor_resolved_end'
         ), 0)
     )
 );

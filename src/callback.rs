@@ -14,6 +14,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
+use crate::container::GpuRequest;
 use crate::domain::{
     AgentKind, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow, TaskState,
     ThreadId, Workload,
@@ -87,6 +88,19 @@ pub enum WorkloadView {
         /// Full argv including the program.
         command: Vec<String>,
     },
+    /// Container identity. Omits environment values, which may hold secrets.
+    Container {
+        /// Image pinned by digest.
+        image: String,
+        /// Argv head that replaces the image entrypoint, when set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entrypoint: Option<Vec<String>>,
+        /// Arguments after the image.
+        args: Vec<String>,
+        /// GPUs the container may use, when set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpus: Option<GpuRequest>,
+    },
 }
 
 impl From<&Workload> for WorkloadView {
@@ -99,6 +113,15 @@ impl From<&Workload> for WorkloadView {
             },
             Workload::Task(task) => Self::Task {
                 command: task.command.to_vec(),
+            },
+            Workload::Container(container) => Self::Container {
+                image: container.image.as_str().to_owned(),
+                entrypoint: container
+                    .entrypoint
+                    .as_ref()
+                    .map(|entrypoint| entrypoint.as_slice().to_vec()),
+                args: container.args.clone(),
+                gpus: container.gpus.clone(),
             },
         }
     }
@@ -738,6 +761,7 @@ mod tests {
             binary: PathBuf::from("/bin/claude"),
             state,
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
+            container_exit_evidence: crate::domain::ContainerExitEvidence::Unconfirmed,
             callback_status: CallbackStatus::Pending,
             attention: AttentionState::Pending,
             cancel_requested_at: None,

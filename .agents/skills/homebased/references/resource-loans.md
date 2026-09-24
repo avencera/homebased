@@ -10,6 +10,9 @@ belongs to a registered resource. Do not bypass an active loan or FIFO request
 queue. Do not monitor a loan by polling with a model or in a command loop.
 Queued GPU commands must run native foreground executables. Scripts,
 interpreters, shell wrappers, container clients, and detach tools are refused.
+For work in a pinned Docker image, submit a `container` workload with `gpus`
+instead of a `docker` command. Homebased starts, watches, and removes that
+container, and releases the GPU only after it confirms the removal.
 
 Check the exact actions for the assigned supervisor machine and thread:
 
@@ -56,13 +59,14 @@ exact task, resource revision, and `state_binding` from `resource show`:
   dashboard shows `Operator release required`, even with no queued request.
 - When `loan` is `restoring`, use the exact `return_execution_mode` value from
   `resource show`: `direct_segment_trainer` selects `restoring_return`, and
-  `native_foreground` selects `restoring_foreground_return`. Use the Restoring
+  `native_foreground` or `container` selects `restoring_foreground_return`. Use the Restoring
   loan and action UUIDs and `resume_task_id` for the binding. If the field is
   absent or unknown, do not guess from the decision, task status, command name,
   or command text, and do not submit either binding.
 - A native foreground return task keeps the Restoring loan until a successful
-  end with a confirmed process-group exit. An operator attestation is not exit
-  proof, and the task keeps its saved state.
+  end with a confirmed process-group exit. A container return task keeps it
+  until the container exits with code 0 and Homebased confirms its removal. An
+  operator attestation is not exit proof, and the task keeps its saved state.
 
 See the [operator procedure](../../../../docs/resource-loans.md#resolve-an-unproven-ended-trainer).
 Keep the document and operation ID unchanged after an unknown outcome, and
@@ -74,9 +78,11 @@ and `resource resolve` work for remote and co-located supervisors. Keep the
 same action, request, and task IDs when an outcome is unknown.
 
 A native foreground return task keeps the `restoring` reservation until it
-exits with code 0 and a confirmed process-group exit. It never becomes the
-registered training task, so do not expect a release action for it. Use
-`resource resolve` for a failed foreground end.
+exits with code 0 and a confirmed process-group exit. A container return task
+keeps it until the container exits with code 0 and Homebased confirms that the
+container is removed. Neither becomes the registered training task, so do not
+expect a release action for it. Use `resource resolve` for a failed end with
+confirmed evidence.
 
 Do not use the current live training job to test, verify, or demonstrate this
 workflow. Use a controlled registered task.

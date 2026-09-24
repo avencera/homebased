@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::domain::{
-    API_VERSION, CallbackStatus, ExitReason, ProcessStatus, TaskId, TaskName, TaskReport, TaskRow,
-    TerminalCallbackProjection, ThreadId,
+    API_VERSION, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason, ProcessStatus,
+    TaskId, TaskName, TaskReport, TaskRow, TerminalCallbackProjection, ThreadId, Workload,
 };
 use crate::machine::MachineId;
 use crate::store::TaskPresentation;
@@ -170,6 +170,46 @@ pub struct TaskDetail {
     /// Event already sent, or the one that will be sent. `None` while running
     /// with no interim event.
     pub last_event: Option<HomebasedEvent>,
+    /// Container of a container task and its witness. Omitted for other workloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerDetail>,
+}
+
+/// Container that a container task owns, as the task layer saved it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerDetail {
+    /// Fixed container name.
+    pub name: String,
+    /// Image pinned by digest.
+    pub image: String,
+    /// Container ID, once the worker saved it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<ContainerId>,
+    /// When a worker first saw the container start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Witness that the container stopped and was removed. Unconfirmed until the task ends.
+    pub exit_evidence: ContainerExitEvidence,
+}
+
+impl ContainerDetail {
+    /// Build the view of a container task, or `None` for other workloads.
+    #[must_use]
+    pub fn from_row(
+        row: &TaskRow,
+        record: Option<&crate::store::TaskContainerRecord>,
+    ) -> Option<Self> {
+        let Workload::Container(workload) = &row.workload else {
+            return None;
+        };
+        Some(Self {
+            name: crate::container::docker::container_name(row.id),
+            image: workload.image.as_str().to_owned(),
+            container_id: record.and_then(|record| record.container_id.clone()),
+            started_at: record.and_then(|record| record.started_at),
+            exit_evidence: row.container_exit_evidence.clone(),
+        })
+    }
 }
 
 /// `GET /v1/tasks/{id}/log`.

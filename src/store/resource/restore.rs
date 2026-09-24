@@ -6,9 +6,10 @@
 //! IMMEDIATE transaction. The accepting transaction also saves the task's typed
 //! execution mode. A direct-segment trainer closes its Restoring loan on a
 //! confirmed start and becomes the registered background task. A native
-//! foreground task keeps the loan reserved while it runs and closes it only after
-//! a successful end with a confirmed process-group exit. Any other end needs an
-//! explicit supervisor resolution
+//! foreground or container task keeps the loan reserved while it runs and closes
+//! it only after a successful end with its confirmed exit witness: a
+//! process-group exit, or a removed container. Any other end needs an explicit
+//! supervisor resolution
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use super::trainer_lock::{
 };
 use super::{LoanActionPhase, replace_loan_in_action_phase_on, select_authority_resource};
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskRow, TaskState,
+    ContainerId, ExitReason, ProcessStatus, TaskEnv, TaskId, TaskRow, TaskState, WorkExitEvidence,
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -320,6 +321,12 @@ enum RestoreClosureBasis {
     /// The bound native foreground task ended successfully, and the task layer
     /// confirmed that its owned process group exited
     ForegroundEnded { outcome: ExitReason },
+    /// The bound container task exited with code 0, and the worker removed the
+    /// exact container and confirmed that its ID is absent
+    ContainerEnded {
+        outcome: ExitReason,
+        container_id: ContainerId,
+    },
     /// The supervisor explicitly accepted an end that had proven process release
     SupervisorResolvedEnd {
         authority: SupervisorActionAuthority,
@@ -592,6 +599,7 @@ fn prepare_return_task_for_authority(
     require_prior_background_ended(&tx, &pending)?;
     let (spec, _, _) = return_task_spec(&tx, &pending, &authority, &launch, executor_env)?;
     crate::spec::check_cwd(&spec.cwd)?;
+    crate::spec::check_workload_host(&spec.workload)?;
     let normalized_spec_sha256 = normalized_spec_sha256(&spec)?;
     Ok(PreparedReturnTask {
         spec,
@@ -616,12 +624,13 @@ fn return_task_spec(
     Ok((spec, executor_env, binary))
 }
 
-/// Check the return task row against the ownership contract its argv selected
+/// Check the return task row against the ownership contract its work selected
 ///
 /// A foreground command needs an inspectable native entry point. A trainer argv
 /// must pass the full direct-segment check, because only that shape has an
-/// ownership lock that later release proof can verify. The validated contract
-/// fixes the task's execution mode
+/// ownership lock that later release proof can verify. A container needs no
+/// entry point: Homebased drives the `docker` CLI itself and removes the
+/// container. The validated contract fixes the task's execution mode
 fn check_return_command_ownership(
     launch: &ReturnLaunch,
     spec: &NormalizedSpec,
@@ -634,9 +643,8 @@ fn check_return_command_ownership(
     let unsupported = |risk| {
         ReturnDecisionError::Rejected(ReturnDecisionRejection::UnsupportedCommandOwnership { risk })
     };
-    let command = foreground::task_command(spec)
-        .ok_or_else(|| unsupported(ResourceTaskOwnershipRisk::UninspectableEntryPoint))?;
-    let contract = CommandOwnershipContract::for_return_command(command).map_err(unsupported)?;
+    let contract =
+        CommandOwnershipContract::for_return_work(&spec.workload).map_err(unsupported)?;
     match contract {
         CommandOwnershipContract::ForegroundExecutable => {
             foreground::inspect_foreground_entry_point(&row.binary).map_err(unsupported)?;
@@ -645,6 +653,7 @@ fn check_return_command_ownership(
             DirectSegmentCommandShape::validate_launch(spec, row)
                 .map_err(|_| unsupported(ResourceTaskOwnershipRisk::Interpreter))?;
         }
+        CommandOwnershipContract::Container => {}
     }
 
     Ok(contract.into())
@@ -723,6 +732,7 @@ fn accept_return_task_for_authority(
     }
 
     crate::spec::check_cwd(&spec.cwd)?;
+    crate::spec::check_workload_host(&spec.workload)?;
     let row = crate::store::new_queued_task(crate::store::NewTask {
         id: task_id,
         name: Some(spec.name.clone()),
@@ -834,9 +844,10 @@ fn accept_return_task_for_authority(
 /// Observe one Restoring loan and close it by the task's saved execution mode
 ///
 /// A direct-segment task closes the loan on a confirmed start and becomes the
-/// registered background task. A native foreground task keeps the loan while it
-/// runs and closes it only after a successful end with a confirmed process-group
-/// exit, leaving no registered task. Every other state keeps the loan reserved
+/// registered background task. A native foreground or container task keeps the
+/// loan while it runs and closes it only after a successful end with its
+/// confirmed exit witness, leaving no registered task. Every other state keeps
+/// the loan reserved
 fn reconcile_restoring_loan_for_authority(
     conn: &mut Connection,
     authority_machine: MachineId,
@@ -893,17 +904,21 @@ fn reconcile_restoring_loan_for_authority(
                 state: bound.row.status(),
             });
         }
-        (TaskState::Running { .. }, ReturnExecutionMode::NativeForeground) => {
+        (
+            TaskState::Running { .. },
+            ReturnExecutionMode::NativeForeground | ReturnExecutionMode::Container,
+        ) => {
             return Ok(RestoreReconcileOutcome::ForegroundRunning {
                 loan: loan.clone(),
                 action_id,
                 task_id,
             });
         }
-        (TaskState::Finished { reason }, ReturnExecutionMode::NativeForeground) => {
-            if let Some(reason) = foreground_end_gap(&bound.row, reason) {
-                return attention(reason);
-            }
+        (TaskState::Finished { reason }, mode) => {
+            let basis = match loan_holding_end(&bound.row, reason, mode) {
+                Ok(basis) => basis,
+                Err(reason) => return attention(reason),
+            };
             (
                 LoanClosure::ForegroundReturnEnded {
                     return_context: return_context.clone(),
@@ -911,9 +926,7 @@ fn reconcile_restoring_loan_for_authority(
                     outcome: reason.clone(),
                 },
                 None,
-                RestoreClosureBasis::ForegroundEnded {
-                    outcome: reason.clone(),
-                },
+                basis,
             )
         }
     };
@@ -951,31 +964,62 @@ fn reconcile_restoring_loan_for_authority(
     })
 }
 
-/// Return why a native foreground end cannot close its loan, if it cannot
+/// Return the closure basis of a return task that held its loan, or why its end cannot close it
 ///
-/// Only a zero exit with a confirmed owned process-group exit is free. A failed
-/// end needs the supervisor's explicit resolution, and an unconfirmed exit is
-/// not proof that the process released the GPU
-fn foreground_end_gap(row: &TaskRow, reason: &ExitReason) -> Option<RestoreAttentionReason> {
+/// Only a zero exit with the witness of the task's mode is free: a confirmed
+/// owned process-group exit for a native command, or a removed container for a
+/// container. A failed end needs the supervisor's explicit resolution, and an
+/// unconfirmed witness is not proof that the work released the GPU
+fn loan_holding_end(
+    row: &TaskRow,
+    reason: &ExitReason,
+    mode: ReturnExecutionMode,
+) -> Result<RestoreClosureBasis, RestoreAttentionReason> {
     let state = row.status();
-    match (reason, row.process_group_exit_evidence()) {
-        (ExitReason::Exit { code: 0 }, ProcessGroupExitEvidence::ConfirmedExited) => None,
-        (_, ProcessGroupExitEvidence::Unconfirmed) => {
-            Some(RestoreAttentionReason::ForegroundExitUnconfirmed { state })
+    let success = *reason == ExitReason::Exit { code: 0 };
+    let evidence = row.work_exit_evidence();
+    match (mode, evidence) {
+        (ReturnExecutionMode::NativeForeground, WorkExitEvidence::ProcessGroupExited)
+            if success =>
+        {
+            Ok(RestoreClosureBasis::ForegroundEnded {
+                outcome: reason.clone(),
+            })
         }
         (
-            _,
-            ProcessGroupExitEvidence::ConfirmedExited | ProcessGroupExitEvidence::NoChildSpawned,
-        ) => Some(RestoreAttentionReason::ForegroundEnded { state }),
+            ReturnExecutionMode::Container,
+            WorkExitEvidence::ContainerRemoved { container_id, .. },
+        ) if success => Ok(RestoreClosureBasis::ContainerEnded {
+            outcome: reason.clone(),
+            container_id,
+        }),
+        (
+            ReturnExecutionMode::NativeForeground,
+            WorkExitEvidence::ProcessGroupExited | WorkExitEvidence::NoWorkStarted,
+        ) => Err(RestoreAttentionReason::ForegroundEnded { state }),
+        (ReturnExecutionMode::NativeForeground, _) => {
+            Err(RestoreAttentionReason::ForegroundExitUnconfirmed { state })
+        }
+        (
+            ReturnExecutionMode::Container,
+            WorkExitEvidence::ContainerRemoved { .. } | WorkExitEvidence::NoWorkStarted,
+        ) => Err(RestoreAttentionReason::ContainerEnded { state }),
+        (ReturnExecutionMode::Container, _) => {
+            Err(RestoreAttentionReason::ContainerExitUnconfirmed { state })
+        }
+        (ReturnExecutionMode::DirectSegmentTrainer, _) => {
+            Err(RestoreAttentionReason::EndedBeforeConfirmedStart { state })
+        }
     }
 }
 
 /// Close a Restoring loan whose bound task ended without a mode-specific closure
 ///
-/// This covers a direct-segment task that ended before a confirmed start and a
-/// native foreground task that ended without success. The exact current
-/// supervisor must name the action, task, and current revision. The task must be
-/// terminal with proven process release; a lost task stays reserved
+/// This covers a direct-segment task that ended before a confirmed start, and a
+/// native foreground or container task that ended without success. The exact
+/// current supervisor must name the action, task, and current revision. The task
+/// must be terminal with the proven release its mode needs; a lost task stays
+/// reserved
 fn resolve_ended_restore_for_authority(
     conn: &mut Connection,
     resolution: EndedRestoreResolution,
@@ -1052,12 +1096,16 @@ fn resolve_ended_restore_for_authority(
             return Err(ReturnDecisionError::RestoreNotEnded { task_id });
         }
     };
-    // the task layer records NoChildSpawned only before its child spawns, so the
-    // other outcomes need a confirmed process-group exit and the witness that the
-    // command contract requires
-    let held_lock = match row.process_group_exit_evidence() {
-        ProcessGroupExitEvidence::ConfirmedExited => hold_restore_release(&tx, &resource, &bound)?,
-        ProcessGroupExitEvidence::NoChildSpawned
+    // the task layer records no started work only before its child spawns or its
+    // container starts, so the other outcomes need the exit witness of the task's
+    // mode, and a trainer also needs its released lock
+    let held_lock = match (row.work_exit_evidence(), bound.execution_mode) {
+        (
+            WorkExitEvidence::ProcessGroupExited,
+            ReturnExecutionMode::NativeForeground | ReturnExecutionMode::DirectSegmentTrainer,
+        ) => hold_restore_release(&tx, &resource, &bound)?,
+        (WorkExitEvidence::ContainerRemoved { .. }, ReturnExecutionMode::Container) => None,
+        (WorkExitEvidence::NoWorkStarted, _)
             if matches!(
                 outcome,
                 ExitReason::SpawnFailed { .. } | ExitReason::Cancelled
@@ -1065,9 +1113,7 @@ fn resolve_ended_restore_for_authority(
         {
             None
         }
-        ProcessGroupExitEvidence::NoChildSpawned | ProcessGroupExitEvidence::Unconfirmed => {
-            return Err(ReturnDecisionError::RestoreReleaseUnproven { task_id });
-        }
+        _ => return Err(ReturnDecisionError::RestoreReleaseUnproven { task_id }),
     };
 
     let closed = Loan {
@@ -1133,7 +1179,7 @@ fn hold_restore_release(
 ) -> Result<Option<HeldTrainerRelease>, ReturnDecisionError> {
     let task_id = bound.row.id;
     let mode = bound.execution_mode;
-    if mode == ReturnExecutionMode::NativeForeground {
+    if mode.holds_loan_while_running() {
         return Ok(None);
     }
     let witness_task = bound.resumed_run.unwrap_or(task_id);

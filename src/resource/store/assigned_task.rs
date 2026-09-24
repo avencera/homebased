@@ -10,8 +10,9 @@ use super::provenance::serving_release_provenance_matches;
 use super::queue::oldest_queued_request_for_authority;
 use super::revision::swap_resource_revision;
 use super::rows::{check_authority, select_non_closed_loan, select_request_by_id, select_resource};
-use crate::domain::{ExitReason, ProcessGroupExitEvidence, TaskId, TaskState};
+use crate::domain::{ExitReason, TaskId, TaskState, WorkExitEvidence};
 use crate::machine::MachineId;
+use crate::resource::foreground::CommandOwnershipContract;
 use crate::resource::{
     ActionId, CommandSpec, Loan, LoanId, LoanPhase, LoanState, NoticeId, ResourceId,
     ResourceRequest, ResourceRequestState, ResourceRevision, ResourceTaskOwnershipRisk,
@@ -75,8 +76,8 @@ pub(crate) enum AssignedResourceTaskAttention {
     TaskIdentityMismatch,
     /// The task reached Lost without proving ownership exit
     TaskLost,
-    /// The task is terminal but the owned process group is not confirmed exited
-    ProcessGroupExitUnconfirmed,
+    /// The task is terminal but its exit witness is not confirmed
+    ExitWitnessUnconfirmed,
     /// No-child evidence came with an outcome that no pre-spawn path records
     InvalidNoChildSpawnEvidence,
     /// The command can outlive the task-run process group
@@ -110,11 +111,16 @@ pub(crate) enum ResourceTaskCompletionResult {
 }
 
 /// Proof kind that authorized one resource task to release its loan turn
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResourceTaskReleaseProof {
     /// The task-run worker confirmed that its owned process group exited
     ConfirmedProcessGroupExit,
+    /// The worker read the container's exit code, removed it, and saw its ID absent
+    ConfirmedContainerRemoved {
+        /// Removed container
+        container_id: crate::domain::ContainerId,
+    },
     /// The task failed before it spawned a child process
     NoChildSpawnedAfterSpawnFailure,
     /// Cancellation won the Queued CAS, so the worker can never reach its spawn
@@ -513,7 +519,7 @@ fn match_resource_task_layer(
         )),
         TaskState::Lost => Ok(ResourceTaskLayerObservation::Lost),
         TaskState::Finished { reason } => {
-            match resource_task_release_proof(request, reason, task.process_group_exit_evidence()) {
+            match resource_task_release_proof(request, reason, task.work_exit_evidence()) {
                 Ok(release_proof) => Ok(ResourceTaskLayerObservation::Finished {
                     outcome: reason.clone(),
                     release_proof,
@@ -538,41 +544,55 @@ fn resource_task_row_matches(task: &crate::domain::TaskRow, request: &ResourceRe
 pub(super) fn resource_task_release_proof(
     request: &ResourceRequest,
     outcome: &ExitReason,
-    evidence: ProcessGroupExitEvidence,
+    evidence: WorkExitEvidence,
 ) -> Result<ResourceTaskReleaseProof, AssignedResourceTaskAttention> {
-    match evidence {
-        ProcessGroupExitEvidence::ConfirmedExited => {
-            if let Some(risk) = resource_task_ownership_risk(request.spec()) {
-                return Err(AssignedResourceTaskAttention::OwnershipUncertain(risk));
-            }
+    let confirmed = match evidence {
+        // the task layer records no started work only before the worker spawns its
+        // child or starts its container, or when a store CAS leaves Queued, which
+        // the worker needs to win first; any other outcome contradicts those paths
+        WorkExitEvidence::NoWorkStarted => {
+            return match outcome {
+                ExitReason::SpawnFailed { .. } => {
+                    Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterSpawnFailure)
+                }
+                ExitReason::Cancelled => {
+                    Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterQueuedCancel)
+                }
+                ExitReason::Exit { .. } | ExitReason::Signal { .. } => {
+                    Err(AssignedResourceTaskAttention::InvalidNoChildSpawnEvidence)
+                }
+            };
+        }
+        WorkExitEvidence::Unconfirmed => {
+            return Err(AssignedResourceTaskAttention::ExitWitnessUnconfirmed);
+        }
+        confirmed @ (WorkExitEvidence::ProcessGroupExited
+        | WorkExitEvidence::ContainerRemoved { .. }) => confirmed,
+    };
+    let contract =
+        CommandOwnershipContract::for_queued_work(&request.spec().as_normalized().workload)
+            .map_err(AssignedResourceTaskAttention::OwnershipUncertain)?;
+    match (confirmed, contract) {
+        (WorkExitEvidence::ProcessGroupExited, CommandOwnershipContract::ForegroundExecutable) => {
             Ok(ResourceTaskReleaseProof::ConfirmedProcessGroupExit)
         }
-        // the task layer records NoChildSpawned only before the worker spawns its
-        // child or when a store CAS leaves Queued, which the worker needs to win
-        // before it spawns; any other outcome contradicts those paths
-        ProcessGroupExitEvidence::NoChildSpawned => match outcome {
-            ExitReason::SpawnFailed { .. } => {
-                Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterSpawnFailure)
-            }
-            ExitReason::Cancelled => Ok(ResourceTaskReleaseProof::NoChildSpawnedAfterQueuedCancel),
-            ExitReason::Exit { .. } | ExitReason::Signal { .. } => {
-                Err(AssignedResourceTaskAttention::InvalidNoChildSpawnEvidence)
-            }
-        },
-        ProcessGroupExitEvidence::Unconfirmed => {
-            Err(AssignedResourceTaskAttention::ProcessGroupExitUnconfirmed)
-        }
+        (
+            WorkExitEvidence::ContainerRemoved { container_id, .. },
+            CommandOwnershipContract::Container,
+        ) => Ok(ResourceTaskReleaseProof::ConfirmedContainerRemoved { container_id }),
+        // a witness that the queued contract does not name proves nothing
+        _ => Err(AssignedResourceTaskAttention::ExitWitnessUnconfirmed),
     }
 }
 
-/// Classify a queued command against the foreground ownership contract
+/// Classify queued work against the ownership contract
 ///
-/// Only the foreground contract lets process-group exit release the resource
+/// A foreground command releases the resource on its process-group exit and a
+/// container on its removal. Every other shape is refused
 pub(super) fn resource_task_ownership_risk(
     command: &CommandSpec,
 ) -> Option<ResourceTaskOwnershipRisk> {
-    crate::resource::foreground::CommandOwnershipContract::for_queued_command(command.command())
-        .err()
+    CommandOwnershipContract::for_queued_work(&command.as_normalized().workload).err()
 }
 
 fn select_resource_task_completion_receipt(

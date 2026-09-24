@@ -12,10 +12,10 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `execution_machine` | Stable UUID of the machine that ran the child. Present on new events. |
 | `name` | Submitted task name. Omitted only for tasks stored before name was required. |
 | `display_name` | Non-empty server-derived label: the submitted name, or a workload fallback for unnamed stored rows. |
-| `workload` | Discriminated union: `{"type":"agent","agent":"…","model":null\|string}` or `{"type":"task","command":[…]}`. |
+| `workload` | Discriminated union: `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. |
 | `thread` | The thread the event was addressed to. |
 | `cwd` | The child's working directory. |
-| `evidence` | Absolute task directory on the execution machine. Agent tasks contain prompt evidence, `output.log`, and `exit.json`. Task workloads omit prompt files. Origin callback logs stay on the origin machine. |
+| `evidence` | Absolute task directory on the execution machine. Agent tasks contain prompt evidence, `output.log`, and `exit.json`. Task workloads omit prompt files. Container tasks also contain `container.cid`, the container ID that Docker wrote. Origin callback logs stay on the origin machine. |
 | `reports` | Worker reports in `seq` order, each `{"seq", "outcome", "summary"}`. `[]` when the worker never reported. |
 | `process` | Tagged exit payload, or `null` for interim events. |
 | `timeout_secs` | Present on `TASK_CHECK_DUE`: the configured output-inactivity timeout. |

@@ -21,8 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskRow, TaskState,
-    ThreadId,
+    ExitReason, ProcessStatus, TaskEnv, TaskId, TaskRow, TaskState, ThreadId, WorkExitEvidence,
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -863,10 +862,14 @@ fn require_background_slot_free(
             return Err(BackgroundLaunchError::PredecessorReleaseUnproven { task_id });
         }
         EndedLaunchRelease::NeverSpawned => {}
-        // a restore can register a foreground command, whose group exit suffices
+        // the confirmed evidence must be the kind that the task's contract names,
+        // and a trainer also needs its released lock
         EndedLaunchRelease::ConfirmedExited => {
             let witness = ended_task_witness(conn, resource.authority_machine(), task_id)
                 .map_err(|error| predecessor_lock_error(task_id, error))?;
+            if !witness.accepts(&row.work_exit_evidence()) {
+                return Err(BackgroundLaunchError::PredecessorReleaseUnproven { task_id });
+            }
             if witness == EndedTaskWitness::TrainerLock {
                 let held = hold_predecessor_lock(conn, resource, task_id)?;
                 clearance.held_locks.push((task_id, held));
@@ -1260,16 +1263,19 @@ fn current_launch_record_on(
 
 /// Classify the task-layer release evidence of one background task row
 ///
-/// The task layer records NoChildSpawned only when it failed or cancelled the
-/// row before any worker child started, so that evidence with any other outcome
-/// proves nothing. A lost or non-terminal row is never released
+/// The task layer records that no work started only when it failed or
+/// cancelled the row before any worker child or container started, so that
+/// evidence with any other outcome proves nothing. A lost or non-terminal row is
+/// never released
 fn ended_task_release(row: &TaskRow) -> EndedLaunchRelease {
     let TaskState::Finished { reason } = &row.state else {
         return EndedLaunchRelease::Unproven;
     };
-    match row.process_group_exit_evidence() {
-        ProcessGroupExitEvidence::ConfirmedExited => EndedLaunchRelease::ConfirmedExited,
-        ProcessGroupExitEvidence::NoChildSpawned
+    match row.work_exit_evidence() {
+        WorkExitEvidence::ProcessGroupExited | WorkExitEvidence::ContainerRemoved { .. } => {
+            EndedLaunchRelease::ConfirmedExited
+        }
+        WorkExitEvidence::NoWorkStarted
             if matches!(
                 reason,
                 ExitReason::SpawnFailed { .. } | ExitReason::Cancelled
@@ -1277,7 +1283,7 @@ fn ended_task_release(row: &TaskRow) -> EndedLaunchRelease {
         {
             EndedLaunchRelease::NeverSpawned
         }
-        ProcessGroupExitEvidence::NoChildSpawned | ProcessGroupExitEvidence::Unconfirmed => {
+        WorkExitEvidence::NoWorkStarted | WorkExitEvidence::Unconfirmed => {
             EndedLaunchRelease::Unproven
         }
     }

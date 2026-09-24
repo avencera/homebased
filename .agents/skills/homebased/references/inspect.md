@@ -27,7 +27,7 @@ homebased --json task show <id>
 | `name` | Submitted goal label. Omitted only for tasks stored before name was required. |
 | `display_name` | Non-empty label: the submitted name, or a workload fallback for unnamed stored rows. |
 | `status` | Process status, see above. |
-| `workload` | `{"type":"agent","agent":"…","model":null\|string}` or `{"type":"task","command":[…]}`. |
+| `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
 | `callback` | Retained task-row callback state. For tasks with sequenced events, use `failed_events` for per-event callback failures. |
 | `cancel_requested_at` | Set once `task cancel` ran. |

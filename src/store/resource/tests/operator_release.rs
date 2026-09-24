@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 const OBSERVATION: &str = "nvidia-smi on the authority lists no trainer process";
 
-fn attestation_for(
+pub(super) fn attestation_for(
     store: &Store,
     authority: MachineId,
     resource_id: ResourceId,
@@ -210,6 +210,7 @@ fn unbound_failed_trainer_stays_reserved_until_the_attestation_serves_the_queue(
             trainer_end: AttestedTrainerEnd::Finished {
                 outcome: ExitReason::Exit { code: 3 },
                 process_group_exit: ProcessGroupExitEvidence::Unconfirmed,
+                container_exit: None,
             },
             trainer_launch: AttestedTrainerLaunch::FirstBackgroundLaunch {
                 request_id: launch_request,
@@ -948,6 +949,7 @@ fn first_launch_that_ended_before_registration_releases_only_through_its_exact_a
             trainer_end: AttestedTrainerEnd::Finished {
                 outcome: ExitReason::Exit { code: 1 },
                 process_group_exit: ProcessGroupExitEvidence::Unconfirmed,
+                container_exit: None,
             },
             trainer_launch: AttestedTrainerLaunch::FirstBackgroundLaunch {
                 request_id: launch_request,
@@ -1797,6 +1799,7 @@ fn unconfirmed_foreground_exit_closes_into_the_saved_idle_boundary() {
         AttestedTrainerEnd::Finished {
             outcome: ExitReason::Exit { code: 0 },
             process_group_exit: ProcessGroupExitEvidence::Unconfirmed,
+            container_exit: None,
         }
     );
     assert!(matches!(
@@ -1959,6 +1962,8 @@ fn schema_27_receipts_survive_the_restore_outcome_migration() {
                  INSERT INTO resource_operator_attestations
                      (operation_id, resource_id, task_id, preceding_launch, receipt_json)
                  VALUES ('{operation}', '{}', '{task}', '{}', '{legacy}');
+                 ALTER TABLE tasks DROP COLUMN container_exit_evidence;
+                 DROP TABLE task_containers;
                  PRAGMA user_version = 27;",
                 resource.id.as_uuid(),
                 request.0

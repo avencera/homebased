@@ -651,8 +651,27 @@ pub(super) fn serving_fixture_with_spec(
     spec: NormalizedSpec,
 ) -> ServingFixture {
     let directory = tempdir().unwrap();
-    let mut store = Store::open(&directory.path().join("db")).unwrap();
-    let authority = MachineId::new();
+    let database = directory.path().join("db");
+    serving_fixture_at(
+        directory,
+        &database,
+        MachineId::new(),
+        local_origin,
+        save_local_route,
+        spec,
+    )
+}
+
+/// Serving fixture whose store and authority are the ones a daemon home uses
+pub(super) fn serving_fixture_at(
+    directory: tempfile::TempDir,
+    database: &Path,
+    authority: MachineId,
+    local_origin: bool,
+    save_local_route: bool,
+    spec: NormalizedSpec,
+) -> ServingFixture {
+    let mut store = Store::open(database).unwrap();
     let origin = if local_origin {
         authority
     } else {

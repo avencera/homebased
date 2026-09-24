@@ -914,8 +914,9 @@
 					</p>
 				{:else if phaseType === 'restoring'}
 					<p class="mt-3 rounded border border-border/70 bg-muted/40 p-2 text-muted-foreground">
-						Return task holds the reservation. A trainer releases it on a confirmed start; a native
-						foreground command releases it after a successful, confirmed exit.
+						Return task holds the reservation. A trainer releases it on a confirmed start. A native
+						foreground command releases it after a successful, confirmed exit. A container releases
+						it after it exits with code 0 and Homebased confirms its removal.
 					</p>
 					<p class="mt-2 font-mono text-[11px] break-all">
 						return_execution_mode: {detail.return_execution_mode ?? 'unknown — do not guess'}

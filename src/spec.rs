@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agents::{OpenCodeExtraArgsError, validate_opencode_extra_args};
+use crate::container::ContainerWorkload;
+use crate::container::spec::container_workload_schema;
 use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
@@ -114,8 +116,9 @@ struct SubmitSpecWire {
 fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let agent_kind = subschema::<AgentKind>(generator);
     let command = subschema::<CommandLine>(generator);
+    let container = container_workload_schema(false);
     schemars::json_schema!({
-        "description": "Workload variant. Exactly one of agent or task.",
+        "description": "Workload variant. Exactly one of agent, task, or container.",
         "oneOf": [
             {
                 "title": "agent",
@@ -147,7 +150,8 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
                 },
                 "required": ["type", "command"],
                 "additionalProperties": false
-            }
+            },
+            container
         ]
     })
 }
@@ -249,6 +253,8 @@ pub enum SubmitWorkloadValidated {
         /// Validated argv
         command: CommandLine,
     },
+    /// Docker container
+    Container(Box<ContainerWorkload>),
 }
 
 /// Validated submit spec
@@ -304,6 +310,8 @@ pub enum NormalizedWorkload {
     Agent(NormalizedAgentWorkload),
     /// Arbitrary command
     Task(NormalizedTaskWorkload),
+    /// Docker container that Homebased starts, watches, and removes
+    Container(Box<ContainerWorkload>),
 }
 
 /// Spec with prompt inlined and `prompt_file` removed. This is the only shape
@@ -404,7 +412,7 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
         .ok_or_else(|| AppError::InvalidSpec {
             pointer: "/workload/type".into(),
             value: workload_raw.get("type").cloned().unwrap_or(Value::Null),
-            message: "workload.type must be \"agent\" or \"task\"".into(),
+            message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
     match kind {
@@ -427,12 +435,21 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
                 .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
             Ok(NormalizedWorkload::Task(NormalizedTaskWorkload { command }))
         }
+        "container" => Ok(NormalizedWorkload::Container(parse_container(&content)?)),
         other => Err(AppError::InvalidSpec {
             pointer: "/workload/type".into(),
             value: json!(other),
-            message: "workload.type must be \"agent\" or \"task\"".into(),
+            message: WORKLOAD_TYPE_MESSAGE.into(),
         }),
     }
+}
+
+const WORKLOAD_TYPE_MESSAGE: &str = "workload.type must be \"agent\", \"task\", or \"container\"";
+
+fn parse_container(content: &Value) -> Result<Box<ContainerWorkload>, AppError> {
+    ContainerWorkload::from_value(content)
+        .map(Box::new)
+        .map_err(|err| err.into_invalid_spec("/workload"))
 }
 
 /// Map a serde failure onto `invalid_spec`, including missing required fields
@@ -539,7 +556,7 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
         .ok_or_else(|| AppError::InvalidSpec {
             pointer: "/workload/type".into(),
             value: workload_raw.get("type").cloned().unwrap_or(Value::Null),
-            message: "workload.type must be \"agent\" or \"task\"".into(),
+            message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
     match kind {
@@ -564,10 +581,13 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
                 .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
             Ok(SubmitWorkloadValidated::Task { command })
         }
+        "container" => Ok(SubmitWorkloadValidated::Container(parse_container(
+            &content,
+        )?)),
         other => Err(AppError::InvalidSpec {
             pointer: "/workload/type".into(),
             value: json!(other),
-            message: "workload.type must be \"agent\" or \"task\"".into(),
+            message: WORKLOAD_TYPE_MESSAGE.into(),
         }),
     }
 }
@@ -646,6 +666,9 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
                 command: command.clone(),
             })
         }
+        SubmitWorkloadValidated::Container(container) => {
+            NormalizedWorkload::Container(container.clone())
+        }
     };
     Ok(NormalizedSpec {
         api_version: API_VERSION,
@@ -662,6 +685,19 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
 pub fn schema_json() -> Result<Value, AppError> {
     let schema = schemars::schema_for!(SubmitSpecWire);
     Ok(serde_json::to_value(&schema)?)
+}
+
+/// Check the host inputs that a workload names on the machine that runs it
+///
+/// A container's mount sources must exist there and must not expose a
+/// container daemon socket. Other workloads name no host inputs beyond `cwd`
+pub fn check_workload_host(workload: &NormalizedWorkload) -> Result<(), AppError> {
+    match workload {
+        NormalizedWorkload::Container(container) => {
+            crate::container::check_container_host(container)
+        }
+        NormalizedWorkload::Agent(_) | NormalizedWorkload::Task(_) => Ok(()),
+    }
 }
 
 /// Require `cwd` to exist and be a directory
@@ -1143,6 +1179,109 @@ mod tests {
             &with_workload(json!({"type": "agent", "agent": "gemini", "prompt": "hi"})),
             false,
             "an unsupported agent kind",
+        );
+    }
+
+    #[test]
+    fn schema_and_parser_agree_on_container_workloads() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let container = |extra: Value| {
+            let mut workload = json!({
+                "type": "container",
+                "image": format!("eval@{digest}"),
+                "memory": "1g"
+            });
+            if let (Some(workload), Value::Object(extra)) = (workload.as_object_mut(), extra) {
+                workload.extend(extra);
+            }
+            with_workload(workload)
+        };
+        for (extra, why) in [
+            (json!({}), "a minimal container"),
+            (json!({ "image": digest }), "an image ID"),
+            (
+                json!({ "image": format!("misc.local:5000/team/eval-probe@{digest}") }),
+                "a registry image",
+            ),
+            (
+                json!({
+                    "entrypoint": ["/usr/bin/python3", "-m", "eval"],
+                    "args": ["--ckpt", "/data/ckpt", ""],
+                    "gpus": [0, 1],
+                    "memory": 25_769_803_776_u64,
+                    "user": "1000:1000",
+                    "workdir": "/work",
+                    "mounts": [{ "source": "/shared/ckpt", "target": "/data", "read_only": true }],
+                    "env": { "HF_HOME": "/data/hf" }
+                }),
+                "every field",
+            ),
+            (json!({ "gpus": "all" }), "all GPUs"),
+        ] {
+            assert_verdict(&container(extra), true, why);
+        }
+        for (extra, why) in [
+            (json!({ "image": "eval:latest" }), "a tag alone"),
+            (
+                json!({ "image": format!("eval:1.0@{digest}") }),
+                "a tag beside a digest",
+            ),
+            (json!({ "memory": null }), "a null memory limit"),
+            (json!({ "privileged": true }), "privileged mode"),
+            (json!({ "pid": "host" }), "a host PID namespace"),
+            (json!({ "restart": "always" }), "a restart policy"),
+            (json!({ "command": ["python"] }), "a command field"),
+            (json!({ "gpus": [] }), "an empty GPU list"),
+            (json!({ "gpus": [0, 0] }), "a repeated GPU"),
+            (json!({ "gpus": null }), "a null GPU request"),
+            (json!({ "entrypoint": [] }), "an empty entrypoint"),
+            (json!({ "args": "python eval.py" }), "a shell string"),
+            (json!({ "user": "root" }), "a named user"),
+            (json!({ "workdir": "work" }), "a relative workdir"),
+            (
+                json!({ "env": { "1X": "v" } }),
+                "an invalid environment name",
+            ),
+            (
+                json!({ "mounts": [{ "source": "data", "target": "/d" }] }),
+                "a relative mount source",
+            ),
+            (
+                json!({ "mounts": [{ "source": "/data", "target": "/d", "propagation": "shared" }] }),
+                "an unknown mount option",
+            ),
+        ] {
+            assert_verdict(&container(extra), false, why);
+        }
+        let mut missing_memory = container(json!({}));
+        missing_memory["workload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memory");
+        assert_verdict(&missing_memory, false, "a missing memory limit");
+    }
+
+    #[test]
+    fn container_workloads_normalize_and_survive_the_socket() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let spec = parse_spec_value(&with_workload(json!({
+            "type": "container",
+            "image": digest,
+            "memory": "2g",
+            "gpus": [1],
+            "env": { "B": "2", "A": "1" }
+        })))
+        .unwrap();
+        let normalized = normalize(&spec).unwrap();
+        let mut body = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(body["workload"]["type"], "container");
+        assert_eq!(body["workload"]["memory"], json!(2_u64 << 30));
+        assert_eq!(parse_normalized_value(&body).unwrap(), normalized);
+        body["workload"]["privileged"] = json!(true);
+        let err = parse_normalized_value(&body).unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidSpec { pointer, .. } if pointer == "/workload/privileged"),
+            "{err:?}"
         );
     }
 

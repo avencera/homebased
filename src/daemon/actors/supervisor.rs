@@ -876,7 +876,7 @@ async fn finish_spawn_failed(
         id,
         from: ProcessStatus::Queued,
         reason,
-        process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+        evidence: ProcessGroupExitEvidence::NoChildSpawned.into(),
         reply,
     })
     .await?;

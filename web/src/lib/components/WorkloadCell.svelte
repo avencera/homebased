@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { WorkloadView } from '$lib/api';
-	import { formatWorkload } from '$lib/format';
+	import { containerArgv, formatWorkload, imageName } from '$lib/format';
 	import { cn } from '$lib/utils';
 
 	interface Props {
@@ -12,22 +12,40 @@
 
 	// the badge names the selected model because it is the useful agent identity
 	const label = $derived.by(() => {
-		if (workload.type !== 'agent') return 'cmd';
-		const name = workload.model ?? workload.agent;
-		return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
+		switch (workload.type) {
+			case 'agent': {
+				const name = workload.model ?? workload.agent;
+				return workload.reasoning ? `${name} · ${workload.reasoning}` : name;
+			}
+			case 'container':
+				return 'ctr';
+			case 'task':
+				return 'cmd';
+		}
 	});
 	const detail = $derived.by(() => {
-		if (workload.type === 'agent') return null;
-		return workload.command.length > 0 ? formatWorkload(workload) : null;
+		switch (workload.type) {
+			case 'agent':
+				return null;
+			case 'container':
+				return imageName(workload.image);
+			case 'task':
+				return workload.command.length > 0 ? formatWorkload(workload) : null;
+		}
 	});
 	const title = $derived.by(() => {
-		if (workload.type === 'agent') {
-			const model = workload.model
-				? `agent ${workload.agent}, model ${workload.model}`
-				: `agent ${workload.agent}, default model`;
-			return workload.reasoning ? `${model}, reasoning ${workload.reasoning}` : model;
+		switch (workload.type) {
+			case 'agent': {
+				const model = workload.model
+					? `agent ${workload.agent}, model ${workload.model}`
+					: `agent ${workload.agent}, default model`;
+				return workload.reasoning ? `${model}, reasoning ${workload.reasoning}` : model;
+			}
+			case 'container':
+				return `container ${workload.image}: ${containerArgv(workload).join(' ')}`;
+			case 'task':
+				return `command: ${workload.command.join(' ')}`;
 		}
-		return `command: ${workload.command.join(' ')}`;
 	});
 </script>
 

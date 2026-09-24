@@ -13,10 +13,10 @@ use crate::callback::{
     EventKind, ReportView, check_due_event, exit_event, lost_event, notify_event, terminal_event,
 };
 use crate::domain::{
-    AttentionState, CallbackStatus, ExitReason, ProcessGroupExitEvidence, ProcessStatus,
-    REPORTS_MAX, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskId, TaskName,
-    TaskReport, TaskRow, TaskState, TerminalCallbackProjection, ThreadId, Workload,
-    check_report_allowed, check_status_transition,
+    AttentionState, CallbackStatus, ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence,
+    ProcessStatus, REPORTS_MAX, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv,
+    TaskExitEvidence, TaskId, TaskName, TaskReport, TaskRow, TaskState, TerminalCallbackProjection,
+    ThreadId, Workload, check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
@@ -30,10 +30,12 @@ use crate::submission::{
 };
 
 mod cancellation;
+mod container;
 mod events;
 mod identity;
 mod message;
 mod resource;
+pub use container::TaskContainerRecord;
 pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
 pub(crate) use resource::VerifiedReleaseProof;
@@ -232,7 +234,7 @@ CREATE TABLE outbound_message_bindings (
 const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, callback_status,
     attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at,
-    process_group_exit_evidence
+    process_group_exit_evidence, container_exit_evidence
  FROM tasks";
 
 /// Operator attestation receipts gained the Restoring return outcomes after v0.4.0
@@ -274,15 +276,116 @@ DROP TABLE resource_operator_attestations;
 ALTER TABLE resource_operator_attestations_v28 RENAME TO resource_operator_attestations;
 ";
 
+/// Schema version of the v0.5.0 release
+const RELEASED_V0_5_SCHEMA_VERSION: i64 = 28;
+
+/// Container tasks gained their witness after v0.5.0
+///
+/// `container_exit_evidence` sits beside `process_group_exit_evidence` so the
+/// terminal transition writes both in one update. `task_containers` keeps the
+/// saved container ID, its start, and the adoption streak of later workers
+const MIGRATE_28_TO_29_TASKS: &str = r"
+ALTER TABLE tasks ADD COLUMN container_exit_evidence TEXT;
+
+CREATE TABLE task_containers (
+    task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id),
+    container_id TEXT CHECK (
+        container_id IS NULL
+        OR (length(container_id) = 64 AND container_id NOT GLOB '*[^0-9a-f]*')
+    ),
+    started_at TEXT,
+    adoptions INTEGER NOT NULL DEFAULT 0 CHECK (adoptions >= 0)
+);
+";
+
+/// Resource requests and restore closures gained container work after v0.5.0
+///
+/// SQLite cannot change a CHECK constraint in place, so both tables are
+/// rebuilt with the constraints that `RESOURCE_SCHEMA` now declares. Existing
+/// rows keep their bytes, and `RESOURCE_SCHEMA` recreates the dropped indexes
+const MIGRATE_28_TO_29_RESOURCES: &str = r"
+CREATE TABLE resource_requests_v29 (
+    acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (acceptance_sequence > 0),
+    request_id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL UNIQUE,
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    origin_machine TEXT NOT NULL,
+    spec_json TEXT NOT NULL CHECK (
+        json_valid(spec_json)
+        AND COALESCE(json_type(spec_json) = 'object', 0)
+        AND COALESCE(json_type(spec_json, '$.api_version') = 'integer', 0)
+        AND COALESCE(json_type(spec_json, '$.thread') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.name') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.cwd') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.timeout') = 'text', 0)
+        AND COALESCE(json_type(spec_json, '$.workload') = 'object', 0)
+        AND COALESCE(
+            (
+                json_extract(spec_json, '$.workload.type') = 'task'
+                AND json_type(spec_json, '$.workload.command') = 'array'
+            ) OR (
+                json_extract(spec_json, '$.workload.type') = 'container'
+                AND json_type(spec_json, '$.workload.image') = 'text'
+                AND json_type(spec_json, '$.workload.gpus') IS NOT NULL
+            ),
+            0
+        )
+    ),
+    state_json TEXT NOT NULL CHECK (
+        json_valid(state_json)
+        AND COALESCE(json_type(state_json) = 'object', 0)
+        AND COALESCE(json_type(state_json, '$.type') = 'text', 0)
+        AND COALESCE(json_extract(state_json, '$.type') IN (
+            'queued', 'assigned', 'finished', 'cancelled_before_launch', 'rejected'
+        ), 0)
+    )
+);
+INSERT INTO resource_requests_v29
+    (acceptance_sequence, request_id, task_id, resource_id, origin_machine, spec_json, state_json)
+SELECT acceptance_sequence, request_id, task_id, resource_id, origin_machine, spec_json, state_json
+FROM resource_requests ORDER BY acceptance_sequence;
+DROP TABLE resource_requests;
+ALTER TABLE resource_requests_v29 RENAME TO resource_requests;
+
+CREATE TABLE resource_restore_closures_v29 (
+    action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
+    task_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
+            'confirmed_running', 'foreground_ended', 'container_ended', 'supervisor_resolved_end'
+        ), 0)
+    )
+);
+INSERT INTO resource_restore_closures_v29 (action_id, task_id, receipt_json)
+SELECT action_id, task_id, receipt_json FROM resource_restore_closures ORDER BY rowid;
+DROP TABLE resource_restore_closures;
+ALTER TABLE resource_restore_closures_v29 RENAME TO resource_restore_closures;
+";
+
 /// Move a released version 2 database to the current schema
+///
+/// The version 2 schema has no resource tables, so `RESOURCE_SCHEMA` creates
+/// them with the current constraints
 fn migrate_2_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_2_TO_CURRENT)?;
+    conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
     conn.execute_batch(RESOURCE_SCHEMA)
 }
 
 /// Move a v0.4.0 database to the current schema
 fn migrate_27_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_27_TO_28)?;
+    migrate_28_to_current(conn)
+}
+
+/// Move a v0.5.0 database to the current schema
+fn migrate_28_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
+    conn.execute_batch(MIGRATE_28_TO_29_RESOURCES)?;
     conn.execute_batch(RESOURCE_SCHEMA)
 }
 
@@ -353,8 +456,8 @@ fn insert_task_with_project_root_on(
             env_path, env_home, binary, status, exit_reason,
             callback_status, attention_state, timeout_notified_at,
             pid, cancel_requested_at, created_at, updated_at, project_root,
-            process_group_exit_evidence
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            process_group_exit_evidence, container_exit_evidence
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             row.id.to_string(),
             row.thread.to_string(),
@@ -376,6 +479,7 @@ fn insert_task_with_project_root_on(
             fmt_time(row.updated_at),
             project_root.map(|root| root.to_string_lossy().into_owned()),
             row.process_group_exit_evidence.as_str(),
+            row.container_exit_evidence.to_storage()?,
         ],
     )?;
     Ok(())
@@ -552,7 +656,7 @@ pub(crate) fn insert_remote_origin_task_records_on(
     if origin == execution
         || spec.machine.is_some()
         || spec.thread != owners.thread
-        || !matches!(&spec.workload, crate::spec::NormalizedWorkload::Task(_))
+        || matches!(&spec.workload, crate::spec::NormalizedWorkload::Agent(_))
         || row.status() != ProcessStatus::Queued
         || row.name.as_ref() != Some(&spec.name)
         || row.thread != spec.thread
@@ -661,6 +765,7 @@ impl Store {
                 }
                 2 => migrate_2_to_current(&transaction)?,
                 RELEASED_V0_4_SCHEMA_VERSION => migrate_27_to_current(&transaction)?,
+                RELEASED_V0_5_SCHEMA_VERSION => migrate_28_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1542,26 +1647,25 @@ impl Store {
         id: TaskId,
         from: ProcessStatus,
         reason: &ExitReason,
-        evidence: ProcessGroupExitEvidence,
+        evidence: impl Into<TaskExitEvidence>,
     ) -> Result<Option<TaskRow>, AppError> {
-        if evidence == ProcessGroupExitEvidence::ConfirmedExited && from != ProcessStatus::Running {
-            return Err(AppError::Internal {
-                message: "confirmed process-group exit requires a running task worker".into(),
-            });
-        }
-        // a worker that won Queued->Running may already have spawned, so only its
-        // own pre-spawn failure can claim that no child exists
-        if evidence == ProcessGroupExitEvidence::NoChildSpawned
-            && from != ProcessStatus::Queued
-            && !matches!(reason, ExitReason::SpawnFailed { .. })
-        {
-            return Err(AppError::Internal {
-                message: "no-child evidence after start requires a spawn failure".into(),
-            });
-        }
+        let evidence = &evidence.into();
+        check_exit_evidence(from, reason, evidence)?;
         let to = ProcessStatus::from(reason);
         check_status_transition(from, to)?;
-        self.immediate(|| self.cas_exit_inner(id, from, reason, evidence))
+        self.immediate(|| {
+            if evidence.container != ContainerExitEvidence::Unconfirmed
+                && !matches!(
+                    self.get_task(id)?.map(|row| row.workload),
+                    Some(Workload::Container(_))
+                )
+            {
+                return Err(AppError::Internal {
+                    message: "container evidence requires a container task".into(),
+                });
+            }
+            self.cas_exit_inner(id, from, reason, evidence)
+        })
     }
 
     fn cas_exit_inner(
@@ -1569,19 +1673,20 @@ impl Store {
         id: TaskId,
         from: ProcessStatus,
         reason: &ExitReason,
-        evidence: ProcessGroupExitEvidence,
+        evidence: &TaskExitEvidence,
     ) -> Result<Option<TaskRow>, AppError> {
         let to = ProcessStatus::from(reason);
         let now = fmt_time(Utc::now());
         let reason_json = serde_json::to_string(reason)?;
         let n = self.conn.execute(
             "UPDATE tasks SET status = ?1, exit_reason = ?2,
-                process_group_exit_evidence = ?3, updated_at = ?4
-             WHERE id = ?5 AND status = ?6",
+                process_group_exit_evidence = ?3, container_exit_evidence = ?4, updated_at = ?5
+             WHERE id = ?6 AND status = ?7",
             params![
                 to.as_str(),
                 reason_json,
-                evidence.as_str(),
+                evidence.process_group.as_str(),
+                evidence.container.to_storage()?,
                 now,
                 id.to_string(),
                 from.as_str()
@@ -1663,7 +1768,7 @@ impl Store {
                 id,
                 ProcessStatus::Queued,
                 &ExitReason::Cancelled,
-                ProcessGroupExitEvidence::NoChildSpawned,
+                &ProcessGroupExitEvidence::NoChildSpawned.into(),
             )? {
                 return Ok(CancelResult::CancelledQueued(row));
             }
@@ -1902,6 +2007,53 @@ pub enum CancelResult {
     SignalWorker(TaskRow),
 }
 
+/// Refuse terminal evidence that no worker path records with this transition
+fn check_exit_evidence(
+    from: ProcessStatus,
+    reason: &ExitReason,
+    evidence: &TaskExitEvidence,
+) -> Result<(), AppError> {
+    let refuse = |message: &str| {
+        Err(AppError::Internal {
+            message: message.into(),
+        })
+    };
+    if evidence.process_group == ProcessGroupExitEvidence::ConfirmedExited
+        && from != ProcessStatus::Running
+    {
+        return refuse("confirmed process-group exit requires a running task worker");
+    }
+    // a worker that won Queued->Running may already have spawned, so only its
+    // own pre-spawn failure can claim that no child exists
+    if evidence.process_group == ProcessGroupExitEvidence::NoChildSpawned
+        && from != ProcessStatus::Queued
+        && !matches!(reason, ExitReason::SpawnFailed { .. })
+    {
+        return refuse("no-child evidence after start requires a spawn failure");
+    }
+    match &evidence.container {
+        ContainerExitEvidence::Unconfirmed => Ok(()),
+        _ if from != ProcessStatus::Running => {
+            refuse("container evidence requires a running task worker")
+        }
+        ContainerExitEvidence::NeverStarted
+            if !matches!(
+                reason,
+                ExitReason::SpawnFailed { .. } | ExitReason::Cancelled
+            ) =>
+        {
+            refuse("never-started container evidence requires a spawn failure or a cancel")
+        }
+        ContainerExitEvidence::Confirmed { exit_code, .. }
+            if !matches!(reason, ExitReason::Cancelled)
+                && *reason != (ExitReason::Exit { code: *exit_code }) =>
+        {
+            refuse("confirmed container evidence must match the task exit code")
+        }
+        ContainerExitEvidence::NeverStarted | ContainerExitEvidence::Confirmed { .. } => Ok(()),
+    }
+}
+
 fn fmt_time(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -1958,6 +2110,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let created_at: String = row.get(16)?;
     let updated_at: String = row.get(17)?;
     let process_group_exit_evidence: Option<String> = row.get(18)?;
+    let container_exit_evidence: Option<String> = row.get(19)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
@@ -1985,13 +2138,15 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         None => None,
     };
     let status = ProcessStatus::from_storage(&status).map_err(parse_err)?;
-    let process_group_exit_evidence = match status {
-        ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled => {
-            ProcessGroupExitEvidence::from_storage(process_group_exit_evidence.as_deref())
-        }
-        ProcessStatus::Queued | ProcessStatus::Running | ProcessStatus::Lost => {
-            ProcessGroupExitEvidence::Unconfirmed
-        }
+    let (process_group_exit_evidence, container_exit_evidence) = match status {
+        ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled => (
+            ProcessGroupExitEvidence::from_storage(process_group_exit_evidence.as_deref()),
+            ContainerExitEvidence::from_storage(container_exit_evidence.as_deref()),
+        ),
+        ProcessStatus::Queued | ProcessStatus::Running | ProcessStatus::Lost => (
+            ProcessGroupExitEvidence::Unconfirmed,
+            ContainerExitEvidence::Unconfirmed,
+        ),
     };
     let callback_status = CallbackStatus::from_storage(&callback_status).map_err(parse_err)?;
     let timeout_notified_at = match timeout_notified_at {
@@ -2018,6 +2173,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         binary: Path::new(&binary).to_path_buf(),
         state: TaskState::from_storage(status, exit_reason, pid).map_err(parse_err)?,
         process_group_exit_evidence,
+        container_exit_evidence,
         callback_status,
         attention,
         cancel_requested_at,
@@ -2061,6 +2217,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         binary: new.binary,
         state: TaskState::Queued,
         process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
+        container_exit_evidence: ContainerExitEvidence::Unconfirmed,
         callback_status: CallbackStatus::Pending,
         attention: AttentionState::Pending,
         cancel_requested_at: None,
@@ -2077,6 +2234,24 @@ pub struct ExitJson {
     /// Evidence for the task-run worker's child process group
     #[serde(default)]
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
+    /// Evidence for a container task's container
+    #[serde(default, skip_serializing_if = "is_unconfirmed_container")]
+    pub container_exit_evidence: ContainerExitEvidence,
+}
+
+impl ExitJson {
+    /// Evidence recorded with this exit
+    #[must_use]
+    pub fn evidence(&self) -> TaskExitEvidence {
+        TaskExitEvidence {
+            process_group: self.process_group_exit_evidence,
+            container: self.container_exit_evidence.clone(),
+        }
+    }
+}
+
+fn is_unconfirmed_container(evidence: &ContainerExitEvidence) -> bool {
+    *evidence == ContainerExitEvidence::Unconfirmed
 }
 
 /// Parse `exit.json` if present
@@ -2094,18 +2269,20 @@ pub fn read_exit_json(path: &Path) -> Result<Option<ExitJson>, AppError> {
 
 /// Write `exit.json` via temp + rename
 pub fn write_exit_json(path: &Path, reason: &ExitReason) -> Result<(), AppError> {
-    write_exit_json_with_evidence(path, reason, ProcessGroupExitEvidence::Unconfirmed)
+    write_exit_json_with_evidence(path, reason, TaskExitEvidence::default())
 }
 
 pub(crate) fn write_exit_json_with_evidence(
     path: &Path,
     reason: &ExitReason,
-    process_group_exit_evidence: ProcessGroupExitEvidence,
+    evidence: impl Into<TaskExitEvidence>,
 ) -> Result<(), AppError> {
+    let evidence = evidence.into();
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(&ExitJson {
         reason: reason.clone(),
-        process_group_exit_evidence,
+        process_group_exit_evidence: evidence.process_group,
+        container_exit_evidence: evidence.container.clone(),
     })?;
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)?;
@@ -2115,16 +2292,17 @@ pub(crate) fn write_exit_json_with_evidence(
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION, Store, new_queued_task,
-        read_exit_json, write_exit_json_with_evidence,
+        BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
+        RELEASED_V0_5_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
+        write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
     use crate::domain::{
-        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ExitReason,
-        ProcessGroupExitEvidence, ProcessStatus, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES,
-        TaskEnv, TaskId, TaskName, TaskRow, TaskState, TaskWorkload, TerminalCallbackProjection,
-        ThreadId, TransitionError, Workload,
+        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ContainerExitEvidence,
+        ContainerId, ExitReason, ProcessGroupExitEvidence, ProcessStatus, ReportOutcome,
+        SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskExitEvidence, TaskId, TaskName, TaskRow,
+        TaskState, TaskWorkload, TerminalCallbackProjection, ThreadId, TransitionError, Workload,
     };
     use crate::error::AppError;
     use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, OutboxState};
@@ -3513,6 +3691,131 @@ CREATE TABLE reports (
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert!(enabled);
+    }
+
+    /// Schema text of one table or index
+    fn schema_sql(store: &Store, name: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn released_v0_5_database_gains_the_container_witness_and_keeps_its_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            // restore the v0.5.0 shape: no container column or table, and a
+            // request CHECK that accepted only command work
+            store
+                .conn
+                .execute_batch(&format!(
+                    "ALTER TABLE tasks DROP COLUMN container_exit_evidence;
+                     DROP TABLE task_containers;
+                     DROP TABLE resource_requests;
+                     CREATE TABLE resource_requests (
+                         acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                         request_id TEXT NOT NULL UNIQUE,
+                         task_id TEXT NOT NULL UNIQUE,
+                         resource_id TEXT NOT NULL REFERENCES resources(id),
+                         origin_machine TEXT NOT NULL,
+                         spec_json TEXT NOT NULL CHECK (
+                             COALESCE(json_extract(spec_json, '$.workload.type') = 'task', 0)
+                         ),
+                         state_json TEXT NOT NULL
+                     );
+                     PRAGMA user_version = {RELEASED_V0_5_SCHEMA_VERSION};"
+                ))
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let row = store.require_task(id).unwrap();
+        assert_eq!(
+            row.container_exit_evidence,
+            ContainerExitEvidence::Unconfirmed
+        );
+        assert_eq!(store.task_container(id).unwrap(), None);
+        assert!(schema_sql(&store, "resource_requests").contains("'container'"));
+        assert!(!schema_sql(&store, "resource_requests").contains("'task', 0) AND"));
+        assert!(schema_sql(&store, "resource_restore_closures").contains("'container_ended'"));
+        schema_sql(&store, "resource_requests_fifo");
+        schema_sql(&store, "resource_requests_queued_fifo");
+        assert_resource_tables_installed(&store);
+        assert_foreign_keys_enabled(&store);
+    }
+
+    #[test]
+    fn container_evidence_is_refused_where_no_container_path_records_it() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        insert_local(&store, id);
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap()
+            .unwrap();
+        let confirmed = |exit_code| TaskExitEvidence {
+            process_group: ProcessGroupExitEvidence::Unconfirmed,
+            container: ContainerExitEvidence::Confirmed {
+                container_id: ContainerId::parse(&"a".repeat(64)).unwrap(),
+                exit_code,
+            },
+        };
+        // a command task has no container, so container evidence cannot be its witness
+        assert!(
+            store
+                .cas_exit_with_evidence(
+                    id,
+                    ProcessStatus::Running,
+                    &ExitReason::Exit { code: 0 },
+                    confirmed(0),
+                )
+                .is_err()
+        );
+        // the confirmed exit code must be the task's exit code
+        assert!(
+            store
+                .cas_exit_with_evidence(
+                    id,
+                    ProcessStatus::Running,
+                    &ExitReason::Exit { code: 0 },
+                    confirmed(1),
+                )
+                .is_err()
+        );
+        let never_started = TaskExitEvidence {
+            process_group: ProcessGroupExitEvidence::Unconfirmed,
+            container: ContainerExitEvidence::NeverStarted,
+        };
+        assert!(
+            store
+                .cas_exit_with_evidence(
+                    id,
+                    ProcessStatus::Running,
+                    &ExitReason::Exit { code: 0 },
+                    never_started,
+                )
+                .is_err(),
+            "a container that never started cannot exit with a code"
+        );
+        assert_eq!(
+            store.require_task(id).unwrap().status(),
+            ProcessStatus::Running
+        );
     }
 
     #[test]

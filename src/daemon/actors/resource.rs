@@ -1664,7 +1664,7 @@ fn task_completion_attention_reason(
         AssignedResourceTaskAttention::TaskLost => {
             ResourceQueueAttentionReason::AssignedTaskLost { task_id }
         }
-        AssignedResourceTaskAttention::ProcessGroupExitUnconfirmed => {
+        AssignedResourceTaskAttention::ExitWitnessUnconfirmed => {
             ResourceQueueAttentionReason::AssignedTaskExitUnconfirmed { task_id }
         }
         AssignedResourceTaskAttention::InvalidNoChildSpawnEvidence => {

@@ -384,6 +384,10 @@ fn workload_label(value: &Value) -> String {
                 parts.join(" ")
             }
         }
+        Some("container") => match workload.get("image").and_then(Value::as_str) {
+            Some(image) => format!("container {}", image.split('@').next().unwrap_or(image)),
+            None => "container".into(),
+        },
         _ => "-".into(),
     }
 }

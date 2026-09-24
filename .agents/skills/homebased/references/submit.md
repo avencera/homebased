@@ -22,8 +22,11 @@ Several sessions can share one cwd. Tell the user which id you chose. If you can
 | Long commands: `cargo build`, test suites, render jobs | `task` |
 | GitHub CI watch: `gh pr checks … --watch` | `task` |
 | A model must reason and produce a report | `agent` |
+| Work in a pinned Docker image, such as checkpoint evaluation | `container` |
 
 A `task` runs an argv array with no shell. A caller that needs shell syntax must request it explicitly, for example `["sh", "-lc", "..."]`.
+
+A `container` runs a pinned image. Do not submit a `docker run` command as a `task`: its client can exit while the container keeps running, and resource work refuses it. For a `container`, Homebased creates the container, saves its ID, starts it, streams its logs to `output.log`, waits for it, and then removes it. The task exit code is the container exit code.
 
 ## 3. Write the prompt file (agent only)
 
@@ -81,6 +84,31 @@ Task example:
 }
 ```
 
+Container example:
+
+```json
+{
+  "api_version": 1,
+  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+  "name": "evaluate checkpoint 12",
+  "cwd": "/home/praveen/code/project",
+  "timeout": "2h",
+  "workload": {
+    "type": "container",
+    "image": "registry.example/eval@sha256:<64-hex-digest>",
+    "entrypoint": ["/usr/bin/python3", "-m", "eval"],
+    "args": ["--checkpoint", "/data/checkpoints/12"],
+    "gpus": "all",
+    "memory": "24g",
+    "mounts": [
+      { "source": "/shared/checkpoints", "target": "/data/checkpoints", "read_only": true },
+      { "source": "/shared/eval-output", "target": "/out" }
+    ],
+    "env": { "HF_HOME": "/data/hf" }
+  }
+}
+```
+
 GitHub CI watcher as a normal task:
 
 ```json
@@ -98,7 +126,7 @@ GitHub CI watcher as a normal task:
 | `cwd` | yes | For local tasks, an existing directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
-| `workload` | yes | Internally tagged enum: `type` is `agent` or `task`. |
+| `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
 Agent-only fields under `workload`:
 
@@ -116,6 +144,24 @@ Task-only fields under `workload`:
 | --- | --- | --- |
 | `command` | yes | Non-empty argv. Index 0 is a non-empty program. Later args may be empty. No NUL bytes. No shell. |
 
+Container-only fields under `workload`:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `image` | yes | Pinned by digest: `sha256:<64 hex>` image ID or `name@sha256:<64 hex>`. A tag is refused. The image must already be on the execution machine; Homebased does not pull it. |
+| `entrypoint` | no | Argv array that replaces the image entrypoint. |
+| `args` | no | Argv array after the image. Passed unchanged; not a shell string. |
+| `gpus` | no | `"all"` or an array of device indices. Required for resource work. |
+| `memory` | yes | Byte count, or a size such as `512m` or `24g` (binary units). Also the swap limit. At least 6 MiB. |
+| `user` | no | Numeric `uid:gid`. Defaults to the daemon's user. |
+| `workdir` | no | Absolute working directory in the container. |
+| `mounts` | no | Array of `{source, target, read_only}`. `source` is an absolute path that must exist on the execution machine. `read_only` defaults to `false`. Docker and containerd sockets, and directories that contain them, are refused. |
+| `env` | no | Object of explicit values. Nothing passes through from the host. |
+
+Docker options that these fields do not model are refused, for example privileged mode, host PID or IPC namespaces, added capabilities, extra devices, and restart policies. The container always runs with `--init` and no restart policy. Container work needs the `docker` CLI on the execution machine's `PATH` and Docker Engine. Version 1 targets Docker Engine on Linux.
+
+If the worker that watches a container stops, the container keeps running and the task stays `running`. The daemon starts a new worker that finds the container by its saved ID, its ID file, or its fixed name `homebased-<task-uuid>` and task label. If Homebased cannot read the container's exit code, the task becomes `lost`. `task cancel` stops the container, kills it after a grace period, and removes it. `task show` includes a `container` object with the container ID and its exit evidence.
+
 Unknown fields and cross-variant fields fail with `invalid_spec` and a JSON pointer. Run `homebased task schema` to print the JSON Schema when in doubt.
 
 The origin and executor have different roles. For a local task, the child uses the submitter's captured `PATH` and `HOME`. For a remote task, the execution machine uses its own daemon environment, `HOME`, installed agents, and toolchain. The executor checks its own `cwd` and expands `~/` using its own home directory. It receives prompt text, not the origin's prompt-file path.
@@ -131,7 +177,7 @@ homebased --json task submit --spec "$dir/spec.json" --dry-run
 homebased --json task submit --spec "$dir/spec.json"
 ```
 
-The dry run validates the spec, resolves the executable and `cwd`, and prints the normalized spec, child argv, and stdin policy. A remote dry run asks the selected executor to validate and expand its invocation. It returns the executor's `execution_cwd`. It spawns nothing and creates no task or request record. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials.
+The dry run validates the spec, resolves the executable and `cwd`, and prints the normalized spec, child argv, and stdin policy. For a `container`, the argv is the `docker container create` call that Homebased makes, with `<task-dir>` and a nil task UUID as placeholders. A remote dry run asks the selected executor to validate and expand its invocation. It returns the executor's `execution_cwd`. It spawns nothing and creates no task or request record. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials.
 
 Request UUIDs apply only to remote submissions (specs with `machine`). The CLI makes a new request UUID for each remote submit by default. Pass `--request-id <uuid>` to choose and retain the identity before the first request, so the caller can retry after it loses the response. A local spec rejects `--request-id`; omit `machine` to submit locally.
 

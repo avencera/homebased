@@ -6,6 +6,8 @@ mod assigned_task;
 mod background;
 mod cancellation;
 mod completed_boundary;
+mod container;
+mod docker;
 mod ended_trainer;
 mod foreground;
 mod operator_release;

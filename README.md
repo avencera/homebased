@@ -191,8 +191,11 @@ Always pass `--json` on data commands. Every JSON object carries `api_version: 1
 | --- | --- |
 | Long commands: `cargo build`, test suites, CI watchers | `task` |
 | A model must reason and produce a report | `agent` |
+| Work in a pinned Docker image, such as checkpoint evaluation | `container` |
 
 A `task` runs an argv array with no shell. A caller that needs shell syntax must request it, for example `["sh", "-lc", "..."]`. An `agent` runs Codex, Claude, Grok, or OpenCode with a prompt file. Prefer `task` unless a model must reason.
+
+A `container` runs an image pinned by digest, with typed fields for the entrypoint, arguments, GPUs, memory limit, user, working directory, mounts, and environment. Homebased builds the Docker calls itself: it creates the container, saves its ID, starts it, streams its logs to `output.log`, waits for it, and removes it. The task exit code is the container exit code. If the watching worker stops, the container keeps running and the daemon adopts it. Docker options that the fields do not model, such as privileged mode, are refused. See [submit.md](.agents/skills/homebased/references/submit.md) for the fields.
 
 Claude agent workloads use streaming JSON output by default, so `output.log` records progress during a turn. A caller can select a different Claude output format with `extra_args`; exact spellings of Homebased-managed standalone switches are reserved tokens there, so Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other extra arguments keep their order and spelling.
 

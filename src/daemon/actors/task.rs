@@ -10,14 +10,22 @@ use tokio::task::AbortHandle;
 use crate::callback::ATTENTION_SETTLE;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{
-    AttentionState, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskState,
+    AttentionState, ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskRow, TaskState,
+    Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
+use crate::runner;
 use crate::store::{self, CancelResult};
 
 /// Retry interval when an attention event cannot be committed
 const ATTENTION_RETRY: Duration = Duration::from_secs(30);
+
+/// Adopting workers that may stop in a row before they reach a container
+///
+/// Each worker that reaches the container ends the streak, so this bounds only
+/// a worker that keeps failing before it can observe the container
+const CONTAINER_ADOPTION_LIMIT: u32 = 3;
 
 /// Longest single sleep before the deadline is recomputed from the wall clock
 /// and `output.log` mtime. The inactivity timer has no product maximum, so
@@ -91,26 +99,7 @@ impl Actor for TaskActor {
         myself: ActorRef<Self::Msg>,
         id: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let lock_path = self.home.task_paths(id).runner_lock;
-        // a dedicated OS thread, not `spawn_blocking`: the `flock` is
-        // uninterruptible and the tokio blocking pool waits for every thread on
-        // runtime drop, which would hold `serve` open past SIGTERM until the
-        // worker exits (REQ-23, DEC-21). This thread may outlive the runtime;
-        // the cast simply fails once the actor is gone
-        let watch = myself.clone();
-        std::thread::Builder::new()
-            .name(format!("hb-lock-{id}"))
-            .spawn(move || {
-                if let Err(err) = home::flock_exclusive(&lock_path, LockMode::Blocking) {
-                    tracing::warn!(%id, "flock watch: {err}");
-                }
-                if let Err(err) = watch.cast(TaskMsg::LockReleased) {
-                    tracing::debug!(%id, "lock watch cast: {err}");
-                }
-            })
-            .map_err(|err| AppError::Internal {
-                message: format!("spawn lock watch thread: {err}"),
-            })?;
+        watch_runner_lock(&myself, &self.home, id)?;
 
         let row = call(&self.store, |reply| StoreMsg::GetTask { id, reply })
             .await?
@@ -144,12 +133,19 @@ impl Actor for TaskActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            TaskMsg::LockReleased => {
-                if let Err(err) = apply_after_lock(self, state.id).await {
-                    tracing::warn!(id = %state.id, "apply after lock: {err}");
+            TaskMsg::LockReleased => match apply_after_lock(self, state.id).await {
+                Ok(AfterLock::Settled) => myself.stop(None),
+                Ok(AfterLock::WorkerRunning) => {
+                    if let Err(err) = watch_runner_lock(&myself, &self.home, state.id) {
+                        tracing::warn!(id = %state.id, "watch adopting worker: {err}");
+                        myself.stop(None);
+                    }
                 }
-                myself.stop(None);
-            }
+                Err(err) => {
+                    tracing::warn!(id = %state.id, "apply after lock: {err}");
+                    myself.stop(None);
+                }
+            },
             TaskMsg::AttentionDue => {
                 state.cancel_attention_timer();
                 if state.attention != AttentionPhase::Armed {
@@ -182,6 +178,31 @@ impl Actor for TaskActor {
         }
         Ok(())
     }
+}
+
+/// Watch `runner.lock` and report once the worker that holds it releases it
+///
+/// A dedicated OS thread, not `spawn_blocking`: the `flock` is uninterruptible
+/// and the tokio blocking pool waits for every thread on runtime drop, which
+/// would hold `serve` open past SIGTERM until the worker exits (REQ-23, DEC-21).
+/// This thread may outlive the runtime; the cast simply fails once the actor is gone
+fn watch_runner_lock(myself: &ActorRef<TaskMsg>, home: &Home, id: TaskId) -> Result<(), AppError> {
+    let lock_path = home.task_paths(id).runner_lock;
+    let watch = myself.clone();
+    std::thread::Builder::new()
+        .name(format!("hb-lock-{id}"))
+        .spawn(move || {
+            if let Err(err) = home::flock_exclusive(&lock_path, LockMode::Blocking) {
+                tracing::warn!(%id, "flock watch: {err}");
+            }
+            if let Err(err) = watch.cast(TaskMsg::LockReleased) {
+                tracing::debug!(%id, "lock watch cast: {err}");
+            }
+        })
+        .map(|_| ())
+        .map_err(|err| AppError::Internal {
+            message: format!("spawn lock watch thread: {err}"),
+        })
 }
 
 /// Time left before an inactivity reminder is due. Saturating throughout:
@@ -312,21 +333,77 @@ async fn start_attention_reminder(
     Ok(AttentionStep::Done)
 }
 
-async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<(), AppError> {
+/// What the watch does after the worker released `runner.lock`
+enum AfterLock {
+    /// The task has its terminal state, so the watch ends
+    Settled,
+    /// A worker holds the lock again, so the watch continues
+    WorkerRunning,
+}
+
+async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<AfterLock, AppError> {
     let Some(row) = call(&actor.store, |reply| StoreMsg::GetTask { id, reply }).await? else {
-        return Ok(());
+        return Ok(AfterLock::Settled);
     };
     if row.state.is_terminal() {
-        return Ok(());
+        return Ok(AfterLock::Settled);
     }
     let paths = actor.home.task_paths(id);
     match store::read_exit_json(&paths.exit_json)? {
         Some(exit) => {
-            apply_exit(actor, row, &exit.reason, exit.process_group_exit_evidence).await?
+            apply_exit(actor, row, &exit.reason, exit.evidence()).await?;
         }
-        None => apply_lost(actor, row).await?,
+        None if matches!(row.workload, Workload::Container(_))
+            && matches!(row.state, TaskState::Running { .. }) =>
+        {
+            return adopt_container(actor, row).await;
+        }
+        None => {
+            apply_lost(actor, row).await?;
+        }
     };
-    Ok(())
+    Ok(AfterLock::Settled)
+}
+
+/// Start a worker that adopts a running container task's container
+///
+/// The container runs under dockerd, so the task stays running while it runs.
+/// The new worker finds the container by its saved ID, ID file, or name, and
+/// finishes the witness. A streak of workers that never reach the container
+/// ends with the task lost, which keeps any resource loan reserved
+async fn adopt_container(actor: &TaskActor, row: TaskRow) -> Result<AfterLock, AppError> {
+    let id = row.id;
+    let claimed = call(&actor.store, |reply| StoreMsg::ClaimContainerAdoption {
+        id,
+        limit: CONTAINER_ADOPTION_LIMIT,
+        reply,
+    })
+    .await?;
+    if !claimed {
+        tracing::warn!(%id, "container workers stopped {CONTAINER_ADOPTION_LIMIT} times in a row before they reached the container");
+        apply_lost(actor, row).await?;
+        return Ok(AfterLock::Settled);
+    }
+    let paths = actor.home.task_paths(id);
+    let lock = match home::flock_exclusive(&paths.runner_lock, LockMode::NonBlocking) {
+        Ok(lock) => lock,
+        // another worker took the lock first, so watch that worker
+        Err(AppError::LockHeld { .. }) => return Ok(AfterLock::WorkerRunning),
+        Err(err) => return Err(err),
+    };
+    let pid = match runner::spawn_task_run(&actor.home, id, lock) {
+        Ok(pid) => pid,
+        Err(err) => {
+            tracing::warn!(%id, "spawn container adoption worker: {err}");
+            apply_lost(actor, row).await?;
+            return Ok(AfterLock::Settled);
+        }
+    };
+    tracing::info!(%id, pid, "worker stopped; adopting the running container");
+    if let Ok(pid) = i32::try_from(pid) {
+        call(&actor.store, |reply| StoreMsg::SetPid { id, pid, reply }).await?;
+    }
+    Ok(AfterLock::WorkerRunning)
 }
 
 /// The worker released the lock without writing `exit.json`
@@ -357,7 +434,7 @@ async fn apply_exit(
     actor: &TaskActor,
     row: TaskRow,
     reason: &ExitReason,
-    process_group_exit_evidence: ProcessGroupExitEvidence,
+    evidence: TaskExitEvidence,
 ) -> Result<TaskRow, AppError> {
     if row.state.is_terminal() {
         return Ok(row);
@@ -367,7 +444,7 @@ async fn apply_exit(
         id,
         from: row.status(),
         reason: reason.clone(),
-        process_group_exit_evidence,
+        evidence,
         reply,
     })
     .await?;

@@ -27,6 +27,8 @@
 	import { LOG_TAIL_LINES, TaskStore } from '$lib/daemon.svelte';
 	import {
 		EM_DASH,
+		containerArgv,
+		containerEvidenceText,
 		exitReasonText,
 		formatCommandArgv,
 		formatDuration,
@@ -162,6 +164,40 @@
 				<dt class="text-muted-foreground">command</dt>
 				<dd class="font-mono whitespace-pre-wrap sm:col-span-3">
 					{formatCommandArgv(task.workload.command)}
+				</dd>
+			{:else if task.workload.type === 'container'}
+				<dt class="text-muted-foreground">image</dt>
+				<dd class="font-mono break-all sm:col-span-3">{task.workload.image}</dd>
+
+				<dt class="text-muted-foreground">command</dt>
+				<dd class="font-mono whitespace-pre-wrap sm:col-span-3">
+					{formatCommandArgv(containerArgv(task.workload)) || EM_DASH}
+				</dd>
+			{/if}
+
+			{#if task.container}
+				<dt class="text-muted-foreground">container</dt>
+				<dd class="flex min-w-0 items-center gap-1 sm:col-span-3">
+					{#if task.container.container_id}
+						<CopyPath
+							value={task.container.container_id}
+							label={`${task.container.name} · ${shortId(task.container.container_id, 12)}`}
+							class="-ml-1"
+						/>
+					{:else}
+						<span class="font-mono">{task.container.name}</span>
+						<span class="text-muted-foreground">(no id saved)</span>
+					{/if}
+				</dd>
+
+				<dt class="text-muted-foreground">witness</dt>
+				<dd class="font-mono sm:col-span-3">
+					{containerEvidenceText(task.container.exit_evidence)}
+					{#if task.container.started_at}
+						<span class="ml-1 text-muted-foreground">
+							(started {formatTimestamp(task.container.started_at)})
+						</span>
+					{/if}
 				</dd>
 			{/if}
 

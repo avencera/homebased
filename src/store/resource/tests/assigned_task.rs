@@ -605,7 +605,7 @@ fn queue_does_not_advance_until_the_exact_process_group_exit_is_confirmed() {
             .reconcile_assigned_resource_task_for_authority(task_reconcile_input(&fixture))
             .unwrap(),
         AssignedResourceTaskReconcileOutcome::Attention(
-            AssignedResourceTaskAttention::ProcessGroupExitUnconfirmed
+            AssignedResourceTaskAttention::ExitWitnessUnconfirmed
         )
     ));
     let requests = fixture

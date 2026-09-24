@@ -9,8 +9,10 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::agents::{AgentArgvInputs, build_agent_invocation, build_agent_invocation_for_identity};
-use crate::domain::{AgentKind, AgentWorkload, TaskIdentity, TaskWorkload, Workload};
+use crate::agents::{AgentArgvInputs, build_agent_invocation_for_identity};
+use crate::container::ContainerUser;
+use crate::container::docker::CreateContext;
+use crate::domain::{AgentKind, AgentWorkload, TaskId, TaskIdentity, TaskWorkload, Workload};
 use crate::error::AppError;
 use crate::spec::{NormalizedAgentWorkload, NormalizedWorkload};
 
@@ -395,37 +397,31 @@ pub fn invocation_from_normalized_for_identity(
                 managed_environment: None,
             })
         }
-    }
-}
-
-/// Build a child invocation from a persisted workload and resolved binary
-///
-/// `agent_prompt_feed` is the task evidence feed path. Agent policy consumes it;
-/// task workloads ignore it
-pub fn invocation_from_workload(
-    workload: &Workload,
-    binary: &Path,
-    cwd: &Path,
-    agent_prompt_feed: &Path,
-) -> ChildInvocation {
-    match workload {
-        Workload::Agent(agent) => build_agent_invocation(
-            AgentArgvInputs {
-                kind: agent.agent.kind,
-                model: agent.agent.model.as_deref(),
-                cwd,
-                extra_args: &agent.extra_args,
-            },
-            binary,
-            agent_prompt_feed,
-        ),
-        Workload::Task(task) => ChildInvocation {
-            program: binary.to_path_buf(),
-            args: task.command.args().to_vec(),
-            stdin: StdinPolicy::Null,
-            environment: ChildEnvironment::default(),
-            managed_environment: None,
-        },
+        // the worker makes several Docker calls; the preview shows the create call
+        NormalizedWorkload::Container(container) => {
+            let binary = resolve_docker_binary(env_path, cwd)?;
+            let task = match identity {
+                TaskIdentity::Actual(task) => task,
+                TaskIdentity::Preview => TaskId(uuid::Uuid::nil()),
+            };
+            let cidfile = Path::new("<task-dir>").join("container.cid");
+            let args = crate::container::docker::create_args(
+                container,
+                &CreateContext {
+                    task,
+                    resource: None,
+                    cidfile: &cidfile,
+                    default_user: ContainerUser::current(),
+                },
+            );
+            Ok(ChildInvocation {
+                program: binary,
+                args,
+                stdin: StdinPolicy::Null,
+                environment: ChildEnvironment::default(),
+                managed_environment: None,
+            })
+        }
     }
 }
 
@@ -460,6 +456,9 @@ pub fn invocation_from_workload_for_identity(
             environment: ChildEnvironment::default(),
             managed_environment: None,
         }),
+        Workload::Container(_) => Err(AppError::Internal {
+            message: "a container task runs through the container witness, not one child".into(),
+        }),
     }
 }
 
@@ -472,7 +471,13 @@ pub fn resolve_workload_binary(
     match workload {
         NormalizedWorkload::Agent(agent) => resolve_agent_binary(agent.agent, env_path, cwd),
         NormalizedWorkload::Task(task) => resolve_executable(task.command.program(), env_path, cwd),
+        NormalizedWorkload::Container(_) => resolve_docker_binary(env_path, cwd),
     }
+}
+
+/// Resolve the `docker` CLI that a container task uses, from the executor `PATH`
+pub fn resolve_docker_binary(env_path: &str, cwd: &Path) -> Result<PathBuf, AppError> {
+    resolve_executable("docker", env_path, cwd)
 }
 
 /// Convert a normalized agent workload into the persisted form
@@ -499,6 +504,7 @@ pub fn persist_workload(workload: &NormalizedWorkload) -> Workload {
     match workload {
         NormalizedWorkload::Agent(agent) => Workload::Agent(persist_agent_workload(agent)),
         NormalizedWorkload::Task(task) => Workload::Task(persist_task_workload(task)),
+        NormalizedWorkload::Container(container) => Workload::Container(container.clone()),
     }
 }
 

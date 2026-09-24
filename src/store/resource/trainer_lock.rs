@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 use super::trainer_association::trainer_association_by_resource_and_task;
-use crate::domain::TaskId;
+use crate::domain::{TaskId, WorkExitEvidence};
 use crate::machine::MachineId;
 use crate::resource::command_shape::direct_segment_runtime_root;
 use crate::resource::foreground::{self, CommandOwnershipContract};
@@ -88,13 +88,32 @@ impl From<ResourceStoreError> for TrainerLockReleaseError {
     }
 }
 
-/// Witness that the ownership contract of an ended task's command requires
+/// Witness that the ownership contract of an ended task's work requires
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EndedTaskWitness {
     /// Native foreground command; the confirmed process-group exit is the witness
     ProcessGroupExit,
     /// Maintained direct-segment trainer; only its released lock is the witness
     TrainerLock,
+    /// Container workload; the exited container, removed and confirmed absent, is the witness
+    ContainerRemoved,
+}
+
+impl EndedTaskWitness {
+    /// Whether the task layer's exit evidence is the kind this witness needs
+    ///
+    /// The trainer lock also needs the wrapper's confirmed process-group exit;
+    /// the caller then holds the lock itself
+    pub(super) fn accepts(self, evidence: &WorkExitEvidence) -> bool {
+        match self {
+            Self::ProcessGroupExit | Self::TrainerLock => {
+                *evidence == WorkExitEvidence::ProcessGroupExited
+            }
+            Self::ContainerRemoved => {
+                matches!(evidence, WorkExitEvidence::ContainerRemoved { .. })
+            }
+        }
+    }
 }
 
 /// Exclusive hold on one exact released trainer lock
@@ -117,23 +136,19 @@ impl HeldTrainerRelease {
     }
 }
 
-/// Classify the witness that an ended task needs from its accepted command
+/// Classify the witness that an ended task needs from its accepted work
 pub(super) fn ended_task_witness(
     conn: &Connection,
     authority_machine: MachineId,
     task_id: TaskId,
 ) -> Result<EndedTaskWitness, TrainerLockReleaseError> {
     let spec = accepted_spec(conn, authority_machine, task_id)?;
-    let command =
-        foreground::task_command(&spec).ok_or(TrainerLockReleaseGap::UnsupportedCommand {
-            task_id,
-            risk: ResourceTaskOwnershipRisk::UninspectableEntryPoint,
-        })?;
-    match CommandOwnershipContract::for_return_command(command) {
+    match CommandOwnershipContract::for_return_work(&spec.workload) {
         Ok(CommandOwnershipContract::ForegroundExecutable) => {
             Ok(EndedTaskWitness::ProcessGroupExit)
         }
         Ok(CommandOwnershipContract::DirectSegmentTrainer) => Ok(EndedTaskWitness::TrainerLock),
+        Ok(CommandOwnershipContract::Container) => Ok(EndedTaskWitness::ContainerRemoved),
         Err(risk) => Err(TrainerLockReleaseGap::UnsupportedCommand { task_id, risk }.into()),
     }
 }

@@ -1,9 +1,9 @@
-//! Foreground ownership contract for resource commands
+//! Ownership contract for resource work
 //!
-//! After a resource command ends, the authority can release the GPU only from
-//! task-layer evidence that the task-run process group exited. That evidence
-//! covers GPU work only while the work stays in that process group, so a command
-//! must name its real workload directly. The contract accepts one of two shapes:
+//! After resource work ends, the authority can release the GPU only from
+//! task-layer evidence that the work stopped. Process-group evidence covers GPU
+//! work only while the work stays in that process group, so a command must name
+//! its real workload directly. The contract accepts one of three shapes:
 //!
 //! - A native foreground executable. Its entry point is an ELF or Mach-O file,
 //!   and neither its name nor its resolved target names a known shell,
@@ -12,6 +12,9 @@
 //!   that Homebased does not inspect, or they can move it out of the group
 //! - The maintained direct-segment trainer, only for background return work
 //!   Its ownership lock, not its process group, is the release witness
+//! - A typed container workload. Homebased starts and removes the container
+//!   itself, so the container's own state is the witness. A `docker` command
+//!   line is still refused, because its client can exit while the container runs
 //!
 //! The rule is conservative, not complete. A native executable can still start
 //! work in another session, and a copied or hard-linked launcher keeps no
@@ -39,29 +42,43 @@ pub enum CommandOwnershipContract {
     /// The static argv shape only selects this contract. The launch must still
     /// pass the full direct-segment check against its task row
     DirectSegmentTrainer,
+    /// Typed container workload; the exited, removed container is the witness
+    Container,
 }
 
 impl CommandOwnershipContract {
-    /// Classify a queued optimization command, which only the foreground contract supports
-    pub fn for_queued_command(command: &CommandLine) -> Result<Self, ResourceTaskOwnershipRisk> {
-        foreground_argv(command).map(|()| Self::ForegroundExecutable)
+    /// Classify queued work: a foreground command or a container
+    pub fn for_queued_work(
+        workload: &NormalizedWorkload,
+    ) -> Result<Self, ResourceTaskOwnershipRisk> {
+        match workload {
+            NormalizedWorkload::Task(task) => {
+                foreground_argv(&task.command).map(|()| Self::ForegroundExecutable)
+            }
+            NormalizedWorkload::Container(_) => Ok(Self::Container),
+            NormalizedWorkload::Agent(_) => Err(ResourceTaskOwnershipRisk::UninspectableEntryPoint),
+        }
     }
 
-    /// Classify a background return command, which may also be the maintained trainer
-    pub fn for_return_command(command: &CommandLine) -> Result<Self, ResourceTaskOwnershipRisk> {
-        if direct_segment_runtime_root(command).is_some() {
+    /// Classify return work, which may also be the maintained trainer
+    pub fn for_return_work(
+        workload: &NormalizedWorkload,
+    ) -> Result<Self, ResourceTaskOwnershipRisk> {
+        if let NormalizedWorkload::Task(task) = workload
+            && direct_segment_runtime_root(&task.command).is_some()
+        {
             return Ok(Self::DirectSegmentTrainer);
         }
-        Self::for_queued_command(command)
+        Self::for_queued_work(workload)
     }
 }
 
-/// Return the command line of a task workload, or `None` for an agent workload
+/// Return the command line of a task workload, or `None` for other workloads
 #[must_use]
 pub fn task_command(spec: &NormalizedSpec) -> Option<&CommandLine> {
     match &spec.workload {
         NormalizedWorkload::Task(task) => Some(&task.command),
-        NormalizedWorkload::Agent(_) => None,
+        NormalizedWorkload::Agent(_) | NormalizedWorkload::Container(_) => None,
     }
 }
 
@@ -87,10 +104,14 @@ pub fn foreground_argv(command: &CommandLine) -> Result<(), ResourceTaskOwnershi
 /// Inspect the entry point of a queued command when its program names a path
 ///
 /// A bare program name resolves from the executor `PATH` only when its task binds,
-/// so [`inspect_foreground_entry_point`] checks it then
+/// so [`inspect_foreground_entry_point`] checks it then. A container has no
+/// entry point on the host; its host inputs are checked instead
 pub fn inspect_path_qualified_entry_point(
     spec: &NormalizedSpec,
 ) -> Result<(), ResourceTaskOwnershipRisk> {
+    if let NormalizedWorkload::Container(_) = &spec.workload {
+        return Ok(());
+    }
     let Some(command) = task_command(spec) else {
         return Err(ResourceTaskOwnershipRisk::UninspectableEntryPoint);
     };
@@ -371,15 +392,23 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{CommandOwnershipContract, foreground_argv, inspect_foreground_entry_point};
+    use crate::container::ContainerWorkload;
     use crate::invocation::CommandLine;
     use crate::resource::ResourceTaskOwnershipRisk::{
         self, ContainerClient, DetachedLauncher, Interpreter, ProgramLauncher, RemoteShell,
         ShellWrapper,
     };
+    use crate::spec::{NormalizedTaskWorkload, NormalizedWorkload};
     use std::path::Path;
 
     fn argv(parts: &[&str]) -> CommandLine {
         CommandLine::try_from_argv(parts.iter().map(|part| (*part).to_owned()).collect()).unwrap()
+    }
+
+    fn task(parts: &[&str]) -> NormalizedWorkload {
+        NormalizedWorkload::Task(NormalizedTaskWorkload {
+            command: argv(parts),
+        })
     }
 
     #[test]
@@ -427,7 +456,7 @@ mod tests {
         ] {
             assert_eq!(foreground_argv(&argv(parts)), Ok(()), "{parts:?}");
             assert_eq!(
-                CommandOwnershipContract::for_queued_command(&argv(parts)),
+                CommandOwnershipContract::for_queued_work(&task(parts)),
                 Ok(CommandOwnershipContract::ForegroundExecutable)
             );
         }
@@ -435,7 +464,7 @@ mod tests {
 
     #[test]
     fn only_return_work_may_select_the_trainer_contract() {
-        let trainer = argv(&[
+        let trainer = task(&[
             "python3",
             "-m",
             "ops.run_segment",
@@ -450,17 +479,42 @@ mod tests {
             "sha256:00",
         ]);
         assert_eq!(
-            CommandOwnershipContract::for_return_command(&trainer),
+            CommandOwnershipContract::for_return_work(&trainer),
             Ok(CommandOwnershipContract::DirectSegmentTrainer)
         );
         assert_eq!(
-            CommandOwnershipContract::for_queued_command(&trainer),
+            CommandOwnershipContract::for_queued_work(&trainer),
             Err(Interpreter)
         );
         assert_eq!(
-            CommandOwnershipContract::for_return_command(&argv(&["python3", "evaluate.py"])),
+            CommandOwnershipContract::for_return_work(&task(&["python3", "evaluate.py"])),
             Err(Interpreter)
         );
+    }
+
+    #[test]
+    fn a_typed_container_selects_the_container_contract_but_a_docker_command_does_not() {
+        let container = NormalizedWorkload::Container(Box::new(
+            ContainerWorkload::from_value(&serde_json::json!({
+                "image": format!("sha256:{}", "0".repeat(64)),
+                "memory": "1g",
+                "gpus": "all"
+            }))
+            .unwrap(),
+        ));
+        for classify in [
+            CommandOwnershipContract::for_queued_work,
+            CommandOwnershipContract::for_return_work,
+        ] {
+            assert_eq!(
+                classify(&container),
+                Ok(CommandOwnershipContract::Container)
+            );
+            assert_eq!(
+                classify(&task(&["docker", "run", "--gpus", "all", "eval"])),
+                Err(ContainerClient)
+            );
+        }
     }
 
     #[test]

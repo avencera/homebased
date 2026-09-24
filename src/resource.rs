@@ -256,7 +256,7 @@ impl TrainerAttemptAssociation {
     }
 }
 
-/// A normalized specification restricted to finite command workloads
+/// A normalized specification restricted to finite command or container workloads
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct CommandSpec(NormalizedSpec);
@@ -266,16 +266,6 @@ impl CommandSpec {
     #[must_use]
     pub const fn as_normalized(&self) -> &NormalizedSpec {
         &self.0
-    }
-
-    /// Borrow the validated argv of the finite command workload
-    #[must_use]
-    pub fn command(&self) -> &crate::invocation::CommandLine {
-        match &self.0.workload {
-            NormalizedWorkload::Task(task) => &task.command,
-            // `TryFrom<NormalizedSpec>` is the only constructor and it rejects agent workloads
-            NormalizedWorkload::Agent(_) => unreachable!("a command spec holds a task workload"),
-        }
     }
 }
 
@@ -287,11 +277,15 @@ impl TryFrom<NormalizedSpec> for CommandSpec {
             return Err(CommandSpecError::ExplicitMachine);
         }
 
-        if matches!(&spec.workload, NormalizedWorkload::Task(_)) {
-            return Ok(Self(spec));
+        match &spec.workload {
+            NormalizedWorkload::Task(_) => Ok(Self(spec)),
+            // resource work holds one exact GPU, so the container must name it
+            NormalizedWorkload::Container(container) if container.gpus.is_none() => {
+                Err(CommandSpecError::ContainerWithoutGpus)
+            }
+            NormalizedWorkload::Container(_) => Ok(Self(spec)),
+            NormalizedWorkload::Agent(_) => Err(CommandSpecError::AgentWorkload),
         }
-
-        Err(CommandSpecError::AgentWorkload)
     }
 }
 
@@ -312,8 +306,11 @@ pub enum CommandSpecError {
     #[error("resource command specifications cannot specify a machine")]
     ExplicitMachine,
     /// Agent workloads are open-ended and cannot enter the finite command queue
-    #[error("resource requests require a command workload")]
+    #[error("resource requests require a command or container workload")]
     AgentWorkload,
+    /// A container on a resource must request its GPUs
+    #[error("resource container workloads require gpus")]
+    ContainerWithoutGpus,
 }
 
 /// Queue and task-result state for a resource request
@@ -566,12 +563,12 @@ pub enum IdleBoundaryProof {
         /// Return task that ended
         task_id: TaskId,
     },
-    /// The latest loan closed after a native foreground return task ended
-    /// successfully with a confirmed process-group exit
+    /// The latest loan closed after a native foreground or container return
+    /// task ended successfully with its confirmed exit witness
     ForegroundReturnEnded {
         /// Closed loan that holds the foreground-end evidence
         loan_id: LoanId,
-        /// Native foreground return task that ended
+        /// Return task that ended
         task_id: TaskId,
     },
     /// The latest first background launch ended before a child process started
@@ -888,14 +885,17 @@ pub enum LoanClosure {
         /// Evidence that the watcher cannot stop the task later
         reason: String,
     },
-    /// A native foreground return task ended successfully with a confirmed process-group exit
+    /// A return task that held the loan while it ran ended successfully with its
+    /// confirmed exit witness
     ///
-    /// The task was never registered as background training, so the closure
-    /// leaves the resource unregistered and names the terminal evidence
+    /// A native foreground task needs a confirmed process-group exit. A container
+    /// task needs its exited container removed and confirmed absent. The task was
+    /// never registered as background training, so the closure leaves the
+    /// resource unregistered and names the terminal evidence
     ForegroundReturnEnded {
         /// Return evidence retained after closure
         return_context: ReturnContext,
-        /// Bound native foreground return task that ended
+        /// Bound return task that ended
         task_id: TaskId,
         /// Successful task-layer outcome
         outcome: ExitReason,
@@ -1056,6 +1056,24 @@ pub enum ReturnExecutionMode {
     /// loan keeps the resource reserved while the task runs and closes only
     /// after a successful end with a confirmed process-group exit
     NativeForeground,
+    /// Typed container workload
+    ///
+    /// Like a native foreground task, it never becomes registered background
+    /// training and keeps the Restoring loan while it runs. The loan closes only
+    /// after exit code 0 with confirmed container evidence: the exact container
+    /// exited, Homebased removed it, and its ID is absent
+    Container,
+}
+
+impl ReturnExecutionMode {
+    /// Whether the return task holds the Restoring loan until it ends
+    #[must_use]
+    pub const fn holds_loan_while_running(self) -> bool {
+        match self {
+            Self::NativeForeground | Self::Container => true,
+            Self::DirectSegmentTrainer => false,
+        }
+    }
 }
 
 impl From<foreground::CommandOwnershipContract> for ReturnExecutionMode {
@@ -1065,6 +1083,7 @@ impl From<foreground::CommandOwnershipContract> for ReturnExecutionMode {
             foreground::CommandOwnershipContract::DirectSegmentTrainer => {
                 Self::DirectSegmentTrainer
             }
+            foreground::CommandOwnershipContract::Container => Self::Container,
         }
     }
 }
@@ -1196,12 +1215,7 @@ impl ReturnDecision {
         if spec.as_normalized().thread != supervisor_thread {
             return Err(ReturnDecisionRejection::ThreadMismatch);
         }
-        let command = foreground::task_command(spec.as_normalized()).ok_or(
-            ReturnDecisionRejection::UnsupportedCommandOwnership {
-                risk: ResourceTaskOwnershipRisk::UninspectableEntryPoint,
-            },
-        )?;
-        foreground::CommandOwnershipContract::for_return_command(command)
+        foreground::CommandOwnershipContract::for_return_work(&spec.as_normalized().workload)
             .map_err(|risk| ReturnDecisionRejection::UnsupportedCommandOwnership { risk })?;
 
         Ok(())
@@ -1451,7 +1465,8 @@ pub enum ResourceQueueAttentionReason {
         /// Exact assigned command task that needs an owner decision
         task_id: TaskId,
     },
-    /// The assigned command task is terminal but its process-group exit is unconfirmed
+    /// The assigned task is terminal but its exit witness is unconfirmed: a
+    /// process-group exit for a command, or a removed container for a container
     AssignedTaskExitUnconfirmed {
         /// Exact assigned command task that needs an owner decision
         task_id: TaskId,
@@ -1502,6 +1517,16 @@ pub enum RestoreAttentionReason {
     },
     /// The native foreground task ended, but its process-group exit is not confirmed
     ForegroundExitUnconfirmed {
+        /// Terminal task state
+        state: ProcessStatus,
+    },
+    /// The container task ended without success; the supervisor must resolve it explicitly
+    ContainerEnded {
+        /// Terminal task state
+        state: ProcessStatus,
+    },
+    /// The container task ended, but its container evidence is not confirmed
+    ContainerExitUnconfirmed {
         /// Terminal task state
         state: ProcessStatus,
     },

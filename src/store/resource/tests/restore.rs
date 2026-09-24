@@ -77,7 +77,7 @@ type Rejection = (
     fn(&ReturnDecisionError) -> bool,
 );
 
-fn completed_task(fixture: &ServingFixture) -> TaskId {
+pub(super) fn completed_task(fixture: &ServingFixture) -> TaskId {
     fixture.resource.registered_background_task.unwrap()
 }
 
@@ -120,13 +120,13 @@ pub(super) fn launch_input(
     }
 }
 
-fn saved_loan(store: &Store, authority: MachineId) -> Option<Loan> {
+pub(super) fn saved_loan(store: &Store, authority: MachineId) -> Option<Loan> {
     store.resource_snapshots_for_authority(authority).unwrap()[0]
         .loan
         .clone()
 }
 
-fn saved_resource(store: &Store, authority: MachineId) -> Resource {
+pub(super) fn saved_resource(store: &Store, authority: MachineId) -> Resource {
     store.resource_snapshots_for_authority(authority).unwrap()[0]
         .resource
         .clone()
@@ -145,7 +145,7 @@ fn assert_still_awaiting_return(fixture: &ServingFixture, authority: &Supervisor
     );
 }
 
-fn accept_post_return_request(fixture: &mut ServingFixture) -> ResourceRequest {
+pub(super) fn accept_post_return_request(fixture: &mut ServingFixture) -> ResourceRequest {
     fixture
         .store
         .accept_resource_request(
@@ -537,7 +537,7 @@ fn remote_supervisor_return_launch_is_unsupported_before_any_task_record() {
     assert_eq!(receipts, 0);
 }
 
-fn reconcile_restore(fixture: &mut ServingFixture) -> RestoreReconcileOutcome {
+pub(super) fn reconcile_restore(fixture: &mut ServingFixture) -> RestoreReconcileOutcome {
     fixture
         .store
         .reconcile_restoring_loan_for_authority(fixture.authority, fixture.resource.id)
@@ -563,7 +563,7 @@ fn finish_running_task(
         .unwrap();
 }
 
-fn restore_closure_basis(store: &Store, action_id: ActionId) -> Option<String> {
+pub(super) fn restore_closure_basis(store: &Store, action_id: ActionId) -> Option<String> {
     store
         .conn
         .query_row(
@@ -576,7 +576,10 @@ fn restore_closure_basis(store: &Store, action_id: ActionId) -> Option<String> {
         .unwrap()
 }
 
-fn request_state(fixture: &ServingFixture, request_id: RequestId) -> Option<ResourceRequestState> {
+pub(super) fn request_state(
+    fixture: &ServingFixture,
+    request_id: RequestId,
+) -> Option<ResourceRequestState> {
     fixture
         .store
         .resource_requests(fixture.authority, fixture.resource.id)
@@ -930,7 +933,7 @@ fn native_foreground_return_without_a_successful_confirmed_end_stays_reserved() 
     }
 }
 
-fn read_return_execution_mode(fixture: &ServingFixture) -> Option<ReturnExecutionMode> {
+pub(super) fn read_return_execution_mode(fixture: &ServingFixture) -> Option<ReturnExecutionMode> {
     read_return_execution_mode_for(&fixture.store, fixture.authority, fixture.resource.id)
 }
 
