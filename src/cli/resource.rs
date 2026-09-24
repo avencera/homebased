@@ -19,10 +19,10 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::api::{
     BrowserResourceAction, InitialIdleBody, InitialIdleResponse, OperatorReleaseBody,
-    OperatorReleaseResponse, PendingActionList, PendingActionPhase, QueuePlacement,
-    RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody, ResourceActionBody,
-    ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse, ResourceDetail,
-    ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
+    OperatorReleaseResponse, PendingActionList, PendingActionPhase, PendingActionView,
+    QueuePlacement, RESOURCE_PENDING_PATH, RESOURCE_REGISTER_PATH, RequestCancelBody,
+    ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
+    ResourceDetail, ResourceRegisterBody, ResourceRegistration, ResourceRequestSubmitOutcome,
     ResourceRequestSubmitResponse, SupervisorReplacementBody, TrainerAttemptBody,
     TrainerAttemptResponse, UnavailableAuthority,
 };
@@ -1597,7 +1597,7 @@ async fn action_context_for_current_supervisor<F>(
     predicate: F,
 ) -> Result<ActionContext, AppError>
 where
-    F: Fn(&crate::resource::api::PendingActionView) -> bool,
+    F: Fn(&PendingActionView) -> bool,
 {
     let (machine, thread) = current_supervisor_address(client).await?;
     let pending: PendingActionList = load_json(pending_path)?;
@@ -1624,16 +1624,21 @@ where
         });
     }
     let action = matches[0];
-    let resource_id = action.resource_id;
     if action.supervisor.machine != machine || action.supervisor.thread != thread {
         return Err(AppError::ResourceActionNotAllowed {
-            resource: resource_id,
+            resource: action.resource_id,
             message: "the pending action is not assigned to the current supervisor address".into(),
         });
     }
-    if action.state_revision.get() == 0
-        || action.assignment_revision.get() == 0
-        || action.resource_id.as_uuid().is_nil()
+    action_context(action)
+}
+
+/// Bind a pending action to the exact authority identity a decision must present
+///
+/// Revisions are compare-and-set tokens that the authority checks, and a fresh
+/// resource legitimately holds revision 0, so only nil identities are rejected here
+fn action_context(action: &PendingActionView) -> Result<ActionContext, AppError> {
+    if action.resource_id.as_uuid().is_nil()
         || action.authority_machine.as_uuid().is_nil()
         || action.loan_id.as_uuid().is_nil()
         || action.action_id.as_uuid().is_nil()
@@ -1641,12 +1646,12 @@ where
         || action.supervisor.thread.0.is_nil()
     {
         return Err(invalid_daemon_response(
-            "pending action has an invalid identity or revision",
+            "pending action has an invalid identity",
         ));
     }
     let authority = SupervisorActionAuthority {
         authority_machine: action.authority_machine,
-        resource_id,
+        resource_id: action.resource_id,
         loan_id: action.loan_id,
         action_id: action.action_id,
         expected_state_revision: action.state_revision,
@@ -1654,7 +1659,7 @@ where
         assignment_revision: action.assignment_revision,
     };
     Ok(ActionContext {
-        resource_id,
+        resource_id: action.resource_id,
         action_id: action.action_id,
         authority,
         phase: action.phase.clone(),
@@ -2234,21 +2239,22 @@ mod tests {
 
     use super::{
         BackgroundCommand, RequestCommand, ResourceCommand, ResourceSubmitBody, SupervisorCommand,
-        check_action_outcome, check_background_response, check_operator_release_response,
-        check_trainer_attempt_response, decode_spec_value, load_json, mutation_error,
-        operator_gpu_free_attestation_schema, render_output, resource_registration_schema,
-        resource_return_work_schema, resource_task_schema, resource_trainer_attempt_binding_schema,
-        trainer_attempt_error, trainer_attempt_retry_identity,
+        action_context, check_action_outcome, check_background_response,
+        check_operator_release_response, check_trainer_attempt_response, decode_spec_value,
+        load_json, mutation_error, operator_gpu_free_attestation_schema, render_output,
+        resource_registration_schema, resource_return_work_schema, resource_task_schema,
+        resource_trainer_attempt_binding_schema, trainer_attempt_error,
+        trainer_attempt_retry_identity,
     };
     use crate::cli::{Cli, Command, OutputMode};
     use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
     use crate::error::AppError;
     use crate::machine::MachineId;
     use crate::resource::api::{
-        BrowserResourceAction, OperatorReleaseResponse, QueuePlacement, RequestCancelBody,
-        ResourceActionBody, ResourceBackgroundSubmitOutcome, ResourceBackgroundSubmitResponse,
-        ResourceRegisterBody, ResourceRegistration, SupervisorReplacementBody,
-        TrainerAttemptResponse,
+        BrowserResourceAction, OperatorReleaseResponse, PendingActionPhase, PendingActionView,
+        QueuePlacement, RequestCancelBody, ResourceActionBody, ResourceBackgroundSubmitOutcome,
+        ResourceBackgroundSubmitResponse, ResourceRegisterBody, ResourceRegistration,
+        SupervisorReplacementBody, TrainerAttemptResponse,
     };
     use crate::resource::bound_action::{
         LocalReturnAcceptance, ResourceActionChoice, ResourceActionKind,
@@ -3346,6 +3352,34 @@ mod tests {
             },
             assignment_revision: AssignmentRevision::new(1),
         }
+    }
+
+    #[test]
+    fn pending_action_on_a_fresh_resource_keeps_revision_zero() {
+        let authority = action_authority(true);
+        let action = PendingActionView {
+            resource_id: authority.resource_id,
+            authority_machine: authority.authority_machine,
+            loan_id: authority.loan_id,
+            action_id: authority.action_id,
+            state_revision: ResourceRevision::new(0),
+            supervisor: authority.supervisor,
+            assignment_revision: AssignmentRevision::new(0),
+            phase: PendingActionPhase::ReturnRequired,
+            return_context: None,
+            notice: None,
+        };
+
+        let context = action_context(&action).unwrap();
+
+        assert_eq!(
+            context.authority.expected_state_revision,
+            ResourceRevision::new(0)
+        );
+        assert_eq!(
+            context.authority.assignment_revision,
+            AssignmentRevision::new(0)
+        );
     }
 
     fn return_launch_request(
