@@ -19,8 +19,10 @@
 		activeThread: string | null;
 		/** Project the list is filtered to, highlighted in rows. */
 		activeProject: string | null;
-		onThread: (thread: string) => void;
-		onProject: (project: string) => void;
+		/** Receives null when the active thread is clicked again, to clear the filter. */
+		onThread: (thread: string | null) => void;
+		/** Receives null when the active project is clicked again, to clear the filter. */
+		onProject: (project: string | null) => void;
 		/** Rendered in place of rows when the list is empty. */
 		empty: Snippet;
 		/** Controls for a title bar; the bar shows only when there are some. */
@@ -148,12 +150,15 @@
 						<!-- raised above the row link so a click filters instead of opening the task -->
 						<button
 							type="button"
-							onclick={() => onProject(project)}
+							onclick={() => onProject(activeProject === project ? null : project)}
 							class={cn(
 								'relative z-10 min-w-0 shrink-0 rounded-full',
 								activeProject === project && 'ring-2 ring-primary/60'
 							)}
-							title={`Show only tasks in ${project}`}
+							aria-pressed={activeProject === project}
+							title={activeProject === project
+								? 'Show tasks in all projects'
+								: `Show only tasks in ${project}`}
 						>
 							<Capsule hue={hueFor(project)}>{project}</Capsule>
 						</button>
@@ -167,12 +172,15 @@
 
 					<button
 						type="button"
-						onclick={() => onThread(task.thread)}
+						onclick={() => onThread(activeThread === task.thread ? null : task.thread)}
 						class={cn(
 							'relative z-10 hidden items-center gap-1 justify-self-start rounded px-1 py-0.5 font-mono text-[11px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:inline-flex',
 							activeThread === task.thread && 'text-primary'
 						)}
-						title={`Show only tasks from thread ${task.thread}`}
+						aria-pressed={activeThread === task.thread}
+						title={activeThread === task.thread
+							? 'Show tasks from all threads'
+							: `Show only tasks from thread ${task.thread}`}
 					>
 						<Funnel class="size-3 opacity-60" aria-hidden="true" />
 						{shortId(task.thread)}
