@@ -982,7 +982,12 @@ fn restart_ignores_other_home_unit() {
     h.clear_supervisor_log();
 
     let before_pid = h.socket_pid();
-    let out = h.cmd().args(["daemon", "restart"]).output().unwrap();
+    let out = h
+        .cmd()
+        .args(["daemon", "restart"])
+        .env("HARNESS_SUPERVISOR_KEEP_DAEMON", "1")
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -1166,21 +1171,32 @@ fn matching_home_restart_uses_supervisor() {
     h.clear_supervisor_log();
 
     let before_pid = h.socket_pid();
-    let out = h.cmd().args(["daemon", "restart"]).output().unwrap();
+    let out = h
+        .cmd()
+        .args(["daemon", "restart"])
+        .env("HARNESS_SUPERVISOR_KEEP_DAEMON", "1")
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // restart reloads the unit from disk so an updated unit takes effect
     let calls = h.supervisor_calls();
-    assert_eq!(calls.len(), 1, "{calls:?}");
     if cfg!(target_os = "linux") {
-        assert_eq!(calls[0], "--user restart homebased.service");
+        assert_eq!(
+            calls,
+            ["--user daemon-reload", "--user restart homebased.service"]
+        );
     } else if cfg!(target_os = "macos") {
         let uid = nix::unistd::getuid().as_raw();
         assert_eq!(
-            calls[0],
-            format!("kickstart -k gui/{uid}/dev.praveen.homebased")
+            calls,
+            [
+                format!("bootout gui/{uid}/dev.praveen.homebased"),
+                format!("bootstrap gui/{uid} {}", h.host_unit_path().display()),
+            ]
         );
     }
     // fake restart is a no-op, so the original daemon stays up

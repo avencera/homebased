@@ -144,8 +144,10 @@ pub fn host_stop() -> Result<(), AppError> {
     run_systemctl(&["stop", "homebased.service"])
 }
 
-/// `systemctl --user restart`.
+/// `systemctl --user daemon-reload`, then `restart`.
 pub fn host_restart() -> Result<(), AppError> {
+    // an update may leave a unit file newer than the loaded one; restart must start from the file
+    run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["restart", "homebased.service"])
 }
 

@@ -104,7 +104,7 @@ pub fn host_stop() -> Result<(), AppError> {
     }
 }
 
-/// Restart via the host supervisor.
+/// Reload the unit file, then restart via the host supervisor.
 pub fn host_restart() -> Result<(), AppError> {
     cfg_select! {
         target_os = "macos" => launchd::host_restart(),

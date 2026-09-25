@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::config::CONFIG_ENV;
 use crate::error::AppError;
@@ -13,6 +14,9 @@ use crate::install::{
 
 /// LaunchAgent label.
 pub const LABEL: &str = "dev.praveen.homebased";
+
+/// How long a bootstrap may retry while launchd finishes the bootout
+const BOOTSTRAP_WAIT: Duration = Duration::from_secs(10);
 
 /// Plist path.
 #[must_use]
@@ -133,29 +137,7 @@ pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), App
     }
     std::fs::write(&path, &text)?;
     lint(&path)?;
-    let uid = nix::unistd::getuid().as_raw();
-    // bootout fails when nothing is loaded; the bootstrap below is the real step
-    let _ = Command::new("launchctl")
-        .args([
-            "bootout",
-            &format!("gui/{uid}"),
-            &path.display().to_string(),
-        ])
-        .status();
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{uid}")])
-        .arg(&path)
-        .status()
-        .map_err(|err| AppError::Internal {
-            message: format!("launchctl bootstrap: {err}"),
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::UnitInvalid {
-            message: "launchctl bootstrap failed".into(),
-        })
-    }
+    reload(&path)
 }
 
 /// Unload and remove the plist.
@@ -186,21 +168,45 @@ pub fn host_stop() -> Result<(), AppError> {
     Ok(())
 }
 
-/// `launchctl kickstart -k`.
+/// Unload the job, then bootstrap it again from the plist on disk.
 pub fn host_restart() -> Result<(), AppError> {
+    // `kickstart -k` keeps the loaded definition; an update may leave a newer plist on disk
+    reload(&plist_path())
+}
+
+/// Bootout the loaded job, then bootstrap `path`. `AbandonProcessGroup` keeps
+/// workers alive across the bootout
+fn reload(path: &Path) -> Result<(), AppError> {
     let uid = nix::unistd::getuid().as_raw();
-    let status = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("gui/{uid}/{LABEL}")])
-        .status()
-        .map_err(|err| AppError::Internal {
-            message: format!("launchctl kickstart: {err}"),
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::Internal {
-            message: "launchctl kickstart failed".into(),
-        })
+    // bootout fails when nothing is loaded; the bootstrap below is the real step
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{LABEL}")])
+        .status();
+    bootstrap(uid, path)
+}
+
+fn bootstrap(uid: u32, path: &Path) -> Result<(), AppError> {
+    // launchd can still be tearing down the old job right after bootout and
+    // then rejects the bootstrap, so retry for a short time
+    let deadline = Instant::now() + BOOTSTRAP_WAIT;
+    loop {
+        let output = Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}")])
+            .arg(path)
+            .output()
+            .map_err(|err| AppError::Internal {
+                message: format!("launchctl bootstrap: {err}"),
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::UnitInvalid {
+                message: format!("launchctl bootstrap failed: {}", stderr.trim()),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

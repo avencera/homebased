@@ -5,7 +5,8 @@ log="${HARNESS_SUPERVISOR_LOG:?HARNESS_SUPERVISOR_LOG is unset}"
 printf '%s\n' "$*" >>"$log"
 case " $* " in
 *" stop "*|*" bootout "*)
-  if [ -n "${HARNESS_DAEMON_PID:-}" ]; then
+  # a restart is bootout then bootstrap, and this fake cannot start the daemon again
+  if [ -n "${HARNESS_DAEMON_PID:-}" ] && [ -z "${HARNESS_SUPERVISOR_KEEP_DAEMON:-}" ]; then
     kill -TERM "$HARNESS_DAEMON_PID" 2>/dev/null || true
   fi
   ;;
