@@ -156,8 +156,13 @@
 <!-- pinned to the viewport so the document never scrolls; only the boxes do. The padding keeps
      at least the safe-area insets the browser reports, so the boxes end above the home indicator
      and any browser bar that claims the edge -->
+<!-- the GPU column on wide screens takes width from the task table, so the page widens on very
+     wide screens to give the table back its usual width -->
 <div
-	class="fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4"
+	class={cn(
+		'fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4',
+		split && '2xl:max-w-[104rem]'
+	)}
 >
 	<header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 sm:gap-x-4">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
@@ -314,11 +319,15 @@
 
 	<!-- the page fits the screen and each box scrolls on its own. Each box is as tall as its
 	     content; when both overflow, grid sizing shares the height evenly, and a short box keeps
-	     its content height while the other takes the rest. An expanded box takes the whole area -->
+	     its content height while the other takes the rest. Wide screens put the boxes side by side,
+	     each as tall as its content up to the full height; the task column keeps the width its
+	     table layout needs. An expanded box takes the whole area -->
 	<div
 		class={cn(
 			'mt-3 grid min-h-0 flex-1 content-start gap-3',
-			expanded ? 'grid-rows-[minmax(0,1fr)]' : 'grid-rows-[minmax(0,auto)_minmax(0,auto)]'
+			expanded
+				? 'grid-rows-[minmax(0,1fr)]'
+				: 'grid-rows-[minmax(0,auto)_minmax(0,auto)] xl:grid-cols-[minmax(57rem,1fr)_minmax(18rem,22rem)] xl:grid-rows-[minmax(0,auto)] xl:items-start xl:[&>*]:max-h-full'
 		)}
 	>
 		{#if expanded !== 'gpu'}

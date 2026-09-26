@@ -207,7 +207,9 @@
 <style>
 	/* narrow screens stack each task: name, thread, then pills, and leave the
 	   callback to the detail page; wide screens use one aligned row per task
-	   under a shared header */
+	   under a shared header. The column minimums fit the task column beside the
+	   GPU queue on the narrowest wide screen, so keep them in step with the
+	   dashboard grid */
 	.task-grid {
 		grid-template-columns: auto minmax(0, 1fr) auto;
 		grid-template-areas:
@@ -219,8 +221,8 @@
 	@media (width >= 64rem) {
 		.task-grid {
 			grid-template-columns:
-				6rem minmax(14rem, 1.6fr) 6.5rem 4.5rem minmax(12rem, 1.2fr)
-				minmax(8rem, 1fr) 5rem;
+				6rem minmax(12rem, 1.6fr) 6.5rem 4.5rem minmax(9.5rem, 1.2fr)
+				minmax(7rem, 1fr) 5rem;
 			grid-template-areas: 'machine name status time cwd thread callback';
 		}
 	}
