@@ -1,5 +1,5 @@
-//! `HOMEBASED_EVENT` formatting and origin inbox delivery: `codex queue` for a
-//! Codex thread, or the session socket for a Claude Code session.
+//! `HOMEBASED_EVENT` formatting and origin inbox delivery through T3, Codex
+//! queue, or a Claude Code session socket.
 
 mod claude_inbox;
 
@@ -25,7 +25,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 
-use crate::t3::{T3Env, WakeOutcome, wake_claude_session};
+use crate::t3::{ProviderThread, T3Env, WakeOutcome, owns_thread, wake_thread};
 use claude_inbox::{ClaudeInbox, ClaudeSession};
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -495,68 +495,67 @@ pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), Stri
     Ok(())
 }
 
-/// Saved origin found before the callback actor decides on a T3 wake
+/// Saved origin for one task thread
 pub(crate) enum OriginSession {
-    /// A live Claude session or a Codex thread can take the event now
+    /// A live Claude session can take the event now
     Reachable(ReachableOrigin),
     /// A Claude session with a transcript but no live process
     Stopped,
-}
-
-/// Saved origin that accepts an event without a wake
-pub(crate) struct ReachableOrigin(Reachable);
-
-enum Reachable {
-    Claude(ClaudeInbox),
+    /// A Codex thread that may belong to T3 will be tried there first
+    T3Codex,
+    /// A Codex thread without a T3 owner uses `codex queue`
     Codex,
 }
 
+/// Saved origin that accepts an event without a wake
+pub(crate) struct ReachableOrigin(ClaudeInbox);
+
 impl ReachableOrigin {
-    /// Make one bounded send through the Claude socket or `codex queue`
+    /// Make one bounded send through the Claude session socket
     pub(crate) fn send(
         self,
-        context: &CallbackContext,
         thread: ThreadId,
         line: &str,
         log_path: &Path,
         delivery_lock: &Path,
     ) -> Result<(), String> {
-        if let Reachable::Claude(inbox) = self.0 {
-            return inbox.send(thread, line, log_path, delivery_lock);
-        }
-        let binary = context.codex.path().ok_or_else(|| {
-            context
-                .codex
-                .unavailable_reason()
-                .unwrap_or("saved Codex executable is unavailable")
-                .to_owned()
-        })?;
-        queue_command_once(
-            binary,
-            thread,
-            &context.env,
-            &context.cwd,
-            line,
-            log_path,
-            delivery_lock,
-        )
+        self.0.send(thread, line, log_path, delivery_lock)
     }
 }
 
-/// Find which saved origin owns `thread`
+/// Find which saved origin owns `thread` for a direct message
 ///
-/// A known Claude session with no live process is [`OriginSession::Stopped`];
-/// an id that Claude Code does not know belongs to Codex
+/// A known Claude session with no live process is [`OriginSession::Stopped`]
 pub(crate) fn find_saved_origin(
     context: &CallbackContext,
     thread: ThreadId,
 ) -> Result<OriginSession, String> {
-    let reachable = match ClaudeInbox::find(Path::new(&context.env.home), thread)? {
-        ClaudeSession::Live(inbox) => Reachable::Claude(inbox),
-        ClaudeSession::Stopped => return Ok(OriginSession::Stopped),
-        ClaudeSession::Unknown => Reachable::Codex,
-    };
-    Ok(OriginSession::Reachable(ReachableOrigin(reachable)))
+    match ClaudeInbox::find(Path::new(&context.env.home), thread)? {
+        ClaudeSession::Live(inbox) => Ok(OriginSession::Reachable(ReachableOrigin(inbox))),
+        ClaudeSession::Stopped => Ok(OriginSession::Stopped),
+        ClaudeSession::Unknown => Ok(OriginSession::Codex),
+    }
+}
+
+/// Find which saved origin owns `thread` for an inbox callback
+pub(crate) fn find_saved_inbox_origin(
+    context: &CallbackContext,
+    thread: ThreadId,
+) -> Result<OriginSession, String> {
+    match find_saved_origin(context, thread)? {
+        OriginSession::Codex => {
+            let env = T3Env::new(
+                PathBuf::from(&context.env.home),
+                context.env.path.clone().into(),
+            );
+            match owns_thread(&env, ProviderThread::Codex(thread)) {
+                Ok(false) => Ok(OriginSession::Codex),
+                // try T3 when its state database could not confirm ownership
+                Ok(true) | Err(_) => Ok(OriginSession::T3Codex),
+            }
+        }
+        origin => Ok(origin),
+    }
 }
 
 /// Make exactly one bounded delivery attempt using the saved origin context
@@ -571,11 +570,38 @@ pub(crate) fn send_saved_queue_attempt(
     delivery_lock: &Path,
 ) -> Result<(), String> {
     match find_saved_origin(context, thread)? {
-        OriginSession::Reachable(origin) => {
-            origin.send(context, thread, line, log_path, delivery_lock)
+        OriginSession::Reachable(origin) => origin.send(thread, line, log_path, delivery_lock),
+        OriginSession::T3Codex | OriginSession::Codex => {
+            send_codex_queue_attempt(context, thread, line, log_path, delivery_lock)
         }
         OriginSession::Stopped => Err(format!("Claude session {thread} is not running")),
     }
+}
+
+/// Make one bounded `codex queue` attempt with the saved origin context
+pub(crate) fn send_codex_queue_attempt(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    delivery_lock: &Path,
+) -> Result<(), String> {
+    let binary = context.codex.path().ok_or_else(|| {
+        context
+            .codex
+            .unavailable_reason()
+            .unwrap_or("saved Codex executable is unavailable")
+            .to_owned()
+    })?;
+    queue_command_once(
+        binary,
+        thread,
+        &context.env,
+        &context.cwd,
+        line,
+        log_path,
+        delivery_lock,
+    )
 }
 
 /// Start a turn in the T3 thread that owns a stopped Claude session
@@ -587,17 +613,8 @@ pub(crate) fn wake_stopped_session(
     line: &str,
     log_path: &Path,
 ) -> Result<(), String> {
-    let env = T3Env::new(
-        PathBuf::from(&context.env.home),
-        context.env.path.clone().into(),
-    );
-    match wake_claude_session(&env, thread, line) {
-        WakeOutcome::Woken { t3_thread } => {
-            if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
-                let _ = writeln!(log, "t3 wake thread={t3_thread}");
-            }
-            Ok(())
-        }
+    match wake_provider_thread(context, ProviderThread::Claude(thread), line, log_path) {
+        WakeOutcome::Woken { .. } => Ok(()),
         WakeOutcome::NotT3Thread => Err(format!(
             "Claude session {thread} is not running; no T3 thread owns it"
         )),
@@ -611,6 +628,41 @@ pub(crate) fn wake_stopped_session(
             "T3 API changed for Claude session {thread}: {detail}"
         )),
     }
+}
+
+/// Start a T3 turn for a mapped Codex thread
+pub(crate) fn wake_codex_thread(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+) -> Result<(), String> {
+    match wake_provider_thread(context, ProviderThread::Codex(thread), line, log_path) {
+        WakeOutcome::Woken { .. } => Ok(()),
+        WakeOutcome::NotT3Thread => Err("no T3 thread owns this Codex thread".into()),
+        WakeOutcome::Unavailable(detail) => Err(detail),
+        WakeOutcome::Refused(detail) => Err(detail),
+        WakeOutcome::ApiChanged(detail) => Err(detail),
+    }
+}
+
+fn wake_provider_thread(
+    context: &CallbackContext,
+    provider_thread: ProviderThread,
+    line: &str,
+    log_path: &Path,
+) -> WakeOutcome {
+    let env = T3Env::new(
+        PathBuf::from(&context.env.home),
+        context.env.path.clone().into(),
+    );
+    let outcome = wake_thread(&env, provider_thread, line);
+    if let WakeOutcome::Woken { t3_thread } = &outcome
+        && let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path)
+    {
+        let _ = writeln!(log, "t3 wake thread={t3_thread}");
+    }
+    outcome
 }
 
 fn queue_command_once(

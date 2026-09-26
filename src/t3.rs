@@ -1,4 +1,4 @@
-//! T3 Code client for waking stopped Claude Code sessions and checking its local API
+//! T3 Code client for waking provider sessions and checking its local API
 //!
 //! # T3 Code internals this depends on
 //!
@@ -10,12 +10,13 @@
 //! - User data lives in `~/.t3/userdata`; `server-runtime.json` has `version`,
 //!   `pid`, `host`, `port`, `origin`, and `startedAt`. Version 1 and a live PID
 //!   identify a running server. The process check uses `kill(pid, None)`
-//! - `state.sqlite` has `provider_session_runtime(thread_id,
-//!   resume_cursor_json,last_seen_at)` and
-//!   `projection_threads(thread_id,deleted_at)`. Claude's session id is
-//!   `json_extract(resume_cursor_json, '$.resume')`; `thread_id` is T3's thread
-//!   id. A join on `thread_id` excludes deleted threads, and the newest
-//!   `last_seen_at` wins
+//! - `state.sqlite` has `provider_session_runtime(provider_name,thread_id,
+//!   resume_cursor_json,last_seen_at)` and `projection_threads(thread_id,
+//!   deleted_at)`. Claude sessions use `provider_name = 'claudeAgent'` and
+//!   `json_extract(resume_cursor_json, '$.resume')`; Codex threads use
+//!   `provider_name = 'codex'` and `json_extract(resume_cursor_json,
+//!   '$.threadId')`. `thread_id` is T3's thread id. A join on `thread_id`
+//!   excludes deleted threads, and the newest `last_seen_at` wins
 //! - `t3 auth session issue --json --ttl 5m --label homebased` returns
 //!   `sessionId` and `token` for a bearer session. Revoke it with
 //!   `t3 auth session revoke <sessionId>` after every use; `t3 --version`
@@ -63,18 +64,19 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
-const CLAUDE_THREAD_SQL: &str = "
+const PROVIDER_THREAD_SQL: &str = "
     SELECT r.thread_id
     FROM provider_session_runtime r
     JOIN projection_threads t ON t.thread_id = r.thread_id
     WHERE t.deleted_at IS NULL
+      AND r.provider_name = ?1
       AND CASE WHEN json_valid(r.resume_cursor_json)
-          THEN json_extract(r.resume_cursor_json, '$.resume') = ?1
+          THEN json_extract(r.resume_cursor_json, ?2) = ?3
           ELSE 0 END
     ORDER BY r.last_seen_at DESC
     LIMIT 1";
 const REQUIRED_STATE_SQL: &str = "
-    SELECT r.thread_id, r.resume_cursor_json, r.last_seen_at,
+    SELECT r.thread_id, r.provider_name, r.resume_cursor_json, r.last_seen_at,
            t.thread_id, t.deleted_at
     FROM provider_session_runtime r
     JOIN projection_threads t ON t.thread_id = r.thread_id
@@ -123,12 +125,30 @@ impl T3Env {
     }
 }
 
-/// Result of asking T3 Code to start a turn in a Claude session's owning thread
+/// Provider session that T3 can resume in its owning thread
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderThread {
+    /// Claude session id stored at `resume_cursor_json.$.resume`
+    Claude(ThreadId),
+    /// Codex thread id stored at `resume_cursor_json.$.threadId`
+    Codex(ThreadId),
+}
+
+impl ProviderThread {
+    fn mapping(self) -> (&'static str, &'static str, ThreadId) {
+        match self {
+            Self::Claude(thread) => ("claudeAgent", "$.resume", thread),
+            Self::Codex(thread) => ("codex", "$.threadId", thread),
+        }
+    }
+}
+
+/// Result of asking T3 Code to start a turn in a provider session's owning thread
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeOutcome {
     /// T3 accepted the new turn
     Woken { t3_thread: String },
-    /// No T3 thread owns this Claude session
+    /// No T3 thread owns this provider session
     NotT3Thread,
     /// T3 is not installed or running, or a transport failed
     Unavailable(String),
@@ -205,15 +225,25 @@ impl ProbeReport {
     }
 }
 
-/// Start a T3 turn for the T3 thread that owns a Claude Code session
+/// Check whether T3 has a non-deleted thread for this provider session
+pub fn owns_thread(env: &T3Env, provider_thread: ProviderThread) -> Result<bool, String> {
+    let userdata = env.userdata();
+    if !userdata.is_dir() || !env.state_path().is_file() {
+        return Ok(false);
+    }
+
+    find_provider_thread(&env.state_path(), provider_thread).map(|thread| thread.is_some())
+}
+
+/// Start a T3 turn for the thread that owns this provider session
 #[must_use]
-pub fn wake_claude_session(env: &T3Env, session: ThreadId, text: &str) -> WakeOutcome {
+pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
     let userdata = env.userdata();
     if !userdata.is_dir() || !env.state_path().is_file() {
         return WakeOutcome::NotT3Thread;
     }
 
-    let t3_thread = match find_claude_thread(&env.state_path(), session) {
+    let t3_thread = match find_provider_thread(&env.state_path(), provider_thread) {
         Ok(Some(t3_thread)) => t3_thread,
         Ok(None) => return WakeOutcome::NotT3Thread,
         Err(detail) => return WakeOutcome::Unavailable(detail),
@@ -427,8 +457,16 @@ fn state_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     Ok(connection)
 }
 
-fn find_claude_thread(path: &Path, session: ThreadId) -> Result<Option<String>, String> {
-    query_thread(path, CLAUDE_THREAD_SQL, [session.to_string()])
+fn find_provider_thread(
+    path: &Path,
+    provider_thread: ProviderThread,
+) -> Result<Option<String>, String> {
+    let (provider, cursor, session) = provider_thread.mapping();
+    query_thread(
+        path,
+        PROVIDER_THREAD_SQL,
+        rusqlite::params![provider, cursor, session.to_string()],
+    )
 }
 
 fn state_schema_matches(path: &Path) -> bool {
@@ -1144,6 +1182,14 @@ mod tests {
         ThreadId(Uuid::parse_str(SESSION_ID).unwrap())
     }
 
+    fn claude_thread() -> ProviderThread {
+        ProviderThread::Claude(thread_id())
+    }
+
+    fn codex_thread() -> ProviderThread {
+        ProviderThread::Codex(thread_id())
+    }
+
     struct Fixture {
         _dir: TempDir,
         env: T3Env,
@@ -1152,6 +1198,15 @@ mod tests {
 
     impl Fixture {
         fn new(server: Option<&FakeServer>, mapped: bool, pid: i32) -> Self {
+            let mapping = mapped.then_some(("claudeAgent", "resume", SESSION_ID));
+            Self::with_mapping(server, mapping, pid)
+        }
+
+        fn with_mapping(
+            server: Option<&FakeServer>,
+            mapping: Option<(&str, &str, &str)>,
+            pid: i32,
+        ) -> Self {
             let dir = TempDir::new().unwrap();
             let userdata = dir.path().join(".t3/userdata");
             fs::create_dir_all(&userdata).unwrap();
@@ -1175,7 +1230,7 @@ mod tests {
                  );",
             )
             .unwrap();
-            if mapped {
+            if let Some((provider, cursor, session_id)) = mapping {
                 db.execute(
                     "INSERT INTO projection_threads (thread_id, title) VALUES (?1, 'Fake thread')",
                     [T3_THREAD_ID],
@@ -1184,8 +1239,12 @@ mod tests {
                 db.execute(
                     "INSERT INTO provider_session_runtime
                      (thread_id, provider_name, last_seen_at, resume_cursor_json)
-                     VALUES (?1, 'claude', '2026-09-26T17:00:00Z', ?2)",
-                    rusqlite::params![T3_THREAD_ID, json!({"resume": SESSION_ID}).to_string()],
+                     VALUES (?1, ?2, '2026-09-26T17:00:00Z', ?3)",
+                    rusqlite::params![
+                        T3_THREAD_ID,
+                        provider,
+                        json!({(cursor): session_id}).to_string()
+                    ],
                 )
                 .unwrap();
             }
@@ -1262,8 +1321,10 @@ mod tests {
             dispatch_ok(),
         ]);
         let fixture = Fixture::new(Some(&server), true, live_pid());
-        let first = wake_claude_session(&fixture.env, thread_id(), "resume this task");
-        let second = wake_claude_session(&fixture.env, thread_id(), "resume this task");
+        assert!(owns_thread(&fixture.env, claude_thread()).unwrap());
+        assert!(!owns_thread(&fixture.env, codex_thread()).unwrap());
+        let first = wake_thread(&fixture.env, claude_thread(), "resume this task");
+        let second = wake_thread(&fixture.env, claude_thread(), "resume this task");
 
         assert_eq!(
             first,
@@ -1295,10 +1356,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_mapping_keeps_claude_and_codex_sessions_separate() {
+        let codex_fixture =
+            Fixture::with_mapping(None, Some(("codex", "threadId", SESSION_ID)), live_pid());
+        assert!(owns_thread(&codex_fixture.env, codex_thread()).unwrap());
+        assert!(!owns_thread(&codex_fixture.env, claude_thread()).unwrap());
+        assert_eq!(
+            wake_thread(&codex_fixture.env, claude_thread(), "message"),
+            WakeOutcome::NotT3Thread
+        );
+
+        let claude_fixture = Fixture::new(None, true, live_pid());
+        assert!(owns_thread(&claude_fixture.env, claude_thread()).unwrap());
+        assert!(!owns_thread(&claude_fixture.env, codex_thread()).unwrap());
+        assert_eq!(
+            wake_thread(&claude_fixture.env, codex_thread(), "message"),
+            WakeOutcome::NotT3Thread
+        );
+    }
+
+    #[test]
+    fn codex_thread_maps_by_provider_and_thread_id_and_wakes() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeServer::start(vec![response(200, snapshot(T3_THREAD_ID)), dispatch_ok()]);
+        let fixture = Fixture::with_mapping(
+            Some(&server),
+            Some(("codex", "threadId", SESSION_ID)),
+            live_pid(),
+        );
+
+        assert!(owns_thread(&fixture.env, codex_thread()).unwrap());
+        assert!(!owns_thread(&fixture.env, claude_thread()).unwrap());
+        assert_eq!(
+            wake_thread(&fixture.env, codex_thread(), "resume this task"),
+            WakeOutcome::Woken {
+                t3_thread: T3_THREAD_ID.into()
+            }
+        );
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(fixture.revocations(), ["fake-session"]);
+    }
+
+    #[test]
     fn wake_returns_not_t3_thread_without_a_mapping() {
         let fixture = Fixture::new(None, false, live_pid());
         assert_eq!(
-            wake_claude_session(&fixture.env, thread_id(), "message"),
+            wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::NotT3Thread
         );
         assert!(fixture.revocations().is_empty());
@@ -1308,7 +1413,7 @@ mod tests {
     fn wake_returns_unavailable_for_a_dead_server_pid() {
         let fixture = Fixture::new(None, true, i32::MAX);
         assert!(matches!(
-            wake_claude_session(&fixture.env, thread_id(), "message"),
+            wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::Unavailable(_)
         ));
         assert!(fixture.revocations().is_empty());
@@ -1325,7 +1430,7 @@ mod tests {
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         assert_eq!(
-            wake_claude_session(&fixture.env, thread_id(), "message"),
+            wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::Refused("T3 thread is archived".into())
         );
         assert_eq!(server.requests().len(), 1);
@@ -1344,7 +1449,7 @@ mod tests {
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         assert_eq!(
-            wake_claude_session(&fixture.env, thread_id(), "message"),
+            wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::ApiChanged("turn dispatch returned HTTP 400".into())
         );
         assert_eq!(fixture.revocations(), ["fake-session"]);

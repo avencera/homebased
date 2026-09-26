@@ -1,17 +1,23 @@
 //! Origin inbox dispatcher tests with a fake saved Codex executable
 
 use crate::daemon::actors::StoreActor;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use ractor::Actor;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg, dispatch_inbox};
+use crate::daemon::actors::callback::{
+    CallbackActor, CallbackArgs, CallbackMsg, WakeFailure, dispatch_inbox,
+};
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId};
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
@@ -19,6 +25,180 @@ use crate::home::Home;
 use crate::machine::MachineId;
 use crate::store::Store;
 use crate::submission::{CallbackContext, OriginRoute, PersistedSpec, RequestId, SubmissionState};
+
+const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
+
+struct FakeT3Server {
+    origin: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl FakeT3Server {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let worker = thread::spawn(move || {
+            let snapshot = serde_json::json!({
+                "snapshotSequence": 9,
+                "thread": {
+                    "id": T3_THREAD_ID,
+                    "title": "Fake thread",
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "archivedAt": null,
+                    "deletedAt": null
+                },
+                "page": {}
+            });
+            let responses = [
+                (200, snapshot.to_string()),
+                (200, "{\"sequence\":10}".to_string()),
+            ];
+            for (status, body) in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let Ok(request) = read_http_request(&mut stream) else {
+                    return;
+                };
+                if let Ok(mut requests) = recorded.lock() {
+                    requests.push(request);
+                }
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            origin: format!("http://{address}"),
+            requests,
+            worker: Some(worker),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FakeT3Server {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line)?;
+    let mut headers = String::new();
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().unwrap();
+        }
+        headers.push_str(&line);
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body)?;
+    Ok(format!(
+        "{}{}{}",
+        first_line,
+        headers,
+        String::from_utf8(body).unwrap()
+    ))
+}
+
+fn configure_t3_codex(route: &mut OriginRoute, origin: &str, pid: i32) -> PathBuf {
+    let callback_home = PathBuf::from(&route.callback.env.home);
+    let userdata = callback_home.join(".t3/userdata");
+    std::fs::create_dir_all(&userdata).unwrap();
+    let db = rusqlite::Connection::open(userdata.join("state.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE provider_session_runtime (
+            thread_id TEXT PRIMARY KEY,
+            provider_name TEXT,
+            last_seen_at TEXT,
+            resume_cursor_json TEXT
+         );
+         CREATE TABLE projection_threads (
+            thread_id TEXT PRIMARY KEY,
+            deleted_at TEXT
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO projection_threads (thread_id) VALUES (?1)",
+        [T3_THREAD_ID],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO provider_session_runtime
+         (thread_id, provider_name, last_seen_at, resume_cursor_json)
+         VALUES (?1, 'codex', '2026-09-26T17:00:00Z', ?2)",
+        rusqlite::params![
+            T3_THREAD_ID,
+            serde_json::json!({"threadId": route.thread.to_string()}).to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let port = origin.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
+    std::fs::write(
+        userdata.join("server-runtime.json"),
+        serde_json::json!({
+            "version": 1,
+            "pid": pid,
+            "host": "127.0.0.1",
+            "port": port,
+            "origin": origin,
+            "startedAt": "2026-09-26T17:03:50.514Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bin = callback_home.join("t3-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let t3 = bin.join("t3");
+    std::fs::write(
+        &t3,
+        "#!/bin/sh\nif [ \"$1 $2 $3\" = 'auth session issue' ]; then printf '%s\\n' '{\"sessionId\":\"fake-session\",\"token\":\"fake-token\",\"method\":\"bearer-access-token\",\"scopes\":[]}'; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o700)).unwrap();
+    route.callback.env.path = bin.to_string_lossy().into_owned();
+    callback_home.join("commands")
+}
 
 fn fixture(script: &str) -> (TempDir, Home, OriginRoute) {
     let dir = tempfile::tempdir().unwrap();
@@ -166,6 +346,133 @@ async fn ordered_callbacks_use_saved_origin_and_skip_state_only() {
         store.inbound_events(route.task).unwrap()[1].delivery,
         DeliveryState::NotRequired
     );
+}
+
+#[tokio::test]
+async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
+    let (_dir, home, mut route) =
+        fixture("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/commands\"\nexit 0\n");
+    let server = FakeT3Server::start();
+    let commands = configure_t3_codex(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 1, true))
+        .unwrap();
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
+            .await
+            .unwrap()
+    );
+
+    assert!(!commands.exists());
+    assert_eq!(
+        Store::open(&home.db_path())
+            .unwrap()
+            .inbound_events(route.task)
+            .unwrap()[0]
+            .delivery,
+        DeliveryState::Delivered {
+            attempts: 1,
+            last_error: None
+        }
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /api/orchestration/threads/"));
+    assert!(requests[1].contains("\"type\":\"thread.turn.start\""));
+    assert!(requests[1].contains(&route.task.to_string()));
+    assert!(
+        !call(&callback, |reply| CallbackMsg::InspectAlert {
+            thread: route.thread,
+            reply
+        })
+        .await
+        .unwrap()
+    );
+
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn unavailable_t3_codex_wake_falls_back_and_marks_delivery() {
+    let (_dir, home, mut route) =
+        fixture("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/commands\"\nexit 0\n");
+    let commands = configure_t3_codex(&mut route, "http://127.0.0.1:1", -1);
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 1, true))
+        .unwrap();
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(lines(&commands).len(), 1);
+    assert!(matches!(
+        Store::open(&home.db_path())
+            .unwrap()
+            .inbound_events(route.task)
+            .unwrap()[0]
+            .delivery,
+        DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    assert!(
+        call(&callback, |reply| CallbackMsg::InspectAlert {
+            thread: route.thread,
+            reply
+        })
+        .await
+        .unwrap()
+    );
+
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
 }
 
 #[tokio::test]
@@ -400,7 +707,9 @@ async fn push_only_after_failed_wake_until_delivery() {
             .cast(CallbackMsg::WakeFailed {
                 thread,
                 event: event(&route, 1, true),
-                reason: "T3 refused wake".into(),
+                failure: WakeFailure::CodexQueued {
+                    reason: "T3 refused wake".into(),
+                },
             })
             .unwrap();
         assert!(alerted().await);
@@ -411,7 +720,9 @@ async fn push_only_after_failed_wake_until_delivery() {
         .cast(CallbackMsg::WakeFailed {
             thread,
             event: event(&route, 2, true),
-            reason: "T3 refused wake".into(),
+            failure: WakeFailure::CodexQueued {
+                reason: "T3 refused wake".into(),
+            },
         })
         .unwrap();
     assert!(alerted().await);

@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::callback::{
     HomebasedEvent, OriginSession, ReachableOrigin, append_fallback, check_saved_callback,
-    find_saved_origin, wake_stopped_session,
+    find_saved_inbox_origin, send_codex_queue_attempt, wake_codex_thread, wake_stopped_session,
 };
 use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
@@ -38,14 +38,14 @@ pub enum CallbackMsg {
         /// Whether the wake is allowed now
         reply: RpcReplyPort<Result<bool, AppError>>,
     },
-    /// A settled waiting event followed a real failed T3 wake
+    /// A settled callback had a failed T3 wake and needs a push notice
     WakeFailed {
         /// Origin thread that could not be woken
         thread: ThreadId,
-        /// Event that remains waiting
+        /// Callback event for this origin thread
         event: TaskEvent,
-        /// Failure shown in the push notice
-        reason: String,
+        /// Whether delivery waits for Claude or Codex queue accepted the event
+        failure: WakeFailure,
     },
     /// Clear the alert after the event reaches its origin thread
     Delivered {
@@ -59,6 +59,21 @@ pub enum CallbackMsg {
         thread: ThreadId,
         /// Whether the thread is alerted
         reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+}
+
+/// Wake failure that needs a user notice
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeFailure {
+    /// The Claude event still waits for its session
+    Waiting {
+        /// Why T3 did not wake the session
+        reason: String,
+    },
+    /// Codex queue accepted the event after T3 could not wake its thread
+    CodexQueued {
+        /// Why T3 did not wake the thread
+        reason: String,
     },
 }
 
@@ -99,7 +114,12 @@ impl CallbackState {
         true
     }
 
-    fn alert_after_failed_wake(&mut self, thread: ThreadId, event: TaskEvent, reason: String) {
+    fn alert_after_failed_wake(
+        &mut self,
+        thread: ThreadId,
+        event: TaskEvent,
+        failure: WakeFailure,
+    ) {
         if !self.alerted_threads.insert(thread) {
             return;
         }
@@ -115,19 +135,19 @@ impl CallbackState {
             let title = TitleSources::from_env()
                 .and_then(|sources| sources.titles(&[thread]).into_iter().next().flatten())
                 .unwrap_or_else(|| thread.to_string());
-            let notice = waiting_thread_notice(&title, &event, &machine_name, &reason);
+            let notice = wake_failure_notice(&title, &event, &machine_name, &failure);
             if let Err(error) = notifier.send(&notice) {
-                warn!(%thread, "waiting-thread push failed: {error}");
+                warn!(%thread, "origin-thread push failed: {error}");
             }
         });
     }
 }
 
-fn waiting_thread_notice(
+fn wake_failure_notice(
     title: &str,
     event: &HomebasedEvent,
     machine_name: &str,
-    reason: &str,
+    failure: &WakeFailure,
 ) -> Notice {
     let event_kind = event.event;
     let event_name = serde_json::to_value(event_kind)
@@ -135,11 +155,17 @@ fn waiting_thread_notice(
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{event_kind:?}"));
     let display_name = &event.display_name;
-    Notice {
-        title: format!("Thread needs you: {title}"),
-        message: format!(
+    let message = match failure {
+        WakeFailure::Waiting { reason } => format!(
             "{display_name} ({event_name}) is waiting on {machine_name}: {reason}. Open the thread to receive it."
         ),
+        WakeFailure::CodexQueued { reason } => format!(
+            "{display_name} ({event_name}) is queued in Codex on {machine_name}: T3 could not wake the thread ({reason}). Open it to run the event."
+        ),
+    };
+    Notice {
+        title: format!("Thread needs you: {title}"),
+        message,
         tags: vec!["hourglass".into()],
         priority: NoticePriority::High,
     }
@@ -198,8 +224,8 @@ impl Actor for CallbackActor {
             CallbackMsg::WakeFailed {
                 thread,
                 event,
-                reason,
-            } => state.alert_after_failed_wake(thread, event, reason),
+                failure,
+            } => state.alert_after_failed_wake(thread, event, failure),
             CallbackMsg::Delivered { thread } => {
                 state.alerted_threads.remove(&thread);
             }
@@ -247,13 +273,22 @@ enum AttemptOutcome {
     Settle(DeliveryOutcome),
     /// A claimed T3 wake failed, so the event waits and the thread may need a push
     WakeFailed(String),
+    /// The T3 wake failed, but `codex queue` accepted the event
+    DeliveredWakeFailed(String),
 }
 
 impl AttemptOutcome {
-    fn into_settlement(self) -> (DeliveryOutcome, Option<String>) {
+    fn into_settlement(self) -> (DeliveryOutcome, Option<WakeFailure>) {
         match self {
             Self::Settle(outcome) => (outcome, None),
-            Self::WakeFailed(reason) => (DeliveryOutcome::Deferred(reason.clone()), Some(reason)),
+            Self::WakeFailed(reason) => (
+                DeliveryOutcome::Deferred(reason.clone()),
+                Some(WakeFailure::Waiting { reason }),
+            ),
+            Self::DeliveredWakeFailed(reason) => (
+                DeliveryOutcome::Delivered,
+                Some(WakeFailure::CodexQueued { reason }),
+            ),
         }
     }
 }
@@ -341,16 +376,24 @@ pub(crate) async fn dispatch_inbox(
                 }
             }
             DeliveryState::Delivered { .. } => {
-                let _ = callback.cast(CallbackMsg::Delivered {
-                    thread: route.thread,
-                });
-            }
-            DeliveryState::AwaitingThread { .. } => {
-                if let Some(reason) = failed_wake {
+                if let Some(failure @ WakeFailure::CodexQueued { .. }) = failed_wake {
                     let _ = callback.cast(CallbackMsg::WakeFailed {
                         thread: route.thread,
                         event: settled.event,
-                        reason,
+                        failure,
+                    });
+                } else {
+                    let _ = callback.cast(CallbackMsg::Delivered {
+                        thread: route.thread,
+                    });
+                }
+            }
+            DeliveryState::AwaitingThread { .. } => {
+                if let Some(failure @ WakeFailure::Waiting { .. }) = failed_wake {
+                    let _ = callback.cast(CallbackMsg::WakeFailed {
+                        thread: route.thread,
+                        event: settled.event,
+                        failure,
                     });
                 }
                 // the retry timer picks this task up again
@@ -377,12 +420,14 @@ impl OriginAttempt {
         let lookup = self.context.clone();
         let thread = self.thread;
         let origin = run_blocking("origin callback lookup", move || {
-            find_saved_origin(&lookup, thread)
+            find_saved_inbox_origin(&lookup, thread)
         })
         .await?;
         match origin {
             Ok(OriginSession::Reachable(origin)) => self.send(origin).await,
             Ok(OriginSession::Stopped) => self.wake(callback).await,
+            Ok(OriginSession::T3Codex) => self.wake_codex().await,
+            Ok(OriginSession::Codex) => self.send_codex(None).await,
             Err(error) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Retryable(error))),
         }
     }
@@ -390,7 +435,6 @@ impl OriginAttempt {
     async fn send(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
         let sent = run_blocking("origin callback", move || {
             origin.send(
-                &self.context,
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
@@ -402,6 +446,41 @@ impl OriginAttempt {
             Ok(()) => DeliveryOutcome::Delivered,
             Err(error) => DeliveryOutcome::Retryable(error),
         }))
+    }
+
+    async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
+        let sent = run_blocking("origin callback", move || {
+            send_codex_queue_attempt(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.paths.delivery_lock,
+            )
+        })
+        .await?;
+        Ok(match sent {
+            Ok(()) => match wake_failure {
+                Some(reason) => AttemptOutcome::DeliveredWakeFailed(reason),
+                None => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
+            },
+            Err(error) => AttemptOutcome::Settle(DeliveryOutcome::Retryable(error)),
+        })
+    }
+
+    async fn wake_codex(self) -> Result<AttemptOutcome, AppError> {
+        let context = self.context.clone();
+        let thread = self.thread;
+        let line = self.line.clone();
+        let log_path = self.paths.callback_log.clone();
+        let woken = run_blocking("T3 Codex wake", move || {
+            wake_codex_thread(&context, thread, &line, &log_path)
+        })
+        .await?;
+        match woken {
+            Ok(()) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
+            Err(reason) => self.send_codex(Some(reason)).await,
+        }
     }
 
     /// Wake a stopped Claude session through T3 unless another attempt woke it recently
@@ -432,4 +511,22 @@ async fn run_blocking<T: Send + 'static>(
         .map_err(|error| AppError::Internal {
             message: format!("{label} join: {error}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttemptOutcome, WakeFailure};
+    use crate::events::DeliveryOutcome;
+
+    #[test]
+    fn codex_queue_fallback_settles_as_delivered_with_a_wake_failure() {
+        let result =
+            AttemptOutcome::DeliveredWakeFailed("T3 is unavailable".into()).into_settlement();
+
+        assert!(matches!(result.0, DeliveryOutcome::Delivered));
+        assert!(matches!(
+            result.1,
+            Some(WakeFailure::CodexQueued { reason }) if reason == "T3 is unavailable"
+        ));
+    }
 }

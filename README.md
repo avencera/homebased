@@ -125,10 +125,10 @@ Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `syst
 
 ### T3 Code wake
 
-Homebased can wake a stopped Claude Code session that belongs to T3 Code. It
-sends the task message through T3 Code's undocumented local API, so T3 resumes
-the session and shows the turn in its UI. Run `homebased t3 check` after T3
-updates to check that it still works.
+Homebased can wake stopped Claude sessions and T3-owned Codex threads through
+T3 Code's undocumented local API; if a Codex wake fails, it queues the event
+with `codex queue`. Run `homebased t3 check` after T3 updates to check that the local
+API still works.
 
 ### Fleet
 
