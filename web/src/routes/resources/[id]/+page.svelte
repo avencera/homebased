@@ -22,6 +22,7 @@
 		stringField,
 		tagOf,
 		queueMovePlacement,
+		returnPendingText,
 		type ResourceStatus
 	} from '$lib/resource-state';
 	import {
@@ -243,7 +244,7 @@
 				reason = 'Waiting for the current request to release the GPU.';
 				break;
 			case 'awaiting_return':
-				reason = 'Return reserved; new requests wait for the next checkpoint.';
+				reason = `${returnPendingText(queuedRequests.length, detail?.return_window)}.`;
 				break;
 			case 'restoring':
 				reason = 'Waiting for the return task to confirm its start.';
@@ -745,7 +746,7 @@
 					<p
 						class="mt-3 rounded border border-border/70 bg-muted/40 p-2 text-amber-800 dark:text-amber-300"
 					>
-						Return reserved; new requests wait for the supervisor decision.
+						{returnPendingText(queuedRequests.length, detail.return_window)}.
 					</p>
 				{:else if phaseType === 'restoring'}
 					<p class="mt-3 rounded border border-border/70 bg-muted/40 p-2 text-muted-foreground">
@@ -887,7 +888,7 @@
 			{#if queuedRequests.length === 0}
 				<p class="mt-2 text-muted-foreground">
 					{phaseType === 'awaiting_return'
-						? 'Queue drained. The return is reserved; new requests wait for the next checkpoint.'
+						? `Queue drained. ${returnPendingText(0, detail?.return_window)}.`
 						: 'No queued requests'}
 				</p>
 			{:else}

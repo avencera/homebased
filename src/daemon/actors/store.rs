@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
@@ -25,7 +26,6 @@ use crate::message::{
     MessageAttempt, MessageDelivery, MessageId, MessageReceipt, MessageSendRequest,
     OutboundMessageBinding, Recipient,
 };
-use crate::resource::ReturnLaunch;
 use crate::resource::operator_release::{OperatorGpuFreeAttestation, OperatorGpuFreeResolution};
 use crate::resource::ownership_lock::VerifiedTrainerAttempt;
 use crate::resource::release_watcher::{ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest};
@@ -34,13 +34,15 @@ use crate::resource::store::{
     CompleteReleaseError, OpenReleaseLoanError, ReleaseCheckpointError, ReleaseCompletionResult,
     ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ReleaseWatcherAcceptanceInput,
     ResourceQueueReconcileError, ResourceSnapshot, ResourceStoreError, ResourceTaskAcceptance,
-    ResourceTaskAcceptanceInput, SupervisorNoticeStoreError, TrainerAttemptAssociationStoreError,
+    ResourceTaskAcceptanceInput, ReturnDeadlineOutcome, SupervisorNoticeStoreError,
+    TrainerAttemptAssociationStoreError,
 };
 use crate::resource::{
     ActionId, DeliveryAttemptId, NoticeId, ReleaseCheckpointBaseline, ReleaseWatcherIntent,
     Resource, ResourceId, ResourceQueueReconcileOutcome, ResourceRequest, ResourceRevision,
     SupervisorActionAuthority, SupervisorAddress, SupervisorNotice, TrainerAttemptAssociation,
 };
+use crate::resource::{ReturnDecisionWindow, ReturnLaunch};
 use crate::spec::NormalizedSpec;
 use crate::store::{
     AcceptedActionTask, BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
@@ -423,6 +425,24 @@ pub(crate) enum StoreMsg {
         reason: String,
         /// Typed storage result inside actor and transport errors
         reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
+    },
+    /// Move the decision deadline of one exact AwaitingReturn action
+    HoldReturnForAuthority {
+        /// Exact supervisor authority for the pending return action
+        authority: SupervisorActionAuthority,
+        /// Requested decision time from now, capped by the window limit
+        hold: Duration,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReturnDecisionWindow, ReturnDecisionError>, AppError>>,
+    },
+    /// Serve the next queued request once the pending return action's window closed
+    ServeAfterReturnDeadline {
+        /// Authority machine recorded on the resource
+        authority_machine: MachineId,
+        /// Resource whose AwaitingReturn loan is checked
+        resource_id: ResourceId,
+        /// Typed storage result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ReturnDeadlineOutcome, ResourceStoreError>, AppError>>,
     },
     /// Bind one fixed return task to its action and enter Restoring
     AcceptReturnTaskForAuthority {
@@ -1148,6 +1168,19 @@ impl Actor for StoreActor {
             } => send_reply(
                 reply,
                 Ok(state.record_no_resume_for_authority(authority, reason)),
+            ),
+            StoreMsg::HoldReturnForAuthority {
+                authority,
+                hold,
+                reply,
+            } => send_reply(reply, Ok(state.hold_return_for_authority(authority, hold))),
+            StoreMsg::ServeAfterReturnDeadline {
+                authority_machine,
+                resource_id,
+                reply,
+            } => send_reply(
+                reply,
+                Ok(state.serve_after_return_deadline_for_authority(authority_machine, resource_id)),
             ),
             StoreMsg::AcceptReturnTaskForAuthority { input, reply } => {
                 send_reply(reply, Ok(state.accept_return_task_for_authority(*input)))

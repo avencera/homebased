@@ -600,6 +600,18 @@ pub(super) async fn resource_action(
             .await?;
             closed_outcome(state, authority.resource_id, closed)
         }
+        ResourceActionOperation::HoldReturn { hold } => {
+            let held = call(&state.store, |reply| StoreMsg::HoldReturnForAuthority {
+                authority,
+                hold,
+                reply,
+            })
+            .await?;
+            match held {
+                Ok(window) => Ok(ResourceActionOutcome::ReturnHeld { window }),
+                Err(error) => return_rejection(error),
+            }
+        }
         ResourceActionOperation::ResolveEndedRestore { task_id, reason } => {
             let closed = call(&state.store, |reply| {
                 StoreMsg::ResolveEndedRestoreForAuthority {
@@ -780,6 +792,7 @@ pub(crate) fn return_decision_rejection(
             }
         }
         error @ (ReturnDecisionError::Rejected(_)
+        | ReturnDecisionError::HoldRejected(_)
         | ReturnDecisionError::BackgroundTaskMismatch
         | ReturnDecisionError::TaskRecords(_)) => ResourceActionRejection::DecisionRejected {
             reason: error.to_string(),

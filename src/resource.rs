@@ -22,6 +22,7 @@ pub mod operator_release;
 pub mod ownership_lock;
 mod release_checkpoint;
 pub mod release_watcher;
+pub mod return_window;
 pub(crate) mod store;
 pub mod trainer_publication;
 
@@ -33,6 +34,9 @@ pub(crate) use release_checkpoint::{
     ReleaseCheckpointAction, ReleaseCheckpointBaseline, ReleaseCheckpointBinding,
     ReleaseCheckpointCancellation, ReleaseCheckpointPhase, ReleaseCheckpointState,
     ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome,
+};
+pub use return_window::{
+    RETURN_DECISION_GRACE, RETURN_DECISION_LIMIT, ReturnDecisionWindow, ReturnHoldRejection,
 };
 
 /// Immutable authority-assigned acceptance identity for a resource request
@@ -814,6 +818,16 @@ pub enum ServingReleaseProvenance {
         outcome: ExitReason,
         /// Request digest of the trainer-attempt association that named the lock
         attempt_request_sha256: ownership_lock::TrainerRequestDigest,
+    },
+    /// The supervisor left a return action undecided past its decision window
+    ///
+    /// The loan entered AwaitingReturn only after its own release basis was
+    /// proven, and nothing ran on the resource while it waited. The deadline
+    /// receipt of the expired action holds the loan, return context, and
+    /// registration that the authority saw when it served the queue
+    ReturnDeadlinePassed {
+        /// Expired return action whose deadline receipt permits activation
+        action_id: ActionId,
     },
     /// An operator attested that the ended trainer of this release action no longer holds the GPU
     ///

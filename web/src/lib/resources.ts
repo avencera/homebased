@@ -74,6 +74,12 @@ const BackgroundLaunchSchema = Schema.Struct({
 	status: Schema.String
 });
 
+const ReturnWindowSchema = Schema.Struct({
+	action_id: Schema.String,
+	opened_at: Schema.String,
+	deadline_at: Schema.String
+});
+
 const ReturnExecutionModeSchema = Schema.Literal(
 	'direct_segment_trainer',
 	'native_foreground',
@@ -86,7 +92,8 @@ const ResourceOverviewItemSchema = Schema.Struct({
 	queued_count: Schema.Finite,
 	current_task: Schema.NullOr(ResourceTaskSchema),
 	attention: Schema.NullOr(AttentionSchema),
-	background_launch: Schema.optional(BackgroundLaunchSchema)
+	background_launch: Schema.optional(BackgroundLaunchSchema),
+	return_window: Schema.optional(ReturnWindowSchema)
 });
 
 const ResourceOverviewSchema = Schema.Struct({
@@ -107,7 +114,8 @@ const ResourceDetailSchema = Schema.Struct({
 	background_task_id: Schema.optional(Schema.NullOr(Schema.String)),
 	attention: Schema.NullOr(AttentionSchema),
 	background_launch: Schema.optional(BackgroundLaunchSchema),
-	return_execution_mode: Schema.optional(ReturnExecutionModeSchema)
+	return_execution_mode: Schema.optional(ReturnExecutionModeSchema),
+	return_window: Schema.optional(ReturnWindowSchema)
 });
 
 const PendingActionSchema = Schema.Struct({
@@ -132,6 +140,9 @@ export type ResourceRequestState = Schema.Schema.Type<typeof ResourceRequestSche
 
 /** First background launch that reserves an unregistered resource. */
 export type BackgroundLaunchReservation = Schema.Schema.Type<typeof BackgroundLaunchSchema>;
+
+/** Time the supervisor has to decide a return before queued work takes the resource. */
+export type ReturnWindow = Schema.Schema.Type<typeof ReturnWindowSchema>;
 
 /** Accepted execution mode exposed for the exact current Restoring loan. */
 export type ReturnExecutionMode = Schema.Schema.Type<typeof ReturnExecutionModeSchema>;

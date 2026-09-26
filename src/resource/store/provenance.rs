@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::codec::stored_json;
 use super::error::ResourceStoreError;
 use super::release_completion::{ReleaseCompletionReceipt, ReleaseCompletionResult};
+use super::return_window::return_deadline_serving_matches_on;
 use crate::domain::{ProcessGroupExitEvidence, ProcessStatus, TaskState};
 use crate::machine::MachineId;
 use crate::resource::{
@@ -41,6 +42,16 @@ pub(super) fn serving_release_provenance_matches(
                 loan,
                 return_context,
                 provenance,
+            );
+        }
+        ServingReleaseProvenance::ReturnDeadlinePassed { action_id } => {
+            return return_deadline_serving_matches_on(
+                conn,
+                authority,
+                resource,
+                loan,
+                return_context,
+                *action_id,
             );
         }
         ServingReleaseProvenance::CompletedTrainerResult {
@@ -113,9 +124,11 @@ pub(super) fn serving_release_provenance_matches(
     }
 
     match provenance {
-        // an idle opening and an operator attestation have no release completion receipt
+        // an idle opening, an operator attestation, and an expired return window have
+        // no release completion receipt
         ServingReleaseProvenance::IdleBoundary { .. }
-        | ServingReleaseProvenance::OperatorAttestedGpuFree { .. } => Ok(false),
+        | ServingReleaseProvenance::OperatorAttestedGpuFree { .. }
+        | ServingReleaseProvenance::ReturnDeadlinePassed { .. } => Ok(false),
         ServingReleaseProvenance::CompletedTrainerResult { task_id, .. } => Ok(matches!(
             return_context,
             ReturnContext::AlreadyCompleted { task_id: returned_task, .. }

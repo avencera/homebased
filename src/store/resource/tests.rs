@@ -22,5 +22,6 @@ mod release_watcher;
 mod release_watcher_acceptance;
 mod release_watcher_binding;
 mod restore;
+mod return_deadline;
 mod supervised_launch;
 mod trainer_association;

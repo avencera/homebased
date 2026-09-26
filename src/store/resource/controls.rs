@@ -14,14 +14,15 @@ use crate::resource::api::{BrowserResourceAction, QueuePlacement};
 use crate::resource::store::{
     ResourceStoreError, SupervisorNoticeStoreError, decode_supervisor_notice_record,
     requests_for_resource_for_authority, resources_for_authority,
-    retarget_supervisor_notice_in_transaction, rewrite_queued_request_ranks,
+    retarget_supervisor_notice_in_transaction, return_window_on, rewrite_queued_request_ranks,
     select_non_closed_loan, select_request_by_id, select_supervisor_notice_record,
     swap_resource_revision, update_supervisor_notice_cas,
 };
 use crate::resource::{
     ActionId, AssignmentRevision, DeliveryAttemptId, Loan, LoanId, LoanPhase, LoanState, NoticeId,
     Resource, ResourceId, ResourceRequest, ResourceRequestState, ResourceRevision,
-    ReturnExecutionMode, SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
+    ReturnDecisionWindow, ReturnExecutionMode, SupervisorAddress, SupervisorNotice,
+    SupervisorNoticeDelivery,
 };
 use crate::store::{BackgroundLaunchView, Store};
 use crate::submission::RequestId;
@@ -49,6 +50,8 @@ pub(crate) struct ResourceReadModel {
     pub(crate) background_launch: Option<BackgroundLaunchView>,
     /// Accepted execution mode of the exact current Restoring loan, if proven
     pub(crate) return_execution_mode: Option<ReturnExecutionMode>,
+    /// Decision window of the pending return action, if the loan awaits one
+    pub(crate) return_window: Option<ReturnDecisionWindow>,
 }
 
 /// Immutable content bound to one control operation identity
@@ -226,6 +229,12 @@ fn resource_read_models(
                 snapshot.loan.as_ref(),
             )
             .map_err(|error| ResourceStoreError::ReturnDecisionRead(error.to_string()))?;
+            let return_window = match snapshot.loan.as_ref().map(|loan| &loan.state) {
+                Some(LoanState::Active {
+                    phase: LoanPhase::AwaitingReturn { action_id, .. },
+                }) => return_window_on(conn, *action_id)?,
+                _ => None,
+            };
             Ok(ResourceReadModel {
                 resource: snapshot.resource,
                 loan: snapshot.loan,
@@ -233,6 +242,7 @@ fn resource_read_models(
                 notices,
                 background_launch,
                 return_execution_mode,
+                return_window,
             })
         })
         .collect()

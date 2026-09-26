@@ -3,6 +3,7 @@ import type {
 	ResourceDetail,
 	ResourceOverviewItem,
 	ResourceTaskSummary,
+	ReturnWindow,
 	QueuePlacement
 } from './resources';
 
@@ -98,7 +99,8 @@ export function overviewStatus(
 		item.queued_count,
 		item.current_task,
 		item.attention,
-		item.background_launch
+		item.background_launch,
+		item.return_window
 	);
 }
 
@@ -111,7 +113,8 @@ export function detailStatus(detail: ResourceDetail): ResourceStatus {
 		queued,
 		detail.current_task ?? detail.background_task,
 		detail.attention,
-		detail.background_launch
+		detail.background_launch,
+		detail.return_window
 	);
 }
 
@@ -125,16 +128,22 @@ export interface ResourceQueue {
 	background: ResourceTaskSummary | null;
 	/** Queued requests in the server-provided serving order. */
 	queue: ResourceDetail['requests'];
+	/** Why queued work waits while no task holds the resource, when a return decision is pending. */
+	returnPending: string | null;
 }
 
 /** Reduce a resource detail to its holder and waiting queue. */
 export function resourceQueue(detail: ResourceDetail): ResourceQueue {
+	const queue = detail.requests.filter((request) => tagOf(request.state) === 'queued');
+	const awaitingReturn =
+		tagOf(detail.loan?.state) === 'active' && tagOf(loanPhase(detail.loan)) === 'awaiting_return';
 	return {
 		resource: detail.resource,
 		status: detailStatus(detail),
 		current: detail.current_task,
 		background: detail.background_task,
-		queue: detail.requests.filter((request) => tagOf(request.state) === 'queued')
+		queue,
+		returnPending: awaitingReturn ? returnPendingText(queue.length, detail.return_window) : null
 	};
 }
 
@@ -185,6 +194,29 @@ export function backgroundLaunchText(
 	}
 }
 
+/** Explain when queued work may take a resource whose return decision is pending. */
+export function returnPendingText(
+	queuedCount: number,
+	window: ReturnWindow | undefined,
+	now: number = Date.now()
+): string {
+	const deadline = window ? Date.parse(window.deadline_at) : Number.NaN;
+	if (Number.isNaN(deadline)) return 'The queue drained and return is reserved';
+	// the resource dashboard shows clock times in its fixed US Central time zone
+	const clock = new Date(deadline).toLocaleTimeString('en-US', {
+		timeStyle: 'medium',
+		timeZone: 'America/Chicago'
+	});
+	if (deadline <= now) {
+		return queuedCount > 0
+			? 'The decision time ended; queued work starts now'
+			: 'The decision time ended; new queued work starts at once';
+	}
+	return queuedCount > 0
+		? `Queued work starts at ${clock} unless the supervisor decides first`
+		: `The supervisor has until ${clock} to decide before new queued work can start`;
+}
+
 /** Human-readable task lifecycle state, with unknown states kept explicit. */
 export function taskStatusLabel(task: ResourceTaskSummary | null): string {
 	if (!task) return 'Task state unavailable';
@@ -200,7 +232,8 @@ function deriveStatus(
 	queuedCount: number,
 	currentTask: ResourceTaskSummary | null,
 	attention: ResourceOverviewItem['attention'],
-	backgroundLaunch: BackgroundLaunchReservation | undefined
+	backgroundLaunch: BackgroundLaunchReservation | undefined,
+	returnWindow: ReturnWindow | undefined
 ): ResourceStatus {
 	const stateType = tagOf(loan?.state);
 	if (attention?.code === 'background_launch_release_unproven') {
@@ -229,7 +262,7 @@ function deriveStatus(
 		if (phaseType === 'awaiting_return') {
 			return {
 				label: 'Return pending',
-				message: 'The queue drained and return is reserved',
+				message: returnPendingText(queuedCount, returnWindow),
 				tone: 'amber'
 			};
 		}

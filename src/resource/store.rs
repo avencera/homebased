@@ -13,6 +13,7 @@ mod release_completion;
 mod release_loan;
 mod release_watcher;
 mod resources;
+mod return_window;
 mod revision;
 mod rows;
 mod schema;
@@ -55,6 +56,10 @@ pub(crate) use release_completion::{
 };
 pub(crate) use release_loan::{
     OpenReleaseLoanError, ResourceQueueReconcileError, reconcile_resource_queue_for_authority,
+};
+pub(crate) use return_window::{
+    ReturnDeadlineOutcome, open_missing_return_windows_on, return_window_on,
+    save_held_return_window_on, serve_after_return_deadline_for_authority,
 };
 // production opens release loans only inside queue reconciliation
 #[cfg(test)]

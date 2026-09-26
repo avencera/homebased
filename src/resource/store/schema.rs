@@ -200,6 +200,36 @@ CREATE TABLE IF NOT EXISTS resource_return_decisions (
     )
 );
 
+CREATE TABLE IF NOT EXISTS resource_return_windows (
+    action_id TEXT PRIMARY KEY,
+    loan_id TEXT NOT NULL REFERENCES loans(id),
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    window_json TEXT NOT NULL CHECK (
+        json_valid(window_json)
+        AND COALESCE(json_type(window_json) = 'object', 0)
+        AND COALESCE(json_extract(window_json, '$.action_id') = action_id, 0)
+        AND COALESCE(json_extract(window_json, '$.loan_id') = loan_id, 0)
+        AND COALESCE(json_extract(window_json, '$.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(window_json, '$.opened_at') = 'text', 0)
+        AND COALESCE(json_type(window_json, '$.deadline_at') = 'text', 0)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS resource_return_deadline_servings (
+    action_id TEXT PRIMARY KEY REFERENCES resource_return_windows(action_id),
+    loan_id TEXT NOT NULL REFERENCES loans(id),
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND COALESCE(json_type(receipt_json) = 'object', 0)
+        AND COALESCE(json_extract(receipt_json, '$.window.action_id') = action_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.window.loan_id') = loan_id, 0)
+        AND COALESCE(json_extract(receipt_json, '$.window.resource_id') = resource_id, 0)
+        AND COALESCE(json_type(receipt_json, '$.return_context') = 'object', 0)
+        AND COALESCE(json_type(receipt_json, '$.request_id') = 'text', 0)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS resource_restore_closures (
     action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
     task_id TEXT NOT NULL UNIQUE,

@@ -530,3 +530,107 @@ async fn ongoing_unproven_or_unconfirmed_trainer_keeps_request_queued_and_does_n
         drop(lock_holder);
     }
 }
+
+#[tokio::test]
+async fn an_undecided_return_serves_late_queued_work_after_its_deadline() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let authority = load_or_create_machine_id(&home).unwrap();
+    let fixture = TrainerAssociationFixture::new_for_home(directory, &home, authority);
+    let marker = fixture.home.join("activation-count");
+    let request_spec = fake_resource_task_spec(&fixture.home, &marker);
+    let (mut fixture, binding, _, _, _, loan_id) = release_completion_fixture_with(
+        fixture,
+        request_spec.clone(),
+        machine_other_than(authority),
+    );
+    publish_completed_result(
+        &mut fixture,
+        &binding,
+        ProcessGroupExitEvidence::ConfirmedExited,
+    );
+    let resource_id = fixture.resource.id;
+    drop(fixture.store);
+
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+    let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+    let LoanState::Active {
+        phase: LoanPhase::AwaitingReturn {
+            action_id: expired, ..
+        },
+    } = loan.state
+    else {
+        unreachable!("the helper returns only an AwaitingReturn loan");
+    };
+
+    let late = call(&store, |reply| StoreMsg::AcceptResourceRequest {
+        authority_machine: authority,
+        request_id: RequestId::new(),
+        task_id: TaskId::new(),
+        resource_id,
+        origin_machine: machine_other_than(authority),
+        normalized_spec: Box::new(request_spec),
+        reply,
+    })
+    .await
+    .unwrap();
+    call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
+        id: resource_id,
+        reply,
+    })
+    .await
+    .unwrap();
+    // the open window keeps the late request queued
+    assert!(
+        call(&store, |reply| StoreMsg::GetTask {
+            id: late.task_id,
+            reply,
+        })
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    // close the window now instead of waiting for the default grace
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    rusqlite::Connection::open(home.db_path())
+        .unwrap()
+        .execute(
+            "UPDATE resource_return_windows
+             SET window_json = json_set(window_json, '$.deadline_at', ?1)
+             WHERE action_id = ?2",
+            rusqlite::params![now, expired.as_uuid().to_string()],
+        )
+        .unwrap();
+    call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
+        id: resource_id,
+        reply,
+    })
+    .await
+    .unwrap();
+
+    let row = wait_for_terminal_task(&store, late.task_id).await;
+    assert_eq!(row.status(), ProcessStatus::Succeeded);
+    let loan = wait_for_awaiting_return(&supervisor, resource_id).await;
+    assert_eq!(loan.id, loan_id);
+    assert!(matches!(
+        loan.state,
+        LoanState::Active {
+            phase: LoanPhase::AwaitingReturn { action_id, .. }
+        } if action_id != expired
+    ));
+
+    stop_test_supervisor(supervisor, handle).await;
+}

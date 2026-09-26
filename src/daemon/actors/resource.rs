@@ -1,6 +1,8 @@
 //! Authority-owned queue reconciliation for one resource
 
+use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorId, ActorProcessingErr, ActorRef, RpcReplyPort};
+use tokio::task::AbortHandle;
 
 use crate::daemon::actors::supervisor::ReleaseWatcherLaunch;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call, send_reply};
@@ -14,13 +16,13 @@ use crate::resource::store::{
     AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome, CompleteReleaseError,
     ReleaseCompletionResult, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
     ResourceSnapshot, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
-    ResourceTaskCompletionResult,
+    ResourceTaskCompletionResult, ReturnDeadlineOutcome,
 };
 use crate::resource::{
     ActionId, Loan, LoanPhase, LoanState, ReleaseProofAttentionReason, ReleaseWatcherIntent,
     ReleaseWatcherTaskId, Resource, ResourceId, ResourceQueueAttentionReason,
     ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState, RestoreAttentionReason,
-    SupervisorActionAuthority,
+    ReturnDecisionWindow, SupervisorActionAuthority,
 };
 use crate::store::{BackgroundLaunchPhase, BackgroundLaunchView, RestoreReconcileOutcome};
 use crate::submission::{RequestId, normalized_spec_sha256};
@@ -281,6 +283,23 @@ pub struct ResourceActorState {
     restore_launch: Option<RestoreLaunchAttempt>,
     background_launch: Option<BackgroundLaunchAttempt>,
     pending_background_task: Option<TaskId>,
+    return_deadline_wake: Option<ReturnDeadlineWake>,
+}
+
+/// Wake armed for the saved deadline of one pending return action
+///
+/// The store decides from its saved window whether the deadline passed, so a
+/// wake that fires early, or before a hold moved the deadline, only arms again
+struct ReturnDeadlineWake {
+    action_id: ActionId,
+    deadline_at: DateTime<Utc>,
+    wake: AbortHandle,
+}
+
+impl Drop for ReturnDeadlineWake {
+    fn drop(&mut self) {
+        self.wake.abort();
+    }
 }
 
 // each phase launches through a different supervisor path and can outlive the
@@ -394,6 +413,7 @@ impl Actor for ResourceActor {
             restore_launch: None,
             background_launch: None,
             pending_background_task: None,
+            return_deadline_wake: None,
         };
         reconcile_and_refresh(&myself, &mut state).await?;
 
@@ -553,6 +573,10 @@ async fn reconcile_and_refresh(
 
     if let Some(launch_outcome) = observe_background_launch(state, &snapshot, &outcome).await? {
         outcome = launch_outcome;
+    }
+
+    if let Some(deadline_outcome) = reconcile_return_deadline(myself, state, &mut snapshot).await? {
+        outcome = deadline_outcome;
     }
 
     state.resource = snapshot.resource;
@@ -934,6 +958,91 @@ async fn reconcile_restore(
             // a newly opened loan still needs its watcher and assignment steps
             myself.cast(ResourceMsg::Wake)?;
             Ok(Some(outcome))
+        }
+    }
+}
+
+/// Serve queued work from an undecided return once its window closes
+///
+/// While the window is open, one wake is armed for its saved deadline. The
+/// store serves the next queued request from the same loan only after the
+/// deadline, so the supervisor's decision and this transition cannot both win
+async fn reconcile_return_deadline(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    snapshot: &mut ResourceSnapshot,
+) -> Result<Option<ResourceQueueReconcileOutcome>, AppError> {
+    if awaiting_return_action(snapshot).is_none() {
+        state.return_deadline_wake = None;
+        return Ok(None);
+    }
+    let served = call(&state.store, |reply| StoreMsg::ServeAfterReturnDeadline {
+        authority_machine: state.authority_machine,
+        resource_id: snapshot.resource.id,
+        reply,
+    })
+    .await?;
+    match served {
+        Err(error) => {
+            let resource = snapshot.resource.id.as_uuid();
+            tracing::warn!(%resource, "return deadline check failed: {error}");
+            Ok(None)
+        }
+        Ok(ReturnDeadlineOutcome::Open { window }) => {
+            arm_return_deadline_wake(myself, state, &window);
+            Ok(None)
+        }
+        Ok(ReturnDeadlineOutcome::NotAwaiting | ReturnDeadlineOutcome::NoQueuedRequest) => {
+            // a request accepted later reconciles this actor again
+            state.return_deadline_wake = None;
+            Ok(None)
+        }
+        Ok(ReturnDeadlineOutcome::Served { loan, request }) => {
+            state.return_deadline_wake = None;
+            let resource = snapshot.resource.id.as_uuid();
+            let request_id = request.request_id.0;
+            tracing::info!(
+                %resource,
+                %request_id,
+                "return decision window closed; serving the next queued request"
+            );
+            *snapshot = load_snapshot(state).await?;
+            // the serving loan still needs its assignment launch
+            myself.cast(ResourceMsg::Wake)?;
+            Ok(Some(ResourceQueueReconcileOutcome::LoanAlreadyActive {
+                loan: *loan,
+            }))
+        }
+    }
+}
+
+/// Arm one wake for the deadline of `window`, replacing a wake for an older deadline
+fn arm_return_deadline_wake(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    window: &ReturnDecisionWindow,
+) {
+    if state.return_deadline_wake.as_ref().is_some_and(|armed| {
+        armed.action_id == window.action_id && armed.deadline_at == window.deadline_at
+    }) {
+        return;
+    }
+    let wait = window.remaining_at(Utc::now());
+    let wake = myself.send_after(wait, || ResourceMsg::Wake).abort_handle();
+    state.return_deadline_wake = Some(ReturnDeadlineWake {
+        action_id: window.action_id,
+        deadline_at: window.deadline_at,
+        wake,
+    });
+}
+
+fn awaiting_return_action(snapshot: &ResourceSnapshot) -> Option<ActionId> {
+    match &snapshot.loan.as_ref()?.state {
+        LoanState::Active {
+            phase: LoanPhase::AwaitingReturn { action_id, .. },
+        } => Some(*action_id),
+        LoanState::Active { .. } | LoanState::NeedsAttention { .. } | LoanState::Closed { .. } => {
+            None
         }
     }
 }

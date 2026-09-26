@@ -13,8 +13,8 @@ use crate::machine::MachineId;
 use crate::resource::operator_release::{OperatorGpuFreeAttestation, OperatorGpuFreeReceipt};
 use crate::resource::{
     AcceptanceSequence, ActionId, AssignmentRevision, Loan, LoanId, LoanPhase, NoticeId, Resource,
-    ResourceId, ResourceRequestState, ResourceRevision, ReturnContext, ReturnExecutionMode,
-    SupervisorAddress, SupervisorNotice,
+    ResourceId, ResourceRequestState, ResourceRevision, ReturnContext, ReturnDecisionWindow,
+    ReturnExecutionMode, SupervisorAddress, SupervisorNotice,
 };
 use crate::submission::RequestId;
 
@@ -56,6 +56,9 @@ pub struct ResourceOverview {
     /// First background launch that reserves the unregistered resource, if one does
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_launch: Option<BackgroundLaunchReservation>,
+    /// Decision window of the pending return action, when the loan awaits one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_window: Option<ReturnDecisionWindow>,
 }
 
 /// First background launch that reserves a resource before its task is registered
@@ -132,6 +135,9 @@ pub struct ResourceDetail {
     /// Accepted execution mode of the exact current Restoring loan, when proven
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_execution_mode: Option<ReturnExecutionMode>,
+    /// Decision window of the pending return action, when the loan awaits one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_window: Option<ReturnDecisionWindow>,
 }
 
 /// One queued, assigned, or retained request without its private command content
@@ -254,6 +260,9 @@ pub struct PendingActionView {
     pub return_context: Option<ReturnContext>,
     /// Durable notice for the action, when one exists
     pub notice: Option<SupervisorNotice>,
+    /// Decision window of the pending return action, when the loan awaits one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_window: Option<ReturnDecisionWindow>,
 }
 
 /// Decision that one open action requires

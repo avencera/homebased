@@ -48,7 +48,8 @@ use super::Store;
 use crate::domain::{TaskId, TaskRow};
 use crate::machine::MachineId;
 use crate::resource::store::{
-    ResourceQueueReconcileError, ResourceSnapshot, ResourceStoreError, SupervisorNoticeStoreError,
+    ResourceQueueReconcileError, ResourceSnapshot, ResourceStoreError, ReturnDeadlineOutcome,
+    SupervisorNoticeStoreError,
     bind_release_watcher_for_authority as persist_release_watcher_binding,
     pending_supervisor_notices as load_pending_supervisor_notices,
     reconcile_resource_queue_for_authority as persist_resource_queue_reconciliation,
@@ -56,6 +57,7 @@ use crate::resource::store::{
     register_resource_for_authority, requests_for_resource_for_authority,
     reserve_supervisor_notice_attempt as reserve_notice_attempt,
     resources_for_authority as load_resources_for_authority, select_resource,
+    serve_after_return_deadline_for_authority,
     settle_supervisor_notice_attempt as settle_notice_attempt,
     supervisor_notice as load_supervisor_notice,
 };
@@ -100,6 +102,20 @@ impl Store {
         resource_id: ResourceId,
     ) -> Result<ResourceQueueReconcileOutcome, ResourceQueueReconcileError> {
         persist_resource_queue_reconciliation(&mut self.conn, authority_machine, resource_id)
+    }
+
+    /// Serve the next queued request once the pending return action's window closed
+    pub(crate) fn serve_after_return_deadline_for_authority(
+        &mut self,
+        authority_machine: MachineId,
+        resource_id: ResourceId,
+    ) -> Result<ReturnDeadlineOutcome, ResourceStoreError> {
+        serve_after_return_deadline_for_authority(
+            &mut self.conn,
+            authority_machine,
+            resource_id,
+            chrono::Utc::now(),
+        )
     }
 
     /// Bind one preallocated watcher launch identity to its saved release action

@@ -11,6 +11,9 @@
 //! process-group exit, or a removed container. Any other end needs an explicit
 //! supervisor resolution
 
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -30,14 +33,16 @@ use crate::resource::command_shape::{DirectSegmentCommandShape, same_run_resume_
 use crate::resource::foreground::{self, CommandOwnershipContract};
 use crate::resource::store::{
     ResourceStoreError, release_checkpoint_state_for_action, release_completion_for_loan,
-    select_non_closed_loan, select_resource, select_supervisor_notice_record_by_action,
+    return_window_on, save_held_return_window_on, select_non_closed_loan, select_resource,
+    select_supervisor_notice_record_by_action,
 };
 use crate::resource::trainer_publication::revalidate_checkpoint_publication;
 use crate::resource::{
     ActionId, Loan, LoanClosure, LoanId, LoanPhase, LoanState, ReleaseCheckpointPhase, Resource,
     ResourceId, ResourceRevision, ResourceTaskOwnershipRisk, RestoreAttentionReason, ReturnContext,
-    ReturnDecision, ReturnDecisionRejection, ReturnExecutionMode, ReturnLaunch, ReturnWork,
-    SameRunResumeGap, SupervisorActionAuthority, SupervisorAddress, SupervisorNoticePayload,
+    ReturnDecision, ReturnDecisionRejection, ReturnDecisionWindow, ReturnExecutionMode,
+    ReturnHoldRejection, ReturnLaunch, ReturnWork, SameRunResumeGap, SupervisorActionAuthority,
+    SupervisorAddress, SupervisorNoticePayload,
 };
 use crate::spec::{NormalizedSpec, NormalizedTaskWorkload, NormalizedWorkload};
 use crate::store::IdentityError;
@@ -192,6 +197,9 @@ pub(crate) enum ReturnDecisionError {
     /// The typed decision does not fit the saved action
     #[error(transparent)]
     Rejected(#[from] ReturnDecisionRejection),
+    /// The hold cannot move the deadline of the saved action
+    #[error(transparent)]
+    HoldRejected(#[from] ReturnHoldRejection),
     /// The decision does not come from the current supervisor assignment
     #[error("return decision is not from the current supervisor assignment")]
     NotCurrentSupervisor,
@@ -447,6 +455,15 @@ impl crate::store::Store {
         record_no_resume_for_authority(&mut self.conn, authority, reason)
     }
 
+    /// Move the decision deadline of one exact pending return action
+    pub(crate) fn hold_return_for_authority(
+        &mut self,
+        authority: SupervisorActionAuthority,
+        hold: Duration,
+    ) -> Result<ReturnDecisionWindow, ReturnDecisionError> {
+        hold_return_for_authority(&mut self.conn, authority, hold, Utc::now())
+    }
+
     /// Derive the canonical return task for one pending decision without binding it
     pub(crate) fn prepare_return_task_for_authority(
         &mut self,
@@ -489,6 +506,30 @@ impl crate::store::Store {
     ) -> Result<Vec<TaskId>, ReturnDecisionError> {
         restoring_task_ids_for_authority(&self.conn, authority_machine)
     }
+}
+
+/// Move the decision deadline of one exact AwaitingReturn action
+///
+/// A hold is not a decision: it changes neither the loan nor the resource
+/// revision, so the supervisor decides later with the same pending action
+fn hold_return_for_authority(
+    conn: &mut Connection,
+    authority: SupervisorActionAuthority,
+    hold: Duration,
+    now: DateTime<Utc>,
+) -> Result<ReturnDecisionWindow, ReturnDecisionError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pending = pending_return(&tx, &authority)?;
+    let window = return_window_on(&tx, authority.action_id)?
+        .filter(|window| window.loan_id == pending.loan.id)
+        .ok_or(ReturnDecisionError::ActionNotPending {
+            loan_id: authority.loan_id,
+            action_id: authority.action_id,
+        })?;
+    let held = window.hold(now, hold)?;
+    save_held_return_window_on(&tx, &window, &held)?;
+    tx.commit()?;
+    Ok(held)
 }
 
 /// Close one exact AwaitingReturn loan without starting background work
@@ -1282,7 +1323,8 @@ fn pending_return(
         });
     }
     // the reservation revision is the decision boundary; queued requests accepted
-    // after it do not change the revision and cannot supersede this action
+    // after it do not change the revision, and only the expired decision window
+    // lets one of them supersede this action
     for actual in [notice.state_revision, resource.state_revision] {
         if actual != authority.expected_state_revision {
             return Err(ReturnDecisionError::StaleRevision {

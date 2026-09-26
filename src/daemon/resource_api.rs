@@ -1690,6 +1690,7 @@ async fn local_overviews(state: &AppState) -> Result<Vec<ResourceOverview>, AppE
             current_task: current_task_id(&model).and_then(|id| tasks.get(&id).cloned()),
             attention: attention(&model, inspection.as_ref()),
             background_launch: background_launch_reservation(&model),
+            return_window: model.return_window,
             resource: model.resource,
             loan: model.loan,
         });
@@ -1720,6 +1721,7 @@ async fn local_detail(
     Ok(Some(ResourceDetail {
         background_launch,
         return_execution_mode: model.return_execution_mode,
+        return_window: model.return_window,
         api_version: API_VERSION,
         requests: model.requests.iter().map(request_view).collect(),
         current_task: current_task_id.and_then(|id| tasks.get(&id).cloned()),
@@ -1779,6 +1781,9 @@ fn pending_action(model: &ResourceReadModel) -> Option<PendingActionView> {
             .iter()
             .find(|notice| notice.action_id == action_id)
             .cloned(),
+        return_window: model
+            .return_window
+            .filter(|window| window.action_id == action_id),
     })
 }
 

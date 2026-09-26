@@ -22,7 +22,7 @@ use crate::error::AppError;
 use crate::events::EventPayload;
 use crate::events::{DeliveryState, EventError, TaskEvent};
 use crate::machine::MachineId;
-use crate::resource::store::RESOURCE_SCHEMA;
+use crate::resource::store::{RESOURCE_SCHEMA, open_missing_return_windows_on};
 use crate::spec::NormalizedSpec;
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutionRecord, ExecutorIdentity, OriginRoute,
@@ -457,7 +457,16 @@ ALTER TABLE resource_requests_v31 RENAME TO resource_requests;
 /// Move a released schema version 30 database to the current schema
 fn migrate_30_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_30_TO_CURRENT)?;
-    conn.execute_batch(RESOURCE_SCHEMA)
+    migrate_31_to_current(conn)
+}
+
+/// Released v0.8 databases use schema version 31
+const RELEASED_V0_8_SCHEMA_VERSION: i64 = 31;
+
+/// Add return decision windows, and open one for each loan that already awaits a return
+fn migrate_31_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(RESOURCE_SCHEMA)?;
+    open_missing_return_windows_on(conn, Utc::now())
 }
 
 /// Why `Store::open` refuses a database version
@@ -839,6 +848,7 @@ impl Store {
                 RELEASED_V0_5_SCHEMA_VERSION => migrate_28_to_current(&transaction)?,
                 RELEASED_V0_5_1_SCHEMA_VERSION => migrate_29_to_current(&transaction)?,
                 RELEASED_V0_7_SCHEMA_VERSION => migrate_30_to_current(&transaction)?,
+                RELEASED_V0_8_SCHEMA_VERSION => migrate_31_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2367,7 +2377,8 @@ mod tests {
     use super::{
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
         RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
-        Store, new_queued_task, read_exit_json, write_exit_json_with_evidence,
+        RELEASED_V0_8_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
+        write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -3864,6 +3875,7 @@ CREATE TABLE reports (
                 .execute("DROP TABLE resource_initial_idle_attestations", [])
                 .unwrap();
         }
+        drop_return_window_tables(&store);
         store
             .conn
             .pragma_update(None, "user_version", version)
@@ -3994,6 +4006,43 @@ CREATE TABLE reports (
         schema_sql(&store, "resource_requests_queued_serving_order");
         assert_resource_tables_installed(&store);
         assert_foreign_keys_enabled(&store);
+    }
+
+    /// Remove the tables that schema version 32 added, as a released database lacks them
+    fn drop_return_window_tables(store: &Store) {
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE resource_return_deadline_servings;
+                 DROP TABLE resource_return_windows;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn released_v0_8_database_gains_return_windows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            drop_return_window_tables(&store);
+            store
+                .conn
+                .pragma_update(None, "user_version", RELEASED_V0_8_SCHEMA_VERSION)
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(schema_sql(&store, "resource_return_windows").contains("deadline_at"));
+        assert!(schema_sql(&store, "resource_return_deadline_servings").contains("receipt_json"));
+        store.require_task(id).unwrap();
     }
 
     #[test]

@@ -6,7 +6,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::time::Duration;
 
+use chrono::SecondsFormat;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -127,11 +129,15 @@ pub enum ResourceCommand {
         #[arg(long, required = true, value_name = "FILE")]
         pending_spec: String,
     },
-    /// Make an explicit return choice for a pending action
+    /// Make an explicit return choice for a pending action, or hold it open longer
     ///
     /// Works on the same machine as the resource authority or on another machine
     /// A retry with the same identities replays the saved result and never starts
     /// the task again; a different choice for the same action is a conflict
+    ///
+    /// Queued requests take the resource 2 minutes after the return action opens
+    /// unless a choice exists. `--hold` moves that deadline to now plus the given
+    /// time, up to 10 minutes after the action opened, and is not a choice
     Return {
         /// Stable return action UUID
         #[arg(value_name = "ACTION_ID")]
@@ -140,16 +146,28 @@ pub enum ResourceCommand {
         #[arg(long, required = true, value_name = "FILE")]
         pending_spec: String,
         /// JSON file containing one tagged ReturnWork choice, not a task-submit spec
-        #[arg(long, conflicts_with = "no_resume", requires_all = ["request_id", "task_id"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["no_resume", "hold"],
+            requires_all = ["request_id", "task_id"]
+        )]
         resume_spec: Option<String>,
         /// Close the return action without starting background work and record this reason
         #[arg(
             long,
             value_name = "REASON",
-            conflicts_with = "resume_spec",
-            required_unless_present = "resume_spec"
+            conflicts_with_all = ["resume_spec", "hold"],
+            required_unless_present_any = ["resume_spec", "hold"]
         )]
         no_resume: Option<String>,
+        /// Keep queued requests waiting this much longer for a choice, such as `5m`
+        #[arg(
+            long,
+            value_name = "DURATION",
+            value_parser = humantime::parse_duration,
+            conflicts_with_all = ["resume_spec", "no_resume"]
+        )]
+        hold: Option<Duration>,
         /// Stable retry identity for the return task
         #[arg(long, requires = "resume_spec")]
         request_id: Option<Uuid>,
@@ -382,19 +400,20 @@ pub async fn run(ctx: &Ctx, command: ResourceCommand) -> Result<ExitCode, AppErr
             pending_spec,
             resume_spec,
             no_resume,
+            hold,
             request_id,
             task_id,
         } => {
-            return_action(
-                ctx,
-                action_id,
-                &pending_spec,
-                resume_spec.as_deref(),
-                no_resume.as_deref(),
-                request_id,
-                task_id,
-            )
-            .await
+            let choice = match hold {
+                Some(hold) => ReturnChoice::Hold(hold),
+                None => ReturnChoice::Decide {
+                    resume_path: resume_spec.as_deref(),
+                    no_resume: no_resume.as_deref(),
+                    request_uuid: request_id,
+                    task_id,
+                },
+            };
+            return_action(ctx, action_id, &pending_spec, choice).await
         }
         ResourceCommand::Resolve {
             loan_id,
@@ -1437,14 +1456,22 @@ async fn release_watch(
     emit_action(ctx, response, context.resource_id, context.action_id)
 }
 
+/// Parsed `resource return` flags: one decision, or a hold of the decision window
+enum ReturnChoice<'a> {
+    Decide {
+        resume_path: Option<&'a str>,
+        no_resume: Option<&'a str>,
+        request_uuid: Option<Uuid>,
+        task_id: Option<TaskId>,
+    },
+    Hold(Duration),
+}
+
 async fn return_action(
     ctx: &Ctx,
     action_uuid: Uuid,
     pending_path: &str,
-    resume_path: Option<&str>,
-    no_resume: Option<&str>,
-    request_uuid: Option<Uuid>,
-    task_id: Option<TaskId>,
+    choice: ReturnChoice<'_>,
 ) -> Result<ExitCode, AppError> {
     validate_uuid("ACTION_ID", action_uuid)?;
     let client = Client::new(ctx.home.sock_path());
@@ -1466,6 +1493,24 @@ async fn return_action(
                 resource: context.resource_id,
                 message: "the pending return action has no return context".into(),
             })?;
+    let (resume_path, no_resume, request_uuid, task_id) = match choice {
+        ReturnChoice::Hold(hold) => {
+            let request = ResourceActionSubmitRequest {
+                api_version: API_VERSION,
+                authority: context.authority,
+                choice: ResourceActionChoice::HoldReturn { hold },
+            };
+            let response =
+                submit_action(&client, request, context.resource_id, context.action_id).await?;
+            return emit_action(ctx, response, context.resource_id, context.action_id);
+        }
+        ReturnChoice::Decide {
+            resume_path,
+            no_resume,
+            request_uuid,
+            task_id,
+        } => (resume_path, no_resume, request_uuid, task_id),
+    };
     let decision = match (resume_path, no_resume, request_uuid, task_id) {
         (Some(path), None, Some(request), Some(task)) => {
             validate_uuid("--request-id", request)?;
@@ -1482,7 +1527,7 @@ async fn return_action(
         },
         _ => {
             return Err(AppError::Usage {
-                message: "choose exactly one of --resume-spec or --no-resume; launch needs both --request-id and --task-id".into(),
+                message: "choose exactly one of --resume-spec, --no-resume, or --hold; launch needs both --request-id and --task-id".into(),
             });
         }
     };
@@ -1710,7 +1755,8 @@ async fn submit_action(
         ),
         ResourceActionChoice::Return {
             decision: ReturnDecision::NoResume { .. },
-        } => format!("action id {operation_id}"),
+        }
+        | ResourceActionChoice::HoldReturn { .. } => format!("action id {operation_id}"),
         ResourceActionChoice::ResolveEndedRestore { task_id, .. } => {
             format!("action id {operation_id} and task id {task_id}")
         }
@@ -1759,7 +1805,8 @@ fn check_action_outcome(
         ResourceActionChoice::Return {
             decision: ReturnDecision::NoResume { .. },
         }
-        | ResourceActionChoice::ResolveEndedRestore { .. } => (None, None),
+        | ResourceActionChoice::ResolveEndedRestore { .. }
+        | ResourceActionChoice::HoldReturn { .. } => (None, None),
     };
     let same_loan = |loan: &crate::resource::Loan| {
         loan.id == expected.loan_id && loan.resource_id == expected.resource_id
@@ -1791,8 +1838,20 @@ fn check_action_outcome(
             }
         }
         ResourceActionSubmitOutcome::Closed { loan, .. } => {
-            if expected_kind.is_some() || !same_loan(loan) {
+            if expected_kind.is_some()
+                || matches!(request.choice, ResourceActionChoice::HoldReturn { .. })
+                || !same_loan(loan)
+            {
                 return Err("the action response has a different loan identity");
+            }
+        }
+        ResourceActionSubmitOutcome::ReturnHeld { window } => {
+            if !matches!(request.choice, ResourceActionChoice::HoldReturn { .. })
+                || window.action_id != expected.action_id
+                || window.loan_id != expected.loan_id
+                || window.resource_id != expected.resource_id
+            {
+                return Err("the hold response names a different action");
             }
         }
         ResourceActionSubmitOutcome::Rejected { .. } => {}
@@ -1830,6 +1889,14 @@ fn emit_action(
         ResourceActionSubmitOutcome::Closed { .. } => {
             format!("resource action {} closed its loan", action_id.as_uuid())
         }
+        ResourceActionSubmitOutcome::ReturnHeld { window } => format!(
+            "resource action {} holds queued requests until {} (limit {})",
+            action_id.as_uuid(),
+            window
+                .deadline_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            window.limit_at().to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
         ResourceActionSubmitOutcome::Rejected { reason } => {
             return Err(action_rejection(resource_id, action_id, reason));
         }
@@ -2964,6 +3031,44 @@ mod tests {
         assert_eq!(parsed_request, uuid(request_id));
         assert_eq!(parsed_task, TaskId(uuid(task_id)));
 
+        let hold = Cli::try_parse_from([
+            "homebased",
+            "resource",
+            "return",
+            action,
+            "--pending-spec",
+            "pending.json",
+            "--hold",
+            "5m",
+        ])
+        .unwrap();
+        let Command::Resource {
+            command:
+                ResourceCommand::Return {
+                    hold: Some(parsed_hold),
+                    no_resume: None,
+                    resume_spec: None,
+                    ..
+                },
+        } = hold.command
+        else {
+            panic!("resource return --hold must parse as a hold without a decision");
+        };
+        assert_eq!(parsed_hold, std::time::Duration::from_secs(5 * 60));
+        let hold_and_decision = Cli::try_parse_from([
+            "homebased",
+            "resource",
+            "return",
+            action,
+            "--pending-spec",
+            "pending.json",
+            "--hold",
+            "5m",
+            "--no-resume",
+            "not now",
+        ]);
+        assert!(hold_and_decision.is_err());
+
         let loan_id = "019b4f42-0000-7000-8000-000000000027";
         let task_id = "019b4f42-0000-7000-8000-000000000028";
         let resolve = Cli::try_parse_from([
@@ -3368,6 +3473,7 @@ mod tests {
             phase: PendingActionPhase::ReturnRequired,
             return_context: None,
             notice: None,
+            return_window: None,
         };
 
         let context = action_context(&action).unwrap();

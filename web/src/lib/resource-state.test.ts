@@ -5,7 +5,8 @@ import {
 	detailStatus,
 	overviewStatus,
 	queueMovePlacement,
-	resourceQueue
+	resourceQueue,
+	returnPendingText
 } from './resource-state.ts';
 import type { ResourceDetail, ResourceOverviewItem } from './resources';
 
@@ -123,4 +124,57 @@ test('one-place queue moves use front and back at the ends', () => {
 	assert.equal(queueMovePlacement(four, 0, 'up'), null);
 	assert.equal(queueMovePlacement(four, 3, 'down'), null);
 	assert.equal(queueMovePlacement(four, -1, 'down'), null);
+});
+
+const returnWindow = (deadline: string) => ({
+	action_id: '66666666-6666-4666-8666-666666666666',
+	opened_at: '2026-09-26T06:00:00Z',
+	deadline_at: deadline
+});
+
+test('a pending return names when queued work may take the resource', () => {
+	const now = Date.parse('2026-09-26T06:01:00Z');
+	const open = returnWindow('2026-09-26T06:02:00Z');
+
+	assert.equal(
+		returnPendingText(2, open, now),
+		'Queued work starts at 1:02:00 AM unless the supervisor decides first'
+	);
+	assert.equal(
+		returnPendingText(0, open, now),
+		'The supervisor has until 1:02:00 AM to decide before new queued work can start'
+	);
+	assert.equal(
+		returnPendingText(1, returnWindow('2026-09-26T06:00:30Z'), now),
+		'The decision time ended; queued work starts now'
+	);
+	assert.equal(returnPendingText(1, undefined, now), 'The queue drained and return is reserved');
+});
+
+test('a queue card explains a pending return only while the loan awaits one', () => {
+	const detail: ResourceDetail = {
+		api_version: 1,
+		resource,
+		loan: {
+			id: '77777777-7777-4777-8777-777777777777',
+			resource_id: resource.id,
+			state: {
+				type: 'active',
+				phase: {
+					type: 'awaiting_return',
+					action_id: '66666666-6666-4666-8666-666666666666',
+					return_context: { type: 'idle' }
+				}
+			}
+		},
+		requests: [queuedRequest('first', 1)],
+		notices: [],
+		current_task: null,
+		background_task: null,
+		attention: null,
+		return_window: returnWindow('2999-01-01T00:00:00Z')
+	};
+
+	assert.match(resourceQueue(detail).returnPending ?? '', /^Queued work starts at /);
+	assert.equal(resourceQueue({ ...detail, loan: null }).returnPending, null);
 });

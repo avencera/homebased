@@ -1,11 +1,13 @@
 //! Durable supervisor notices and their bounded delivery attempts
 
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::codec::{StoredReadError, collect_decoded, stored_column, stored_id, stored_json};
+use super::return_window::open_return_window_on;
 use crate::resource::{
     ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, LoanState, NoticeId,
-    SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery,
+    SupervisorAddress, SupervisorNotice, SupervisorNoticeDelivery, SupervisorNoticePayload,
 };
 
 const SUPERVISOR_NOTICE_MAX_ATTEMPTS: u8 = 3;
@@ -113,6 +115,13 @@ pub(crate) fn insert_supervisor_notice_in_transaction(
             encode_supervisor_notice(notice)?,
         ],
     )?;
+    // a return notice opens its action, so the decision window starts with it
+    if matches!(
+        notice.payload,
+        SupervisorNoticePayload::ReturnRequired { .. }
+    ) {
+        open_return_window_on(tx, notice.action_id, notice.loan_id, Utc::now())?;
+    }
     Ok(notice.clone())
 }
 

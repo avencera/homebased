@@ -229,6 +229,9 @@
 				{#if !item.current && !item.background}
 					<p class="text-muted-foreground">Nothing holds this resource</p>
 				{/if}
+				{#if item.returnPending}
+					<p class="text-amber-700 dark:text-amber-300">{item.returnPending}</p>
+				{/if}
 
 				<div class="flex flex-col gap-1">
 					<span class="text-[11px] tracking-wide text-muted-foreground uppercase">

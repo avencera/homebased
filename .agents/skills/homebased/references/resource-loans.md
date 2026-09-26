@@ -94,6 +94,15 @@ launch or an ordinary task. After an operator inspects the authority GPU, the
 operator can run `resource initial-idle --spec <saved-document>` once on the
 authority machine. See the [runbook step](../../../../docs/resource-loans.md#mark-a-new-resource-idle).
 
+A `return_required` action gives the supervisor 2 minutes, counted from when
+it opened. Read `return_window.deadline_at` from pending. After the deadline, a
+queued request takes the resource from the same loan, and the action is no
+longer pending. The loan keeps its return context, and the next drained queue
+opens a new action. Decide quickly. If the choice needs more time, run
+`resource return <action-uuid> --pending-spec <saved-pending> --hold <duration>`
+first, for example `--hold 5m`. The hold stops at 10 minutes after the action
+opened. It is not a choice, so decide before the new deadline.
+
 Use `resource release-watch` only for a remote supervisor action. A co-located
 authority starts its watcher. Do not start another watcher. `resource return`
 and `resource resolve` work for remote and co-located supervisors. Keep the

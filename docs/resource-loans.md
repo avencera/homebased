@@ -503,8 +503,30 @@ with a new operation UUID.
 
 ### Choose what happens after the queue drains
 
-When the phase is `return_required`, use the `return_context` from pending. The
-return-work JSON is one of these exact tagged shapes:
+When the phase is `return_required`, use the `return_context` from pending.
+
+The supervisor has 2 minutes to decide, counted from when the return action
+opened. `return_window.deadline_at` in pending and `resource show` gives the
+exact time. If a request is queued after the deadline and no choice exists, the
+authority serves it from the same loan and the action closes. The loan keeps
+its `return_context`. When the queue drains again, a new return action opens
+with a new action UUID and a new 2 minute window. A choice for the closed
+action is refused as not pending.
+
+To think longer, hold the window before it closes:
+
+```sh
+homebased --json resource return <action-uuid> \
+  --pending-spec pending.json \
+  --hold 5m
+```
+
+A hold moves the deadline to now plus the given time. It never moves the
+deadline more than 10 minutes after the action opened, and it never makes the
+window shorter. A hold is not a choice. It does not change the resource
+revision, so the saved `pending.json` stays valid for the choice.
+
+The return-work JSON is one of these exact tagged shapes:
 
 ```json
 {"type":"same_run_resume","stopped_task":"<task-uuid-from-context>","recovery_ref":"<recovery-ref-from-context>"}

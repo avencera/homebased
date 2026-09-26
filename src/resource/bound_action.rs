@@ -5,11 +5,13 @@
 //! command, and the only spawn. The supervisor saves its fixed-ID origin route
 //! before it sends a launch, and every retry repeats the same identities
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ActionId, Loan, ResourceRevision, ReturnDecision, ReturnLaunch, ReturnWork,
-    SupervisorActionAuthority, validate_release_watcher_identity,
+    ActionId, Loan, ResourceRevision, ReturnDecision, ReturnDecisionWindow, ReturnLaunch,
+    ReturnWork, SupervisorActionAuthority, validate_release_watcher_identity,
 };
 use crate::domain::{API_VERSION, ProcessStatus, TaskId};
 use crate::machine::MachineId;
@@ -108,6 +110,12 @@ pub enum ResourceActionOperation {
         /// Supervisor's durable resolution reason
         reason: String,
     },
+    /// Keep queued work waiting longer for the return decision
+    HoldReturn {
+        /// Requested decision time from now, capped by the window limit
+        #[serde(with = "humantime_serde")]
+        hold: Duration,
+    },
 }
 
 impl ResourceActionOperation {
@@ -121,7 +129,9 @@ impl ResourceActionOperation {
             Self::PrepareReturn { .. } | Self::LaunchReturn { .. } => {
                 Some(ResourceActionKind::Return)
             }
-            Self::NoResume { .. } | Self::ResolveEndedRestore { .. } => None,
+            Self::NoResume { .. } | Self::ResolveEndedRestore { .. } | Self::HoldReturn { .. } => {
+                None
+            }
         }
     }
 
@@ -141,7 +151,8 @@ impl ResourceActionOperation {
             Self::PrepareReleaseWatcher { .. }
             | Self::PrepareReturn { .. }
             | Self::NoResume { .. }
-            | Self::ResolveEndedRestore { .. } => None,
+            | Self::ResolveEndedRestore { .. }
+            | Self::HoldReturn { .. } => None,
         }
     }
 }
@@ -420,6 +431,11 @@ pub enum ResourceActionOutcome {
         /// Resource revision committed with the closure
         state_revision: ResourceRevision,
     },
+    /// The authority saved a later deadline for the return decision
+    ReturnHeld {
+        /// Saved decision window of the action
+        window: ReturnDecisionWindow,
+    },
     /// The authority refused the request and wrote nothing
     Rejected {
         /// Definitive reason
@@ -481,6 +497,12 @@ pub enum ResourceActionChoice {
         /// Supervisor's durable resolution reason
         reason: String,
     },
+    /// Keep queued work waiting longer for the return decision
+    HoldReturn {
+        /// Requested decision time from now, capped by the window limit
+        #[serde(with = "humantime_serde")]
+        hold: Duration,
+    },
 }
 
 /// Socket request from the supervisor thread's machine to its own daemon
@@ -522,6 +544,11 @@ pub enum ResourceActionSubmitOutcome {
         loan: Loan,
         /// Resource revision committed with the closure
         state_revision: ResourceRevision,
+    },
+    /// The authority saved a later deadline for the return decision
+    ReturnHeld {
+        /// Saved decision window of the action
+        window: ReturnDecisionWindow,
     },
     /// The authority refused the action and wrote nothing
     Rejected {

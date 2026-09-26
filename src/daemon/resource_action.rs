@@ -286,7 +286,7 @@ pub(crate) async fn submit(
         ResourceActionChoice::Return {
             decision: ReturnDecision::NoResume { reason },
         } => {
-            submit_closure(
+            submit_without_task(
                 state,
                 authority,
                 ResourceActionOperation::NoResume { reason },
@@ -294,10 +294,18 @@ pub(crate) async fn submit(
             .await
         }
         ResourceActionChoice::ResolveEndedRestore { task_id, reason } => {
-            submit_closure(
+            submit_without_task(
                 state,
                 authority,
                 ResourceActionOperation::ResolveEndedRestore { task_id, reason },
+            )
+            .await
+        }
+        ResourceActionChoice::HoldReturn { hold } => {
+            submit_without_task(
+                state,
+                authority,
+                ResourceActionOperation::HoldReturn { hold },
             )
             .await
         }
@@ -353,6 +361,19 @@ async fn submit_co_located(
                     loan: closure.loan,
                     state_revision: closure.state_revision,
                 }),
+                Err(error) => rejected(error),
+            }
+        }
+        // a hold changes only the saved deadline, which the resource actor reads at its wake
+        ResourceActionChoice::HoldReturn { hold } => {
+            let held = call(&state.store, |reply| StoreMsg::HoldReturnForAuthority {
+                authority,
+                hold,
+                reply,
+            })
+            .await?;
+            match held {
+                Ok(window) => Ok(ResourceActionSubmitOutcome::ReturnHeld { window }),
                 Err(error) => rejected(error),
             }
         }
@@ -565,7 +586,9 @@ async fn create_route(
     let prepared = match send(state, authority, operation).await? {
         ResourceActionOutcome::Prepared { task } => task,
         ResourceActionOutcome::Rejected { reason } => return Ok(Err(reason)),
-        ResourceActionOutcome::Accepted { .. } | ResourceActionOutcome::Closed { .. } => {
+        ResourceActionOutcome::Accepted { .. }
+        | ResourceActionOutcome::Closed { .. }
+        | ResourceActionOutcome::ReturnHeld { .. } => {
             return Err(AppError::RemoteSubmissionUnavailable {
                 message: "resource authority answered prepare with another outcome".into(),
             });
@@ -678,7 +701,9 @@ async fn send_saved_launch(
             ResourceActionRouteResult::Accepted(receipt)
         }
         ResourceActionOutcome::Rejected { reason } => ResourceActionRouteResult::Rejected(reason),
-        ResourceActionOutcome::Prepared { .. } | ResourceActionOutcome::Closed { .. } => {
+        ResourceActionOutcome::Prepared { .. }
+        | ResourceActionOutcome::Closed { .. }
+        | ResourceActionOutcome::ReturnHeld { .. } => {
             return Err(unknown(
                 route,
                 "resource authority answered a launch with another outcome",
@@ -695,7 +720,8 @@ async fn send_saved_launch(
     saved_outcome(&saved)
 }
 
-async fn submit_closure(
+/// Send one operation that binds no task, so no route is saved before it
+async fn submit_without_task(
     state: &AppState,
     authority: SupervisorActionAuthority,
     operation: ResourceActionOperation,
@@ -708,12 +734,16 @@ async fn submit_closure(
             loan,
             state_revision,
         }),
+        ResourceActionOutcome::ReturnHeld { window } => {
+            Ok(ResourceActionSubmitOutcome::ReturnHeld { window })
+        }
         ResourceActionOutcome::Rejected { reason } => {
             Ok(ResourceActionSubmitOutcome::Rejected { reason })
         }
         ResourceActionOutcome::Prepared { .. } | ResourceActionOutcome::Accepted { .. } => {
             Err(AppError::RemoteSubmissionUnavailable {
-                message: "resource authority answered a closure with another outcome".into(),
+                message: "resource authority answered a taskless operation with a task outcome"
+                    .into(),
             })
         }
     }
