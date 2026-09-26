@@ -32,12 +32,7 @@ pub async fn run(ctx: &Ctx, command: NotifyCommand) -> Result<ExitCode, AppError
 async fn test(ctx: &Ctx, message: Option<String>) -> Result<ExitCode, AppError> {
     let config = ctx.config_location()?.load()?;
     let notifier = Notifier::from_config(&config).ok_or(AppError::NotifyNotConfigured)?;
-    let topic = config
-        .notify
-        .ntfy
-        .as_ref()
-        .map(|settings| settings.topic().to_string())
-        .ok_or(AppError::NotifyNotConfigured)?;
+    let topic = notifier.topic().clone();
     let (machine_name, _) = config.machine_name();
     let message = match message {
         Some(message) => format!("{message} (homebased on {machine_name})"),

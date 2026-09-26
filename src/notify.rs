@@ -137,8 +137,6 @@ pub enum NoticePriority {
     Default,
     /// High ntfy priority, level 4
     High,
-    /// Urgent ntfy priority, level 5
-    Urgent,
 }
 
 impl NoticePriority {
@@ -146,7 +144,6 @@ impl NoticePriority {
         match self {
             Self::Default => 3,
             Self::High => 4,
-            Self::Urgent => 5,
         }
     }
 }
@@ -177,18 +174,15 @@ impl Notifier {
         config.notify.ntfy.clone().map(|config| Self { config })
     }
 
+    /// Borrow the configured topic
+    #[must_use]
+    pub fn topic(&self) -> &NtfyTopic {
+        self.config.topic()
+    }
+
     /// Send one notice and report a useful error if ntfy rejects it
     pub fn send(&self, notice: &Notice) -> Result<(), String> {
-        let token = match self.config.token_file() {
-            Some(path) => Some(read_token(path)?),
-            None => None,
-        };
-        if token
-            .as_deref()
-            .is_some_and(|token| token.chars().any(char::is_control))
-        {
-            return Err("ntfy token file must contain a token without control characters".into());
-        }
+        let token = self.config.token_file().map(read_token).transpose()?;
 
         let body = serde_json::json!({
             "topic": self.config.topic.as_str(),
@@ -219,7 +213,9 @@ impl Notifier {
 
 fn read_token(path: &Path) -> Result<String, String> {
     let path = expand_home(path)?;
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+    // follow symlinks so dotfile managers work; a FIFO or directory target is
+    // still rejected before any blocking open
+    let metadata = fs::metadata(&path).map_err(|error| {
         format!(
             "could not inspect ntfy token file {}: {error}",
             path.display()
@@ -251,6 +247,9 @@ fn read_token(path: &Path) -> Result<String, String> {
             "ntfy token file {} must contain a non-empty token",
             path.display()
         ));
+    }
+    if token.chars().any(char::is_control) {
+        return Err("ntfy token file must contain a token without control characters".into());
     }
 
     Ok(token)
@@ -307,7 +306,6 @@ mod tests {
         assert_eq!(config.server(), "https://ntfy.example");
         assert_eq!(NoticePriority::Default.ntfy_level(), 3);
         assert_eq!(NoticePriority::High.ntfy_level(), 4);
-        assert_eq!(NoticePriority::Urgent.ntfy_level(), 5);
     }
 
     #[test]
@@ -366,6 +364,26 @@ mod tests {
         let error = read_token(&non_regular).unwrap_err();
 
         assert!(error.contains(&non_regular.display().to_string()));
+        assert!(error.contains("must be a regular file"));
+    }
+
+    #[test]
+    fn read_token_follows_a_symlink_to_a_regular_file_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("token-target");
+        fs::write(&target, "linked-token\n").unwrap();
+        let link = directory.path().join("token");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(read_token(&link).unwrap(), "linked-token");
+
+        let fifo = directory.path().join("token-fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let fifo_link = directory.path().join("fifo-link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+
+        let error = read_token(&fifo_link).unwrap_err();
+
         assert!(error.contains("must be a regular file"));
     }
 }
