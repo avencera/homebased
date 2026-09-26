@@ -5,9 +5,14 @@
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
 	import Gpu from '@lucide/svelte/icons/gpu';
 	import X from '@lucide/svelte/icons/x';
-	import { isProcessStatus, peerTaskHref, type FleetMachine } from '$lib/api';
+	import { isProcessStatus, peerTaskHref, type FleetMachine, type ThreadRef } from '$lib/api';
 	import type { ResourceQueueStore } from '$lib/daemon.svelte';
-	import { queueMovePlacement, type ResourceQueue } from '$lib/resource-state';
+	import {
+		queueMovePlacement,
+		requestThread,
+		resourceTaskThread,
+		type ResourceQueue
+	} from '$lib/resource-state';
 	import { ResourceOperationManager } from '$lib/resource-operations.svelte';
 	import type { BrowserResourceAction, ResourceDetail, ResourceTaskSummary } from '$lib/resources';
 	import { machineHue } from '$lib/colors';
@@ -15,12 +20,15 @@
 	import Capsule from './Capsule.svelte';
 	import Elapsed from './Elapsed.svelte';
 	import StatusBadge from './StatusBadge.svelte';
+	import ThreadLabel from './ThreadLabel.svelte';
 
 	interface Props {
 		queues: readonly ResourceQueue[];
 		machines: readonly FleetMachine[];
 		resourceStore: ResourceQueueStore;
 		refreshDashboard: () => Promise<void>;
+		/** Title of the thread that started a job, or null while unknown. */
+		threadTitle: (ref: ThreadRef) => string | null;
 		/** Controls shown at the end of each card header. */
 		actions?: Snippet;
 		class?: string;
@@ -31,6 +39,7 @@
 		machines,
 		resourceStore,
 		refreshDashboard,
+		threadTitle,
 		actions,
 		class: className
 	}: Props = $props();
@@ -119,6 +128,17 @@
 	</button>
 {/snippet}
 
+{#snippet jobThread(ref: ThreadRef | null)}
+	{#if ref}
+		<ThreadLabel
+			thread={ref.thread}
+			title={threadTitle(ref)}
+			filterLink
+			class="text-[11px] text-muted-foreground"
+		/>
+	{/if}
+{/snippet}
+
 {#snippet holder(label: string, task: ResourceTaskSummary, authority: string)}
 	{@const machine = runsOn(task, authority)}
 	{@const peerHref = peerTaskHref(machine, task.id)}
@@ -142,6 +162,7 @@
 				<span class="truncate font-medium" title={task.display_name}>{task.display_name}</span>
 			{/if}
 		</div>
+		{@render jobThread(resourceTaskThread(task, authority))}
 		<div class="flex items-center gap-2 text-muted-foreground">
 			{#if isProcessStatus(task.status)}
 				<StatusBadge status={task.status} />
@@ -250,8 +271,11 @@
 									>
 										{index + 1}
 									</span>
-									<span class="min-w-0 flex-1 truncate" title={request.display_name}>
-										{request.display_name}
+									<span class="flex min-w-0 flex-1 flex-col">
+										<span class="truncate" title={request.display_name}>
+											{request.display_name}
+										</span>
+										{@render jobThread(requestThread(request))}
 									</span>
 									{#if request.origin_machine !== item.resource.authority_machine}
 										<Capsule hue={machineHue(origin)} title={`Requested from ${origin}`}

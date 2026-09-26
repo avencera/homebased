@@ -3,10 +3,24 @@
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import { ResourceOverviewStore } from '$lib/daemon.svelte';
 	import { formatCentralTimestamp, shortId } from '$lib/format';
-	import { overviewStatus, stringField, type ResourceStatus } from '$lib/resource-state';
+	import {
+		overviewStatus,
+		resourceTaskThread,
+		stringField,
+		type ResourceStatus
+	} from '$lib/resource-state';
 	import CopyPath from '$lib/components/CopyPath.svelte';
+	import ThreadLabel from '$lib/components/ThreadLabel.svelte';
+	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 
 	const store = new ResourceOverviewStore();
+	const threadTitles = new ThreadTitleStore(() =>
+		(store.overview?.resources ?? []).flatMap((item) => {
+			const current =
+				item.current_task && resourceTaskThread(item.current_task, item.resource.authority_machine);
+			return current ? [item.resource.supervisor, current] : [item.resource.supervisor];
+		})
+	);
 	const readFailureStatus = $derived.by((): ResourceStatus | null => {
 		if (!store.error) return null;
 		const unavailable = store.error.httpStatus === null || store.error.httpStatus >= 500;
@@ -141,13 +155,27 @@
 						<div class="mt-3 grid gap-x-3 gap-y-1 sm:grid-cols-[7rem_minmax(0,1fr)]">
 							<span class="text-muted-foreground">current task</span>
 							{#if item.current_task}
-								<a
-									href={resolve('/tasks/[id]', { id: item.current_task.id })}
-									class="truncate text-primary hover:underline"
-									title={item.current_task.display_name}
-								>
-									{item.current_task.display_name}
-								</a>
+								{@const currentThread = resourceTaskThread(
+									item.current_task,
+									item.resource.authority_machine
+								)}
+								<span class="flex min-w-0 flex-col">
+									<a
+										href={resolve('/tasks/[id]', { id: item.current_task.id })}
+										class="truncate text-primary hover:underline"
+										title={item.current_task.display_name}
+									>
+										{item.current_task.display_name}
+									</a>
+									{#if currentThread}
+										<ThreadLabel
+											thread={currentThread.thread}
+											title={threadTitles.title(currentThread)}
+											filterLink
+											class="text-muted-foreground"
+										/>
+									{/if}
+								</span>
 							{:else if item.resource.registered_background_task}
 								<a
 									href={resolve('/tasks/[id]', {
@@ -172,6 +200,11 @@
 							<span class="text-muted-foreground">supervisor</span>
 							<span class="flex min-w-0 items-center gap-1">
 								<span class="truncate">machine {shortId(item.resource.supervisor.machine)}</span>
+								{#if threadTitles.title(item.resource.supervisor)}
+									<span class="truncate" title={threadTitles.title(item.resource.supervisor)}>
+										&middot; {threadTitles.title(item.resource.supervisor)}
+									</span>
+								{/if}
 								<CopyPath
 									value={item.resource.supervisor.thread}
 									label={`thread ${shortId(item.resource.supervisor.thread)}`}

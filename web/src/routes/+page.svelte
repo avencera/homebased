@@ -10,6 +10,7 @@
 		PROCESS_STATUSES,
 		isInFlight,
 		isProcessStatus,
+		taskThread,
 		type ProcessStatus
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
@@ -18,7 +19,8 @@
 	import Capsule from '$lib/components/Capsule.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
 	import { DaemonStore, ResourceQueueStore } from '$lib/daemon.svelte';
-	import { isBusy } from '$lib/resource-state';
+	import { isBusy, queueThreads } from '$lib/resource-state';
+	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import { EM_DASH, projectName, shortId } from '$lib/format';
 	import { cn } from '$lib/utils';
 
@@ -46,6 +48,15 @@
 		store.machines.find((machine) => machine.location.type === 'local')?.name ?? null
 	);
 	const busyQueues = $derived(resourceStore.queues.filter(isBusy));
+	const threadTitles = new ThreadTitleStore(() => [
+		...visibleTasks.map(taskThread),
+		...busyQueues.flatMap(queueThreads)
+	]);
+	// the filter holds only a thread id, so its title comes from a listed task
+	const threadFilterTitle = $derived.by(() => {
+		const entry = thread ? store.tasks.find((candidate) => candidate.task.thread === thread) : null;
+		return entry ? threadTitles.title(taskThread(entry)) : null;
+	});
 	// while a resource runs or waits on work, tasks and its queue share the screen
 	const split = $derived(busyQueues.length > 0);
 
@@ -277,9 +288,9 @@
 				type="button"
 				onclick={() => navigate({ ...currentFilters, thread: null })}
 				class="rounded border border-primary/50 bg-primary/10 px-2 py-0.5 font-mono text-[11px] leading-5 hover:bg-accent"
-				title={`clear thread filter ${thread}`}
+				title={`clear thread filter ${threadFilterTitle ? `${threadFilterTitle} · ` : ''}${thread}`}
 			>
-				thread {shortId(thread)} &times;
+				thread {threadFilterTitle ?? shortId(thread)} &times;
 			</button>
 		{/if}
 		{#if project}
@@ -311,6 +322,7 @@
 				activeProject={project}
 				onThread={(next) => navigate({ ...currentFilters, thread: next })}
 				onProject={(next) => navigate({ ...currentFilters, project: next })}
+				threadTitle={threadTitles.title}
 				class="min-h-0"
 				actions={split ? tasksExpand : undefined}
 			>
@@ -333,6 +345,7 @@
 				machines={store.machines}
 				{resourceStore}
 				{refreshDashboard}
+				threadTitle={threadTitles.title}
 				class="scrollbar-none min-h-0 overflow-y-auto"
 			>
 				{#snippet actions()}

@@ -5,6 +5,7 @@ import {
 	detailStatus,
 	overviewStatus,
 	queueMovePlacement,
+	queueThreads,
 	resourceQueue,
 	returnPendingText
 } from './resource-state.ts';
@@ -177,4 +178,35 @@ test('a queue card explains a pending return only while the loan awaits one', ()
 
 	assert.match(resourceQueue(detail).returnPending ?? '', /^Queued work starts at /);
 	assert.equal(resourceQueue({ ...detail, loan: null }).returnPending, null);
+});
+
+test('job threads resolve to the machine that runs each thread', () => {
+	const peer = '88888888-8888-4888-8888-888888888888';
+	const task = (id: string, thread: string | undefined, origin: string | null) => ({
+		id,
+		display_name: id,
+		status: 'running',
+		thread,
+		origin_machine: origin,
+		execution_machine: origin ? resource.authority_machine : null
+	});
+	const detail: ResourceDetail = {
+		api_version: 1,
+		resource,
+		loan: null,
+		requests: [
+			{ ...queuedRequest('remote', 1), origin_machine: peer, thread: 'queued-thread' },
+			queuedRequest('older-authority', 2)
+		],
+		notices: [],
+		current_task: task('current', 'current-thread', peer),
+		background_task: task('background', 'background-thread', null),
+		attention: null
+	};
+
+	assert.deepEqual(queueThreads(resourceQueue(detail)), [
+		{ machine: peer, thread: 'current-thread' },
+		{ machine: resource.authority_machine, thread: 'background-thread' },
+		{ machine: peer, thread: 'queued-thread' }
+	]);
 });

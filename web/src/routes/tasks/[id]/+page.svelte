@@ -25,6 +25,7 @@
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { LOG_TAIL_LINES, TaskStore } from '$lib/daemon.svelte';
+	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import {
 		EM_DASH,
 		containerArgv,
@@ -41,6 +42,10 @@
 	const store = new TaskStore(() => page.params.id ?? '');
 	const task = $derived(store.task);
 	const live = $derived(task !== null && isInFlight(task.status));
+	// a task without an origin machine was submitted on this machine
+	const threadRef = $derived(task ? { machine: task.origin_machine, thread: task.thread } : null);
+	const threadTitles = new ThreadTitleStore(() => (threadRef ? [threadRef] : []));
+	const threadName = $derived(threadRef ? threadTitles.title(threadRef) : null);
 
 	let logBox = $state<HTMLElement | null>(null);
 	// Auto-follow starts on and stops as soon as the reader scrolls up.
@@ -128,7 +133,14 @@
 
 			<dt class="text-muted-foreground">thread</dt>
 			<dd class="flex min-w-0 items-center gap-1">
-				<CopyPath value={task.thread} label={shortId(task.thread, 13)} class="-ml-1" />
+				{#if threadName}
+					<span class="truncate" title={threadName}>{threadName}</span>
+				{/if}
+				<CopyPath
+					value={task.thread}
+					label={shortId(task.thread, 13)}
+					class={threadName ? 'text-muted-foreground' : '-ml-1'}
+				/>
 				<a
 					href={resolve(`/?thread=${task.thread}`)}
 					class="text-primary hover:underline"

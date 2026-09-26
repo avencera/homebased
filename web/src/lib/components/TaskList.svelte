@@ -3,7 +3,14 @@
 	import { resolve } from '$app/paths';
 	import Ban from '@lucide/svelte/icons/ban';
 	import Funnel from '@lucide/svelte/icons/funnel';
-	import { isInFlight, peerTaskHref, type FleetMachine, type FleetTask } from '$lib/api';
+	import {
+		isInFlight,
+		peerTaskHref,
+		taskThread,
+		type FleetMachine,
+		type FleetTask,
+		type ThreadRef
+	} from '$lib/api';
 	import { hueFor, machineHue } from '$lib/colors';
 	import { formatTimestamp, projectName, shortId, shortenHome, workloadLabel } from '$lib/format';
 	import { cn } from '$lib/utils';
@@ -11,6 +18,7 @@
 	import Capsule from './Capsule.svelte';
 	import Elapsed from './Elapsed.svelte';
 	import StatusBadge from './StatusBadge.svelte';
+	import ThreadLabel from './ThreadLabel.svelte';
 
 	interface Props {
 		tasks: readonly FleetTask[];
@@ -23,6 +31,8 @@
 		onThread: (thread: string | null) => void;
 		/** Receives null when the active project is clicked again, to clear the filter. */
 		onProject: (project: string | null) => void;
+		/** Title of a submitting thread, or null while unknown. */
+		threadTitle: (ref: ThreadRef) => string | null;
 		/** Rendered in place of rows when the list is empty. */
 		empty: Snippet;
 		/** Controls for a title bar; the bar shows only when there are some. */
@@ -37,6 +47,7 @@
 		activeProject,
 		onThread,
 		onProject,
+		threadTitle,
 		empty,
 		actions,
 		class: className
@@ -87,6 +98,7 @@
 				{@const machine = machineName(entry.machine)}
 				{@const project = projectName(task)}
 				{@const peerHref = peerTaskHref(machineById.get(entry.machine), task.id)}
+				{@const threadName = threadTitle(taskThread(entry))}
 				<li
 					class="task-grid relative grid items-center gap-x-3 gap-y-1 px-3 py-2 pl-4 hover:bg-accent/50 lg:py-1.5"
 					style:--hue={machineHue(machine)}
@@ -174,16 +186,16 @@
 						type="button"
 						onclick={() => onThread(activeThread === task.thread ? null : task.thread)}
 						class={cn(
-							'relative z-10 hidden items-center gap-1 justify-self-start rounded px-1 py-0.5 font-mono text-[11px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:inline-flex',
+							'relative z-10 hidden max-w-full min-w-0 items-center gap-1 justify-self-start rounded px-1 py-0.5 text-[12px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:inline-flex',
 							activeThread === task.thread && 'text-primary'
 						)}
 						aria-pressed={activeThread === task.thread}
 						title={activeThread === task.thread
 							? 'Show tasks from all threads'
-							: `Show only tasks from thread ${task.thread}`}
+							: `Show only tasks from thread ${threadName ? `${threadName} · ` : ''}${task.thread}`}
 					>
-						<Funnel class="size-3 opacity-60" aria-hidden="true" />
-						{shortId(task.thread)}
+						<Funnel class="size-3 shrink-0 opacity-60" aria-hidden="true" />
+						<ThreadLabel thread={task.thread} title={threadName} tooltip={false} />
 					</button>
 
 					<CallbackBadge
@@ -211,7 +223,7 @@
 		.task-grid {
 			grid-template-columns:
 				6rem minmax(14rem, 1.6fr) 6.5rem 4.5rem minmax(12rem, 1.2fr)
-				6.5rem 5rem;
+				minmax(8rem, 1fr) 5rem;
 			grid-template-areas: 'machine name status time cwd thread callback';
 		}
 	}

@@ -1,3 +1,4 @@
+import type { ThreadRef } from './api';
 import type {
 	BackgroundLaunchReservation,
 	ResourceDetail,
@@ -145,6 +146,26 @@ export function resourceQueue(detail: ResourceDetail): ResourceQueue {
 		queue,
 		returnPending: awaitingReturn ? returnPendingText(queue.length, detail.return_window) : null
 	};
+}
+
+/** Submitting thread of a resource task. A task with no origin never left the authority. */
+export function resourceTaskThread(task: ResourceTaskSummary, authority: string): ThreadRef | null {
+	return task.thread ? { machine: task.origin_machine ?? authority, thread: task.thread } : null;
+}
+
+/** Thread that requested one queued job. */
+export function requestThread(request: ResourceDetail['requests'][number]): ThreadRef | null {
+	return request.thread ? { machine: request.origin_machine, thread: request.thread } : null;
+}
+
+/** Every job thread that one resource queue shows. */
+export function queueThreads(queue: ResourceQueue): ThreadRef[] {
+	const authority = queue.resource.authority_machine;
+	return [
+		queue.current && resourceTaskThread(queue.current, authority),
+		queue.background && resourceTaskThread(queue.background, authority),
+		...queue.queue.map(requestThread)
+	].filter((ref) => ref !== null);
 }
 
 /** Return the placement for moving a queued request one place in serving order. */

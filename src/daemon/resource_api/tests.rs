@@ -106,6 +106,7 @@ impl Fixture {
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
             locks: crate::daemon::DaemonLocks::default(),
+            thread_titles: None,
         };
 
         let dashboard_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -2198,6 +2198,7 @@ mod co_located_action {
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
             locks: crate::daemon::DaemonLocks::default(),
+            thread_titles: None,
         }
     }
 

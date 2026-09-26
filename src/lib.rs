@@ -26,6 +26,7 @@ pub mod runner;
 pub mod spec;
 pub mod store;
 pub mod submission;
+pub mod thread_title;
 pub mod update;
 
 #[cfg(test)]

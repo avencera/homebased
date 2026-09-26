@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{CallbackStatus, ExitReason, ProcessStatus, TaskId};
+use crate::domain::{CallbackStatus, ExitReason, ProcessStatus, TaskId, ThreadId};
 use crate::machine::MachineId;
 use crate::resource::operator_release::{OperatorGpuFreeAttestation, OperatorGpuFreeReceipt};
 use crate::resource::{
@@ -152,6 +152,9 @@ pub struct ResourceRequestView {
     pub acceptance_sequence: AcceptanceSequence,
     /// Machine that owns the requesting thread and callback route
     pub origin_machine: MachineId,
+    /// Requesting thread, which runs on `origin_machine`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadId>,
     /// Submitted task name
     pub display_name: String,
     /// Queue state, separate from task process state
@@ -168,6 +171,10 @@ pub struct ResourceTaskSummary {
     pub display_name: String,
     /// Process status
     pub status: ProcessStatus,
+    /// Submitting thread, which runs on `origin_machine`, or on the executor
+    /// when `origin_machine` is unknown
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadId>,
     /// Machine that owns callbacks, when known
     pub origin_machine: Option<MachineId>,
     /// Machine that runs the task, when known

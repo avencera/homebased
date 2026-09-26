@@ -120,11 +120,15 @@ export interface TaskSummary {
 	display_name: string;
 	status: ProcessStatus;
 	workload: WorkloadView;
-	/** Submitting Codex thread. */
+	/** Submitting Codex thread or Claude Code session. */
 	thread: string;
 	cwd: string;
 	/** Git worktree root that the executor found, when there is one. */
 	project_root?: string | null;
+	/** Machine that runs the submitting thread. Absent for a task that stays on one machine. */
+	origin_machine?: string;
+	/** Machine that runs the task. Present with `origin_machine`. */
+	execution_machine?: string;
 	/** Worker pid while running. */
 	pid: number | null;
 	callback: CallbackStatus;
@@ -305,6 +309,8 @@ const TaskSummarySchema = Schema.Struct({
 	thread: Schema.String,
 	cwd: Schema.String,
 	project_root: Schema.optional(Schema.NullOr(Schema.String)),
+	origin_machine: Schema.optional(Schema.String),
+	execution_machine: Schema.optional(Schema.String),
 	pid: Schema.NullOr(Schema.Finite),
 	callback: CallbackStatusSchema,
 	timeout_secs: Schema.Finite,
@@ -335,6 +341,8 @@ const TaskDetailSchema = Schema.Struct({
 	workload: WorkloadSchema,
 	thread: Schema.String,
 	cwd: Schema.String,
+	origin_machine: Schema.optional(Schema.String),
+	execution_machine: Schema.optional(Schema.String),
 	pid: Schema.NullOr(Schema.Finite),
 	callback: CallbackStatusSchema,
 	timeout_secs: Schema.Finite,
@@ -367,6 +375,16 @@ const FleetTaskListSchema = Schema.Struct({
 		})
 	),
 	tasks: Schema.Array(Schema.Struct({ machine: Schema.String, task: TaskSummarySchema }))
+});
+const ThreadTitlesSchema = Schema.Struct({
+	api_version: Schema.Literal(API_VERSION),
+	titles: Schema.Array(
+		Schema.Struct({
+			machine: Schema.optional(Schema.String),
+			thread: Schema.String,
+			title: Schema.NullOr(Schema.String)
+		})
+	)
 });
 const LogTailSchema = Schema.Struct({
 	api_version: Schema.Literal(API_VERSION),
@@ -510,6 +528,37 @@ export function fetchFleetTasks(query: TaskQuery = {}): Promise<FleetTaskList> {
 export function peerTaskHref(machine: FleetMachine | undefined, id: string): string | null {
 	if (machine?.location.type !== 'peer' || !machine.location.address) return null;
 	return `${machine.location.address.replace(/\/+$/, '')}/tasks/${encodeURIComponent(id)}`;
+}
+
+/** One thread and the machine that runs it. */
+export interface ThreadRef {
+	/** Machine that runs the thread. Omitted for the machine that serves the dashboard. */
+	machine?: string;
+	thread: string;
+}
+
+/** Title of one requested thread, or null when no store names it. */
+export interface ThreadTitle extends ThreadRef {
+	title: string | null;
+}
+
+/** Submitting thread of a fleet task and the machine that runs it. */
+export function taskThread(entry: FleetTask): ThreadRef {
+	return { machine: entry.task.origin_machine ?? entry.machine, thread: entry.task.thread };
+}
+
+/** Most threads one title read may name. */
+export const MAX_THREAD_TITLES = 200;
+
+/**
+ * `POST /v1/fleet/thread-titles`: T3 Code title, else the agent's own title, read
+ * on the machine that runs each thread.
+ */
+export async function fetchThreadTitles(
+	threads: readonly ThreadRef[]
+): Promise<readonly ThreadTitle[]> {
+	const body = await postJson('/fleet/thread-titles', { threads }, ThreadTitlesSchema);
+	return body.titles;
 }
 
 /** `GET /v1/tasks/{id}`. */

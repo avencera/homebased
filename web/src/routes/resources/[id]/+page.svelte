@@ -6,7 +6,10 @@
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import CopyPath from '$lib/components/CopyPath.svelte';
+	import ThreadLabel from '$lib/components/ThreadLabel.svelte';
+	import type { ThreadRef } from '$lib/api';
 	import { ResourceDetailStore } from '$lib/daemon.svelte';
+	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import { formatCentralTimestamp, shortId } from '$lib/format';
 	import { ResourceOperationManager } from '$lib/resource-operations.svelte';
 	import {
@@ -22,6 +25,8 @@
 		stringField,
 		tagOf,
 		queueMovePlacement,
+		requestThread,
+		resourceTaskThread,
 		returnPendingText,
 		type ResourceStatus
 	} from '$lib/resource-state';
@@ -71,6 +76,17 @@
 	const otherRequests = $derived(
 		detail?.requests.filter((request) => tagOf(request.state) !== 'queued') ?? []
 	);
+	const threadTitles = new ThreadTitleStore(() => {
+		if (!detail) return [];
+		const authority = detail.resource.authority_machine;
+		return [
+			detail.resource.supervisor,
+			detail.current_task && resourceTaskThread(detail.current_task, authority),
+			detail.background_task && resourceTaskThread(detail.background_task, authority),
+			...detail.requests.map(requestThread)
+		].filter((ref) => ref !== null);
+	});
+	const supervisorTitle = $derived(detail ? threadTitles.title(detail.resource.supervisor) : null);
 	const currentRequest = $derived(
 		detail?.requests.find((request) => request.request_id === currentRequestIdValue) ?? null
 	);
@@ -418,6 +434,19 @@
 	}
 </script>
 
+{#snippet threadLine(ref: ThreadRef | null)}
+	{#if ref}
+		<p class="mt-1 flex min-w-0 items-baseline gap-1.5 text-muted-foreground">
+			<span class="shrink-0">thread</span>
+			<ThreadLabel thread={ref.thread} title={threadTitles.title(ref)} filterLink />
+		</p>
+	{/if}
+{/snippet}
+
+{#snippet requestThreadLine(request: ResourceDetail['requests'][number])}
+	{@render threadLine(requestThread(request))}
+{/snippet}
+
 <div class="mx-auto max-w-7xl px-4 py-4">
 	<header class="flex flex-wrap items-center gap-x-3 gap-y-1">
 		<a
@@ -537,6 +566,7 @@
 	{#if detail}
 		{@const currentTask = detail.current_task}
 		{@const backgroundTask = detail.background_task}
+		{@const holdingTask = currentTask ?? backgroundTask}
 		<section class="mt-3 rounded border border-border bg-card p-3">
 			<div class="flex flex-wrap items-start justify-between gap-3">
 				<div class="min-w-0">
@@ -544,6 +574,9 @@
 						what holds the GPU now
 					</p>
 					<h2 class="mt-1 text-sm font-semibold break-words">{holdsNowText(detail)}</h2>
+					{#if holdingTask}
+						{@render threadLine(resourceTaskThread(holdingTask, detail.resource.authority_machine))}
+					{/if}
 					<p class="mt-1 text-muted-foreground">{status?.message ?? 'Resource state is unknown'}</p>
 				</div>
 				<div class="flex flex-wrap items-center gap-2">
@@ -818,6 +851,9 @@
 						<p class="mt-2 break-all">machine {detail.resource.supervisor.machine}</p>
 						<div class="mt-1 flex flex-wrap items-center gap-1">
 							<span>thread</span>
+							{#if supervisorTitle}
+								<span class="min-w-0 break-words">{supervisorTitle}</span>
+							{/if}
 							<CopyPath
 								value={detail.resource.supervisor.thread}
 								label={detail.resource.supervisor.thread}
@@ -904,6 +940,7 @@
 									</span>
 								</div>
 								<p class="mt-1 text-muted-foreground">{waitReason(index)}</p>
+								{@render requestThreadLine(request)}
 								<p
 									class="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground"
 								>
@@ -1043,6 +1080,7 @@
 								{#if requestResult(request.state)}
 									<p class="mt-1 break-words">Result: {requestResult(request.state)}</p>
 								{/if}
+								{@render requestThreadLine(request)}
 								<p class="mt-1 font-mono text-[11px] text-muted-foreground">
 									request {request.request_id} · task {request.task_id}
 								</p>

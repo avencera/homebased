@@ -787,6 +787,7 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
         fleet: FleetState::Disabled,
         message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
         locks: crate::daemon::DaemonLocks::default(),
+        thread_titles: None,
     };
     let listener = UnixListener::bind(home.sock_path()).unwrap();
     let router = crate::daemon::api::socket_router(state.clone());

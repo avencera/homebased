@@ -21,6 +21,7 @@ mod resource_background;
 mod resource_notice_delivery;
 pub(crate) mod resource_notice_sender;
 mod resource_submit;
+mod thread_titles;
 pub mod web;
 
 use std::fs::File;
@@ -47,6 +48,7 @@ use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 use crate::machine::LocalIdentity;
 use crate::resource::ActionId;
 use crate::submission::RequestId;
+use crate::thread_title::TitleSources;
 
 /// Axum state: actor refs plus immutable path config
 #[derive(Clone)]
@@ -72,6 +74,8 @@ pub struct AppState {
     pub(crate) message_receiver: message_receiver::MessageReceiver,
     /// Per-key locks that serialize idempotent daemon sections
     pub(crate) locks: DaemonLocks,
+    /// Agent stores that name the threads on this machine, when `HOME` is known
+    pub thread_titles: Option<TitleSources>,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -149,6 +153,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         fleet,
         message_receiver: message_receiver::MessageReceiver::default(),
         locks: DaemonLocks::default(),
+        thread_titles: TitleSources::from_env(),
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),

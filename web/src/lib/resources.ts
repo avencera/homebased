@@ -28,6 +28,9 @@ const ResourceTaskSchema = Schema.Struct({
 	id: Schema.String,
 	display_name: Schema.String,
 	status: Schema.String,
+	/** Submitting thread. Older authorities omit it. */
+	thread: Schema.optional(Schema.String),
+	origin_machine: Schema.optional(Schema.NullOr(Schema.String)),
 	execution_machine: Schema.optional(Schema.NullOr(Schema.String)),
 	created_at: Schema.optional(Schema.String),
 	updated_at: Schema.optional(Schema.String),
@@ -52,6 +55,8 @@ const ResourceRequestSchema = Schema.Struct({
 	task_id: Schema.String,
 	acceptance_sequence: Schema.Finite,
 	origin_machine: Schema.String,
+	/** Requesting thread, which runs on `origin_machine`. Older authorities omit it. */
+	thread: Schema.optional(Schema.String),
 	display_name: Schema.String,
 	state: JsonObjectSchema
 });

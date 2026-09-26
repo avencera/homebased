@@ -51,6 +51,7 @@ pub fn read_routes() -> Router<AppState> {
         .merge(crate::daemon::fleet_api::read_routes())
         .merge(crate::daemon::resource_api::read_routes())
         .merge(crate::daemon::fleet_tasks::read_routes())
+        .merge(crate::daemon::thread_titles::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))

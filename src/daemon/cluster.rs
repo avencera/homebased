@@ -429,6 +429,7 @@ pub fn routes(fleet: FleetHandle) -> Router<AppState> {
         .merge(super::resource_background::cluster_routes())
         .merge(super::resource_api::cluster_routes())
         .merge(super::fleet_tasks::cluster_routes())
+        .merge(super::thread_titles::cluster_routes())
 }
 
 async fn receive_message(
@@ -2018,6 +2019,7 @@ mod resource_queue_tests {
             fleet: FleetState::Disabled,
             message_receiver: crate::daemon::message_receiver::MessageReceiver::default(),
             locks: crate::daemon::DaemonLocks::default(),
+            thread_titles: None,
         };
 
         let first = accept_resource_request(State(state.clone()), Json(request.clone()))

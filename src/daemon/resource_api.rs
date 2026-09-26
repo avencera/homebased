@@ -1874,6 +1874,7 @@ fn request_view(request: &ResourceRequest) -> ResourceRequestView {
         task_id: request.task_id,
         acceptance_sequence: request.acceptance_sequence,
         origin_machine: request.origin_machine,
+        thread: Some(request.spec().as_normalized().thread),
         display_name: request.spec().as_normalized().name.as_str().to_owned(),
         state: request.state.clone(),
     }
@@ -1911,6 +1912,7 @@ fn task_summary(summary: TaskSummary) -> ResourceTaskSummary {
         id: summary.id,
         display_name: summary.display_name,
         status: summary.status,
+        thread: Some(summary.thread),
         origin_machine: summary.origin_machine,
         execution_machine: summary.execution_machine,
         pid: summary.pid,
