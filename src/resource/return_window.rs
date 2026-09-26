@@ -21,19 +21,55 @@ pub const RETURN_DECISION_GRACE: Duration = Duration::from_secs(2 * 60);
 pub const RETURN_DECISION_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 /// Saved decision window of one return action
+///
+/// The fields are private so every window keeps its deadline between its
+/// opening and its hard limit, including a window decoded from saved JSON
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "SavedReturnDecisionWindow")]
 pub struct ReturnDecisionWindow {
-    /// Return action that this window belongs to
-    pub action_id: ActionId,
-    /// Loan that awaits the return decision
-    pub loan_id: LoanId,
-    /// Resource reserved for the decision
-    pub resource_id: ResourceId,
-    /// When the queue drained and the return action opened
-    pub opened_at: DateTime<Utc>,
-    /// When queued work may take the resource if no decision exists
-    pub deadline_at: DateTime<Utc>,
+    action_id: ActionId,
+    loan_id: LoanId,
+    resource_id: ResourceId,
+    opened_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+}
+
+/// Unchecked JSON shape of a saved window
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedReturnDecisionWindow {
+    action_id: ActionId,
+    loan_id: LoanId,
+    resource_id: ResourceId,
+    opened_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+}
+
+/// A saved window whose deadline is outside its opening and hard limit
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("return decision window deadline is outside its opening and {limit_minutes} minute limit")]
+pub struct InvalidReturnDecisionWindow {
+    limit_minutes: u64,
+}
+
+impl TryFrom<SavedReturnDecisionWindow> for ReturnDecisionWindow {
+    type Error = InvalidReturnDecisionWindow;
+
+    fn try_from(saved: SavedReturnDecisionWindow) -> Result<Self, Self::Error> {
+        let window = Self {
+            action_id: saved.action_id,
+            loan_id: saved.loan_id,
+            resource_id: saved.resource_id,
+            opened_at: saved.opened_at,
+            deadline_at: saved.deadline_at,
+        };
+        if window.deadline_at < window.opened_at || window.deadline_at > window.limit_at() {
+            return Err(InvalidReturnDecisionWindow {
+                limit_minutes: limit_minutes(),
+            });
+        }
+        Ok(window)
+    }
 }
 
 /// Why a hold cannot move the deadline of a return action
@@ -68,6 +104,36 @@ impl ReturnDecisionWindow {
         }
     }
 
+    /// Return action that this window belongs to
+    #[must_use]
+    pub const fn action_id(&self) -> ActionId {
+        self.action_id
+    }
+
+    /// Loan that awaits the return decision
+    #[must_use]
+    pub const fn loan_id(&self) -> LoanId {
+        self.loan_id
+    }
+
+    /// Resource reserved for the decision
+    #[must_use]
+    pub const fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    /// When the queue drained and the return action opened
+    #[must_use]
+    pub const fn opened_at(&self) -> DateTime<Utc> {
+        self.opened_at
+    }
+
+    /// When queued work may take the resource if no decision exists
+    #[must_use]
+    pub const fn deadline_at(&self) -> DateTime<Utc> {
+        self.deadline_at
+    }
+
     /// Latest deadline that any hold can set
     #[must_use]
     pub fn limit_at(&self) -> DateTime<Utc> {
@@ -97,7 +163,7 @@ impl ReturnDecisionWindow {
         let limit_at = self.limit_at();
         if self.deadline_at >= limit_at || now >= limit_at {
             return Err(ReturnHoldRejection::LimitReached {
-                limit_minutes: RETURN_DECISION_LIMIT.as_secs() / 60,
+                limit_minutes: limit_minutes(),
             });
         }
         // a hold longer than the chrono range is capped by the limit anyway
@@ -110,6 +176,10 @@ impl ReturnDecisionWindow {
             ..self
         })
     }
+}
+
+fn limit_minutes() -> u64 {
+    RETURN_DECISION_LIMIT.as_secs() / 60
 }
 
 #[cfg(test)]
@@ -160,6 +230,24 @@ mod tests {
         let shorter = held.hold(opened_at, Duration::from_secs(60)).unwrap();
 
         assert_eq!(shorter.deadline_at, held.deadline_at);
+    }
+
+    #[test]
+    fn a_saved_window_with_a_deadline_past_its_limit_is_refused() {
+        let saved = serde_json::to_value(window(Utc::now())).unwrap();
+        let opened_at = saved["opened_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let mut past_limit = saved.clone();
+        past_limit["deadline_at"] = serde_json::json!(opened_at + chrono::Duration::minutes(11));
+        let mut before_opening = saved.clone();
+        before_opening["deadline_at"] = serde_json::json!(opened_at - chrono::Duration::seconds(1));
+
+        assert!(serde_json::from_value::<ReturnDecisionWindow>(saved).is_ok());
+        assert!(serde_json::from_value::<ReturnDecisionWindow>(past_limit).is_err());
+        assert!(serde_json::from_value::<ReturnDecisionWindow>(before_opening).is_err());
     }
 
     #[test]

@@ -36,7 +36,8 @@ pub(crate) use release_checkpoint::{
     ReleaseCheckpointStopDecision, ReleaseCheckpointStopOutcome,
 };
 pub use return_window::{
-    RETURN_DECISION_GRACE, RETURN_DECISION_LIMIT, ReturnDecisionWindow, ReturnHoldRejection,
+    InvalidReturnDecisionWindow, RETURN_DECISION_GRACE, RETURN_DECISION_LIMIT,
+    ReturnDecisionWindow, ReturnHoldRejection,
 };
 
 /// Immutable authority-assigned acceptance identity for a resource request

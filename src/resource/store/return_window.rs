@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use super::codec::{encode_json, stored_json};
+use super::codec::{StoredReadError, encode_json, stored_id, stored_json};
 use super::error::{ConflictReason, ResourceStoreError};
 use super::queue::next_queued_request_for_authority;
 use super::revision::swap_resource_revision;
@@ -20,8 +20,8 @@ use super::rows::{check_authority, select_non_closed_loan, select_resource};
 use crate::domain::TaskId;
 use crate::machine::MachineId;
 use crate::resource::{
-    ActionId, Loan, LoanId, LoanPhase, LoanState, Resource, ResourceId, ResourceRequest,
-    ResourceRequestState, ResourceRevision, ReturnContext, ReturnDecisionWindow,
+    ActionId, Loan, LoanId, LoanPhase, LoanState, NilIdentity, Resource, ResourceId,
+    ResourceRequest, ResourceRequestState, ResourceRevision, ReturnContext, ReturnDecisionWindow,
     ServingReleaseProvenance,
 };
 use crate::submission::RequestId;
@@ -84,17 +84,7 @@ pub(crate) fn open_return_window_on(
         [loan_id.as_uuid().to_string()],
         |row| row.get(0),
     )?;
-    let resource_id = resource_id
-        .parse::<uuid::Uuid>()
-        .ok()
-        .and_then(|uuid| ResourceId::from_uuid(uuid).ok())
-        .ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                "loan resource identity is not a resource UUID".into(),
-            )
-        })?;
+    let resource_id: ResourceId = saved_identity("loan resource identity", &resource_id)?;
     let window = ReturnDecisionWindow::open(action_id, loan_id, resource_id, opened_at);
     let window_json = serde_json::to_string(&window)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -137,27 +127,29 @@ pub(crate) fn open_missing_return_windows_on(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for (action_id, loan_id) in pending {
-        let identity = |text: &str| {
-            text.parse::<uuid::Uuid>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
-        };
-        let nil = || {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                "nil identity in an AwaitingReturn loan".into(),
-            )
-        };
-        let action_id = ActionId::from_uuid(identity(&action_id)?).map_err(|_| nil())?;
-        let loan_id = LoanId::from_uuid(identity(&loan_id)?).map_err(|_| nil())?;
+        let action_id: ActionId = saved_identity("awaiting return action identity", &action_id)?;
+        let loan_id: LoanId = saved_identity("awaiting return loan identity", &loan_id)?;
         open_return_window_on(conn, action_id, loan_id, opened_at)?;
     }
     Ok(())
+}
+
+/// Parse one saved identity for a step whose callers handle only SQLite errors
+///
+/// Notice insertion and the schema upgrade run on plain rusqlite results, so a
+/// nil or malformed identity becomes a conversion failure that aborts them
+fn saved_identity<T>(what: &'static str, text: &str) -> Result<T, rusqlite::Error>
+where
+    T: TryFrom<uuid::Uuid, Error = NilIdentity>,
+{
+    stored_id(what, text).map_err(|error| match error {
+        StoredReadError::Storage(error) => error,
+        StoredReadError::Corrupt { what, reason } => rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("{what}: {reason}").into(),
+        ),
+    })
 }
 
 /// Read the saved decision window of one return action
@@ -176,7 +168,7 @@ pub(crate) fn return_window_on(
         return Ok(None);
     };
     let window: ReturnDecisionWindow = stored_json("return decision window", &saved)?;
-    if window.action_id != action_id {
+    if window.action_id() != action_id {
         return Err(ResourceStoreError::corrupt(
             "return decision window",
             "saved window names another action",
@@ -193,10 +185,10 @@ pub(crate) fn save_held_return_window_on(
     saved: &ReturnDecisionWindow,
     held: &ReturnDecisionWindow,
 ) -> Result<(), ResourceStoreError> {
-    if held.action_id != saved.action_id
-        || held.loan_id != saved.loan_id
-        || held.resource_id != saved.resource_id
-        || held.opened_at != saved.opened_at
+    if held.action_id() != saved.action_id()
+        || held.loan_id() != saved.loan_id()
+        || held.resource_id() != saved.resource_id()
+        || held.opened_at() != saved.opened_at()
     {
         return Err(ResourceStoreError::Conflict(ConflictReason::LoanChanged));
     }
@@ -205,7 +197,7 @@ pub(crate) fn save_held_return_window_on(
          WHERE action_id = ?2 AND window_json = ?3",
         params![
             encode_json(held)?,
-            saved.action_id.as_uuid().to_string(),
+            saved.action_id().as_uuid().to_string(),
             encode_json(saved)?,
         ],
     )?;
@@ -245,7 +237,7 @@ pub(crate) fn serve_after_return_deadline_for_authority(
             "an AwaitingReturn loan has no saved window",
         )
     })?;
-    if window.loan_id != loan.id || window.resource_id != resource_id {
+    if window.loan_id() != loan.id || window.resource_id() != resource_id {
         return Err(ResourceStoreError::corrupt(
             "return decision window",
             "saved window names another loan",
@@ -372,9 +364,9 @@ pub(super) fn return_deadline_serving_matches_on(
         return Ok(false);
     };
     let receipt: ReturnDeadlineReceipt = stored_json("return deadline receipt", &saved)?;
-    Ok(receipt.window.action_id == action_id
-        && receipt.window.loan_id == loan.id
-        && receipt.window.resource_id == resource.id
+    Ok(receipt.window.action_id() == action_id
+        && receipt.window.loan_id() == loan.id
+        && receipt.window.resource_id() == resource.id
         && loan.resource_id == resource.id
         && receipt.authority_machine == authority_machine
         && resource.authority_machine() == authority_machine

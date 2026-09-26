@@ -57,9 +57,12 @@ fn a_return_action_opens_its_window_with_the_default_grace() {
 
     let window = window(&fixture, authority.action_id);
 
-    assert_eq!(window.loan_id, authority.loan_id);
-    assert_eq!(window.resource_id, authority.resource_id);
-    assert_eq!(window.deadline_at, window.opened_at + RETURN_DECISION_GRACE);
+    assert_eq!(window.loan_id(), authority.loan_id);
+    assert_eq!(window.resource_id(), authority.resource_id);
+    assert_eq!(
+        window.deadline_at(),
+        window.opened_at() + RETURN_DECISION_GRACE
+    );
 }
 
 #[test]
@@ -69,7 +72,7 @@ fn queued_work_takes_the_resource_only_after_the_window_closes() {
     let later = accept_post_return_request(&mut fixture);
     let window = window(&fixture, authority.action_id);
 
-    let before = window.deadline_at - chrono::Duration::seconds(1);
+    let before = window.deadline_at() - chrono::Duration::seconds(1);
     assert!(matches!(
         serve_at(&mut fixture, before),
         ReturnDeadlineOutcome::Open { window: open } if open == window
@@ -77,7 +80,7 @@ fn queued_work_takes_the_resource_only_after_the_window_closes() {
     assert_eq!(awaited_return(&fixture).0, authority.action_id);
 
     let ReturnDeadlineOutcome::Served { loan, request } =
-        serve_at(&mut fixture, window.deadline_at)
+        serve_at(&mut fixture, window.deadline_at())
     else {
         panic!("an expired window with queued work must serve it");
     };
@@ -170,15 +173,15 @@ fn a_hold_keeps_queued_work_waiting_without_changing_the_pending_action() {
         .hold_return_for_authority(authority, Duration::from_secs(5 * 60))
         .unwrap();
 
-    assert!(held.deadline_at > opened.deadline_at);
-    assert!(held.deadline_at <= opened.opened_at + RETURN_DECISION_LIMIT);
+    assert!(held.deadline_at() > opened.deadline_at());
+    assert!(held.deadline_at() <= opened.opened_at() + RETURN_DECISION_LIMIT);
     assert_eq!(window(&fixture, authority.action_id), held);
     assert_eq!(
         saved_resource(&fixture.store, fixture.authority).state_revision,
         authority.expected_state_revision
     );
     assert!(matches!(
-        serve_at(&mut fixture, opened.deadline_at),
+        serve_at(&mut fixture, opened.deadline_at()),
         ReturnDeadlineOutcome::Open { .. }
     ));
 
@@ -226,7 +229,7 @@ fn an_upgrade_opens_a_full_window_for_a_return_saved_without_one() {
     open_missing_return_windows_on(&fixture.store.conn, upgraded_at).unwrap();
 
     let window = window(&fixture, authority.action_id);
-    assert_eq!(window.opened_at, upgraded_at);
-    assert_eq!(window.loan_id, authority.loan_id);
-    assert_eq!(window.deadline_at, upgraded_at + RETURN_DECISION_GRACE);
+    assert_eq!(window.opened_at(), upgraded_at);
+    assert_eq!(window.loan_id(), authority.loan_id);
+    assert_eq!(window.deadline_at(), upgraded_at + RETURN_DECISION_GRACE);
 }

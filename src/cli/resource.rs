@@ -1493,54 +1493,57 @@ async fn return_action(
                 resource: context.resource_id,
                 message: "the pending return action has no return context".into(),
             })?;
-    let (resume_path, no_resume, request_uuid, task_id) = match choice {
-        ReturnChoice::Hold(hold) => {
-            let request = ResourceActionSubmitRequest {
-                api_version: API_VERSION,
-                authority: context.authority,
-                choice: ResourceActionChoice::HoldReturn { hold },
-            };
-            let response =
-                submit_action(&client, request, context.resource_id, context.action_id).await?;
-            return emit_action(ctx, response, context.resource_id, context.action_id);
-        }
+    let choice = match choice {
+        ReturnChoice::Hold(hold) => ResourceActionChoice::HoldReturn { hold },
         ReturnChoice::Decide {
             resume_path,
             no_resume,
             request_uuid,
             task_id,
-        } => (resume_path, no_resume, request_uuid, task_id),
+        } => {
+            let decision = return_decision(resume_path, no_resume, request_uuid, task_id)?;
+            decision
+                .validate_for(return_context, context.authority.supervisor.thread)
+                .map_err(|error| return_decision_error(context.resource_id, error))?;
+            ResourceActionChoice::Return { decision }
+        }
     };
-    let decision = match (resume_path, no_resume, request_uuid, task_id) {
+    let request = ResourceActionSubmitRequest {
+        api_version: API_VERSION,
+        authority: context.authority,
+        choice,
+    };
+    let response = submit_action(&client, request, context.resource_id, context.action_id).await?;
+    emit_action(ctx, response, context.resource_id, context.action_id)
+}
+
+/// Build the one return decision that the `resource return` decision flags name
+fn return_decision(
+    resume_path: Option<&str>,
+    no_resume: Option<&str>,
+    request_uuid: Option<Uuid>,
+    task_id: Option<TaskId>,
+) -> Result<ReturnDecision, AppError> {
+    match (resume_path, no_resume, request_uuid, task_id) {
         (Some(path), None, Some(request), Some(task)) => {
             validate_uuid("--request-id", request)?;
             validate_uuid("--task-id", task.0)?;
             let work: ReturnWork = load_json(path)?;
-            ReturnDecision::Launch(Box::new(ReturnLaunch {
+            Ok(ReturnDecision::Launch(Box::new(ReturnLaunch {
                 request_id: RequestId(request),
                 task_id: task,
                 work,
-            }))
+            })))
         }
-        (None, Some(reason), None, None) if !reason.trim().is_empty() => ReturnDecision::NoResume {
-            reason: reason.to_string(),
-        },
-        _ => {
-            return Err(AppError::Usage {
-                message: "choose exactly one of --resume-spec, --no-resume, or --hold; launch needs both --request-id and --task-id".into(),
-            });
+        (None, Some(reason), None, None) if !reason.trim().is_empty() => {
+            Ok(ReturnDecision::NoResume {
+                reason: reason.to_string(),
+            })
         }
-    };
-    decision
-        .validate_for(return_context, context.authority.supervisor.thread)
-        .map_err(|error| return_decision_error(context.resource_id, error))?;
-    let request = ResourceActionSubmitRequest {
-        api_version: API_VERSION,
-        authority: context.authority,
-        choice: ResourceActionChoice::Return { decision },
-    };
-    let response = submit_action(&client, request, context.resource_id, context.action_id).await?;
-    emit_action(ctx, response, context.resource_id, context.action_id)
+        _ => Err(AppError::Usage {
+            message: "choose exactly one of --resume-spec, --no-resume, or --hold; launch needs both --request-id and --task-id".into(),
+        }),
+    }
 }
 
 async fn resolve(
@@ -1847,9 +1850,9 @@ fn check_action_outcome(
         }
         ResourceActionSubmitOutcome::ReturnHeld { window } => {
             if !matches!(request.choice, ResourceActionChoice::HoldReturn { .. })
-                || window.action_id != expected.action_id
-                || window.loan_id != expected.loan_id
-                || window.resource_id != expected.resource_id
+                || window.action_id() != expected.action_id
+                || window.loan_id() != expected.loan_id
+                || window.resource_id() != expected.resource_id
             {
                 return Err("the hold response names a different action");
             }
@@ -1893,7 +1896,7 @@ fn emit_action(
             "resource action {} holds queued requests until {} (limit {})",
             action_id.as_uuid(),
             window
-                .deadline_at
+                .deadline_at()
                 .to_rfc3339_opts(SecondsFormat::Secs, true),
             window.limit_at().to_rfc3339_opts(SecondsFormat::Secs, true)
         ),

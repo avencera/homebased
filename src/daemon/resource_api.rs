@@ -1783,7 +1783,7 @@ fn pending_action(model: &ResourceReadModel) -> Option<PendingActionView> {
             .cloned(),
         return_window: model
             .return_window
-            .filter(|window| window.action_id == action_id),
+            .filter(|window| window.action_id() == action_id),
     })
 }
 

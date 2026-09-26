@@ -521,7 +521,7 @@ fn hold_return_for_authority(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pending = pending_return(&tx, &authority)?;
     let window = return_window_on(&tx, authority.action_id)?
-        .filter(|window| window.loan_id == pending.loan.id)
+        .filter(|window| window.loan_id() == pending.loan.id)
         .ok_or(ReturnDecisionError::ActionNotPending {
             loan_id: authority.loan_id,
             action_id: authority.action_id,
