@@ -852,7 +852,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
         }
         messages
     });
-    callback.cast(CallbackMsg::RetryWaiting).unwrap();
+    callback.cast(CallbackMsg::RetryInbox).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let entry = call(&store, |reply| StoreMsg::EarliestInbox {
@@ -1022,4 +1022,48 @@ async fn fallback_write_error_does_not_block_later_success() {
         2
     );
     assert_eq!(store.failed_inbox_events(route.task).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn callback_actor_survives_an_unavailable_store() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nexit 0\n");
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home,
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // every store call from the callback actor fails from here on
+    store.stop(None);
+    store_handle.await.unwrap();
+
+    callback
+        .cast(CallbackMsg::DispatchInbox { id: route.task })
+        .unwrap();
+    callback.cast(CallbackMsg::RetryInbox).unwrap();
+    callback
+        .cast(CallbackMsg::InboxFinished {
+            id: route.task,
+            completed: true,
+        })
+        .unwrap();
+
+    let thread = route.thread;
+    assert!(
+        call(&callback, |reply| CallbackMsg::ClaimWake { thread, reply })
+            .await
+            .unwrap(),
+        "the callback actor keeps running after failed store calls"
+    );
+    callback.stop(None);
+    callback_handle.await.unwrap();
 }

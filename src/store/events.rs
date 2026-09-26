@@ -448,35 +448,6 @@ impl Store {
             .collect()
     }
 
-    /// Task IDs whose earliest unsettled callback waits for its origin thread
-    pub fn waiting_inbox_tasks(&self) -> Result<Vec<TaskId>, EventError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT i.task_id FROM origin_inbox i
-                 JOIN origin_routes r ON r.task_id=i.task_id
-                 WHERE i.seq=(
-                     SELECT MIN(later.seq) FROM origin_inbox later
-                     WHERE later.task_id=i.task_id
-                       AND later.seq>json_extract(r.route_json,'$.last_settled_seq')
-                 )
-                   AND json_extract(i.delivery_json,'$.type')='awaiting_thread'
-                 ORDER BY i.task_id",
-            )
-            .map_err(storage)?;
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .map_err(storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(storage)?
-            .into_iter()
-            .map(|id| {
-                id.parse().map_err(|_| EventError::Invalid {
-                    message: "invalid inbox task UUID".into(),
-                })
-            })
-            .collect()
-    }
-
     /// Select only the first unsettled event after the route's contiguous cursor
     pub fn earliest_unsettled_inbox(
         &mut self,
@@ -2053,7 +2024,6 @@ mod tests {
                 .is_none()
         );
         assert!(store.pending_inbox_tasks().unwrap().contains(&route.task));
-        assert_eq!(store.waiting_inbox_tasks().unwrap(), vec![route.task]);
     }
 
     #[test]
@@ -2227,7 +2197,6 @@ mod tests {
             }
         }
         assert!(store.pending_inbox_tasks().unwrap().is_empty());
-        assert!(store.waiting_inbox_tasks().unwrap().is_empty());
     }
 
     #[test]

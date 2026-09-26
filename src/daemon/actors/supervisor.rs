@@ -337,8 +337,15 @@ impl Actor for SupervisorActor {
         };
         restore_resource_actors(&myself, &mut state).await?;
         recovery::recover_tasks(&myself, &mut state).await?;
-        for id in call(&state.store, |reply| StoreMsg::PendingInboxTasks { reply }).await? {
-            state.callback.cast(CallbackMsg::DispatchInbox { id })?;
+        // a slow store must not fail startup; the callback actor's retry scan
+        // picks these tasks up later
+        match call(&state.store, |reply| StoreMsg::PendingInboxTasks { reply }).await {
+            Ok(ids) => {
+                for id in ids {
+                    state.callback.cast(CallbackMsg::DispatchInbox { id })?;
+                }
+            }
+            Err(error) => tracing::warn!("startup origin inbox scan: {error}"),
         }
         Ok(state)
     }

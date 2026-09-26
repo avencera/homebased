@@ -711,10 +711,6 @@ pub(crate) enum StoreMsg {
     PendingInboxTasks {
         reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
     },
-    /// Find tasks whose earliest unsettled inbox event waits for its origin thread
-    WaitingInboxTasks {
-        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
-    },
     /// Read only the first event after the settled cursor
     EarliestInbox {
         id: TaskId,
@@ -1398,9 +1394,6 @@ impl Actor for StoreActor {
             }
             StoreMsg::PendingInboxTasks { reply } => {
                 send_reply(reply, state.pending_inbox_tasks().map_err(event_error))
-            }
-            StoreMsg::WaitingInboxTasks { reply } => {
-                send_reply(reply, state.waiting_inbox_tasks().map_err(event_error))
             }
             StoreMsg::EarliestInbox { id, reply } => send_reply(
                 reply,

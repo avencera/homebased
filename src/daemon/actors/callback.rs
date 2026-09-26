@@ -20,15 +20,17 @@ use crate::notify::{Notice, NoticePriority, Notifier};
 use crate::submission::CallbackContext;
 use crate::thread_title::TitleSources;
 
-const WAITING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+// a store call can time out on a loaded machine; the scan also restarts a
+// worker that failed to start, so no unsettled event is stranded
+const INBOX_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const T3_WAKE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Delivery messages; workers run concurrently across tasks
 pub enum CallbackMsg {
     /// Start or join the one ordered origin inbox worker for this task
     DispatchInbox { id: TaskId },
-    /// Retry the earliest waiting event for each task
-    RetryWaiting,
+    /// Start a worker for each task with an unsettled event
+    RetryInbox,
     /// One inbox worker ended; check for a receive that raced with its exit
     InboxFinished { id: TaskId, completed: bool },
     /// Claim one T3 wake before a worker starts the blocking wake
@@ -185,7 +187,7 @@ impl Actor for CallbackActor {
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         // the timer task ends on its own once this actor stops
-        myself.send_interval(WAITING_RETRY_INTERVAL, || CallbackMsg::RetryWaiting);
+        myself.send_interval(INBOX_RETRY_INTERVAL, || CallbackMsg::RetryInbox);
         Ok(CallbackState {
             store: args.store,
             home: args.home,
@@ -204,18 +206,22 @@ impl Actor for CallbackActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            CallbackMsg::DispatchInbox { id } => {
-                start_inbox_worker(&myself, state, id).await?;
-            }
-            CallbackMsg::RetryWaiting => {
-                for id in call(&state.store, |reply| StoreMsg::WaitingInboxTasks { reply }).await? {
-                    start_inbox_worker(&myself, state, id).await?;
+            CallbackMsg::DispatchInbox { id } => start_inbox_worker(&myself, state, id).await,
+            CallbackMsg::RetryInbox => {
+                // a store timeout must not stop this actor; the next tick retries
+                match call(&state.store, |reply| StoreMsg::PendingInboxTasks { reply }).await {
+                    Ok(ids) => {
+                        for id in ids {
+                            start_inbox_worker(&myself, state, id).await;
+                        }
+                    }
+                    Err(error) => warn!("origin inbox retry scan: {error}"),
                 }
             }
             CallbackMsg::InboxFinished { id, completed } => {
                 state.active_inbox.remove(&id);
                 if completed {
-                    start_inbox_worker(&myself, state, id).await?;
+                    start_inbox_worker(&myself, state, id).await;
                 }
             }
             CallbackMsg::ClaimWake { thread, reply } => {
@@ -238,17 +244,22 @@ impl Actor for CallbackActor {
     }
 }
 
-async fn start_inbox_worker(
-    myself: &ActorRef<CallbackMsg>,
-    state: &mut CallbackState,
-    id: TaskId,
-) -> Result<(), AppError> {
+/// Start the task's inbox worker unless one runs or nothing is unsettled
+///
+/// A failed store read is logged; the periodic retry scan tries again
+async fn start_inbox_worker(myself: &ActorRef<CallbackMsg>, state: &mut CallbackState, id: TaskId) {
     if state.active_inbox.contains(&id) {
-        return Ok(());
+        return;
     }
-    let first = call(&state.store, |reply| StoreMsg::EarliestInbox { id, reply }).await?;
+    let first = match call(&state.store, |reply| StoreMsg::EarliestInbox { id, reply }).await {
+        Ok(first) => first,
+        Err(error) => {
+            warn!(%id, "origin inbox read: {error}");
+            return;
+        }
+    };
     if !first.is_some_and(|entry| entry.delivery.is_unsettled()) {
-        return Ok(());
+        return;
     }
     state.active_inbox.insert(id);
     let store = state.store.clone();
@@ -264,7 +275,6 @@ async fn start_inbox_worker(
         };
         let _ = myself.cast(CallbackMsg::InboxFinished { id, completed });
     });
-    Ok(())
 }
 
 /// Result of one reserved attempt, before settlement
