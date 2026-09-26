@@ -7,6 +7,7 @@ pub mod message;
 pub mod notify;
 pub mod release_watcher;
 pub mod resource;
+pub mod t3;
 pub mod task;
 pub mod update;
 
@@ -105,6 +106,12 @@ pub enum Command {
         /// Task subcommand
         #[command(subcommand)]
         command: task::TaskCommand,
+    },
+    /// Check the T3 Code local API
+    T3 {
+        /// T3 Code subcommand
+        #[command(subcommand)]
+        command: t3::T3Command,
     },
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
@@ -269,6 +276,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
+        Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::ResourceReleaseWatcher(args) => release_watcher::run(&ctx, args).await,
         Command::Version => {

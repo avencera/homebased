@@ -14,7 +14,6 @@ const STATUS_TAIL_LIMIT: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurlMethod {
     /// Send a GET request.
-    #[expect(dead_code, reason = "GET is part of the reusable internal HTTP API")]
     Get,
     /// Send a POST request.
     Post,

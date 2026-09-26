@@ -123,6 +123,13 @@ To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a r
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.
 
+### T3 Code wake
+
+Homebased can wake a stopped Claude Code session that belongs to T3 Code. It
+sends the task message through T3 Code's undocumented local API, so T3 resumes
+the session and shows the turn in its UI. Run `homebased t3 check` after T3
+updates to check that it still works.
+
 ### Fleet
 
 Fleet is off by default. Add this config to each machine that should join the
