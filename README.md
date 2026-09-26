@@ -98,6 +98,27 @@ Homebased reads `~/.config/homebased/config.toml` when the daemon starts. A miss
 
 The HTTP listener is off by default. Fleet peers use this listener. The dashboard is also served here when its assets are built. There is no application token: any peer that can reach the listener can use Fleet routes and can read every regular file available to the daemon user through the dashboard file browser. Text, raster images, and HTML open on a separate content origin; other files download.
 
+### Push notifications (ntfy)
+
+Add this section to `~/.config/homebased/config.toml` on every machine that
+owns agent threads:
+
+```toml
+[notify.ntfy]
+topic = "praveen_homebased_9630420"
+# server = "https://ntfy.sh"
+# token_file = "~/.config/homebased/ntfy-token"
+```
+
+Anyone who knows an ntfy topic can read its notifications. Choose a hard to
+guess topic and set the config and token files to mode `600`. The daemon reads
+the config at startup, so restart it after you edit this section. Send one test
+push with:
+
+```sh
+homebased notify test
+```
+
 To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines.
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.

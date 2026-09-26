@@ -17,6 +17,7 @@ use crate::daemon::web::DEFAULT_PORT;
 use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
 use crate::machine::{MachineName, host_machine_name};
+use crate::notify::{Notify, NtfyConfig, NtfyTopic};
 
 /// Environment variable that selects the config file.
 pub const CONFIG_ENV: &str = "HOMEBASED_CONFIG";
@@ -104,6 +105,8 @@ pub struct Config {
     pub machine_name: Option<MachineName>,
     /// Fleet support.
     pub fleet: Fleet,
+    /// Optional push notification settings.
+    pub notify: Notify,
 }
 
 /// Whether this machine joins a fleet.
@@ -190,6 +193,39 @@ impl Config {
 struct RawConfig {
     #[serde(default)]
     fleet: RawFleet,
+    #[serde(default)]
+    notify: RawNotify,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNotify {
+    #[serde(default)]
+    ntfy: Option<RawNtfy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNtfy {
+    topic: String,
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    token_file: Option<PathBuf>,
+}
+
+impl RawNotify {
+    fn validate(self) -> Result<Notify, String> {
+        let ntfy = self
+            .ntfy
+            .map(|raw| {
+                let topic = NtfyTopic::parse(&raw.topic)
+                    .map_err(|error| format!("notify.ntfy.topic: {error}"))?;
+                NtfyConfig::new(topic, raw.server, raw.token_file)
+            })
+            .transpose()?;
+        Ok(Notify { ntfy })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,6 +280,7 @@ impl RawConfig {
             discovery,
             machines,
         } = self.fleet;
+        let notify = self.notify.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -267,6 +304,7 @@ impl RawConfig {
         Ok(Config {
             machine_name,
             fleet,
+            notify,
         })
     }
 }
@@ -297,6 +335,7 @@ mod tests {
     fn empty_file_disables_fleet() {
         let config = Config::parse("").unwrap();
         assert_eq!(config, Config::default());
+        assert_eq!(config.notify.ntfy, None);
     }
 
     #[test]
@@ -346,6 +385,43 @@ address = "http://training:7677"
         assert!(err.contains("http://"), "{err}");
         let err = Config::parse("[fleet.discovery]\ntailscale_port = 7000\n").unwrap_err();
         assert!(err.contains("requires tailscale"), "{err}");
+    }
+
+    #[test]
+    fn ntfy_config_uses_server_default_and_normalizes_trailing_slashes() {
+        let config =
+            Config::parse("[notify.ntfy]\ntopic = \"praveen_homebased_9630420\"\n").unwrap();
+        let ntfy = config.notify.ntfy.unwrap();
+        assert_eq!(ntfy.topic().as_str(), "praveen_homebased_9630420");
+        assert_eq!(ntfy.server(), "https://ntfy.sh");
+        assert_eq!(ntfy.token_file(), None);
+
+        let config = Config::parse(
+            "[notify.ntfy]\ntopic = \"homebased\"\nserver = \"https://ntfy.example/\"\ntoken_file = \"~/.config/homebased/token\"\n",
+        )
+        .unwrap();
+        let ntfy = config.notify.ntfy.unwrap();
+        assert_eq!(ntfy.server(), "https://ntfy.example");
+        assert_eq!(
+            ntfy.token_file(),
+            Some(Path::new("~/.config/homebased/token"))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_ntfy_topic_server_and_unknown_fields() {
+        let bad_topic = Config::parse("[notify.ntfy]\ntopic = \"not valid\"\n").unwrap_err();
+        assert!(bad_topic.contains("notify.ntfy.topic"));
+
+        let bad_server = Config::parse(
+            "[notify.ntfy]\ntopic = \"homebased\"\nserver = \"ftp://ntfy.example\"\n",
+        )
+        .unwrap_err();
+        assert!(bad_server.contains("http:// or https://"));
+
+        let unknown =
+            Config::parse("[notify.ntfy]\ntopic = \"homebased\"\ntopci = \"typo\"\n").unwrap_err();
+        assert!(unknown.contains("topci"));
     }
 
     #[test]

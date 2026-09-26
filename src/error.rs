@@ -184,6 +184,15 @@ pub enum AppError {
         /// Why the file was rejected
         message: String,
     },
+    /// Push notification support is not configured
+    #[error("ntfy is not configured; add a [notify.ntfy] section to config.toml")]
+    NotifyNotConfigured,
+    /// An ntfy push could not be sent
+    #[error("ntfy notification failed: {message}")]
+    NotifyFailed {
+        /// Safe summary of the send failure
+        message: String,
+    },
     /// No known machine matches this name or UUID
     #[error("machine not found: {machine}")]
     MachineNotFound {
@@ -445,6 +454,8 @@ impl AppError {
             Self::UnsupportedFile { .. } => "unsupported_file",
             Self::StreamLimit { .. } => "stream_limit",
             Self::ConfigInvalid { .. } => "config_invalid",
+            Self::NotifyNotConfigured => "notify_not_configured",
+            Self::NotifyFailed { .. } => "notify_failed",
             Self::MachineNotFound { .. } => "machine_not_found",
             Self::MachineIdentityMismatch { .. } => "machine_identity_mismatch",
             Self::DuplicateMachineIdentity { .. } => "duplicate_machine_identity",
@@ -492,12 +503,14 @@ impl AppError {
             | Self::ResourceLookupIncomplete { .. }
             | Self::ResourceAuthorityUnavailable { .. }
             | Self::ResourceOutcomeUnknown { .. }
+            | Self::NotifyFailed { .. }
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
             | Self::SummaryTooLong { .. }
             | Self::MessageInvalid { .. }
             | Self::Usage { .. }
-            | Self::ConfigInvalid { .. } => 2,
+            | Self::ConfigInvalid { .. }
+            | Self::NotifyNotConfigured => 2,
             Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
@@ -548,6 +561,7 @@ impl AppError {
             | Self::Usage { .. }
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. } => http::StatusCode::BAD_REQUEST,
+            Self::NotifyNotConfigured => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
@@ -595,6 +609,7 @@ impl AppError {
             | Self::ConfigInvalid { .. }
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
+            | Self::NotifyFailed { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -675,6 +690,8 @@ impl AppError {
                 selected,
                 configured,
             } => json!({ "selected": selected, "configured": configured }),
+            Self::NotifyNotConfigured => json!({}),
+            Self::NotifyFailed { message } => json!({ "message": message }),
             Self::Internal { message } => json!({ "message": message }),
             Self::ResourceNotFound { resource } => json!({ "resource_id": resource }),
             Self::ResourceLookupIncomplete {

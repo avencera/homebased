@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod fleet;
 pub mod message;
+pub mod notify;
 pub mod release_watcher;
 pub mod resource;
 pub mod task;
@@ -86,6 +87,12 @@ pub enum Command {
         /// Message subcommand
         #[command(subcommand)]
         command: message::MessageCommand,
+    },
+    /// Send a push notification
+    Notify {
+        /// Notification subcommand
+        #[command(subcommand)]
+        command: notify::NotifyCommand,
     },
     /// Register and manage shared exclusive resources
     Resource {
@@ -259,6 +266,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Config { command } => config::run(&ctx, command),
         Command::Fleet { command } => fleet::run(&ctx, command).await,
         Command::Message { command } => message::run(&ctx, command).await,
+        Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
