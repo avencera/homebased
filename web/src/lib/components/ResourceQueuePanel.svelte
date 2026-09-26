@@ -267,9 +267,9 @@
 							{#each item.queue as request, index (request.request_id)}
 								{@const origin = machineName(request.origin_machine)}
 								{@const confirming = isConfirming(item.resource.id, request.request_id)}
-								<li class="flex min-w-0 items-center gap-1 py-1">
+								<li class="flex min-w-0 items-center gap-2 py-1">
 									<span
-										class="w-4 shrink-0 text-right font-mono text-muted-foreground tabular-nums"
+										class="w-4 shrink-0 self-start text-right font-mono text-muted-foreground tabular-nums"
 									>
 										{index + 1}
 									</span>
