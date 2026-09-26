@@ -578,7 +578,18 @@ mod tests {
         );
         child.kill().unwrap();
         child.wait().unwrap();
-        home::flock_exclusive(&lock_path, LockMode::NonBlocking).unwrap();
+        // a process that another test forks at this moment holds a copy of the
+        // lock fd until its exec closes it, so allow a short release window
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while let Err(AppError::LockHeld { .. }) =
+            home::flock_exclusive(&lock_path, LockMode::NonBlocking)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lock should be free after the child exits"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
