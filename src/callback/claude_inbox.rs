@@ -99,21 +99,30 @@ pub(crate) struct ClaudeInbox {
     token: String,
 }
 
+/// Ownership and availability of one origin thread in Claude Code
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeSession {
+    /// A live session with a socket inbox
+    Live(ClaudeInbox),
+    /// A known session with a transcript but no live process
+    Stopped,
+    /// No Claude session owns this thread id
+    Unknown,
+}
+
 impl ClaudeInbox {
     /// Find the live Claude Code session whose session id is `thread`
     ///
-    /// `Ok(None)` means Claude Code does not know the id, so the thread belongs
-    /// to Codex. An error means the id is a Claude Code session that cannot take
-    /// messages now, for example because it is not running
-    pub(crate) fn find(home: &Path, thread: ThreadId) -> Result<Option<Self>, String> {
+    /// Other errors indicate a live session with an unsupported inbox
+    pub(crate) fn find(home: &Path, thread: ThreadId) -> Result<ClaudeSession, String> {
         let claude = home.join(".claude");
         if let Some(inbox) = Self::find_live(&claude.join("sessions"), thread)? {
-            return Ok(Some(inbox));
+            return Ok(ClaudeSession::Live(inbox));
         }
         if has_transcript(&claude.join("projects"), thread) {
-            return Err(format!("Claude session {thread} is not running"));
+            return Ok(ClaudeSession::Stopped);
         }
-        Ok(None)
+        Ok(ClaudeSession::Unknown)
     }
 
     fn find_live(sessions: &Path, thread: ThreadId) -> Result<Option<Self>, String> {
@@ -362,7 +371,10 @@ mod tests {
     #[test]
     fn unknown_thread_belongs_to_codex() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(ClaudeInbox::find(home.path(), thread()), Ok(None));
+        assert_eq!(
+            ClaudeInbox::find(home.path(), thread()),
+            Ok(ClaudeSession::Unknown)
+        );
     }
 
     #[test]
@@ -376,7 +388,9 @@ mod tests {
             body
         });
 
-        let inbox = ClaudeInbox::find(home.path(), thread()).unwrap().unwrap();
+        let ClaudeSession::Live(inbox) = ClaudeInbox::find(home.path(), thread()).unwrap() else {
+            panic!("session must be live");
+        };
         let line = "HOMEBASED_EVENT {\"api_version\":1}";
         inbox
             .send(
@@ -413,15 +427,20 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join(format!("{THREAD}.jsonl")), "").unwrap();
 
-        let error = ClaudeInbox::find(home.path(), thread()).unwrap_err();
-        assert!(error.contains("not running"), "{error}");
+        assert_eq!(
+            ClaudeInbox::find(home.path(), thread()),
+            Ok(ClaudeSession::Stopped)
+        );
     }
 
     #[test]
     fn dead_session_record_is_ignored() {
         // pid 0 addresses the process group, never one session
         let (home, _socket) = home_with_session(0, PEER_PROTOCOL);
-        assert_eq!(ClaudeInbox::find(home.path(), thread()), Ok(None));
+        assert_eq!(
+            ClaudeInbox::find(home.path(), thread()),
+            Ok(ClaudeSession::Unknown)
+        );
     }
 
     #[test]

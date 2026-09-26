@@ -712,10 +712,6 @@ pub(crate) enum StoreMsg {
         reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
     },
     /// Find tasks whose earliest unsettled inbox event waits for its origin thread
-    #[expect(
-        dead_code,
-        reason = "consumed by waiting-thread dispatcher integration"
-    )]
     WaitingInboxTasks {
         reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
     },

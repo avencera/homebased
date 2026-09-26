@@ -1403,6 +1403,7 @@ impl Store {
 
     /// Whether a terminal callback still waits for its inbox result to settle
     pub fn has_pending_terminal_callbacks(&self) -> Result<bool, AppError> {
+        // waiting threads can sleep for hours; their events remain durable across restarts
         let rows = self.list_tasks(
             &[
                 ProcessStatus::Succeeded,

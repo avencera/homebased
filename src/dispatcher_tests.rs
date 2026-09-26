@@ -1,11 +1,14 @@
 //! Origin inbox dispatcher tests with a fake saved Codex executable
 
 use crate::daemon::actors::StoreActor;
+use std::io::Read;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use ractor::Actor;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg, dispatch_inbox};
@@ -300,6 +303,8 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
         CallbackArgs {
             store: store.clone(),
             home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
         },
     )
     .await
@@ -329,6 +334,236 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
     assert_eq!(
         lines(&PathBuf::from(&route.callback.env.home).join("commands")).len(),
         1
+    );
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn push_only_after_failed_wake_until_delivery() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nexit 0\n");
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home,
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let thread = route.thread;
+    let alerted = || async {
+        call(&callback, |reply| CallbackMsg::InspectAlert {
+            thread,
+            reply,
+        })
+        .await
+        .unwrap()
+    };
+    assert!(!alerted().await);
+    assert!(
+        call(&callback, |reply| CallbackMsg::ClaimWake { thread, reply })
+            .await
+            .unwrap()
+    );
+    assert!(
+        !call(&callback, |reply| CallbackMsg::ClaimWake { thread, reply })
+            .await
+            .unwrap()
+    );
+    assert!(!alerted().await);
+
+    for _ in 0..2 {
+        callback
+            .cast(CallbackMsg::WakeFailed {
+                thread,
+                event: event(&route, 1, true),
+                reason: "T3 refused wake".into(),
+            })
+            .unwrap();
+        assert!(alerted().await);
+    }
+    callback.cast(CallbackMsg::Delivered { thread }).unwrap();
+    assert!(!alerted().await);
+    callback
+        .cast(CallbackMsg::WakeFailed {
+            thread,
+            event: event(&route, 2, true),
+            reason: "T3 refused wake".into(),
+        })
+        .unwrap();
+    assert!(alerted().await);
+
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nexit 0\n");
+    let callback_home = PathBuf::from(&route.callback.env.home);
+    let project = callback_home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let thread = route.thread;
+    std::fs::write(project.join(format!("{thread}.jsonl")), "").unwrap();
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 1, true))
+        .unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 2, true))
+        .unwrap();
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    callback
+        .cast(CallbackMsg::DispatchInbox { id: route.task })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let entry = call(&store, |reply| StoreMsg::EarliestInbox {
+                id: route.task,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if matches!(entry.delivery, DeliveryState::AwaitingThread { .. }) {
+                assert!(matches!(
+                    entry.delivery,
+                    DeliveryState::AwaitingThread { attempts: 0, .. }
+                ));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if call(&callback, |reply| CallbackMsg::InspectAlert {
+                thread,
+                reply,
+            })
+            .await
+            .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted = Store::open(&home.db_path()).unwrap();
+    assert_eq!(
+        persisted
+            .origin_route_by_task(route.task)
+            .unwrap()
+            .unwrap()
+            .last_settled_seq,
+        0
+    );
+    assert!(!home.fallback_log_path().exists());
+    drop(persisted);
+
+    let sessions = callback_home.join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let socket = callback_home.join("inbox.sock");
+    let pid = std::process::id();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        serde_json::json!({
+            "pid": pid,
+            "sessionId": route.thread.to_string(),
+            "messagingSocketPath": socket,
+            "peerProtocol": 1,
+            "updatedAt": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let digest = Sha256::digest(socket.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(
+        sessions.join(format!("{pid}.{hex}.key")),
+        serde_json::json!({ "peerToken": "test-token" }).to_string(),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            messages.push(body);
+        }
+        messages
+    });
+    callback.cast(CallbackMsg::RetryWaiting).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let entry = call(&store, |reply| StoreMsg::EarliestInbox {
+                id: route.task,
+                reply,
+            })
+            .await
+            .unwrap();
+            if entry.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let messages = receiver.join().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].contains("HOMEBASED_EVENT"));
+    let persisted = Store::open(&home.db_path()).unwrap();
+    let entries = persisted.inbound_events(route.task).unwrap();
+    assert!(matches!(
+        entries[0].delivery,
+        DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    assert!(matches!(
+        entries[1].delivery,
+        DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    assert!(
+        !call(&callback, |reply| CallbackMsg::InspectAlert {
+            thread,
+            reply
+        })
+        .await
+        .unwrap()
     );
     callback.stop(None);
     callback_handle.await.unwrap();

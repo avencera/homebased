@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
@@ -19,6 +20,7 @@ use crate::error::AppError;
 use crate::home::{Home, LockMode};
 use crate::invocation::{persist_workload, resolve_agent_binary_with};
 use crate::machine::{MachineId, load_or_create_machine_id};
+use crate::notify::Notifier;
 use crate::resource::background_launch::RemoteBackgroundLaunchReceipt;
 use crate::resource::bound_action::{ResourceActionOutcome, ResourceActionRequest};
 use crate::resource::store::{
@@ -253,6 +255,8 @@ pub(crate) struct SupervisorActor;
 pub(crate) struct SupervisorArgs {
     home: Home,
     callback_codex_pin: Option<String>,
+    notifier: Option<Arc<Notifier>>,
+    machine_name: String,
 }
 
 impl SupervisorArgs {
@@ -265,7 +269,20 @@ impl SupervisorArgs {
         Self {
             home,
             callback_codex_pin,
+            notifier: None,
+            machine_name: "this machine".into(),
         }
+    }
+
+    /// Supply daemon notification settings to the callback actor
+    pub(crate) fn with_notifications(
+        mut self,
+        notifier: Option<Arc<Notifier>>,
+        machine_name: String,
+    ) -> Self {
+        self.notifier = notifier;
+        self.machine_name = machine_name;
+        self
     }
 }
 
@@ -280,6 +297,8 @@ impl Actor for SupervisorActor {
         SupervisorArgs {
             home,
             callback_codex_pin,
+            notifier,
+            machine_name,
         }: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         let (store, _store_handle) = StoreActor::spawn_linked(
@@ -301,6 +320,8 @@ impl Actor for SupervisorActor {
             CallbackArgs {
                 store: store.clone(),
                 home: home.clone(),
+                notifier,
+                machine_name,
             },
             myself.get_cell(),
         )

@@ -10,7 +10,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::callback::{check_saved_callback, send_saved_queue_attempt};
+use crate::callback::{
+    AttemptResult, QueueDeliveryMode, check_saved_callback, prepare_saved_queue_attempt,
+    send_saved_queue_attempt,
+};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::keyed_locks::{KeyedGuard, KeyedLocks};
@@ -317,13 +320,19 @@ async fn send_queue_line(
     let lock_path = paths.delivery_lock;
     let queue_context = context.clone();
     tokio::task::spawn_blocking(move || {
-        send_saved_queue_attempt(
+        let prepared = prepare_saved_queue_attempt(&queue_context, destination_thread)?;
+        match send_saved_queue_attempt(
             &queue_context,
             destination_thread,
             &line,
             &log_path,
             &lock_path,
-        )
+            prepared,
+            QueueDeliveryMode::Direct,
+        )? {
+            AttemptResult::Delivered => Ok(()),
+            AttemptResult::Deferred { reason, .. } => Err(reason),
+        }
     })
     .await
     .map_err(|error| error.to_string())?

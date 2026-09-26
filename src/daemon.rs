@@ -21,11 +21,13 @@ mod resource_background;
 mod resource_notice_delivery;
 pub(crate) mod resource_notice_sender;
 mod resource_submit;
+mod t3_watch;
 mod thread_titles;
 pub mod web;
 
 use std::fs::File;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ractor::{Actor, ActorRef};
 use tokio::net::{TcpListener, UnixListener};
@@ -46,6 +48,7 @@ use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 use crate::machine::LocalIdentity;
+use crate::notify::Notifier;
 use crate::resource::ActionId;
 use crate::submission::RequestId;
 use crate::thread_title::TitleSources;
@@ -126,10 +129,12 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         },
         None => (None, None),
     };
+    let notifier = Notifier::from_config(&config).map(Arc::new);
     let supervisor_args = SupervisorArgs::new(
         home.clone(),
         std::env::var(crate::domain::AgentKind::Codex.binary_env()).ok(),
-    );
+    )
+    .with_notifications(notifier.clone(), machine.name.to_string());
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await
         .map_err(|err| AppError::Internal {
@@ -167,6 +172,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let background_recovery = tokio::spawn(resource_background::recover(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let notice_delivery = tokio::spawn(resource_notice_delivery::run(state.clone()));
+    let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -210,6 +216,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     background_recovery.abort();
     cancellation.abort();
     notice_delivery.abort();
+    t3_watcher.abort();
     if !supervisor_died {
         supervisor.stop(None);
         if let Err(err) = handle.await {

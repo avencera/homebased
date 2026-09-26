@@ -25,7 +25,8 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 
-use claude_inbox::ClaudeInbox;
+use crate::t3::{T3Env, WakeOutcome, wake_claude_session};
+use claude_inbox::{ClaudeInbox, ClaudeSession};
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
@@ -494,19 +495,110 @@ pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), Stri
     Ok(())
 }
 
-/// Make exactly one bounded delivery attempt using the saved origin context
+/// Result of one saved origin route attempt
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttemptResult {
+    /// A socket, T3, or Codex accepted the event
+    Delivered,
+    /// The thread cannot receive the event now
+    Deferred { reason: String, wake_failed: bool },
+}
+
+/// Saved origin selected before a worker claims a T3 wake
+pub(crate) struct PreparedQueueAttempt(ClaudeSession);
+
+impl PreparedQueueAttempt {
+    /// Whether this attempt needs a wake claim from the callback actor
+    pub(crate) fn needs_wake(&self) -> bool {
+        matches!(self.0, ClaudeSession::Stopped)
+    }
+}
+
+/// How the caller handles a stopped Claude session
+pub(crate) enum QueueDeliveryMode {
+    /// Direct messages report a stopped session as an error
+    Direct,
+    /// Origin inbox events may use a claimed T3 wake
+    OriginInbox { wake_claimed: bool },
+}
+
+/// Find the saved origin before any T3 wake claim
+pub(crate) fn prepare_saved_queue_attempt(
+    context: &CallbackContext,
+    thread: ThreadId,
+) -> Result<PreparedQueueAttempt, String> {
+    ClaudeInbox::find(Path::new(&context.env.home), thread).map(PreparedQueueAttempt)
+}
+
+/// Make one bounded callback attempt and report a stopped session separately
 ///
-/// A thread id owned by a live Claude Code session goes to that session's
-/// inbox. Any other thread id goes to `codex queue`
+/// A live Claude session receives the event through its socket; a stopped
+/// session can wake through T3; an unknown id uses `codex queue`
 pub(crate) fn send_saved_queue_attempt(
     context: &CallbackContext,
     thread: ThreadId,
     line: &str,
     log_path: &Path,
     delivery_lock: &Path,
-) -> Result<(), String> {
-    if let Some(inbox) = ClaudeInbox::find(Path::new(&context.env.home), thread)? {
-        return inbox.send(thread, line, log_path, delivery_lock);
+    prepared: PreparedQueueAttempt,
+    mode: QueueDeliveryMode,
+) -> Result<AttemptResult, String> {
+    match prepared.0 {
+        ClaudeSession::Live(inbox) => {
+            return inbox
+                .send(thread, line, log_path, delivery_lock)
+                .map(|()| AttemptResult::Delivered);
+        }
+        ClaudeSession::Stopped if matches!(mode, QueueDeliveryMode::Direct) => {
+            return Err(format!("Claude session {thread} is not running"));
+        }
+        ClaudeSession::Stopped
+            if matches!(
+                mode,
+                QueueDeliveryMode::OriginInbox {
+                    wake_claimed: false
+                }
+            ) =>
+        {
+            return Ok(AttemptResult::Deferred {
+                reason: format!("Claude session {thread} is not running; T3 wake retried later"),
+                wake_failed: false,
+            });
+        }
+        ClaudeSession::Stopped => {
+            let env = T3Env::new(
+                PathBuf::from(&context.env.home),
+                context.env.path.clone().into(),
+            );
+            let outcome = wake_claude_session(&env, thread, line);
+            return match outcome {
+                WakeOutcome::Woken { t3_thread } => {
+                    if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(log, "t3 wake thread={t3_thread}");
+                    }
+                    Ok(AttemptResult::Delivered)
+                }
+                WakeOutcome::NotT3Thread => Ok(AttemptResult::Deferred {
+                    reason: format!("Claude session {thread} is not running; no T3 thread owns it"),
+                    wake_failed: true,
+                }),
+                WakeOutcome::Unavailable(detail) => Ok(AttemptResult::Deferred {
+                    reason: format!("T3 unavailable for Claude session {thread}: {detail}"),
+                    wake_failed: true,
+                }),
+                WakeOutcome::Refused(detail) => Ok(AttemptResult::Deferred {
+                    reason: format!("T3 refused Claude session {thread}: {detail}"),
+                    wake_failed: true,
+                }),
+                WakeOutcome::ApiChanged(detail) => Ok(AttemptResult::Deferred {
+                    reason: format!("T3 API changed for Claude session {thread}: {detail}"),
+                    wake_failed: true,
+                }),
+            };
+        }
+        ClaudeSession::Unknown => {}
     }
     let binary = context.codex.path().ok_or_else(|| {
         context
@@ -524,6 +616,7 @@ pub(crate) fn send_saved_queue_attempt(
         log_path,
         delivery_lock,
     )
+    .map(|()| AttemptResult::Delivered)
 }
 
 fn queue_command_once(
@@ -779,6 +872,39 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn direct_message_to_stopped_claude_session_does_not_wake() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = row(TaskState::Queued).thread;
+        let project = home.path().join(".claude/projects/-work");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{thread}.jsonl")), "").unwrap();
+        let context = CallbackContext {
+            env: TaskEnv {
+                path: String::new(),
+                home: home.path().to_string_lossy().into_owned(),
+            },
+            cwd: home.path().to_path_buf(),
+            codex: PathBuf::from("/bin/true").into(),
+        };
+        let prepared = prepare_saved_queue_attempt(&context, thread).unwrap();
+        assert!(prepared.needs_wake());
+        let log = home.path().join("callback.log");
+        let lock = home.path().join("delivery.lock");
+        let error = send_saved_queue_attempt(
+            &context,
+            thread,
+            "HOMEBASED_MESSAGE {}",
+            &log,
+            &lock,
+            prepared,
+            QueueDeliveryMode::Direct,
+        )
+        .unwrap_err();
+        assert_eq!(error, format!("Claude session {thread} is not running"));
+        assert!(!log.exists());
     }
 
     fn report(seq: i64, outcome: ReportOutcome) -> TaskReport {
