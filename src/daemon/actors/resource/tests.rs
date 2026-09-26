@@ -646,3 +646,22 @@ fn resource_ids_round_trip_in_actor_names() {
     );
     assert!(resource_id_from_actor_name(Some("homebased.resource.invalid".into())).is_none());
 }
+
+#[tokio::test]
+async fn a_fired_deadline_wake_no_longer_covers_its_deadline() {
+    let target = super::ReturnWakeTarget::Deadline {
+        action_id: crate::resource::ActionId::new(),
+        deadline_at: chrono::Utc::now(),
+    };
+    let pending = tokio::spawn(std::future::pending::<()>());
+    let armed = super::ReturnDeadlineWake::new(target, pending.abort_handle());
+    assert!(armed.covers(target));
+    assert!(!armed.covers(super::ReturnWakeTarget::Retry));
+
+    // a wake that fired before the wall-clock deadline must let the next reconcile arm again
+    let fired = tokio::spawn(async {});
+    let handle = fired.abort_handle();
+    fired.await.unwrap();
+    let fired = super::ReturnDeadlineWake::new(target, handle);
+    assert!(!fired.covers(target));
+}

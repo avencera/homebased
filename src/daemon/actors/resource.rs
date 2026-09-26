@@ -1,5 +1,7 @@
 //! Authority-owned queue reconciliation for one resource
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorId, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tokio::task::AbortHandle;
@@ -22,7 +24,7 @@ use crate::resource::{
     ActionId, Loan, LoanPhase, LoanState, ReleaseProofAttentionReason, ReleaseWatcherIntent,
     ReleaseWatcherTaskId, Resource, ResourceId, ResourceQueueAttentionReason,
     ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState, RestoreAttentionReason,
-    ReturnDecisionWindow, SupervisorActionAuthority,
+    SupervisorActionAuthority,
 };
 use crate::store::{BackgroundLaunchPhase, BackgroundLaunchView, RestoreReconcileOutcome};
 use crate::submission::{RequestId, normalized_spec_sha256};
@@ -286,14 +288,44 @@ pub struct ResourceActorState {
     return_deadline_wake: Option<ReturnDeadlineWake>,
 }
 
-/// Wake armed for the saved deadline of one pending return action
+/// Wait before checking a return deadline again after the store failed to answer
+const RETURN_DEADLINE_RETRY: Duration = Duration::from_secs(5);
+
+/// Shortest wait before a deadline wake, so a clock step cannot spin the actor
+const RETURN_DEADLINE_MIN_WAIT: Duration = Duration::from_secs(1);
+
+/// Wake armed for one pending return action
 ///
-/// The store decides from its saved window whether the deadline passed, so a
-/// wake that fires early, or before a hold moved the deadline, only arms again
+/// The store decides from its saved window whether the deadline passed. The
+/// timer uses the monotonic clock and the window uses wall time, so a wake can
+/// fire before the saved deadline; a fired wake then no longer covers it, and
+/// the next reconcile arms another one
 struct ReturnDeadlineWake {
-    action_id: ActionId,
-    deadline_at: DateTime<Utc>,
+    target: ReturnWakeTarget,
     wake: AbortHandle,
+}
+
+/// What one return deadline wake checks
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnWakeTarget {
+    /// The saved deadline of one return action
+    Deadline {
+        action_id: ActionId,
+        deadline_at: DateTime<Utc>,
+    },
+    /// Another check after the store failed to answer
+    Retry,
+}
+
+impl ReturnDeadlineWake {
+    const fn new(target: ReturnWakeTarget, wake: AbortHandle) -> Self {
+        Self { target, wake }
+    }
+
+    /// Whether this wake is armed for `target` and has not fired yet
+    fn covers(&self, target: ReturnWakeTarget) -> bool {
+        self.target == target && !self.wake.is_finished()
+    }
 }
 
 impl Drop for ReturnDeadlineWake {
@@ -986,10 +1018,21 @@ async fn reconcile_return_deadline(
         Err(error) => {
             let resource = snapshot.resource.id.as_uuid();
             tracing::warn!(%resource, "return deadline check failed: {error}");
+            // without another wake, queued work could wait for an unrelated event
+            arm_return_wake(
+                myself,
+                state,
+                ReturnWakeTarget::Retry,
+                RETURN_DEADLINE_RETRY,
+            );
             Ok(None)
         }
         Ok(ReturnDeadlineOutcome::Open { window }) => {
-            arm_return_deadline_wake(myself, state, &window);
+            let target = ReturnWakeTarget::Deadline {
+                action_id: window.action_id(),
+                deadline_at: window.deadline_at(),
+            };
+            arm_return_wake(myself, state, target, window.remaining_at(Utc::now()));
             Ok(None)
         }
         Ok(ReturnDeadlineOutcome::NotAwaiting | ReturnDeadlineOutcome::NoQueuedRequest) => {
@@ -1016,24 +1059,24 @@ async fn reconcile_return_deadline(
     }
 }
 
-/// Arm one wake for the deadline of `window`, replacing a wake for an older deadline
-fn arm_return_deadline_wake(
+/// Arm one wake for `target` unless an unfired wake already covers it
+fn arm_return_wake(
     myself: &ActorRef<ResourceMsg>,
     state: &mut ResourceActorState,
-    window: &ReturnDecisionWindow,
+    target: ReturnWakeTarget,
+    wait: Duration,
 ) {
-    if state.return_deadline_wake.as_ref().is_some_and(|armed| {
-        armed.action_id == window.action_id && armed.deadline_at == window.deadline_at
-    }) {
+    if state
+        .return_deadline_wake
+        .as_ref()
+        .is_some_and(|armed| armed.covers(target))
+    {
         return;
     }
-    let wait = window.remaining_at(Utc::now());
-    let wake = myself.send_after(wait, || ResourceMsg::Wake).abort_handle();
-    state.return_deadline_wake = Some(ReturnDeadlineWake {
-        action_id: window.action_id,
-        deadline_at: window.deadline_at,
-        wake,
-    });
+    let wake = myself
+        .send_after(wait.max(RETURN_DEADLINE_MIN_WAIT), || ResourceMsg::Wake)
+        .abort_handle();
+    state.return_deadline_wake = Some(ReturnDeadlineWake::new(target, wake));
 }
 
 fn awaiting_return_action(snapshot: &ResourceSnapshot) -> Option<ActionId> {
