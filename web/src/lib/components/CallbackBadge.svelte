@@ -8,6 +8,7 @@
 			callback: {
 				pending: 'bg-transparent text-muted-foreground ring-border',
 				sending: 'bg-sky-500/10 text-sky-700 ring-sky-500/30 dark:text-sky-300',
+				waiting: 'bg-amber-500/10 text-amber-700 ring-amber-500/30 dark:text-amber-300',
 				sent: 'bg-transparent text-emerald-700 ring-emerald-500/30 dark:text-emerald-300',
 				failed: 'bg-red-500/10 text-red-700 ring-red-500/40 dark:text-red-300'
 			}

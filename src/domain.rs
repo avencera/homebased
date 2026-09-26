@@ -611,6 +611,8 @@ pub enum CallbackStatus {
     Pending,
     /// A queue attempt has been reserved for the terminal event
     Sending,
+    /// The terminal event waits for its origin thread to accept messages
+    Waiting,
     /// `codex queue` succeeded
     Sent,
     /// The terminal event settled without queue success
@@ -624,6 +626,7 @@ impl CallbackStatus {
         match self {
             Self::Pending => "pending",
             Self::Sending => "sending",
+            Self::Waiting => "waiting",
             Self::Sent => "sent",
             Self::Failed => "failed",
         }
@@ -634,6 +637,7 @@ impl CallbackStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "sending" => Ok(Self::Sending),
+            "waiting" => Ok(Self::Waiting),
             "sent" => Ok(Self::Sent),
             "failed" => Ok(Self::Failed),
             other => Err(AppError::Internal {
@@ -1149,15 +1153,28 @@ impl From<&ExitReason> for ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AgentKind, AgentWorkload, AttentionState, ContainerExitEvidence, ContainerId,
-        ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity, TaskName,
-        TaskNameError, TaskRow, TaskState, TaskWorkload, ThreadId, TransitionError,
+        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ContainerExitEvidence,
+        ContainerId, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity,
+        TaskName, TaskNameError, TaskRow, TaskState, TaskWorkload, ThreadId, TransitionError,
         WorkExitEvidence, Workload, check_report_allowed, check_status_transition, display_name,
         workload_display_name,
     };
     use crate::error::AppError;
     use chrono::Utc;
     use std::str::FromStr;
+
+    #[test]
+    fn callback_status_waiting_has_a_stable_storage_and_json_tag() {
+        assert_eq!(CallbackStatus::Waiting.as_str(), "waiting");
+        assert_eq!(
+            CallbackStatus::from_storage("waiting").unwrap(),
+            CallbackStatus::Waiting
+        );
+        assert_eq!(
+            serde_json::to_value(CallbackStatus::Waiting).unwrap(),
+            serde_json::json!("waiting")
+        );
+    }
 
     #[test]
     fn thread_id_parse_rejects_prefix() {

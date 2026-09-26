@@ -431,7 +431,37 @@ impl Store {
             .conn
             .prepare(
                 "SELECT DISTINCT task_id FROM origin_inbox
-             WHERE json_extract(delivery_json, '$.type') = 'pending_delivery' ORDER BY task_id",
+             WHERE json_extract(delivery_json, '$.type') IN ('pending_delivery','awaiting_thread')
+             ORDER BY task_id",
+            )
+            .map_err(storage)?;
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .into_iter()
+            .map(|id| {
+                id.parse().map_err(|_| EventError::Invalid {
+                    message: "invalid inbox task UUID".into(),
+                })
+            })
+            .collect()
+    }
+
+    /// Task IDs whose earliest unsettled callback waits for its origin thread
+    pub fn waiting_inbox_tasks(&self) -> Result<Vec<TaskId>, EventError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.task_id FROM origin_inbox i
+                 JOIN origin_routes r ON r.task_id=i.task_id
+                 WHERE i.seq=(
+                     SELECT MIN(later.seq) FROM origin_inbox later
+                     WHERE later.task_id=i.task_id
+                       AND later.seq>json_extract(r.route_json,'$.last_settled_seq')
+                 )
+                   AND json_extract(i.delivery_json,'$.type')='awaiting_thread'
+                 ORDER BY i.task_id",
             )
             .map_err(storage)?;
         stmt.query_map([], |row| row.get::<_, String>(0))
@@ -521,19 +551,25 @@ impl Store {
         if first_seq != sql_seq(seq.get())? {
             return Ok(None);
         }
-        let DeliveryState::PendingDelivery {
-            attempts,
-            last_error,
-        } = decode(&delivery_json)?
-        else {
-            return Ok(None);
-        };
-        if attempts >= 3 {
-            return Ok(None);
-        }
-        let delivery = DeliveryState::PendingDelivery {
-            attempts: attempts + 1,
-            last_error,
+        let current_delivery: DeliveryState = decode(&delivery_json)?;
+        let delivery = match current_delivery {
+            DeliveryState::PendingDelivery {
+                attempts,
+                last_error,
+            } if attempts < 3 => DeliveryState::PendingDelivery {
+                attempts: attempts + 1,
+                last_error,
+            },
+            DeliveryState::AwaitingThread {
+                attempts,
+                since,
+                reason,
+            } if attempts < 3 => DeliveryState::AwaitingThread {
+                attempts: attempts + 1,
+                since,
+                reason,
+            },
+            _ => return Ok(None),
         };
         tx.execute(
             "UPDATE origin_inbox SET delivery_json=?1 WHERE task_id=?2 AND seq=?3",
@@ -548,7 +584,7 @@ impl Store {
         }))
     }
 
-    /// Settle one earliest pending event and advance only a contiguous settled prefix
+    /// Record an outcome for the earliest inbox event and advance only a contiguous settled prefix
     pub fn settle_inbox_attempt(
         &mut self,
         task: TaskId,
@@ -574,14 +610,22 @@ impl Store {
             params![task.to_string(), sql_seq(seq.get())?],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).map_err(storage)?;
-        let DeliveryState::PendingDelivery {
-            attempts,
-            last_error,
-        } = decode(&row.2)?
-        else {
-            return Err(EventError::Invalid {
-                message: "inbox event is not pending".into(),
-            });
+        let current_delivery: DeliveryState = decode(&row.2)?;
+        let (attempts, last_error, waiting_since) = match current_delivery {
+            DeliveryState::PendingDelivery {
+                attempts,
+                last_error,
+            } => (attempts, last_error, None),
+            DeliveryState::AwaitingThread {
+                attempts,
+                since,
+                reason,
+            } => (attempts, Some(reason), Some(since)),
+            _ => {
+                return Err(EventError::Invalid {
+                    message: "inbox event is not unsettled".into(),
+                });
+            }
         };
         if seq.get() != route.last_settled_seq + 1 {
             return Err(EventError::Invalid {
@@ -592,6 +636,11 @@ impl Store {
             DeliveryOutcome::Delivered if attempts > 0 => DeliveryState::Delivered {
                 attempts,
                 last_error,
+            },
+            DeliveryOutcome::Deferred(reason) if attempts > 0 => DeliveryState::AwaitingThread {
+                attempts: attempts.saturating_sub(1),
+                since: waiting_since.unwrap_or_else(Utc::now),
+                reason,
             },
             DeliveryOutcome::Retryable(error) if attempts >= 3 => DeliveryState::DeliveryFailed {
                 attempts,
@@ -605,13 +654,16 @@ impl Store {
                 attempts,
                 last_error: error,
             },
-            DeliveryOutcome::Delivered => {
+            DeliveryOutcome::Delivered | DeliveryOutcome::Deferred(_) => {
                 return Err(EventError::Invalid {
-                    message: "success without a reserved attempt".into(),
+                    message: "delivery outcome without a reserved attempt".into(),
                 });
             }
         };
-        let settled = !matches!(&delivery, DeliveryState::PendingDelivery { .. });
+        let settled = !matches!(
+            &delivery,
+            DeliveryState::PendingDelivery { .. } | DeliveryState::AwaitingThread { .. }
+        );
         tx.execute(
             "UPDATE origin_inbox
              SET delivery_json=?1,
@@ -645,7 +697,7 @@ impl Store {
                 .map_err(storage)?;
             }
         }
-        if !matches!(delivery, DeliveryState::PendingDelivery { .. }) {
+        if settled {
             let mut cursor = route.last_settled_seq;
             while let Some(next_json) = tx
                 .query_row(
@@ -658,7 +710,7 @@ impl Store {
             {
                 if matches!(
                     decode::<DeliveryState>(&next_json)?,
-                    DeliveryState::PendingDelivery { .. }
+                    DeliveryState::PendingDelivery { .. } | DeliveryState::AwaitingThread { .. }
                 ) {
                     break;
                 }
@@ -1538,11 +1590,11 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_pending_and_failed_callback_payloads() {
+    fn compaction_preserves_unsettled_and_failed_callback_payloads() {
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
-
         let pending_route = route();
+
         store.insert_origin_route(&pending_route).unwrap();
         store
             .accept_execution(&ExecutionRecord {
@@ -1602,9 +1654,44 @@ mod tests {
                 DeliveryOutcome::Permanent("callback unavailable".into()),
             )
             .unwrap();
+        let waiting_route = route();
+        store.insert_origin_route(&waiting_route).unwrap();
+        store
+            .accept_execution(&ExecutionRecord {
+                task: waiting_route.task,
+                origin_machine: waiting_route.origin_machine,
+                execution_machine: waiting_route.execution_machine,
+                spec: waiting_route.spec.clone(),
+                state: ProcessStatus::Queued,
+            })
+            .unwrap();
+        let waiting = callback_event(&waiting_route, 1, None);
+        store
+            .append_outbound_event(
+                waiting_route.task,
+                waiting_route.origin_machine,
+                waiting_route.execution_machine,
+                waiting.payload.clone(),
+            )
+            .unwrap();
+        store.accept_inbound_event(&waiting).unwrap();
+        store
+            .mark_outbound_acknowledged(waiting_route.task, waiting.seq)
+            .unwrap();
+        store
+            .reserve_inbox_attempt(waiting_route.task, waiting.seq)
+            .unwrap()
+            .unwrap();
+        store
+            .settle_inbox_attempt(
+                waiting_route.task,
+                waiting.seq,
+                DeliveryOutcome::Deferred("origin thread is asleep".into()),
+            )
+            .unwrap();
         age_event_payloads(&store);
 
-        assert_eq!(store.compact_old_event_payloads().unwrap().compacted, 2);
+        assert_eq!(store.compact_old_event_payloads().unwrap().compacted, 3);
         let pending_inbox = store.inbound_events(pending_route.task).unwrap();
         assert_eq!(pending_inbox.len(), 1);
         assert_eq!(pending_inbox[0].event, pending);
@@ -1619,6 +1706,14 @@ mod tests {
             &failed_inbox[0].delivery,
             DeliveryState::DeliveryFailed { last_error, .. }
                 if last_error == "callback unavailable"
+        ));
+        let waiting_inbox = store.inbound_events(waiting_route.task).unwrap();
+        assert_eq!(waiting_inbox.len(), 1);
+        assert_eq!(waiting_inbox[0].event, waiting);
+        assert!(matches!(
+            &waiting_inbox[0].delivery,
+            DeliveryState::AwaitingThread { reason, .. }
+                if reason == "origin thread is asleep"
         ));
     }
 
@@ -1886,6 +1981,285 @@ mod tests {
         let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
         assert_eq!(saved.last_accepted_seq, 3);
         assert_eq!(saved.last_settled_seq, 0);
+    }
+
+    #[test]
+    fn deferred_callback_refunds_attempt_and_blocks_later_events() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let pending_route = route();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+        store
+            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
+            .unwrap();
+        store.insert_origin_route(&pending_route).unwrap();
+        store
+            .accept_inbound_event(&callback_event(&pending_route, 1, None))
+            .unwrap();
+
+        let reserved = store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reserved.delivery,
+            DeliveryState::PendingDelivery { attempts: 1, .. }
+        ));
+        let before = chrono::Utc::now();
+        let deferred = store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("origin thread is asleep".into()),
+            )
+            .unwrap();
+        let after = chrono::Utc::now();
+        let DeliveryState::AwaitingThread {
+            attempts,
+            since,
+            reason,
+        } = deferred.delivery
+        else {
+            panic!("deferred callback state")
+        };
+        assert_eq!(attempts, 0);
+        assert!(since >= before && since <= after);
+        assert_eq!(reason, "origin thread is asleep");
+        assert_eq!(
+            store
+                .origin_route_by_task(route.task)
+                .unwrap()
+                .unwrap()
+                .last_settled_seq,
+            0
+        );
+        let settled_at: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT settled_at FROM origin_inbox WHERE task_id=?1 AND seq=1",
+                [route.task.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled_at, None);
+
+        let earliest = store.earliest_unsettled_inbox(route.task).unwrap().unwrap();
+        assert_eq!(earliest.event.seq, callback.seq);
+        assert!(matches!(
+            earliest.delivery,
+            DeliveryState::AwaitingThread { attempts: 0, .. }
+        ));
+        assert!(
+            store
+                .reserve_inbox_attempt(route.task, NonZeroU64::new(2).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.pending_inbox_tasks().unwrap().contains(&route.task));
+        assert_eq!(store.waiting_inbox_tasks().unwrap(), vec![route.task]);
+    }
+
+    #[test]
+    fn repeated_deferral_keeps_the_original_waiting_time() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+        store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("thread is asleep".into()),
+            )
+            .unwrap();
+        let DeliveryState::AwaitingThread { since, .. } =
+            &store.inbound_events(route.task).unwrap()[0].delivery
+        else {
+            panic!("awaiting thread state")
+        };
+
+        let reserved = store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reserved.delivery,
+            DeliveryState::AwaitingThread {
+                attempts: 1,
+                since: reserved_since,
+                reason: reserved_reason,
+            } if reserved_since == *since && reserved_reason == "thread is asleep"
+        ));
+        store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("thread is still asleep".into()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &store.inbound_events(route.task).unwrap()[0].delivery,
+            DeliveryState::AwaitingThread {
+                attempts: 0,
+                since: original_since,
+                reason,
+            } if *original_since == *since && reason == "thread is still asleep"
+        ));
+    }
+
+    #[test]
+    fn awaiting_callback_can_deliver_and_records_its_wait_reason() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+        store
+            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
+            .unwrap();
+        store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("origin thread is asleep".into()),
+            )
+            .unwrap();
+        let reserved = store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reserved.delivery,
+            DeliveryState::AwaitingThread { attempts: 1, .. }
+        ));
+
+        let delivered = store
+            .settle_inbox_attempt(route.task, callback.seq, DeliveryOutcome::Delivered)
+            .unwrap();
+        assert_eq!(
+            delivered.delivery,
+            DeliveryState::Delivered {
+                attempts: 1,
+                last_error: Some("origin thread is asleep".into()),
+            }
+        );
+        assert_eq!(
+            store
+                .origin_route_by_task(route.task)
+                .unwrap()
+                .unwrap()
+                .last_settled_seq,
+            2
+        );
+    }
+
+    #[test]
+    fn awaiting_retryable_failure_resumes_the_three_attempt_budget() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+        store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("origin thread is asleep".into()),
+            )
+            .unwrap();
+
+        for attempts in 1..=3 {
+            let reserved = store
+                .reserve_inbox_attempt(route.task, callback.seq)
+                .unwrap()
+                .unwrap();
+            if attempts == 1 {
+                assert!(matches!(
+                    reserved.delivery,
+                    DeliveryState::AwaitingThread { attempts: 1, .. }
+                ));
+            } else {
+                assert!(matches!(
+                    reserved.delivery,
+                    DeliveryState::PendingDelivery {
+                        attempts: reserved_attempts,
+                        ..
+                    } if reserved_attempts == attempts
+                ));
+            }
+            let result = store
+                .settle_inbox_attempt(
+                    route.task,
+                    callback.seq,
+                    DeliveryOutcome::Retryable(format!("send failed {attempts}")),
+                )
+                .unwrap();
+            if attempts < 3 {
+                assert_eq!(
+                    result.delivery,
+                    DeliveryState::PendingDelivery {
+                        attempts,
+                        last_error: Some(format!("send failed {attempts}")),
+                    }
+                );
+            } else {
+                assert_eq!(
+                    result.delivery,
+                    DeliveryState::DeliveryFailed {
+                        attempts,
+                        last_error: "send failed 3".into(),
+                    }
+                );
+            }
+        }
+        assert!(store.pending_inbox_tasks().unwrap().is_empty());
+        assert!(store.waiting_inbox_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deferred_outcome_without_a_reserved_attempt_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+
+        assert!(matches!(
+            store.settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("origin thread is asleep".into())
+            ),
+            Err(EventError::Invalid { .. })
+        ));
+        assert_eq!(
+            store.inbound_events(route.task).unwrap()[0].delivery,
+            DeliveryState::PendingDelivery {
+                attempts: 0,
+                last_error: None,
+            }
+        );
     }
 
     #[test]

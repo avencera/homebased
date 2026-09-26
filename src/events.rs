@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU64;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, ReportView};
@@ -156,6 +157,17 @@ pub enum DeliveryState {
         /// Last retryable error, if any
         last_error: Option<String>,
     },
+    /// The origin thread cannot take messages now, for example its Claude Code session has no live
+    /// process and cannot be woken; the dispatcher keeps retrying without counting these checks
+    /// against the send budget
+    AwaitingThread {
+        /// Reserved command attempts, excluding refunded checks
+        attempts: u8,
+        /// When this event first began waiting for its origin thread
+        since: DateTime<Utc>,
+        /// Why the origin thread could not take a message
+        reason: String,
+    },
     /// Queue delivery succeeded
     Delivered {
         /// Reserved command attempts
@@ -177,6 +189,9 @@ pub enum DeliveryState {
 pub enum DeliveryOutcome {
     /// The queue command accepted the event
     Delivered,
+    /// The attempt found the origin thread unable to take messages and sent nothing that could have
+    /// been delivered, so the attempt is refunded
+    Deferred(String),
     /// The command failed and can be retried within the durable budget
     Retryable(String),
     /// The saved callback context or command cannot be used again
@@ -263,6 +278,22 @@ mod tests {
     use super::*;
     use crate::callback::{EventKind, NextAction, WorkloadView};
     use crate::domain::ThreadId;
+
+    #[test]
+    fn awaiting_thread_delivery_state_uses_its_durable_tag() {
+        let state = DeliveryState::AwaitingThread {
+            attempts: 2,
+            since: Utc::now(),
+            reason: "origin thread is asleep".into(),
+        };
+
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["type"], "awaiting_thread");
+        assert_eq!(
+            serde_json::from_value::<DeliveryState>(value).unwrap(),
+            state
+        );
+    }
 
     #[test]
     fn callback_adds_identity_without_changing_legacy_fields() {

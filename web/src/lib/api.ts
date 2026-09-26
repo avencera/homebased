@@ -41,7 +41,7 @@ export function isInFlight(status: ProcessStatus): boolean {
 export type AgentKind = 'codex' | 'claude' | 'grok' | 'opencode';
 
 /** Callback delivery state. Outlives the process state. */
-export type CallbackStatus = 'pending' | 'sending' | 'sent' | 'failed';
+export type CallbackStatus = 'pending' | 'sending' | 'waiting' | 'sent' | 'failed';
 
 /** Worker-authored outcome of one report. */
 export type ReportOutcome = 'succeeded' | 'failed' | 'blocked';
@@ -259,7 +259,7 @@ const ProcessStatusSchema = Schema.Literal(
 	'lost'
 );
 const AgentKindSchema = Schema.Literal('codex', 'claude', 'grok', 'opencode');
-const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'sent', 'failed');
+const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'waiting', 'sent', 'failed');
 const CheckTimeoutStatusSchema = Schema.Literal('pending', 'sent');
 const ReportOutcomeSchema = Schema.Literal('succeeded', 'failed', 'blocked');
 const ExitReasonSchema = Schema.Union(

@@ -1486,6 +1486,9 @@ impl Store {
                         CallbackStatus::Sending
                     }))
                 }
+                DeliveryState::AwaitingThread { .. } => Ok(
+                    TerminalCallbackProjection::OriginInbox(CallbackStatus::Waiting),
+                ),
                 DeliveryState::Delivered { .. } => Ok(TerminalCallbackProjection::OriginInbox(
                     CallbackStatus::Sent,
                 )),
@@ -4390,6 +4393,34 @@ CREATE TABLE reports (
             ))
             .unwrap()["callback"],
             "failed"
+        );
+    }
+
+    #[test]
+    fn terminal_callback_waiting_projects_to_callback_status() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let id = TaskId::new();
+        insert_local(&store, id);
+        store
+            .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
+            .unwrap();
+
+        deliver_outbound_events(&mut store, id, |_| {
+            DeliveryOutcome::Deferred("origin thread is asleep".into())
+        });
+
+        assert_eq!(
+            store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
+            TerminalCallbackProjection::OriginInbox(CallbackStatus::Waiting)
+        );
+        assert_eq!(
+            serde_json::to_value(TaskSummary::from_row(
+                &store.require_task(id).unwrap(),
+                Some(&store.task_presentations(&[id]).unwrap()[&id]),
+            ))
+            .unwrap()["callback"],
+            "waiting"
         );
     }
 
