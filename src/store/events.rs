@@ -660,10 +660,7 @@ impl Store {
                 });
             }
         };
-        let settled = !matches!(
-            &delivery,
-            DeliveryState::PendingDelivery { .. } | DeliveryState::AwaitingThread { .. }
-        );
+        let settled = !delivery.is_unsettled();
         tx.execute(
             "UPDATE origin_inbox
              SET delivery_json=?1,
@@ -708,10 +705,7 @@ impl Store {
                 .optional()
                 .map_err(storage)?
             {
-                if matches!(
-                    decode::<DeliveryState>(&next_json)?,
-                    DeliveryState::PendingDelivery { .. } | DeliveryState::AwaitingThread { .. }
-                ) {
+                if decode::<DeliveryState>(&next_json)?.is_unsettled() {
                     break;
                 }
                 cursor += 1;

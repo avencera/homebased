@@ -93,9 +93,23 @@ async fn dispatch(home: &Home, id: TaskId) {
     let (store, handle) = StoreActor::spawn(None, StoreActor, home.db_path())
         .await
         .unwrap();
-    dispatch_inbox(store.clone(), home.clone(), id)
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    dispatch_inbox(store.clone(), home.clone(), id, callback.clone())
         .await
         .unwrap();
+    callback.stop(None);
+    callback_handle.await.unwrap();
     store.stop(None);
     handle.await.unwrap();
 }
@@ -556,6 +570,74 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
     assert!(matches!(
         entries[1].delivery,
         DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    assert!(
+        !call(&callback, |reply| CallbackMsg::InspectAlert {
+            thread,
+            reply
+        })
+        .await
+        .unwrap()
+    );
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn throttled_wake_check_waits_without_a_push() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nexit 0\n");
+    let callback_home = PathBuf::from(&route.callback.env.home);
+    let project = callback_home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let thread = route.thread;
+    std::fs::write(project.join(format!("{thread}.jsonl")), "").unwrap();
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 1, true))
+        .unwrap();
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // another task woke this thread moments ago
+    assert!(
+        call(&callback, |reply| CallbackMsg::ClaimWake { thread, reply })
+            .await
+            .unwrap()
+    );
+
+    let drained = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
+        .await
+        .unwrap();
+
+    assert!(!drained);
+    let entry = call(&store, |reply| StoreMsg::EarliestInbox {
+        id: route.task,
+        reply,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        entry.delivery,
+        DeliveryState::AwaitingThread { attempts: 0, ref reason, .. }
+            if reason.contains("T3 wake retried later")
     ));
     assert!(
         !call(&callback, |reply| CallbackMsg::InspectAlert {

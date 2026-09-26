@@ -185,6 +185,17 @@ pub enum DeliveryState {
     },
 }
 
+impl DeliveryState {
+    /// Whether the dispatcher still owns this event
+    #[must_use]
+    pub fn is_unsettled(&self) -> bool {
+        matches!(
+            self,
+            Self::PendingDelivery { .. } | Self::AwaitingThread { .. }
+        )
+    }
+}
+
 /// Result of one reserved origin queue attempt
 pub enum DeliveryOutcome {
     /// The queue command accepted the event

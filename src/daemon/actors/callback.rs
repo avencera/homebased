@@ -5,19 +5,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
-use tokio::sync::watch;
 use tracing::warn;
 
 use crate::callback::{
-    AttemptResult, QueueDeliveryMode, append_fallback, check_saved_callback,
-    prepare_saved_queue_attempt, send_saved_queue_attempt,
+    HomebasedEvent, OriginSession, ReachableOrigin, append_fallback, check_saved_callback,
+    find_saved_origin, wake_stopped_session,
 };
 use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
-use crate::home::Home;
+use crate::home::{Home, TaskPaths};
 use crate::notify::{Notice, NoticePriority, Notifier};
+use crate::submission::CallbackContext;
 use crate::thread_title::TitleSources;
 
 const WAITING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -83,7 +83,6 @@ pub struct CallbackState {
     wake_times: HashMap<ThreadId, Instant>,
     alerted_threads: HashSet<ThreadId>,
     active_inbox: HashSet<TaskId>,
-    _timer_stop: watch::Sender<bool>,
 }
 
 impl CallbackState {
@@ -107,32 +106,42 @@ impl CallbackState {
         let Some(notifier) = self.notifier.clone() else {
             return;
         };
+        let EventPayload::Callback { event, .. } = event.payload else {
+            return;
+        };
         let machine_name = self.machine_name.clone();
+        // thread titles read transcripts and ntfy runs curl; both block
         tokio::task::spawn_blocking(move || {
-            let EventPayload::Callback { event, .. } = event.payload else {
-                return;
-            };
             let title = TitleSources::from_env()
                 .and_then(|sources| sources.titles(&[thread]).into_iter().next().flatten())
                 .unwrap_or_else(|| thread.to_string());
-            let event_kind = event.event;
-            let event_name = serde_json::to_value(event.event)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| format!("{event_kind:?}"));
-            let display_name = &event.display_name;
-            let notice = Notice {
-                title: format!("Thread needs you: {title}"),
-                message: format!(
-                    "{display_name} ({event_name}) is waiting on {machine_name}: {reason}. Open the thread to receive it."
-                ),
-                tags: vec!["hourglass".into()],
-                priority: NoticePriority::High,
-            };
+            let notice = waiting_thread_notice(&title, &event, &machine_name, &reason);
             if let Err(error) = notifier.send(&notice) {
                 warn!(%thread, "waiting-thread push failed: {error}");
             }
         });
+    }
+}
+
+fn waiting_thread_notice(
+    title: &str,
+    event: &HomebasedEvent,
+    machine_name: &str,
+    reason: &str,
+) -> Notice {
+    let event_kind = event.event;
+    let event_name = serde_json::to_value(event_kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{event_kind:?}"));
+    let display_name = &event.display_name;
+    Notice {
+        title: format!("Thread needs you: {title}"),
+        message: format!(
+            "{display_name} ({event_name}) is waiting on {machine_name}: {reason}. Open the thread to receive it."
+        ),
+        tags: vec!["hourglass".into()],
+        priority: NoticePriority::High,
     }
 }
 
@@ -149,25 +158,8 @@ impl Actor for CallbackActor {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let (timer_stop, mut stopped) = watch::channel(false);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(WAITING_RETRY_INTERVAL);
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if myself.cast(CallbackMsg::RetryWaiting).is_err() {
-                            break;
-                        }
-                    }
-                    result = stopped.changed() => {
-                        if result.is_err() || *stopped.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        // the timer task ends on its own once this actor stops
+        myself.send_interval(WAITING_RETRY_INTERVAL, || CallbackMsg::RetryWaiting);
         Ok(CallbackState {
             store: args.store,
             home: args.home,
@@ -176,7 +168,6 @@ impl Actor for CallbackActor {
             wake_times: HashMap::new(),
             alerted_threads: HashSet::new(),
             active_inbox: HashSet::new(),
-            _timer_stop: timer_stop,
         })
     }
 
@@ -230,7 +221,7 @@ async fn start_inbox_worker(
         return Ok(());
     }
     let first = call(&state.store, |reply| StoreMsg::EarliestInbox { id, reply }).await?;
-    if !first.is_some_and(|entry| unsettled(&entry.delivery)) {
+    if !first.is_some_and(|entry| entry.delivery.is_unsettled()) {
         return Ok(());
     }
     state.active_inbox.insert(id);
@@ -238,7 +229,7 @@ async fn start_inbox_worker(
     let home = state.home.clone();
     let myself = myself.clone();
     tokio::spawn(async move {
-        let completed = match dispatch_inbox_with(store, home, id, myself.clone()).await {
+        let completed = match dispatch_inbox(store, home, id, myself.clone()).await {
             Ok(completed) => completed,
             Err(error) => {
                 warn!(%id, "origin inbox dispatch: {error}");
@@ -250,43 +241,28 @@ async fn start_inbox_worker(
     Ok(())
 }
 
-fn unsettled(delivery: &DeliveryState) -> bool {
-    matches!(
-        delivery,
-        DeliveryState::PendingDelivery { .. } | DeliveryState::AwaitingThread { .. }
-    )
+/// Result of one reserved attempt, before settlement
+enum AttemptOutcome {
+    /// Settle the event with this outcome
+    Settle(DeliveryOutcome),
+    /// A claimed T3 wake failed, so the event waits and the thread may need a push
+    WakeFailed(String),
+}
+
+impl AttemptOutcome {
+    fn into_settlement(self) -> (DeliveryOutcome, Option<String>) {
+        match self {
+            Self::Settle(outcome) => (outcome, None),
+            Self::WakeFailed(reason) => (DeliveryOutcome::Deferred(reason.clone()), Some(reason)),
+        }
+    }
 }
 
 /// Drain one task's inbox in sequence using only its saved origin route
-#[cfg(test)]
+///
+/// Returns `false` when the worker stops before the inbox is drained, for
+/// example because the earliest event waits for its origin thread
 pub(crate) async fn dispatch_inbox(
-    store: ActorRef<StoreMsg>,
-    home: Home,
-    id: TaskId,
-) -> Result<(), AppError> {
-    let (actor, handle) = CallbackActor::spawn(
-        None,
-        CallbackActor,
-        CallbackArgs {
-            store: store.clone(),
-            home: home.clone(),
-            notifier: None,
-            machine_name: "test".into(),
-        },
-    )
-    .await
-    .map_err(|error| AppError::Internal {
-        message: format!("callback actor spawn: {error}"),
-    })?;
-    let result = dispatch_inbox_with(store, home, id, actor.clone()).await;
-    actor.stop(None);
-    handle.await.map_err(|error| AppError::Internal {
-        message: format!("callback actor join: {error}"),
-    })?;
-    result.map(|_| ())
-}
-
-async fn dispatch_inbox_with(
     store: ActorRef<StoreMsg>,
     home: Home,
     id: TaskId,
@@ -310,17 +286,16 @@ async fn dispatch_inbox_with(
         let route = call(&store, |reply| StoreMsg::OriginRoute { id, reply })
             .await?
             .ok_or(AppError::RouteNotFound { task: id })?;
-        let mut failed_wake = None;
         let outcome = if attempts >= 3 {
-            DeliveryOutcome::Permanent(
-                last_error.unwrap_or_else(|| {
-                    "queue attempt budget exhausted after daemon restart".into()
-                }),
-            )
+            AttemptOutcome::Settle(DeliveryOutcome::Permanent(last_error.unwrap_or_else(
+                || "queue attempt budget exhausted after daemon restart".into(),
+            )))
         } else if let Err(error) = check_saved_callback(&route.callback) {
-            DeliveryOutcome::Permanent(error)
+            AttemptOutcome::Settle(DeliveryOutcome::Permanent(error))
         } else if let Err(error) = home.prepare_task(id) {
-            DeliveryOutcome::Permanent(format!("prepare callback delivery lock: {error}"))
+            AttemptOutcome::Settle(DeliveryOutcome::Permanent(format!(
+                "prepare callback delivery lock: {error}"
+            )))
         } else {
             let Some(_reserved) = call(&store, |reply| StoreMsg::ReserveInboxAttempt {
                 id,
@@ -337,56 +312,15 @@ async fn dispatch_inbox_with(
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
-            let paths = home.task_paths(id);
-            let context = route.callback;
-            let thread = route.thread;
-            let prepared = tokio::task::spawn_blocking({
-                let context = context.clone();
-                move || prepare_saved_queue_attempt(&context, thread)
-            })
-            .await
-            .map_err(|error| AppError::Internal {
-                message: format!("origin callback lookup join: {error}"),
-            })?;
-            let result = match prepared {
-                Ok(prepared) => {
-                    let wake_claimed = if prepared.needs_wake() {
-                        call(&callback, |reply| CallbackMsg::ClaimWake { thread, reply }).await?
-                    } else {
-                        false
-                    };
-                    tokio::task::spawn_blocking(move || {
-                        send_saved_queue_attempt(
-                            &context,
-                            thread,
-                            &line,
-                            &paths.callback_log,
-                            &paths.delivery_lock,
-                            prepared,
-                            QueueDeliveryMode::OriginInbox { wake_claimed },
-                        )
-                    })
-                    .await
-                    .map_err(|error| AppError::Internal {
-                        message: format!("origin callback join: {error}"),
-                    })?
-                }
-                Err(error) => Err(error),
+            let attempt = OriginAttempt {
+                context: route.callback.clone(),
+                thread: route.thread,
+                line,
+                paths: home.task_paths(id),
             };
-            match result {
-                Ok(AttemptResult::Delivered) => DeliveryOutcome::Delivered,
-                Ok(AttemptResult::Deferred {
-                    reason,
-                    wake_failed,
-                }) => {
-                    if wake_failed {
-                        failed_wake = Some(reason.clone());
-                    }
-                    DeliveryOutcome::Deferred(reason)
-                }
-                Err(error) => DeliveryOutcome::Retryable(error),
-            }
+            attempt.run(&callback).await?
         };
+        let (outcome, failed_wake) = outcome.into_settlement();
         let settled = call(&store, |reply| StoreMsg::SettleInboxAttempt {
             id,
             seq,
@@ -394,34 +328,108 @@ async fn dispatch_inbox_with(
             reply,
         })
         .await?;
-        if let DeliveryState::DeliveryFailed { last_error, .. } = &settled.delivery {
-            let line = settled
-                .event
-                .callback_message_line()?
-                .ok_or(AppError::Internal {
-                    message: "failed inbox event has no callback payload".into(),
-                })?;
-            if let Err(error) = append_fallback(&home.fallback_log_path(), &line, last_error) {
-                warn!(%id, seq = seq.get(), "origin callback fallback log: {error}");
+        match &settled.delivery {
+            DeliveryState::DeliveryFailed { last_error, .. } => {
+                let line = settled
+                    .event
+                    .callback_message_line()?
+                    .ok_or(AppError::Internal {
+                        message: "failed inbox event has no callback payload".into(),
+                    })?;
+                if let Err(error) = append_fallback(&home.fallback_log_path(), &line, last_error) {
+                    warn!(%id, seq = seq.get(), "origin callback fallback log: {error}");
+                }
             }
-        }
-        if matches!(settled.delivery, DeliveryState::Delivered { .. }) {
-            let _ = callback.cast(CallbackMsg::Delivered {
-                thread: route.thread,
-            });
-        }
-        if matches!(settled.delivery, DeliveryState::AwaitingThread { .. }) {
-            if let Some(reason) = failed_wake {
-                let _ = callback.cast(CallbackMsg::WakeFailed {
+            DeliveryState::Delivered { .. } => {
+                let _ = callback.cast(CallbackMsg::Delivered {
                     thread: route.thread,
-                    event: settled.event,
-                    reason,
                 });
             }
-            return Ok(false);
-        }
-        if matches!(settled.delivery, DeliveryState::PendingDelivery { .. }) {
-            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempts + 1))).await;
+            DeliveryState::AwaitingThread { .. } => {
+                if let Some(reason) = failed_wake {
+                    let _ = callback.cast(CallbackMsg::WakeFailed {
+                        thread: route.thread,
+                        event: settled.event,
+                        reason,
+                    });
+                }
+                // the retry timer picks this task up again
+                return Ok(false);
+            }
+            DeliveryState::PendingDelivery { .. } => {
+                tokio::time::sleep(Duration::from_millis(200 * u64::from(attempts + 1))).await;
+            }
+            DeliveryState::NotRequired => {}
         }
     }
+}
+
+/// One reserved attempt on a saved origin route
+struct OriginAttempt {
+    context: CallbackContext,
+    thread: ThreadId,
+    line: String,
+    paths: TaskPaths,
+}
+
+impl OriginAttempt {
+    async fn run(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
+        let lookup = self.context.clone();
+        let thread = self.thread;
+        let origin = run_blocking("origin callback lookup", move || {
+            find_saved_origin(&lookup, thread)
+        })
+        .await?;
+        match origin {
+            Ok(OriginSession::Reachable(origin)) => self.send(origin).await,
+            Ok(OriginSession::Stopped) => self.wake(callback).await,
+            Err(error) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Retryable(error))),
+        }
+    }
+
+    async fn send(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
+        let sent = run_blocking("origin callback", move || {
+            origin.send(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.paths.delivery_lock,
+            )
+        })
+        .await?;
+        Ok(AttemptOutcome::Settle(match sent {
+            Ok(()) => DeliveryOutcome::Delivered,
+            Err(error) => DeliveryOutcome::Retryable(error),
+        }))
+    }
+
+    /// Wake a stopped Claude session through T3 unless another attempt woke it recently
+    async fn wake(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
+        let thread = self.thread;
+        if !call(callback, |reply| CallbackMsg::ClaimWake { thread, reply }).await? {
+            return Ok(AttemptOutcome::Settle(DeliveryOutcome::Deferred(format!(
+                "Claude session {thread} is not running; T3 wake retried later"
+            ))));
+        }
+        let woken = run_blocking("T3 wake", move || {
+            wake_stopped_session(&self.context, thread, &self.line, &self.paths.callback_log)
+        })
+        .await?;
+        Ok(match woken {
+            Ok(()) => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
+            Err(reason) => AttemptOutcome::WakeFailed(reason),
+        })
+    }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    label: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("{label} join: {error}"),
+        })
 }
