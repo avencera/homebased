@@ -8,6 +8,7 @@
 	import { isProcessStatus, peerTaskHref, type FleetMachine, type ThreadRef } from '$lib/api';
 	import type { ResourceQueueStore } from '$lib/daemon.svelte';
 	import {
+		namesMachine,
 		queueMovePlacement,
 		requestThread,
 		resourceTaskThread,
@@ -193,9 +194,11 @@
 				>
 					{item.resource.display_name}
 				</a>
-				<Capsule hue={machineHue(authority)} dot title={`Authority ${authority}`}
-					>{authority}</Capsule
-				>
+				{#if !namesMachine(item.resource.display_name, authority)}
+					<Capsule hue={machineHue(authority)} dot title={`Authority ${authority}`}
+						>{authority}</Capsule
+					>
+				{/if}
 				<span
 					class={cn('ml-auto shrink-0', toneClass[item.status.tone])}
 					title={item.status.message}

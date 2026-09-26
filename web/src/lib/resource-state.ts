@@ -191,6 +191,19 @@ export function queueMovePlacement(
 	return next ? { type: 'after', request_id: next.request_id } : null;
 }
 
+/**
+ * Whether a resource name already names its authority machine, as in "code.local NVIDIA GPU" on
+ * `code`, so the card can drop the machine pill
+ */
+export function namesMachine(displayName: string, machine: string): boolean {
+	const name = machine.toLowerCase();
+	// a host word may carry a domain such as `.local`
+	return displayName
+		.toLowerCase()
+		.split(/\s+/)
+		.some((word) => word.split('.')[0] === name);
+}
+
 /** Whether a resource runs or waits on work, so it earns space next to the task list. */
 export function isBusy(queue: ResourceQueue): boolean {
 	return queue.current !== null || queue.background !== null || queue.queue.length > 0;

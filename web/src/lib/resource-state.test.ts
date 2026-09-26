@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
 	detailStatus,
+	namesMachine,
 	overviewStatus,
 	queueMovePlacement,
 	queueThreads,
@@ -209,4 +210,11 @@ test('job threads resolve to the machine that runs each thread', () => {
 		{ machine: resource.authority_machine, thread: 'background-thread' },
 		{ machine: peer, thread: 'queued-thread' }
 	]);
+});
+
+test('a resource name names its machine only by a whole host word', () => {
+	assert.equal(namesMachine('code.local NVIDIA GPU', 'code'), true);
+	assert.equal(namesMachine('Code GPU', 'code'), true);
+	assert.equal(namesMachine('shared GPU', 'code'), false);
+	assert.equal(namesMachine('codec GPU', 'code'), false);
 });
