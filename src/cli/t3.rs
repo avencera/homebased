@@ -43,25 +43,16 @@ fn print_report(ctx: &Ctx, report: &ProbeReport) -> Result<(), AppError> {
     match ctx.output {
         OutputMode::Json => ctx.print_json(to_value(report)?),
         OutputMode::Quiet => {
-            println!("{}", status_name(report.status));
+            println!("{}", report.status.as_str());
             Ok(())
         }
         OutputMode::Human => {
-            println!("t3 check: {}", status_name(report.status));
+            println!("t3 check: {}", report.status.as_str());
             for check in &report.checks {
                 let result = if check.ok { "ok" } else { "failed" };
                 println!("{result} {}: {}", check.name, check.detail);
             }
             Ok(())
         }
-    }
-}
-
-fn status_name(status: ProbeStatus) -> &'static str {
-    match status {
-        ProbeStatus::NotInstalled => "not_installed",
-        ProbeStatus::NotRunning => "not_running",
-        ProbeStatus::Compatible => "compatible",
-        ProbeStatus::Changed => "changed",
     }
 }

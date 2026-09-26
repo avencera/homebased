@@ -32,18 +32,22 @@
 //!   return HTTP 500 with `reason: orchestration_dispatch_failed`. HTTP 401 or
 //!   403 indicates a changed API, and HTTP 404 can return a typed error object
 //!
-//! Calls use the blocking system `curl` helper. The callback dispatcher must
-//! call this module from `spawn_blocking`
+//! Calls use the blocking system `curl` helper and `t3` commands with a
+//! deadline. The callback dispatcher must call this module from `spawn_blocking`
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use nix::errno::Errno;
-use nix::sys::signal::kill;
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -56,6 +60,9 @@ use crate::domain::ThreadId;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
 const CLAUDE_THREAD_SQL: &str = "
     SELECT r.thread_id
     FROM provider_session_runtime r
@@ -97,16 +104,14 @@ impl T3Env {
     }
 
     /// Read the home directory and PATH from the current process environment
+    ///
+    /// Without `HOME`, the home directory comes from the password database
     #[must_use]
     pub fn from_env() -> Self {
-        let home = std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from);
-        let path = match std::env::var_os("PATH") {
-            Some(path) => path,
-            None => OsString::new(),
-        };
-        Self { home, path }
+        Self {
+            home: std::env::home_dir().unwrap_or_default(),
+            path: std::env::var_os("PATH").unwrap_or_default(),
+        }
     }
 
     fn userdata(&self) -> PathBuf {
@@ -145,6 +150,19 @@ pub enum ProbeStatus {
     Compatible,
     /// A required local API check failed
     Changed,
+}
+
+impl ProbeStatus {
+    /// Stable name, matching the JSON value
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not_installed",
+            Self::NotRunning => "not_running",
+            Self::Compatible => "compatible",
+            Self::Changed => "changed",
+        }
+    }
 }
 
 /// One result in a T3 API probe
@@ -195,19 +213,21 @@ pub fn wake_claude_session(env: &T3Env, session: ThreadId, text: &str) -> WakeOu
         return WakeOutcome::NotT3Thread;
     }
 
-    let Some(t3_thread) = find_claude_thread(&env.state_path(), session) else {
-        return WakeOutcome::NotT3Thread;
+    let t3_thread = match find_claude_thread(&env.state_path(), session) {
+        Ok(Some(t3_thread)) => t3_thread,
+        Ok(None) => return WakeOutcome::NotT3Thread,
+        Err(detail) => return WakeOutcome::Unavailable(detail),
     };
 
     let runtime = match load_runtime(&userdata) {
         Ok(runtime) => runtime,
         Err(detail) => return WakeOutcome::Unavailable(detail),
     };
-    let executable = match resolve_t3(env) {
-        Ok(executable) => executable,
+    let cli = match T3Cli::resolve(env) {
+        Ok(cli) => cli,
         Err(detail) => return WakeOutcome::Unavailable(detail),
     };
-    let token = match issue_token(&executable) {
+    let token = match cli.issue_token() {
         Ok(token) => token,
         Err(IssueError::Unavailable(detail)) => return WakeOutcome::Unavailable(detail),
         Err(IssueError::Changed(detail)) => return WakeOutcome::ApiChanged(detail),
@@ -261,8 +281,8 @@ pub fn probe(env: &T3Env) -> ProbeReport {
         "T3 server runtime is valid and its process is alive",
     ));
 
-    let executable = resolve_t3(env);
-    let version = executable.as_ref().ok().and_then(|path| t3_version(path));
+    let cli = T3Cli::resolve(env);
+    let version = cli.as_ref().ok().and_then(T3Cli::version);
 
     if !state_schema_matches(&env.state_path()) {
         checks.push(failed(
@@ -276,14 +296,14 @@ pub fn probe(env: &T3Env) -> ProbeReport {
         "required state.sqlite columns exist",
     ));
 
-    let executable = match executable {
-        Ok(executable) => executable,
+    let cli = match cli {
+        Ok(cli) => cli,
         Err(detail) => {
             checks.push(failed("token_issue", detail));
             return report(ProbeStatus::Changed, version, checks);
         }
     };
-    let token = match issue_token(&executable) {
+    let token = match cli.issue_token() {
         Ok(token) => token,
         Err(error) => {
             checks.push(failed("token_issue", error.detail()));
@@ -407,11 +427,8 @@ fn state_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     Ok(connection)
 }
 
-fn find_claude_thread(path: &Path, session: ThreadId) -> Option<String> {
-    let db = state_connection(path).ok()?;
-    db.query_row(CLAUDE_THREAD_SQL, [session.to_string()], |row| row.get(0))
-        .optional()
-        .ok()?
+fn find_claude_thread(path: &Path, session: ThreadId) -> Result<Option<String>, String> {
+    query_thread(path, CLAUDE_THREAD_SQL, [session.to_string()])
 }
 
 fn state_schema_matches(path: &Path) -> bool {
@@ -422,17 +439,170 @@ fn state_schema_matches(path: &Path) -> bool {
 }
 
 fn latest_thread(path: &Path) -> Result<Option<String>, String> {
+    query_thread(path, LATEST_THREAD_SQL, [])
+}
+
+fn query_thread(
+    path: &Path,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<String>, String> {
     let db = state_connection(path).map_err(|_| "state.sqlite cannot be read".to_string())?;
-    db.query_row(LATEST_THREAD_SQL, [], |row| row.get(0))
+    db.query_row(sql, params, |row| row.get(0))
         .optional()
         .map_err(|_| "state.sqlite thread lookup failed".to_string())
 }
 
-fn resolve_t3(env: &T3Env) -> Result<PathBuf, String> {
-    let cwd =
-        std::env::current_dir().map_err(|_| "could not read current directory".to_string())?;
-    which::which_in("t3", Some(env.path.clone()), &cwd)
-        .map_err(|_| "t3 is not installed or is not on PATH".to_string())
+/// The `t3` executable, run with the PATH and HOME that located it
+#[derive(Debug, Clone)]
+struct T3Cli {
+    executable: PathBuf,
+    env: T3Env,
+    timeout: Duration,
+}
+
+/// Exit result and bounded stdout from one `t3` command
+struct CliOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+impl T3Cli {
+    fn resolve(env: &T3Env) -> Result<Self, String> {
+        let cwd =
+            std::env::current_dir().map_err(|_| "could not read current directory".to_string())?;
+        let executable = which::which_in("t3", Some(&env.path), &cwd)
+            .map_err(|_| "t3 is not installed or is not on PATH".to_string())?;
+        Ok(Self {
+            executable,
+            env: env.clone(),
+            timeout: CLI_TIMEOUT,
+        })
+    }
+
+    /// Run one command and kill its process group at the deadline
+    ///
+    /// A hung `t3` would otherwise hold a callback worker and a blocking
+    /// thread forever
+    fn run(&self, label: &str, args: &[&str]) -> Result<CliOutput, String> {
+        let mut child = Command::new(&self.executable)
+            .args(args)
+            .env("PATH", &self.env.path)
+            .env("HOME", &self.env.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|_| format!("could not start {label}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("could not read {label} output"))?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.take(CLI_OUTPUT_LIMIT).read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| format!("could not wait for {label}"))?
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label} timed out after {}s",
+                    self.timeout.as_secs_f32()
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        // a descendant can keep the pipe open after the direct child exits
+        let stdout = receiver.recv_timeout(CLI_DRAIN_TIMEOUT).unwrap_or_default();
+        Ok(CliOutput {
+            success: status.success(),
+            stdout,
+        })
+    }
+
+    fn issue_token(&self) -> Result<IssuedToken, IssueError> {
+        let output = self
+            .run(
+                "t3 auth session issue",
+                &[
+                    "auth",
+                    "session",
+                    "issue",
+                    "--json",
+                    "--ttl",
+                    "5m",
+                    "--label",
+                    "homebased",
+                ],
+            )
+            .map_err(IssueError::Unavailable)?;
+        let parsed = serde_json::from_slice::<Value>(&output.stdout);
+        // dropping the revoker on any early return revokes a session that was
+        // issued, even when the command reports failure
+        let revoker = parsed
+            .as_ref()
+            .ok()
+            .and_then(|value| non_empty_string(value.get("sessionId")))
+            .map(|session_id| TokenRevoker {
+                cli: self.clone(),
+                session_id,
+            });
+        if !output.success {
+            return Err(IssueError::Unavailable(
+                "t3 auth session issue failed".into(),
+            ));
+        }
+
+        let value =
+            parsed.map_err(|_| IssueError::Changed("t3 token output is not valid JSON".into()))?;
+        let Some(revoker) = revoker else {
+            return Err(IssueError::Changed(
+                "t3 token output has no sessionId".into(),
+            ));
+        };
+        if value.get("method").and_then(Value::as_str) != Some("bearer-access-token") {
+            return Err(IssueError::Changed(
+                "t3 token output has an unexpected method".into(),
+            ));
+        }
+        if value.get("scopes").and_then(Value::as_array).is_none() {
+            return Err(IssueError::Changed(
+                "t3 token output has no scopes array".into(),
+            ));
+        }
+        let Some(token) = non_empty_string(value.get("token")) else {
+            return Err(IssueError::Changed("t3 token output has no token".into()));
+        };
+
+        Ok(IssuedToken {
+            value: token,
+            _revoker: revoker,
+        })
+    }
+
+    fn version(&self) -> Option<String> {
+        let output = self.run("t3 --version", &["--version"]).ok()?;
+        if !output.success {
+            return None;
+        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!version.is_empty()).then_some(version)
+    }
 }
 
 enum IssueError {
@@ -453,105 +623,19 @@ struct IssuedToken {
     _revoker: TokenRevoker,
 }
 
+/// Revokes one issued T3 session when dropped
 struct TokenRevoker {
-    executable: PathBuf,
+    cli: T3Cli,
     session_id: String,
 }
 
 impl Drop for TokenRevoker {
     fn drop(&mut self) {
-        let _ = Command::new(&self.executable)
-            .args(["auth", "session", "revoke", &self.session_id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = self.cli.run(
+            "t3 auth session revoke",
+            &["auth", "session", "revoke", &self.session_id],
+        );
     }
-}
-
-fn issue_token(executable: &Path) -> Result<IssuedToken, IssueError> {
-    let output = Command::new(executable)
-        .args([
-            "auth",
-            "session",
-            "issue",
-            "--json",
-            "--ttl",
-            "5m",
-            "--label",
-            "homebased",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|_| IssueError::Unavailable("could not start t3 auth session issue".into()))?;
-    let parsed = serde_json::from_slice::<Value>(&output.stdout);
-    if !output.status.success() {
-        if let Ok(value) = &parsed
-            && let Some(session_id) = value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        {
-            let revoker = TokenRevoker {
-                executable: executable.to_path_buf(),
-                session_id: session_id.to_owned(),
-            };
-            drop(revoker);
-        }
-        return Err(IssueError::Unavailable(
-            "t3 auth session issue failed".into(),
-        ));
-    }
-
-    let value =
-        parsed.map_err(|_| IssueError::Changed("t3 token output is not valid JSON".into()))?;
-    let Some(session_id) = value
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Err(IssueError::Changed(
-            "t3 token output has no sessionId".into(),
-        ));
-    };
-    let revoker = TokenRevoker {
-        executable: executable.to_path_buf(),
-        session_id: session_id.to_owned(),
-    };
-    if value.get("method").and_then(Value::as_str) != Some("bearer-access-token") {
-        drop(revoker);
-        return Err(IssueError::Changed(
-            "t3 token output has an unexpected method".into(),
-        ));
-    }
-    if value.get("scopes").and_then(Value::as_array).is_none() {
-        drop(revoker);
-        return Err(IssueError::Changed(
-            "t3 token output has no scopes array".into(),
-        ));
-    }
-    let Some(token) = value
-        .get("token")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        drop(revoker);
-        return Err(IssueError::Changed("t3 token output has no token".into()));
-    };
-
-    Ok(IssuedToken {
-        value: token.to_owned(),
-        _revoker: revoker,
-    })
-}
-
-fn t3_version(executable: &Path) -> Option<String> {
-    let output = Command::new(executable).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!version.is_empty()).then_some(version)
 }
 
 struct ThreadSnapshot {
@@ -1332,6 +1416,25 @@ mod tests {
 
         let fixture = Fixture::new(None, true, i32::MAX);
         assert_eq!(probe(&fixture.env).status, ProbeStatus::NotRunning);
+    }
+
+    #[test]
+    fn hung_t3_cli_is_killed_at_the_deadline() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("t3");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = T3Cli {
+            executable: script,
+            env: T3Env::new(dir.path().to_path_buf(), std::env::var_os("PATH").unwrap()),
+            timeout: Duration::from_millis(200),
+        };
+
+        let started = Instant::now();
+        let error = cli.run("t3 auth session issue", &[]).err().unwrap();
+
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
