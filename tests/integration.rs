@@ -2846,7 +2846,11 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
             .any(|m| event_json(m)["task"] == id.to_string())
     });
     assert!(delivered, "reconcile never delivered the pending callback");
-    assert_eq!(h.show(&id.to_string())["callback"], "sent");
+    // the queued message lands before the settle commits
+    let sent = wait_until(Duration::from_secs(10), || {
+        h.show(&id.to_string())["callback"] == "sent"
+    });
+    assert!(sent, "delivered callback never settled as sent");
 }
 
 #[test]
