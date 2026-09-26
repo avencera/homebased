@@ -3,6 +3,7 @@
 
 import { IsDocumentVisible, useInterval } from 'runed';
 import {
+	IN_FLIGHT_STATUSES,
 	asApiError,
 	fetchLogTail,
 	fetchFleetTasks,
@@ -27,6 +28,9 @@ import {
 	type ResourceDetail,
 	type ResourceOverview
 } from './resources';
+
+/** Every queued and running task, from every thread. */
+const IN_FLIGHT_QUERY: TaskQuery = { statuses: IN_FLIGHT_STATUSES };
 
 /** Refresh cadence while the tab is visible. */
 export const POLL_INTERVAL_MS = 2000;
@@ -71,6 +75,8 @@ export class DaemonStore {
 	machines = $state<readonly FleetMachine[]>([]);
 	/** Filtered tasks from every machine that answered, newest first. */
 	tasks = $state<readonly FleetTask[]>([]);
+	/** Queued and running tasks on every machine that answered, whatever the filter. */
+	inFlight = $state<readonly FleetTask[]>([]);
 	/** Error from the last attempt, cleared by the next success. */
 	error = $state<ApiError | null>(null);
 	/** Epoch milliseconds of the last settled attempt. */
@@ -98,12 +104,19 @@ export class DaemonStore {
 	async refresh(): Promise<void> {
 		const generation = ++this.#generation;
 		const query = this.#query();
+		// the default view is the in-flight list, so it needs no second fleet read
+		const listsInFlight = queryKey(query) === queryKey(IN_FLIGHT_QUERY);
 		try {
-			const [status, fleet] = await Promise.all([fetchStatus(), fetchFleetTasks(query)]);
+			const [status, fleet, inFlight] = await Promise.all([
+				fetchStatus(),
+				fetchFleetTasks(query),
+				listsInFlight ? null : fetchFleetTasks(IN_FLIGHT_QUERY)
+			]);
 			if (generation !== this.#generation) return;
 			this.status = status;
 			this.machines = fleet.machines;
 			this.tasks = fleet.tasks;
+			this.inFlight = (inFlight ?? fleet).tasks;
 			this.error = null;
 		} catch (cause) {
 			if (generation !== this.#generation) return;

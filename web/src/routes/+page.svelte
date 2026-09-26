@@ -44,9 +44,18 @@
 				: []
 		)
 	);
-	const localName = $derived(
-		store.machines.find((machine) => machine.location.type === 'local')?.name ?? null
-	);
+	// the merged fleet list holds each task once, from the machine that runs it
+	const inFlightByMachine = $derived.by(() => {
+		const counts: Record<string, number> = {};
+		for (const entry of store.inFlight) {
+			const name = store.machines.find((machine) => machine.machine === entry.machine)?.name;
+			const key = name ?? shortId(entry.machine);
+			counts[key] = (counts[key] ?? 0) + 1;
+		}
+		return Object.entries(counts)
+			.map(([name, count]) => `${count} on ${name}`)
+			.join(', ');
+	});
 	const busyQueues = $derived(resourceStore.queues.filter(isBusy));
 	const threadTitles = new ThreadTitleStore(() => [
 		...visibleTasks.map(taskThread),
@@ -163,10 +172,8 @@
 				{store.online ? 'socket up' : 'socket down'}
 			</span>
 		</span>
-		<span class="text-muted-foreground">
-			{store.status?.in_flight ?? 0} in flight{#if localName}<span class="hidden sm:inline"
-					>{` on ${localName}`}</span
-				>{/if}
+		<span class="text-muted-foreground" title={inFlightByMachine || undefined}>
+			{store.inFlight.length} in flight
 		</span>
 		{#if store.status}
 			<span class="hidden font-mono text-muted-foreground sm:inline" title={store.status.socket}>
