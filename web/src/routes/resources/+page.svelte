@@ -171,7 +171,6 @@
 										<ThreadLabel
 											thread={currentThread.thread}
 											title={threadTitles.title(currentThread)}
-											filterLink
 											class="text-muted-foreground"
 										/>
 									{/if}

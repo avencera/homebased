@@ -40,6 +40,7 @@
 	},
 	"dependencies": {
 		"@lucide/svelte": "^1.47.0",
+		"bits-ui": "^2.19.3",
 		"clsx": "^2.1.1",
 		"effect": "^3.22.2",
 		"runed": "^0.37.1",

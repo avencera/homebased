@@ -438,7 +438,7 @@
 	{#if ref}
 		<p class="mt-1 flex min-w-0 items-baseline gap-1.5 text-muted-foreground">
 			<span class="shrink-0">thread</span>
-			<ThreadLabel thread={ref.thread} title={threadTitles.title(ref)} filterLink />
+			<ThreadLabel thread={ref.thread} title={threadTitles.title(ref)} />
 		</p>
 	{/if}
 {/snippet}

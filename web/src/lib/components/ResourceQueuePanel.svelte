@@ -133,7 +133,6 @@
 		<ThreadLabel
 			thread={ref.thread}
 			title={threadTitle(ref)}
-			filterLink
 			class="text-[11px] text-muted-foreground"
 		/>
 	{/if}

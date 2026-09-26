@@ -2,7 +2,6 @@
 	import type { Snippet } from 'svelte';
 	import { resolve } from '$app/paths';
 	import Ban from '@lucide/svelte/icons/ban';
-	import Funnel from '@lucide/svelte/icons/funnel';
 	import {
 		isInFlight,
 		peerTaskHref,
@@ -182,21 +181,18 @@
 						</span>
 					</span>
 
-					<button
-						type="button"
-						onclick={() => onThread(activeThread === task.thread ? null : task.thread)}
-						class={cn(
-							'relative z-10 hidden max-w-full min-w-0 items-center gap-1 justify-self-start rounded px-1 py-0.5 text-[12px] text-muted-foreground [grid-area:thread] hover:bg-accent hover:text-foreground lg:inline-flex',
-							activeThread === task.thread && 'text-primary'
-						)}
-						aria-pressed={activeThread === task.thread}
-						title={activeThread === task.thread
-							? 'Show tasks from all threads'
-							: `Show only tasks from thread ${threadName ? `${threadName} · ` : ''}${task.thread}`}
-					>
-						<Funnel class="size-3 shrink-0 opacity-60" aria-hidden="true" />
-						<ThreadLabel thread={task.thread} title={threadName} tooltip={false} />
-					</button>
+					<!-- raised above the row link so a tap opens the thread instead of the task -->
+					<span class="relative z-10 flex min-w-0 [grid-area:thread]">
+						<ThreadLabel
+							thread={task.thread}
+							title={threadName}
+							filter={{
+								active: activeThread === task.thread,
+								toggle: () => onThread(activeThread === task.thread ? null : task.thread)
+							}}
+							class="-ml-1 px-1 py-0.5 text-[12px] text-muted-foreground"
+						/>
+					</span>
 
 					<CallbackBadge
 						callback={task.callback}
@@ -209,13 +205,14 @@
 </div>
 
 <style>
-	/* narrow screens show each task in two lines, name then pills, and leave
-	   the thread and callback to the detail page; wide screens use one aligned
-	   row per task under a shared header */
+	/* narrow screens stack each task: name, thread, then pills, and leave the
+	   callback to the detail page; wide screens use one aligned row per task
+	   under a shared header */
 	.task-grid {
 		grid-template-columns: auto minmax(0, 1fr) auto;
 		grid-template-areas:
 			'name name status'
+			'thread thread thread'
 			'machine cwd time';
 	}
 

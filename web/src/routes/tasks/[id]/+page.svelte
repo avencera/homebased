@@ -24,6 +24,7 @@
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import ThreadLabel from '$lib/components/ThreadLabel.svelte';
 	import { LOG_TAIL_LINES, TaskStore } from '$lib/daemon.svelte';
 	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import {
@@ -133,14 +134,7 @@
 
 			<dt class="text-muted-foreground">thread</dt>
 			<dd class="flex min-w-0 items-center gap-1">
-				{#if threadName}
-					<span class="truncate" title={threadName}>{threadName}</span>
-				{/if}
-				<CopyPath
-					value={task.thread}
-					label={shortId(task.thread, 13)}
-					class={threadName ? 'text-muted-foreground' : '-ml-1'}
-				/>
+				<ThreadLabel thread={task.thread} title={threadName} idLength={13} />
 				<a
 					href={resolve(`/?thread=${task.thread}`)}
 					class="text-primary hover:underline"
