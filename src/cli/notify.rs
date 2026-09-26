@@ -1,4 +1,4 @@
-//! `homebased notify` commands.
+//! `homebased notify` commands
 
 use std::process::ExitCode;
 
@@ -10,19 +10,19 @@ use crate::notify::{Notice, NoticePriority, Notifier};
 
 use super::{Ctx, OutputMode};
 
-/// Notification subcommands.
+/// Notification subcommands
 #[derive(Debug, Subcommand)]
 #[command(after_help = crate::cli::AFTER_HELP)]
 pub enum NotifyCommand {
-    /// Send one test push through the configured ntfy server.
+    /// Send one test push through the configured ntfy server
     Test {
-        /// Replace the default test message.
+        /// Replace the default test message
         #[arg(long)]
         message: Option<String>,
     },
 }
 
-/// Run one notification command.
+/// Run one notification command
 pub async fn run(ctx: &Ctx, command: NotifyCommand) -> Result<ExitCode, AppError> {
     match command {
         NotifyCommand::Test { message } => test(ctx, message).await,

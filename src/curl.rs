@@ -1,4 +1,4 @@
-//! Blocking HTTP requests through the system `curl` executable.
+//! Blocking HTTP requests through the system `curl` executable
 
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -10,39 +10,39 @@ const STDERR_LIMIT: usize = 8 * 1024;
 const STATUS_MARKER: &str = "\nHOMEBASED_HTTP_STATUS:";
 const STATUS_TAIL_LIMIT: usize = 64;
 
-/// HTTP method used by a blocking curl request.
+/// HTTP method used by a blocking curl request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurlMethod {
-    /// Send a GET request.
+    /// Send a GET request
     Get,
-    /// Send a POST request.
+    /// Send a POST request
     Post,
 }
 
-/// Input for one blocking curl request.
+/// Input for one blocking curl request
 pub(crate) struct CurlRequest<'a> {
-    /// HTTP method.
+    /// HTTP method
     pub(crate) method: CurlMethod,
-    /// Full request URL.
+    /// Full request URL
     pub(crate) url: &'a str,
-    /// Optional bearer token.
+    /// Optional bearer token
     pub(crate) bearer: Option<&'a str>,
-    /// Optional JSON request body.
+    /// Optional JSON request body
     pub(crate) json_body: Option<&'a serde_json::Value>,
-    /// Maximum request time.
+    /// Maximum request time
     pub(crate) timeout: Duration,
 }
 
-/// Result from one blocking curl request.
+/// Result from one blocking curl request
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CurlResponse {
-    /// HTTP response status.
+    /// HTTP response status
     pub(crate) status: u16,
-    /// Response body, limited to the first 1 MiB.
+    /// Response body, limited to the first 1 MiB
     pub(crate) body: String,
 }
 
-/// Send a blocking HTTP request through the system `curl` executable.
+/// Send a blocking HTTP request through the system `curl` executable
 pub(crate) fn send(request: &CurlRequest<'_>) -> Result<CurlResponse, String> {
     let config = render_config(request)?;
     let args = curl_args(request.timeout);
