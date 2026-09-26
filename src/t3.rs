@@ -7,9 +7,16 @@
 //! can change these details without notice. Run `homebased t3 check` after a T3
 //! update
 //!
+//! Verified with T3 Code stable `0.0.42` and nightly `0.0.43`
+//!
 //! - User data lives in `~/.t3/userdata`; `server-runtime.json` has `version`,
-//!   `pid`, `host`, `port`, `origin`, and `startedAt`. Version 1 and a live PID
-//!   identify a running server. The process check uses `kill(pid, None)`
+//!   `pid`, and `origin`. Version 1 and a live PID identify a running server.
+//!   The process check uses `kill(pid, None)`. The desktop app also writes
+//!   `host`, `port`, and `startedAt`; a service-managed server omits `host`
+//!   and adds `serviceManaged`, so the client ignores those fields
+//! - The `t3` CLI is the running server's executable
+//!   (`~/.t3/runtime/versions/<version>/t3`), found through `/proc/<pid>/exe`
+//!   or `ps`, else `t3` on PATH. The macOS desktop app does not put it on PATH
 //! - `state.sqlite` has `provider_session_runtime(provider_name,thread_id,
 //!   resume_cursor_json,last_seen_at)` and `projection_threads(thread_id,
 //!   deleted_at)`. Claude sessions use `provider_name = 'claudeAgent'` and
@@ -170,6 +177,8 @@ pub enum ProbeStatus {
     Compatible,
     /// A required local API check failed
     Changed,
+    /// T3 runs, but homebased cannot use it now, for example its CLI cannot be found
+    Unavailable,
 }
 
 impl ProbeStatus {
@@ -181,6 +190,7 @@ impl ProbeStatus {
             Self::NotRunning => "not_running",
             Self::Compatible => "compatible",
             Self::Changed => "changed",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -253,7 +263,7 @@ pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> 
         Ok(runtime) => runtime,
         Err(detail) => return WakeOutcome::Unavailable(detail),
     };
-    let cli = match T3Cli::resolve(env) {
+    let cli = match T3Cli::resolve(env, runtime.pid) {
         Ok(cli) => cli,
         Err(detail) => return WakeOutcome::Unavailable(detail),
     };
@@ -311,7 +321,7 @@ pub fn probe(env: &T3Env) -> ProbeReport {
         "T3 server runtime is valid and its process is alive",
     ));
 
-    let cli = T3Cli::resolve(env);
+    let cli = T3Cli::resolve(env, runtime.pid);
     let version = cli.as_ref().ok().and_then(T3Cli::version);
 
     if !state_schema_matches(&env.state_path()) {
@@ -330,13 +340,17 @@ pub fn probe(env: &T3Env) -> ProbeReport {
         Ok(cli) => cli,
         Err(detail) => {
             checks.push(failed("token_issue", detail));
-            return report(ProbeStatus::Changed, version, checks);
+            return report(ProbeStatus::Unavailable, version, checks);
         }
     };
     let token = match cli.issue_token() {
         Ok(token) => token,
-        Err(error) => {
-            checks.push(failed("token_issue", error.detail()));
+        Err(IssueError::Unavailable(detail)) => {
+            checks.push(failed("token_issue", detail));
+            return report(ProbeStatus::Unavailable, version, checks);
+        }
+        Err(IssueError::Changed(detail)) => {
+            checks.push(failed("token_issue", detail));
             return report(ProbeStatus::Changed, version, checks);
         }
     };
@@ -404,11 +418,7 @@ pub fn probe(env: &T3Env) -> ProbeReport {
 struct RuntimeFile {
     version: u32,
     pid: i32,
-    host: String,
-    port: u16,
     origin: String,
-    #[serde(rename = "startedAt")]
-    started_at: String,
 }
 
 fn load_runtime(userdata: &Path) -> Result<RuntimeFile, String> {
@@ -416,13 +426,8 @@ fn load_runtime(userdata: &Path) -> Result<RuntimeFile, String> {
     let bytes = fs::read(path).map_err(|_| "T3 server runtime file is missing".to_string())?;
     let runtime: RuntimeFile = serde_json::from_slice(&bytes)
         .map_err(|_| "T3 server runtime file is invalid".to_string())?;
-    if runtime.version != 1
-        || runtime.pid <= 0
-        || runtime.host.trim().is_empty()
-        || runtime.port == 0
-        || runtime.started_at.trim().is_empty()
-        || !valid_origin(&runtime.origin)
-    {
+    // a service-managed server omits `host`, so read only the fields the client uses
+    if runtime.version != 1 || runtime.pid <= 0 || !valid_origin(&runtime.origin) {
         return Err("T3 server runtime file is invalid".into());
     }
     if !process_is_alive(runtime.pid) {
@@ -505,12 +510,43 @@ struct CliOutput {
     stdout: Vec<u8>,
 }
 
+/// Executable of the running T3 server, when it is the `t3` binary
+///
+/// The server binary is also the CLI and always matches the server version.
+/// The macOS desktop app starts it from `~/.t3/runtime/versions/<version>/t3`
+/// without putting `t3` on PATH
+fn server_executable(pid: i32) -> Option<PathBuf> {
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .or_else(|| process_path_from_ps(pid))?;
+    let is_t3 = executable.file_name().is_some_and(|name| name == "t3");
+    (is_t3 && executable.is_file()).then_some(executable)
+}
+
+/// macOS has no `/proc`; `ps -o comm=` prints the full executable path there
+fn process_path_from_ps(pid: i32) -> Option<PathBuf> {
+    let output = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (output.status.success() && path.starts_with('/')).then(|| PathBuf::from(path))
+}
+
 impl T3Cli {
-    fn resolve(env: &T3Env) -> Result<Self, String> {
-        let cwd =
-            std::env::current_dir().map_err(|_| "could not read current directory".to_string())?;
-        let executable = which::which_in("t3", Some(&env.path), &cwd)
-            .map_err(|_| "t3 is not installed or is not on PATH".to_string())?;
+    fn resolve(env: &T3Env, server_pid: i32) -> Result<Self, String> {
+        let executable = match server_executable(server_pid) {
+            Some(executable) => executable,
+            None => {
+                let cwd = std::env::current_dir()
+                    .map_err(|_| "could not read current directory".to_string())?;
+                which::which_in("t3", Some(&env.path), &cwd)
+                    .map_err(|_| "t3 is not installed or is not on PATH".to_string())?
+            }
+        };
         Ok(Self {
             executable,
             env: env.clone(),
@@ -646,14 +682,6 @@ impl T3Cli {
 enum IssueError {
     Unavailable(String),
     Changed(String),
-}
-
-impl IssueError {
-    fn detail(&self) -> String {
-        match self {
-            Self::Unavailable(detail) | Self::Changed(detail) => detail.clone(),
-        }
-    }
 }
 
 struct IssuedToken {
@@ -1258,13 +1286,14 @@ mod tests {
                 .rsplit_once(':')
                 .and_then(|(_, port)| port.parse::<u16>().ok())
                 .unwrap_or(1);
+            // the service-managed shape: no `host`, plus `serviceManaged`
             let runtime = json!({
                 "version": 1,
                 "pid": pid,
-                "host": "127.0.0.1",
                 "port": port,
                 "origin": origin,
-                "startedAt": "2026-09-26T17:03:50.514Z"
+                "startedAt": "2026-09-26T17:03:50.514Z",
+                "serviceManaged": true
             });
             fs::write(
                 userdata.join("server-runtime.json"),
@@ -1521,6 +1550,42 @@ mod tests {
 
         let fixture = Fixture::new(None, true, i32::MAX);
         assert_eq!(probe(&fixture.env).status, ProbeStatus::NotRunning);
+    }
+
+    #[test]
+    fn desktop_runtime_file_with_host_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let runtime = json!({
+            "version": 1,
+            "pid": pid,
+            "host": "127.0.0.1",
+            "port": 3773,
+            "origin": "http://127.0.0.1:3773",
+            "startedAt": "2026-09-26T21:09:01.839Z"
+        });
+        fs::write(
+            dir.path().join("server-runtime.json"),
+            serde_json::to_vec(&runtime).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_runtime(dir.path()).unwrap().origin,
+            "http://127.0.0.1:3773"
+        );
+    }
+
+    #[test]
+    fn missing_cli_is_unavailable_not_an_api_change() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let mut fixture = Fixture::new(None, true, pid);
+        fixture.env = T3Env::new(fixture.env.home.clone(), OsString::new());
+
+        let report = probe(&fixture.env);
+
+        assert_eq!(report.status, ProbeStatus::Unavailable);
+        assert_eq!(report.fingerprint(), None);
     }
 
     #[test]

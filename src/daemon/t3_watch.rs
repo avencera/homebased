@@ -40,7 +40,7 @@ impl WatchState {
                 self.last_alerted = Some(fingerprint.clone());
                 Some(fingerprint)
             }
-            ProbeStatus::NotInstalled | ProbeStatus::NotRunning => None,
+            ProbeStatus::NotInstalled | ProbeStatus::NotRunning | ProbeStatus::Unavailable => None,
         }
     }
 }
@@ -80,7 +80,7 @@ pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
         match report.status {
             ProbeStatus::Compatible => info!("T3 Code API compatible"),
             ProbeStatus::Changed => warn!("T3 Code API changed"),
-            ProbeStatus::NotInstalled | ProbeStatus::NotRunning => {
+            ProbeStatus::NotInstalled | ProbeStatus::NotRunning | ProbeStatus::Unavailable => {
                 debug!(status = ?report.status, "T3 Code API probe skipped");
             }
         }
