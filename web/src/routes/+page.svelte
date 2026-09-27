@@ -319,15 +319,16 @@
 
 	<!-- the page fits the screen and each box scrolls on its own. Each box is as tall as its
 	     content; when both overflow, grid sizing shares the height evenly, and a short box keeps
-	     its content height while the other takes the rest. Wide screens put the boxes side by side,
-	     each as tall as its content up to the full height; the task column keeps the width its
-	     table layout needs. An expanded box takes the whole area -->
+	     its content height while the other takes the rest. When the GPU queue shows, wide screens put
+	     the boxes side by side, each as tall as its content up to the full height; the task column
+	     keeps the width its table layout needs. An expanded box takes the whole area -->
 	<div
 		class={cn(
 			'mt-3 grid min-h-0 flex-1 content-start gap-3',
-			expanded
-				? 'grid-rows-[minmax(0,1fr)]'
-				: 'grid-rows-[minmax(0,auto)_minmax(0,auto)] xl:grid-cols-[minmax(57rem,1fr)_minmax(18rem,22rem)] xl:grid-rows-[minmax(0,auto)] xl:items-start xl:[&>*]:max-h-full'
+			expanded ? 'grid-rows-[minmax(0,1fr)]' : 'grid-rows-[minmax(0,auto)_minmax(0,auto)]',
+			split &&
+				!expanded &&
+				'xl:grid-cols-[minmax(57rem,1fr)_minmax(18rem,22rem)] xl:grid-rows-[minmax(0,auto)] xl:items-start xl:[&>*]:max-h-full'
 		)}
 	>
 		{#if expanded !== 'gpu'}
