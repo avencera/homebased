@@ -163,7 +163,7 @@
 							type="button"
 							onclick={() => onProject(activeProject === project ? null : project)}
 							class={cn(
-								'relative z-10 min-w-0 shrink-0 rounded-full',
+								'relative z-10 flex max-w-full min-w-0 shrink-0 rounded-full',
 								activeProject === project && 'ring-2 ring-primary/60'
 							)}
 							aria-pressed={activeProject === project}
