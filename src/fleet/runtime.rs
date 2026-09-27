@@ -221,13 +221,10 @@ fn mdns_announcement(handle: &FleetHandle, listener: SocketAddr) -> Option<MdnsA
         warn!(%listener, "fleet listener is loopback-only; mDNS announcement skipped");
         return None;
     }
-    let host_label =
-        crate::machine::host_machine_name().unwrap_or_else(|| handle.shared.local.name.clone());
     Some(MdnsAnnouncement {
         header: handle.shared.advertisement.header(),
         port: listener.port(),
         ip: (!ip.is_unspecified()).then_some(ip),
-        host: format!("{host_label}.local."),
     })
 }
 

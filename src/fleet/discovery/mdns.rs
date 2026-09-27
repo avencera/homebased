@@ -22,7 +22,7 @@ use crate::fleet::discovery::{
     ClaimedIdentity, DiscoveryEvent, DiscoverySender, SERVICE_TYPE, is_routable_peer_ip,
     provider_for,
 };
-use crate::machine::{BootId, MachineId};
+use crate::machine::{BootId, MACHINE_NAME_MAX_LEN, MachineId};
 
 /// TXT key for the machine UUID.
 pub const TXT_MACHINE: &str = "machine";
@@ -34,6 +34,9 @@ pub const TXT_NAME: &str = "name";
 pub const TXT_PROTOCOL: &str = "proto";
 /// TXT key for the Homebased version.
 pub const TXT_VERSION: &str = "version";
+
+/// Machine UUID characters in the instance name
+const UUID_PREFIX_LEN: usize = 8;
 
 /// mDNS timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,17 +65,28 @@ pub struct MdnsAnnouncement {
     pub port: u16,
     /// Specific listener IP, or `None` for every interface address.
     pub ip: Option<IpAddr>,
-    /// mDNS host name, such as `code.local.`.
-    pub host: String,
 }
 
 impl MdnsAnnouncement {
     /// Instance name. The UUID prefix keeps two machines with one name apart,
     /// so the conflict reaches the directory instead of the mDNS responder.
+    /// The name part is cut so the result fits one DNS label
     #[must_use]
     pub fn instance(&self) -> String {
         let uuid = self.header.machine.to_string();
-        format!("{}-{}", self.header.name, &uuid[..8])
+        let name = self.header.name.as_str();
+        let name = &name[..name.len().min(MACHINE_NAME_MAX_LEN - UUID_PREFIX_LEN - 1)];
+        format!("{name}-{}", &uuid[..UUID_PREFIX_LEN])
+    }
+
+    /// Host name for the address records, such as `code-1a2b3c4d.local.`
+    ///
+    /// The OS responder (Bonjour or Avahi) owns `<hostname>.local.`. A second
+    /// responder that announces it makes the OS see a name conflict and rename
+    /// the machine, so Homebased announces a host name that only it owns
+    #[must_use]
+    pub fn host(&self) -> String {
+        format!("{}.local.", self.instance())
     }
 
     fn service_info(&self) -> Result<ServiceInfo, mdns_sd::Error> {
@@ -84,11 +98,12 @@ impl MdnsAnnouncement {
             (TXT_VERSION, self.header.version.clone()),
         ];
         let instance = self.instance();
+        let host = self.host();
         match self.ip {
             Some(ip) => ServiceInfo::new(
                 SERVICE_TYPE,
                 &instance,
-                &self.host,
+                &host,
                 ip,
                 self.port,
                 &properties[..],
@@ -96,7 +111,7 @@ impl MdnsAnnouncement {
             None => ServiceInfo::new(
                 SERVICE_TYPE,
                 &instance,
-                &self.host,
+                &host,
                 (),
                 self.port,
                 &properties[..],
@@ -281,7 +296,6 @@ mod tests {
             },
             port: 7677,
             ip: Some("10.0.0.2".parse().unwrap()),
-            host: "code.local.".into(),
         }
     }
 
@@ -303,6 +317,26 @@ mod tests {
             info.get_property_val_str(TXT_PROTOCOL),
             Some(SUPPORTED_PROTOCOLS.to_string().as_str())
         );
+    }
+
+    // announcing `code.local.` made macOS rename itself to `code-2`
+    #[test]
+    fn host_is_not_the_os_host_name() {
+        let announcement = announcement();
+        let info = announcement.service_info().unwrap();
+        assert_ne!(info.get_hostname(), "code.local.");
+        assert_eq!(
+            info.get_hostname(),
+            format!("{}.local.", announcement.instance())
+        );
+    }
+
+    #[test]
+    fn long_name_instance_fits_one_dns_label() {
+        let mut announcement = announcement();
+        announcement.header.name = MachineName::parse(&"a".repeat(MACHINE_NAME_MAX_LEN)).unwrap();
+        assert_eq!(announcement.instance().len(), MACHINE_NAME_MAX_LEN);
+        assert!(announcement.service_info().is_ok());
     }
 
     #[test]
