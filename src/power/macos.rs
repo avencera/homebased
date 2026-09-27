@@ -1,4 +1,4 @@
-//! IOKit power assertion that blocks idle system sleep.
+//! IOKit power assertion that blocks system sleep.
 
 use std::ffi::{CStr, c_char, c_void};
 
@@ -11,8 +11,10 @@ const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 const K_IO_RETURN_SUCCESS: IoReturn = 0;
 // IOReturn codes are 32-bit patterns; the wrap to i32 is intended
 const K_IO_RETURN_BAD_ARGUMENT: IoReturn = 0xE000_02C2_u32 as IoReturn;
-// the assertion `caffeinate -i` takes; any user may create it
-const PREVENT_USER_IDLE_SYSTEM_SLEEP: &CStr = c"PreventUserIdleSystemSleep";
+// the assertion `caffeinate -s` takes; any user may create it. The weaker
+// PreventUserIdleSystemSleep does not stop a dark wake from going back to
+// sleep, so a host that was asleep when the daemon started stays asleep
+const PREVENT_SYSTEM_SLEEP: &CStr = c"PreventSystemSleep";
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -56,16 +58,15 @@ impl Drop for CfString {
     }
 }
 
-/// A held `PreventUserIdleSystemSleep` assertion, released on drop.
+/// A held `PreventSystemSleep` assertion, released on drop.
 #[derive(Debug)]
-pub(super) struct IdleSleepAssertion(IoPmAssertionId);
+pub(super) struct SystemSleepAssertion(IoPmAssertionId);
 
-impl IdleSleepAssertion {
+impl SystemSleepAssertion {
     /// Create the assertion. `name` shows in `pmset -g assertions`. The error
     /// is the `IOReturn` code.
     pub(super) fn create(name: &CStr) -> Result<Self, IoReturn> {
-        let assertion_type =
-            CfString::new(PREVENT_USER_IDLE_SYSTEM_SLEEP).ok_or(K_IO_RETURN_BAD_ARGUMENT)?;
+        let assertion_type = CfString::new(PREVENT_SYSTEM_SLEEP).ok_or(K_IO_RETURN_BAD_ARGUMENT)?;
         let name = CfString::new(name).ok_or(K_IO_RETURN_BAD_ARGUMENT)?;
         let mut id: IoPmAssertionId = 0;
         // SAFETY: both strings are live CFStrings for the call, and `id` is a
@@ -85,7 +86,7 @@ impl IdleSleepAssertion {
     }
 }
 
-impl Drop for IdleSleepAssertion {
+impl Drop for SystemSleepAssertion {
     fn drop(&mut self) {
         // SAFETY: the id came from a successful create and is released once;
         // a failed release leaves nothing to clean up, and process exit

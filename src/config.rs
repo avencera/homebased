@@ -212,7 +212,7 @@ struct RawPower {
 impl RawPower {
     fn policy(self) -> SleepPolicy {
         if self.keep_awake {
-            return SleepPolicy::PreventIdle;
+            return SleepPolicy::Prevent;
         }
         SleepPolicy::Allow
     }
@@ -365,7 +365,7 @@ mod tests {
     fn keep_awake_selects_the_sleep_policy() {
         assert_eq!(Config::parse("").unwrap().sleep, SleepPolicy::Allow);
         let config = Config::parse("[power]\nkeep_awake = true\n").unwrap();
-        assert_eq!(config.sleep, SleepPolicy::PreventIdle);
+        assert_eq!(config.sleep, SleepPolicy::Prevent);
         let config = Config::parse("[power]\nkeep_awake = false\n").unwrap();
         assert_eq!(config.sleep, SleepPolicy::Allow);
         assert!(Config::parse("[power]\nkeep_wake = true\n").is_err());

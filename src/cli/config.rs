@@ -61,7 +61,7 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
             println!("fleet: {fleet}");
             let sleep = match config.sleep {
                 SleepPolicy::Allow => "allowed",
-                SleepPolicy::PreventIdle => "idle sleep blocked (power.keep_awake)",
+                SleepPolicy::Prevent => "blocked on AC power (power.keep_awake)",
             };
             println!("sleep: {sleep}");
         }

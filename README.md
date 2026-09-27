@@ -129,9 +129,12 @@ On a Mac that serves agents or tunnels, add this section to
 keep_awake = true
 ```
 
-While the daemon runs, it holds a `PreventUserIdleSystemSleep` power
-assertion, the same one that `caffeinate -i` takes. The system does not
-idle-sleep, but the display can still sleep. A normal user can create this
+While the daemon runs, it holds a `PreventSystemSleep` power assertion, the
+same one that `caffeinate -s` takes. On AC power, the system does not sleep,
+and a Mac that is already asleep stays awake after its next dark wake. The
+display can still sleep, and macOS ignores the assertion on battery power.
+The weaker `caffeinate -i` assertion does not work here: it does not stop a
+dark wake from going back to sleep. A normal user can create this
 assertion, so it needs no `sudo pmset` change, and updates and reinstalls keep
 it. When the daemon stops, macOS releases the assertion. Check it with:
 
@@ -139,7 +142,7 @@ it. When the daemon stops, macOS releases the assertion. Check it with:
 pmset -g assertions | grep homebased
 ```
 
-Idle sleep drops outbound connections, such as a T3 Connect tunnel, and no
+Sleep drops outbound connections, such as a T3 Connect tunnel, and no
 incoming traffic wakes the Mac to restore them. SSH still works during sleep
 because "Wake for network access" wakes the Mac for an incoming connection.
 Linux does not support this setting; the daemon logs a warning and ignores it.
