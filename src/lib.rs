@@ -22,6 +22,7 @@ pub mod invocation;
 pub mod machine;
 pub mod message;
 pub mod notify;
+pub mod power;
 pub mod report;
 pub mod resource;
 pub mod runner;

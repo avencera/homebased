@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
 use crate::machine::{MachineName, host_machine_name};
 use crate::notify::{Notify, NtfyConfig, NtfyTopic};
+use crate::power::SleepPolicy;
 
 /// Environment variable that selects the config file.
 pub const CONFIG_ENV: &str = "HOMEBASED_CONFIG";
@@ -107,6 +108,8 @@ pub struct Config {
     pub fleet: Fleet,
     /// Optional push notification settings.
     pub notify: Notify,
+    /// Whether the daemon keeps the host awake, from `power.keep_awake`.
+    pub sleep: SleepPolicy,
 }
 
 /// Whether this machine joins a fleet.
@@ -195,6 +198,24 @@ struct RawConfig {
     fleet: RawFleet,
     #[serde(default)]
     notify: RawNotify,
+    #[serde(default)]
+    power: RawPower,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPower {
+    #[serde(default)]
+    keep_awake: bool,
+}
+
+impl RawPower {
+    fn policy(self) -> SleepPolicy {
+        if self.keep_awake {
+            return SleepPolicy::PreventIdle;
+        }
+        SleepPolicy::Allow
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +302,7 @@ impl RawConfig {
             machines,
         } = self.fleet;
         let notify = self.notify.validate()?;
+        let sleep = self.power.policy();
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -305,6 +327,7 @@ impl RawConfig {
             machine_name,
             fleet,
             notify,
+            sleep,
         })
     }
 }
@@ -336,6 +359,16 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert_eq!(config, Config::default());
         assert_eq!(config.notify.ntfy, None);
+    }
+
+    #[test]
+    fn keep_awake_selects_the_sleep_policy() {
+        assert_eq!(Config::parse("").unwrap().sleep, SleepPolicy::Allow);
+        let config = Config::parse("[power]\nkeep_awake = true\n").unwrap();
+        assert_eq!(config.sleep, SleepPolicy::PreventIdle);
+        let config = Config::parse("[power]\nkeep_awake = false\n").unwrap();
+        assert_eq!(config.sleep, SleepPolicy::Allow);
+        assert!(Config::parse("[power]\nkeep_wake = true\n").is_err());
     }
 
     #[test]

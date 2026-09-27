@@ -105,6 +105,9 @@ pub(crate) struct DaemonLocks {
 pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<(), AppError> {
     home.ensure()?;
     let _daemon_lock = acquire_daemon_lock(&home)?;
+    // held until serve returns, so the host stays awake exactly while this
+    // daemon runs
+    let _awake = config.sleep.apply();
     // the lock is held, so no earlier boot of this installation is still serving
     let machine = LocalMachine {
         identity: LocalIdentity::start(&home)?,

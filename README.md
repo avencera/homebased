@@ -119,6 +119,31 @@ push with:
 homebased notify test
 ```
 
+### Keep the host awake (macOS)
+
+On a Mac that serves agents or tunnels, add this section to
+`~/.config/homebased/config.toml`:
+
+```toml
+[power]
+keep_awake = true
+```
+
+While the daemon runs, it holds a `PreventUserIdleSystemSleep` power
+assertion, the same one that `caffeinate -i` takes. The system does not
+idle-sleep, but the display can still sleep. A normal user can create this
+assertion, so it needs no `sudo pmset` change, and updates and reinstalls keep
+it. When the daemon stops, macOS releases the assertion. Check it with:
+
+```sh
+pmset -g assertions | grep homebased
+```
+
+Idle sleep drops outbound connections, such as a T3 Connect tunnel, and no
+incoming traffic wakes the Mac to restore them. SSH still works during sleep
+because "Wake for network access" wakes the Mac for an incoming connection.
+Linux does not support this setting; the daemon logs a warning and ignores it.
+
 To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines.
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.

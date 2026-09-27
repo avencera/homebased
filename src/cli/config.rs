@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::config::{ConfigLocation, Fleet};
 use crate::error::AppError;
+use crate::power::SleepPolicy;
 
 use super::{Ctx, OutputMode};
 
@@ -44,6 +45,7 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
             "machine_name": name,
             "machine_name_source": name_source,
             "fleet": config.fleet,
+            "sleep": config.sleep,
         }))?,
         OutputMode::Quiet => println!("{}", location.path().display()),
         OutputMode::Human => {
@@ -57,6 +59,11 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
             println!("config ok: {}{presence}", location.path().display());
             println!("machine name: {name}");
             println!("fleet: {fleet}");
+            let sleep = match config.sleep {
+                SleepPolicy::Allow => "allowed",
+                SleepPolicy::PreventIdle => "idle sleep blocked (power.keep_awake)",
+            };
+            println!("sleep: {sleep}");
         }
     }
     Ok(ExitCode::SUCCESS)
