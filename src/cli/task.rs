@@ -255,9 +255,27 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
                 workload_label(&value),
                 check
             );
+            print_waiting_events(&value);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line per callback that waits for its origin thread and when the wait ends
+fn print_waiting_events(value: &Value) {
+    let Some(events) = value.get("waiting_events").and_then(Value::as_array) else {
+        return;
+    };
+    for event in events {
+        let field = |name| event.get(name).and_then(Value::as_str).unwrap_or("-");
+        println!(
+            "  callback seq {} waits for its thread since {}, gives up at {}: {}",
+            event.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            field("since"),
+            field("until"),
+            field("reason"),
+        );
+    }
 }
 
 async fn log_cmd(ctx: &Ctx, id: TaskId, tail: Option<usize>) -> Result<ExitCode, AppError> {

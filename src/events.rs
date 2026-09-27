@@ -144,6 +144,14 @@ pub struct OutboxEvent {
     pub notification_required: bool,
 }
 
+/// How long an event may wait for its origin thread before delivery gives up
+///
+/// Some hosts, such as T3 Code, run one Claude Code process per turn, so a
+/// session can have no live process for hours between turns. After this limit
+/// the event settles as failed and goes to the fallback log, which lets later
+/// events for the task proceed
+pub const THREAD_WAIT_LIMIT: chrono::TimeDelta = chrono::TimeDelta::days(3);
+
 /// Origin callback result, separate from transport acknowledgement
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -194,6 +202,19 @@ impl DeliveryState {
             Self::PendingDelivery { .. } | Self::AwaitingThread { .. }
         )
     }
+}
+
+/// An event that waits for its origin thread, retained for task inspection
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitingInboxEvent {
+    /// Per-task event sequence
+    pub seq: u64,
+    /// When the event began waiting
+    pub since: DateTime<Utc>,
+    /// When delivery gives up if the origin thread still cannot take it
+    pub until: DateTime<Utc>,
+    /// Why the origin thread could not take the event
+    pub reason: String,
 }
 
 /// Result of one reserved origin queue attempt

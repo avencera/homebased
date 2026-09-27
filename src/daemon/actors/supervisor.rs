@@ -322,6 +322,7 @@ impl Actor for SupervisorActor {
                 home: home.clone(),
                 notifier,
                 machine_name,
+                claude_sessions: std::env::home_dir().map(|home| home.join(".claude/sessions")),
             },
             myself.get_cell(),
         )

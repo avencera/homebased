@@ -281,6 +281,7 @@ async fn dispatch(home: &Home, id: TaskId) {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -376,6 +377,7 @@ async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -441,6 +443,7 @@ async fn unavailable_t3_codex_wake_falls_back_and_marks_delivery() {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -626,6 +629,7 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -676,6 +680,7 @@ async fn push_only_after_failed_wake_until_delivery() {
             home,
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -762,6 +767,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -922,6 +928,7 @@ async fn throttled_wake_check_waits_without_a_push() {
             home: home.clone(),
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -1038,6 +1045,7 @@ async fn callback_actor_survives_an_unavailable_store() {
             home,
             notifier: None,
             machine_name: "test".into(),
+            claude_sessions: None,
         },
     )
     .await
@@ -1066,4 +1074,181 @@ async fn callback_actor_survives_an_unavailable_store() {
     );
     callback.stop(None);
     callback_handle.await.unwrap();
+}
+
+/// Write a live registry entry and peer key for `thread` under `callback_home`
+fn register_live_claude_session(callback_home: &Path, thread: &str, socket: &Path) {
+    let sessions = callback_home.join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let pid = std::process::id();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        serde_json::json!({
+            "pid": pid,
+            "sessionId": thread,
+            "messagingSocketPath": socket,
+            "peerProtocol": 1,
+            "updatedAt": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let digest = Sha256::digest(socket.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(
+        sessions.join(format!("{pid}.{hex}.key")),
+        serde_json::json!({ "peerToken": "test-token" }).to_string(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn new_claude_process_receives_each_waiting_event_exactly_once() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nexit 0\n");
+    let callback_home = PathBuf::from(&route.callback.env.home);
+    let project = callback_home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let thread = route.thread;
+    std::fs::write(project.join(format!("{thread}.jsonl")), "").unwrap();
+    // a dead turn process of the same session, as T3 Code leaves behind
+    let sessions = callback_home.join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join("0.json"),
+        serde_json::json!({
+            "pid": 0,
+            "sessionId": thread.to_string(),
+            "messagingSocketPath": callback_home.join("dead.sock"),
+            "peerProtocol": 1,
+            "updatedAt": 2,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    for seq in [1, 2] {
+        persisted
+            .accept_inbound_event(&event(&route, seq, true))
+            .unwrap();
+    }
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+            claude_sessions: Some(sessions.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    callback
+        .cast(CallbackMsg::DispatchInbox { id: route.task })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let entry = call(&store, |reply| StoreMsg::EarliestInbox {
+                id: route.task,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if matches!(entry.delivery, DeliveryState::AwaitingThread { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let waiting = Store::open(&home.db_path())
+        .unwrap()
+        .waiting_inbox_events(route.task)
+        .unwrap();
+    assert_eq!(waiting.len(), 1, "only the head of the task waits");
+    assert_eq!(waiting[0].seq, 1);
+    assert_eq!(
+        waiting[0].until - waiting[0].since,
+        crate::events::THREAD_WAIT_LIMIT
+    );
+
+    let socket = callback_home.join("inbox.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut messages = Vec::new();
+        // wait past a second registry change and retry for any duplicate
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    messages.push(body);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        messages
+    });
+    // no RetryInbox cast: the registry watcher must notice the new process
+    register_live_claude_session(&callback_home, &thread.to_string(), &socket);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let entry = call(&store, |reply| StoreMsg::EarliestInbox {
+                id: route.task,
+                reply,
+            })
+            .await
+            .unwrap();
+            if entry.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // a later turn changes the registry again; settled events must not resend
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    register_live_claude_session(&callback_home, &thread.to_string(), &socket);
+    callback.cast(CallbackMsg::RetryInbox).unwrap();
+
+    let messages = tokio::task::spawn_blocking(move || receiver.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    for (message, seq) in messages.iter().zip([1, 2]) {
+        let frame: serde_json::Value =
+            serde_json::from_str(message.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(frame["session_id"], thread.to_string());
+        let content = frame["message"]["content"].as_str().unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(content.strip_prefix("HOMEBASED_EVENT ").unwrap()).unwrap();
+        assert_eq!(event["seq"], seq, "events arrive in task order");
+    }
+    let entries = Store::open(&home.db_path())
+        .unwrap()
+        .inbound_events(route.task)
+        .unwrap();
+    for entry in entries {
+        assert!(matches!(
+            entry.delivery,
+            DeliveryState::Delivered { attempts: 1, .. }
+        ));
+    }
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
 }

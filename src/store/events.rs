@@ -13,7 +13,8 @@ use crate::domain::{API_VERSION, SUMMARY_MAX_BYTES, TaskId};
 use crate::error::AppError;
 use crate::events::{
     DeliveryOutcome, DeliveryState, EventAcceptance, EventError, EventPayload, EventRouteState,
-    EventRouteStatus, FailedInboxEvent, InboxEvent, OutboxEvent, OutboxState, TaskEvent,
+    EventRouteStatus, FailedInboxEvent, InboxEvent, OutboxEvent, OutboxState, THREAD_WAIT_LIMIT,
+    TaskEvent, WaitingInboxEvent,
 };
 use crate::machine::MachineId;
 use crate::submission::{
@@ -608,11 +609,25 @@ impl Store {
                 attempts,
                 last_error,
             },
-            DeliveryOutcome::Deferred(reason) if attempts > 0 => DeliveryState::AwaitingThread {
-                attempts: attempts.saturating_sub(1),
-                since: waiting_since.unwrap_or_else(Utc::now),
-                reason,
-            },
+            DeliveryOutcome::Deferred(reason) if attempts > 0 => {
+                let since = waiting_since.unwrap_or_else(Utc::now);
+                let attempts = attempts.saturating_sub(1);
+                if Utc::now() - since >= THREAD_WAIT_LIMIT {
+                    DeliveryState::DeliveryFailed {
+                        attempts,
+                        last_error: format!(
+                            "gave up after waiting {} days for the origin thread: {reason}",
+                            THREAD_WAIT_LIMIT.num_days()
+                        ),
+                    }
+                } else {
+                    DeliveryState::AwaitingThread {
+                        attempts,
+                        since,
+                        reason,
+                    }
+                }
+            }
             DeliveryOutcome::Retryable(error) if attempts >= 3 => DeliveryState::DeliveryFailed {
                 attempts,
                 last_error: error,
@@ -709,6 +724,23 @@ impl Store {
                     seq: entry.event.seq.get(),
                     attempts,
                     error: last_error,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// List callbacks that wait for their origin thread, with the time each wait ends
+    pub fn waiting_inbox_events(&self, task: TaskId) -> Result<Vec<WaitingInboxEvent>, EventError> {
+        Ok(self
+            .inbound_events(task)?
+            .into_iter()
+            .filter_map(|entry| match entry.delivery {
+                DeliveryState::AwaitingThread { since, reason, .. } => Some(WaitingInboxEvent {
+                    seq: entry.event.seq.get(),
+                    since,
+                    until: since + THREAD_WAIT_LIMIT,
+                    reason,
                 }),
                 _ => None,
             })
@@ -1211,13 +1243,13 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::EVENT_RETENTION_BATCH_SIZE;
+    use super::{EVENT_RETENTION_BATCH_SIZE, encode};
     use crate::callback::ReportView;
     use crate::domain::{TaskEnv, TaskId};
     use crate::error::AppError;
     use crate::events::{
         DeliveryOutcome, DeliveryState, EventAcceptance, EventError, EventPayload, EventRouteState,
-        TaskEvent,
+        THREAD_WAIT_LIMIT, TaskEvent,
     };
     use crate::machine::MachineId;
     use crate::store::{IdentityError, Store};
@@ -1226,6 +1258,7 @@ mod tests {
         ResourceBackgroundRoutePhase, ResourceQueueOutcome, ResourceQueueReceipt,
         ResourceRoutePhase, SubmissionState,
     };
+    use chrono::Utc;
     use rusqlite::params;
     use std::num::NonZeroU64;
 
@@ -2079,6 +2112,61 @@ mod tests {
                 reason,
             } if *original_since == *since && reason == "thread is still asleep"
         ));
+    }
+
+    #[test]
+    fn waiting_past_the_limit_fails_and_releases_later_events() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let route = route();
+        store.insert_origin_route(&route).unwrap();
+        let callback = callback_event(&route, 1, None);
+        store.accept_inbound_event(&callback).unwrap();
+        store
+            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
+            .unwrap();
+        let expired = DeliveryState::AwaitingThread {
+            attempts: 0,
+            since: Utc::now() - THREAD_WAIT_LIMIT,
+            reason: "Claude session is not running".into(),
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE origin_inbox SET delivery_json=?1 WHERE task_id=?2 AND seq=1",
+                params![encode(&expired).unwrap(), route.task.to_string()],
+            )
+            .unwrap();
+        let waiting = store.waiting_inbox_events(route.task).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].until - waiting[0].since, THREAD_WAIT_LIMIT);
+
+        store
+            .reserve_inbox_attempt(route.task, callback.seq)
+            .unwrap()
+            .unwrap();
+        let settled = store
+            .settle_inbox_attempt(
+                route.task,
+                callback.seq,
+                DeliveryOutcome::Deferred("Claude session is not running".into()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &settled.delivery,
+            DeliveryState::DeliveryFailed { attempts: 0, last_error }
+                if last_error.starts_with("gave up after waiting 3 days")
+        ));
+        assert!(store.waiting_inbox_events(route.task).unwrap().is_empty());
+        assert_eq!(
+            store
+                .origin_route_by_task(route.task)
+                .unwrap()
+                .unwrap()
+                .last_settled_seq,
+            2
+        );
     }
 
     #[test]

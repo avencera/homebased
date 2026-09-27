@@ -16,6 +16,7 @@ use crate::daemon::cluster::{
 };
 use crate::domain::{API_VERSION, TaskId};
 use crate::error::AppError;
+use crate::events::WaitingInboxEvent;
 use crate::fleet::address::MachineAddress;
 use crate::fleet::http::ClusterClient;
 use crate::fleet::probe::{VerifiedDestination, check_probed, probe};
@@ -173,6 +174,7 @@ pub(super) async fn show(state: &AppState, id: TaskId) -> Result<Value, AppError
         annotate(&mut value, origin, machine, machine, "available");
         if let Some(failed_events) = local_failures(state, id).await? {
             value["failed_events"] = json!(failed_events);
+            value["waiting_events"] = json!(local_waiting(state, id).await?);
         }
         return Ok(value);
     }
@@ -192,6 +194,7 @@ pub(super) async fn show(state: &AppState, id: TaskId) -> Result<Value, AppError
                 annotate(&mut value, origin, *machine, *machine, "available");
                 if let Some(route) = records.routes.values().next() {
                     value["failed_events"] = json!(route.failed_events);
+                    value["waiting_events"] = json!(local_waiting(state, id).await?);
                 }
                 return Ok(value);
             }
@@ -312,6 +315,15 @@ async fn local_failures(
             })
             .collect(),
     ))
+}
+
+/// Callbacks that wait for their origin thread; only the origin owns this state
+async fn local_waiting(state: &AppState, id: TaskId) -> Result<Vec<WaitingInboxEvent>, AppError> {
+    call(&state.store, |reply| StoreMsg::WaitingInboxEvents {
+        id,
+        reply,
+    })
+    .await
 }
 
 async fn lookup(state: &AppState, id: TaskId) -> Result<Records, AppError> {

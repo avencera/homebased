@@ -19,7 +19,7 @@ use std::num::NonZeroU64;
 
 use crate::events::{
     DeliveryOutcome, EventAcceptance, EventError, EventRouteStatus, FailedInboxEvent, InboxEvent,
-    OutboxEvent, TaskEvent,
+    OutboxEvent, TaskEvent, WaitingInboxEvent,
 };
 use crate::machine::MachineId;
 use crate::message::{
@@ -734,6 +734,11 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Vec<FailedInboxEvent>, AppError>>,
     },
+    /// Read origin callbacks that wait for their origin thread
+    WaitingInboxEvents {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Vec<WaitingInboxEvent>, AppError>>,
+    },
     /// Fetch the immutable origin callback route
     OriginRoute {
         id: TaskId,
@@ -1416,6 +1421,9 @@ impl Actor for StoreActor {
             ),
             StoreMsg::FailedInboxEvents { id, reply } => {
                 send_reply(reply, state.failed_inbox_events(id).map_err(event_error))
+            }
+            StoreMsg::WaitingInboxEvents { id, reply } => {
+                send_reply(reply, state.waiting_inbox_events(id).map_err(event_error))
             }
             StoreMsg::OriginRoute { id, reply } => send_reply(
                 reply,

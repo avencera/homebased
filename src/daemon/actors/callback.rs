@@ -1,8 +1,10 @@
 //! `CallbackActor` owns ordered origin inbox delivery
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tracing::warn;
@@ -24,6 +26,14 @@ use crate::thread_title::TitleSources;
 // worker that failed to start, so no unsettled event is stranded
 const INBOX_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const T3_WAKE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+// a host such as T3 Code can run one short Claude Code process per turn, so a
+// waiting event needs a live registry entry noticed well inside one turn
+const CLAUDE_REGISTRY_POLL: Duration = Duration::from_secs(2);
+
+// the registry file can appear before its peer key file or socket; an early
+// send spends the three-attempt budget, so let the new process settle first
+const CLAUDE_REGISTRY_SETTLE: Duration = Duration::from_secs(1);
 
 /// Delivery messages; workers run concurrently across tasks
 pub enum CallbackMsg {
@@ -89,6 +99,11 @@ pub struct CallbackArgs {
     pub notifier: Option<Arc<Notifier>>,
     /// Name shown in waiting-thread notices
     pub machine_name: String,
+    /// Claude Code session registry to watch, usually `~/.claude/sessions`
+    ///
+    /// A new or changed entry retries waiting events at once instead of at the
+    /// next periodic scan
+    pub claude_sessions: Option<PathBuf>,
 }
 
 /// Holds store ref, home, and retry state
@@ -100,6 +115,7 @@ pub struct CallbackState {
     wake_times: HashMap<ThreadId, Instant>,
     alerted_threads: HashSet<ThreadId>,
     active_inbox: HashSet<TaskId>,
+    registry_watch: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CallbackState {
@@ -188,6 +204,9 @@ impl Actor for CallbackActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         // the timer task ends on its own once this actor stops
         myself.send_interval(INBOX_RETRY_INTERVAL, || CallbackMsg::RetryInbox);
+        let registry_watch = args
+            .claude_sessions
+            .map(|sessions| tokio::spawn(watch_claude_sessions(sessions, myself.clone())));
         Ok(CallbackState {
             store: args.store,
             home: args.home,
@@ -196,7 +215,19 @@ impl Actor for CallbackActor {
             wake_times: HashMap::new(),
             alerted_threads: HashSet::new(),
             active_inbox: HashSet::new(),
+            registry_watch,
         })
+    }
+
+    async fn post_stop(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        if let Some(watch) = state.registry_watch.take() {
+            watch.abort();
+        }
+        Ok(())
     }
 
     async fn handle(
@@ -241,6 +272,59 @@ impl Actor for CallbackActor {
             }
         }
         Ok(())
+    }
+}
+
+/// Snapshot of `*.json` registry entries by file name and modification time
+type RegistrySnapshot = HashMap<OsString, Option<SystemTime>>;
+
+fn registry_snapshot(sessions: &Path) -> RegistrySnapshot {
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return RegistrySnapshot::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+            (entry.file_name(), modified)
+        })
+        .collect()
+}
+
+/// Retry waiting events when a Claude Code session registry entry appears or changes
+///
+/// The retry only starts workers; each worker still resolves the live entry
+/// for its exact session id and live PID
+async fn watch_claude_sessions(sessions: PathBuf, callback: ActorRef<CallbackMsg>) {
+    let mut last: Option<RegistrySnapshot> = None;
+    let mut interval = tokio::time::interval(CLAUDE_REGISTRY_POLL);
+    loop {
+        interval.tick().await;
+        let dir = sessions.clone();
+        let Ok(snapshot) = tokio::task::spawn_blocking(move || registry_snapshot(&dir)).await
+        else {
+            continue;
+        };
+        let changed = last.as_ref().is_some_and(|last| {
+            snapshot
+                .iter()
+                .any(|(name, modified)| last.get(name) != Some(modified))
+        });
+        last = Some(snapshot);
+        if !changed {
+            continue;
+        }
+
+        tokio::time::sleep(CLAUDE_REGISTRY_SETTLE).await;
+        if callback.cast(CallbackMsg::RetryInbox).is_err() {
+            return;
+        }
     }
 }
 

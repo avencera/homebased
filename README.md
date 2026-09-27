@@ -158,6 +158,15 @@ T3 Code's undocumented local API; if a Codex wake fails, it queues the event
 with `codex queue`. Run `homebased t3 check` after T3 updates to check that the local
 API still works.
 
+A Claude session with a transcript but no live process is waiting, not gone.
+Some hosts, T3 Code among them, start a new `claude` process for each turn.
+Homebased keeps the event in the task inbox and watches
+`~/.claude/sessions/`. When a live process for that session id appears, it
+sends the event, keeping the task's events in order. `homebased task show`
+lists each waiting event with its reason and the time delivery gives up.
+After 3 days the event is marked failed and is written to
+`callback-fallback.log`.
+
 ### Fleet
 
 Fleet is off by default. Add this config to each machine that should join the
