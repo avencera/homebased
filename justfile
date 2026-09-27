@@ -19,9 +19,13 @@ build-release: web-build
 bump part:
     cargo xtask bump {{part}}
 
-# Place: local | github | gh | public
+# Deploy through GitHub Actions: bump and commit the version, push master, run
+# `just release`, wait for the Release workflow, then run `homebased update` on
+# each machine. Place: github (default) | gh | public | local
+#
+# Release through GitHub Actions by default; `local` installs a dev build here
 [group('build')]
-release place="local":
+release place="github":
     cargo xtask release {{place}}
 
 [private]
