@@ -33,9 +33,7 @@ where
 {
     match actor.call(build, Some(CALL_TIMEOUT)).await {
         Ok(ractor::rpc::CallResult::Success(inner)) => inner,
-        Ok(ractor::rpc::CallResult::Timeout) => Err(AppError::Internal {
-            message: "actor call timed out".into(),
-        }),
+        Ok(ractor::rpc::CallResult::Timeout) => Err(AppError::DaemonBusy),
         Ok(ractor::rpc::CallResult::SenderError) => Err(AppError::Internal {
             message: "actor call sender error".into(),
         }),

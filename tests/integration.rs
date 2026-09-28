@@ -861,9 +861,62 @@ fn followup_dry_run_reads_message_file_without_spawning() {
         ])
         .output()
         .unwrap();
-    assert_eq!(local_request_id.status.code(), Some(2));
-    let request_error: Value = serde_json::from_slice(&local_request_id.stderr).unwrap();
-    assert_eq!(request_error["error"]["code"], "usage");
+    assert!(
+        local_request_id.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local_request_id.stderr)
+    );
+}
+
+#[test]
+fn local_submit_retry_with_the_same_request_returns_the_saved_task() {
+    let h = Harness::new();
+    let request = "01a0e487-b877-76e2-9dc2-806bff0bf687";
+    let submit = |prompt: &str| {
+        let spec_path = h.home.join("retry-spec.json");
+        fs::write(
+            &spec_path,
+            serde_json::to_vec(&Harness::spec("claude", prompt)).unwrap(),
+        )
+        .unwrap();
+        h.cmd()
+            .args(["--json", "task", "submit", "--spec"])
+            .arg(&spec_path)
+            .args(["--request-id", request])
+            .output()
+            .unwrap()
+    };
+
+    let first = submit("do the work");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["request_id"], request);
+    let id = first["id"].as_str().unwrap().to_string();
+
+    // a caller that lost the first response retries with the same request
+    let retry = submit("do the work");
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry["id"], id);
+    let tasks: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tasks, 1);
+
+    let changed = submit("different work");
+    assert!(!changed.status.success());
+    let error: Value = serde_json::from_slice(&changed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "submission_conflict");
+    h.wait_status(&id, "succeeded");
 }
 
 #[test]

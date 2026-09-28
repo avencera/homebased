@@ -729,6 +729,7 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(trainer_row),
         spec: Box::new(fixture.spec.clone()),
+        request: crate::submission::RequestId::new(),
         reply,
     })
     .await
@@ -1166,6 +1167,7 @@ async fn remote_supervisor_watcher_is_bound_then_launched_once_for_the_superviso
                 &remote_task(background_task, &trainer_spec),
                 &trainer_spec,
                 authority,
+                crate::submission::RequestId::new(),
                 PathBuf::from("/bin/echo").into(),
             )
             .unwrap();

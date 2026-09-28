@@ -130,6 +130,7 @@ fn release_watcher_binding_returns_the_saved_intent_on_exact_retry() {
             &reserved_task,
             &spec(),
             authority,
+            crate::submission::RequestId::new(),
             PathBuf::from("/bin/echo").into(),
         ),
         Err(crate::error::AppError::ClusterTaskConflict { task })

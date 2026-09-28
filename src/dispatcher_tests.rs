@@ -505,7 +505,13 @@ async fn local_terminal_event_delivers_once_after_restart() {
     });
     let store = Store::open(&home.db_path()).unwrap();
     store
-        .insert_local_task(&row, spec, machine, route.callback.codex.clone())
+        .insert_local_task(
+            &row,
+            spec,
+            machine,
+            crate::submission::RequestId::new(),
+            route.callback.codex.clone(),
+        )
         .unwrap();
     store
         .cas_status(row.id, ProcessStatus::Queued, ProcessStatus::Running)

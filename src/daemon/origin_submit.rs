@@ -19,18 +19,14 @@ use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
 use crate::invocation::resolve_agent_binary;
 use crate::spec::{self, NormalizedSpec};
-use crate::submission::{
-    CallbackContext, ExecutorIdentity, OriginRoute, RequestId, SubmissionState,
-};
+use crate::submission::{CallbackContext, ExecutorIdentity, OriginRoute, SubmissionState};
 
 /// Submit a remote request once or resolve its saved outcome without resending
 pub(super) async fn submit(
     state: &AppState,
     body: SubmitBody,
-) -> Result<(TaskId, ProcessStatus, Option<RequestId>), AppError> {
-    let request = body.request.ok_or_else(|| AppError::Internal {
-        message: "remote dispatch has no request UUID".into(),
-    })?;
+) -> Result<(TaskId, ProcessStatus), AppError> {
+    let request = body.request;
     let _request_guard = state.locks.origin_submissions.lock(request).await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request,
@@ -50,7 +46,7 @@ pub(super) async fn submit(
             ));
         }
         let (task, status) = finish_saved(state, route).await?;
-        return Ok((task, status, Some(request)));
+        return Ok((task, status));
     }
 
     let machine_name = body
@@ -127,7 +123,7 @@ pub(super) async fn submit(
     };
     if saved.task != task {
         let (task, status) = finish_saved(state, saved).await?;
-        return Ok((task, status, Some(request)));
+        return Ok((task, status));
     }
     let wire = SubmitExecution {
         api_version: API_VERSION,
@@ -148,8 +144,7 @@ pub(super) async fn submit(
         .await
         .map_err(|error| unknown(&saved, error.to_string()))?;
     let identity = decode_identity(&saved, response, destination.protocol)?;
-    let (task, status) = resolve_identity(state, saved, identity.identity).await?;
-    Ok((task, status, Some(request)))
+    resolve_identity(state, saved, identity.identity).await
 }
 
 fn local_machine_selector(machine: &crate::machine::MachineName) -> AppError {
@@ -357,7 +352,7 @@ fn unknown(route: &OriginRoute, message: impl Into<String>) -> AppError {
     }
 }
 
-fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppError {
+pub(super) fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppError {
     AppError::SubmissionConflict {
         request: route.request,
         task: route.task,

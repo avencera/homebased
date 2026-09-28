@@ -40,6 +40,7 @@ use crate::store::{
 use crate::submission::{CallbackExecutable, ExecutionRecord, ExecutorIdentity, RequestId};
 
 mod recovery;
+use recovery::ResourceOwnedTasks;
 mod resource_launch;
 
 pub(crate) use resource_launch::return_decision_rejection;
@@ -140,11 +141,17 @@ pub(crate) enum SupervisorMsg {
             Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
         >,
     },
-    /// Persist a queued row, spawn its worker, and watch it
+    /// Persist a queued row under its request, spawn its worker, and watch it
     Launch {
         row: Box<TaskRow>,
         spec: Box<NormalizedSpec>,
+        request: RequestId,
         reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Finish the launch of a saved local task; `None` when a resource flow owns it
+    ResumeLocal {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<ProcessStatus>, AppError>>,
     },
     /// Accept a remote task and launch only if this request won acceptance
     LaunchRemote {
@@ -422,8 +429,16 @@ impl Actor for SupervisorActor {
                 let result = launch_remote_background(&myself, state, *launch).await;
                 send_reply(reply, result);
             }
-            SupervisorMsg::Launch { row, spec, reply } => {
-                send_reply(reply, launch(&myself, state, *row, *spec).await);
+            SupervisorMsg::Launch {
+                row,
+                spec,
+                request,
+                reply,
+            } => {
+                send_reply(reply, launch(&myself, state, *row, *spec, request).await);
+            }
+            SupervisorMsg::ResumeLocal { id, reply } => {
+                send_reply(reply, resume_local(&myself, state, id).await);
             }
             SupervisorMsg::LaunchRemote { request, reply } => {
                 send_reply(reply, launch_remote(&myself, state, *request).await);
@@ -778,8 +793,10 @@ async fn launch_accepted(
             return Ok(());
         }
     };
-    record_pid(state, id, pid).await?;
-    spawn_task_actor(supervisor, state, id).await
+    let recorded = record_pid(state, id, pid).await;
+    // the worker runs whether or not its pid was saved, so it is always watched
+    spawn_task_actor(supervisor, state, id).await?;
+    recorded
 }
 
 /// Resolve the Codex executable that callbacks for a supervisor-launched task use
@@ -838,18 +855,29 @@ async fn launch(
     state: &mut SupervisorState,
     row: TaskRow,
     spec: NormalizedSpec,
+    request: RequestId,
 ) -> Result<(), AppError> {
     let id = row.id;
     let codex = resolve_callback_codex(state, &row.env.path, &row.cwd);
-    call(&state.store, |reply| StoreMsg::InsertLocalTask {
+    let inserted = call(&state.store, |reply| StoreMsg::InsertLocalTask {
         row: Box::new(row),
         spec: Box::new(spec),
         machine: state.machine,
+        request,
         codex,
         reply,
     })
-    .await?;
+    .await;
     let paths = state.home.task_paths(id);
+    if let Err(error) = inserted {
+        // a timed-out insert may still commit, so only a refused one gives up its files
+        if !matches!(error, AppError::DaemonBusy)
+            && let Err(cleanup) = std::fs::remove_dir_all(&paths.dir)
+        {
+            tracing::warn!(%id, "remove refused task directory: {cleanup}");
+        }
+        return Err(error);
+    }
     // uncontended: the lock file is new for this id, so the blocking flock
     // never stalls the mailbox
     let lock = match runner::lock_before_spawn(&paths) {
@@ -866,8 +894,41 @@ async fn launch(
             return Err(err);
         }
     };
-    record_pid(state, id, pid).await?;
-    spawn_task_actor(supervisor, state, id).await
+    let recorded = record_pid(state, id, pid).await;
+    // the worker runs whether or not its pid was saved, so it is always watched
+    spawn_task_actor(supervisor, state, id).await?;
+    recorded
+}
+
+/// Give a saved local task the worker and watch that its launch may have missed
+///
+/// A submit whose caller timed out can leave its row committed without a
+/// worker, or with a worker that nothing watches. A task whose launch a
+/// resource flow owns is left to that resource and reported as `None`
+async fn resume_local(
+    supervisor: &ActorRef<SupervisorMsg>,
+    state: &mut SupervisorState,
+    id: TaskId,
+) -> Result<Option<ProcessStatus>, AppError> {
+    if ResourceOwnedTasks::load(state).await?.owns(id) {
+        return Ok(None);
+    }
+    if !state.tasks.contains_key(&id) {
+        match task_status(state, id).await? {
+            ProcessStatus::Queued => launch_accepted(supervisor, state, id).await?,
+            status if !status.is_terminal() => spawn_task_actor(supervisor, state, id).await?,
+            _ => {}
+        }
+    }
+    // a failed spawn finishes the row, so report the status after the launch
+    task_status(state, id).await.map(Some)
+}
+
+async fn task_status(state: &SupervisorState, id: TaskId) -> Result<ProcessStatus, AppError> {
+    call(&state.store, |reply| StoreMsg::GetTask { id, reply })
+        .await?
+        .map(|row| row.status())
+        .ok_or(AppError::TaskNotFound { id })
 }
 
 /// Save the spawned runner's pid, refusing one outside the signed range the store keeps

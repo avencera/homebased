@@ -175,6 +175,8 @@ pub struct TaskPaths {
     pub output: PathBuf,
     /// Exclusive flock held by `task-run`.
     pub runner_lock: PathBuf,
+    /// Stderr of `task-run` itself, which explains a worker that stops before `exit.json`
+    pub worker_log: PathBuf,
     /// Worker evidence of exit.
     pub exit_json: PathBuf,
     /// `codex queue` stdout/stderr.
@@ -214,6 +216,7 @@ impl TaskPaths {
             feed: dir.join("prompt.feed.txt"),
             output: dir.join("output.log"),
             runner_lock: dir.join("runner.lock"),
+            worker_log: dir.join("worker.log"),
             exit_json: dir.join("exit.json"),
             callback_log: dir.join("callback.log"),
             delivery_lock: dir.join(DELIVERY_LOCK),

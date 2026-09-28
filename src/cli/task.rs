@@ -2,6 +2,7 @@
 
 use std::io::{self, Read};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ pub enum TaskCommand {
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Stable UUID for retry after a lost remote submission response
+        /// Stable UUID for retry after a lost submission response
         #[arg(long)]
         request_id: Option<uuid::Uuid>,
         /// Let a Homebased worker send events to a thread other than its parent task's thread
@@ -63,7 +64,7 @@ pub enum TaskCommand {
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Stable UUID for retry after a lost remote submission response
+        /// Stable UUID for retry after a lost submission response
         #[arg(long)]
         request_id: Option<uuid::Uuid>,
         /// Let a Homebased worker send events to a thread other than its parent task's thread
@@ -203,13 +204,14 @@ async fn submit_normalized(
     SubmitOrigin::capture(&ctx.home)?.check(normalized.thread, allow_other_thread)?;
     let env = crate::domain::TaskEnv::capture();
     let callback_cwd = std::env::current_dir()?;
-    let request_id = submission_request_id(normalized.machine.is_some(), request_id)?;
-    let mut body = json!({
+    let remote = normalized.machine.is_some();
+    let request_id = request_id.map(RequestId).unwrap_or_default();
+    let body = json!({
         "spec": normalized,
         "env": env,
         "callback_cwd": callback_cwd,
+        "request_id": request_id,
     });
-    include_request_id(&mut body, request_id);
 
     let client = Client::new(ctx.home.sock_path());
     if dry_run {
@@ -228,7 +230,8 @@ async fn submit_normalized(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let value = client.post("/v1/tasks", &body).await?;
+    let announce_retries = matches!(ctx.output, super::OutputMode::Human);
+    let value = post_submit(&client, &body, remote, announce_retries).await?;
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -434,23 +437,55 @@ async fn followup_machines(
     Ok((inventory.local.machine, execution_machine, machine))
 }
 
-fn submission_request_id(
-    remote: bool,
-    request_id: Option<uuid::Uuid>,
-) -> Result<Option<RequestId>, AppError> {
-    if !remote && request_id.is_some() {
-        return Err(AppError::Usage {
-            message: "--request-id is only valid for a remote submission; set machine in the spec or omit --request-id".into(),
-        });
-    }
+/// Waits between local submit attempts. The daemon has stalled for over a
+/// minute when the disk was slow, so the schedule covers about 90 seconds
+const LOCAL_SUBMIT_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+];
 
-    Ok(remote.then(|| request_id.map(RequestId).unwrap_or_default()))
+/// Post a submit, retrying a local one with the same request UUID while its outcome is unknown
+///
+/// The request UUID makes the retry safe: the daemon returns the task an earlier
+/// attempt saved instead of creating another. A remote submit returns its
+/// unknown outcome at once, because a slow peer can keep it unknown for much longer
+async fn post_submit(
+    client: &Client,
+    body: &Value,
+    remote: bool,
+    announce_retries: bool,
+) -> Result<Value, AppError> {
+    let delays: &[Duration] = if remote {
+        &[]
+    } else {
+        &LOCAL_SUBMIT_RETRY_DELAYS
+    };
+    let mut delays = delays.iter();
+    loop {
+        let error = match client.post("/v1/tasks", body).await {
+            Err(error) if retries_local_submit(&error) => error,
+            result => return result,
+        };
+        let Some(delay) = delays.next() else {
+            return Err(error);
+        };
+        // JSON and quiet modes keep stderr to the final error envelope
+        if announce_retries {
+            eprintln!("warning: {error}; retrying in {}s", delay.as_secs());
+        }
+        tokio::time::sleep(*delay).await;
+    }
 }
 
-fn include_request_id(body: &mut Value, request_id: Option<RequestId>) {
-    if let Some(request_id) = request_id {
-        body["request_id"] = json!(request_id);
-    }
+fn retries_local_submit(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::SubmissionOutcomeUnknown { .. } | AppError::DaemonBusy
+    )
 }
 
 fn schema(ctx: &Ctx) -> Result<ExitCode, AppError> {
@@ -700,47 +735,30 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
 
-    use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{include_request_id, report, submission_request_id};
+    use super::{report, retries_local_submit};
     use crate::cli::{Ctx, OutputMode};
     use crate::domain::{
         Agent, AgentKind, AgentWorkload, ReportOutcome, TaskEnv, TaskId, ThreadId, Workload,
     };
+    use crate::error::AppError;
     use crate::home::Home;
     use crate::machine::MachineId;
     use crate::store::{NewTask, Store, new_queued_task};
 
     #[test]
-    fn local_submission_has_no_request_id() {
-        let mut body = serde_json::json!({});
-        include_request_id(&mut body, submission_request_id(false, None).unwrap());
-        assert!(body.get("request_id").is_none());
-    }
-
-    #[test]
-    fn remote_submission_generates_or_preserves_request_id() {
-        let generated = submission_request_id(true, None).unwrap().unwrap();
-        assert_ne!(generated.0, uuid::Uuid::nil());
-        let mut body = serde_json::json!({});
-        include_request_id(&mut body, Some(generated));
-        assert_eq!(body["request_id"], json!(generated));
-
-        let explicit = uuid::Uuid::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
-        assert_eq!(
-            submission_request_id(true, Some(explicit)).unwrap(),
-            Some(crate::submission::RequestId(explicit))
-        );
-    }
-
-    #[test]
-    fn explicit_request_id_is_rejected_for_local_submission() {
-        let explicit = uuid::Uuid::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
-        assert!(matches!(
-            submission_request_id(false, Some(explicit)),
-            Err(crate::error::AppError::Usage { .. })
-        ));
+    fn local_submit_retries_only_unknown_outcomes() {
+        let unknown = AppError::SubmissionOutcomeUnknown {
+            request: crate::submission::RequestId::new(),
+            task: TaskId::new(),
+            message: "busy".into(),
+        };
+        assert!(retries_local_submit(&unknown));
+        assert!(retries_local_submit(&AppError::DaemonBusy));
+        assert!(!retries_local_submit(&AppError::Internal {
+            message: "boom".into()
+        }));
     }
 
     #[test]

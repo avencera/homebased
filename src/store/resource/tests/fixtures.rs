@@ -322,6 +322,7 @@ impl TrainerAssociationFixture {
                 &row,
                 &self.spec,
                 self.authority,
+                crate::submission::RequestId::new(),
                 PathBuf::from("/bin/echo").into(),
             )
             .unwrap();
@@ -500,6 +501,7 @@ pub(super) fn open_release_for_test(
             &trainer_row,
             &trainer_spec,
             authority,
+            crate::submission::RequestId::new(),
             PathBuf::from("/bin/echo").into(),
         )
         .unwrap();

@@ -486,6 +486,7 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             count: input.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
         },
         "daemon_already_running" => AppError::DaemonAlreadyRunning,
+        "daemon_busy" => AppError::DaemonBusy,
         "too_many_reports" => AppError::TooManyReports {
             count: input.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
         },

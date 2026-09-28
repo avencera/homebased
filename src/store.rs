@@ -864,14 +864,26 @@ pub struct TaskPresentation {
     pub attention_delivered: bool,
 }
 
+/// Wait for another connection's write lock. It matches the daemon's actor call
+/// timeout, since the daemon's callers stop waiting then anyway
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Store {
     /// Open the SQLite file at `path`, applying the initial schema when empty
     pub fn open(path: &Path) -> Result<Self, AppError> {
+        Self::open_with_busy_timeout(path, BUSY_TIMEOUT)
+    }
+
+    /// Open with a chosen wait for another connection's write lock
+    ///
+    /// A process that no caller waits on can outlast a slow daemon commit
+    /// instead of failing its work
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -922,6 +934,7 @@ impl Store {
         row: &TaskRow,
         spec: &NormalizedSpec,
         machine: MachineId,
+        request: RequestId,
         codex: CallbackExecutable,
     ) -> Result<(), AppError> {
         let callback = CallbackContext {
@@ -930,15 +943,7 @@ impl Store {
             codex,
         };
         self.immediate(|| {
-            insert_local_task_records_on(
-                &self.conn,
-                row,
-                spec,
-                machine,
-                RequestId::new(),
-                &callback,
-                None,
-            )
+            insert_local_task_records_on(&self.conn, row, spec, machine, request, &callback, None)
         })
     }
 
@@ -2567,6 +2572,7 @@ mod tests {
                 &row,
                 &spec,
                 MachineId::new(),
+                crate::submission::RequestId::new(),
                 CallbackExecutable::available("/bin/true".into()),
             )
             .unwrap();
@@ -2805,6 +2811,7 @@ mod tests {
                 &row,
                 &spec,
                 machine,
+                crate::submission::RequestId::new(),
                 CallbackExecutable::available("/bin/true".into()),
             )
             .unwrap();
@@ -2847,6 +2854,7 @@ mod tests {
                 &row,
                 &spec,
                 MachineId::new(),
+                crate::submission::RequestId::new(),
                 CallbackExecutable::available("/bin/true".into()),
             ),
             Err(AppError::ClusterTaskConflict { task: conflict }) if conflict == task
@@ -3632,6 +3640,7 @@ mod tests {
                     &row,
                     &spec,
                     MachineId::new(),
+                    crate::submission::RequestId::new(),
                     CallbackExecutable::available("/bin/true".into())
                 )
                 .is_err()

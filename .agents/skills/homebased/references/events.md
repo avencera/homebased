@@ -33,7 +33,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `TASK_BLOCKED` | `answer_and_resubmit` | The last report was `blocked`. The process has exited. | Answer the question. If it needs the user, ask them. Then submit a new task whose prompt contains the answer (see submit.md). |
 | `TASK_FAILED` | `inspect_log` | Last report `failed`, non-zero exit, signal, or spawn failure. | Run `homebased task log <id> --tail 200`. Decide: fix the prompt and resubmit, raise the check timeout, fix the environment for `spawn_failed`, or report to the user. |
 | `TASK_CANCELLED` | `none` | `task cancel` or `daemon stop --yes` ended it. | Nothing unless the user wants it rerun. |
-| `TASK_LOST` | `inspect_log` | The worker process disappeared without writing `exit.json`, for example after a machine reboot or a `kill -9`. | Check `homebased --json daemon status` and the log. Resubmit if the work is incomplete. |
+| `TASK_LOST` | `inspect_log` | The worker process disappeared without writing `exit.json`, for example after a machine reboot or a `kill -9`. | Check `homebased --json daemon status`, the log, and `worker.log` in the evidence directory. Resubmit if the work is incomplete. |
 
 ## Duplicates
 

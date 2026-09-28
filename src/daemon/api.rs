@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{
@@ -32,10 +32,9 @@ use crate::files::{
 };
 use crate::invocation::{
     ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized_for_identity,
-    persist_workload, resolve_workload_binary,
 };
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
-use crate::store::{self, CancelResult};
+use crate::store::CancelResult;
 use crate::submission::RequestId;
 
 impl IntoResponse for AppError {
@@ -153,7 +152,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppEr
 pub(super) struct SubmitBody {
     pub(super) spec: NormalizedSpec,
     pub(super) env: TaskEnv,
-    pub(super) request: Option<RequestId>,
+    pub(super) request: RequestId,
     pub(super) callback_cwd: Option<PathBuf>,
 }
 
@@ -205,18 +204,8 @@ where
             .ok_or_else(|| missing_field("/spec", "spec"))?;
         // parse_normalized_value already enforces api_version and min timeout
         let spec = spec::parse_normalized_value(&spec_value).map_err(|err| prefix("/spec", err))?;
-        let request = match (spec.machine.is_some(), envelope.request_id) {
-            (true, request_id) => Some(request_id.unwrap_or_default()),
-            (false, Some(request_id)) => {
-                return Err(AppError::InvalidSpec {
-                    pointer: "/request_id".into(),
-                    value: json!(request_id),
-                    message: "request_id is only valid for remote submissions with spec.machine"
-                        .into(),
-                });
-            }
-            (false, None) => None,
-        };
+        // a caller without its own request UUID gets a fresh one, so every task has a retry identity
+        let request = envelope.request_id.unwrap_or_default();
         Ok(Self(SubmitBody {
             spec,
             env,
@@ -269,8 +258,7 @@ struct SubmitResponse {
     api_version: u32,
     id: TaskId,
     task_id: TaskId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<RequestId>,
+    request_id: RequestId,
     status: ProcessStatus,
 }
 
@@ -278,11 +266,11 @@ async fn submit(
     State(state): State<AppState>,
     SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
-    let (id, status, request_id) = if body.spec.machine.is_some() {
+    let request_id = body.request;
+    let (id, status) = if body.spec.machine.is_some() {
         crate::daemon::origin_submit::submit(&state, body).await?
     } else {
-        let (id, status) = accept_task(&state, body).await?;
-        (id, status, None)
+        crate::daemon::local_submit::submit(&state, body).await?
     };
     Ok((
         StatusCode::OK,
@@ -633,44 +621,6 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
     }
 }
 
-pub(super) async fn accept_task(
-    state: &AppState,
-    body: SubmitBody,
-) -> Result<(TaskId, ProcessStatus), AppError> {
-    let spec = body.spec;
-    if spec.machine.is_some() {
-        return Err(AppError::Usage {
-            message: "local task acceptance received a remote machine selector".into(),
-        });
-    }
-    spec::check_cwd(&spec.cwd)?;
-    spec::check_workload_host(&spec.workload)?;
-    let binary = resolve_workload_binary(&spec.workload, &body.env.path, &spec.cwd)?;
-    let id = TaskId::new();
-    let paths = state.home.prepare_task(id)?;
-    if let NormalizedWorkload::Agent(agent) = &spec.workload {
-        crate::runner::write_task_files(&paths, &agent.prompt, agent.report_trailer)?;
-    }
-    let workload: Workload = persist_workload(&spec.workload);
-    let row = store::new_queued_task(store::NewTask {
-        id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload,
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: body.env,
-        binary,
-    });
-    call(&state.supervisor, |reply| SupervisorMsg::Launch {
-        row: Box::new(row),
-        spec: Box::new(spec),
-        reply,
-    })
-    .await?;
-    Ok((id, ProcessStatus::Queued))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SpecBody, SubmitBody, SubmitResponse};
@@ -723,52 +673,34 @@ mod tests {
         let body = extract(&valid()).await.unwrap();
         assert_eq!(body.env.path, "/bin");
         assert_eq!(body.spec.api_version, 1);
-        assert_eq!(body.request, None);
+        assert_ne!(body.request.0, uuid::Uuid::nil());
     }
 
     #[tokio::test]
-    async fn local_request_id_is_rejected() {
-        let mut value = valid();
-        value["request_id"] = json!("01a0ab97-a7aa-7463-a5b0-8d500e40e431");
-        let (pointer, found) = invalid_spec(extract(&value).await.unwrap_err());
-        assert_eq!(pointer, "/request_id");
-        assert_eq!(found, value["request_id"]);
-    }
-
-    #[tokio::test]
-    async fn remote_request_id_is_generated_or_preserved() {
-        let mut value = valid();
-        value["spec"]["machine"] = json!("code");
-        let generated = extract(&value).await.unwrap().request.unwrap();
-        assert_ne!(generated.0, uuid::Uuid::nil());
-
+    async fn request_id_is_generated_or_preserved() {
         let explicit = uuid::Uuid::parse_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap();
-        value["request_id"] = json!(explicit);
-        assert_eq!(
-            extract(&value).await.unwrap().request,
-            Some(RequestId(explicit))
-        );
+        for machine in [None, Some("code")] {
+            let mut value = valid();
+            if let Some(machine) = machine {
+                value["spec"]["machine"] = json!(machine);
+            }
+            let generated = extract(&value).await.unwrap().request;
+            assert_ne!(generated.0, uuid::Uuid::nil());
+
+            value["request_id"] = json!(explicit);
+            assert_eq!(extract(&value).await.unwrap().request, RequestId(explicit));
+        }
     }
 
     #[test]
-    fn local_submit_response_omits_request_id() {
+    fn submit_response_carries_request_id() {
         let id = TaskId::new();
-        let response = SubmitResponse {
-            api_version: API_VERSION,
-            id,
-            task_id: id,
-            request_id: None,
-            status: ProcessStatus::Queued,
-        };
-        let value = serde_json::to_value(response).unwrap();
-        assert!(value.get("request_id").is_none());
-
         let request_id = RequestId(uuid::Uuid::now_v7());
         let response = SubmitResponse {
             api_version: API_VERSION,
             id,
             task_id: id,
-            request_id: Some(request_id),
+            request_id,
             status: ProcessStatus::Queued,
         };
         let value = serde_json::to_value(response).unwrap();

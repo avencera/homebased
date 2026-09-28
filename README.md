@@ -339,7 +339,9 @@ homebased --json task submit --spec remote.json --request-id "$request_id"
 
 Keep the same request UUID if the submit response is lost. Retry with that UUID;
 do not make a new request UUID for the same intended task. Without
-`--request-id`, the CLI creates a new one for each submit command.
+`--request-id`, the CLI creates a new one for each submit command. Local submits
+use request UUIDs the same way, and the CLI retries a local submit whose outcome
+is unknown, or that meets `daemon_busy`, for about 90 seconds.
 
 `homebased task schema` prints the JSON Schema. The full field contract is in [`.agents/skills/homebased/references/submit.md`](.agents/skills/homebased/references/submit.md).
 
@@ -361,8 +363,8 @@ a thread at a time. `resume_thread_busy`
 names the active task; wait for its event before trying again.
 
 Run `task followup` on the task's origin or execution machine. A request from
-another machine returns `followup_wrong_machine`. For a remote follow-up, use
-`--request-id <uuid>` to retry after a lost response. Use
+another machine returns `followup_wrong_machine`. Use `--request-id <uuid>` to
+retry a follow-up after a lost response. Use
 `--allow-other-thread` only when a worker must send events to a thread other
 than its parent task's thread.
 

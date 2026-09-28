@@ -830,6 +830,7 @@ pub(crate) enum StoreMsg {
         row: Box<TaskRow>,
         spec: Box<NormalizedSpec>,
         machine: MachineId,
+        request: RequestId,
         codex: CallbackExecutable,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
@@ -1568,10 +1569,14 @@ impl Actor for StoreActor {
                 row,
                 spec,
                 machine,
+                request,
                 codex,
                 reply,
             } => {
-                send_reply(reply, state.insert_local_task(&row, &spec, machine, codex));
+                send_reply(
+                    reply,
+                    state.insert_local_task(&row, &spec, machine, request, codex),
+                );
             }
             StoreMsg::InsertRemoteTask {
                 row,

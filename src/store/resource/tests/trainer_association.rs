@@ -245,6 +245,7 @@ fn trainer_attempt_associations_keep_history_and_read_only_the_current_registrat
             &second_row,
             &fixture.spec,
             fixture.authority,
+            crate::submission::RequestId::new(),
             PathBuf::from("/bin/echo").into(),
         )
         .unwrap();
@@ -384,6 +385,7 @@ fn trainer_attempt_association_requires_running_task_identity_and_matching_spec(
             &row,
             &queued_task.spec,
             queued_task.authority,
+            crate::submission::RequestId::new(),
             PathBuf::from("/bin/echo").into(),
         )
         .unwrap();

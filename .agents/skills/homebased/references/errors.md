@@ -52,6 +52,7 @@ Errors go to stderr. With `--json` they are one object:
 | `duplicate_machine_name` | 5 | More than one live machine has the selected name. | Give each machine a unique `fleet.machine_name`; validate config and rediscover. |
 | `cluster_protocol_incompatible` | 5 | The peer and local daemon do not share a supported Fleet protocol version. | Update the incompatible Homebased installation. |
 | `submission_outcome_unknown` | 1, retryable | The executor may have accepted the request, but the origin has no definitive reply. | Retry the same spec with the same `--request-id`. Do not create a new request UUID for the same intended task. The error input includes `request_id` and `task_id`. |
+| `daemon_busy` | 1 | A daemon call timed out, usually because the disk is slow. The operation may still complete. | Check the current state, for example with `task show` or `task list`, before you repeat a change. A local submit retries this by itself. If it keeps happening, tell the user that the daemon or its disk needs attention. |
 | `submission_rejected` | 5 | The executor retained a definitive rejection for this task identity. | Fix the cause and submit again with a new request UUID. |
 | `submission_conflict` | 5 | The request UUID was already used with different task content. | Retry with the original content, or use a new UUID for new work. |
 | `remote_submission_unavailable` | 1, retryable | This daemon cannot start remote work now. | Check Fleet configuration and the selected executor, then retry. |

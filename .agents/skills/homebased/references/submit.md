@@ -186,7 +186,7 @@ homebased --json task submit --spec "$dir/spec.json"
 
 The dry run validates the spec, checks the callback `thread` as the real submit does, resolves the executable and `cwd`, and prints the normalized spec, child argv, and stdin policy. For a `container`, the argv is the `docker container create` call that Homebased makes, with `<task-dir>` and a nil task UUID as placeholders. A remote dry run asks the selected executor to validate and expand its invocation. It returns the executor's `execution_cwd`. It spawns nothing and creates no task or request record. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials.
 
-Request UUIDs apply only to remote submissions (specs with `machine`). The CLI makes a new request UUID for each remote submit by default. Pass `--request-id <uuid>` to choose and retain the identity before the first request, so the caller can retry after it loses the response. A local spec rejects `--request-id`; omit `machine` to submit locally.
+Every submission has a request UUID. The CLI makes a new one for each submit by default. Pass `--request-id <uuid>` to choose and retain the identity before the first request, so the caller can retry after it loses the response.
 
 ```bash
 request_id="$(uuidgen)"
@@ -194,7 +194,7 @@ homebased --json task submit --spec "$dir/spec.json" --request-id "$request_id" 
 homebased --json task submit --spec "$dir/spec.json" --request-id "$request_id"
 ```
 
-The dry run does not store the request UUID. The real remote submit saves one request-to-task mapping before it sends work. If the response is lost or has `submission_outcome_unknown`, retry with the same request UUID and unchanged spec. Homebased resolves the saved outcome; it does not submit the absent task again. Changed content with the same request UUID returns `submission_conflict`. Use a new UUID only for a new submission after a definitive rejection. Local submit responses omit `request_id` because local tasks do not have this retry mapping.
+The dry run does not store the request UUID. The real submit saves one request-to-task mapping with the task. If the response is lost or has `submission_outcome_unknown`, retry with the same request UUID and unchanged spec. Homebased returns the saved task, and starts it if its launch stopped; it does not create a second task. Changed content with the same request UUID returns `submission_conflict`. Use a new UUID only for a new submission after a definitive rejection. A local submit retries `submission_outcome_unknown` and `daemon_busy` by itself with the same request UUID for about 90 seconds before it returns the error. A remote submit returns `submission_outcome_unknown` at once.
 
 The real submit returns after acceptance, before the child finishes:
 
@@ -221,8 +221,8 @@ succeeds, fails, is cancelled, or is lost. Run follow-up on the task's origin
 or execution machine.
 Followup keeps its working directory, timeout, model, extra arguments, and
 report-trailer setting. Use `--thread <uuid>` to choose the thread that receives
-the new task's events, and `--name <name>` to set its task name. For remote
-follow-ups, `--request-id <uuid>` sets a stable retry identity. Use
+the new task's events, and `--name <name>` to set its task name.
+`--request-id <uuid>` sets a stable retry identity. Use
 `--allow-other-thread` only when a worker must send events to a thread other
 than its parent task's thread. `--dry-run` prints the normal submit preview
 without starting the worker. A running task cannot be resumed because that

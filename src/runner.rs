@@ -36,6 +36,9 @@ const KILL_GRACE: Duration = Duration::from_secs(10);
 const KILL_REAP_GRACE: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(50);
 const CANCELLATION_POLL: Duration = Duration::from_millis(250);
+/// Lock wait for the worker's connection. A worker that cannot claim its row
+/// leaves the task lost, and nothing waits on it, so it outlasts slow daemon commits
+const WORKER_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy)]
 enum ChildCancellationCause {
@@ -75,6 +78,18 @@ pub(crate) fn set_task_run_executable_for_tests(executable: std::path::PathBuf) 
 pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppError> {
     let exe = task_run_executable()?;
     let fd = lock.as_raw_fd();
+    // an error that stops the worker before `exit.json` is otherwise lost with it
+    let worker_stderr = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.task_paths(id).worker_log)
+    {
+        Ok(log) => Stdio::from(log),
+        Err(err) => {
+            warn!(%id, "open worker log: {err}");
+            Stdio::null()
+        }
+    };
     let mut cmd = StdCommand::new(&exe);
     cmd.arg("task-run")
         .arg("--home")
@@ -85,7 +100,7 @@ pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppErr
         .arg(fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(worker_stderr);
     unsafe {
         cmd.pre_exec(move || prepare_worker(fd));
     }
@@ -144,7 +159,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         message: format!("signal: {err}"),
     })?;
     home.ensure()?;
-    let store = Store::open(&home.db_path())?;
+    let store = Store::open_with_busy_timeout(&home.db_path(), WORKER_BUSY_TIMEOUT)?;
     let started = store
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)?
         .is_some();
@@ -676,6 +691,7 @@ mod tests {
             feed: dir.path().join("prompt.feed.txt"),
             output: dir.path().join("output.log"),
             runner_lock: dir.path().join("runner.lock"),
+            worker_log: dir.path().join("worker.log"),
             exit_json: dir.path().join("exit.json"),
             callback_log: dir.path().join("callback.log"),
             delivery_lock: dir.path().join("delivery.lock"),

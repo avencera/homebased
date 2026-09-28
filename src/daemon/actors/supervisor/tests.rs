@@ -1023,6 +1023,7 @@ async fn direct_launch_still_starts_its_command() {
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
         spec: Box::new(spec),
+        request: RequestId::new(),
         reply,
     })
     .await
@@ -1040,6 +1041,89 @@ async fn direct_launch_still_starts_its_command() {
         .unwrap()
         .unwrap();
     assert_eq!(row.status(), ProcessStatus::Succeeded);
+
+    drop(runner_lock);
+    stop_supervisor(supervisor, handle).await;
+}
+
+#[tokio::test]
+async fn resume_local_starts_a_committed_row_whose_launch_stopped() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    configure_task_runner();
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let spec = resource_command();
+    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
+        panic!("resume test must use a command workload");
+    };
+    let id = TaskId::new();
+    let row = new_queued_task(NewTask {
+        id,
+        name: Some(spec.name.clone()),
+        thread: spec.thread,
+        workload: Workload::Task(TaskWorkload {
+            command: workload.command,
+        }),
+        cwd: spec.cwd.clone(),
+        timeout: spec.timeout,
+        env: TaskEnv {
+            path: "/bin".into(),
+            home: "/tmp".into(),
+        },
+        binary: "/bin/echo".into(),
+    });
+    home.prepare_task(id).unwrap();
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    // the row commits under its request after startup recovery ran, as when the
+    // submit's caller timed out and the supervisor never spawned the worker
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+    let machine = load_or_create_machine_id(&home).unwrap();
+    call(&store, |reply| StoreMsg::InsertLocalTask {
+        row: Box::new(row),
+        spec: Box::new(spec),
+        machine,
+        request: RequestId::new(),
+        codex: CallbackExecutable::available("/bin/echo".into()),
+        reply,
+    })
+    .await
+    .unwrap();
+
+    let status = call(&supervisor, |reply| SupervisorMsg::ResumeLocal {
+        id,
+        reply,
+    })
+    .await
+    .unwrap();
+    // the status is read after the launch, so the worker may already have claimed or finished the task
+    assert!(
+        matches!(
+            status,
+            Some(ProcessStatus::Queued | ProcessStatus::Running | ProcessStatus::Succeeded)
+        ),
+        "{status:?}"
+    );
+    let runner_lock = acquire_runner_lock_after_task_exit(&home, id).await;
+    assert_eq!(
+        std::fs::read_to_string(home.task_paths(id).output).unwrap(),
+        "hello\n"
+    );
+    let status = call(&supervisor, |reply| SupervisorMsg::ResumeLocal {
+        id,
+        reply,
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, Some(ProcessStatus::Succeeded));
 
     drop(runner_lock);
     stop_supervisor(supervisor, handle).await;
@@ -1087,6 +1171,7 @@ async fn direct_launch_keeps_an_unresolved_callback_codex_unavailable() {
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
         spec: Box::new(spec),
+        request: RequestId::new(),
         reply,
     })
     .await

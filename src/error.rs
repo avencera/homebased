@@ -476,6 +476,10 @@ pub enum AppError {
         /// Missing owner or proof
         message: String,
     },
+    /// A daemon actor did not answer within the call timeout. The operation may
+    /// still complete after the caller stops waiting
+    #[error("daemon busy: an internal call timed out; the operation may still complete")]
+    DaemonBusy,
     #[error("{message}")]
     Internal {
         /// Underlying failure text
@@ -566,6 +570,7 @@ impl AppError {
             Self::ResourceOperationConflict { .. } => "resource_operation_conflict",
             Self::ResourceActionNotAllowed { .. } => "resource_action_not_allowed",
             Self::ResourceOperationUnavailable { .. } => "resource_operation_unavailable",
+            Self::DaemonBusy => "daemon_busy",
             Self::Internal { .. } => "internal",
         }
     }
@@ -586,6 +591,7 @@ impl AppError {
             | Self::ResourceAuthorityUnavailable { .. }
             | Self::ResourceOutcomeUnknown { .. }
             | Self::NotifyFailed { .. }
+            | Self::DaemonBusy
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
             | Self::UnknownThread { .. }
@@ -698,7 +704,8 @@ impl AppError {
             | Self::SubmissionOutcomeUnknown { .. }
             | Self::ResourceLookupIncomplete { .. }
             | Self::ResourceAuthorityUnavailable { .. }
-            | Self::ResourceOutcomeUnknown { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
+            | Self::ResourceOutcomeUnknown { .. }
+            | Self::DaemonBusy => http::StatusCode::SERVICE_UNAVAILABLE,
             Self::DaemonUnavailable { .. }
             | Self::ConfigInvalid { .. }
             | Self::UnitInvalid { .. }
@@ -815,6 +822,7 @@ impl AppError {
             } => json!({ "selected": selected, "configured": configured }),
             Self::NotifyNotConfigured => json!({}),
             Self::NotifyFailed { message } => json!({ "message": message }),
+            Self::DaemonBusy => json!({}),
             Self::Internal { message } => json!({ "message": message }),
             Self::ResourceNotFound { resource } => json!({ "resource_id": resource }),
             Self::ResourceLookupIncomplete {

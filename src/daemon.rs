@@ -10,6 +10,7 @@ pub mod fleet_api;
 pub mod fleet_tasks;
 mod inspection;
 mod keyed_locks;
+mod local_submit;
 pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
