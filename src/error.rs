@@ -336,11 +336,11 @@ pub enum AppError {
         id: MessageId,
     },
     /// The receiver could not complete one explicit queue attempt
-    #[error("message delivery failed: {id}")]
+    #[error("message delivery failed: {id}: {message}")]
     MessageDeliveryFailed {
         /// Message UUID that remains available for an explicit retry
         id: MessageId,
-        /// Safe summary of the queue failure
+        /// Why the attempt failed and how to retry it
         message: String,
     },
     /// The receiver may have queued the message but did not return a valid acknowledgement

@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::callback::{check_saved_callback, send_saved_queue_attempt};
+use crate::callback::claude_inbox::ClaudeInbox;
+use crate::callback::send_saved_queue_attempt;
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::keyed_locks::{KeyedGuard, KeyedLocks};
@@ -22,7 +23,7 @@ use crate::message::{
     MessageSource, Recipient,
 };
 use crate::resource::{SupervisorNoticeReceipt, SupervisorNoticeRequest};
-use crate::submission::CallbackContext;
+use crate::submission::{CallbackContext, CallbackExecutable};
 
 const SESSION_META_MAX_BYTES: usize = 64 * 1024;
 const MESSAGE_PREFIX: &str = "HOMEBASED_MESSAGE ";
@@ -304,14 +305,18 @@ async fn send_queue_line(
         .prepare_message(message_id)
         .map_err(|error| error.to_string())?;
     let env = TaskEnv::capture();
-    let codex = resolve_agent_binary(AgentKind::Codex, &env.path, &destination_cwd)
-        .map_err(|error| error.to_string())?;
+    // only a Codex destination needs the executable; the send checks it there
+    let codex = match resolve_agent_binary(AgentKind::Codex, &env.path, &destination_cwd) {
+        Ok(path) => CallbackExecutable::available(path),
+        Err(error) => CallbackExecutable::Unavailable {
+            reason: error.to_string(),
+        },
+    };
     let context = CallbackContext {
         env,
         cwd: destination_cwd,
-        codex: codex.into(),
+        codex,
     };
-    check_saved_callback(&context).map_err(|error| error.to_string())?;
 
     let log_path = paths.queue_log;
     let lock_path = paths.delivery_lock;
@@ -354,10 +359,12 @@ impl<'a> From<&'a MessageAttempt> for QueuedMessage<'a> {
 }
 
 fn delivery_failed(message_id: MessageId, error: impl std::fmt::Display) -> AppError {
-    tracing::warn!(message_id = %message_id, "message queue attempt failed: {error}");
+    tracing::warn!(message_id = %message_id, "message delivery attempt failed: {error}");
     AppError::MessageDeliveryFailed {
         id: message_id,
-        message: "Codex queue attempt failed; retry the same message UUID explicitly".into(),
+        message: format!(
+            "delivery attempt failed: {error}; retry the same message UUID explicitly"
+        ),
     }
 }
 
@@ -370,11 +377,12 @@ fn attempt_wait_failed(message_id: MessageId) -> AppError {
 }
 
 fn notice_delivery_failed(message_id: MessageId, error: impl std::fmt::Display) -> AppError {
-    tracing::warn!(attempt_id = %message_id, "supervisor notice queue attempt failed: {error}");
+    tracing::warn!(attempt_id = %message_id, "supervisor notice delivery attempt failed: {error}");
     AppError::MessageDeliveryFailed {
         id: message_id,
-        message: "Codex queue attempt failed; retry the same delivery attempt UUID explicitly"
-            .into(),
+        message: format!(
+            "delivery attempt failed: {error}; retry the same delivery attempt UUID explicitly"
+        ),
     }
 }
 
@@ -386,18 +394,25 @@ async fn resolve_destination(recipient: &Recipient) -> Result<(ThreadId, PathBuf
 }
 
 fn resolve_destination_sync(recipient: &Recipient) -> Result<(ThreadId, PathBuf), AppError> {
-    let sessions = local_sessions()?;
     let selected = match recipient {
-        Recipient::Thread { thread } => sessions
-            .into_iter()
-            .filter(|session| session.thread == *thread)
-            .max_by_key(|session| session.modified)
-            .ok_or_else(|| AppError::AgentThreadNotFound {
-                selector: thread.to_string(),
-            })?,
+        Recipient::Thread { thread } => {
+            // delivery also looks for a Claude session before a Codex thread
+            if let Some(cwd) = claude_session_cwd(*thread)? {
+                return Ok((*thread, cwd));
+            }
+            local_sessions()?
+                .into_iter()
+                .filter(|session| session.thread == *thread)
+                .max_by_key(|session| session.modified)
+                .ok_or_else(|| AppError::AgentThreadNotFound {
+                    selector: thread.to_string(),
+                })?
+        }
+        // a cwd selects only Codex threads: headless Claude workers share their
+        // owner's cwd and registry shape, so the newest session there is often a worker
         Recipient::Cwd { cwd } => {
             let target = expand_receiver_cwd(cwd)?;
-            sessions
+            local_sessions()?
                 .into_iter()
                 .filter(|session| session.cwd == target)
                 .max_by_key(|session| session.modified)
@@ -407,6 +422,22 @@ fn resolve_destination_sync(recipient: &Recipient) -> Result<(ThreadId, PathBuf)
         }
     };
     Ok((selected.thread, selected.cwd))
+}
+
+/// Working directory of the local Claude Code session with this id, if one owns it
+fn claude_session_cwd(thread: ThreadId) -> Result<Option<PathBuf>, AppError> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::MessageUnavailable {
+            message: "receiver HOME is unavailable".into(),
+        })?;
+    ClaudeInbox::session_cwd(&home, thread).map_err(|error| {
+        tracing::warn!(%thread, "Claude session metadata unavailable: {error}");
+        AppError::MessageUnavailable {
+            message: format!("cannot inspect local Claude session metadata: {error}"),
+        }
+    })
 }
 
 fn expand_receiver_cwd(cwd: &Path) -> Result<PathBuf, AppError> {

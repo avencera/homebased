@@ -1,7 +1,7 @@
 //! `HOMEBASED_EVENT` formatting and origin inbox delivery through T3, Codex
 //! queue, or a Claude Code session socket.
 
-mod claude_inbox;
+pub(crate) mod claude_inbox;
 pub mod destination;
 
 use std::fs::OpenOptions;
@@ -559,10 +559,12 @@ pub(crate) fn find_saved_inbox_origin(
     }
 }
 
-/// Make exactly one bounded delivery attempt using the saved origin context
+/// Make exactly one bounded direct-message delivery attempt
 ///
-/// A stopped Claude session is an error; only the origin inbox dispatcher
-/// may wake it through T3
+/// A live Claude session takes the line through its socket inbox. A stopped
+/// Claude session gets a new turn from the T3 thread that owns it, because a
+/// host such as T3 Code runs no Claude process between turns. A Codex thread
+/// takes it through `codex queue`, so only that path needs the Codex executable
 pub(crate) fn send_saved_queue_attempt(
     context: &CallbackContext,
     thread: ThreadId,
@@ -572,10 +574,11 @@ pub(crate) fn send_saved_queue_attempt(
 ) -> Result<(), String> {
     match find_saved_origin(context, thread)? {
         OriginSession::Reachable(origin) => origin.send(thread, line, log_path, delivery_lock),
+        OriginSession::Stopped => wake_stopped_session(context, thread, line, log_path),
         OriginSession::T3Codex | OriginSession::Codex => {
+            check_saved_callback(context)?;
             send_codex_queue_attempt(context, thread, line, log_path, delivery_lock)
         }
-        OriginSession::Stopped => Err(format!("Claude session {thread} is not running")),
     }
 }
 
@@ -921,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_message_to_stopped_claude_session_does_not_wake() {
+    fn direct_message_to_stopped_claude_session_needs_a_t3_owner() {
         let home = tempfile::tempdir().unwrap();
         let thread = row(TaskState::Queued).thread;
         let project = home.path().join(".claude/projects/-work");
@@ -933,7 +936,10 @@ mod tests {
                 home: home.path().to_string_lossy().into_owned(),
             },
             cwd: home.path().to_path_buf(),
-            codex: PathBuf::from("/bin/true").into(),
+            // a Claude destination must not depend on the Codex executable
+            codex: crate::submission::CallbackExecutable::Unavailable {
+                reason: "codex is not installed".into(),
+            },
         };
         assert!(matches!(
             find_saved_origin(&context, thread),
@@ -943,7 +949,10 @@ mod tests {
         let lock = home.path().join("delivery.lock");
         let error = send_saved_queue_attempt(&context, thread, "HOMEBASED_MESSAGE {}", &log, &lock)
             .unwrap_err();
-        assert_eq!(error, format!("Claude session {thread} is not running"));
+        assert_eq!(
+            error,
+            format!("Claude session {thread} is not running; no T3 thread owns it")
+        );
         assert!(!log.exists());
     }
 

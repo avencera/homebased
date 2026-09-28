@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -21,6 +22,7 @@ use homebased::resource::{
 };
 use homebased::store::Store;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -202,6 +204,33 @@ fn write_session(user_home: &Path, name: &str, thread: ThreadId, cwd: &Path) {
         }
     });
     fs::write(path, format!("{first_line}\n{{\"type\":\"event_msg\"}}\n")).unwrap();
+}
+
+/// Register a live Claude Code session inbox, the way Claude Code 2.1 does
+fn write_claude_session(user_home: &Path, thread: ThreadId, cwd: &Path) -> UnixListener {
+    let sessions = user_home.join(".claude/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let socket = user_home.join("claude.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    // this test process stands in for the live session process
+    let pid = std::process::id();
+    let record = json!({
+        "pid": pid,
+        "sessionId": thread.to_string(),
+        "cwd": cwd,
+        "messagingSocketPath": socket,
+        "peerProtocol": 1,
+        "updatedAt": 1,
+    });
+    fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
+    let digest = Sha256::digest(socket.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    fs::write(
+        sessions.join(format!("{pid}.{hex}.key")),
+        json!({ "peerToken": "test-token" }).to_string(),
+    )
+    .unwrap();
+    listener
 }
 
 fn request(id: MessageId, destination: MachineId, recipient: Value, body: &str) -> Value {
@@ -433,6 +462,69 @@ fn receiver_binds_sessions_retries_once_and_never_replays_after_restart() {
         .unwrap();
     let typed: MessageRequest = serde_json::from_value(failed_request).unwrap();
     assert_eq!(typed.message_id, id);
+}
+
+#[test]
+fn receiver_delivers_to_claude_sessions_without_codex_queue() {
+    let daemon = Daemon::start();
+    let live_cwd = daemon.user_home.join("live-project");
+    fs::create_dir_all(&live_cwd).unwrap();
+    let live_thread = ThreadId(Uuid::now_v7());
+    let listener = write_claude_session(&daemon.user_home, live_thread, &live_cwd);
+    let inbox = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut body = String::new();
+        stream.read_to_string(&mut body).unwrap();
+        body
+    });
+
+    let live_id = MessageId::new();
+    let live = daemon.send(&request(
+        live_id,
+        daemon.machine_id(),
+        json!({"kind": "thread", "thread": live_thread}),
+        "Review the Claude change",
+    ));
+    assert_eq!(live.status, 200, "{:?}", live.body);
+    assert_eq!(
+        live.body["receipt"]["destination_thread"],
+        live_thread.to_string()
+    );
+    assert_eq!(
+        live.body["receipt"]["destination_cwd"],
+        live_cwd.to_string_lossy().to_string()
+    );
+    let frame = inbox.join().unwrap();
+    let lines: Vec<Value> = frame
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[1]["session_id"], live_thread.to_string());
+    let content = lines[1]["message"]["content"].as_str().unwrap();
+    assert!(content.starts_with("HOMEBASED_MESSAGE "), "{content}");
+    assert!(content.contains(&format!("\"message_id\":\"{live_id}\"")));
+    assert!(content.contains("\"body\":\"Review the Claude change\""));
+    assert!(daemon.queue_calls().is_empty());
+
+    // a stopped session with no T3 owner fails with the reason, not as unknown
+    let stopped_thread = ThreadId(Uuid::now_v7());
+    let project = daemon.user_home.join(".claude/projects/-stopped-project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join(format!("{stopped_thread}.jsonl")),
+        format!("{}\n", json!({ "type": "user", "cwd": live_cwd })),
+    )
+    .unwrap();
+    let stopped = daemon.send(&request(
+        MessageId::new(),
+        daemon.machine_id(),
+        json!({"kind": "thread", "thread": stopped_thread}),
+        "Are you there?",
+    ));
+    assert_eq!(stopped.body["error"]["code"], "message_delivery_failed");
+    let message = stopped.body["error"]["input"]["message"].as_str().unwrap();
+    assert!(message.contains("no T3 thread owns it"), "{message}");
+    assert!(daemon.queue_calls().is_empty());
 }
 
 #[test]

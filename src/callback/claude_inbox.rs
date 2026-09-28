@@ -16,7 +16,7 @@
 //!
 //! - Registry location: `~/.claude/sessions/<pid>.json`. A custom
 //!   `CLAUDE_CONFIG_DIR` moves it, and this sender does not follow that
-//! - Registry fields: `pid`, `sessionId`, `messagingSocketPath`,
+//! - Registry fields: `pid`, `sessionId`, `cwd`, `messagingSocketPath`,
 //!   `peerProtocol` (currently 1), and `updatedAt`
 //! - Key file name: `<pid>.<sha256 of the socket path as written>.key`, not of
 //!   its realpath, with JSON field `peerToken`
@@ -26,7 +26,8 @@
 //!   whose `session_id` is not its own
 //! - Frame size limit of 1 MiB, and the macOS close delay of 150 ms
 //! - Transcript location `~/.claude/projects/<cwd key>/<session id>.jsonl`,
-//!   used only to tell a stopped Claude session from a Codex thread
+//!   used to tell a stopped Claude session from a Codex thread. A direct
+//!   message to a stopped session reads the first `cwd` field of its lines
 //!
 //! A change can fail quietly: the socket accepts the bytes and the receiver
 //! drops them, so the task still shows the event as sent. After a Claude Code
@@ -37,7 +38,7 @@
 //! `uds-messaging`, `peerToken`, and `session_id mismatch`
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -72,12 +73,19 @@ const MACOS_CLOSE_DELAY: Duration = Duration::from_millis(150);
 /// How long to wait for the receiver to close after the write half closes
 const CLOSE_WAIT: Duration = Duration::from_secs(1);
 
+/// Transcript prefix read to find a stopped session's working directory
+///
+/// The first lines are small metadata records; the first message line
+/// already carries `cwd`
+const TRANSCRIPT_CWD_SCAN_BYTES: u64 = 1024 * 1024;
+
 /// Registry record that a live Claude Code session writes for its inbox
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionRecord {
     pid: i32,
     session_id: Option<String>,
+    cwd: Option<PathBuf>,
     messaging_socket_path: Option<PathBuf>,
     peer_protocol: Option<u64>,
     #[serde(default)]
@@ -125,23 +133,36 @@ impl ClaudeInbox {
         Ok(ClaudeSession::Unknown)
     }
 
+    /// Working directory of the Claude Code session whose session id is `thread`
+    ///
+    /// `None` means no Claude session owns `thread`, by the same test as
+    /// [`ClaudeInbox::find`]: a live registry entry or a transcript. The newest
+    /// registry entry's `cwd` wins over the transcript
+    pub(crate) fn session_cwd(home: &Path, thread: ThreadId) -> Result<Option<PathBuf>, String> {
+        let claude = home.join(".claude");
+        let mut records = owning_records(&claude.join("sessions"), thread)?;
+        let transcript = transcript_path(&claude.join("projects"), thread);
+        if transcript.is_none() && !records.iter().any(|record| process_alive(record.pid)) {
+            return Ok(None);
+        }
+
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        let recorded = records
+            .into_iter()
+            .filter_map(|record| record.cwd)
+            .find(|cwd| cwd.is_absolute());
+        if let Some(cwd) = recorded.or_else(|| transcript.as_deref().and_then(transcript_cwd)) {
+            return Ok(Some(cwd));
+        }
+        Err(format!(
+            "Claude session {thread} has no recorded working directory"
+        ))
+    }
+
     fn find_live(sessions: &Path, thread: ThreadId) -> Result<Option<Self>, String> {
-        let entries = match fs::read_dir(sessions) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "read Claude session registry {}: {error}",
-                    sessions.display()
-                ));
-            }
-        };
-        let newest = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .filter_map(|path| read_record(&path))
-            .filter(|record| record_owns(record, thread) && process_alive(record.pid))
+        let newest = owning_records(sessions, thread)?
+            .into_iter()
+            .filter(|record| process_alive(record.pid))
             .max_by_key(|record| record.updated_at);
         let Some(record) = newest else {
             return Ok(None);
@@ -201,15 +222,67 @@ impl ClaudeInbox {
     }
 }
 
+/// Registry records, live or not, whose session id is `thread`
+fn owning_records(sessions: &Path, thread: ThreadId) -> Result<Vec<SessionRecord>, String> {
+    let entries = match fs::read_dir(sessions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read Claude session registry {}: {error}",
+                sessions.display()
+            ));
+        }
+    };
+    Ok(entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| read_record(&path))
+        .filter(|record| record_owns(record, thread))
+        .collect())
+}
+
 /// Claude Code keeps each session transcript at `projects/<cwd key>/<id>.jsonl`
 fn has_transcript(projects: &Path, thread: ThreadId) -> bool {
-    let Ok(entries) = fs::read_dir(projects) else {
-        return false;
-    };
+    transcript_path(projects, thread).is_some()
+}
+
+fn transcript_path(projects: &Path, thread: ThreadId) -> Option<PathBuf> {
+    let entries = fs::read_dir(projects).ok()?;
     let file = format!("{thread}.jsonl");
     entries
         .filter_map(Result::ok)
-        .any(|entry| entry.path().join(&file).is_file())
+        .map(|entry| entry.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// First absolute `cwd` field in the transcript prefix
+///
+/// The `<cwd key>` directory name is lossy, so the transcript lines are the
+/// only record of a stopped session's directory
+fn transcript_cwd(path: &Path) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Line {
+        cwd: Option<PathBuf>,
+    }
+
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file).take(TRANSCRIPT_CWD_SCAN_BYTES);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            return None;
+        }
+        // a line cut off by the scan limit does not parse and is skipped
+        let Ok(Line { cwd: Some(cwd) }) = serde_json::from_slice(&line) else {
+            continue;
+        };
+        if cwd.is_absolute() {
+            return Some(cwd);
+        }
+    }
 }
 
 fn read_record(path: &Path) -> Option<SessionRecord> {
@@ -351,6 +424,7 @@ mod tests {
         let record = json!({
             "pid": pid,
             "sessionId": THREAD,
+            "cwd": "/work/live",
             "messagingSocketPath": socket,
             "peerProtocol": protocol,
             "updatedAt": 1,
@@ -441,6 +515,41 @@ mod tests {
             ClaudeInbox::find(home.path(), thread()),
             Ok(ClaudeSession::Unknown)
         );
+    }
+
+    #[test]
+    fn live_session_cwd_comes_from_its_registry_entry() {
+        let (home, _socket) = home_with_session(live_pid(), PEER_PROTOCOL);
+        assert_eq!(
+            ClaudeInbox::session_cwd(home.path(), thread()),
+            Ok(Some(PathBuf::from("/work/live")))
+        );
+    }
+
+    #[test]
+    fn stopped_session_cwd_comes_from_its_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/-work-stopped");
+        fs::create_dir_all(&project).unwrap();
+        let lines = [
+            json!({ "type": "ai-title", "sessionId": THREAD }),
+            json!({ "type": "user", "cwd": "relative" }),
+            json!({ "type": "user", "cwd": "/work/stopped" }),
+        ];
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(project.join(format!("{THREAD}.jsonl")), body).unwrap();
+
+        assert_eq!(
+            ClaudeInbox::session_cwd(home.path(), thread()),
+            Ok(Some(PathBuf::from("/work/stopped")))
+        );
+    }
+
+    #[test]
+    fn dead_registry_entry_alone_owns_no_session() {
+        // delivery would treat this id as a Codex thread, so resolution must too
+        let (home, _socket) = home_with_session(0, PEER_PROTOCOL);
+        assert_eq!(ClaudeInbox::session_cwd(home.path(), thread()), Ok(None));
     }
 
     #[test]

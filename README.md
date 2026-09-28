@@ -395,7 +395,7 @@ to ignore duplicates.
 
 ### Direct messages
 
-Send a message to an exact Codex thread on a known machine:
+Send a message to an exact Claude Code session or Codex thread on a known machine:
 
 ```sh
 homebased --json message send \
@@ -405,8 +405,10 @@ homebased --json message send \
   --message "Please review this change."
 ```
 
-The CLI can also select the destination by receiver-side `--cwd`, or send to
-the origin thread for a task with `--task <task-uuid>` alone. Pass the same
+The CLI can also select a Codex thread by receiver-side `--cwd`, or send to
+the origin thread for a task with `--task <task-uuid>` alone. A Claude session
+with no live process gets the message as a new turn in the T3 Code thread that
+owns it. Pass the same
 `--message-id <uuid>` to retry after a lost response. Delivery is synchronous
 and at-least-once. A receiver crash before it stores the receipt can lead to a
 duplicate message. Read [messages.md](.agents/skills/homebased/references/messages.md)

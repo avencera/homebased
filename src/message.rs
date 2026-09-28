@@ -125,12 +125,12 @@ impl MessageSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Recipient {
-    /// Deliver to this exact local Codex thread
+    /// Deliver to this exact local Claude Code session or Codex thread
     Thread {
         /// Destination thread UUID
         thread: ThreadId,
     },
-    /// Deliver to the most recently active local thread with this exact cwd
+    /// Deliver to the most recently active local Codex thread with this exact cwd
     Cwd {
         /// Absolute receiver path, or a path beginning with `~/` on the receiver
         cwd: PathBuf,

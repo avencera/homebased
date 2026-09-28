@@ -346,7 +346,15 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 AppError::Internal {
                     message: message.clone(),
                 },
-                |id| AppError::MessageDeliveryFailed { id, message },
+                |id| AppError::MessageDeliveryFailed {
+                    id,
+                    // the top-level message is the display form, which already names the id
+                    message: input
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&message)
+                        .to_string(),
+                },
             ),
         "message_outcome_unknown" => {
             let id = input
@@ -437,6 +445,24 @@ mod tests {
 
     use super::*;
     use crate::domain::AgentKind;
+
+    #[test]
+    fn message_delivery_failure_keeps_its_reason_across_hops() {
+        let original = AppError::MessageDeliveryFailed {
+            id: crate::message::MessageId::new(),
+            message: "Claude session is not running; no T3 thread owns it".into(),
+        };
+        let body = serde_json::to_vec(&original.to_json()).unwrap();
+
+        let once = map_error(StatusCode::BAD_GATEWAY, &body);
+        let twice = map_error(
+            StatusCode::BAD_GATEWAY,
+            &serde_json::to_vec(&once.to_json()).unwrap(),
+        );
+
+        assert_eq!(twice.to_string(), original.to_string());
+        assert_eq!(twice.input(), original.input());
+    }
 
     #[test]
     fn agent_configuration_error_keeps_its_public_code() {

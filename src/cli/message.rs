@@ -21,15 +21,15 @@ use super::{Ctx, OutputMode};
 #[derive(Debug, Subcommand)]
 #[command(after_help = crate::cli::AFTER_HELP)]
 pub enum MessageCommand {
-    /// Send a direct message to a Codex thread.
+    /// Send a direct message to a Claude Code session or Codex thread.
     Send {
         /// Destination machine name or UUID. Required with `--thread` or `--cwd`.
         #[arg(long, conflicts_with = "task")]
         machine: Option<String>,
-        /// Exact destination thread UUID.
+        /// Exact destination Claude Code session or Codex thread UUID.
         #[arg(long, conflicts_with_all = ["cwd", "task"])]
         thread: Option<ThreadId>,
-        /// Destination working directory on the receiving machine.
+        /// Destination working directory on the receiving machine. Selects Codex threads only.
         #[arg(long, conflicts_with_all = ["thread", "task"])]
         cwd: Option<PathBuf>,
         /// Send to this task's origin thread. Use alone, without `--machine`.
