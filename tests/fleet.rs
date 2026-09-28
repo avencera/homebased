@@ -801,7 +801,8 @@ fn remote_dry_run_expands_executor_home_without_identity() {
         .unwrap();
     assert!(!missing_cwd.status.success());
     let error: Value = serde_json::from_slice(&missing_cwd.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "cwd_not_found");
+    assert_eq!(error["error"]["code"], "invalid_cwd");
+    assert_eq!(error["error"]["input"]["problem"], "not_found");
     spec.cwd = PathBuf::from("~/");
     spec.workload = remote_spec(&executor, vec!["/missing-executor-command"]).workload;
     fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -4806,4 +4807,85 @@ async fn saved_remote_background_route_retries_after_restart_and_lost_reply_with
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(fixture.trainer.starts(), 1);
     fs::write(&fixture.trainer.gate, b"").unwrap();
+}
+
+#[test]
+fn remote_submit_with_a_missing_executor_cwd_is_a_typed_rejection() {
+    let origin = Daemon::start("missing-cwd-origin", true);
+    let executor = Daemon::start("remote-executor", true);
+    add_peer(&origin, &executor);
+    let mut spec = cli_remote_spec(&executor, vec!["/bin/echo", "hello"]);
+    spec.cwd = PathBuf::from("~/not-present");
+    let request = RequestId::new();
+
+    // the executor refuses at acceptance, and a retry answers from the saved refusal
+    for _ in 0..2 {
+        let output = submit_file(&origin, &spec, request);
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_cwd", "{error}");
+        assert_eq!(error["error"]["input"]["pointer"], "/cwd");
+        assert_eq!(error["error"]["input"]["value"], "~/not-present");
+        assert_eq!(error["error"]["input"]["problem"], "not_found");
+    }
+    let rejected: String = rusqlite::Connection::open(executor.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row("SELECT identity_json FROM executor_identities", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(rejected.contains("cwd_not_found"), "{rejected}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_resource_request_with_a_missing_cwd_is_rejected_at_acceptance() {
+    let origin = Daemon::start("resource-missing-cwd-origin", true);
+    let authority = Daemon::start("resource-missing-cwd-authority", true);
+    add_peer(&origin, &authority);
+    add_peer(&authority, &origin);
+    let resource = ResourceId::new();
+    seed_authority_resource(&authority, resource);
+    let mut spec = remote_spec(&authority, vec!["/bin/echo", "never-queued"]);
+    spec.cwd = PathBuf::from("/nonexistent/homebased-missing-cwd");
+    let route = seed_resource_route(
+        &origin,
+        &authority,
+        resource,
+        RequestId::new(),
+        TaskId::new(),
+        &spec,
+    );
+
+    let (status, rejected) = post_resource_queue(&authority, &origin, &route).await;
+    assert_eq!(status, 200, "{rejected}");
+    let receipt: ResourceQueueReceipt =
+        serde_json::from_value(rejected["receipt"].clone()).unwrap();
+    let saved = Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .resolve_resource_route(&receipt)
+        .unwrap();
+    let SubmissionState::Resource {
+        phase: ResourceRoutePhase::Rejected { reason },
+        ..
+    } = saved.submission
+    else {
+        panic!(
+            "the authority must refuse the request: {:?}",
+            saved.submission
+        );
+    };
+    assert_eq!(reason, "cwd_not_found");
+    // the origin rebuilds the typed error from its own spec
+    let error = homebased::spec::HostInputRejection::parse(&reason)
+        .unwrap()
+        .into_error(&spec);
+    assert_eq!(error.code(), "invalid_cwd");
+
+    let queued: i64 = rusqlite::Connection::open(authority.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM resource_requests", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(queued, 0);
 }

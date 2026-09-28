@@ -26,8 +26,7 @@ pub(super) async fn submit(
             message: "local task acceptance received a remote machine selector".into(),
         });
     }
-    spec::check_cwd(&spec.cwd)?;
-    spec::check_workload_host(&spec.workload)?;
+    spec::check_spec_host(&spec)?;
     let request = body.request;
     let _request_guard = state.locks.origin_submissions.lock(request).await;
     if let Some(route) = saved_route(state, request).await? {

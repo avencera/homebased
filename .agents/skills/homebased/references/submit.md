@@ -129,7 +129,7 @@ GitHub CI watcher as a normal task:
 | `api_version` | yes | Always `1`. |
 | `thread` | yes | Codex thread or Claude Code session UUID from step 1. It must exist on the submitting machine (`unknown_thread`). |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
-| `cwd` | yes | For local tasks, an existing directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. |
+| `cwd` | yes | A host directory that already exists and is accessible on the machine that runs the task. For local tasks, a directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. For a `container`, `cwd` is still a host path, never a path inside the container: use a mount `source` or another host directory, and set `workdir` for the directory inside the container. A missing `cwd` fails the submit with `invalid_cwd`. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
@@ -161,7 +161,7 @@ Container-only fields under `workload`:
 | `gpus` | no | `"all"` or an array of device indices. Required for resource work. |
 | `memory` | yes | Byte count, or a size such as `512m` or `24g` (binary units). Also the swap limit. At least 6 MiB. |
 | `user` | no | Numeric `uid:gid`. Defaults to the daemon's user. |
-| `workdir` | no | Absolute working directory in the container. |
+| `workdir` | no | Absolute working directory in the container. Put a container path here, not in `cwd`. |
 | `mounts` | no | Array of `{source, target, read_only}`. `source` is an absolute path that must exist on the execution machine. `read_only` defaults to `false`. Docker and containerd sockets, and directories that contain them, are refused. |
 | `env` | no | Object of explicit values. Nothing passes through from the host. |
 

@@ -3,11 +3,11 @@
 use std::os::unix::fs::symlink;
 
 use super::fixtures::{acceptance_input, resource, serving_fixture_with_spec};
-use crate::domain::TaskId;
+use crate::domain::{ProcessStatus, TaskId};
 use crate::machine::MachineId;
 use crate::resource::ResourceTaskOwnershipRisk;
 use crate::resource::foreground::test_support::native_fake_command;
-use crate::resource::store::{ResourceStoreError, ResourceTaskAcceptance};
+use crate::resource::store::{PreLaunchFailure, ResourceStoreError, ResourceTaskAcceptance};
 use crate::spec::NormalizedSpec;
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -150,36 +150,42 @@ fn wrapped_detached_and_script_launches_never_enter_the_queue() {
 }
 
 #[test]
-fn bare_program_that_resolves_to_a_script_is_refused_before_any_task_row() {
-    let spec = command_in(Path::new("/tmp"), &[Path::new("prepared-command")]);
-    let mut fixture = serving_fixture_with_spec(true, true, spec);
-    let scripts = fixture.directory.path().join("scripts");
-    let natives = fixture.directory.path().join("natives");
-    fs::create_dir(&scripts).unwrap();
-    fs::create_dir(&natives).unwrap();
-    write_script(&scripts.join("prepared-command"));
-    symlink(native_fake_command(), natives.join("prepared-command")).unwrap();
+fn bare_program_that_resolves_to_a_script_is_accepted_only_to_fail_before_launch() {
+    let accept_on = |directory: &str, native: bool| {
+        let spec = command_in(Path::new("/tmp"), &[Path::new("prepared-command")]);
+        let mut fixture = serving_fixture_with_spec(true, true, spec);
+        let bin = fixture.directory.path().join(directory);
+        fs::create_dir(&bin).unwrap();
+        if native {
+            symlink(native_fake_command(), bin.join("prepared-command")).unwrap();
+        } else {
+            write_script(&bin.join("prepared-command"));
+        }
+        let mut input = acceptance_input(&fixture);
+        input.executor_env.path = bin.display().to_string();
+        let acceptance = fixture.store.accept_assigned_resource_task(input).unwrap();
+        (fixture, acceptance)
+    };
 
-    let mut input = acceptance_input(&fixture);
-    input.executor_env.path = scripts.display().to_string();
-    assert!(matches!(
-        fixture.store.accept_assigned_resource_task(input.clone()),
-        Err(ResourceStoreError::UnsupportedCommandOwnership {
-            risk: ResourceTaskOwnershipRisk::ScriptEntryPoint
-        })
-    ));
-    assert!(
-        fixture
-            .store
-            .get_task(fixture.request.task_id)
-            .unwrap()
-            .is_none()
-    );
+    // the task gets its records so it can end with a reason, but it must never spawn
+    let (fixture, acceptance) = accept_on("scripts", false);
+    let task = fixture.request.task_id;
+    let ResourceTaskAcceptance::Unlaunchable {
+        task: accepted,
+        failure: PreLaunchFailure::Preparation { message },
+    } = acceptance
+    else {
+        panic!("a script entry point must be accepted as unlaunchable, got {acceptance:?}");
+    };
+    assert_eq!(accepted, task);
+    assert!(message.contains("ScriptEntryPoint"), "{message}");
+    let row = fixture.store.get_task(task).unwrap().unwrap();
+    assert_eq!(row.status(), ProcessStatus::Queued);
 
     // the same bare name on a PATH with a native executable binds normally
-    input.executor_env.path = natives.display().to_string();
+    let (fixture, acceptance) = accept_on("natives", true);
     assert_eq!(
-        fixture.store.accept_assigned_resource_task(input).unwrap(),
+        acceptance,
         ResourceTaskAcceptance::Inserted {
             task: fixture.request.task_id
         }

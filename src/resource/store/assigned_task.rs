@@ -526,7 +526,8 @@ fn resource_task_row_matches(task: &crate::domain::TaskRow, request: &ResourceRe
         && task.workload == crate::invocation::persist_workload(&spec.workload)
         && task.cwd == spec.cwd
         && task.timeout == spec.timeout
-        && task.binary.is_absolute()
+        // an empty binary never resolved, so its task failed before launch
+        && (task.binary.is_absolute() || task.binary.as_os_str().is_empty())
 }
 
 pub(super) fn resource_task_release_proof(

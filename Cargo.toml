@@ -58,6 +58,7 @@ assert_cmd = "2.2.2"
 jsonschema = { version = "0.56.0", default-features = false }
 predicates = "3.1.4"
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [lints.clippy]
 unwrap_used = "deny"

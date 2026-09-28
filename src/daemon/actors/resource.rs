@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorId, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 use crate::daemon::actors::supervisor::ReleaseWatcherLaunch;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call, send_reply};
@@ -16,13 +17,13 @@ use crate::resource::release_watcher::{ReleaseWatcherCommand, release_watcher_ex
 use crate::resource::store::{
     AssignedResourceTaskAttention, AssignedResourceTaskProgress,
     AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome, CompleteReleaseError,
-    ReleaseCompletionResult, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
-    ResourceSnapshot, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
-    ResourceTaskCompletionResult, ReturnDeadlineOutcome,
+    PreLaunchFailure, ReleaseCompletionResult, ReleaseWatcherAcceptance,
+    ReleaseWatcherAcceptanceError, ResourceSnapshot, ResourceTaskAcceptance,
+    ResourceTaskAcceptanceInput, ResourceTaskCompletionResult, ReturnDeadlineOutcome,
 };
 use crate::resource::{
-    ActionId, Loan, LoanPhase, LoanState, ReleaseProofAttentionReason, ReleaseWatcherIntent,
-    ReleaseWatcherTaskId, Resource, ResourceId, ResourceQueueAttentionReason,
+    ActionId, LAUNCH_CONFIRMATION_BOUND, Loan, LoanPhase, LoanState, ReleaseProofAttentionReason,
+    ReleaseWatcherIntent, ReleaseWatcherTaskId, Resource, ResourceId, ResourceQueueAttentionReason,
     ResourceQueueReconcileOutcome, ResourceRequest, ResourceRequestState, RestoreAttentionReason,
     SupervisorActionAuthority,
 };
@@ -250,6 +251,8 @@ pub enum ResourceTaskActivationResult {
         /// State retained by the task layer
         state: ProcessStatus,
     },
+    /// The task layer accepted this task, and it failed before launch
+    FailedBeforeLaunch,
     /// Cancellation prevented task acceptance
     Prevented,
     /// The request may have committed, but the supervisor result was not definitive
@@ -286,6 +289,24 @@ pub struct ResourceActorState {
     background_launch: Option<BackgroundLaunchAttempt>,
     pending_background_task: Option<TaskId>,
     return_deadline_wake: Option<ReturnDeadlineWake>,
+    unconfirmed_launch: Option<UnconfirmedLaunch>,
+}
+
+/// Assigned launch whose outcome this actor lifetime has not confirmed
+///
+/// After [`LAUNCH_CONFIRMATION_BOUND`] the task is failed before launch, and
+/// again after each further bound while its outcome stays unknown
+struct UnconfirmedLaunch {
+    key: ActivationKey,
+    // monotonic time of the first observation or of the last failure request
+    since: Instant,
+    wake: AbortHandle,
+}
+
+impl Drop for UnconfirmedLaunch {
+    fn drop(&mut self) {
+        self.wake.abort();
+    }
 }
 
 /// Wait before checking a return deadline again after the store failed to answer
@@ -446,6 +467,7 @@ impl Actor for ResourceActor {
             background_launch: None,
             pending_background_task: None,
             return_deadline_wake: None,
+            unconfirmed_launch: None,
         };
         reconcile_and_refresh(&myself, &mut state).await?;
 
@@ -711,8 +733,20 @@ enum ServingProgress {
     },
 }
 
-/// Reconcile the assigned task of the serving loan, and launch it once when needed
+/// Reconcile the assigned task of the serving loan, launch it once when needed,
+/// and fail it before launch when its outcome stays unknown past the bound
 async fn reconcile_serving_task(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    snapshot: &mut ResourceSnapshot,
+) -> Result<ServingProgress, AppError> {
+    let progress = reconcile_serving_progress(myself, state, snapshot).await?;
+    bound_unconfirmed_launch(myself, state, snapshot, &progress);
+
+    Ok(progress)
+}
+
+async fn reconcile_serving_progress(
     myself: &ActorRef<ResourceMsg>,
     state: &mut ResourceActorState,
     snapshot: &mut ResourceSnapshot,
@@ -809,7 +843,23 @@ fn launch_assigned_task(
             progress: attempt.progress,
         };
     }
-    let input = ResourceTaskAcceptanceInput {
+    let input = activation_input(state, snapshot, &loan, &request);
+    state.activation_attempt = Some(ActivationAttempt::pending(ActivationKey {
+        request_id: request.request_id,
+        task_id: request.task_id,
+    }));
+    schedule_assigned_activation(myself.clone(), state.supervisor.clone(), input, None);
+
+    ServingProgress::LaunchRequested { loan }
+}
+
+fn activation_input(
+    state: &ResourceActorState,
+    snapshot: &ResourceSnapshot,
+    loan: &Loan,
+    request: &ResourceRequest,
+) -> ResourceTaskAcceptanceInput {
+    ResourceTaskAcceptanceInput {
         authority_machine: state.authority_machine,
         resource_id: request.resource_id,
         request_id: request.request_id,
@@ -819,14 +869,122 @@ fn launch_assigned_task(
         expected_state_revision: snapshot.resource.state_revision,
         command_spec: request.spec().clone(),
         executor_env: TaskEnv::capture(),
-    };
-    state.activation_attempt = Some(ActivationAttempt::pending(ActivationKey {
+    }
+}
+
+/// Serving assignment whose launch has no confirmed start yet, if any
+///
+/// A queued task, a launch request without a definite reply, and a task this
+/// lifetime cannot see a worker for all count; a running or ended task does not
+fn unconfirmed_launch(
+    state: &ResourceActorState,
+    snapshot: &ResourceSnapshot,
+    progress: &ServingProgress,
+) -> Option<(ActivationKey, Option<(Loan, ResourceRequest)>)> {
+    let key = |request: &ResourceRequest| ActivationKey {
         request_id: request.request_id,
         task_id: request.task_id,
-    }));
-    schedule_assigned_activation(myself.clone(), state.supervisor.clone(), input);
+    };
+    match progress {
+        ServingProgress::Accepted {
+            loan,
+            request,
+            progress: AssignedResourceTaskProgress::Queued,
+            ..
+        } => Some((key(request), Some((loan.clone(), (**request).clone())))),
+        ServingProgress::LaunchAttempted {
+            request,
+            progress:
+                LaunchProgress::Pending
+                | LaunchProgress::Finished(
+                    ResourceTaskActivationResult::Prevented
+                    | ResourceTaskActivationResult::Uncertain
+                    | ResourceTaskActivationResult::Existing {
+                        state: ProcessStatus::Queued,
+                    },
+                ),
+        } => Some((
+            key(request),
+            snapshot.loan.clone().map(|loan| (loan, request.clone())),
+        )),
+        // the request is only known to the pending attempt until its reply
+        ServingProgress::LaunchRequested { .. } => {
+            state.activation_attempt.map(|attempt| (attempt.key, None))
+        }
+        ServingProgress::Unassigned
+        | ServingProgress::Completed { .. }
+        | ServingProgress::Accepted { .. }
+        | ServingProgress::LaunchAttempted { .. }
+        | ServingProgress::Attention { .. } => None,
+    }
+}
 
-    ServingProgress::LaunchRequested { loan }
+/// Start the confirmation clock for an unconfirmed launch, and fail the task
+/// before launch once the clock passes [`LAUNCH_CONFIRMATION_BOUND`]
+///
+/// The failure request cannot hide started work: the store returns an existing
+/// acceptance unchanged, and the supervisor fails only a task that is still
+/// queued, which no worker has claimed
+fn bound_unconfirmed_launch(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    snapshot: &ResourceSnapshot,
+    progress: &ServingProgress,
+) {
+    let Some((key, assignment)) = unconfirmed_launch(state, snapshot, progress) else {
+        state.unconfirmed_launch = None;
+        return;
+    };
+    let armed = state
+        .unconfirmed_launch
+        .as_ref()
+        .filter(|unconfirmed| unconfirmed.key == key);
+    let Some(since) = armed.map(|unconfirmed| unconfirmed.since) else {
+        arm_unconfirmed_launch(myself, state, key, Instant::now());
+        return;
+    };
+    let remaining = LAUNCH_CONFIRMATION_BOUND.saturating_sub(since.elapsed());
+    let Some((loan, request)) = assignment.filter(|_| remaining.is_zero()) else {
+        // a timer can fire just before the bound, and only a wake reconciles an
+        // idle queue, so another wake always covers the rest of the bound
+        if state
+            .unconfirmed_launch
+            .as_ref()
+            .is_some_and(|unconfirmed| unconfirmed.wake.is_finished())
+        {
+            arm_unconfirmed_launch(myself, state, key, since);
+        }
+        return;
+    };
+
+    let task_id = key.task_id;
+    tracing::warn!(
+        %task_id,
+        "assigned launch has no confirmed start after the bound; failing it before launch"
+    );
+    let input = activation_input(state, snapshot, &loan, &request);
+    state.activation_attempt = Some(ActivationAttempt::pending(key));
+    schedule_assigned_activation(
+        myself.clone(),
+        state.supervisor.clone(),
+        input,
+        Some(PreLaunchFailure::LaunchUnconfirmed),
+    );
+    // a failure request whose outcome is also unknown is tried again after another bound
+    arm_unconfirmed_launch(myself, state, key, Instant::now());
+}
+
+/// Track `key` from `since` and wake once the bound from `since` has passed
+fn arm_unconfirmed_launch(
+    myself: &ActorRef<ResourceMsg>,
+    state: &mut ResourceActorState,
+    key: ActivationKey,
+    since: Instant,
+) {
+    // one extra millisecond keeps a timer that rounds down from landing before the bound
+    let wait = LAUNCH_CONFIRMATION_BOUND.saturating_sub(since.elapsed()) + Duration::from_millis(1);
+    let wake = myself.send_after(wait, || ResourceMsg::Wake).abort_handle();
+    state.unconfirmed_launch = Some(UnconfirmedLaunch { key, since, wake });
 }
 
 /// Queue outcome for serving progress, or `None` to keep the earlier outcome
@@ -1229,24 +1387,41 @@ fn serving_assignment(
     Some((loan.clone(), request.clone()))
 }
 
+/// Ask the supervisor to launch the assigned task, or to fail it before launch
 fn schedule_assigned_activation(
     resource_actor: ActorRef<ResourceMsg>,
     supervisor: ActorRef<SupervisorMsg>,
     input: ResourceTaskAcceptanceInput,
+    failure: Option<PreLaunchFailure>,
 ) {
     let request_id = input.request_id;
     let task_id = input.task_id;
     tokio::spawn(async move {
-        let result = call(&supervisor, |reply| {
-            SupervisorMsg::LaunchAssignedResourceTask {
-                input: Box::new(input),
-                reply,
+        let input = Box::new(input);
+        let result = match failure {
+            None => {
+                call(&supervisor, |reply| {
+                    SupervisorMsg::LaunchAssignedResourceTask { input, reply }
+                })
+                .await
             }
-        })
-        .await;
+            Some(failure) => {
+                call(&supervisor, |reply| {
+                    SupervisorMsg::FailAssignedResourceTaskBeforeLaunch {
+                        input,
+                        failure,
+                        reply,
+                    }
+                })
+                .await
+            }
+        };
         let result = match result {
             Ok(Ok(ResourceTaskAcceptance::Inserted { task })) if task == task_id => {
                 ResourceTaskActivationResult::Inserted
+            }
+            Ok(Ok(ResourceTaskAcceptance::Unlaunchable { task, .. })) if task == task_id => {
+                ResourceTaskActivationResult::FailedBeforeLaunch
             }
             Ok(Ok(ResourceTaskAcceptance::Existing { task, state })) if task == task_id => {
                 ResourceTaskActivationResult::Existing { state }

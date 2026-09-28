@@ -8,7 +8,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
 
 use crate::cancellation::{
     CancellationOwner, CancellationPlan, CancellationReceipt, CancellationRequest,
@@ -32,7 +31,7 @@ use crate::resource::{
     ResourceQueueRequest, ResourceQueueResponse, ResourceRequest, ResourceRequestState,
     SupervisorNoticeRequest, SupervisorNoticeResponse,
 };
-use crate::spec;
+use crate::spec::{self, NormalizedSpec};
 use crate::store::IdentityError;
 use crate::submission::{
     ExecutorIdentity, RejectionTombstone, RequestId, ResourceCancellationOutcome,
@@ -1196,8 +1195,10 @@ async fn preview_execution(
     check_protocol(body.protocol_version, body.destination_machine)?;
     let spec = spec::parse_normalized_value(&body.spec)?;
     let cwd = expand_executor_cwd(&spec.cwd)?;
-    spec::check_cwd(&cwd)?;
-    spec::check_workload_host(&spec.workload)?;
+    spec::check_spec_host(&NormalizedSpec {
+        cwd: cwd.clone(),
+        ..spec.clone()
+    })?;
     let env = TaskEnv::capture();
     let feed = state.home.root().join("tasks/<task-id>/prompt.feed.txt");
     let invocation = invocation_from_normalized_for_identity(
@@ -1337,25 +1338,14 @@ async fn submit_execution(
         _ if !body.unknown.is_empty() => Some("invalid_request_fields"),
         (Err(_), _) => Some("invalid_spec"),
         (_, Err(AppError::InvalidSpec { .. })) => Some("invalid_cwd"),
-        (_, Ok(cwd)) => match std::fs::metadata(cwd) {
-            Ok(metadata) if metadata.is_dir() => None,
-            Ok(_) => Some("cwd_not_directory"),
-            Err(error) if error.kind() == ErrorKind::NotFound => Some("cwd_not_found"),
-            Err(error) => {
-                return Err(AppError::RemoteSubmissionUnavailable {
-                    message: format!("cannot inspect executor cwd: {error}"),
-                });
-            }
-        },
+        (Ok(spec), Ok(cwd)) => spec::check_spec_host(&NormalizedSpec {
+            cwd: cwd.clone(),
+            ..spec.clone()
+        })
+        .err()
+        .map(|error| error.rejection.as_str()),
         _ => None,
     };
-    // a container needs its mount sources on this machine, like its cwd
-    let reason = reason.or_else(|| match &normalized {
-        Ok(spec) if spec::check_workload_host(&spec.workload).is_err() => {
-            Some("container_host_inputs_unavailable")
-        }
-        _ => None,
-    });
     if let Some(reason) = reason {
         let tombstone = RejectionTombstone {
             task: body.task,

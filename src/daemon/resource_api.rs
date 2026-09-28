@@ -599,7 +599,7 @@ fn background_error(
         },
         // the spec or executor environment is invalid; nothing was written
         Error::TaskRecords(
-            error @ (AppError::CwdNotFound { .. }
+            error @ (AppError::InvalidCwd { .. }
             | AppError::ExecutableMissing { .. }
             | AppError::InvalidSpec { .. }
             | AppError::Usage { .. }),
@@ -1010,15 +1010,21 @@ async fn submit_request(
     let resource = path_value(id)?;
     let body = ResourceSubmitBody::parse(&value)?;
     let authority = request_authority(&state, resource, body.request_id).await?;
+    let spec = body.spec;
     let input = ResourceSubmitInput {
         request: body.request_id,
         resource,
         authority,
-        spec: body.spec,
+        spec: spec.clone(),
         env: body.env,
         callback_cwd: body.callback_cwd,
     };
     let (task_id, outcome) = match super::resource_submit::submit(&state, input).await? {
+        ResourceSubmitOutcome::Rejected { reason, .. }
+            if let Some(rejection) = crate::spec::HostInputRejection::parse(&reason) =>
+        {
+            return Err(host_input_error(&state, authority, &spec, rejection));
+        }
         ResourceSubmitOutcome::Waiting { task } => (task, ResourceRequestSubmitOutcome::Waiting),
         ResourceSubmitOutcome::Activated { task } => {
             (task, ResourceRequestSubmitOutcome::Activated)
@@ -1038,6 +1044,24 @@ async fn submit_request(
         authority_machine: authority,
         outcome,
     }))
+}
+
+/// Typed error for an authority's refusal of the spec's host inputs
+///
+/// A local authority checks this file system again for the precise error; a
+/// remote refusal is rebuilt from the spec
+fn host_input_error(
+    state: &AppState,
+    authority: MachineId,
+    spec: &crate::spec::NormalizedSpec,
+    rejection: crate::spec::HostInputRejection,
+) -> AppError {
+    if authority == state.machine.identity.machine
+        && let Err(error) = crate::spec::check_spec_host(spec)
+    {
+        return error.into();
+    }
+    rejection.into_error(spec)
 }
 
 /// Authority for a request submission; a retry reuses the saved route so a lost
@@ -2122,6 +2146,14 @@ fn notice_attention(model: &ResourceReadModel) -> Option<AttentionView> {
     })
 }
 
+fn unconfirmed_launch_bound() -> String {
+    format!(
+        "if it has not started {} after this was first seen, it fails before launch as \
+         launch_unconfirmed and the queue moves on",
+        humantime::format_duration(crate::resource::LAUNCH_CONFIRMATION_BOUND)
+    )
+}
+
 fn queue_attention(reason: &ResourceQueueAttentionReason) -> (String, Option<TaskId>) {
     use ResourceQueueAttentionReason as Reason;
     match reason {
@@ -2139,7 +2171,10 @@ fn queue_attention(reason: &ResourceQueueAttentionReason) -> (String, Option<Tas
             Some(*task_id),
         ),
         Reason::AcceptedTaskLaunchUncertain { task_id } => (
-            "an accepted command task has no proven worker start".into(),
+            format!(
+                "an accepted command task has no proven worker start; {}",
+                unconfirmed_launch_bound()
+            ),
             Some(*task_id),
         ),
         Reason::UnverifiedServingRelease => (
@@ -2153,7 +2188,10 @@ fn queue_attention(reason: &ResourceQueueAttentionReason) -> (String, Option<Tas
             Some(*task_id),
         ),
         Reason::AssignedTaskLaunchUncertain { task_id } => (
-            "the assigned command launch result is uncertain".into(),
+            format!(
+                "the assigned command launch result is uncertain; {}",
+                unconfirmed_launch_bound()
+            ),
             Some(*task_id),
         ),
         Reason::AssignedTaskLost { task_id } => (

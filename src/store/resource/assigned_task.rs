@@ -1,16 +1,19 @@
 //! Acceptance of authority-assigned resource requests as executor tasks
 
+use std::path::PathBuf;
+
 use rusqlite::{Connection, TransactionBehavior};
 
 use super::{encode_resource_json, resource_task_row_matches, task_has_any_event};
 use crate::domain::{ProcessStatus, TaskId, TaskRow};
+use crate::error::AppError;
 use crate::events::EventPayload;
 use crate::machine::MachineId;
 use crate::resource::store::{
     AcceptedResourceTask, AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome,
-    ConflictReason, ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
-    accept_request_for_authority, assigned_resource_request_for_acceptance,
-    assigned_resource_requests_for_authority,
+    ConflictReason, PreLaunchFailure, ResourceStoreError, ResourceTaskAcceptance,
+    ResourceTaskAcceptanceInput, accept_request_for_authority,
+    assigned_resource_request_for_acceptance, assigned_resource_requests_for_authority,
     reconcile_assigned_resource_task_for_authority as persist_assigned_task_reconciliation,
 };
 use crate::resource::{ResourceId, ResourceRequest, ResourceRequestState};
@@ -100,9 +103,33 @@ impl Store {
     }
 
     /// Accept one selected resource request as a task on this store connection
+    ///
+    /// A command that cannot be prepared here is still accepted, as
+    /// [`ResourceTaskAcceptance::Unlaunchable`], so the caller can fail it before
+    /// launch and release the queue instead of leaving no record behind
     pub(crate) fn accept_assigned_resource_task(
         &mut self,
         input: ResourceTaskAcceptanceInput,
+    ) -> Result<ResourceTaskAcceptance, ResourceStoreError> {
+        self.accept_assigned_resource_task_with(input, None)
+    }
+
+    /// Accept one selected resource request that must fail before launch
+    ///
+    /// An existing acceptance is returned unchanged, so the caller decides what
+    /// to do with a task that already has records
+    pub(crate) fn accept_unlaunchable_resource_task(
+        &mut self,
+        input: ResourceTaskAcceptanceInput,
+        failure: PreLaunchFailure,
+    ) -> Result<ResourceTaskAcceptance, ResourceStoreError> {
+        self.accept_assigned_resource_task_with(input, Some(failure))
+    }
+
+    fn accept_assigned_resource_task_with(
+        &mut self,
+        input: ResourceTaskAcceptanceInput,
+        forced_failure: Option<PreLaunchFailure>,
     ) -> Result<ResourceTaskAcceptance, ResourceStoreError> {
         let tx = self
             .conn
@@ -160,7 +187,8 @@ impl Store {
             return Err(conflict(ConflictReason::TaskIdentityInUse));
         }
 
-        let row = new_resource_task_row(&input, normalized_spec)?;
+        let (row, preparation_failure) = new_resource_task_row(&input, normalized_spec)?;
+        let failure = forced_failure.or(preparation_failure);
         let project_root = crate::store::find_project_root(&row.cwd);
         crate::store::insert_task_with_project_root_on(&tx, &row, project_root.as_deref())
             .map_err(ResourceStoreError::TaskPreparation)?;
@@ -190,8 +218,10 @@ impl Store {
         )?;
 
         tx.commit()?;
-        Ok(ResourceTaskAcceptance::Inserted {
-            task: input.task_id,
+        let task = input.task_id;
+        Ok(match failure {
+            None => ResourceTaskAcceptance::Inserted { task },
+            Some(failure) => ResourceTaskAcceptance::Unlaunchable { task, failure },
         })
     }
 
@@ -207,42 +237,59 @@ impl Store {
 /// Build the queued task row for a first acceptance on this executor
 ///
 /// A bare program name resolves from the executor PATH only here, so the resolved
-/// entry point must pass the foreground contract before any row exists. A
+/// entry point must pass the foreground contract before the task may launch. A
 /// container runs through the resolved `docker` CLI, which Homebased drives
-/// itself, so its mount sources are checked instead
+/// itself, so its mount sources are checked instead. A command that fails these
+/// checks still gets its row with the failure, so it ends before launch with a
+/// reason; a binary that never resolved is saved as an empty path
 fn new_resource_task_row(
     input: &ResourceTaskAcceptanceInput,
     normalized_spec: &NormalizedSpec,
-) -> Result<TaskRow, ResourceStoreError> {
-    crate::spec::check_cwd(&normalized_spec.cwd).map_err(ResourceStoreError::TaskPreparation)?;
-    crate::spec::check_workload_host(&normalized_spec.workload)
-        .map_err(ResourceStoreError::TaskPreparation)?;
-    let workload = crate::invocation::persist_workload(&normalized_spec.workload);
+) -> Result<(TaskRow, Option<PreLaunchFailure>), ResourceStoreError> {
     let binary = crate::invocation::resolve_workload_binary(
         &normalized_spec.workload,
         &input.executor_env.path,
         &normalized_spec.cwd,
-    )
-    .map_err(ResourceStoreError::TaskPreparation)?;
-    if !matches!(normalized_spec.workload, NormalizedWorkload::Container(_)) {
-        crate::resource::foreground::inspect_foreground_entry_point(&binary)
-            .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })?;
-    }
+    );
+    let failure = launch_preparation_failure(normalized_spec, binary.as_ref());
     let row = crate::store::new_queued_task(NewTask {
         id: input.task_id,
         name: Some(normalized_spec.name.clone()),
         thread: normalized_spec.thread,
-        workload,
+        workload: crate::invocation::persist_workload(&normalized_spec.workload),
         cwd: normalized_spec.cwd.clone(),
         timeout: normalized_spec.timeout,
         env: input.executor_env.clone(),
-        binary,
+        binary: binary.unwrap_or_default(),
     });
     if !resource_task_row_matches(&row, input.task_id, normalized_spec) {
         return Err(conflict(ConflictReason::TaskRowMismatch));
     }
 
-    Ok(row)
+    Ok((row, failure))
+}
+
+/// First reason this executor cannot launch the saved command, if any
+fn launch_preparation_failure(
+    spec: &NormalizedSpec,
+    binary: Result<&PathBuf, &AppError>,
+) -> Option<PreLaunchFailure> {
+    let message = |message: String| Some(PreLaunchFailure::Preparation { message });
+    if let Err(error) = crate::spec::check_spec_host(spec) {
+        return message(error.error.to_string());
+    }
+    let binary = match binary {
+        Ok(binary) => binary,
+        Err(error) => return message(error.to_string()),
+    };
+    if matches!(spec.workload, NormalizedWorkload::Container(_)) {
+        return None;
+    }
+    crate::resource::foreground::inspect_foreground_entry_point(binary)
+        .err()
+        .and_then(|risk| {
+            message(ResourceStoreError::UnsupportedCommandOwnership { risk }.to_string())
+        })
 }
 
 /// Check an accepted identity, its origin column, first event, and task row against one request

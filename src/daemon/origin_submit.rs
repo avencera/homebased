@@ -147,6 +147,31 @@ pub(super) async fn submit(
     resolve_identity(state, saved, identity.identity).await
 }
 
+/// Whether recovery ended in the executor's saved refusal rather than a failure
+fn is_definite_rejection(error: &AppError) -> bool {
+    match error {
+        AppError::SubmissionRejected { .. } | AppError::InvalidCwd { .. } => true,
+        // a refused mount source is rebuilt as this pointer
+        AppError::InvalidSpec { pointer, .. } => pointer == "/workload/mounts",
+        _ => false,
+    }
+}
+
+/// Error for an executor refusal, typed when the executor refused a host input
+fn rejected(route: &OriginRoute, reason: &str) -> AppError {
+    match (
+        spec::HostInputRejection::parse(reason),
+        route.current_spec(),
+    ) {
+        (Some(rejection), Some(spec)) => rejection.into_error(spec),
+        _ => AppError::SubmissionRejected {
+            request: route.request,
+            task: route.task,
+            reason: reason.to_owned(),
+        },
+    }
+}
+
 fn local_machine_selector(machine: &crate::machine::MachineName) -> AppError {
     AppError::InvalidSpec {
         pointer: "/machine".into(),
@@ -164,11 +189,7 @@ async fn finish_saved(
             route.task,
             route.last_execution_state.unwrap_or(ProcessStatus::Queued),
         )),
-        SubmissionState::Rejected { reason } => Err(AppError::SubmissionRejected {
-            request: route.request,
-            task: route.task,
-            reason: reason.clone(),
-        }),
+        SubmissionState::Rejected { reason } => Err(rejected(&route, reason)),
         SubmissionState::AcceptanceUnknown => reconcile(state, route).await,
         SubmissionState::Resource { .. }
         | SubmissionState::ResourceAction { .. }
@@ -241,7 +262,7 @@ pub(super) async fn recover(state: AppState) {
     };
     for route in routes {
         if let Err(error) = reconcile(&state, route).await
-            && !matches!(error, AppError::SubmissionRejected { .. })
+            && !is_definite_rejection(&error)
         {
             warn!("origin submission recovery: {error}");
         }
@@ -290,11 +311,7 @@ async fn resolve_identity(
     .map_err(|error| unknown(&route, format!("cannot save executor result: {error}")))?;
     match saved.submission {
         SubmissionState::Accepted => Ok((route.task, saved.last_execution_state.unwrap_or(status))),
-        SubmissionState::Rejected { reason } => Err(AppError::SubmissionRejected {
-            request: route.request,
-            task: route.task,
-            reason,
-        }),
+        SubmissionState::Rejected { reason } => Err(rejected(&route, &reason)),
         SubmissionState::AcceptanceUnknown => Err(unknown(&route, "origin route is unresolved")),
         SubmissionState::Resource { .. }
         | SubmissionState::ResourceAction { .. }

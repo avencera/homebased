@@ -213,8 +213,11 @@ conflict.
 
 Background and queued command inputs use the same strict `ResourceTaskSubmitSpec`
 shape shown below. The command is an argv array; it is not a shell string. The
-spec has no `machine` field. Use a callback `thread` and a `cwd` available on
-the authority machine. The queued command must run an inspectable native ELF or
+spec has no `machine` field. Use a callback `thread` and a `cwd` that is an
+existing host directory on the authority machine. For a `container` workload,
+`cwd` is still a host path; a mount target exists only inside the container.
+The authority refuses a missing `cwd` (`invalid_cwd`) or mount source
+(`invalid_spec`) at submit, before the request enters the queue. The queued command must run an inspectable native ELF or
 Mach-O executable in the task's foreground process group. Scripts, shells,
 interpreters, container clients, remote launchers, and detach tools are not
 accepted. The authority cannot use process-group exit as release proof for
@@ -303,6 +306,23 @@ homebased --json resource request cancel \
 
 Canceling the last request does not remove an active loan or its return
 obligation.
+
+An assigned request belongs to its task, so `resource request cancel` refuses
+it and names the command to use instead: `homebased task cancel <task-uuid>`
+cancels the task whether or not it started, and the queue serves the next
+request.
+
+A request that reaches its turn but cannot launch, for example because its
+`cwd`, a mount source, or its executable disappeared after it was queued, gets
+a task that ends `failed` before launch. Its `SpawnFailed` reason starts with
+`launch failed before start`, the task's thread receives `TASK_FAILED`, and the
+queue serves the next request. When the launch outcome is unknown, such as after
+a daemon restart mid-launch, the resource actor waits at most 2 minutes
+(`LAUNCH_CONFIRMATION_BOUND`) for a confirmed start. A task that is still
+queued, or never got a task record, is then failed before launch with a reason
+that starts with `launch_unconfirmed`, and the queue moves on. A worker must
+move its task from queued to running before it spawns anything, so this cannot
+hide work that already started.
 
 Move only a request that is still queued. Read the latest state revision with
 `resource show`, then choose exactly one placement: `--front`, `--back`,

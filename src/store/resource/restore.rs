@@ -639,8 +639,7 @@ fn prepare_return_task_for_authority(
     decision.validate_for(&pending.return_context, authority.supervisor.thread)?;
     require_prior_background_ended(&tx, &pending)?;
     let (spec, _, _) = return_task_spec(&tx, &pending, &authority, &launch, executor_env)?;
-    crate::spec::check_cwd(&spec.cwd)?;
-    crate::spec::check_workload_host(&spec.workload)?;
+    crate::spec::check_spec_host(&spec).map_err(AppError::from)?;
     let normalized_spec_sha256 = normalized_spec_sha256(&spec)?;
     Ok(PreparedReturnTask {
         spec,
@@ -772,8 +771,7 @@ fn accept_return_task_for_authority(
         return Err(ReturnDecisionError::IdentityConflict { task_id });
     }
 
-    crate::spec::check_cwd(&spec.cwd)?;
-    crate::spec::check_workload_host(&spec.workload)?;
+    crate::spec::check_spec_host(&spec).map_err(AppError::from)?;
     let row = crate::store::new_queued_task(crate::store::NewTask {
         id: task_id,
         name: Some(spec.name.clone()),

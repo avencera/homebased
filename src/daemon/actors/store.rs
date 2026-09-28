@@ -31,11 +31,11 @@ use crate::resource::ownership_lock::VerifiedTrainerAttempt;
 use crate::resource::release_watcher::{ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest};
 use crate::resource::store::{
     AcceptedResourceTask, AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome,
-    CompleteReleaseError, OpenReleaseLoanError, ReleaseCheckpointError, ReleaseCompletionResult,
-    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ReleaseWatcherAcceptanceInput,
-    ResourceQueueReconcileError, ResourceSnapshot, ResourceStoreError, ResourceTaskAcceptance,
-    ResourceTaskAcceptanceInput, ReturnDeadlineOutcome, SupervisorNoticeStoreError,
-    TrainerAttemptAssociationStoreError,
+    CompleteReleaseError, OpenReleaseLoanError, PreLaunchFailure, ReleaseCheckpointError,
+    ReleaseCompletionResult, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
+    ReleaseWatcherAcceptanceInput, ResourceQueueReconcileError, ResourceSnapshot,
+    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput, ReturnDeadlineOutcome,
+    SupervisorNoticeStoreError, TrainerAttemptAssociationStoreError,
 };
 use crate::resource::{
     ActionId, DeliveryAttemptId, NoticeId, ReleaseCheckpointBaseline, ReleaseWatcherIntent,
@@ -173,6 +173,15 @@ fn resource_error(
         },
         error @ ResourceStoreError::UnsupportedCommandOwnership { .. } => AppError::Usage {
             message: error.to_string(),
+        },
+        // a definitive refusal, so the origin saves it instead of retrying an unknown outcome
+        ResourceStoreError::HostInputRejected(error) => match (request, task) {
+            (Some(request), Some(task)) => AppError::SubmissionRejected {
+                request,
+                task,
+                reason: error.rejection.as_str().into(),
+            },
+            _ => error.error,
         },
         ResourceStoreError::TaskPreparation(error) => error,
         ResourceStoreError::TaskRow(error) => error,
@@ -312,6 +321,15 @@ pub(crate) enum StoreMsg {
     AcceptAssignedResourceTask {
         /// Selection identity, immutable spec, and executor runtime environment
         input: Box<ResourceTaskAcceptanceInput>,
+        /// Typed task-layer result inside actor and transport errors
+        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
+    },
+    /// Accept the exact request selected by a Serving loan as a task that must fail before launch
+    AcceptUnlaunchableResourceTask {
+        /// Selection identity, immutable spec, and executor runtime environment
+        input: Box<ResourceTaskAcceptanceInput>,
+        /// Why the task ends before launch
+        failure: PreLaunchFailure,
         /// Typed task-layer result inside actor and transport errors
         reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
     },
@@ -1085,6 +1103,16 @@ impl Actor for StoreActor {
             ),
             StoreMsg::AcceptAssignedResourceTask { input, reply } => {
                 send_reply(reply, Ok(state.accept_assigned_resource_task(*input)));
+            }
+            StoreMsg::AcceptUnlaunchableResourceTask {
+                input,
+                failure,
+                reply,
+            } => {
+                send_reply(
+                    reply,
+                    Ok(state.accept_unlaunchable_resource_task(*input, failure)),
+                );
             }
             StoreMsg::AssignedResourceTaskReconcile { input, reply } => {
                 send_reply(

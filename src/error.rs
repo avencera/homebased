@@ -13,7 +13,20 @@ use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
 use crate::resource::ResourceId;
+use crate::spec::CwdProblem;
 use crate::submission::RequestId;
+
+/// Hint for a `cwd` that names a path inside the container instead of a host path
+fn cwd_suggestion(path: &std::path::Path, suggested: Option<&std::path::Path>) -> String {
+    suggested.map_or_else(String::new, |source| {
+        format!(
+            "; cwd is a host path, and {} is inside a container mount target, so use the \
+             mount source path {}",
+            path.display(),
+            source.display()
+        )
+    })
+}
 
 /// Application error with a stable machine-readable code
 #[derive(Debug, thiserror::Error)]
@@ -80,11 +93,20 @@ pub enum AppError {
         /// Machine that ran the source task
         execution_machine: MachineId,
     },
-    /// Spec `cwd` is missing or not a directory
-    #[error("cwd not found: {}", path.display())]
-    CwdNotFound {
+    /// `cwd` is not an existing, accessible host directory on the machine that runs the task
+    #[error(
+        "invalid cwd {}: it {} on the machine that runs the task{}",
+        path.display(),
+        problem.describe(),
+        cwd_suggestion(path, suggested_cwd.as_deref())
+    )]
+    InvalidCwd {
         /// Directory the spec asked for
         path: PathBuf,
+        /// Why the directory cannot be used
+        problem: CwdProblem,
+        /// Host path of the container mount whose target contains `path`
+        suggested_cwd: Option<PathBuf>,
     },
     /// Requested program is missing, not a file, or not executable
     #[error("executable missing: {program}")]
@@ -517,7 +539,7 @@ impl AppError {
             Self::FollowupUnavailable { .. } => "followup_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
-            Self::CwdNotFound { .. } => "cwd_not_found",
+            Self::InvalidCwd { .. } => "invalid_cwd",
             Self::ExecutableMissing { .. } => "executable_missing",
             Self::SummaryTooLong { .. } => "summary_too_long",
             Self::TooManyReports { .. } => "too_many_reports",
@@ -594,6 +616,7 @@ impl AppError {
             | Self::DaemonBusy
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
+            | Self::InvalidCwd { .. }
             | Self::UnknownThread { .. }
             | Self::ThreadMismatch { .. }
             | Self::SummaryTooLong { .. }
@@ -607,7 +630,6 @@ impl AppError {
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
-            | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::NotDirectory { .. }
@@ -650,6 +672,7 @@ impl AppError {
     pub fn http_status(&self) -> http::StatusCode {
         match self {
             Self::InvalidSpec { .. }
+            | Self::InvalidCwd { .. }
             | Self::UnknownThread { .. }
             | Self::ThreadMismatch { .. }
             | Self::SummaryTooLong { .. }
@@ -664,7 +687,6 @@ impl AppError {
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
-            | Self::CwdNotFound { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::MachineNotFound { .. }
@@ -781,7 +803,16 @@ impl AppError {
                 json!({ "message_id": id, "machine": machine, "message": message })
             }
             Self::MessageUnavailable { message } => json!({ "message": message }),
-            Self::CwdNotFound { path } => json!({ "cwd": path }),
+            Self::InvalidCwd {
+                path,
+                problem,
+                suggested_cwd,
+            } => json!({
+                "pointer": "/cwd",
+                "value": path,
+                "problem": problem,
+                "suggested_cwd": suggested_cwd,
+            }),
             Self::ExecutableMissing { program } => json!({ "program": program }),
             Self::SummaryTooLong { len } => json!({ "len": len }),
             Self::TooManyReports { count } => json!({ "count": count }),

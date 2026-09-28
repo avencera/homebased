@@ -434,13 +434,26 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "message_receiver_unavailable" => AppError::MessageUnavailable { message },
-        "cwd_not_found" => AppError::CwdNotFound {
-            path: input
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default(),
-        },
+        "invalid_cwd" => {
+            let path_at = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from)
+            };
+            let problem = input
+                .get("problem")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (path_at("value"), problem) {
+                (Some(path), Some(problem)) => AppError::InvalidCwd {
+                    path,
+                    problem,
+                    suggested_cwd: path_at("suggested_cwd"),
+                },
+                _ => AppError::Internal { message },
+            }
+        }
         "executable_missing" => AppError::ExecutableMissing {
             program: input
                 .get("program")

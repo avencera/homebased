@@ -1777,3 +1777,127 @@ async fn initial_idle_saves_one_receipt_for_a_resource_with_no_history() {
     assert_eq!(error_code(&response), "resource_action_not_allowed");
     fixture.stop().await;
 }
+
+impl Fixture {
+    async fn submit_container(
+        &self,
+        request_id: RequestId,
+        cwd: &str,
+        source: &std::path::Path,
+    ) -> (StatusCode, Value) {
+        self.socket_post(
+            &format!("/v1/resources/{}/requests", self.resource.as_uuid()),
+            json!({
+                "api_version": 1,
+                "request_id": request_id,
+                "spec": {
+                    "api_version": 1,
+                    "thread": THREAD,
+                    "name": "container benchmark",
+                    "cwd": cwd,
+                    "timeout": "4h",
+                    "workload": {
+                        "type": "container",
+                        "image": format!("bench@sha256:{}", "0".repeat(64)),
+                        "gpus": "all",
+                        "memory": "8g",
+                        "mounts": [{ "source": source, "target": "/scratch" }]
+                    }
+                },
+                "env": { "path": self.bin, "home": "/tmp" },
+                "callback_cwd": self.callback_cwd,
+            }),
+        )
+        .await
+    }
+}
+
+// the incident spec: `cwd` named the container mount target instead of a host path
+#[tokio::test]
+async fn request_submit_rejects_a_container_path_as_cwd_and_names_the_mount_source() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let source = fixture.callback_cwd.clone();
+    let request_id = RequestId::new();
+
+    // a retry with the same request id answers from the saved rejection
+    for _ in 0..2 {
+        let (status, response) = fixture
+            .submit_container(request_id, "/scratch/runs", &source)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(error_code(&response), "invalid_cwd");
+        let input = &response["error"]["input"];
+        assert_eq!(input["pointer"], "/cwd");
+        assert_eq!(input["value"], "/scratch/runs");
+        assert_eq!(input["problem"], "not_found");
+        assert_eq!(input["suggested_cwd"], json!(source.join("runs")));
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("cwd is a host path"), "{message}");
+    }
+    assert_eq!(fixture.detail().await["requests"], json!([]));
+
+    // the mount source itself is a valid cwd
+    let (status, response) = fixture
+        .submit_container(RequestId::new(), source.to_str().unwrap(), &source)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["outcome"]["type"], "waiting");
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn request_submit_rejects_a_missing_mount_source() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let missing = fixture.callback_cwd.join("missing-source");
+    let (status, response) = fixture
+        .submit_container(
+            RequestId::new(),
+            fixture.callback_cwd.to_str().unwrap(),
+            &missing,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(error_code(&response), "invalid_spec");
+    assert_eq!(
+        response["error"]["input"]["pointer"],
+        "/workload/mounts/0/source"
+    );
+    assert_eq!(fixture.detail().await["requests"], json!([]));
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn cancelling_an_assigned_request_names_the_task_cancel_command() {
+    let _serial = SUPERVISOR_TEST_LOCK.lock().await;
+    let fixture = Fixture::new().await;
+    let (request_id, task_id) = fixture.submit_request().await;
+    crate::store::mark_request_assigned_for_race(&fixture.state.home.db_path(), request_id);
+    let revision = fixture.detail().await["resource"]["state_revision"]
+        .as_u64()
+        .unwrap();
+
+    let (status, response) = fixture
+        .socket_post(
+            &format!(
+                "/v1/resources/{}/requests/{}/cancel",
+                fixture.resource.as_uuid(),
+                request_id.0
+            ),
+            json!({
+                "api_version": 1,
+                "operation_id": Uuid::now_v7(),
+                "expected_revision": revision,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(error_code(&response), "resource_action_not_allowed");
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("homebased task cancel {task_id}")),
+        "{message}"
+    );
+    fixture.stop().await;
+}

@@ -214,7 +214,7 @@ fn launch_rejection(error: BackgroundLaunchError) -> Result<ResourceBackgroundRe
         },
         // the spec or executor environment cannot run here; nothing was written
         Error::TaskRecords(
-            error @ (AppError::CwdNotFound { .. }
+            error @ (AppError::InvalidCwd { .. }
             | AppError::ExecutableMissing { .. }
             | AppError::InvalidSpec { .. }
             | AppError::Usage { .. }),

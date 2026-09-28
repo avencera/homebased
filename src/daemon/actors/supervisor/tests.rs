@@ -2659,3 +2659,246 @@ fn resolved_callback_codex_is_available() {
 
     assert_eq!(codex, CallbackExecutable::available(path));
 }
+
+fn command_in(cwd: &std::path::Path) -> NormalizedSpec {
+    serde_json::from_value(json!({
+        "api_version": 1,
+        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "name": "resource launch failure test",
+        "cwd": cwd,
+        "timeout": "4h",
+        "workload": { "type": "task", "command": ["/bin/echo", "hello"] }
+    }))
+    .unwrap()
+}
+
+async fn wait_for_failed_task(store: &ActorRef<StoreMsg>, task_id: TaskId) -> TaskRow {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(row) = call(store, |reply| StoreMsg::GetTask { id: task_id, reply })
+                .await
+                .unwrap()
+                && row.status() == ProcessStatus::Failed
+            {
+                return row;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the assigned task must reach a durable failed state")
+}
+
+async fn request_states(
+    store: &ActorRef<StoreMsg>,
+    authority: MachineId,
+    resource: ResourceId,
+) -> Vec<(RequestId, ResourceRequestState)> {
+    call(store, |reply| StoreMsg::ResourceRequests {
+        authority_machine: authority,
+        resource_id: resource,
+        reply,
+    })
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|request| (request.request_id, request.state))
+    .collect()
+}
+
+fn spawn_failure_message(row: &TaskRow) -> String {
+    match row.exit_reason() {
+        Some(ExitReason::SpawnFailed { message }) => message.clone(),
+        other => panic!("expected a spawn failure, got {other:?}"),
+    }
+}
+
+// the cwd existed when the request was queued and was removed before its turn,
+// so the launch fails for a known reason and must not leave the queue blocked
+#[tokio::test]
+async fn known_launch_failure_fails_the_task_notifies_and_serves_the_next_request() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    configure_task_runner();
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let authority = load_or_create_machine_id(&home).unwrap();
+    let work = directory.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    // a remote origin keeps the task's events in this executor's outbox
+    let origin = MachineId::new();
+    let (resource, _loan, request_id, task_id, _input) =
+        seed_serving_assigned_resource_task_with_spec(&home, authority, origin, command_in(&work));
+    let next_request = RequestId::new();
+    Store::open(&home.db_path())
+        .unwrap()
+        .accept_resource_request(
+            authority,
+            next_request,
+            TaskId::new(),
+            resource.id,
+            origin,
+            resource_command(),
+        )
+        .unwrap();
+    std::fs::remove_dir(&work).unwrap();
+
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+
+    let row = wait_for_failed_task(&store, task_id).await;
+    let message = spawn_failure_message(&row);
+    assert!(message.contains("launch failed before start"), "{message}");
+    assert!(message.contains("invalid cwd"), "{message}");
+    assert_eq!(
+        Store::open(&home.db_path())
+            .unwrap()
+            .process_group_exit_evidence(task_id)
+            .unwrap(),
+        Some(ProcessGroupExitEvidence::NoChildSpawned)
+    );
+    let output = std::fs::read_to_string(home.task_paths(task_id).output).unwrap();
+    assert!(output.contains("invalid cwd"), "{output}");
+
+    // the thread hears the failure through the task's terminal event
+    let events = Store::open(&home.db_path())
+        .unwrap()
+        .pending_outbound_events(task_id)
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.payload.process_state() == Some(ProcessStatus::Failed)),
+        "{events:?}"
+    );
+
+    // the failed request finishes and the next one owns the loan
+    let served = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let states = request_states(&store, authority, resource.id).await;
+            let finished = states.iter().any(|(id, state)| {
+                *id == request_id
+                    && matches!(
+                        state,
+                        ResourceRequestState::Finished {
+                            outcome: ExitReason::SpawnFailed { .. }
+                        }
+                    )
+            });
+            let next_served = states.iter().any(|(id, state)| {
+                *id == next_request && !matches!(state, ResourceRequestState::Queued)
+            });
+            if finished && next_served {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        served.is_ok(),
+        "{:?}",
+        request_states(&store, authority, resource.id).await
+    );
+
+    stop_supervisor(supervisor, handle).await;
+}
+
+// a queued row this daemon lifetime did not insert has an unknown launch outcome;
+// after the bound it is failed as launch_unconfirmed and the queue moves on
+#[tokio::test]
+async fn unknown_launch_outcome_fails_as_unconfirmed_after_the_bound() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    configure_task_runner();
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let authority = load_or_create_machine_id(&home).unwrap();
+    let (resource, loan, request_id, task_id, input) =
+        seed_serving_assigned_resource_task(&home, authority, authority);
+    assert!(matches!(
+        Store::open(&home.db_path())
+            .unwrap()
+            .accept_assigned_resource_task(input)
+            .unwrap(),
+        ResourceTaskAcceptance::Inserted { task } if task == task_id
+    ));
+
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+    let inspection = inspect_resource(&supervisor, resource.id).await.unwrap();
+    assert!(matches!(
+        inspection.reconcile_outcome,
+        Some(ResourceQueueReconcileOutcome::AttentionRequired {
+            reason: ResourceQueueAttentionReason::AcceptedTaskLaunchUncertain { .. },
+            ..
+        })
+    ));
+
+    // before the bound the task keeps its unknown outcome
+    tokio::time::pause();
+    tokio::time::advance(crate::resource::LAUNCH_CONFIRMATION_BOUND / 2).await;
+    tokio::time::resume();
+    call(&supervisor, |reply| SupervisorMsg::ReconcileResource {
+        id: resource.id,
+        reply,
+    })
+    .await
+    .unwrap();
+    let row = call(&store, |reply| StoreMsg::GetTask { id: task_id, reply })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status(), ProcessStatus::Queued);
+
+    tokio::time::pause();
+    tokio::time::advance(crate::resource::LAUNCH_CONFIRMATION_BOUND).await;
+    tokio::time::resume();
+    let row = wait_for_failed_task(&store, task_id).await;
+    let message = spawn_failure_message(&row);
+    assert!(message.starts_with("launch_unconfirmed"), "{message}");
+    assert_eq!(row.pid(), None);
+
+    let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let inspection = inspect_resource(&supervisor, resource.id).await.unwrap();
+            if matches!(
+                inspection.loan.as_ref().map(|saved| &saved.state),
+                Some(LoanState::Active {
+                    phase: LoanPhase::AwaitingReturn { .. },
+                })
+            ) {
+                return inspection;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the unconfirmed launch must release its serving turn");
+    assert_eq!(released.loan.map(|saved| saved.id), Some(loan.id));
+    assert!(matches!(
+        request_states(&store, authority, resource.id).await[..],
+        [(id, ResourceRequestState::Finished { .. })] if id == request_id
+    ));
+
+    stop_supervisor(supervisor, handle).await;
+}

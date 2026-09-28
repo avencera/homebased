@@ -639,7 +639,7 @@ fn prepare_launch_row(
     spec: &NormalizedSpec,
     env: &TaskEnv,
 ) -> Result<(TaskRow, BackgroundCommandContract), BackgroundLaunchError> {
-    crate::spec::check_cwd(&spec.cwd)?;
+    crate::spec::check_spec_host(spec).map_err(AppError::from)?;
     let binary = crate::invocation::resolve_workload_binary(&spec.workload, &env.path, &spec.cwd)?;
     let row = crate::store::new_queued_task(crate::store::NewTask {
         id: task_id,

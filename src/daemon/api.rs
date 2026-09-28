@@ -314,8 +314,7 @@ pub(super) fn local_dry_run(
     spec: NormalizedSpec,
     env: TaskEnv,
 ) -> Result<DryRunResponse, AppError> {
-    spec::check_cwd(&spec.cwd)?;
-    spec::check_workload_host(&spec.workload)?;
+    spec::check_spec_host(&spec)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
     let invocation = invocation_from_normalized_for_identity(
         &spec.workload,

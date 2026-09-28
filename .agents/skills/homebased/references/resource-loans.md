@@ -33,7 +33,25 @@ answered and `actions` is empty, there is no pending supervisor action for that
 exact address; still check `resource show` for an active loan and
 `resource requests` for queued work in serving order.
 
-Cancel a still-queued request with `resource request cancel`. Reorder one with
+Every request `cwd` is a host directory on the resource authority, even for a
+`container` workload; a mount target such as `/scratch` exists only inside the
+container. `resource request submit` and `resource background submit` refuse a
+missing `cwd` with `invalid_cwd` and a missing mount source with
+`invalid_spec`, before the request enters the queue.
+
+When the request's turn comes and the authority still cannot launch it, for
+example because its `cwd`, a mount source, or its executable disappeared, the
+task ends `failed` before launch with a `launch failed before start` reason, the
+thread gets its `TASK_FAILED` event, and the queue serves the next request. A
+launch whose outcome stays unknown, such as after a daemon restart mid-launch,
+is failed the same way with a `launch_unconfirmed` reason once it has had no
+confirmed start for 2 minutes. `resource show` reports `queue_blocked` only
+until then.
+
+Cancel a still-queued request with `resource request cancel`. An assigned
+request belongs to its task: cancel it with `homebased task cancel <task-uuid>`,
+which works whether or not the task started and serves the next request; the
+`resource request cancel` error names that command. Reorder one with
 `resource request move` and exactly one of `--front`, `--back`,
 `--before <request-uuid>`, or `--after <request-uuid>`. Both need
 `--expected-revision` from `resource show` and a stable `--operation-id`. A

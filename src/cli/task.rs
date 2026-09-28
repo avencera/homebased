@@ -199,7 +199,7 @@ async fn submit_normalized(
     allow_other_thread: bool,
 ) -> Result<ExitCode, AppError> {
     if normalized.machine.is_none() {
-        spec::check_cwd(&normalized.cwd)?;
+        spec::check_spec_host(&normalized)?;
     }
     SubmitOrigin::capture(&ctx.home)?.check(normalized.thread, allow_other_thread)?;
     let env = crate::domain::TaskEnv::capture();

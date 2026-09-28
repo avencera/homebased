@@ -146,15 +146,14 @@ fn replay_request_on(
 /// Refuse new queued work outside the ownership contract
 ///
 /// A path-qualified entry point is inspected now. A bare program name resolves
-/// from the executor `PATH`, so its task binding inspects it before any spawn. A
-/// container's mount sources must exist on this authority
+/// from the executor `PATH`, so its task binding inspects it before any spawn.
+/// The `cwd` and a container's mount sources must exist on this authority
 fn check_queued_command_ownership(spec: &NormalizedSpec) -> Result<(), ResourceStoreError> {
     let command_spec = CommandSpec::try_from(spec.clone())?;
     if let Some(risk) = resource_task_ownership_risk(&command_spec) {
         return Err(ResourceStoreError::UnsupportedCommandOwnership { risk });
     }
-    crate::spec::check_workload_host(&spec.workload)
-        .map_err(ResourceStoreError::TaskPreparation)?;
+    crate::spec::check_spec_host(spec).map_err(ResourceStoreError::HostInputRejected)?;
     crate::resource::foreground::inspect_path_qualified_entry_point(spec)
         .map_err(|risk| ResourceStoreError::UnsupportedCommandOwnership { risk })
 }

@@ -59,6 +59,9 @@ pub(crate) enum ResourceStoreError {
         /// First contract violation found in the command or its entry point
         risk: ResourceTaskOwnershipRisk,
     },
+    /// The spec's host inputs cannot be used on this authority, so it can never launch here
+    #[error("{}", .0.error)]
+    HostInputRejected(crate::spec::HostInputError),
     /// The saved command cannot be prepared on the executor machine
     #[error("resource command cannot be prepared: {0}")]
     TaskPreparation(#[from] AppError),

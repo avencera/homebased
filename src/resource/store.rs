@@ -23,7 +23,7 @@ pub(crate) mod test_support;
 mod tests;
 
 pub(crate) use acceptance::{
-    AcceptedResourceTask, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
+    AcceptedResourceTask, PreLaunchFailure, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
     assigned_resource_request_for_acceptance,
 };
 pub(crate) use assigned_task::{

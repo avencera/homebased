@@ -313,6 +313,16 @@ fn begin_resource_control(
     let effect = match &request.action {
         BrowserResourceAction::CancelQueued { request_id } => {
             let queued = request_for_resource(&tx, request.resource_id, *request_id)?;
+            if let ResourceRequestState::Assigned { .. } = queued.state {
+                // the task layer owns an assigned request, started or not, so its
+                // cancellation goes through the task and releases the queue
+                return Err(ResourceControlError::NotAllowed(format!(
+                    "request is assigned, not queued; cancel its task with `homebased task \
+                     cancel {}`, which works whether or not the task started and serves the \
+                     next request",
+                    queued.task_id
+                )));
+            }
             if queued.state != ResourceRequestState::Queued {
                 return Err(ResourceControlError::NotAllowed(format!(
                     "request is {}, not queued",

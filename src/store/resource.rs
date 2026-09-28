@@ -269,7 +269,13 @@ fn resource_task_row_matches(row: &TaskRow, task: TaskId, spec: &NormalizedSpec)
         && row.workload == crate::invocation::persist_workload(&spec.workload)
         && row.cwd == spec.cwd
         && row.timeout == spec.timeout
-        && row.binary.is_absolute()
+        && binary_is_resolved_or_unresolvable(&row.binary)
+}
+
+/// Accepted rows name an absolute binary, or an empty path when the executable
+/// never resolved and the task failed before launch
+fn binary_is_resolved_or_unresolvable(binary: &std::path::Path) -> bool {
+    binary.is_absolute() || binary.as_os_str().is_empty()
 }
 
 /// Whether two task rows share every immutable launch field

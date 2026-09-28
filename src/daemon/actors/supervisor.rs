@@ -24,8 +24,8 @@ use crate::notify::Notifier;
 use crate::resource::background_launch::RemoteBackgroundLaunchReceipt;
 use crate::resource::bound_action::{ResourceActionOutcome, ResourceActionRequest};
 use crate::resource::store::{
-    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ResourceSnapshot, ResourceStoreError,
-    ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
+    PreLaunchFailure, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ResourceSnapshot,
+    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
 };
 use crate::resource::{
     ReleaseWatcherIntent, Resource, ResourceId, ReturnDecision, SupervisorActionAuthority,
@@ -45,8 +45,8 @@ mod resource_launch;
 
 pub(crate) use resource_launch::return_decision_rejection;
 use resource_launch::{
-    decide_return, launch_assigned_resource_task, launch_background, launch_bound_release_watcher,
-    launch_remote_background, resource_action,
+    decide_return, fail_assigned_resource_task_before_launch, launch_assigned_resource_task,
+    launch_background, launch_bound_release_watcher, launch_remote_background, resource_action,
 };
 
 const STORE_NAME: &str = "homebased.store";
@@ -82,6 +82,15 @@ pub(crate) enum SupervisorMsg {
     LaunchAssignedResourceTask {
         /// Exact Serving assignment and fixed task identity selected by the resource owner
         input: Box<ResourceTaskAcceptanceInput>,
+        /// Typed task acceptance, nested inside actor and storage errors
+        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
+    },
+    /// Accept one assigned request whose launch must fail, and fail its task if it has not started
+    FailAssignedResourceTaskBeforeLaunch {
+        /// Exact Serving assignment and fixed task identity selected by the resource owner
+        input: Box<ResourceTaskAcceptanceInput>,
+        /// Why the task ends before launch
+        failure: PreLaunchFailure,
         /// Typed task acceptance, nested inside actor and storage errors
         reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
     },
@@ -387,6 +396,16 @@ impl Actor for SupervisorActor {
             }
             SupervisorMsg::LaunchAssignedResourceTask { input, reply } => {
                 let result = launch_assigned_resource_task(&myself, state, *input).await;
+                send_reply(reply, result);
+            }
+            SupervisorMsg::FailAssignedResourceTaskBeforeLaunch {
+                input,
+                failure,
+                reply,
+            } => {
+                let result =
+                    fail_assigned_resource_task_before_launch(&myself, state, *input, failure)
+                        .await;
                 send_reply(reply, result);
             }
             SupervisorMsg::LaunchBoundReleaseWatcher { launch, reply } => {
@@ -959,10 +978,21 @@ async fn finish_spawn_failed(
     id: TaskId,
     err: &AppError,
 ) -> Result<(), AppError> {
-    let reason = ExitReason::SpawnFailed {
-        message: err.to_string(),
-    };
-    call(&state.store, |reply| StoreMsg::CasExit {
+    fail_queued_task(state, id, err.to_string()).await?;
+    Ok(())
+}
+
+/// End a queued task with a spawn failure; no worker can start it afterwards
+///
+/// Returns whether this call won the transition; a worker that already moved
+/// the task to running keeps it
+async fn fail_queued_task(
+    state: &SupervisorState,
+    id: TaskId,
+    message: String,
+) -> Result<bool, AppError> {
+    let reason = ExitReason::SpawnFailed { message };
+    let failed = call(&state.store, |reply| StoreMsg::CasExit {
         id,
         from: ProcessStatus::Queued,
         reason,
@@ -970,7 +1000,7 @@ async fn finish_spawn_failed(
         reply,
     })
     .await?;
-    Ok(())
+    Ok(failed.is_some())
 }
 
 async fn spawn_task_actor(

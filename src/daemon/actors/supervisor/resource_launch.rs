@@ -7,8 +7,9 @@ use ractor::{ActorRef, RpcReplyPort};
 
 use super::{
     BackgroundLaunch, ReleaseWatcherLaunch, RemoteBackgroundLaunch, ReturnDecisionOutcome,
-    SupervisorMsg, SupervisorState, ensure_resource_actor, reconcile_resource_actor,
-    resolve_callback_codex, spawn_inserted, spawn_task_actor, wake_resource,
+    SupervisorMsg, SupervisorState, ensure_resource_actor, fail_queued_task,
+    reconcile_resource_actor, resolve_callback_codex, spawn_inserted, spawn_task_actor,
+    wake_resource,
 };
 use crate::daemon::actors::resource::{
     BackgroundLaunchResult, ReleaseWatcherLaunchResult, ResourceMsg, RestoreLaunchResult,
@@ -24,8 +25,9 @@ use crate::resource::bound_action::{
 };
 use crate::resource::release_watcher::ReleaseWatcherCommand;
 use crate::resource::store::{
-    ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ReleaseWatcherAcceptanceInput,
-    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
+    PreLaunchFailure, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
+    ReleaseWatcherAcceptanceInput, ResourceStoreError, ResourceTaskAcceptance,
+    ResourceTaskAcceptanceInput,
 };
 use crate::resource::{
     ReleaseWatcherIntent, ResourceId, ReturnDecision, ReturnLaunch, SupervisorActionAuthority,
@@ -75,13 +77,50 @@ pub(super) async fn launch_assigned_resource_task(
     state: &mut SupervisorState,
     input: ResourceTaskAcceptanceInput,
 ) -> Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError> {
+    accept_assigned_resource_task(supervisor, state, input, None).await
+}
+
+/// Accept an assigned request as a task that fails before launch
+///
+/// A task that already has records fails only while it is still queued; a
+/// started or ended task keeps its state
+pub(super) async fn fail_assigned_resource_task_before_launch(
+    supervisor: &ActorRef<SupervisorMsg>,
+    state: &mut SupervisorState,
+    input: ResourceTaskAcceptanceInput,
+    failure: PreLaunchFailure,
+) -> Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError> {
+    accept_assigned_resource_task(supervisor, state, input, Some(failure)).await
+}
+
+async fn accept_assigned_resource_task(
+    supervisor: &ActorRef<SupervisorMsg>,
+    state: &mut SupervisorState,
+    input: ResourceTaskAcceptanceInput,
+    forced_failure: Option<PreLaunchFailure>,
+) -> Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError> {
     let task_id = input.task_id;
     let resource_id = input.resource_id;
-    let acceptance = call(&state.store, |reply| StoreMsg::AcceptAssignedResourceTask {
-        input: Box::new(input),
-        reply,
-    })
-    .await?;
+    let input = Box::new(input);
+    let acceptance = match forced_failure.clone() {
+        None => {
+            call(&state.store, |reply| StoreMsg::AcceptAssignedResourceTask {
+                input,
+                reply,
+            })
+            .await?
+        }
+        Some(failure) => {
+            call(&state.store, |reply| {
+                StoreMsg::AcceptUnlaunchableResourceTask {
+                    input,
+                    failure,
+                    reply,
+                }
+            })
+            .await?
+        }
+    };
     let acceptance = match acceptance {
         Ok(acceptance) => acceptance,
         Err(error) => return Ok(Err(error)),
@@ -91,18 +130,27 @@ pub(super) async fn launch_assigned_resource_task(
         ResourceTaskAcceptance::Inserted { task } if *task == task_id => {
             spawn_inserted(supervisor, state, task_id).await?;
         }
+        ResourceTaskAcceptance::Unlaunchable { task, failure } if *task == task_id => {
+            fail_before_launch(state, task_id, failure).await?;
+        }
         ResourceTaskAcceptance::Existing {
             task,
             state: status,
-        } if *task == task_id => match status {
-            ProcessStatus::Queued => {
+        } if *task == task_id => match (status, &forced_failure) {
+            (ProcessStatus::Queued, Some(failure)) => {
+                fail_before_launch(state, task_id, failure).await?;
+            }
+            (ProcessStatus::Queued, None) => {
                 reconcile_resource_actor(supervisor, state, resource_id).await?;
             }
-            ProcessStatus::Running => spawn_task_actor(supervisor, state, task_id).await?,
-            ProcessStatus::Succeeded
-            | ProcessStatus::Failed
-            | ProcessStatus::Cancelled
-            | ProcessStatus::Lost => {}
+            (ProcessStatus::Running, _) => spawn_task_actor(supervisor, state, task_id).await?,
+            (
+                ProcessStatus::Succeeded
+                | ProcessStatus::Failed
+                | ProcessStatus::Cancelled
+                | ProcessStatus::Lost,
+                _,
+            ) => {}
         },
         _ => {
             return Err(AppError::Internal {
@@ -114,6 +162,35 @@ pub(super) async fn launch_assigned_resource_task(
     }
 
     Ok(Ok(acceptance))
+}
+
+/// Record a failure before launch on a queued task and keep its reason in the output
+///
+/// The Queued-to-Failed transition wins only if no worker reached Running, so it
+/// cannot hide a started child; the terminal event notifies the task's thread
+async fn fail_before_launch(
+    state: &SupervisorState,
+    task_id: TaskId,
+    failure: &PreLaunchFailure,
+) -> Result<(), AppError> {
+    let message = failure.message();
+    if !fail_queued_task(state, task_id, message.clone()).await? {
+        // a worker won Running first, so the output belongs to its child
+        return Ok(());
+    }
+    tracing::warn!(%task_id, "resource task failed before launch: {message}");
+
+    // `task output` shows the reason too; the terminal event carries it either way
+    let written = state.home.prepare_task(task_id).and_then(|paths| {
+        Ok(std::fs::write(
+            paths.output,
+            format!("homebased: {message}\n"),
+        )?)
+    });
+    if let Err(error) = written {
+        tracing::warn!(%task_id, "cannot write the launch failure output: {error}");
+    }
+    Ok(())
 }
 
 pub(super) async fn launch_bound_release_watcher(

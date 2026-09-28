@@ -50,6 +50,14 @@ pub(crate) enum ResourceTaskAcceptance {
         /// Preallocated task identity accepted by this authority
         task: TaskId,
     },
+    /// This call committed the task records, but the task must fail before it
+    /// launches; the caller records the failure instead of spawning a worker
+    Unlaunchable {
+        /// Preallocated task identity accepted by this authority
+        task: TaskId,
+        /// Why the task cannot launch
+        failure: PreLaunchFailure,
+    },
     /// An exact acceptance already exists and retains its current task state
     Existing {
         /// Preallocated task identity accepted by this authority
@@ -57,6 +65,38 @@ pub(crate) enum ResourceTaskAcceptance {
         /// State retained by the task layer
         state: ProcessStatus,
     },
+}
+
+/// Why an assigned task ends before it launches
+///
+/// The task still gets its records and a failed terminal event, so its thread
+/// hears the reason and the queue serves the next request
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreLaunchFailure {
+    /// The executor cannot prepare the saved command here, such as a missing
+    /// `cwd`, mount source, or executable
+    Preparation {
+        /// Preparation error shown to the thread
+        message: String,
+    },
+    /// The launch outcome stayed unknown past [`crate::resource::LAUNCH_CONFIRMATION_BOUND`]
+    /// with no started worker
+    LaunchUnconfirmed,
+}
+
+impl PreLaunchFailure {
+    /// Spawn-failure message saved with the failed task
+    #[must_use]
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Preparation { message } => format!("launch failed before start: {message}"),
+            Self::LaunchUnconfirmed => format!(
+                "launch_unconfirmed: the launch had no confirmed start after {}, so it was \
+                 failed before launch",
+                humantime::format_duration(crate::resource::LAUNCH_CONFIRMATION_BOUND)
+            ),
+        }
+    }
 }
 
 /// Accepted task identity retained by an authority-owned assigned request

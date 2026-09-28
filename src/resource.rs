@@ -26,6 +26,17 @@ pub mod return_window;
 pub(crate) mod store;
 pub mod trainer_publication;
 
+/// Longest time an assigned command may sit with an unknown launch outcome
+///
+/// The resource actor starts the clock when it first sees the outcome as
+/// unknown, such as after a daemon restart mid-launch or a supervisor reply
+/// that never arrived. After the bound, a task that has not started is failed
+/// before launch with `launch_unconfirmed`, its thread is told, and the queue
+/// serves the next request. A worker must win the task's Queued-to-Running
+/// transition before it spawns anything, so failing a still-queued task cannot
+/// race a child that already started
+pub const LAUNCH_CONFIRMATION_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub use id::{
     ActionId, DeliveryAttemptId, IdentityParseError, LoanId, NilIdentity, NoticeId,
     ReleaseStopReservationId, ResourceId,
