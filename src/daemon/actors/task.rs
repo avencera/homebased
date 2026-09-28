@@ -412,10 +412,13 @@ async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<TaskRow, AppError
         return Ok(row);
     }
     let id = row.id;
+    let paths = actor.home.task_paths(id);
+    let worker_thread = runner::worker_thread(&row, &paths);
     let cas = call(&actor.store, |reply| StoreMsg::CasStatus {
         id,
         from: row.status(),
         to: ProcessStatus::Lost,
+        worker_thread,
         reply,
     })
     .await?;
@@ -440,11 +443,14 @@ async fn apply_exit(
         return Ok(row);
     }
     let id = row.id;
-    let cas = call(&actor.store, |reply| StoreMsg::CasExit {
+    let paths = actor.home.task_paths(id);
+    let worker_thread = runner::worker_thread(&row, &paths);
+    let cas = call(&actor.store, |reply| StoreMsg::CasExitWithWorkerThread {
         id,
         from: row.status(),
         reason: reason.clone(),
         evidence,
+        worker_thread,
         reply,
     })
     .await?;
@@ -656,6 +662,7 @@ mod tests {
                 agent: Agent::new(AgentKind::Claude, None),
                 extra_args: vec![],
                 report_trailer: false,
+                resume_thread: None,
             }),
             cwd: dir.path().to_path_buf(),
             timeout: Duration::from_secs(4 * 3600),

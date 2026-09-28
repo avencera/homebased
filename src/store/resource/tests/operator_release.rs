@@ -1962,6 +1962,7 @@ fn schema_27_receipts_survive_the_restore_outcome_migration() {
                  INSERT INTO resource_operator_attestations
                      (operation_id, resource_id, task_id, preceding_launch, receipt_json)
                  VALUES ('{operation}', '{}', '{task}', '{}', '{legacy}');
+                 ALTER TABLE tasks DROP COLUMN worker_thread;
                  ALTER TABLE tasks DROP COLUMN container_exit_evidence;
                  DROP TABLE task_containers;
                  PRAGMA user_version = 27;",

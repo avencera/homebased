@@ -491,6 +491,32 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
     assert_eq!(changed_error["error"]["code"], "message_conflict");
     assert_eq!(receiver.queue_calls().len(), 1);
 
+    let unresolved_id = MessageId::new();
+    let unresolved = send_thread(
+        &sender,
+        "missing-machine-name",
+        exact_thread,
+        "Original request whose target cannot be resolved",
+        unresolved_id,
+    );
+    assert!(!unresolved.status.success());
+    let unresolved_error: Value = serde_json::from_slice(&unresolved.stderr).unwrap();
+    assert_eq!(unresolved_error["error"]["code"], "machine_not_found");
+    let changed_unresolved = send_thread(
+        &sender,
+        "missing-machine-name",
+        exact_thread,
+        "Changed request after failed resolution",
+        unresolved_id,
+    );
+    assert!(!changed_unresolved.status.success());
+    let changed_unresolved_error: Value =
+        serde_json::from_slice(&changed_unresolved.stderr).unwrap();
+    assert_eq!(
+        changed_unresolved_error["error"]["code"],
+        "message_conflict"
+    );
+
     let cwd_id = MessageId::new();
     let cwd_output = sender.cli(&[
         "--json",
@@ -549,7 +575,7 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
                 cwd: task_cwd,
                 codex: CallbackExecutable::available(receiver.codex.clone()),
             },
-            spec: PersistedSpec::Current(spec),
+            spec: PersistedSpec::Current(Box::new(spec)),
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
             last_updated_at: Some(chrono::Utc::now()),
@@ -641,4 +667,121 @@ fn sender_reports_offline_machine_before_message_delivery() {
         error["error"]["input"]["machine"],
         receiver.machine_id().to_string()
     );
+}
+
+#[test]
+fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() {
+    let sender = Daemon::start("sender");
+    let thread = ThreadId(Uuid::now_v7());
+    let cwd = sender.user_home.join("self-message-workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_session(&sender.user_home, "self-message", thread, &cwd);
+    let task = TaskId::new();
+    let spec = spec::parse_normalized_value(&json!({
+        "api_version": API_VERSION,
+        "thread": thread,
+        "name": "self message source",
+        "cwd": cwd,
+        "timeout": "30m",
+        "workload": { "type": "task", "command": ["/bin/true"] },
+    }))
+    .unwrap();
+    Store::open(&sender.state_home.join("homebased.sqlite"))
+        .unwrap()
+        .insert_origin_route(&OriginRoute {
+            request: RequestId::new(),
+            task,
+            origin_machine: sender.machine_id(),
+            execution_machine: sender.machine_id(),
+            thread,
+            callback: CallbackContext {
+                env: TaskEnv {
+                    path: "/bin".into(),
+                    home: sender.user_home.to_string_lossy().into_owned(),
+                },
+                cwd,
+                codex: CallbackExecutable::available(sender.codex.clone()),
+            },
+            spec: PersistedSpec::Current(Box::new(spec)),
+            submission: SubmissionState::Accepted,
+            last_execution_state: None,
+            last_updated_at: Some(chrono::Utc::now()),
+            last_accepted_seq: 0,
+            last_settled_seq: 0,
+        })
+        .unwrap();
+
+    let task_id = task.to_string();
+    let self_message = MessageId::new();
+    let self_output = sender.cli(&[
+        "--json",
+        "message",
+        "send",
+        "--task",
+        &task_id,
+        "--message",
+        "Do not deliver this to myself",
+        "--message-id",
+        &self_message.to_string(),
+        "--source-thread",
+        &thread.to_string(),
+    ]);
+    assert!(!self_output.status.success());
+    let self_error: Value = serde_json::from_slice(&self_output.stderr).unwrap();
+    assert_eq!(self_error["error"]["code"], "message_to_self");
+    assert_eq!(self_error["error"]["input"]["thread"], thread.to_string());
+    assert!(
+        self_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("homebased task followup")
+    );
+    assert!(sender.queue_calls().is_empty());
+    let repeated_self_message = sender.cli(&[
+        "--json",
+        "message",
+        "send",
+        "--task",
+        &task_id,
+        "--message",
+        "Do not deliver this to myself",
+        "--message-id",
+        &self_message.to_string(),
+        "--source-thread",
+        &thread.to_string(),
+    ]);
+    assert!(!repeated_self_message.status.success());
+    let repeated_self_error: Value = serde_json::from_slice(&repeated_self_message.stderr).unwrap();
+    assert_eq!(repeated_self_error["error"]["code"], "message_to_self");
+    assert!(sender.queue_calls().is_empty());
+    let binding_count: i64 = rusqlite::Connection::open(sender.state_home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM outbound_message_bindings WHERE message_id=?1",
+            [self_message.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding_count, 1);
+
+    let task_source_id = MessageId::new();
+    let task_source_output = sender.cli(&[
+        "--json",
+        "message",
+        "send",
+        "--task",
+        &task_id,
+        "--message",
+        "A worker task may message its origin",
+        "--message-id",
+        &task_source_id.to_string(),
+        "--source-task",
+        &task_id,
+    ]);
+    assert!(
+        task_source_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&task_source_output.stderr)
+    );
+    assert_eq!(sender.queue_calls().len(), 1);
 }

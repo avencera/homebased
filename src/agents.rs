@@ -5,7 +5,7 @@ use std::path::Path;
 use jsonc_parser::{ParseOptions, parse_to_serde_value};
 use serde_json::{Value, json};
 
-use crate::domain::{AgentKind, TaskIdentity};
+use crate::domain::{AgentKind, TaskIdentity, ThreadId};
 use crate::error::AppError;
 use crate::invocation::{
     ChildEnvironment, ChildInvocation, GeneratedAgentOverlay, ManagedEnvironmentPolicy,
@@ -23,6 +23,8 @@ pub struct AgentArgvInputs<'a> {
     pub cwd: &'a Path,
     /// Extra argv appended after the unattended flags.
     pub extra_args: &'a [String],
+    /// Codex thread to resume, when set.
+    pub resume_thread: Option<ThreadId>,
 }
 
 /// Build unattended argv for an agent workload.
@@ -128,6 +130,11 @@ fn build_standard_agent_invocation(
         AgentKind::OpenCode => unreachable!("OpenCode uses its managed invocation builder"),
     };
     append_extra_args(&mut args, inputs.extra_args, inputs.kind);
+    if inputs.kind == AgentKind::Codex
+        && let Some(thread) = inputs.resume_thread
+    {
+        args.extend(["resume".into(), thread.to_string(), "-".into()]);
+    }
     ChildInvocation {
         program: binary.to_path_buf(),
         args,
@@ -447,6 +454,7 @@ mod tests {
                 model,
                 cwd: Path::new("/work"),
                 extra_args,
+                resume_thread: None,
             },
             Path::new("/bin/agent"),
             feed,
@@ -478,6 +486,7 @@ mod tests {
                 model,
                 cwd: Path::new("/work"),
                 extra_args,
+                resume_thread: None,
             },
             Path::new("/bin/opencode"),
             Path::new("/state/tasks/id/prompt.feed.txt"),
@@ -754,6 +763,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_resume_argv_appends_resume_after_extra_args() {
+        let thread: ThreadId = "01a0e487-b877-76e2-9dc2-806bff0bf685".parse().unwrap();
+        let extra_args = vec!["-c".into(), "model_reasoning_effort=\"high\"".into()];
+        let argv = build_agent_invocation(
+            AgentArgvInputs {
+                kind: AgentKind::Codex,
+                model: Some("gpt-6-luna"),
+                cwd: Path::new("/work/tree"),
+                extra_args: &extra_args,
+                resume_thread: Some(thread),
+            },
+            Path::new("/bin/codex"),
+            Path::new("/state/tasks/id/prompt.feed.txt"),
+        );
+        assert_eq!(
+            argv.to_vec(),
+            vec![
+                "/bin/codex",
+                "exec",
+                "-C",
+                "/work/tree",
+                "-s",
+                "danger-full-access",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "gpt-6-luna",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "resume",
+                "01a0e487-b877-76e2-9dc2-806bff0bf685",
+                "-",
+            ]
+        );
+        assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
+    }
+
+    #[test]
     fn grok_argv_uses_prompt_feed_not_dash_p() {
         let feed = Path::new("/state/tasks/id/prompt.feed.txt");
         let argv = build(AgentKind::Grok, feed);
@@ -951,6 +997,7 @@ mod tests {
                     model: None,
                     cwd: Path::new("/work"),
                     extra_args: &[],
+                    resume_thread: None,
                 },
                 Path::new("/bin/agent"),
                 feed,

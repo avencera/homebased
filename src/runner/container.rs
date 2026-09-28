@@ -60,6 +60,7 @@ pub(super) async fn run(
                     paths,
                     &ExitReason::SpawnFailed { message },
                     ProcessGroupExitEvidence::NoChildSpawned.into(),
+                    row,
                 );
             }
             let resource = store.resource_for_task(id).unwrap_or_else(|error| {
@@ -90,6 +91,7 @@ pub(super) async fn run(
                 process_group: ProcessGroupExitEvidence::Unconfirmed,
                 container: evidence,
             },
+            row,
         ),
         ContainerRunEnd::Lost { note } => {
             append_note(&paths.output, &note);

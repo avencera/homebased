@@ -71,7 +71,7 @@ impl From<PathBuf> for CallbackExecutable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistedSpec {
     /// Caller-provided normalized request content
-    Current(NormalizedSpec),
+    Current(Box<NormalizedSpec>),
     /// Historical local row with no complete normalized request evidence
     MigratedLocal,
 }
@@ -84,7 +84,7 @@ pub enum PersistedSpec {
     deny_unknown_fields
 )]
 enum TaggedPersistedSpec {
-    Current(NormalizedSpec),
+    Current(Box<NormalizedSpec>),
     MigratedLocal,
 }
 
@@ -113,8 +113,8 @@ impl<'de> Deserialize<'de> for PersistedSpec {
         }
 
         Ok(match Compatible::deserialize(deserializer)? {
-            Compatible::Tagged(TaggedPersistedSpec::Current(spec))
-            | Compatible::LegacyCurrent(spec) => Self::Current(spec),
+            Compatible::Tagged(TaggedPersistedSpec::Current(spec)) => Self::Current(spec),
+            Compatible::LegacyCurrent(spec) => Self::Current(Box::new(spec)),
             Compatible::Tagged(TaggedPersistedSpec::MigratedLocal) => Self::MigratedLocal,
         })
     }
@@ -122,7 +122,7 @@ impl<'de> Deserialize<'de> for PersistedSpec {
 
 impl From<NormalizedSpec> for PersistedSpec {
     fn from(spec: NormalizedSpec) -> Self {
-        Self::Current(spec)
+        Self::Current(Box::new(spec))
     }
 }
 
@@ -149,7 +149,7 @@ impl PersistedSpec {
     #[must_use]
     pub fn into_current(self) -> Option<NormalizedSpec> {
         match self {
-            Self::Current(spec) => Some(spec),
+            Self::Current(spec) => Some(*spec),
             Self::MigratedLocal => None,
         }
     }
@@ -1319,9 +1319,9 @@ mod tests {
         use crate::resource::{CommandSpec, ReturnWork};
 
         let input = action_input(ResourceActionLaunch::Return {
-            work: ReturnWork::NewBackgroundWork {
+            work: Box::new(ReturnWork::NewBackgroundWork {
                 spec: CommandSpec::try_from(spec()).unwrap(),
-            },
+            }),
         });
         let route = OriginRoute::new_resource_action(input.clone()).unwrap();
         assert_eq!(

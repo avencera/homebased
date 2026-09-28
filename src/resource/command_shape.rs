@@ -1562,6 +1562,7 @@ mod tests {
             prompt: "not a task command".into(),
             extra_args: Vec::new(),
             report_trailer: true,
+            resume_thread: None,
         });
         fixture.association = association(fixture.task.id, &fixture.spec, &fixture.runtime_root);
 

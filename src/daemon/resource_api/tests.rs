@@ -268,6 +268,7 @@ impl Fixture {
             id: task_id,
             from: ProcessStatus::Queued,
             to: ProcessStatus::Running,
+            worker_thread: None,
             reply,
         })
         .await
@@ -285,6 +286,7 @@ impl Fixture {
                 id: task_id,
                 from: ProcessStatus::Running,
                 to: ProcessStatus::Lost,
+                worker_thread: None,
                 reply,
             })
             .await
@@ -330,6 +332,7 @@ impl Fixture {
                 id: task_id,
                 from,
                 to,
+                worker_thread: None,
                 reply,
             })
             .await

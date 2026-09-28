@@ -414,6 +414,7 @@ mod tests {
                 agent: Agent::new(AgentKind::Claude, None),
                 extra_args: Vec::new(),
                 report_trailer: false,
+                resume_thread: None,
             }),
             cwd: directory.path().to_path_buf(),
             timeout: Duration::from_secs(4 * 3600),

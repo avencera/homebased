@@ -272,6 +272,10 @@ Submit specs use `api_version: 1` and a `workload` object. The required top-leve
 
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
+Codex agent specs may set `workload.resume_thread` to resume a Codex thread
+with the new prompt. Use `task followup` for a finished Codex task so Homebased
+uses its recorded worker thread and keeps the task settings.
+
 Agent example:
 
 ```json
@@ -344,9 +348,23 @@ do not make a new request UUID for the same intended task. Without
 ```sh
 homebased --json task list --status running,queued
 homebased --json task show <id>
+homebased --json task followup <id> --message "The missing detail is X. Continue and report."
 homebased task log <id> --tail 200
 homebased --json task cancel <id>
 ```
+
+`task show` and `task list` include `worker_thread` for a Codex task that printed
+a session header, whether the task succeeds, fails, is cancelled, or is lost.
+`task followup` accepts `--message` or `--message-file`, and resumes only a
+terminal Codex task with a recorded worker thread. Only one follow-up can resume
+a thread at a time. `resume_thread_busy`
+names the active task; wait for its event before trying again.
+
+Run `task followup` on the task's origin or execution machine. A request from
+another machine returns `followup_wrong_machine`. For a remote follow-up, use
+`--request-id <uuid>` to retry after a lost response. Use
+`--allow-other-thread` only when a worker must send events to a thread other
+than its parent task's thread.
 
 Task ids are full UUIDs. Prefix matching does not exist. `task list` shows tasks
 stored on the local machine. `task show`, `task log`, and `task cancel` use the
@@ -406,9 +424,11 @@ homebased --json message send \
 ```
 
 The CLI can also select a Codex thread by receiver-side `--cwd`, or send to
-the origin thread for a task with `--task <task-uuid>` alone. A Claude session
-with no live process gets the message as a new turn in the T3 Code thread that
-owns it. Pass the same
+the origin thread for a task with `--task <task-uuid>` alone. This is the
+origin thread, not the task worker. A send to its own source thread returns
+`message_to_self`; use `task followup` for a finished Codex worker. A Claude
+session with no live process gets the message as a new turn in the T3 Code
+thread that owns it. Pass the same
 `--message-id <uuid>` to retry after a lost response. Delivery is synchronous
 and at-least-once. A receiver crash before it stores the receipt can lead to a
 duplicate message. Read [messages.md](.agents/skills/homebased/references/messages.md)

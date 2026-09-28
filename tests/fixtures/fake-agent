@@ -6,6 +6,7 @@ task="${HOMEBASED_TASK_ID:-unknown}"
 # the agent's own pid, so tests can assert the agent group is gone rather than
 # re-checking the worker pid they signalled
 printf '%s\n' "$$" > "$record/agent-pid-$task.txt"
+meta="$record/agent-meta-$task.txt"
 {
   printf 'argv0=%s\n' "$0"
   printf 'argv=%s\n' "$*"
@@ -13,7 +14,8 @@ printf '%s\n' "$$" > "$record/agent-pid-$task.txt"
   printf 'HOME=%s\n' "${HOME:-}"
   printf 'HOMEBASED_TASK_ID=%s\n' "${HOMEBASED_TASK_ID:-}"
   printf 'HOMEBASED_HOME=%s\n' "${HOMEBASED_HOME:-}"
-} > "$record/agent-meta.txt"
+} > "$meta"
+cp "$meta" "$record/agent-meta.txt"
 
 if [ -f "$record/ignore-term" ]; then
   trap '' TERM

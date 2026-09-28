@@ -50,6 +50,11 @@ origin machine and original thread. If it cannot check a peer that may hold the
 route, it returns `cluster_lookup_incomplete` instead of claiming no route
 exists.
 
+`--task` targets the task's origin thread, not the worker's thread. If the
+source thread is also the destination, the send fails with `message_to_self`.
+Use `homebased task followup <task-id> --message "..."` to resume a finished
+Codex worker with new information. See [submit.md](submit.md).
+
 ## Choose the source and conversation
 
 By default, the CLI uses `HOMEBASED_TASK_ID` as the source task. Otherwise, it
@@ -82,12 +87,13 @@ conversation UUID is the message UUID.
 
 ## Retry safely
 
-Delivery is synchronous. The destination daemon saves the message identity,
-request content, and resolved destination before it delivers the line. After
-delivery succeeds, it saves a receipt before it returns success. It does not keep
-an offline mailbox or resume an unfinished message attempt after restart.
-The sender also saves the selected machine UUID before delivery. A retry with
-the same message UUID cannot move to another machine if a name changes owners.
+Delivery is synchronous. The sender saves the message identity and request
+content before it resolves the destination. After resolution, it saves the
+destination before it delivers the line. After delivery succeeds, it saves a
+receipt before it returns success. It does not keep an offline mailbox or
+resume an unfinished message attempt after restart. The sender also saves the
+selected machine UUID before delivery. A retry with the same message UUID
+cannot move to another machine if a name changes owners.
 
 The CLI creates a message UUID unless you pass `--message-id <uuid>`. Choose
 the UUID before the first send if you may need to retry after a lost response.
@@ -95,6 +101,10 @@ Retry with the same message UUID, destination, source, body, and other options.
 The receiver returns a saved receipt without another queue call when it has
 one. It uses the saved thread when it retries a `--cwd` destination. Reusing a
 message UUID with different request content returns `message_conflict`.
+If target resolution fails, the UUID stays reserved for that request. Retrying
+with the same content resolves again; changing the content returns
+`message_conflict`. A rejected self-send stays unbound, so the same retry
+returns `message_to_self` again.
 
 ```bash
 message_id="$(uuidgen)"

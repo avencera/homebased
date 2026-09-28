@@ -375,7 +375,8 @@ ALTER TABLE resource_restore_closures_v29 RENAME TO resource_restore_closures;
 fn migrate_2_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_2_TO_CURRENT)?;
     conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
-    conn.execute_batch(RESOURCE_SCHEMA)
+    conn.execute_batch(RESOURCE_SCHEMA)?;
+    migrate_32_to_current(conn)
 }
 
 /// Move a v0.4.0 database to the current schema
@@ -466,7 +467,16 @@ const RELEASED_V0_8_SCHEMA_VERSION: i64 = 31;
 /// Add return decision windows, and open one for each loan that already awaits a return
 fn migrate_31_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(RESOURCE_SCHEMA)?;
-    open_missing_return_windows_on(conn, Utc::now())
+    open_missing_return_windows_on(conn, Utc::now())?;
+    migrate_32_to_current(conn)
+}
+
+/// Released v0.8.7 databases use schema version 32
+const RELEASED_V0_8_7_SCHEMA_VERSION: i64 = 32;
+
+/// Add the Codex worker thread captured from its task log
+fn migrate_32_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("ALTER TABLE tasks ADD COLUMN worker_thread TEXT;")
 }
 
 /// Why `Store::open` refuses a database version
@@ -530,6 +540,7 @@ fn insert_task_with_project_root_on(
     row: &TaskRow,
     project_root: Option<&Path>,
 ) -> Result<(), AppError> {
+    reject_busy_resume_thread_on(conn, row)?;
     conn.execute(
         "INSERT INTO tasks (
             id, thread_id, name, workload_json, cwd, timeout_secs,
@@ -562,6 +573,37 @@ fn insert_task_with_project_root_on(
             row.container_exit_evidence.to_storage()?,
         ],
     )?;
+    Ok(())
+}
+
+fn reject_busy_resume_thread_on(conn: &Connection, row: &TaskRow) -> Result<(), AppError> {
+    let Workload::Agent(agent) = &row.workload else {
+        return Ok(());
+    };
+    if agent.agent.kind != crate::domain::AgentKind::Codex {
+        return Ok(());
+    }
+    let Some(thread) = agent.resume_thread else {
+        return Ok(());
+    };
+    let task: Option<String> = conn
+        .query_row(
+            "SELECT id FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND json_extract(workload_json, '$.type') = 'agent'
+               AND json_extract(workload_json, '$.agent') = 'codex'
+               AND json_extract(workload_json, '$.resume_thread') = ?1
+             ORDER BY created_at, id LIMIT 1",
+            [thread.to_string()],
+            |entry| entry.get(0),
+        )
+        .optional()?;
+    if let Some(task) = task {
+        return Err(AppError::ResumeThreadBusy {
+            thread,
+            task: task.parse()?,
+        });
+    }
     Ok(())
 }
 
@@ -812,6 +854,8 @@ pub struct TaskPresentation {
     pub id: TaskId,
     /// Nearest Git worktree root, captured when the executor accepted the task
     pub project_root: Option<PathBuf>,
+    /// Codex thread created by this task's worker, when the log included one
+    pub worker_thread: Option<ThreadId>,
     /// Owners from an accepted executor identity. Rejected and legacy tasks have none
     pub owners: Option<TaskOwners>,
     /// Typed origin-inbox ownership or legacy status for this task row
@@ -849,6 +893,7 @@ impl Store {
                 RELEASED_V0_5_1_SCHEMA_VERSION => migrate_29_to_current(&transaction)?,
                 RELEASED_V0_7_SCHEMA_VERSION => migrate_30_to_current(&transaction)?,
                 RELEASED_V0_8_SCHEMA_VERSION => migrate_31_to_current(&transaction)?,
+                RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -860,7 +905,7 @@ impl Store {
 
     /// Insert a queued task
     pub fn insert_task(&self, row: &TaskRow) -> Result<(), AppError> {
-        self.insert_task_with_project_root(row, None)
+        self.immediate(|| self.insert_task_with_project_root(row, None))
     }
 
     fn insert_task_with_project_root(
@@ -1333,7 +1378,7 @@ impl Store {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT t.id, t.project_root, e.identity_json
+                "SELECT t.id, t.project_root, e.identity_json, t.worker_thread
                  FROM tasks t LEFT JOIN executor_identities e ON e.task_id=t.id
                  WHERE t.id IN ({placeholders})"
             );
@@ -1342,6 +1387,7 @@ impl Store {
                 let raw_id: String = row.get(0)?;
                 let project_root: Option<String> = row.get(1)?;
                 let identity_json: Option<String> = row.get(2)?;
+                let raw_worker_thread: Option<String> = row.get(3)?;
                 let conversion_error = |error: AppError| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -1350,6 +1396,9 @@ impl Store {
                     )
                 };
                 let id = raw_id.parse().map_err(conversion_error)?;
+                let worker_thread = raw_worker_thread
+                    .map(|raw| raw.parse::<ThreadId>().map_err(conversion_error))
+                    .transpose()?;
                 let owners = match identity_json {
                     Some(json) => {
                         let identity: ExecutorIdentity =
@@ -1382,6 +1431,7 @@ impl Store {
                 Ok(TaskPresentation {
                     id,
                     project_root: project_root.map(PathBuf::from),
+                    worker_thread,
                     owners,
                     terminal_callback: TerminalCallbackProjection::Legacy(CallbackStatus::Pending),
                     attention_delivered: false,
@@ -1694,13 +1744,27 @@ impl Store {
         from: ProcessStatus,
         to: ProcessStatus,
     ) -> Result<Option<TaskRow>, AppError> {
+        self.cas_status_with_worker_thread(id, from, to, None)
+    }
+
+    /// CAS process status and save a worker thread in the same update
+    pub(crate) fn cas_status_with_worker_thread(
+        &self,
+        id: TaskId,
+        from: ProcessStatus,
+        to: ProcessStatus,
+        worker_thread: Option<ThreadId>,
+    ) -> Result<Option<TaskRow>, AppError> {
         check_status_transition(from, to)?;
         self.immediate(|| {
             let n = self.conn.execute(
-                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+                "UPDATE tasks SET status = ?1, updated_at = ?2,
+                    worker_thread = COALESCE(?3, worker_thread)
+                 WHERE id = ?4 AND status = ?5",
                 params![
                     to.as_str(),
                     fmt_time(Utc::now()),
+                    worker_thread.map(|thread| thread.to_string()),
                     id.to_string(),
                     from.as_str()
                 ],
@@ -1736,6 +1800,18 @@ impl Store {
         reason: &ExitReason,
         evidence: impl Into<TaskExitEvidence>,
     ) -> Result<Option<TaskRow>, AppError> {
+        self.cas_exit_with_evidence_and_worker_thread(id, from, reason, evidence, None)
+    }
+
+    /// Commit terminal state and the Codex worker thread in one transaction
+    pub(crate) fn cas_exit_with_evidence_and_worker_thread(
+        &self,
+        id: TaskId,
+        from: ProcessStatus,
+        reason: &ExitReason,
+        evidence: impl Into<TaskExitEvidence>,
+        worker_thread: Option<ThreadId>,
+    ) -> Result<Option<TaskRow>, AppError> {
         let evidence = &evidence.into();
         check_exit_evidence(from, reason, evidence)?;
         let to = ProcessStatus::from(reason);
@@ -1751,7 +1827,7 @@ impl Store {
                     message: "container evidence requires a container task".into(),
                 });
             }
-            self.cas_exit_inner(id, from, reason, evidence)
+            self.cas_exit_inner_with_worker_thread(id, from, reason, evidence, worker_thread)
         })
     }
 
@@ -1762,19 +1838,32 @@ impl Store {
         reason: &ExitReason,
         evidence: &TaskExitEvidence,
     ) -> Result<Option<TaskRow>, AppError> {
+        self.cas_exit_inner_with_worker_thread(id, from, reason, evidence, None)
+    }
+
+    fn cas_exit_inner_with_worker_thread(
+        &self,
+        id: TaskId,
+        from: ProcessStatus,
+        reason: &ExitReason,
+        evidence: &TaskExitEvidence,
+        worker_thread: Option<ThreadId>,
+    ) -> Result<Option<TaskRow>, AppError> {
         let to = ProcessStatus::from(reason);
         let now = fmt_time(Utc::now());
         let reason_json = serde_json::to_string(reason)?;
         let n = self.conn.execute(
             "UPDATE tasks SET status = ?1, exit_reason = ?2,
-                process_group_exit_evidence = ?3, container_exit_evidence = ?4, updated_at = ?5
-             WHERE id = ?6 AND status = ?7",
+                process_group_exit_evidence = ?3, container_exit_evidence = ?4,
+                updated_at = ?5, worker_thread = COALESCE(?6, worker_thread)
+             WHERE id = ?7 AND status = ?8",
             params![
                 to.as_str(),
                 reason_json,
                 evidence.process_group.as_str(),
                 evidence.container.to_storage()?,
                 now,
+                worker_thread.map(|thread| thread.to_string()),
                 id.to_string(),
                 from.as_str()
             ],
@@ -2381,8 +2470,8 @@ mod tests {
     use super::{
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
         RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
-        RELEASED_V0_8_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
-        write_exit_json_with_evidence,
+        RELEASED_V0_8_7_SCHEMA_VERSION, RELEASED_V0_8_SCHEMA_VERSION, Store, new_queued_task,
+        read_exit_json, write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -2422,6 +2511,7 @@ mod tests {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),
                 extra_args: vec!["--verbose".into()],
                 report_trailer: true,
+                resume_thread: None,
             }),
             cwd: Path::new("/tmp").to_path_buf(),
             timeout: Duration::from_secs(4 * 3600),
@@ -3726,6 +3816,41 @@ CREATE TABLE reports (
         assert_foreign_keys_enabled(&store);
     }
 
+    #[test]
+    fn released_v0_8_7_schema_gains_worker_thread_and_keeps_task_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            store
+                .conn
+                .execute_batch(&format!(
+                    "ALTER TABLE tasks DROP COLUMN worker_thread;
+                     PRAGMA user_version = {RELEASED_V0_8_7_SCHEMA_VERSION};"
+                ))
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(store.require_task(id).unwrap().id, id);
+        let worker_thread: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT worker_thread FROM tasks WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker_thread, None);
+    }
+
     fn assert_resource_tables_installed(store: &Store) {
         for table in [
             "resources",
@@ -3873,6 +3998,10 @@ CREATE TABLE reports (
                 )
                 .unwrap();
         }
+        store
+            .conn
+            .execute("ALTER TABLE tasks DROP COLUMN worker_thread", [])
+            .unwrap();
         if version < RELEASED_V0_7_SCHEMA_VERSION {
             store
                 .conn
@@ -3972,7 +4101,8 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN container_exit_evidence;
+                    "ALTER TABLE tasks DROP COLUMN worker_thread;
+                     ALTER TABLE tasks DROP COLUMN container_exit_evidence;
                      DROP TABLE task_containers;
                      DROP TABLE resource_requests;
                      CREATE TABLE resource_requests (
@@ -4034,6 +4164,10 @@ CREATE TABLE reports (
             drop_return_window_tables(&store);
             store
                 .conn
+                .execute("ALTER TABLE tasks DROP COLUMN worker_thread", [])
+                .unwrap();
+            store
+                .conn
                 .pragma_update(None, "user_version", RELEASED_V0_8_SCHEMA_VERSION)
                 .unwrap();
         }
@@ -4061,6 +4195,7 @@ CREATE TABLE reports (
                 .conn
                 .execute_batch(&format!(
                     "DROP TABLE resource_initial_idle_attestations;
+                     ALTER TABLE tasks DROP COLUMN worker_thread;
                      PRAGMA user_version = {RELEASED_V0_5_1_SCHEMA_VERSION};"
                 ))
                 .unwrap();

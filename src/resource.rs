@@ -1790,6 +1790,7 @@ mod tests {
                 prompt: "do work".into(),
                 extra_args: Vec::new(),
                 report_trailer: true,
+                resume_thread: None,
             }),
         }
     }

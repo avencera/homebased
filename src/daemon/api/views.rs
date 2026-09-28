@@ -58,6 +58,9 @@ pub struct TaskSummary {
     pub workload: WorkloadView,
     /// Submitting Codex thread.
     pub thread: ThreadId,
+    /// Codex thread created by the task worker, when the worker printed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_thread: Option<ThreadId>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Git worktree root captured when the executor accepted the task.
@@ -100,6 +103,7 @@ impl TaskSummary {
             status: row.status(),
             workload: WorkloadView::from(&row.workload),
             thread: row.thread,
+            worker_thread: presentation.and_then(|presentation| presentation.worker_thread),
             cwd: row.cwd.clone(),
             project_root: presentation.and_then(|presentation| presentation.project_root.clone()),
             origin_machine: owners.map(|owners| owners.origin_machine),
@@ -126,6 +130,20 @@ impl TaskSummary {
             updated_at: row.updated_at,
         }
     }
+}
+
+/// Private Codex settings used to resume a task from the local CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskFollowupSource {
+    /// Public API version.
+    pub api_version: u32,
+    /// Model selected by the source task.
+    pub model: Option<String>,
+    /// Extra arguments selected by the source task.
+    pub extra_args: Vec<String>,
+    /// Whether the source task fed the reporting trailer to Codex.
+    pub report_trailer: bool,
 }
 
 /// `GET /v1/tasks`.

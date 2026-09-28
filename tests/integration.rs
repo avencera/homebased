@@ -206,6 +206,10 @@ impl Harness {
         fs::read_to_string(self.record.join(format!("stdin-{id}.txt"))).unwrap()
     }
 
+    fn agent_meta(&self, id: &str) -> String {
+        fs::read_to_string(self.record.join(format!("agent-meta-{id}.txt"))).unwrap()
+    }
+
     fn opencode_meta(&self, id: &str) -> String {
         let path = self.record.join(format!("opencode-meta-{id}.txt"));
         assert!(wait_until(Duration::from_secs(10), || path.exists()));
@@ -541,6 +545,374 @@ fn submit_then_fake_codex_receives_event() {
 }
 
 #[test]
+fn codex_worker_thread_is_recorded_and_followup_resumes_the_worker() {
+    let h = Harness::new();
+    let cwd = h.dir.path().join("codex-workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    let mut spec = Harness::spec_with_cwd("codex", "original prompt", &cwd);
+    spec["workload"]["model"] = json!("gpt-6-luna");
+    spec["workload"]["extra_args"] = json!(["-c", "model_reasoning_effort=\"high\""]);
+    spec["workload"]["report_trailer"] = json!(false);
+    let source = h.submit(&spec);
+    let source_show = h.wait_status(&source, "succeeded");
+    assert_eq!(source_show["worker_thread"], worker_thread);
+
+    let list = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    assert!(list.status.success());
+    let listed: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["id"] == source && task["worker_thread"] == worker_thread })
+    );
+
+    let human = h.cmd().args(["task", "show", &source]).output().unwrap();
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains(&format!("worker thread {worker_thread}"))
+    );
+
+    let followup = h
+        .cmd()
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "Review the new information",
+            "--thread",
+            THREAD,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        followup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&followup.stderr)
+    );
+    let followup_json: Value = serde_json::from_slice(&followup.stdout).unwrap();
+    let followup_id = followup_json["id"].as_str().unwrap();
+    let followup_show = h.wait_status(followup_id, "succeeded");
+    assert_eq!(followup_show["worker_thread"], worker_thread);
+    let argv = h.agent_meta(followup_id);
+    assert!(
+        argv.contains(&format!(
+            "argv=exec -C {} -s danger-full-access --dangerously-bypass-approvals-and-sandbox -m gpt-6-luna -c model_reasoning_effort=\"high\" resume {worker_thread} -",
+            cwd.display()
+        )),
+        "{argv}"
+    );
+    assert_eq!(h.agent_stdin(followup_id), "Review the new information");
+
+    let conn = rusqlite::Connection::open(h.home.join("homebased.sqlite")).unwrap();
+    let workload_json: String = conn
+        .query_row(
+            "SELECT workload_json FROM tasks WHERE id=?1",
+            [followup_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workload: Value = serde_json::from_str(&workload_json).unwrap();
+    assert_eq!(workload["resume_thread"], worker_thread);
+    assert_eq!(workload["agent"], "codex");
+    assert_eq!(workload["model"], "gpt-6-luna");
+    assert_eq!(workload["extra_args"], spec["workload"]["extra_args"]);
+    assert_eq!(workload["report_trailer"], false);
+    let stored_cwd: String = conn
+        .query_row("SELECT cwd FROM tasks WHERE id=?1", [followup_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored_cwd, cwd.to_string_lossy().to_string());
+}
+
+#[test]
+fn task_followup_reports_each_blocker() {
+    let h = Harness::new();
+    h.set_control("sleep", "30");
+    let running = h.submit(&Harness::spec("codex", "keep running"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        h.show(&running)["status"] == "running"
+    }));
+    let running_error = followup_error(&h, &running);
+    assert_eq!(running_error["error"]["code"], "followup_unavailable");
+    assert_eq!(running_error["error"]["input"]["reason"], "not_terminal");
+    h.clear_controls();
+    let cancel = h.cmd().args(["task", "cancel", &running]).output().unwrap();
+    assert!(cancel.status.success());
+    h.wait_status(&running, "cancelled");
+
+    let claude = h.submit(&Harness::spec("claude", "not codex"));
+    h.wait_status(&claude, "succeeded");
+    let claude_error = followup_error(&h, &claude);
+    assert_eq!(claude_error["error"]["code"], "followup_unavailable");
+    assert_eq!(claude_error["error"]["input"]["reason"], "not_codex");
+
+    let codex = h.submit(&Harness::spec("codex", "no session header"));
+    let codex_show = h.wait_status(&codex, "succeeded");
+    assert!(codex_show.get("worker_thread").is_none());
+    let no_thread_error = followup_error(&h, &codex);
+    assert_eq!(no_thread_error["error"]["code"], "followup_unavailable");
+    assert_eq!(
+        no_thread_error["error"]["input"]["reason"],
+        "no_worker_thread"
+    );
+}
+
+#[test]
+fn task_followup_refuses_a_second_active_resume_then_allows_a_later_one() {
+    let h = Harness::new();
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    let source = h.submit(&Harness::spec("codex", "original"));
+    h.wait_status(&source, "succeeded");
+
+    h.set_control("sleep", "3");
+    let first = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "first follow-up",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_id = serde_json::from_slice::<Value>(&first.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let second = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "second follow-up",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(5));
+    let error: Value = serde_json::from_slice(&second.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "resume_thread_busy");
+    assert_eq!(error["error"]["input"]["thread"], worker_thread);
+    assert_eq!(error["error"]["input"]["task"], first_id);
+
+    h.wait_status(&first_id, "succeeded");
+    h.clear_controls();
+    let next = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "after the first event",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next_id = serde_json::from_slice::<Value>(&next.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.wait_status(&next_id, "succeeded");
+}
+
+#[test]
+fn followup_allows_a_worker_to_select_another_event_thread_when_requested() {
+    let h = Harness::new();
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    let source = h.submit(&Harness::spec("codex", "original"));
+    h.wait_status(&source, "succeeded");
+
+    let other_thread = "01a0e487-b877-76e2-9dc2-806bff0bf686";
+    register_thread(&h.user_home, other_thread);
+    let mismatch = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &source)
+        .env("CODEX_THREAD_ID", other_thread)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "wrong thread by default",
+            "--thread",
+            other_thread,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2));
+    let mismatch_error: Value = serde_json::from_slice(&mismatch.stderr).unwrap();
+    assert_eq!(mismatch_error["error"]["code"], "thread_mismatch");
+
+    let accepted = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &source)
+        .env("CODEX_THREAD_ID", other_thread)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "allow the other thread",
+            "--thread",
+            other_thread,
+            "--allow-other-thread",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let id = serde_json::from_slice::<Value>(&accepted.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.wait_status(&id, "succeeded");
+}
+
+#[test]
+fn followup_dry_run_reads_message_file_without_spawning() {
+    let h = Harness::new();
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    let source = h.submit(&Harness::spec("codex", "original"));
+    h.wait_status(&source, "succeeded");
+    let message_path = h.home.join("followup-message.txt");
+    fs::write(&message_path, "message from file").unwrap();
+
+    let before: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    let dry_run = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["--json", "task", "followup", &source, "--thread", THREAD])
+        .arg("--message-file")
+        .arg(&message_path)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(preview["spec"]["workload"]["prompt"], "message from file");
+    assert_eq!(preview["stdin"], "prompt_feed");
+    let argv: Vec<String> = serde_json::from_value(preview["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(3)
+            .any(|args| { args == ["resume", worker_thread, "-"] })
+    );
+    let after: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, before);
+
+    let local_request_id = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--thread",
+            THREAD,
+            "--message",
+            "local retry id",
+            "--request-id",
+            "01a0e487-b877-76e2-9dc2-806bff0bf687",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(local_request_id.status.code(), Some(2));
+    let request_error: Value = serde_json::from_slice(&local_request_id.stderr).unwrap();
+    assert_eq!(request_error["error"]["code"], "usage");
+}
+
+#[test]
+fn daemon_applies_exit_json_and_records_codex_worker_thread() {
+    let h = Harness::new();
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    h.set_control("sleep", "30");
+    let task = h.submit(&Harness::spec("codex", "hold"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        h.show(&task)["status"] == "running"
+    }));
+    let agent_pid = h.agent_pid(&task);
+    let output = h.home.join("tasks").join(&task).join("output.log");
+    assert!(wait_until(Duration::from_secs(5), || {
+        fs::read_to_string(&output)
+            .ok()
+            .is_some_and(|text| text.contains(&format!("session id: {worker_thread}")))
+    }));
+
+    let exit_path = h.home.join("tasks").join(&task).join("exit.json");
+    homebased::store::write_exit_json(&exit_path, &ExitReason::Exit { code: 0 }).unwrap();
+    let worker_pid = h.show(&task)["pid"].as_i64().unwrap() as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(worker_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-agent_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+
+    let finished = h.wait_status(&task, "succeeded");
+    assert_eq!(finished["worker_thread"], worker_thread);
+}
+
+fn followup_error(h: &Harness, task: &str) -> Value {
+    let output = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["--json", "task", "followup", task, "--message", "more work"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+#[test]
 fn daemon_restart_keeps_worker() {
     let mut h = Harness::new();
     let spec = Harness::spec("claude", "sleeping");
@@ -584,7 +956,9 @@ fn daemon_restart_keeps_worker() {
 #[test]
 fn kill9_worker_marks_lost() {
     let h = Harness::new();
-    let spec = Harness::spec("claude", "hold");
+    let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
+    h.set_control("stdout", &format!("session id: {worker_thread}\n"));
+    let spec = Harness::spec("codex", "hold");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     h.set_control("sleep", "20");
@@ -612,7 +986,8 @@ fn kill9_worker_marks_lost() {
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
-    h.wait_status(&id, "lost");
+    let lost = h.wait_status(&id, "lost");
+    assert_eq!(lost["worker_thread"], worker_thread);
     let msgs = h.wait_for_event(&id, "TASK_LOST");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     let ev = event_json(&msgs[0]);
@@ -2835,6 +3210,7 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
                 agent: Agent::new(AgentKind::Claude, None),
                 extra_args: vec![],
                 report_trailer: false,
+                resume_thread: None,
             }),
             cwd: std::env::temp_dir(),
             timeout: Duration::from_secs(2 * 3600),

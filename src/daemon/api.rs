@@ -18,14 +18,14 @@ use crate::cancellation::{
 };
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
-    ContainerDetail, LogTail, StatusBody, TaskDetail, TaskList, TaskSummary,
+    ContainerDetail, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList, TaskSummary,
 };
 use crate::daemon::cancel_delivery::CancelResponse;
 use crate::daemon::{AppState, web};
 use crate::domain::{
-    API_VERSION, ProcessStatus, TaskEnv, TaskId, TaskIdentity, ThreadId, Workload,
+    API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskIdentity, ThreadId, Workload,
 };
-use crate::error::AppError;
+use crate::error::{AppError, FollowupBlocker};
 use crate::files::{
     ContentOriginBody, DirectoryListing, PathToken, ResolveBody, ResolvedPath, list_directory,
     resolve_absolute_path,
@@ -74,11 +74,65 @@ pub fn write_routes() -> Router<AppState> {
 pub fn socket_router(state: AppState) -> Router {
     read_routes()
         .merge(write_routes())
+        .route("/v1/tasks/{id}/followup-source", get(followup_source))
         .merge(crate::daemon::fleet_api::socket_routes())
         .merge(crate::daemon::release_watcher_api::socket_routes())
         .merge(crate::daemon::resource_action::socket_routes())
         .merge(crate::daemon::resource_api::socket_routes())
         .with_state(state)
+}
+
+async fn followup_source(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TaskFollowupSource>, AppError> {
+    if let Some(row) = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await? {
+        return followup_source_from_workload(id, &row.workload).map(Json);
+    }
+    let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply })
+        .await?
+        .ok_or(AppError::TaskNotFound { id })?;
+    let spec = route.spec.current().ok_or_else(|| AppError::Internal {
+        message: format!("task {id} has no saved workload for followup"),
+    })?;
+    match &spec.workload {
+        NormalizedWorkload::Agent(agent) if agent.agent == AgentKind::Codex => {
+            Ok(Json(TaskFollowupSource {
+                api_version: API_VERSION,
+                model: agent.model.clone(),
+                extra_args: agent.extra_args.clone(),
+                report_trailer: agent.report_trailer,
+            }))
+        }
+        _ => Err(AppError::FollowupUnavailable {
+            task: id,
+            reason: FollowupBlocker::NotCodex,
+        }),
+    }
+}
+
+fn followup_source_from_workload(
+    id: TaskId,
+    workload: &Workload,
+) -> Result<TaskFollowupSource, AppError> {
+    let Workload::Agent(agent) = workload else {
+        return Err(AppError::FollowupUnavailable {
+            task: id,
+            reason: FollowupBlocker::NotCodex,
+        });
+    };
+    if agent.agent.kind != AgentKind::Codex {
+        return Err(AppError::FollowupUnavailable {
+            task: id,
+            reason: FollowupBlocker::NotCodex,
+        });
+    }
+    Ok(TaskFollowupSource {
+        api_version: API_VERSION,
+        model: agent.agent.model.clone(),
+        extra_args: agent.extra_args.clone(),
+        report_trailer: agent.report_trailer,
+    })
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {

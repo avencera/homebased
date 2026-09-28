@@ -16,9 +16,9 @@ pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`
 ///
-/// Released versions 1, 2, 27, 28, 29, 30, and 31 migrate in place to this version
+/// Released versions 1, 2, and 27 through 32 migrate in place to this version
 /// Unreleased development versions 3 through 26 are refused
-pub const SCHEMA_VERSION: i64 = 32;
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;
@@ -823,6 +823,9 @@ pub struct AgentWorkload {
     /// Whether the reporting trailer is fed to the child
     #[serde(default = "default_true")]
     pub report_trailer: bool,
+    /// Existing Codex conversation to resume
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_thread: Option<ThreadId>,
 }
 
 fn default_true() -> bool {
@@ -1456,6 +1459,7 @@ mod tests {
             agent: Agent::new(AgentKind::Claude, Some("fable".into())),
             extra_args: vec![],
             report_trailer: true,
+            resume_thread: None,
         });
         assert_eq!(display_name(Some(&name), &agent), "my job");
         assert_eq!(workload_display_name(&agent), "claude/fable");
@@ -1463,6 +1467,7 @@ mod tests {
             agent: Agent::new(AgentKind::Grok, None),
             extra_args: vec![],
             report_trailer: true,
+            resume_thread: None,
         });
         assert_eq!(workload_display_name(&agent_bare), "grok");
         let task = Workload::Task(TaskWorkload {

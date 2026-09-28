@@ -187,6 +187,58 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             .map_or(AppError::Internal { message }, |task| {
                 AppError::TaskNotStarted { task }
             }),
+        "followup_unavailable" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let reason = input
+                .get("reason")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (task, reason) {
+                (Some(task), Some(reason)) => AppError::FollowupUnavailable { task, reason },
+                _ => AppError::Internal { message },
+            }
+        }
+        "resume_thread_busy" => {
+            let thread = input
+                .get("thread")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (thread, task) {
+                (Some(thread), Some(task)) => AppError::ResumeThreadBusy { thread, task },
+                _ => AppError::Internal { message },
+            }
+        }
+        "followup_wrong_machine" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let origin_machine = input
+                .get("origin_machine")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let execution_machine = input
+                .get("execution_machine")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (task, origin_machine, execution_machine) {
+                (Some(task), Some(origin_machine), Some(execution_machine)) => {
+                    AppError::FollowupWrongMachine {
+                        task,
+                        origin_machine,
+                        execution_machine,
+                    }
+                }
+                _ => AppError::Internal { message },
+            }
+        }
         "cluster_task_conflict" => input
             .get("task")
             .cloned()
@@ -324,6 +376,13 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 .unwrap_or(&message)
                 .to_string(),
         },
+        "message_to_self" => input
+            .get("thread")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map_or(AppError::Internal { message }, |thread| {
+                AppError::MessageToSelf { thread }
+            }),
         "agent_thread_not_found" => AppError::AgentThreadNotFound {
             selector: input
                 .get("selector")
@@ -481,6 +540,35 @@ mod tests {
             }
         ));
         assert_eq!(error.code(), "agent_configuration");
+    }
+
+    #[test]
+    fn followup_and_message_to_self_errors_round_trip() {
+        let errors = [
+            AppError::FollowupUnavailable {
+                task: crate::domain::TaskId::new(),
+                reason: crate::error::FollowupBlocker::NoWorkerThread,
+            },
+            AppError::MessageToSelf {
+                thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
+            },
+            AppError::ResumeThreadBusy {
+                thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
+                task: crate::domain::TaskId::new(),
+            },
+            AppError::FollowupWrongMachine {
+                task: crate::domain::TaskId::new(),
+                origin_machine: crate::machine::MachineId::new(),
+                execution_machine: crate::machine::MachineId::new(),
+            },
+        ];
+        for original in errors {
+            let body = serde_json::to_vec(&original.to_json()).unwrap();
+            let mapped = map_error(original.http_status(), &body);
+            assert_eq!(mapped.code(), original.code());
+            assert_eq!(mapped.input(), original.input());
+            assert_eq!(mapped.to_string(), original.to_string());
+        }
     }
 
     #[test]

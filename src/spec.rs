@@ -67,6 +67,9 @@ pub struct SubmitAgentWorkload {
     /// Append the reporting trailer to the child feed
     #[serde(default = "default_true")]
     pub report_trailer: bool,
+    /// Resume this Codex thread
+    #[serde(default)]
+    pub resume_thread: Option<ThreadId>,
 }
 
 /// Wire task workload: argv only. Command is validated after deserialize so
@@ -115,6 +118,7 @@ struct SubmitSpecWire {
 /// the command shape are pulled from their owning types so they cannot drift
 fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let agent_kind = subschema::<AgentKind>(generator);
+    let resume_thread = subschema::<Option<ThreadId>>(generator);
     let command = subschema::<CommandLine>(generator);
     let container = container_workload_schema(false);
     schemars::json_schema!({
@@ -131,7 +135,8 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
                     "prompt": { "type": "string" },
                     "prompt_file": { "type": "string" },
                     "extra_args": { "type": "array", "items": { "type": "string" } },
-                    "report_trailer": { "type": "boolean", "default": true }
+                    "report_trailer": { "type": "boolean", "default": true },
+                    "resume_thread": resume_thread
                 },
                 "required": ["type", "agent"],
                 "additionalProperties": false,
@@ -253,6 +258,8 @@ pub struct SubmitAgent {
     pub extra_args: Vec<String>,
     /// Trailer flag
     pub report_trailer: bool,
+    /// Thread to resume when the agent is Codex
+    pub resume_thread: Option<ThreadId>,
 }
 
 /// Validated submit workload before prompt resolution
@@ -304,6 +311,9 @@ pub struct NormalizedAgentWorkload {
     pub extra_args: Vec<String>,
     /// Trailer flag
     pub report_trailer: bool,
+    /// Thread to resume when the agent is Codex
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_thread: Option<ThreadId>,
 }
 
 /// Normalized task workload
@@ -427,6 +437,7 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
             message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
+    validate_resume_thread_field(kind, &content)?;
     match kind {
         "agent" => {
             let agent: NormalizedAgentWorkload = deserialize_under(&content, "/workload")?;
@@ -571,6 +582,7 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
             message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
+    validate_resume_thread_field(kind, &content)?;
     match kind {
         "agent" => {
             let agent: SubmitAgentWorkload = deserialize_under(&content, "/workload")?;
@@ -585,6 +597,7 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
                 prompt,
                 extra_args: agent.extra_args,
                 report_trailer: agent.report_trailer,
+                resume_thread: agent.resume_thread,
             }))
         }
         "task" => {
@@ -602,6 +615,21 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
             message: WORKLOAD_TYPE_MESSAGE.into(),
         }),
     }
+}
+
+fn validate_resume_thread_field(kind: &str, workload: &Value) -> Result<(), AppError> {
+    if let Some(resume_thread) = workload
+        .get("resume_thread")
+        .filter(|value| !value.is_null())
+        && (kind != "agent" || workload.get("agent").and_then(Value::as_str) != Some("codex"))
+    {
+        return Err(AppError::InvalidSpec {
+            pointer: "/workload/resume_thread".into(),
+            value: resume_thread.clone(),
+            message: "resume_thread is only valid with agent: codex".into(),
+        });
+    }
+    Ok(())
 }
 
 fn invalid_agent_extra_args(workload: &Value, error: OpenCodeExtraArgsError) -> AppError {
@@ -671,6 +699,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
                 prompt,
                 extra_args: agent.extra_args.clone(),
                 report_trailer: agent.report_trailer,
+                resume_thread: agent.resume_thread,
             })
         }
         SubmitWorkloadValidated::Task { command } => {
@@ -952,6 +981,30 @@ mod tests {
     }
 
     #[test]
+    fn resume_thread_is_rejected_for_non_codex_agents() {
+        let mut value = valid_agent();
+        value["workload"]["resume_thread"] = json!("01a0e487-b877-76e2-9dc2-806bff0bf685");
+        let err = parse_spec_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::InvalidSpec { pointer, value, .. }
+                if pointer == "/workload/resume_thread"
+                    && value == json!("01a0e487-b877-76e2-9dc2-806bff0bf685")
+        ));
+    }
+
+    #[test]
+    fn null_resume_thread_is_accepted_for_non_codex_agents() {
+        let mut value = valid_agent();
+        value["workload"]["resume_thread"] = Value::Null;
+        let parsed = parse_spec_value(&value).unwrap();
+        let SubmitWorkloadValidated::Agent(agent) = parsed.workload else {
+            panic!("expected agent workload");
+        };
+        assert_eq!(agent.resume_thread, None);
+    }
+
+    #[test]
     fn opencode_accepts_provider_qualified_models_and_preserves_variants() {
         for model in [
             Some("zai-coding-plan/glm-5.3-flash"),
@@ -1021,6 +1074,7 @@ mod tests {
                 prompt: PromptSource::File(PathBuf::from("p.txt")),
                 extra_args: vec![],
                 report_trailer: true,
+                resume_thread: None,
             }),
         };
         let normalized = normalize(&spec).unwrap();

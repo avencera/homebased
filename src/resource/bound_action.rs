@@ -55,7 +55,7 @@ pub enum ResourceActionLaunch {
     /// The returning background task for the return action
     Return {
         /// Typed work chosen by the supervisor
-        work: ReturnWork,
+        work: Box<ReturnWork>,
     },
 }
 

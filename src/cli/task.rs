@@ -9,7 +9,11 @@ use serde_json::{Value, json};
 use crate::callback::destination::SubmitOrigin;
 use crate::callback::{last_event_for_row, notify_event};
 use crate::client::Client;
-use crate::domain::{ProcessStatus, ReportOutcome, TaskId, ThreadId};
+use crate::daemon::api::views::TaskFollowupSource;
+use crate::daemon::fleet_api::MachinesBody;
+use crate::domain::{
+    ProcessStatus, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId, ThreadId,
+};
 use crate::error::AppError;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
@@ -26,6 +30,36 @@ pub enum TaskCommand {
         /// Spec file, or `-` for stdin.
         #[arg(long)]
         spec: String,
+        /// Validate and print argv; spawn nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stable UUID for retry after a lost remote submission response
+        #[arg(long)]
+        request_id: Option<uuid::Uuid>,
+        /// Let a Homebased worker send events to a thread other than its parent task's thread
+        #[arg(long)]
+        allow_other_thread: bool,
+    },
+    /// Resume a finished Codex worker with more information.
+    Followup {
+        /// Full source task UUID.
+        task: TaskId,
+        /// Prompt text. Exactly one of this or `--message-file` is required.
+        #[arg(
+            long,
+            required_unless_present = "message_file",
+            conflicts_with = "message_file"
+        )]
+        message: Option<String>,
+        /// Prompt file. Exactly one of this or `--message` is required.
+        #[arg(long, required_unless_present = "message", conflicts_with = "message")]
+        message_file: Option<String>,
+        /// Thread that receives events for the follow-up task.
+        #[arg(long)]
+        thread: Option<ThreadId>,
+        /// Name for the follow-up task.
+        #[arg(long)]
+        name: Option<String>,
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
@@ -85,6 +119,16 @@ pub enum TaskCommand {
     },
 }
 
+struct FollowupOptions {
+    message: Option<String>,
+    message_file: Option<String>,
+    thread: Option<ThreadId>,
+    name: Option<String>,
+    dry_run: bool,
+    request_id: Option<uuid::Uuid>,
+    allow_other_thread: bool,
+}
+
 /// Dispatch a task command.
 pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> {
     match command {
@@ -94,6 +138,31 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             request_id,
             allow_other_thread,
         } => submit(ctx, &spec, dry_run, request_id, allow_other_thread).await,
+        TaskCommand::Followup {
+            task,
+            message,
+            message_file,
+            thread,
+            name,
+            dry_run,
+            request_id,
+            allow_other_thread,
+        } => {
+            followup(
+                ctx,
+                task,
+                FollowupOptions {
+                    message,
+                    message_file,
+                    thread,
+                    name,
+                    dry_run,
+                    request_id,
+                    allow_other_thread,
+                },
+            )
+            .await
+        }
         TaskCommand::Schema => schema(ctx),
         TaskCommand::List { status, thread } => list(ctx, status, thread).await,
         TaskCommand::Show { id } => show(ctx, id).await,
@@ -118,6 +187,16 @@ async fn submit(
 ) -> Result<ExitCode, AppError> {
     let spec = load_spec(spec_path)?;
     let normalized = spec::normalize(&spec)?;
+    submit_normalized(ctx, normalized, dry_run, request_id, allow_other_thread).await
+}
+
+async fn submit_normalized(
+    ctx: &Ctx,
+    normalized: crate::spec::NormalizedSpec,
+    dry_run: bool,
+    request_id: Option<uuid::Uuid>,
+    allow_other_thread: bool,
+) -> Result<ExitCode, AppError> {
     if normalized.machine.is_none() {
         spec::check_cwd(&normalized.cwd)?;
     }
@@ -157,6 +236,202 @@ async fn submit(
         .to_string();
     ctx.print_id(&id, &format!("submitted {id}"), value)?;
     Ok(ExitCode::SUCCESS)
+}
+
+async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<ExitCode, AppError> {
+    let FollowupOptions {
+        message,
+        message_file,
+        thread,
+        name,
+        dry_run,
+        request_id,
+        allow_other_thread,
+    } = options;
+    let client = Client::new(ctx.home.sock_path());
+    let detail = client.get(&format!("/v1/tasks/{task}")).await?;
+    let terminal = detail
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(|status| ProcessStatus::from_storage(status).ok())
+        .is_some_and(ProcessStatus::is_terminal);
+    if !terminal {
+        return Err(followup_unavailable(
+            task,
+            crate::error::FollowupBlocker::NotTerminal,
+        ));
+    }
+    let (local_machine, execution_machine, machine) =
+        followup_machines(&client, task, &detail).await?;
+    if detail.get("availability").and_then(Value::as_str) != Some("available") {
+        return Err(AppError::TaskUnavailable {
+            task,
+            machine: execution_machine,
+        });
+    }
+
+    let source: TaskFollowupSource = serde_json::from_value(
+        client
+            .get(&format!("/v1/tasks/{task}/followup-source"))
+            .await?,
+    )
+    .map_err(|error| AppError::Internal {
+        message: format!("invalid task followup source: {error}"),
+    })?;
+    if source.api_version != crate::domain::API_VERSION {
+        return Err(AppError::Internal {
+            message: "task followup source uses an unsupported API version".into(),
+        });
+    }
+    let resume_thread = detail
+        .get("worker_thread")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<ThreadId>().ok())
+        .ok_or_else(|| followup_unavailable(task, crate::error::FollowupBlocker::NoWorkerThread))?;
+
+    let thread = select_followup_thread(thread)?;
+    let name = name.unwrap_or_else(|| followup_name(detail.get("display_name")));
+    let prompt = read_followup_message(message, message_file)?;
+    let cwd = detail
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal {
+            message: "task detail has no working directory".into(),
+        })?;
+    let timeout_secs = detail
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AppError::Internal {
+            message: "task detail has no timeout".into(),
+        })?;
+    let mut submit_spec = json!({
+        "api_version": crate::domain::API_VERSION,
+        "thread": thread,
+        "name": name,
+        "cwd": cwd,
+        "machine": machine,
+        "timeout": format!("{timeout_secs}s"),
+        "workload": {
+            "type": "agent",
+            "agent": "codex",
+            "model": source.model,
+            "prompt": prompt,
+            "extra_args": source.extra_args,
+            "report_trailer": source.report_trailer,
+            "resume_thread": resume_thread,
+        },
+    });
+    if local_machine == execution_machine
+        && let Some(object) = submit_spec.as_object_mut()
+    {
+        let _ = object.remove("machine");
+    }
+    let parsed = spec::parse_spec_value(&submit_spec)?;
+    let normalized = spec::normalize(&parsed)?;
+    submit_normalized(ctx, normalized, dry_run, request_id, allow_other_thread).await
+}
+
+fn followup_unavailable(task: TaskId, reason: crate::error::FollowupBlocker) -> AppError {
+    AppError::FollowupUnavailable { task, reason }
+}
+
+fn select_followup_thread(explicit: Option<ThreadId>) -> Result<ThreadId, AppError> {
+    if let Some(thread) = explicit {
+        return Ok(thread);
+    }
+    for key in THREAD_ENV_VARS {
+        let Some(value) = std::env::var_os(key) else {
+            continue;
+        };
+        let value = value.to_str().ok_or_else(|| AppError::Usage {
+            message: format!("{key} must be a UUID"),
+        })?;
+        return value.parse().map_err(|error: AppError| AppError::Usage {
+            message: format!("{key} must be a thread UUID: {error}"),
+        });
+    }
+    Err(AppError::Usage {
+        message:
+            "pass --thread or set CODEX_THREAD_ID, CODEX_SESSION_ID, or CLAUDE_CODE_SESSION_ID"
+                .into(),
+    })
+}
+
+fn followup_name(display_name: Option<&Value>) -> String {
+    let display_name = display_name.and_then(Value::as_str).unwrap_or("task");
+    format!("follow up: {display_name}")
+        .chars()
+        .take(TASK_NAME_MAX_CHARS)
+        .collect()
+}
+
+fn read_followup_message(
+    message: Option<String>,
+    message_file: Option<String>,
+) -> Result<String, AppError> {
+    match (message, message_file) {
+        (Some(message), None) => Ok(message),
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).map_err(|error| AppError::FileNotFound {
+                message: format!("read follow-up message {path}: {error}"),
+            })
+        }
+        _ => Err(AppError::Usage {
+            message: "exactly one of --message or --message-file is required".into(),
+        }),
+    }
+}
+
+async fn followup_machines(
+    client: &Client,
+    task: TaskId,
+    detail: &Value,
+) -> Result<
+    (
+        crate::machine::MachineId,
+        crate::machine::MachineId,
+        Option<String>,
+    ),
+    AppError,
+> {
+    let origin_machine = detail
+        .get("origin_machine")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Usage {
+            message: "task detail does not identify its origin machine".into(),
+        })?
+        .parse::<crate::machine::MachineId>()?;
+    let execution_machine = detail
+        .get("execution_machine")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Usage {
+            message: "task detail does not identify its execution machine".into(),
+        })?
+        .parse::<crate::machine::MachineId>()?;
+    let inventory: MachinesBody = serde_json::from_value(client.get("/v1/fleet/machines").await?)
+        .map_err(|error| AppError::Internal {
+        message: format!("invalid Fleet machine list: {error}"),
+    })?;
+    if inventory.local.machine != origin_machine && inventory.local.machine != execution_machine {
+        return Err(AppError::FollowupWrongMachine {
+            task,
+            origin_machine,
+            execution_machine,
+        });
+    }
+    let machine = if inventory.local.machine == execution_machine {
+        None
+    } else {
+        let peer = inventory
+            .machines
+            .iter()
+            .find(|peer| peer.machine == execution_machine)
+            .ok_or_else(|| AppError::MachineNotFound {
+                machine: execution_machine.to_string(),
+            })?;
+        Some(peer.name.to_string())
+    };
+    Ok((inventory.local.machine, execution_machine, machine))
 }
 
 fn submission_request_id(
@@ -262,6 +537,9 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
                 workload_label(&value),
                 check
             );
+            if let Some(worker_thread) = value.get("worker_thread").and_then(Value::as_str) {
+                println!("  worker thread {worker_thread}");
+            }
             print_waiting_events(&value);
         }
     }
@@ -479,6 +757,7 @@ mod tests {
                 agent: Agent::new(AgentKind::Claude, None),
                 extra_args: Vec::new(),
                 report_trailer: false,
+                resume_thread: None,
             }),
             cwd: directory.path().to_path_buf(),
             timeout: Duration::from_secs(4 * 3600),

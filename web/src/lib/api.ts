@@ -122,6 +122,8 @@ export interface TaskSummary {
 	workload: WorkloadView;
 	/** Submitting Codex thread or Claude Code session. */
 	thread: string;
+	/** Codex thread created by the task worker, when the worker printed one. */
+	worker_thread?: string;
 	cwd: string;
 	/** Git worktree root that the executor found, when there is one. */
 	project_root?: string | null;
@@ -307,6 +309,7 @@ const TaskSummarySchema = Schema.Struct({
 	status: ProcessStatusSchema,
 	workload: WorkloadSchema,
 	thread: Schema.String,
+	worker_thread: Schema.optional(Schema.String),
 	cwd: Schema.String,
 	project_root: Schema.optional(Schema.NullOr(Schema.String)),
 	origin_machine: Schema.optional(Schema.String),
@@ -340,6 +343,7 @@ const TaskDetailSchema = Schema.Struct({
 	status: ProcessStatusSchema,
 	workload: WorkloadSchema,
 	thread: Schema.String,
+	worker_thread: Schema.optional(Schema.String),
 	cwd: Schema.String,
 	origin_machine: Schema.optional(Schema.String),
 	execution_machine: Schema.optional(Schema.String),

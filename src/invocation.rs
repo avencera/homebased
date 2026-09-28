@@ -380,6 +380,7 @@ pub fn invocation_from_normalized_for_identity(
                     model: agent.model.as_deref(),
                     cwd,
                     extra_args: &agent.extra_args,
+                    resume_thread: agent.resume_thread,
                 },
                 &binary,
                 feed,
@@ -442,6 +443,7 @@ pub fn invocation_from_workload_for_identity(
                     model: agent.agent.model.as_deref(),
                     cwd,
                     extra_args: &agent.extra_args,
+                    resume_thread: agent.resume_thread,
                 },
                 binary,
                 agent_prompt_feed,
@@ -487,6 +489,7 @@ pub fn persist_agent_workload(agent: &NormalizedAgentWorkload) -> AgentWorkload 
         agent: crate::domain::Agent::new(agent.agent, agent.model.clone()),
         extra_args: agent.extra_args.clone(),
         report_trailer: agent.report_trailer,
+        resume_thread: agent.resume_thread,
     }
 }
 

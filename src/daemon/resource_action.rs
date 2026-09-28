@@ -279,7 +279,9 @@ pub(crate) async fn submit(
                 state,
                 authority,
                 Some((request_id, task_id)),
-                ResourceActionLaunch::Return { work },
+                ResourceActionLaunch::Return {
+                    work: Box::new(work),
+                },
             )
             .await
         }
@@ -572,7 +574,7 @@ async fn create_route(
                 launch: ReturnLaunch {
                     request_id,
                     task_id,
-                    work: work.clone(),
+                    work: work.as_ref().clone(),
                 },
             }
         }
@@ -688,7 +690,7 @@ async fn send_saved_launch(
             launch: ReturnLaunch {
                 request_id: route.request,
                 task_id: route.task,
-                work: work.clone(),
+                work: work.as_ref().clone(),
             },
             normalized_spec_sha256: task.normalized_spec_sha256,
         },

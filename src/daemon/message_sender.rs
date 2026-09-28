@@ -28,6 +28,7 @@ pub(crate) async fn send(
     request: MessageSendRequest,
 ) -> Result<MessageSendResponse, AppError> {
     request.validate()?;
+    let local = state.machine.identity.machine;
     let binding = call(&state.store, |reply| StoreMsg::BeginOutboundMessage {
         request: request.clone(),
         reply,
@@ -37,6 +38,7 @@ pub(crate) async fn send(
         bound @ OutboundMessageBinding::Bound { .. } => bound,
         OutboundMessageBinding::Resolving { request } => {
             let (destination, recipient) = resolve_target(state, &request.target).await?;
+            reject_message_to_self(&request, local, destination, &recipient)?;
             call(&state.store, |reply| StoreMsg::BindOutboundMessage {
                 request: request.clone(),
                 destination_machine: destination,
@@ -56,7 +58,6 @@ pub(crate) async fn send(
             message: "outbound message route did not resolve".into(),
         });
     };
-    let local = state.machine.identity.machine;
     let source = source_route(request.source.clone(), local);
     let protocol_version;
     let receipt = if destination == local {
@@ -120,6 +121,24 @@ async fn resolve_target(
             Ok((machine, Recipient::Thread { thread }))
         }
     }
+}
+
+fn reject_message_to_self(
+    request: &MessageSendRequest,
+    local: MachineId,
+    destination: MachineId,
+    recipient: &Recipient,
+) -> Result<(), AppError> {
+    if destination == local
+        && let MessageSourceSelector::Thread { thread } = &request.source
+        && let Recipient::Thread {
+            thread: destination_thread,
+        } = recipient
+        && *thread == *destination_thread
+    {
+        return Err(AppError::MessageToSelf { thread: *thread });
+    }
+    Ok(())
 }
 
 async fn resolve_machine(state: &AppState, selector: &str) -> Result<MachineId, AppError> {

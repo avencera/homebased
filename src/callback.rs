@@ -904,6 +904,7 @@ mod tests {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),
                 extra_args: vec![],
                 report_trailer: true,
+                resume_thread: None,
             }),
             cwd: PathBuf::from("/work"),
             timeout: Duration::from_secs(4 * 3600),
@@ -972,6 +973,7 @@ mod tests {
             agent: Agent::new(AgentKind::Codex, Some("gpt-5.6-luna".into())),
             extra_args: vec!["--config".into(), "model_reasoning_effort=\"max\"".into()],
             report_trailer: true,
+            resume_thread: None,
         });
         let json = serde_json::to_value(WorkloadView::from(&workload)).unwrap();
         assert_eq!(
@@ -1036,6 +1038,7 @@ mod tests {
             agent: Agent::new(AgentKind::Codex, Some("gpt-5.6-luna".into())),
             extra_args: extra_args.to_vec(),
             report_trailer: true,
+            resume_thread: None,
         })
     }
 

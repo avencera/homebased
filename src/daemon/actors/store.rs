@@ -876,6 +876,7 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         from: ProcessStatus,
         to: ProcessStatus,
+        worker_thread: Option<crate::domain::ThreadId>,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
     /// Compare-and-swap to the status the reason implies, storing the reason
@@ -884,6 +885,15 @@ pub(crate) enum StoreMsg {
         from: ProcessStatus,
         reason: ExitReason,
         evidence: TaskExitEvidence,
+        reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
+    },
+    /// Compare-and-swap to a terminal status and record a worker thread
+    CasExitWithWorkerThread {
+        id: TaskId,
+        from: ProcessStatus,
+        reason: ExitReason,
+        evidence: TaskExitEvidence,
+        worker_thread: Option<crate::domain::ThreadId>,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
     /// Record the worker pid
@@ -1591,8 +1601,12 @@ impl Actor for StoreActor {
                 id,
                 from,
                 to,
+                worker_thread,
                 reply,
-            } => send_reply(reply, state.cas_status(id, from, to)),
+            } => send_reply(
+                reply,
+                state.cas_status_with_worker_thread(id, from, to, worker_thread),
+            ),
             StoreMsg::CasExit {
                 id,
                 from,
@@ -1602,6 +1616,23 @@ impl Actor for StoreActor {
             } => send_reply(
                 reply,
                 state.cas_exit_with_evidence(id, from, &reason, evidence),
+            ),
+            StoreMsg::CasExitWithWorkerThread {
+                id,
+                from,
+                reason,
+                evidence,
+                worker_thread,
+                reply,
+            } => send_reply(
+                reply,
+                state.cas_exit_with_evidence_and_worker_thread(
+                    id,
+                    from,
+                    &reason,
+                    evidence,
+                    worker_thread,
+                ),
             ),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
             StoreMsg::ClaimContainerAdoption { id, limit, reply } => {

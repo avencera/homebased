@@ -52,6 +52,34 @@ pub enum AppError {
         /// Task that did not start
         task: TaskId,
     },
+    /// A task cannot be resumed as a Codex worker
+    #[error("task {task} cannot be followed up: {reason}")]
+    FollowupUnavailable {
+        /// Source task
+        task: TaskId,
+        /// Why this task cannot be resumed
+        reason: FollowupBlocker,
+    },
+    /// A Codex thread already has an active resume task
+    #[error("thread {thread} is already being resumed by task {task}; wait for its event")]
+    ResumeThreadBusy {
+        /// Codex thread requested by the new task
+        thread: ThreadId,
+        /// Active task already resuming the thread
+        task: TaskId,
+    },
+    /// Follow-up was requested on a machine that does not own the task
+    #[error(
+        "task {task} must be followed up on its origin machine {origin_machine} or execution machine {execution_machine}; run `homebased task followup` on either machine"
+    )]
+    FollowupWrongMachine {
+        /// Source task
+        task: TaskId,
+        /// Machine that owns callbacks for the source task
+        origin_machine: MachineId,
+        /// Machine that ran the source task
+        execution_machine: MachineId,
+    },
     /// Spec `cwd` is missing or not a directory
     #[error("cwd not found: {}", path.display())]
     CwdNotFound {
@@ -323,6 +351,14 @@ pub enum AppError {
         /// Why the message request is invalid
         message: String,
     },
+    /// A message destination is the sender's own thread
+    #[error(
+        "destination thread {thread} is the sender's own thread; --task targets the task's origin thread, not its worker; use `homebased task followup` for a finished Codex worker"
+    )]
+    MessageToSelf {
+        /// Thread that is both sender and destination
+        thread: ThreadId,
+    },
     /// No local Codex session matches the requested destination
     #[error("agent thread not found for {selector}")]
     AgentThreadNotFound {
@@ -447,6 +483,23 @@ pub enum AppError {
     },
 }
 
+/// Why a task cannot be resumed as a Codex worker
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowupBlocker {
+    /// The task workload is not a Codex agent
+    #[error("the workload is not a Codex agent")]
+    NotCodex,
+    /// The task has no known terminal status
+    #[error("the task is not terminal")]
+    NotTerminal,
+    /// The task has no recorded Codex worker thread
+    #[error("the task has no recorded worker thread")]
+    NoWorkerThread,
+}
+
 impl AppError {
     /// Machine-readable code from `plan §CLI`
     #[must_use]
@@ -457,6 +510,9 @@ impl AppError {
             Self::ClusterLookupIncomplete { .. } => "cluster_lookup_incomplete",
             Self::TaskUnavailable { .. } => "task_unavailable",
             Self::TaskNotStarted { .. } => "task_not_started",
+            Self::FollowupUnavailable { .. } => "followup_unavailable",
+            Self::ResumeThreadBusy { .. } => "resume_thread_busy",
+            Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
             Self::CwdNotFound { .. } => "cwd_not_found",
             Self::ExecutableMissing { .. } => "executable_missing",
             Self::SummaryTooLong { .. } => "summary_too_long",
@@ -495,6 +551,7 @@ impl AppError {
             Self::ResourceCancellationUnavailable { .. } => "resource_cancellation_unavailable",
             Self::EventContentConflict { .. } => "event_content_conflict",
             Self::MessageInvalid { .. } => "message_invalid",
+            Self::MessageToSelf { .. } => "message_to_self",
             Self::AgentThreadNotFound { .. } => "agent_thread_not_found",
             Self::MessageConflict { .. } => "message_conflict",
             Self::MessageDeliveryFailed { .. } => "message_delivery_failed",
@@ -536,6 +593,8 @@ impl AppError {
             | Self::SummaryTooLong { .. }
             | Self::MessageInvalid { .. }
             | Self::Usage { .. }
+            | Self::MessageToSelf { .. }
+            | Self::FollowupWrongMachine { .. }
             | Self::ConfigInvalid { .. }
             | Self::NotifyNotConfigured => 2,
             Self::AgentConfiguration { .. } => 1,
@@ -553,6 +612,8 @@ impl AppError {
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
+            | Self::FollowupUnavailable { .. }
+            | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
             | Self::HostUnitHomeMismatch { .. }
@@ -590,6 +651,8 @@ impl AppError {
             | Self::Usage { .. }
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. } => http::StatusCode::BAD_REQUEST,
+            Self::MessageToSelf { .. } => http::StatusCode::BAD_REQUEST,
+            Self::FollowupWrongMachine { .. } => http::StatusCode::BAD_REQUEST,
             Self::NotifyNotConfigured => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
@@ -604,6 +667,8 @@ impl AppError {
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
+            | Self::FollowupUnavailable { .. }
+            | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
             | Self::HostUnitHomeMismatch { .. }
@@ -668,12 +733,25 @@ impl AppError {
     pub fn input(&self) -> Value {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
+            Self::FollowupUnavailable { task, reason } => {
+                json!({ "task": task, "reason": reason })
+            }
             Self::ClusterLookupIncomplete { task, unchecked } => {
                 json!({ "task": task, "unchecked": unchecked })
             }
             Self::TaskUnavailable { task, machine } => {
                 json!({ "task": task, "machine": machine })
             }
+            Self::ResumeThreadBusy { thread, task } => json!({ "thread": thread, "task": task }),
+            Self::FollowupWrongMachine {
+                task,
+                origin_machine,
+                execution_machine,
+            } => json!({
+                "task": task,
+                "origin_machine": origin_machine,
+                "execution_machine": execution_machine
+            }),
             Self::TaskNotStarted { task } => json!({ "task": task }),
             Self::RouteNotFound { task }
             | Self::ClusterTaskConflict { task }
@@ -682,6 +760,7 @@ impl AppError {
             }
             Self::EventContentConflict { task, seq } => json!({ "task": task, "seq": seq }),
             Self::MessageInvalid { message } => json!({ "message": message }),
+            Self::MessageToSelf { thread } => json!({ "thread": thread }),
             Self::AgentThreadNotFound { selector } => json!({ "selector": selector }),
             Self::MessageConflict { id } => json!({ "message_id": id }),
             Self::MessageDeliveryFailed { id, message } => {

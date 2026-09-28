@@ -1,9 +1,10 @@
 //! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
-    TaskRow, TaskState, Workload,
+    TaskRow, TaskState, ThreadId, Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
@@ -224,6 +225,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         &paths,
         &exit.reason,
         exit.process_group_exit_evidence.into(),
+        &row,
     )
 }
 
@@ -236,16 +238,56 @@ fn record_exit(
     paths: &TaskPaths,
     reason: &ExitReason,
     evidence: TaskExitEvidence,
+    row: &TaskRow,
 ) -> Result<(), AppError> {
     store::write_exit_json_with_evidence(&paths.exit_json, reason, evidence.clone())?;
+    let worker_thread = worker_thread(row, paths);
     if store
-        .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence)?
+        .cas_exit_with_evidence_and_worker_thread(
+            id,
+            ProcessStatus::Running,
+            reason,
+            evidence,
+            worker_thread,
+        )?
         .is_none()
     {
         let current = store.require_task(id)?;
         warn!(%id, status = %current.status(), "cas_exit failed");
     }
     Ok(())
+}
+
+const WORKER_THREAD_LOG_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Read the Codex worker thread from the task output when its workload is Codex
+pub(crate) fn worker_thread(row: &TaskRow, paths: &TaskPaths) -> Option<ThreadId> {
+    match &row.workload {
+        Workload::Agent(agent) if agent.agent.kind == crate::domain::AgentKind::Codex => {
+            codex_worker_thread(&paths.output)
+        }
+        _ => None,
+    }
+}
+
+fn codex_worker_thread(path: &Path) -> Option<ThreadId> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    let _ = file
+        .by_ref()
+        .take(WORKER_THREAD_LOG_PREFIX_BYTES as u64)
+        .read_to_end(&mut bytes);
+    parse_codex_worker_thread(&bytes)
+}
+
+fn parse_codex_worker_thread(log: &[u8]) -> Option<ThreadId> {
+    log.get(..log.len().min(WORKER_THREAD_LOG_PREFIX_BYTES))?
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| {
+            let line = std::str::from_utf8(line).ok()?.trim();
+            let uuid = line.strip_prefix("session id: ")?;
+            uuid.parse().ok()
+        })
 }
 
 async fn run_child(
@@ -552,6 +594,39 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn parses_codex_session_header_from_output_log() {
+        let thread: ThreadId = "01a0e487-b877-76e2-9dc2-806bff0bf685".parse().unwrap();
+        assert_eq!(
+            parse_codex_worker_thread(
+                format!("startup\n  session id: {thread}  \nmore output\n").as_bytes()
+            ),
+            Some(thread)
+        );
+    }
+
+    #[test]
+    fn absent_codex_session_header_is_not_recorded() {
+        assert_eq!(parse_codex_worker_thread(b"Codex started\nworking\n"), None);
+    }
+
+    #[test]
+    fn malformed_codex_session_header_is_not_recorded() {
+        assert_eq!(
+            parse_codex_worker_thread(
+                b"session id: not-a-uuid\nsession id: 01a0e487-b877-76e2-9dc2-806bff0bf685 extra\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_session_header_after_64_kib_is_ignored() {
+        let mut output = vec![b'x'; WORKER_THREAD_LOG_PREFIX_BYTES];
+        output.extend_from_slice(b"\nsession id: 01a0e487-b877-76e2-9dc2-806bff0bf685\n");
+        assert_eq!(parse_codex_worker_thread(&output), None);
+    }
 
     #[test]
     fn inherited_flock_held_after_parent_closes() {

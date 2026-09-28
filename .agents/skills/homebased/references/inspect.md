@@ -12,7 +12,7 @@ homebased --quiet task list --status running               # bare ids, one per l
 
 Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list.
 
-Each entry: `id`, `name`, `display_name`, `status`, `workload`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `display_name`. `name` is omitted only for tasks stored before it was required.
+Each entry: `id`, `name`, `display_name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is present for a Codex task when Homebased finds a session header in the first 64 KiB of `output.log`. It records the thread when the task ends, whether it succeeds, fails, is cancelled, or is lost. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `display_name`. `name` is omitted only for tasks stored before it was required.
 
 `task list` reads tasks stored on this machine. It does not query every Fleet peer.
 
@@ -28,6 +28,7 @@ homebased --json task show <id>
 | `display_name` | Non-empty label: the submitted name, or a workload fallback for unnamed stored rows. |
 | `status` | Process status, see above. |
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
+| `worker_thread` | Codex worker thread UUID, when Homebased found a valid session id in the first 64 KiB of `output.log`. Recorded when the task ends, including lost tasks. Omitted when unknown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
 | `callback` | Retained task-row callback state. For tasks with sequenced events, use `failed_events` for per-event callback failures. |
 | `cancel_requested_at` | Set once `task cancel` ran. |
@@ -46,6 +47,12 @@ Fleet-aware `show` results can also include `origin_machine`, `execution_machine
 When the task is not stored locally, `task show` checks known Fleet machines in parallel. It follows any saved origin route to its execution machine. A remote result also has `origin_machine`, `execution_machine`, `found_on`, and `availability`. The executor record is the source for process state, reports, log path, and evidence. If an origin route is known but its executor is offline, `show` returns the cached submission and last known state with an unavailable marker. The cached response does not invent a process status for an unknown submission.
 
 The lookup scope is the known Fleet at the time of the request. If any machine cannot give a definitive answer, the CLI returns the retryable `cluster_lookup_incomplete` error with the unchecked machine UUIDs. It returns `task_not_found` only when every machine in that scope gives a definitive negative answer. A known route whose executor cannot be reached is not `task_not_found`.
+
+Use `homebased task followup <id> --message "..."` to resume a terminal Codex
+worker. Run it on the task's origin or execution machine. Only one follow-up
+can resume a thread at a time. It reads `worker_thread` from the executor task
+view, including for a Fleet task. See [submit.md](submit.md) for its options
+and limits.
 
 ## Log
 

@@ -143,6 +143,7 @@ Agent-only fields under `workload`:
 | `model` | no | Passed through unchanged: `-m` for codex and grok, `--model` for claude and opencode. OpenCode accepts provider-qualified values such as `provider/model#variant`; Homebased does not maintain a model allowlist. |
 | `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. OpenCode defaults to `--format json` and allows an explicit format, but reserves the agent, `cwd`, model, prompt, session, server, and standalone controls. |
 | `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. |
+| `resume_thread` | no | A non-null value is Codex-only. Null is treated as absent for any agent. Resume this Codex thread and send the prompt on stdin. Use `task followup` for a terminal worker; only one follow-up can resume a thread at a time. |
 
 Task-only fields under `workload`:
 
@@ -207,4 +208,25 @@ Tell the user the task id, the workload, the inactivity timeout, and that result
 
 ## Resubmitting after a blocked or failed task
 
-There is no resume. Write a new prompt that includes the answer or the fix, name the previous task's `evidence` directory so the worker can read its `output.log`, and submit a new spec.
+Use `task followup` to resume a finished Codex worker with its prior thread context:
+
+```bash
+homebased --json task followup <task-id> \
+  --message "The missing detail is X. Continue the task and report the result."
+```
+
+The source must be a terminal Codex task with a recorded `worker_thread`. The
+thread is recorded when a Codex task printed a session header, whether it
+succeeds, fails, is cancelled, or is lost. Run follow-up on the task's origin
+or execution machine.
+Followup keeps its working directory, timeout, model, extra arguments, and
+report-trailer setting. Use `--thread <uuid>` to choose the thread that receives
+the new task's events, and `--name <name>` to set its task name. For remote
+follow-ups, `--request-id <uuid>` sets a stable retry identity. Use
+`--allow-other-thread` only when a worker must send events to a thread other
+than its parent task's thread. `--dry-run` prints the normal submit preview
+without starting the worker. A running task cannot be resumed because that
+would put two writers on one thread. `resume_thread_busy` names the active
+task; wait for its event before trying again. For other agents, write a new
+prompt that includes the answer or fix and points to the previous task's
+`evidence` directory.

@@ -149,6 +149,7 @@ fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> C
             model: Some("smoke-model"),
             cwd,
             extra_args: &[],
+            resume_thread: None,
         },
         &live_binary(kind),
         feed,

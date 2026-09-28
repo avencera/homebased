@@ -3706,7 +3706,7 @@ async fn saved_remote_return_route_retries_the_same_identity_after_restart_and_l
             authority: action,
         },
         launch: homebased::resource::bound_action::ResourceActionLaunch::Return {
-            work: launch.work.clone(),
+            work: Box::new(launch.work.clone()),
         },
     })
     .unwrap();
@@ -3884,7 +3884,7 @@ async fn remote_action_refuses_wrong_route_owner_revision_and_evidence_without_r
                     authority: action,
                 },
                 launch: homebased::resource::bound_action::ResourceActionLaunch::Return {
-                    work: other.work.clone(),
+                    work: Box::new(other.work.clone()),
                 },
             })
             .unwrap(),
