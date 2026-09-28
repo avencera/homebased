@@ -24,6 +24,18 @@ const THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
 const WEB_OFF: &str = "off";
 const WEB_EPHEMERAL: &str = "127.0.0.1:0";
 
+/// Give `thread` a Codex session file under `user_home` so the submitting CLI
+/// accepts it as a callback thread
+fn register_thread(user_home: &Path, thread: &str) {
+    let day = user_home.join(".codex/sessions/2026/01/01");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-2026-01-01T00-00-00-{thread}.jsonl")),
+        "",
+    )
+    .unwrap();
+}
+
 struct Harness {
     dir: TempDir,
     /// Private `$HOME` so unit paths never touch the developer's real home
@@ -55,6 +67,7 @@ impl Harness {
         fs::create_dir_all(&user_home).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&record).unwrap();
+        register_thread(&user_home, THREAD);
         let hb = assert_cmd::cargo::cargo_bin("homebased");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let path = format!(
@@ -90,6 +103,8 @@ impl Harness {
             .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
             .env("FAKE_RECORD_DIR", &self.record)
             .env("HOME", &self.user_home)
+            .env_remove("CODEX_HOME")
+            .env_remove("HOMEBASED_TASK_ID")
             .env("HARNESS_SUPERVISOR_LOG", &self.supervisor_log)
             .current_dir(std::env::temp_dir());
         if let Some(child) = &self.daemon {
@@ -2181,6 +2196,7 @@ fn list_filters_by_status_and_thread() {
     h.wait_status(&done, "succeeded");
 
     let mut spec = Harness::spec("claude", "still running");
+    register_thread(&h.user_home, other_thread);
     spec["thread"] = json!(other_thread);
     let spec_path = h.home.join("spec-running.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -3251,4 +3267,125 @@ fn docker_killed_daemon_and_worker_adopt_the_running_container() {
     assert!(log.contains("after the restart"), "{log}");
     let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
+}
+
+/// Run `homebased --json <args> --spec <file>` and return the exit code and error JSON
+fn submit_error(h: &Harness, spec: &Value, args: &[&str], worker: Option<&str>) -> (i32, Value) {
+    let spec_path = h.home.join("rejected-spec.json");
+    fs::write(&spec_path, serde_json::to_vec(spec).unwrap()).unwrap();
+    let mut cmd = h.cmd();
+    if let Some(task) = worker {
+        cmd.env("HOMEBASED_TASK_ID", task);
+    }
+    let out = cmd
+        .arg("--json")
+        .args(args)
+        .arg("--spec")
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+    let error = serde_json::from_slice(&out.stderr).unwrap_or(Value::Null);
+    (out.status.code().unwrap(), error)
+}
+
+#[test]
+fn mistyped_thread_is_rejected_before_any_work_starts() {
+    let h = Harness::new();
+    let mistyped = "01a0ab97-a7aa-7463-a5b0-8d500e40e4ff";
+    let mut spec = Harness::task_spec(&["/bin/echo", "hello"]);
+    spec["thread"] = json!(mistyped);
+    let resource = uuid::Uuid::now_v7().to_string();
+    let request = uuid::Uuid::now_v7().to_string();
+
+    for args in [
+        vec!["task", "submit"],
+        vec!["task", "submit", "--dry-run"],
+        vec![
+            "resource",
+            "request",
+            "submit",
+            &resource,
+            "--request-id",
+            &request,
+        ],
+        vec![
+            "resource",
+            "background",
+            "submit",
+            &resource,
+            "--request-id",
+            &request,
+        ],
+    ] {
+        let (code, error) = submit_error(&h, &spec, &args, None);
+        assert_eq!(code, 2, "{args:?} {error}");
+        assert_eq!(error["api_version"], 1);
+        assert_eq!(error["error"]["code"], "unknown_thread", "{args:?} {error}");
+        assert_eq!(error["error"]["input"]["value"], mistyped);
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("did you mean {THREAD}")),
+            "{message}"
+        );
+    }
+    let listed = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["tasks"], json!([]), "{listed}");
+}
+
+#[test]
+fn worker_submit_to_another_thread_needs_the_override_flag() {
+    let h = Harness::new();
+    let parent = h.submit(&Harness::task_spec(&["/bin/echo", "parent"]));
+    let other = "01a0ab97-a7aa-7463-a5b0-8d500e40e777";
+    register_thread(&h.user_home, other);
+    let mut spec = Harness::task_spec(&["/bin/echo", "child"]);
+    spec["thread"] = json!(other);
+
+    let (code, error) = submit_error(&h, &spec, &["task", "submit", "--dry-run"], Some(&parent));
+    assert_eq!(code, 2, "{error}");
+    assert_eq!(error["error"]["code"], "thread_mismatch", "{error}");
+    assert_eq!(error["error"]["input"]["parent_task"], parent.as_str());
+    assert_eq!(error["error"]["input"]["parent_thread"], THREAD);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(other) && message.contains(THREAD),
+        "{message}"
+    );
+
+    let allowed = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &parent)
+        .args([
+            "--json",
+            "task",
+            "submit",
+            "--dry-run",
+            "--allow-other-thread",
+        ])
+        .arg("--spec")
+        .arg(h.home.join("rejected-spec.json"))
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    let same_path = h.home.join("same-thread.json");
+    let same_spec = Harness::task_spec(&["/bin/echo", "same"]);
+    fs::write(&same_path, serde_json::to_vec(&same_spec).unwrap()).unwrap();
+    let same = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &parent)
+        .args(["--json", "task", "submit", "--dry-run", "--spec"])
+        .arg(&same_path)
+        .output()
+        .unwrap();
+    assert!(
+        same.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
 }

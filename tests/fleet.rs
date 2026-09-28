@@ -89,6 +89,7 @@ impl Daemon {
             .env("HOMEBASED_CONFIG", &self.config)
             .env("HOME", &self.user_home)
             .env_remove("CODEX_HOME")
+            .env_remove("HOMEBASED_TASK_ID")
             .env_remove("HOMEBASED_WEB_LISTEN");
         if let Some(codex) = &self.codex_override {
             cmd.env("HOMEBASED_CODEX", codex);
@@ -467,6 +468,18 @@ async fn post_resource_cancel_wire(
     )
 }
 
+/// Give `thread` a Codex session file under `user_home` so the submitting CLI
+/// accepts it as a callback thread
+fn register_thread(user_home: &Path, thread: &str) {
+    let day = user_home.join(".codex/sessions/2026/01/01");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-2026-01-01T00-00-00-{thread}.jsonl")),
+        "",
+    )
+    .unwrap();
+}
+
 fn submit_file(daemon: &Daemon, spec: &NormalizedSpec, request: RequestId) -> std::process::Output {
     let path = daemon
         ._dir
@@ -477,6 +490,8 @@ fn submit_file(daemon: &Daemon, spec: &NormalizedSpec, request: RequestId) -> st
 }
 
 fn submit_command(daemon: &Daemon, path: &Path, request: RequestId) -> Command {
+    let spec: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    register_thread(&daemon.user_home, spec["thread"].as_str().unwrap());
     let mut command = daemon.cmd();
     command
         .current_dir(&daemon.user_home)
@@ -751,6 +766,7 @@ fn remote_dry_run_expands_executor_home_without_identity() {
     spec.cwd = PathBuf::from("~/");
     let path = origin._dir.path().join("dry-run.json");
     fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    register_thread(&origin.user_home, &spec.thread.to_string());
     let output = origin
         .cmd()
         .current_dir(&origin.user_home)
@@ -1561,6 +1577,7 @@ async fn new_local_reports_and_exit_use_sequenced_callbacks_across_restart() {
     daemon.codex_override = Some(codex);
     daemon.restart();
     let spec_path = daemon._dir.path().join("submit.json");
+    register_thread(&daemon.user_home, "01a0ab97-a7aa-7463-a5b0-8d500e40e431");
     fs::write(
         &spec_path,
         serde_json::to_vec(&serde_json::json!({

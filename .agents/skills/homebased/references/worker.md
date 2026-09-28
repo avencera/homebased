@@ -6,6 +6,7 @@
 
 - Follow the prompt. Verify the work the way the prompt asks, or with the repository's normal checks if it says nothing.
 - Do not run `codex queue`. Do not submit new homebased tasks unless the prompt asks for it.
+- When the prompt asks you to submit tasks, set the spec `thread` to your parent task's thread: `homebased --json task show "$HOMEBASED_TASK_ID"` prints it. Do not use `HOMEBASED_TASK_ID` itself. Another thread fails with `thread_mismatch` unless you pass `--allow-other-thread`. On a remote executor the parent's thread is not on this machine, so the submit fails with `unknown_thread`.
 - Leave the working tree in the state the prompt asked for. Do not commit or push unless instructed.
 
 ## Report when finished

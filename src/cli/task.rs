@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
+use crate::callback::destination::SubmitOrigin;
 use crate::callback::{last_event_for_row, notify_event};
 use crate::client::Client;
 use crate::domain::{ProcessStatus, ReportOutcome, TaskId, ThreadId};
@@ -31,6 +32,9 @@ pub enum TaskCommand {
         /// Stable UUID for retry after a lost remote submission response
         #[arg(long)]
         request_id: Option<uuid::Uuid>,
+        /// Let a Homebased worker send events to a thread other than its parent task's thread
+        #[arg(long)]
+        allow_other_thread: bool,
     },
     /// Print the JSON Schema for the submit spec.
     Schema,
@@ -88,7 +92,8 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             spec,
             dry_run,
             request_id,
-        } => submit(ctx, &spec, dry_run, request_id).await,
+            allow_other_thread,
+        } => submit(ctx, &spec, dry_run, request_id, allow_other_thread).await,
         TaskCommand::Schema => schema(ctx),
         TaskCommand::List { status, thread } => list(ctx, status, thread).await,
         TaskCommand::Show { id } => show(ctx, id).await,
@@ -109,12 +114,14 @@ async fn submit(
     spec_path: &str,
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
+    allow_other_thread: bool,
 ) -> Result<ExitCode, AppError> {
     let spec = load_spec(spec_path)?;
     let normalized = spec::normalize(&spec)?;
     if normalized.machine.is_none() {
         spec::check_cwd(&normalized.cwd)?;
     }
+    SubmitOrigin::capture(&ctx.home)?.check(normalized.thread, allow_other_thread)?;
     let env = crate::domain::TaskEnv::capture();
     let callback_cwd = std::env::current_dir()?;
     let request_id = submission_request_id(normalized.machine.is_some(), request_id)?;

@@ -201,22 +201,34 @@ impl PromptSource {
     }
 
     /// Read the prompt text, resolving a relative file against `cwd`
+    ///
+    /// A blank prompt is refused: the agent would start with only the report
+    /// trailer and no task
     fn read(&self, cwd: &Path) -> Result<String, AppError> {
-        match self {
-            Self::Inline(text) => Ok(text.clone()),
+        let (text, pointer, value) = match self {
+            Self::Inline(text) => (text.clone(), "/workload/prompt", json!(text)),
             Self::File(path) => {
                 let resolved = if path.is_absolute() {
                     path.clone()
                 } else {
                     cwd.join(path)
                 };
-                fs::read_to_string(&resolved).map_err(|err| AppError::InvalidSpec {
+                let text = fs::read_to_string(&resolved).map_err(|err| AppError::InvalidSpec {
                     pointer: "/workload/prompt_file".into(),
                     value: json!(path),
                     message: format!("failed to read prompt_file {}: {err}", resolved.display()),
-                })
+                })?;
+                (text, "/workload/prompt_file", json!(path))
             }
+        };
+        if text.trim().is_empty() {
+            return Err(AppError::InvalidSpec {
+                pointer: pointer.into(),
+                value,
+                message: "the prompt is empty; write the task for the agent".into(),
+            });
         }
+        Ok(text)
     }
 }
 
@@ -770,6 +782,28 @@ mod tests {
         value["machine"] = json!("code");
         value["workload"].as_object_mut().unwrap().remove("prompt");
         value["workload"]["prompt_file"] = json!("prompt.txt");
+        let spec = parse_spec_value(&value).unwrap();
+        assert!(matches!(
+            normalize(&spec),
+            Err(AppError::InvalidSpec { pointer, .. }) if pointer == "/workload/prompt_file"
+        ));
+    }
+
+    #[test]
+    fn blank_prompt_rejected() {
+        let mut value = valid_agent();
+        value["workload"]["prompt"] = json!(" \n");
+        let spec = parse_spec_value(&value).unwrap();
+        assert!(matches!(
+            normalize(&spec),
+            Err(AppError::InvalidSpec { pointer, .. }) if pointer == "/workload/prompt"
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prompt.md");
+        fs::write(&file, "\n").unwrap();
+        value["workload"].as_object_mut().unwrap().remove("prompt");
+        value["workload"]["prompt_file"] = json!(file);
         let spec = parse_spec_value(&value).unwrap();
         assert!(matches!(
             normalize(&spec),

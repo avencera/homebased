@@ -19,6 +19,8 @@ done
 
 Several sessions can share one cwd. Tell the user which id you chose. If you cannot find one, ask for it instead of guessing.
 
+Copy the id; do not retype it. Submit checks the id against the Claude Code session registry and transcripts and the Codex session files on this machine. An unknown id fails with `unknown_thread`, and the error suggests a known id that differs by a likely typo. A Homebased task id is not a thread id. See [errors.md](errors.md).
+
 ## 2. Choose the workload
 
 | Work | `workload.type` |
@@ -125,7 +127,7 @@ GitHub CI watcher as a normal task:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `api_version` | yes | Always `1`. |
-| `thread` | yes | Codex thread or Claude Code session UUID from step 1. |
+| `thread` | yes | Codex thread or Claude Code session UUID from step 1. It must exist on the submitting machine (`unknown_thread`). |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | For local tasks, an existing directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
@@ -181,7 +183,7 @@ homebased --json task submit --spec "$dir/spec.json" --dry-run
 homebased --json task submit --spec "$dir/spec.json"
 ```
 
-The dry run validates the spec, resolves the executable and `cwd`, and prints the normalized spec, child argv, and stdin policy. For a `container`, the argv is the `docker container create` call that Homebased makes, with `<task-dir>` and a nil task UUID as placeholders. A remote dry run asks the selected executor to validate and expand its invocation. It returns the executor's `execution_cwd`. It spawns nothing and creates no task or request record. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials.
+The dry run validates the spec, checks the callback `thread` as the real submit does, resolves the executable and `cwd`, and prints the normalized spec, child argv, and stdin policy. For a `container`, the argv is the `docker container create` call that Homebased makes, with `<task-dir>` and a nil task UUID as placeholders. A remote dry run asks the selected executor to validate and expand its invocation. It returns the executor's `execution_cwd`. It spawns nothing and creates no task or request record. Task argv is exact. Agent argv may contain a documented `<task-id>` evidence-path placeholder for Grok. OpenCode dry runs include only a safe `managed_environment` policy and generated-agent description; they do not include inherited configuration or credentials.
 
 Request UUIDs apply only to remote submissions (specs with `machine`). The CLI makes a new request UUID for each remote submit by default. Pass `--request-id <uuid>` to choose and retain the identity before the first request, so the caller can retry after it loses the response. A local spec rejects `--request-id`; omit `machine` to submit locally.
 

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::callback::destination::SubmitOrigin;
 use crate::client::Client;
 use crate::daemon::fleet_api::MachinesBody;
 use crate::domain::{API_VERSION, THREAD_ENV_VARS, TaskEnv, TaskId, ThreadId};
@@ -241,6 +242,9 @@ pub enum BackgroundCommand {
         /// Task spec file, or `-` for stdin
         #[arg(long)]
         spec: String,
+        /// Let a Homebased worker send events to a thread other than its parent task's thread
+        #[arg(long)]
+        allow_other_thread: bool,
     },
     /// Bind a trainer attempt to one registered Homebased task
     BindAttempt {
@@ -270,6 +274,9 @@ pub enum RequestCommand {
         /// Task spec file, or `-` for stdin
         #[arg(long)]
         spec: String,
+        /// Let a Homebased worker send events to a thread other than its parent task's thread
+        #[arg(long)]
+        allow_other_thread: bool,
     },
     /// Cancel one queued request before task activation
     Cancel {
@@ -1029,7 +1036,17 @@ async fn background(ctx: &Ctx, command: BackgroundCommand) -> Result<ExitCode, A
             resource_id,
             request_id,
             spec: path,
-        } => submit_command(ctx, resource_id, request_id, &path, true).await,
+            allow_other_thread,
+        } => {
+            let submit = SubmitCommand {
+                resource_uuid: resource_id,
+                request_uuid: request_id,
+                path: &path,
+                background: true,
+                allow_other_thread,
+            };
+            submit_command(ctx, submit).await
+        }
         BackgroundCommand::BindAttempt {
             resource_id,
             task_id,
@@ -1139,7 +1156,17 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
             resource_id,
             request_id,
             spec: path,
-        } => submit_command(ctx, resource_id, request_id, &path, false).await,
+            allow_other_thread,
+        } => {
+            let submit = SubmitCommand {
+                resource_uuid: resource_id,
+                request_uuid: request_id,
+                path: &path,
+                background: false,
+                allow_other_thread,
+            };
+            submit_command(ctx, submit).await
+        }
         RequestCommand::Cancel {
             resource_id,
             request_id,
@@ -1184,16 +1211,27 @@ async fn request(ctx: &Ctx, command: RequestCommand) -> Result<ExitCode, AppErro
     }
 }
 
-async fn submit_command(
-    ctx: &Ctx,
+/// One `resource request submit` or `resource background submit` call
+struct SubmitCommand<'a> {
     resource_uuid: Uuid,
     request_uuid: Uuid,
-    path: &str,
+    path: &'a str,
     background: bool,
-) -> Result<ExitCode, AppError> {
+    allow_other_thread: bool,
+}
+
+async fn submit_command(ctx: &Ctx, submit: SubmitCommand<'_>) -> Result<ExitCode, AppError> {
+    let SubmitCommand {
+        resource_uuid,
+        request_uuid,
+        path,
+        background,
+        allow_other_thread,
+    } = submit;
     let resource_id = resource_id_arg(resource_uuid)?;
     validate_uuid("--request-id", request_uuid)?;
     let spec = load_resource_task_spec(path)?;
+    SubmitOrigin::capture(&ctx.home)?.check(spec.thread, allow_other_thread)?;
     let callback_cwd = std::env::current_dir()?;
     if !callback_cwd.is_absolute() {
         return Err(AppError::Usage {

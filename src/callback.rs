@@ -2,6 +2,7 @@
 //! queue, or a Claude Code session socket.
 
 mod claude_inbox;
+pub mod destination;
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};

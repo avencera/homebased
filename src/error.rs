@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::domain::{AgentKind, ProcessStatus, TaskId};
+use crate::callback::destination::ThreadSuggestion;
+use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
 use crate::resource::ResourceId;
@@ -92,6 +93,28 @@ pub enum AppError {
         value: Value,
         /// Why the value was rejected
         message: String,
+    },
+    /// Spec `thread` names no session that can receive events on this machine
+    #[error("{message}")]
+    UnknownThread {
+        /// Thread the spec named
+        thread: ThreadId,
+        /// Known threads that differ from `thread` by a likely typo, best first
+        suggestions: Vec<ThreadSuggestion>,
+        /// Why the thread was rejected and what was likely intended
+        message: String,
+    },
+    /// A worker's spec names a thread other than its parent task's thread
+    #[error(
+        "spec field thread {thread} differs from thread {parent_thread} of parent task {parent_task}; use {parent_thread}, or pass --allow-other-thread when the events must go to another session"
+    )]
+    ThreadMismatch {
+        /// Thread the spec named
+        thread: ThreadId,
+        /// Worker task from `HOMEBASED_TASK_ID`
+        parent_task: TaskId,
+        /// Thread that receives the parent task's events
+        parent_thread: ThreadId,
     },
     /// Agent-specific child configuration could not be built safely
     #[error("{agent} child configuration: {message}")]
@@ -440,6 +463,8 @@ impl AppError {
             Self::TooManyReports { .. } => "too_many_reports",
             Self::TaskTerminal { .. } => "task_terminal",
             Self::InvalidSpec { .. } => "invalid_spec",
+            Self::UnknownThread { .. } => "unknown_thread",
+            Self::ThreadMismatch { .. } => "thread_mismatch",
             Self::AgentConfiguration { .. } => "agent_configuration",
             Self::DaemonAlreadyRunning => "daemon_already_running",
             Self::LockHeld { .. } => "lock_held",
@@ -506,6 +531,8 @@ impl AppError {
             | Self::NotifyFailed { .. }
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
+            | Self::UnknownThread { .. }
+            | Self::ThreadMismatch { .. }
             | Self::SummaryTooLong { .. }
             | Self::MessageInvalid { .. }
             | Self::Usage { .. }
@@ -556,6 +583,8 @@ impl AppError {
     pub fn http_status(&self) -> http::StatusCode {
         match self {
             Self::InvalidSpec { .. }
+            | Self::UnknownThread { .. }
+            | Self::ThreadMismatch { .. }
             | Self::SummaryTooLong { .. }
             | Self::MessageInvalid { .. }
             | Self::Usage { .. }
@@ -674,6 +703,21 @@ impl AppError {
             Self::InvalidSpec { pointer, value, .. } => {
                 json!({ "pointer": pointer, "value": value })
             }
+            Self::UnknownThread {
+                thread,
+                suggestions,
+                ..
+            } => json!({ "pointer": "/thread", "value": thread, "suggestions": suggestions }),
+            Self::ThreadMismatch {
+                thread,
+                parent_task,
+                parent_thread,
+            } => json!({
+                "pointer": "/thread",
+                "value": thread,
+                "parent_task": parent_task,
+                "parent_thread": parent_thread,
+            }),
             Self::AgentConfiguration { agent, message } => {
                 json!({ "agent": agent, "message": message })
             }
