@@ -21,6 +21,7 @@
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import { isInFlight } from '$lib/api';
 	import CallbackBadge from '$lib/components/CallbackBadge.svelte';
+	import CommandArgv from '$lib/components/CommandArgv.svelte';
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
@@ -73,7 +74,10 @@
 		</a>
 		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		{#if task}
-			<h1 class="text-base font-semibold tracking-tight" title={task.display_name}>
+			<h1
+				class="min-w-0 text-base font-semibold tracking-tight wrap-anywhere"
+				title={task.display_name}
+			>
 				{task.display_name}
 			</h1>
 			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
@@ -115,7 +119,7 @@
 			class="mt-3 grid grid-cols-[7rem_minmax(0,1fr)] gap-x-3 gap-y-1 rounded border border-border bg-card px-3 py-2 sm:grid-cols-[7rem_minmax(0,1fr)_7rem_minmax(0,1fr)]"
 		>
 			<dt class="text-muted-foreground">workload</dt>
-			<dd class="font-mono">{workloadLabel(task)}</dd>
+			<dd class="font-mono wrap-anywhere">{workloadLabel(task)}</dd>
 
 			<dt class="text-muted-foreground">pid</dt>
 			<dd class="font-mono">{task.pid ?? EM_DASH}</dd>
@@ -168,15 +172,15 @@
 
 			{#if task.workload.type === 'task'}
 				<dt class="text-muted-foreground">command</dt>
-				<dd class="font-mono whitespace-pre-wrap sm:col-span-3">
-					{formatCommandArgv(task.workload.command)}
+				<dd class="min-w-0 sm:col-span-3">
+					<CommandArgv argv={task.workload.command} cwd={task.cwd} />
 				</dd>
 			{:else if task.workload.type === 'container'}
 				<dt class="text-muted-foreground">image</dt>
 				<dd class="font-mono break-all sm:col-span-3">{task.workload.image}</dd>
 
 				<dt class="text-muted-foreground">command</dt>
-				<dd class="font-mono whitespace-pre-wrap sm:col-span-3">
+				<dd class="font-mono wrap-anywhere whitespace-pre-wrap sm:col-span-3">
 					{formatCommandArgv(containerArgv(task.workload)) || EM_DASH}
 				</dd>
 			{/if}
@@ -208,7 +212,7 @@
 			{/if}
 
 			<dt class="text-muted-foreground">exit</dt>
-			<dd class="font-mono">{exitReasonText(task.exit_reason)}</dd>
+			<dd class="font-mono wrap-anywhere">{exitReasonText(task.exit_reason)}</dd>
 
 			<dt class="text-muted-foreground">callback</dt>
 			<dd><CallbackBadge callback={task.callback} /></dd>
@@ -287,7 +291,7 @@
 				id="output-log"
 				bind:this={logBox}
 				onscroll={onLogScroll}
-				class="max-h-96 overflow-auto rounded border border-border bg-card px-3 py-2 font-mono text-[12px] leading-5 whitespace-pre-wrap">{store
+				class="max-h-96 overflow-auto rounded border border-border bg-card px-3 py-2 font-mono text-[12px] leading-5 wrap-anywhere whitespace-pre-wrap">{store
 					.logTail?.log || 'No output yet'}</pre>
 		</section>
 
