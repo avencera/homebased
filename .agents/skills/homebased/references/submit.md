@@ -4,7 +4,7 @@
 
 The spec needs the UUID of the Codex thread or Claude Code session that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the thread.
 
-In Claude Code, use `$CLAUDE_CODE_SESSION_ID`. The session must be running when an event is sent; events for a stopped session fail and go to the fallback log.
+In Claude Code, use `$CLAUDE_CODE_SESSION_ID`. A live session gets each event at once. When the session has no live process, a T3 Code thread that owns it gets the event as a new turn. Otherwise the event waits and is sent when a process for the session starts again; after 3 days it is marked failed and written to `callback-fallback.log`. To chain work without depending on this, submit the next phase now with `after`; see [Start after other tasks](#start-after-other-tasks).
 
 In Codex:
 
@@ -233,6 +233,8 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 Tell the user the task id, the workload, the inactivity timeout, and that results arrive as `HOMEBASED_EVENT` messages in the submitting thread. Do not wait, sleep, or poll. On `TASK_CHECK_DUE`, inspect status and recent logs. If the task is still live but the evidence does not show whether it can make progress, tell the user that the state is uncertain and leave the task running. Cancel or intervene only when evidence requires it. Several tasks may run at once; there is no concurrency bound, so keep the count sensible for the execution machine.
 
 ## Resubmitting after a blocked or failed task
+
+To change course while a Claude worker is still running, send it new instructions with `homebased message send --worker <task-id>` instead; see [messages.md](messages.md).
 
 Use `task followup` to resume a finished Codex worker with its prior thread context:
 
