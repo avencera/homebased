@@ -11,11 +11,13 @@ const REQUEST_TIMEOUT_MS = 5000;
 
 const API_BASE = '/v1';
 
-/** Process lifecycle, `ProcessStatus` in the daemon. */
-export type ProcessStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost';
+/** Task lifecycle, `TaskStatus` in the daemon: `held` waits on its origin for dependencies. */
+export type ProcessStatus =
+	'held' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost';
 
 /** Every status, in lifecycle order. */
 export const PROCESS_STATUSES: readonly ProcessStatus[] = [
+	'held',
 	'queued',
 	'running',
 	'succeeded',
@@ -24,8 +26,8 @@ export const PROCESS_STATUSES: readonly ProcessStatus[] = [
 	'lost'
 ];
 
-/** Statuses of a worker that can still change on its own. */
-export const IN_FLIGHT_STATUSES: readonly ProcessStatus[] = ['queued', 'running'];
+/** Statuses of a task that can still change on its own. */
+export const IN_FLIGHT_STATUSES: readonly ProcessStatus[] = ['held', 'queued', 'running'];
 
 /** Narrow a URL or user supplied string to a known status. */
 export function isProcessStatus(value: string): value is ProcessStatus {
@@ -253,6 +255,7 @@ export interface TaskDetail extends TaskSummary {
 }
 
 const ProcessStatusSchema = Schema.Literal(
+	'held',
 	'queued',
 	'running',
 	'succeeded',

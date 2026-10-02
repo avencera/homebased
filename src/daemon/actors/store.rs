@@ -11,6 +11,7 @@ use crate::cancellation::{
     ResourceCancellationRequestIdentity,
 };
 use crate::daemon::actors::send_reply;
+use crate::dependency::{DependencyLookup, HeldCancellation, TaskDependencies};
 use crate::domain::{
     ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
@@ -50,15 +51,18 @@ use crate::store::{
     RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
     ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput,
 };
-use crate::store::{CancelResult, OperatorGpuFreeError, Store, TaskPresentation};
+use crate::store::{
+    CancelResult, HeldCancel, LocalAdmission, OperatorGpuFreeError, Store, TaskPresentation,
+    UnlaunchedTask,
+};
 use crate::store::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
 use crate::store::{
     ResourceControlError, ResourceControlRequest, ResourceControlStart, ResourceReadModel,
     SupervisorReplacement,
 };
 use crate::submission::{
-    CallbackExecutable, ExecutorIdentity, OriginRoute, RejectionTombstone, RequestId,
-    ResourceCancellationReceipt, ResourceQueueReceipt, SubmissionState,
+    CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute, RejectionTombstone,
+    RequestId, ResourceCancellationReceipt, ResourceQueueReceipt, SubmissionState,
 };
 
 fn control_error(
@@ -805,6 +809,61 @@ pub(crate) enum StoreMsg {
         route: Box<OriginRoute>,
         reply: RpcReplyPort<Result<OriginRoute, AppError>>,
     },
+    /// Allocate an origin route with the dependencies it was submitted with
+    InsertOriginRouteAfter {
+        route: Box<OriginRoute>,
+        after: TaskDependencies,
+        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    },
+    /// Read the dependencies saved with one origin route
+    RouteDependencies {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<TaskDependencies>, AppError>>,
+    },
+    /// Read the retained origin inbox of one task in sequence order
+    InboundEvents {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Vec<InboxEvent>, AppError>>,
+    },
+    /// Read routes that wait for dependencies or for their launch to be answered
+    HeldRoutes {
+        reply: RpcReplyPort<Result<Vec<DependentRoute>, AppError>>,
+    },
+    /// Read local tasks submitted with dependencies whose rows still wait for a worker
+    UnstartedDependentTasks {
+        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
+    },
+    /// Read tasks with dependencies that never launched, with their callback delivery
+    UnlaunchedTasks {
+        reply: RpcReplyPort<Result<Vec<UnlaunchedTask>, AppError>>,
+    },
+    /// Read one task with dependencies that never launched
+    UnlaunchedTask {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<UnlaunchedTask>, AppError>>,
+    },
+    /// Read the state of each dependency, or `None` for one with no origin route here
+    DependencyStates {
+        tasks: Vec<TaskId>,
+        reply: RpcReplyPort<Result<DependencyLookup, AppError>>,
+    },
+    /// Cancel a waiting held route and queue its terminal event
+    CancelHeldRoute {
+        id: TaskId,
+        cause: HeldCancellation,
+        reply: RpcReplyPort<Result<HeldCancel, AppError>>,
+    },
+    /// Mark a waiting remote held route as launching before its first send
+    BeginHeldLaunch {
+        id: TaskId,
+        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    },
+    /// Reject a waiting held route whose launch was refused before any task was saved
+    RefuseHeldLaunch {
+        id: TaskId,
+        reason: String,
+        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    },
     /// Persist a definitive executor result
     ResolveOriginRoute {
         id: TaskId,
@@ -848,7 +907,7 @@ pub(crate) enum StoreMsg {
         row: Box<TaskRow>,
         spec: Box<NormalizedSpec>,
         machine: MachineId,
-        request: RequestId,
+        admission: LocalAdmission,
         codex: CallbackExecutable,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
@@ -1531,6 +1590,40 @@ impl Actor for StoreActor {
                 reply,
                 state.insert_origin_route(&route).map_err(identity_error),
             ),
+            StoreMsg::InsertOriginRouteAfter {
+                route,
+                after,
+                reply,
+            } => send_reply(
+                reply,
+                state
+                    .insert_origin_route_after(&route, Some(&after))
+                    .map_err(identity_error),
+            ),
+            StoreMsg::RouteDependencies { id, reply } => {
+                send_reply(reply, state.route_dependencies(id));
+            }
+            StoreMsg::InboundEvents { id, reply } => {
+                send_reply(reply, state.inbound_events(id).map_err(event_error));
+            }
+            StoreMsg::HeldRoutes { reply } => send_reply(reply, state.held_routes()),
+            StoreMsg::UnstartedDependentTasks { reply } => {
+                send_reply(reply, state.unstarted_dependent_tasks());
+            }
+            StoreMsg::UnlaunchedTasks { reply } => send_reply(reply, state.unlaunched_tasks()),
+            StoreMsg::UnlaunchedTask { id, reply } => send_reply(reply, state.unlaunched_task(id)),
+            StoreMsg::DependencyStates { tasks, reply } => {
+                send_reply(reply, state.dependency_states(&tasks));
+            }
+            StoreMsg::CancelHeldRoute { id, cause, reply } => {
+                send_reply(reply, state.cancel_held_route(id, cause));
+            }
+            StoreMsg::BeginHeldLaunch { id, reply } => {
+                send_reply(reply, state.begin_held_launch(id));
+            }
+            StoreMsg::RefuseHeldLaunch { id, reason, reply } => {
+                send_reply(reply, state.refuse_held_launch(id, &reason));
+            }
             StoreMsg::ResolveOriginRoute { id, outcome, reply } => send_reply(
                 reply,
                 state
@@ -1597,13 +1690,13 @@ impl Actor for StoreActor {
                 row,
                 spec,
                 machine,
-                request,
+                admission,
                 codex,
                 reply,
             } => {
                 send_reply(
                     reply,
-                    state.insert_local_task(&row, &spec, machine, request, codex),
+                    state.admit_local_task(&row, &spec, machine, &admission, codex),
                 );
             }
             StoreMsg::InsertRemoteTask {

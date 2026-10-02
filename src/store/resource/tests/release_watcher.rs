@@ -729,7 +729,10 @@ async fn bound_watcher_stops_the_trainer_at_a_new_checkpoint_and_one_optimizatio
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(trainer_row),
         spec: Box::new(fixture.spec.clone()),
-        request: crate::submission::RequestId::new(),
+        admission: crate::store::LocalAdmission::Submitted {
+            request: crate::submission::RequestId::new(),
+            after: None,
+        },
         reply,
     })
     .await

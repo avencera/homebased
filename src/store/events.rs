@@ -18,8 +18,8 @@ use crate::events::{
 };
 use crate::machine::MachineId;
 use crate::submission::{
-    ExecutorIdentity, OriginRoute, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
-    ResourceRoutePhase, SubmissionState,
+    ExecutorIdentity, HeldPhase, OriginRoute, ResourceActionRoutePhase,
+    ResourceBackgroundRoutePhase, ResourceRoutePhase, SubmissionState,
 };
 
 const EVENT_RETENTION_DAYS: i64 = 30;
@@ -1125,6 +1125,23 @@ impl Store {
                     });
                 }
             },
+            // the executor's first queued event proves that a released launch
+            // was accepted, even when its reply was lost
+            SubmissionState::Held { phase } => match phase {
+                HeldPhase::Launching => {
+                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
+                        return Err(EventError::Invalid {
+                            message: "first released task event must report queued state".into(),
+                        });
+                    }
+                    true
+                }
+                HeldPhase::Waiting | HeldPhase::Cancelled { .. } => {
+                    return Err(EventError::Invalid {
+                        message: "held route has not launched a task".into(),
+                    });
+                }
+            },
             _ => false,
         };
         let delivery = if event.payload.notification_required() {
@@ -1167,6 +1184,7 @@ impl Store {
                 SubmissionState::ResourceBackground { phase, .. } => {
                     *phase = ResourceBackgroundRoutePhase::Accepted;
                 }
+                SubmissionState::Held { .. } => route.submission = SubmissionState::Accepted,
                 SubmissionState::AcceptanceUnknown
                 | SubmissionState::Accepted
                 | SubmissionState::Rejected { .. } => {}
@@ -1187,6 +1205,9 @@ impl Store {
             params![encode(&route)?, event.task.to_string()],
         )
         .map_err(storage)?;
+        if let Some(outcome) = super::dependency::terminal_outcome(&event.payload) {
+            super::dependency::record_outcome_on(&tx, event.task, outcome).map_err(storage)?;
+        }
         tx.commit().map_err(storage)?;
         Ok(EventAcceptance::Acknowledged {
             seq: event.seq.get(),

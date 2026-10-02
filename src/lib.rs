@@ -10,6 +10,7 @@ pub mod config;
 pub mod container;
 pub(crate) mod curl;
 pub mod daemon;
+pub mod dependency;
 pub mod digest;
 pub mod domain;
 pub mod error;

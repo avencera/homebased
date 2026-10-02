@@ -6,6 +6,7 @@
 		base: 'inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px] leading-4 ring-1 ring-inset',
 		variants: {
 			status: {
+				held: 'bg-slate-500/10 text-slate-600 ring-slate-500/20 dark:text-slate-400',
 				queued: 'bg-slate-500/10 text-slate-700 ring-slate-500/30 dark:text-slate-300',
 				running: 'bg-sky-500/10 text-sky-700 ring-sky-500/40 dark:text-sky-300',
 				succeeded: 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/40 dark:text-emerald-300',

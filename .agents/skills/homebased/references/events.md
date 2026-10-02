@@ -20,6 +20,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `process` | Tagged exit payload, or `null` for interim events. |
 | `timeout_secs` | Present on `TASK_CHECK_DUE`: the configured output-inactivity timeout. |
 | `next_action` | Suggested step. Follow it unless the reports say otherwise. |
+| `cancel_reason` | Present only when the origin cancelled a held task before it started: `{"type":"dependency_ended","dependency":"<uuid>","outcome":"failed"}`, or `{"type":"requested"}` after `task cancel`. `outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown` when the dependency ended but no record says how. |
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.
 
@@ -31,9 +32,13 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `TASK_CHECK_DUE` | `inspect_task` | The child was still live after it wrote no output for the full inactivity timeout. `process` is `null`, and status is unchanged. | Inspect current status and recent logs because output can resume after the event. If the evidence does not show whether the task can make progress, tell the user that the state is uncertain and leave it running. Cancel or intervene only when evidence requires it. A terminal event still follows later. |
 | `TASK_SUCCEEDED` | `review_output` | Exit 0 and the last report was `succeeded`, or there were no reports. | Read the last summary. With `reports: []` (normal for task workloads) read `output.log` before trusting the result. Verify the work in `cwd` before telling the user it is done. |
 | `TASK_BLOCKED` | `answer_and_resubmit` | The last report was `blocked`. The process has exited. | Answer the question. If it needs the user, ask them. Then submit a new task whose prompt contains the answer (see submit.md). |
-| `TASK_FAILED` | `inspect_log` | Last report `failed`, non-zero exit, signal, or spawn failure. | Run `homebased task log <id> --tail 200`. Decide: fix the prompt and resubmit, raise the check timeout, fix the environment for `spawn_failed`, or report to the user. |
-| `TASK_CANCELLED` | `none` | `task cancel` or `daemon stop --yes` ended it. | Nothing unless the user wants it rerun. |
+| `TASK_FAILED` | `inspect_log` | Last report `failed`, non-zero exit, signal, or spawn failure. | Run `homebased task log <id> --tail 200`. Decide: fix the prompt and resubmit, raise the check timeout, fix the environment for `spawn_failed`, or report to the user. A held task whose start was refused, for example because its `cwd` no longer exists, has a `spawn_failed` message and no log. |
+| `TASK_CANCELLED` | `none` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, the task never started: a dependency in its `after` list ended without success, or it was cancelled while held. `reports` is `[]`. | Nothing unless the user wants it rerun. For a failed dependency, handle that task's own event first, then submit the held work again. |
 | `TASK_LOST` | `inspect_log` | The worker process disappeared without writing `exit.json`, for example after a machine reboot or a `kill -9`. | Check `homebased --json daemon status`, the log, and `worker.log` in the evidence directory. Resubmit if the work is incomplete. |
+
+## Held tasks
+
+A task submitted with `after` stays on its origin until each dependency succeeds; the origin sends its events like any other task. When it cannot start, the origin sends its only event itself: `TASK_CANCELLED` with `cancel_reason`, or `TASK_FAILED` with `spawn_failed`. Tasks held on a cancelled task are cancelled in turn, each with a `cancel_reason` that names the task it waited on.
 
 ## Duplicates
 

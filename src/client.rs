@@ -180,6 +180,27 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
+        "unknown_dependency" => input
+            .get("task")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .map_or(AppError::Internal { message }, |task| {
+                AppError::UnknownDependency { task }
+            }),
+        "dependency_failed" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let outcome = input
+                .get("outcome")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (task, outcome) {
+                (Some(task), Some(outcome)) => AppError::DependencyFailed { task, outcome },
+                _ => AppError::Internal { message },
+            }
+        }
         "task_not_started" => input
             .get("task")
             .cloned()

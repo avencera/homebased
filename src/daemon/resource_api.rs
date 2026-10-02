@@ -36,7 +36,7 @@ use super::cluster::{OriginResourceCancellationOutcome, ReadQuery};
 use super::peer_read::{READ_MAX_BODY, read_peer};
 use super::resource_submit::{ResourceSubmitInput, ResourceSubmitOutcome};
 use crate::cancellation::ResourceCancellationTarget;
-use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
+use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::machine::MachineId;
@@ -1926,16 +1926,17 @@ async fn task_summaries(
         .iter()
         .map(|row| {
             let summary = TaskSummary::from_row(row, presentations.get(&row.id));
-            (row.id, task_summary(summary))
+            (row.id, task_summary(summary, row.status()))
         })
         .collect())
 }
 
-fn task_summary(summary: TaskSummary) -> ResourceTaskSummary {
+/// Resource view of one task row; a row always has a process status
+fn task_summary(summary: TaskSummary, status: ProcessStatus) -> ResourceTaskSummary {
     ResourceTaskSummary {
         id: summary.id,
         display_name: summary.display_name,
-        status: summary.status,
+        status,
         thread: Some(summary.thread),
         origin_machine: summary.origin_machine,
         execution_machine: summary.execution_machine,

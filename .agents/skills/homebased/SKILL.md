@@ -20,6 +20,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Use `homebased message send` for a direct message to a Claude Code session or Codex thread. Address a session by its id or by a task whose origin it is, never by its display name, which changes each time the session restarts. Read [messages.md](references/messages.md) for destination, source, and retry rules.
 - `message send --task` targets the task's origin thread, not its worker. Use `message send --worker <task>` to give a running Claude worker new instructions; it reads them at its next turn boundary. Use `homebased task followup` to resume a terminal Codex worker with new information. Run follow-up on the task's origin or execution machine. Only one follow-up can resume a thread at a time; wait for the active task's event after `resume_thread_busy`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
+- To start work only after other tasks succeed, submit it now with `after` in the spec. The daemon holds it, starts it when every dependency succeeds, and cancels it if one ends any other way. Do not wait for the events to submit the next phase.
 - Use `homebased daemon stop` or `homebased daemon restart`, never raw `systemctl` or `launchctl`, so in-flight tasks are protected.
 - On Praveen's machines, every daemon install or reinstall must set `HOMEBASED_WEB_LISTEN=0.0.0.0:7677`. The dashboard is off unless this is set. Do not omit it, and do not replace the LAN bind with loopback.
 - Task ids are full UUIDs. Prefix matching does not exist.
@@ -36,7 +37,7 @@ Pick the first row that matches, then read only that file.
 | --- | --- |
 | `HOMEBASED_TASK_ID` is set in this session's environment | [worker.md](references/worker.md). You are the worker, not the orchestrator. |
 | A message starting with `HOMEBASED_EVENT ` arrived | [events.md](references/events.md) |
-| Starting background work, following up a finished task, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
+| Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks | [inspect.md](references/inspect.md) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |

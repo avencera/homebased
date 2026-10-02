@@ -18,12 +18,15 @@ use crate::cancellation::{
 };
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
-    ContainerDetail, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList, TaskSummary,
+    ContainerDetail, DependencyView, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList,
+    TaskSummary,
 };
 use crate::daemon::cancel_delivery::CancelResponse;
 use crate::daemon::{AppState, web};
+use crate::dependency::TaskDependencies;
 use crate::domain::{
-    API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskIdentity, ThreadId, Workload,
+    API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskIdentity, TaskStatus, ThreadId,
+    Workload,
 };
 use crate::error::{AppError, FollowupBlocker};
 use crate::files::{
@@ -154,6 +157,8 @@ pub(super) struct SubmitBody {
     pub(super) env: TaskEnv,
     pub(super) request: RequestId,
     pub(super) callback_cwd: Option<PathBuf>,
+    /// Origin-only dependencies, kept beside the spec so no executor receives them
+    pub(super) after: Option<TaskDependencies>,
 }
 
 /// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
@@ -170,6 +175,8 @@ struct SubmitEnvelope {
     request_id: Option<RequestId>,
     #[serde(default)]
     callback_cwd: Option<PathBuf>,
+    #[serde(default)]
+    after: Option<Value>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -204,6 +211,7 @@ where
             .ok_or_else(|| missing_field("/spec", "spec"))?;
         // parse_normalized_value already enforces api_version and min timeout
         let spec = spec::parse_normalized_value(&spec_value).map_err(|err| prefix("/spec", err))?;
+        let after = envelope.after.as_ref().map(spec::parse_after).transpose()?;
         // a caller without its own request UUID gets a fresh one, so every task has a retry identity
         let request = envelope.request_id.unwrap_or_default();
         Ok(Self(SubmitBody {
@@ -211,6 +219,7 @@ where
             env,
             request,
             callback_cwd: envelope.callback_cwd,
+            after,
         }))
     }
 }
@@ -259,7 +268,7 @@ struct SubmitResponse {
     id: TaskId,
     task_id: TaskId,
     request_id: RequestId,
-    status: ProcessStatus,
+    status: TaskStatus,
 }
 
 async fn submit(
@@ -267,11 +276,7 @@ async fn submit(
     SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
     let request_id = body.request;
-    let (id, status) = if body.spec.machine.is_some() {
-        crate::daemon::origin_submit::submit(&state, body).await?
-    } else {
-        crate::daemon::local_submit::submit(&state, body).await?
-    };
+    let (id, status) = crate::daemon::dependencies::submit(&state, body).await?;
     Ok((
         StatusCode::OK,
         Json(SubmitResponse {
@@ -294,19 +299,27 @@ pub(super) struct DryRunResponse {
     pub(super) execution_cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) managed_environment: Option<ManagedEnvironmentPreview>,
+    /// Dependencies and their state when the spec has `after`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) after: Option<Vec<DependencyView>>,
 }
 
 async fn dry_run(
     State(state): State<AppState>,
     SpecBody(body): SpecBody,
 ) -> Result<Json<DryRunResponse>, AppError> {
+    let after = match &body.after {
+        Some(after) => Some(crate::daemon::dependencies::preview(&state, after).await?),
+        None => None,
+    };
     let spec = body.spec;
-    if spec.machine.is_some() {
-        return crate::daemon::origin_submit::dry_run(&state, spec, body.env)
-            .await
-            .map(Json);
-    }
-    local_dry_run(&state, spec, body.env).map(Json)
+    let mut response = if spec.machine.is_some() {
+        crate::daemon::origin_submit::dry_run(&state, spec, body.env).await?
+    } else {
+        local_dry_run(&state, spec, body.env)?
+    };
+    response.after = after;
+    Ok(Json(response))
 }
 
 pub(super) fn local_dry_run(
@@ -330,6 +343,7 @@ pub(super) fn local_dry_run(
         stdin: invocation.stdin,
         execution_cwd: None,
         managed_environment: invocation.managed_environment,
+        after: None,
     })
 }
 
@@ -359,7 +373,7 @@ pub(super) struct ListQuery {
 /// Parsed task-list filter. An empty status list matches every status
 #[derive(Debug, Clone, Default)]
 pub(super) struct TaskFilter {
-    pub(super) statuses: Vec<ProcessStatus>,
+    pub(super) statuses: Vec<TaskStatus>,
     pub(super) thread: Option<ThreadId>,
 }
 
@@ -372,11 +386,9 @@ impl TaskFilter {
             if part.is_empty() {
                 continue;
             }
-            statuses.push(
-                ProcessStatus::from_storage(part).map_err(|_| AppError::Usage {
-                    message: format!("invalid status {part}"),
-                })?,
-            );
+            statuses.push(TaskStatus::parse(part).map_err(|_| AppError::Usage {
+                message: format!("invalid status {part}"),
+            })?);
         }
         let thread = query
             .thread
@@ -386,10 +398,16 @@ impl TaskFilter {
     }
 
     /// Query pairs that parse back into this filter, `&`-terminated when non-empty
+    /// Whether a task with this status and thread passes the filter
+    fn matches(&self, status: TaskStatus, thread: ThreadId) -> bool {
+        (self.statuses.is_empty() || self.statuses.contains(&status))
+            && self.thread.is_none_or(|wanted| wanted == thread)
+    }
+
     pub(super) fn query_prefix(&self) -> String {
         let mut prefix = String::new();
         if !self.statuses.is_empty() {
-            let statuses: Vec<&str> = self.statuses.iter().map(ProcessStatus::as_str).collect();
+            let statuses: Vec<&str> = self.statuses.iter().map(TaskStatus::as_str).collect();
             prefix.push_str(&format!("status={}&", statuses.join(",")));
         }
         if let Some(thread) = self.thread {
@@ -400,23 +418,47 @@ impl TaskFilter {
 }
 
 /// Public summaries of the tasks this daemon stores, in id order
+///
+/// Tasks held here, or ended here before launch, have no task row; their
+/// origin route is the only record, so they are listed from it
 pub(super) async fn local_task_summaries(
     state: &AppState,
     filter: TaskFilter,
 ) -> Result<Vec<TaskSummary>, AppError> {
-    let rows = call(&state.store, |reply| StoreMsg::ListTasks {
-        statuses: filter.statuses,
-        thread: filter.thread,
-        reply,
-    })
-    .await?;
+    let processes: Vec<ProcessStatus> = filter
+        .statuses
+        .iter()
+        .filter_map(|status| status.process())
+        .collect();
+    // an empty status list reads every row, so a held-only filter reads none
+    let rows = if filter.statuses.is_empty() || !processes.is_empty() {
+        call(&state.store, |reply| StoreMsg::ListTasks {
+            statuses: processes,
+            thread: filter.thread,
+            reply,
+        })
+        .await?
+    } else {
+        Vec::new()
+    };
     let ids = rows.iter().map(|row| row.id).collect();
     let presentations = call(&state.store, |reply| StoreMsg::TaskPresentations {
         ids,
         reply,
     })
     .await?;
-    Ok(TaskList::from_rows(&rows, &presentations).tasks)
+    let mut tasks = TaskList::from_rows(&rows, &presentations).tasks;
+    let unlaunched = call(&state.store, |reply| StoreMsg::UnlaunchedTasks { reply }).await?;
+    for task in unlaunched {
+        let after = crate::daemon::dependencies::views(state, &task.held.after).await?;
+        if let Some(summary) = TaskSummary::from_unlaunched(&task, after)
+            && filter.matches(summary.status, summary.thread)
+        {
+            tasks.push(summary);
+        }
+    }
+    tasks.sort_by_key(|task| task.id.0);
+    Ok(tasks)
 }
 
 async fn list(
@@ -540,6 +582,9 @@ async fn cancel(
     .await?;
     if let Some(saved) = saved {
         return Ok(Json(CancelResponse::intent(&saved)));
+    }
+    if let Some(response) = crate::daemon::dependencies::cancel(&state, id).await? {
+        return Ok(Json(response));
     }
 
     let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
@@ -700,7 +745,7 @@ mod tests {
             id,
             task_id: id,
             request_id,
-            status: ProcessStatus::Queued,
+            status: ProcessStatus::Queued.into(),
         };
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["request_id"], json!(request_id));
@@ -754,6 +799,24 @@ mod tests {
         value["spec"]["timeout"] = json!("29m");
         let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
         assert_eq!(pointer, "/spec/timeout");
+    }
+
+    #[tokio::test]
+    async fn after_rides_beside_the_spec_with_its_own_pointer() {
+        let mut value = valid();
+        let task = TaskId::new();
+        value["after"] = json!([task]);
+        let body = extract(&value).await.unwrap();
+        assert_eq!(body.after.unwrap().tasks(), &[task]);
+
+        value["after"] = json!([]);
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/after");
+        // the normalized spec has no `after` of its own
+        let mut value = valid();
+        value["spec"]["after"] = json!([task]);
+        let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());
+        assert_eq!(pointer, "/spec/after");
     }
 
     #[tokio::test]

@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 use crate::agents::{AgentExtraArgsError, validate_agent_extra_args};
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
-use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
+use crate::dependency::{DependencyListError, MAX_DEPENDENCIES, TaskDependencies};
+use crate::domain::{
+    API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskId, TaskName, ThreadId,
+};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
@@ -38,6 +41,16 @@ fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "type": "string",
         "default": "1h",
         "description": "Output-inactivity timer as a humantime duration. Default 1h. Minimum 30m. Does not kill the child."
+    })
+}
+
+fn after_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "string", "format": "uuid" },
+        "minItems": 1,
+        "maxItems": MAX_DEPENDENCIES,
+        "uniqueItems": true
     })
 }
 
@@ -104,6 +117,12 @@ struct SubmitSpecWire {
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
+    /// Task UUIDs that must succeed before this task starts. Each must be a
+    /// task this daemon is the origin for. Omit for no dependencies
+    // parsed from `Value` so each list error gets its own pointer
+    #[serde(default)]
+    #[schemars(schema_with = "after_schema")]
+    after: Option<Value>,
     /// Workload variant. Parsed from `Value` after the envelope so nested
     /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
@@ -293,6 +312,11 @@ pub struct SubmitSpec {
     pub machine: Option<MachineName>,
     /// Output-inactivity timeout
     pub timeout: Duration,
+    /// Tasks that must succeed before this task starts
+    ///
+    /// Origin-only: it travels beside the normalized spec, never inside it, so
+    /// an executor cannot receive it
+    pub after: Option<TaskDependencies>,
     /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
@@ -560,6 +584,7 @@ fn check_timeout(timeout: Duration, pointer: &str) -> Result<(), AppError> {
 fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppError> {
     check_api_version(wire.api_version, "/api_version")?;
     check_timeout(wire.timeout, "/timeout")?;
+    let after = wire.after.as_ref().map(parse_after).transpose()?;
     let workload = parse_submit_workload(&wire.workload)?;
     Ok(SubmitSpec {
         api_version: wire.api_version,
@@ -568,7 +593,31 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         cwd: wire.cwd,
         machine: wire.machine,
         timeout: wire.timeout,
+        after,
         workload,
+    })
+}
+
+/// Parse a top-level `after` value, with pointers under `/after`
+///
+/// The submit spec and the daemon socket envelope both carry `after` at the
+/// top level, so both report the same pointers
+pub fn parse_after(value: &Value) -> Result<TaskDependencies, AppError> {
+    let tasks: Vec<TaskId> = deserialize_under(value, "/after")?;
+    TaskDependencies::new(tasks).map_err(|error| {
+        let (pointer, value) = match error {
+            DependencyListError::Duplicate { index, task } => {
+                (format!("/after/{index}"), json!(task))
+            }
+            DependencyListError::Empty | DependencyListError::TooMany { .. } => {
+                ("/after".to_owned(), value.clone())
+            }
+        };
+        AppError::InvalidSpec {
+            pointer,
+            value,
+            message: error.to_string(),
+        }
     })
 }
 
@@ -1052,6 +1101,50 @@ mod tests {
         value
     }
 
+    #[track_caller]
+    fn after_error(after: Value) -> (String, Value) {
+        let mut value = valid_task();
+        value["after"] = after;
+        match parse_spec_value(&value).unwrap_err() {
+            AppError::InvalidSpec { pointer, value, .. } => (pointer, value),
+            other => panic!("expected invalid_spec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn after_is_optional_sorted_and_kept_out_of_the_normalized_spec() {
+        let spec = parse_spec_value(&valid_task()).unwrap();
+        assert!(spec.after.is_none());
+
+        let first = crate::domain::TaskId::new();
+        let second = crate::domain::TaskId::new();
+        let mut value = valid_task();
+        value["after"] = json!([second, first]);
+        let spec = parse_spec_value(&value).unwrap();
+        assert_eq!(spec.after.as_ref().unwrap().tasks(), &[first, second]);
+        let normalized = serde_json::to_value(normalize(&spec).unwrap()).unwrap();
+        assert!(normalized.get("after").is_none());
+    }
+
+    #[test]
+    fn after_list_errors_point_at_the_offending_entry() {
+        let (pointer, value) = after_error(json!([]));
+        assert_eq!((pointer.as_str(), value), ("/after", json!([])));
+
+        let task = crate::domain::TaskId::new();
+        let (pointer, value) = after_error(json!([task, crate::domain::TaskId::new(), task]));
+        assert_eq!((pointer.as_str(), value), ("/after/2", json!(task)));
+
+        let many: Vec<_> = (0..=crate::dependency::MAX_DEPENDENCIES)
+            .map(|_| crate::domain::TaskId::new())
+            .collect();
+        let (pointer, _) = after_error(json!(many));
+        assert_eq!(pointer, "/after");
+
+        let (pointer, value) = after_error(json!(["not-a-uuid"]));
+        assert_eq!((pointer.as_str(), value), ("/after/0", json!("not-a-uuid")));
+    }
+
     #[test]
     fn unknown_field_rejected() {
         let mut value = valid_agent();
@@ -1242,6 +1335,7 @@ mod tests {
             name: TaskName::parse("from file").unwrap(),
             cwd: dir.path().to_path_buf(),
             timeout: default_timeout(),
+            after: None,
             workload: SubmitWorkloadValidated::Agent(SubmitAgent {
                 agent: AgentKind::Claude,
                 model: None,

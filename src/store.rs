@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::callback::{
     EventKind, ReportView, check_due_event, exit_event, lost_event, notify_event, terminal_event,
 };
+use crate::dependency::TaskDependencies;
 use crate::domain::{
     AttentionState, CallbackStatus, ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence,
     ProcessStatus, REPORTS_MAX, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv,
@@ -31,11 +32,13 @@ use crate::submission::{
 
 mod cancellation;
 mod container;
+mod dependency;
 mod events;
 mod identity;
 mod message;
 mod resource;
 pub use container::TaskContainerRecord;
+pub use dependency::{HeldCancel, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
 pub(crate) use resource::VerifiedReleaseProof;
@@ -476,7 +479,73 @@ const RELEASED_V0_8_7_SCHEMA_VERSION: i64 = 32;
 
 /// Add the Codex worker thread captured from its task log
 fn migrate_32_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch("ALTER TABLE tasks ADD COLUMN worker_thread TEXT;")
+    conn.execute_batch("ALTER TABLE tasks ADD COLUMN worker_thread TEXT;")?;
+    migrate_33_to_current(conn)
+}
+
+/// Released v0.11 and v0.12 databases use schema version 33
+const RELEASED_V0_11_SCHEMA_VERSION: i64 = 33;
+
+/// Add task dependencies and the terminal outcome that releases or cancels a held task
+///
+/// `after_json` is the origin-only dependency list, saved beside the route
+/// like `spec_json`. `outcome` is how the task ended, taken from its terminal
+/// event, so it survives inbox payload compaction
+const MIGRATE_33_TO_34: &str = r"
+ALTER TABLE origin_routes ADD COLUMN after_json TEXT;
+ALTER TABLE origin_routes ADD COLUMN outcome TEXT
+    CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost'));
+";
+
+/// Outcomes of tasks that finished before the `outcome` column existed
+///
+/// Only definitive evidence sets an outcome. The retained terminal event names
+/// it. Older events may be pruned, so a local task's row and last report decide
+/// it next, by the same rules that built its terminal event. A remote route
+/// keeps only its last process state, which is not an outcome: a worker can
+/// exit 0 after reporting `blocked`, and its reports are on the executor. Such
+/// a route stays without an outcome, and dependency checks read its ending as
+/// unknown, which never counts as success
+const BACKFILL_33_TO_34: &str = r"
+UPDATE origin_routes SET outcome = (
+    SELECT CASE json_extract(i.event_json, '$.payload.event.event')
+        WHEN 'TASK_SUCCEEDED' THEN 'succeeded'
+        WHEN 'TASK_FAILED' THEN 'failed'
+        WHEN 'TASK_BLOCKED' THEN 'blocked'
+        WHEN 'TASK_CANCELLED' THEN 'cancelled'
+        WHEN 'TASK_LOST' THEN 'lost'
+    END
+    FROM origin_inbox i
+    WHERE i.task_id = origin_routes.task_id
+      AND json_extract(i.event_json, '$.payload.type') = 'callback'
+      AND json_extract(i.event_json, '$.payload.state') IN ('succeeded', 'failed', 'cancelled', 'lost')
+    ORDER BY i.seq DESC LIMIT 1
+)
+WHERE outcome IS NULL;
+
+UPDATE origin_routes SET outcome = (
+    SELECT CASE
+        WHEN t.status IN ('cancelled', 'lost') THEN t.status
+        WHEN last.outcome = 'blocked' THEN 'blocked'
+        WHEN t.status = 'failed' OR last.outcome = 'failed' THEN 'failed'
+        ELSE 'succeeded'
+    END
+    FROM tasks t
+    LEFT JOIN (
+        SELECT r.task_id, r.outcome FROM reports r
+        WHERE r.seq = (SELECT MAX(seq) FROM reports WHERE task_id = r.task_id)
+    ) last ON last.task_id = t.id
+    WHERE t.id = origin_routes.task_id
+      AND t.status IN ('succeeded', 'failed', 'cancelled', 'lost')
+)
+WHERE outcome IS NULL
+  AND json_extract(route_json, '$.origin_machine') = json_extract(route_json, '$.execution_machine');
+";
+
+/// Move a v0.11 database to the current schema
+fn migrate_33_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_33_TO_34)?;
+    conn.execute_batch(BACKFILL_33_TO_34)
 }
 
 /// Why `Store::open` refuses a database version
@@ -718,6 +787,99 @@ fn insert_local_task_records_on(
     Ok(())
 }
 
+/// How a local launch commits its origin route with the task row
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalAdmission {
+    /// A new submission: insert an accepted route for this request
+    Submitted {
+        /// Caller retry identity
+        request: RequestId,
+        /// Dependencies that had all succeeded when the request was admitted
+        after: Option<TaskDependencies>,
+    },
+    /// A held route whose dependencies succeeded: accept the route saved at submit
+    Released {
+        /// Retry identity saved with the held route
+        request: RequestId,
+    },
+}
+
+/// Accept the waiting held route of a local task with its first row and event
+///
+/// The row must repeat the saved spec and callback environment, so the task
+/// runs as submitted even though the submitting shell is gone
+fn release_held_local_task_records_on(
+    conn: &Connection,
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    machine: MachineId,
+    request: RequestId,
+) -> Result<(), AppError> {
+    let route_json: String = conn
+        .query_row(
+            "SELECT route_json FROM origin_routes WHERE task_id=?1",
+            [row.id.to_string()],
+            |entry| entry.get(0),
+        )
+        .optional()?
+        .ok_or(AppError::RouteNotFound { task: row.id })?;
+    let mut route: OriginRoute = serde_json::from_str(&route_json)?;
+    let waiting = matches!(
+        route.submission,
+        SubmissionState::Held {
+            phase: crate::submission::HeldPhase::Waiting
+        }
+    );
+    if !waiting
+        || route.request != request
+        || route.task != row.id
+        || route.origin_machine != machine
+        || route.execution_machine != machine
+        || route.current_spec() != Some(spec)
+    {
+        return Err(AppError::ClusterTaskConflict { task: row.id });
+    }
+    validate_local_task_acceptance(row, spec, &route.callback)?;
+    if resource_request_task_id_is_reserved(conn, row.id)?
+        || release_watcher_task_id_is_reserved(conn, row.id)?
+    {
+        return Err(AppError::ClusterTaskConflict { task: row.id });
+    }
+
+    let project_root = find_project_root(&row.cwd);
+    insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
+    route.submission = SubmissionState::Accepted;
+    route.last_execution_state = Some(ProcessStatus::Queued);
+    route.last_updated_at = Some(chrono::Utc::now());
+    let identity = ExecutorIdentity::Accepted(ExecutionRecord {
+        task: row.id,
+        origin_machine: machine,
+        execution_machine: machine,
+        spec: spec.clone().into(),
+        state: ProcessStatus::Queued,
+    });
+    conn.execute(
+        "UPDATE origin_routes SET route_json=?1 WHERE task_id=?2",
+        params![serde_json::to_string(&route)?, row.id.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
+        params![
+            row.id.to_string(),
+            machine.to_string(),
+            serde_json::to_string(&identity)?
+        ],
+    )?;
+    events::append_produced_event_on(
+        conn,
+        row.id,
+        EventPayload::State {
+            status: ProcessStatus::Queued,
+        },
+    )?;
+    Ok(())
+}
+
 /// Fixed owners of one authority task whose callback route lives on another machine
 pub(crate) struct RemoteOriginTask {
     /// Stable retry identity saved in the remote route
@@ -906,6 +1068,7 @@ impl Store {
                 RELEASED_V0_7_SCHEMA_VERSION => migrate_30_to_current(&transaction)?,
                 RELEASED_V0_8_SCHEMA_VERSION => migrate_31_to_current(&transaction)?,
                 RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
+                RELEASED_V0_11_SCHEMA_VERSION => migrate_33_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -945,6 +1108,45 @@ impl Store {
         self.immediate(|| {
             insert_local_task_records_on(&self.conn, row, spec, machine, request, &callback, None)
         })
+    }
+
+    /// Commit a local task row with the origin route its admission names
+    ///
+    /// A submission inserts a new accepted route, saving its dependencies. A
+    /// release accepts the held route saved at submit, with the callback
+    /// context saved then, so the row and the route change together
+    pub fn admit_local_task(
+        &self,
+        row: &TaskRow,
+        spec: &NormalizedSpec,
+        machine: MachineId,
+        admission: &LocalAdmission,
+        codex: CallbackExecutable,
+    ) -> Result<(), AppError> {
+        match admission {
+            LocalAdmission::Submitted { request, after } => {
+                let callback = CallbackContext {
+                    env: row.env.clone(),
+                    cwd: row.cwd.clone(),
+                    codex,
+                };
+                self.immediate(|| {
+                    insert_local_task_records_on(
+                        &self.conn, row, spec, machine, *request, &callback, None,
+                    )?;
+                    if let Some(after) = after {
+                        self.conn.execute(
+                            "UPDATE origin_routes SET after_json=?1 WHERE task_id=?2",
+                            params![serde_json::to_string(after)?, row.id.to_string()],
+                        )?;
+                    }
+                    Ok(())
+                })
+            }
+            LocalAdmission::Released { request } => self.immediate(|| {
+                release_held_local_task_records_on(&self.conn, row, spec, machine, *request)
+            }),
+        }
     }
 
     /// Accept one remote execution with its queued row and first outbound event atomically
@@ -2475,8 +2677,9 @@ mod tests {
     use super::{
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
         RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
-        RELEASED_V0_8_7_SCHEMA_VERSION, RELEASED_V0_8_SCHEMA_VERSION, Store, new_queued_task,
-        read_exit_json, write_exit_json_with_evidence,
+        RELEASED_V0_8_7_SCHEMA_VERSION, RELEASED_V0_8_SCHEMA_VERSION,
+        RELEASED_V0_11_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
+        write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -3825,6 +4028,105 @@ CREATE TABLE reports (
         assert_foreign_keys_enabled(&store);
     }
 
+    /// Run one local task to exit 0 after a last report with this outcome
+    fn finish_local(store: &Store, id: TaskId, last_report: ReportOutcome) {
+        insert_local(store, id);
+        store
+            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+            .unwrap();
+        store
+            .append_report_with_notification(id, last_report, "done", false)
+            .unwrap();
+        store
+            .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
+            .unwrap();
+    }
+
+    /// Save a remote route whose task exited 0 but whose terminal event is gone
+    fn insert_pruned_remote_route(store: &mut Store, id: TaskId) {
+        let row = task_row(id);
+        let route = OriginRoute {
+            request: RequestId::new(),
+            task: id,
+            origin_machine: MachineId::new(),
+            execution_machine: MachineId::new(),
+            thread: row.thread,
+            callback: CallbackContext {
+                env: row.env.clone(),
+                cwd: row.cwd.clone(),
+                codex: CallbackExecutable::available(Path::new("/bin/true").into()),
+            },
+            spec: local_spec(&row).into(),
+            submission: SubmissionState::Accepted,
+            last_execution_state: Some(ProcessStatus::Succeeded),
+            last_updated_at: Some(Utc::now()),
+            last_accepted_seq: 4,
+            last_settled_seq: 4,
+        };
+        store.insert_origin_route(&route).unwrap();
+    }
+
+    #[test]
+    fn released_v0_11_schema_backfills_outcomes_only_from_definitive_evidence() {
+        use crate::dependency::{DependencyOutcome, DependencyState, TaskOutcome};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let delivered = TaskId::new();
+        let undelivered = TaskId::new();
+        let pending = TaskId::new();
+        let pruned_remote = TaskId::new();
+        {
+            let mut store = Store::open(&path).unwrap();
+            finish_local(&store, delivered, ReportOutcome::Blocked);
+            deliver_outbound_events(&mut store, delivered, |_| DeliveryOutcome::Delivered);
+            // its terminal event never reached the inbox, so the task row decides
+            finish_local(&store, undelivered, ReportOutcome::Failed);
+            insert_local(&store, pending);
+            // exit 0 is not success: the last report on the executor may say blocked
+            insert_pruned_remote_route(&mut store, pruned_remote);
+            store
+                .conn
+                .execute_batch(&format!(
+                    "ALTER TABLE origin_routes DROP COLUMN after_json;
+                     ALTER TABLE origin_routes DROP COLUMN outcome;
+                     PRAGMA user_version = {RELEASED_V0_11_SCHEMA_VERSION};"
+                ))
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .dependency_states(&[delivered, undelivered, pending, pruned_remote])
+                .unwrap(),
+            vec![
+                (
+                    delivered,
+                    Some(DependencyState::Ended(TaskOutcome::Blocked.into()))
+                ),
+                (
+                    undelivered,
+                    Some(DependencyState::Ended(TaskOutcome::Failed.into()))
+                ),
+                (pending, Some(DependencyState::Pending)),
+                (
+                    pruned_remote,
+                    Some(DependencyState::Ended(DependencyOutcome::Unknown))
+                ),
+            ]
+        );
+        let saved: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT outcome FROM origin_routes WHERE task_id=?1",
+                [pruned_remote.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, None);
+    }
+
     #[test]
     fn released_v0_8_7_schema_gains_worker_thread_and_keeps_task_rows() {
         let dir = tempdir().unwrap();
@@ -3837,6 +4139,8 @@ CREATE TABLE reports (
                 .conn
                 .execute_batch(&format!(
                     "ALTER TABLE tasks DROP COLUMN worker_thread;
+                     ALTER TABLE origin_routes DROP COLUMN after_json;
+                     ALTER TABLE origin_routes DROP COLUMN outcome;
                      PRAGMA user_version = {RELEASED_V0_8_7_SCHEMA_VERSION};"
                 ))
                 .unwrap();
@@ -4009,7 +4313,11 @@ CREATE TABLE reports (
         }
         store
             .conn
-            .execute("ALTER TABLE tasks DROP COLUMN worker_thread", [])
+            .execute_batch(
+                "ALTER TABLE tasks DROP COLUMN worker_thread;
+                 ALTER TABLE origin_routes DROP COLUMN after_json;
+                 ALTER TABLE origin_routes DROP COLUMN outcome;",
+            )
             .unwrap();
         if version < RELEASED_V0_7_SCHEMA_VERSION {
             store
@@ -4111,6 +4419,8 @@ CREATE TABLE reports (
                 .conn
                 .execute_batch(&format!(
                     "ALTER TABLE tasks DROP COLUMN worker_thread;
+                     ALTER TABLE origin_routes DROP COLUMN after_json;
+                     ALTER TABLE origin_routes DROP COLUMN outcome;
                      ALTER TABLE tasks DROP COLUMN container_exit_evidence;
                      DROP TABLE task_containers;
                      DROP TABLE resource_requests;
@@ -4173,7 +4483,11 @@ CREATE TABLE reports (
             drop_return_window_tables(&store);
             store
                 .conn
-                .execute("ALTER TABLE tasks DROP COLUMN worker_thread", [])
+                .execute_batch(
+                    "ALTER TABLE tasks DROP COLUMN worker_thread;
+                 ALTER TABLE origin_routes DROP COLUMN after_json;
+                 ALTER TABLE origin_routes DROP COLUMN outcome;",
+                )
                 .unwrap();
             store
                 .conn
@@ -4205,6 +4519,8 @@ CREATE TABLE reports (
                 .execute_batch(&format!(
                     "DROP TABLE resource_initial_idle_attestations;
                      ALTER TABLE tasks DROP COLUMN worker_thread;
+                     ALTER TABLE origin_routes DROP COLUMN after_json;
+                     ALTER TABLE origin_routes DROP COLUMN outcome;
                      PRAGMA user_version = {RELEASED_V0_5_1_SCHEMA_VERSION};"
                 ))
                 .unwrap();

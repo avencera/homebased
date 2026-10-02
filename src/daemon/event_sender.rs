@@ -38,14 +38,15 @@ struct Sender {
     fleet: FleetState,
 }
 
+/// Exponential retry schedule for one key, shared by daemon loops that resend saved work
 #[derive(Clone, Copy)]
-struct Retry {
+pub(super) struct Retry {
     failures: u32,
     next: Instant,
 }
 
 impl Retry {
-    fn after_failure(previous: Option<Self>, now: Instant) -> Self {
+    pub(super) fn after_failure(previous: Option<Self>, now: Instant) -> Self {
         let failures = previous.map_or(0, |retry| retry.failures).saturating_add(1);
         Self {
             failures,
@@ -53,7 +54,7 @@ impl Retry {
         }
     }
 
-    fn ready(self, now: Instant) -> bool {
+    pub(super) fn ready(self, now: Instant) -> bool {
         self.next <= now
     }
 }

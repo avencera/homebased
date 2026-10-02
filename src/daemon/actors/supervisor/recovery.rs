@@ -13,14 +13,18 @@ use crate::submission::ExecutorIdentity;
 
 /// Give every non-terminal task an owner after a daemon restart
 ///
-/// Only a queued remote acceptance is launched, and `launch_accepted` still
-/// refuses one whose runner lock is held; every other row is observed or left
-/// for its resource actor
+/// Only a queued remote acceptance or released local task is launched, and
+/// `launch_accepted` still refuses one whose runner lock is held; every other
+/// row is observed or left for its resource actor
 pub(super) async fn recover_tasks(
     supervisor: &ActorRef<SupervisorMsg>,
     state: &mut SupervisorState,
 ) -> Result<(), AppError> {
     let owned = ResourceOwnedTasks::load(state).await?;
+    let released = call(&state.store, |reply| StoreMsg::UnstartedDependentTasks {
+        reply,
+    })
+    .await?;
     let rows = call(&state.store, |reply| StoreMsg::NonTerminal { reply }).await?;
     for row in rows {
         // a queued return or first background task may have lost its spawn, and a
@@ -45,6 +49,7 @@ pub(super) async fn recover_tasks(
             owned.accepted.get(&row.id),
             owned.watchers.contains(&row.id),
             identity.as_ref(),
+            released.contains(&row.id),
         ) {
             StartupRecoveryAction::LaunchAccepted => {
                 launch_accepted(supervisor, state, row.id).await?;
@@ -125,11 +130,17 @@ pub(super) enum StartupRecoveryAction {
     DeferResource,
 }
 
+/// Decide how startup recovery owns one non-terminal row
+///
+/// `released` marks a local task submitted with dependencies. Its origin, not
+/// a caller, retries its launch, so a queued row is launched rather than
+/// observed into `lost`
 pub(super) fn startup_recovery_action(
     row: &TaskRow,
     resource_task: Option<&AcceptedResourceTask>,
     release_watcher: bool,
     identity: Option<&ExecutorIdentity>,
+    released: bool,
 ) -> StartupRecoveryAction {
     if let Some(resource_task) = resource_task {
         return match (row.status(), resource_task.state) {
@@ -144,11 +155,12 @@ pub(super) fn startup_recovery_action(
     }
 
     if row.status() == ProcessStatus::Queued
-        && matches!(
-            identity,
-            Some(ExecutorIdentity::Accepted(record))
-                if record.origin_machine != record.execution_machine
-        )
+        && (released
+            || matches!(
+                identity,
+                Some(ExecutorIdentity::Accepted(record))
+                    if record.origin_machine != record.execution_machine
+            ))
     {
         return StartupRecoveryAction::LaunchAccepted;
     }

@@ -17,7 +17,7 @@ use crate::domain::{
     AgentKind, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskRow,
 };
 use crate::error::AppError;
-use crate::home::{Home, LockMode};
+use crate::home::{Home, LockMode, TaskPaths};
 use crate::invocation::{persist_workload, resolve_agent_binary_with};
 use crate::machine::{MachineId, load_or_create_machine_id};
 use crate::notify::Notifier;
@@ -35,7 +35,8 @@ use crate::runner;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
 use crate::store::{
     BackgroundLaunchAcceptance, BackgroundLaunchError, CancelResult, EndedRestoreResolution,
-    NewTask, ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, new_queued_task,
+    LocalAdmission, NewTask, ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance,
+    new_queued_task,
 };
 use crate::submission::{CallbackExecutable, ExecutionRecord, ExecutorIdentity, RequestId};
 
@@ -150,12 +151,20 @@ pub(crate) enum SupervisorMsg {
             Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
         >,
     },
-    /// Persist a queued row under its request, spawn its worker, and watch it
+    /// Persist a queued row under its admission, spawn its worker, and watch it
     Launch {
         row: Box<TaskRow>,
         spec: Box<NormalizedSpec>,
-        request: RequestId,
+        admission: LocalAdmission,
         reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Resolve the Codex executable that callbacks for a local task would use
+    ///
+    /// A held local task saves it at submit, like the route of a launched one
+    CallbackCodex {
+        path: String,
+        cwd: PathBuf,
+        reply: RpcReplyPort<Result<CallbackExecutable, AppError>>,
     },
     /// Finish the launch of a saved local task; `None` when a resource flow owns it
     ResumeLocal {
@@ -451,10 +460,13 @@ impl Actor for SupervisorActor {
             SupervisorMsg::Launch {
                 row,
                 spec,
-                request,
+                admission,
                 reply,
             } => {
-                send_reply(reply, launch(&myself, state, *row, *spec, request).await);
+                send_reply(reply, launch(&myself, state, *row, *spec, admission).await);
+            }
+            SupervisorMsg::CallbackCodex { path, cwd, reply } => {
+                send_reply(reply, Ok(resolve_callback_codex(state, &path, &cwd)));
             }
             SupervisorMsg::ResumeLocal { id, reply } => {
                 send_reply(reply, resume_local(&myself, state, id).await);
@@ -862,39 +874,46 @@ fn task_id_from_name(name: Option<String>) -> Option<TaskId> {
     rest.parse().ok()
 }
 
-/// Insert the row, spawn the worker with the runner lock held, then watch it
+/// Write the task files, insert the row, spawn the worker with the runner lock held, then watch it
 /// Runs inside the supervisor so a task always has an in-process owner from
 /// the moment its worker exists, and so a client that disconnects mid-submit
 /// cannot strand a Queued row with no worker. The cost is that launches are
 /// serialized under one `CALL_TIMEOUT`; each is a few store calls and a
 /// fork, so that only bites when SQLite itself stalls. A failed spawn
 /// finishes the row as `SpawnFailed` and returns the spawn error
+///
+/// A release keeps its pre-assigned task UUID, so the release loop resends it
+/// after a timed-out attempt that may still be queued here. Launches run one
+/// at a time, so the resend sees that attempt's row and only finishes its
+/// launch, leaving the files of its worker alone
 async fn launch(
     supervisor: &ActorRef<SupervisorMsg>,
     state: &mut SupervisorState,
     row: TaskRow,
     spec: NormalizedSpec,
-    request: RequestId,
+    admission: LocalAdmission,
 ) -> Result<(), AppError> {
     let id = row.id;
+    if matches!(admission, LocalAdmission::Released { .. }) && task_exists(state, id).await? {
+        resume_local(supervisor, state, id).await?;
+        return Ok(());
+    }
+    let paths = state.home.prepare_task(id)?;
+    if let NormalizedWorkload::Agent(agent) = &spec.workload {
+        runner::write_task_files(&paths, &agent.prompt, agent.report_trailer)?;
+    }
     let codex = resolve_callback_codex(state, &row.env.path, &row.cwd);
     let inserted = call(&state.store, |reply| StoreMsg::InsertLocalTask {
         row: Box::new(row),
         spec: Box::new(spec),
         machine: state.machine,
-        request,
+        admission,
         codex,
         reply,
     })
     .await;
-    let paths = state.home.task_paths(id);
     if let Err(error) = inserted {
-        // a timed-out insert may still commit, so only a refused one gives up its files
-        if !matches!(error, AppError::DaemonBusy)
-            && let Err(cleanup) = std::fs::remove_dir_all(&paths.dir)
-        {
-            tracing::warn!(%id, "remove refused task directory: {cleanup}");
-        }
+        remove_refused_task_files(state, id, &paths, &error).await;
         return Err(error);
     }
     // uncontended: the lock file is new for this id, so the blocking flock
@@ -917,6 +936,31 @@ async fn launch(
     // the worker runs whether or not its pid was saved, so it is always watched
     spawn_task_actor(supervisor, state, id).await?;
     recorded
+}
+
+/// Remove the files of a launch whose row the store refused
+///
+/// A timed-out insert may still commit, and a committed row belongs to a
+/// worker that reads these files, so only a refusal with no row for this task
+/// gives them up. A failed check keeps them
+async fn remove_refused_task_files(
+    state: &SupervisorState,
+    id: TaskId,
+    paths: &TaskPaths,
+    error: &AppError,
+) {
+    if matches!(error, AppError::DaemonBusy) || task_exists(state, id).await.unwrap_or(true) {
+        return;
+    }
+    if let Err(cleanup) = std::fs::remove_dir_all(&paths.dir) {
+        tracing::warn!(%id, "remove refused task directory: {cleanup}");
+    }
+}
+
+async fn task_exists(state: &SupervisorState, id: TaskId) -> Result<bool, AppError> {
+    Ok(call(&state.store, |reply| StoreMsg::GetTask { id, reply })
+        .await?
+        .is_some())
 }
 
 /// Give a saved local task the worker and watch that its launch may have missed

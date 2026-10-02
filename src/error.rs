@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::callback::destination::ThreadSuggestion;
+use crate::dependency::DependencyOutcome;
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
@@ -100,6 +101,24 @@ pub enum AppError {
         origin_machine: MachineId,
         /// Machine that ran the source task
         execution_machine: MachineId,
+    },
+    /// An `after` entry names no task that this daemon is the origin for
+    #[error(
+        "dependency {task} is not a task submitted through this machine; after may name only tasks this daemon is the origin for"
+    )]
+    UnknownDependency {
+        /// Dependency without an origin route here
+        task: TaskId,
+    },
+    /// An `after` entry already ended without success, so the task could never start
+    #[error(
+        "dependency {task} already ended without success (outcome {outcome}); the task would never start"
+    )]
+    DependencyFailed {
+        /// Dependency that ended
+        task: TaskId,
+        /// How it ended, `unknown` when no record says
+        outcome: DependencyOutcome,
     },
     /// `cwd` is not an existing, accessible host directory on the machine that runs the task
     #[error(
@@ -567,6 +586,8 @@ impl AppError {
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
             Self::InvalidCwd { .. } => "invalid_cwd",
+            Self::UnknownDependency { .. } => "unknown_dependency",
+            Self::DependencyFailed { .. } => "dependency_failed",
             Self::ExecutableMissing { .. } => "executable_missing",
             Self::SummaryTooLong { .. } => "summary_too_long",
             Self::TooManyReports { .. } => "too_many_reports",
@@ -657,6 +678,7 @@ impl AppError {
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
+            | Self::UnknownDependency { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::NotDirectory { .. }
@@ -667,6 +689,7 @@ impl AppError {
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
+            | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
@@ -715,6 +738,7 @@ impl AppError {
             Self::TaskNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
+            | Self::UnknownDependency { .. }
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::MachineNotFound { .. }
@@ -723,6 +747,7 @@ impl AppError {
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
+            | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
@@ -814,6 +839,10 @@ impl AppError {
                 "execution_machine": execution_machine
             }),
             Self::TaskNotStarted { task } => json!({ "task": task }),
+            Self::UnknownDependency { task } => json!({ "pointer": "/after", "task": task }),
+            Self::DependencyFailed { task, outcome } => {
+                json!({ "pointer": "/after", "task": task, "outcome": outcome })
+            }
             Self::RouteNotFound { task }
             | Self::ClusterTaskConflict { task }
             | Self::ResourceCancellationUnavailable { task } => {

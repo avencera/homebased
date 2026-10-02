@@ -7,25 +7,29 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::AppState;
-use super::actors::{StoreMsg, call};
+use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::{DryRunResponse, SubmitBody};
 use super::cluster::{
     AbandonExecution, IdentityBody, PreviewBody, PreviewExecution, SubmitExecution,
 };
-use crate::domain::{API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId};
+use crate::dependency::TaskDependencies;
+use crate::domain::{API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskStatus};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
 use crate::invocation::resolve_agent_binary;
+use crate::machine::{MachineId, MachineName};
 use crate::spec::{self, NormalizedSpec};
-use crate::submission::{CallbackContext, ExecutorIdentity, OriginRoute, SubmissionState};
+use crate::submission::{
+    CallbackContext, ExecutorIdentity, HeldPhase, OriginRoute, SubmissionState,
+};
 
 /// Submit a remote request once or resolve its saved outcome without resending
 pub(super) async fn submit(
     state: &AppState,
     body: SubmitBody,
-) -> Result<(TaskId, ProcessStatus), AppError> {
+) -> Result<(TaskId, TaskStatus), AppError> {
     let request = body.request;
     let _request_guard = state.locks.origin_submissions.lock(request).await;
     let saved = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
@@ -34,19 +38,8 @@ pub(super) async fn submit(
     })
     .await?;
     if let Some(route) = saved {
-        ensure_direct_route(&route)?;
-        let saved_spec = route
-            .spec
-            .current()
-            .ok_or_else(|| conflict(&route, "migrated local task has no remote request"))?;
-        if *saved_spec != body.spec {
-            return Err(conflict(
-                &route,
-                "request UUID has different normalized content",
-            ));
-        }
-        let (task, status) = finish_saved(state, route).await?;
-        return Ok((task, status));
+        check_retry(state, &route, &body).await?;
+        return finish_saved(state, route).await;
     }
 
     let machine_name = body
@@ -56,6 +49,118 @@ pub(super) async fn submit(
         .ok_or_else(|| AppError::Internal {
             message: "remote dispatch has no machine".into(),
         })?;
+    let machine = execution_machine(state, machine_name).await?;
+    let fleet = state
+        .fleet
+        .handle()
+        .ok_or_else(|| AppError::MachineNotFound {
+            machine: machine_name.to_string(),
+        })?;
+    let destination = fleet.connect(machine).await?;
+    let callback = callback_context(body.env, body.callback_cwd)?;
+    let task = TaskId::new();
+    let route = OriginRoute {
+        request,
+        task,
+        origin_machine: state.machine.identity.machine,
+        execution_machine: machine,
+        thread: body.spec.thread,
+        callback,
+        spec: body.spec.into(),
+        submission: SubmissionState::AcceptanceUnknown,
+        last_execution_state: None,
+        last_updated_at: Some(chrono::Utc::now()),
+        last_accepted_seq: 0,
+        last_settled_seq: 0,
+    };
+    let saved = insert_route(state, route, body.after).await?;
+    if saved.task != task {
+        return finish_saved(state, saved).await;
+    }
+    let wire = execution_wire(&saved, destination.protocol, machine)?;
+    let response = ClusterClient::default()
+        .post_json(&destination.address, "/v1/cluster/executions", &wire)
+        .await
+        .map_err(|error| unknown(&saved, error.to_string()))?;
+    let identity = decode_identity(&saved, response, destination.protocol)?;
+    resolve_identity(state, saved, identity.identity).await
+}
+
+/// Save a new route with its dependencies, or return the route an identical request saved
+pub(super) async fn insert_route(
+    state: &AppState,
+    route: OriginRoute,
+    after: Option<TaskDependencies>,
+) -> Result<OriginRoute, AppError> {
+    let request = route.request;
+    let inserted = match after {
+        Some(after) => {
+            call(&state.store, |reply| StoreMsg::InsertOriginRouteAfter {
+                route: Box::new(route),
+                after,
+                reply,
+            })
+            .await
+        }
+        None => {
+            call(&state.store, |reply| StoreMsg::InsertOriginRoute {
+                route: Box::new(route),
+                reply,
+            })
+            .await
+        }
+    };
+    match inserted {
+        Ok(saved) => Ok(saved),
+        Err(error) => {
+            let found = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
+                request,
+                reply,
+            })
+            .await?;
+            match found {
+                Some(found) => Err(conflict(&found, error.to_string())),
+                None => Err(error),
+            }
+        }
+    }
+}
+
+/// Refuse a retry whose spec or dependencies differ from the saved request
+async fn check_retry(
+    state: &AppState,
+    route: &OriginRoute,
+    body: &SubmitBody,
+) -> Result<(), AppError> {
+    if !matches!(route.submission, SubmissionState::Held { .. }) {
+        ensure_direct_route(route)?;
+    }
+    let saved_spec = route
+        .spec
+        .current()
+        .ok_or_else(|| conflict(route, "migrated local task has no remote request"))?;
+    if *saved_spec != body.spec {
+        return Err(conflict(
+            route,
+            "request UUID has different normalized content",
+        ));
+    }
+    let saved_after = call(&state.store, |reply| StoreMsg::RouteDependencies {
+        id: route.task,
+        reply,
+    })
+    .await?;
+    if saved_after != body.after {
+        return Err(conflict(route, "request UUID has different dependencies"));
+    }
+    Ok(())
+}
+
+/// Resolve a spec machine name to the peer that will execute it
+pub(super) async fn execution_machine(
+    state: &AppState,
+    machine_name: &MachineName,
+) -> Result<MachineId, AppError> {
     let Some(fleet) = state.fleet.handle() else {
         if machine_name == &state.machine.name {
             return Err(local_machine_selector(machine_name));
@@ -64,12 +169,18 @@ pub(super) async fn submit(
             machine: machine_name.to_string(),
         });
     };
-    let machine = match fleet.resolve_name(machine_name).await? {
-        NameTarget::Local => return Err(local_machine_selector(machine_name)),
-        NameTarget::Peer(machine) => machine,
-    };
-    let destination = fleet.connect(machine).await?;
-    let callback_cwd = body.callback_cwd.ok_or_else(|| AppError::InvalidSpec {
+    match fleet.resolve_name(machine_name).await? {
+        NameTarget::Local => Err(local_machine_selector(machine_name)),
+        NameTarget::Peer(machine) => Ok(machine),
+    }
+}
+
+/// Origin-only callback context for a remote task, from the submitting shell
+pub(super) fn callback_context(
+    env: TaskEnv,
+    callback_cwd: Option<std::path::PathBuf>,
+) -> Result<CallbackContext, AppError> {
+    let callback_cwd = callback_cwd.ok_or_else(|| AppError::InvalidSpec {
         pointer: "/callback_cwd".into(),
         value: Value::Null,
         message: "remote submission needs the CLI callback directory".into(),
@@ -82,69 +193,80 @@ pub(super) async fn submit(
         });
     }
     spec::check_cwd(&callback_cwd)?;
-    let codex = resolve_agent_binary(AgentKind::Codex, &body.env.path, &callback_cwd)?;
-    let task = TaskId::new();
-    let route = OriginRoute {
-        request,
-        task,
-        origin_machine: state.machine.identity.machine,
-        execution_machine: machine,
-        thread: body.spec.thread,
-        callback: CallbackContext {
-            env: body.env,
-            cwd: callback_cwd,
-            codex: codex.into(),
-        },
-        spec: body.spec.into(),
-        submission: SubmissionState::AcceptanceUnknown,
-        last_execution_state: None,
-        last_updated_at: Some(chrono::Utc::now()),
-        last_accepted_seq: 0,
-        last_settled_seq: 0,
-    };
-    let saved = match call(&state.store, |reply| StoreMsg::InsertOriginRoute {
-        route: Box::new(route),
+    let codex = resolve_agent_binary(AgentKind::Codex, &env.path, &callback_cwd)?;
+    Ok(CallbackContext {
+        env,
+        cwd: callback_cwd,
+        codex: codex.into(),
+    })
+}
+
+/// The submit sent to an executor: the saved normalized spec under the saved task UUID
+///
+/// The spec is the route's own normalized content. Dependencies are saved
+/// beside the route, so they cannot reach the executor
+fn execution_wire(
+    route: &OriginRoute,
+    protocol: ClusterProtocolVersion,
+    machine: MachineId,
+) -> Result<SubmitExecution, AppError> {
+    let spec = route
+        .spec
+        .current()
+        .ok_or_else(|| conflict(route, "migrated local task has no remote request"))?;
+    Ok(SubmitExecution {
+        api_version: API_VERSION,
+        protocol_version: protocol.0,
+        destination_machine: machine,
+        origin_machine: route.origin_machine,
+        task: route.task,
+        spec: serde_json::to_value(spec)?,
+        unknown: BTreeMap::new(),
+    })
+}
+
+/// Launch a held remote task whose dependencies all succeeded
+///
+/// The route stays waiting until the executor is reachable, then becomes
+/// launching before the send. A lost reply leaves it launching, and the next
+/// attempt resends the same task UUID, which the executor accepts once
+pub(super) async fn release(state: &AppState, route: OriginRoute) -> Result<(), AppError> {
+    let _request_guard = state.locks.origin_submissions.lock(route.request).await;
+    let fleet = state
+        .fleet
+        .handle()
+        .ok_or_else(|| unknown(&route, "fleet is disabled"))?;
+    let destination = fleet.connect(route.execution_machine).await?;
+    let route = call(&state.store, |reply| StoreMsg::BeginHeldLaunch {
+        id: route.task,
         reply,
     })
-    .await
-    {
-        Ok(saved) => saved,
-        Err(error) => {
-            let found = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
-                request,
-                reply,
-            })
-            .await?;
-            if let Some(found) = found {
-                return Err(conflict(&found, error.to_string()));
-            }
-            return Err(error);
+    .await?;
+    if !matches!(
+        route.submission,
+        SubmissionState::Held {
+            phase: HeldPhase::Launching
         }
-    };
-    if saved.task != task {
-        let (task, status) = finish_saved(state, saved).await?;
-        return Ok((task, status));
+    ) {
+        return Ok(());
     }
-    let wire = SubmitExecution {
-        api_version: API_VERSION,
-        protocol_version: destination.protocol.0,
-        destination_machine: machine,
-        origin_machine: saved.origin_machine,
-        task,
-        spec: serde_json::to_value(
-            saved
-                .spec
-                .current()
-                .ok_or_else(|| conflict(&saved, "migrated local task has no remote request"))?,
-        )?,
-        unknown: BTreeMap::new(),
-    };
+    let wire = execution_wire(&route, destination.protocol, route.execution_machine)?;
     let response = ClusterClient::default()
         .post_json(&destination.address, "/v1/cluster/executions", &wire)
         .await
-        .map_err(|error| unknown(&saved, error.to_string()))?;
-    let identity = decode_identity(&saved, response, destination.protocol)?;
-    resolve_identity(state, saved, identity.identity).await
+        .map_err(|error| unknown(&route, error.to_string()))?;
+    let identity = decode_identity(&route, response, destination.protocol)?;
+    let task = route.task;
+    let resolved = resolve_identity(state, route, identity.identity).await;
+    // a refused launch queued the held task's terminal event
+    state
+        .supervisor
+        .cast(SupervisorMsg::DispatchInbox { id: task })?;
+    match resolved {
+        Ok(_) => Ok(()),
+        Err(error) if is_definite_rejection(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether recovery ended in the executor's saved refusal rather than a failure
@@ -172,7 +294,7 @@ fn rejected(route: &OriginRoute, reason: &str) -> AppError {
     }
 }
 
-fn local_machine_selector(machine: &crate::machine::MachineName) -> AppError {
+fn local_machine_selector(machine: &MachineName) -> AppError {
     AppError::InvalidSpec {
         pointer: "/machine".into(),
         value: Value::String(machine.to_string()),
@@ -183,14 +305,19 @@ fn local_machine_selector(machine: &crate::machine::MachineName) -> AppError {
 async fn finish_saved(
     state: &AppState,
     route: OriginRoute,
-) -> Result<(TaskId, ProcessStatus), AppError> {
+) -> Result<(TaskId, TaskStatus), AppError> {
     match &route.submission {
         SubmissionState::Accepted => Ok((
             route.task,
-            route.last_execution_state.unwrap_or(ProcessStatus::Queued),
+            route
+                .last_execution_state
+                .unwrap_or(ProcessStatus::Queued)
+                .into(),
         )),
         SubmissionState::Rejected { reason } => Err(rejected(&route, reason)),
         SubmissionState::AcceptanceUnknown => reconcile(state, route).await,
+        // the dependency release owns a held route, including its launch
+        SubmissionState::Held { phase } => Ok((route.task, phase.status())),
         SubmissionState::Resource { .. }
         | SubmissionState::ResourceAction { .. }
         | SubmissionState::ResourceBackground { .. } => {
@@ -199,10 +326,7 @@ async fn finish_saved(
     }
 }
 
-async fn reconcile(
-    state: &AppState,
-    route: OriginRoute,
-) -> Result<(TaskId, ProcessStatus), AppError> {
+async fn reconcile(state: &AppState, route: OriginRoute) -> Result<(TaskId, TaskStatus), AppError> {
     ensure_direct_route(&route)?;
     let fleet = state
         .fleet
@@ -273,8 +397,15 @@ async fn resolve_identity(
     state: &AppState,
     route: OriginRoute,
     identity: Option<ExecutorIdentity>,
-) -> Result<(TaskId, ProcessStatus), AppError> {
-    ensure_direct_route(&route)?;
+) -> Result<(TaskId, TaskStatus), AppError> {
+    if !matches!(
+        route.submission,
+        SubmissionState::Held {
+            phase: HeldPhase::Launching
+        }
+    ) {
+        ensure_direct_route(&route)?;
+    }
     let (outcome, status) = match identity {
         Some(ExecutorIdentity::Accepted(record)) => {
             if record.task != route.task
@@ -310,9 +441,14 @@ async fn resolve_identity(
     .await
     .map_err(|error| unknown(&route, format!("cannot save executor result: {error}")))?;
     match saved.submission {
-        SubmissionState::Accepted => Ok((route.task, saved.last_execution_state.unwrap_or(status))),
+        SubmissionState::Accepted => Ok((
+            route.task,
+            saved.last_execution_state.unwrap_or(status).into(),
+        )),
         SubmissionState::Rejected { reason } => Err(rejected(&route, &reason)),
-        SubmissionState::AcceptanceUnknown => Err(unknown(&route, "origin route is unresolved")),
+        SubmissionState::AcceptanceUnknown | SubmissionState::Held { .. } => {
+            Err(unknown(&route, "origin route is unresolved"))
+        }
         SubmissionState::Resource { .. }
         | SubmissionState::ResourceAction { .. }
         | SubmissionState::ResourceBackground { .. } => {
@@ -448,6 +584,7 @@ pub(super) async fn dry_run(
         stdin: preview.stdin,
         execution_cwd: Some(preview.cwd),
         managed_environment: None,
+        after: None,
     })
 }
 

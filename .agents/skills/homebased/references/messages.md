@@ -75,7 +75,7 @@ that it acted on the message.
 
 `--worker` returns:
 
-- `worker_message_unavailable` with `reason: no_worker_thread` for a queued
+- `worker_message_unavailable` with `reason: no_worker_thread` for a held or queued
   task, or a running task whose agent records no thread while it runs. A Codex
   worker records its thread only when it finishes, so it cannot take a live
   message.

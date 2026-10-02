@@ -343,6 +343,33 @@ do not make a new request UUID for the same intended task. Without
 use request UUIDs the same way, and the CLI retries a local submit whose outcome
 is unknown, or that meets `daemon_busy`, for about 90 seconds.
 
+### Start after other tasks
+
+Set `after` to a list of task UUIDs to start a task only when those tasks
+succeed. The daemon that accepts the submit holds the task and starts it
+itself, so the orchestrator does not have to be running when the last
+dependency finishes.
+
+```json
+{
+  "api_version": 1,
+  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+  "name": "phase b2: integrate",
+  "cwd": "/path/to/project",
+  "after": ["01a0b06f-306c-749e-aa9e-9e1a619ee915"],
+  "workload": { "type": "task", "command": ["cargo", "test"] }
+}
+```
+
+Each dependency must be a task submitted through the same daemon, local or
+remote; a held task can be a dependency too, so chains work. Success means
+`TASK_SUCCEEDED`. The submit returns `held` while a dependency is pending, or
+`queued` when all of them already succeeded. When a dependency ends any other
+way, the held task is cancelled before it starts and its thread gets
+`TASK_CANCELLED` with a `cancel_reason`. A held task starts with the
+environment and callback context saved at submit. `task cancel` cancels a held
+task before it starts. Tasks held on a cancelled task are cancelled too.
+
 `homebased task schema` prints the JSON Schema. The full field contract is in [`.agents/skills/homebased/references/submit.md`](.agents/skills/homebased/references/submit.md).
 
 ### Inspect and cancel
@@ -371,7 +398,7 @@ retry a follow-up after a lost response. Use
 than its parent task's thread.
 
 Task ids are full UUIDs. Prefix matching does not exist. `task list` shows tasks
-stored on the local machine. `task show`, `task log`, and `task cancel` use the
+stored on the local machine, including tasks held here with status `held`. `task show`, `task log`, and `task cancel` use the
 local daemon and can find or operate on a task in the known Fleet. A show result
 includes `origin_machine`, `execution_machine`, `found_on`, and `availability`.
 When the executor is offline, show can return cached origin state. Log data
@@ -412,7 +439,7 @@ to ignore duplicates.
 | `TASK_SUCCEEDED` | Exit 0, or last report was `succeeded`. |
 | `TASK_BLOCKED` | Last report was `blocked`. The process has exited. Answer and submit a new spec. There is no resume. |
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. |
-| `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. |
+| `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started. |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
 
 ### Direct messages
@@ -441,7 +468,7 @@ for source, reply, and retry rules.
 Use `--worker <task-uuid>` alone to send new instructions to a running Claude
 worker. The daemon sends to the task's execution machine and `worker_thread`.
 The worker reads the message at its next turn boundary; if it finishes its final
-turn first, the message is never read, and the sender cannot tell. A queued
+turn first, the message is never read, and the sender cannot tell. A held or queued
 task, or a running Codex worker, which records its thread only at exit, returns
 `worker_message_unavailable` with `reason: no_worker_thread`. A finished task
 returns `reason: terminal`.
@@ -463,6 +490,8 @@ homebased --json update --tag v0.2.0
 ```
 
 `--dry-run` prints the tag, target, and destination without downloading or restarting. Running workers are separate processes; they keep running across the restart.
+
+Update every Fleet machine to the same version. Machines must run the same homebased version to see held tasks across the Fleet: until an older machine updates, it reports a newer peer that has held tasks as unavailable.
 
 ### From this repository
 

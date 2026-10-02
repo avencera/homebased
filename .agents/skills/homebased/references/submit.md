@@ -132,6 +132,7 @@ GitHub CI watcher as a normal task:
 | `cwd` | yes | A host directory that already exists and is accessible on the machine that runs the task. For local tasks, a directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. For a `container`, `cwd` is still a host path, never a path inside the container: use a mount `source` or another host directory, and set `workdir` for the directory inside the container. A missing `cwd` fails the submit with `invalid_cwd`. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
+| `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
 Agent-only fields under `workload`:
@@ -201,6 +202,31 @@ The real submit returns after acceptance, before the child finishes:
 ```json
 {"api_version": 1, "id": "01a0b06f-306c-749e-aa9e-9e1a619ee915", "task_id": "01a0b06f-306c-749e-aa9e-9e1a619ee915", "request_id": "01a0b06f-306c-749e-aa9e-9e1a619ee916", "status": "queued"}
 ```
+
+A task with a pending `after` dependency returns `"status": "held"`.
+
+### Start after other tasks
+
+Set `after` to start a task only when other tasks succeed. The daemon holds the task and starts it itself, so the orchestrator does not need to be running when the last dependency finishes.
+
+```json
+{
+  "api_version": 1,
+  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+  "name": "phase b2: integrate",
+  "cwd": "/home/praveen/code/project",
+  "after": ["01a0b06f-306c-749e-aa9e-9e1a619ee915"],
+  "workload": { "type": "task", "command": ["cargo", "test"] }
+}
+```
+
+- Success means `TASK_SUCCEEDED`: exit 0 and a last report that is not `blocked` or `failed`. Any other ending cancels the held task before it starts, and so does an `unknown` outcome: a task that ended with no record of how.
+- Every dependency must be a task submitted through this daemon. Another task fails with `unknown_dependency`. A dependency that already ended without success fails with `dependency_failed`.
+- If every dependency already succeeded, the task starts at once and the response status is `queued`. Otherwise the response status is `held` and the task id is final.
+- A held task starts with the environment, `cwd`, and callback context saved at submit. A remote held task waits while its execution machine is unreachable and starts when it is back.
+- When a dependency ends without success, the held task gets `TASK_CANCELLED` with a `cancel_reason` that names the dependency. Tasks held on it are cancelled the same way. `homebased task cancel` on a held task cancels it before it starts.
+- `after` is part of the request identity: a retry with the same request UUID and a different `after` returns `submission_conflict`. A dry run checks the dependencies and stores nothing.
+- `task followup` has no `after`. Write a spec to chain a follow-up.
 
 ## 6. End the turn
 

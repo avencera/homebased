@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::dependency::{HeldCancellation, TaskDependencies};
 use crate::digest::Sha256Digest;
-use crate::domain::{ProcessStatus, TaskEnv, TaskId, ThreadId};
+use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
 use crate::resource::background_launch::{BackgroundLaunchBinding, ResourceBackgroundRejection};
 use crate::resource::bound_action::{
@@ -242,6 +243,40 @@ pub enum ResourceBackgroundRoutePhase {
     },
 }
 
+/// Durable phase of one origin route held until its dependencies succeed
+///
+/// A held route has no task row and no executor identity. Its dependencies
+/// are saved beside it, and only the origin's dependency release moves it on:
+/// a local task goes straight to [`SubmissionState::Accepted`] with its row,
+/// and a remote one goes through [`Self::Launching`]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeldPhase {
+    /// At least one dependency has not finished
+    Waiting,
+    /// Every dependency succeeded and the launch may have reached the remote executor
+    ///
+    /// The launch is resent with the same task UUID until the executor answers,
+    /// so cancellation from here must reach the executor
+    Launching,
+    /// The origin cancelled the task before any launch
+    Cancelled {
+        /// Dependency ending or request that cancelled it
+        cause: HeldCancellation,
+    },
+}
+
+impl HeldPhase {
+    /// Public status of a task in this phase
+    #[must_use]
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Self::Waiting | Self::Launching => TaskStatus::Held,
+            Self::Cancelled { .. } => TaskStatus::Process(ProcessStatus::Cancelled),
+        }
+    }
+}
+
 /// Resource action that owns one action-bound origin route
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -411,6 +446,11 @@ pub enum SubmissionState {
         /// Action-specific acceptance phase
         phase: ResourceActionRoutePhase,
     },
+    /// This task identity waits on its origin for its dependencies to succeed
+    Held {
+        /// Hold, launch, or cancellation phase
+        phase: HeldPhase,
+    },
     /// This task identity is the first background launch of a remote authority
     ///
     /// It has no loan or action. Recovery retries the same identities, and the
@@ -500,6 +540,35 @@ impl<'de> Deserialize<'de> for OriginRoute {
     }
 }
 
+/// One origin route with the dependencies it was submitted with
+///
+/// The store saves the dependencies beside the route, like its spec, so they
+/// stay on the origin and never enter the route summary that peers read
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependentRoute {
+    /// Saved origin route
+    pub route: OriginRoute,
+    /// Tasks that must succeed before it launches
+    pub after: TaskDependencies,
+}
+
+/// Exact identity and origin-owned context used to create a held route
+#[derive(Debug, Clone)]
+pub struct NewHeldRoute {
+    /// Caller retry UUID
+    pub request: RequestId,
+    /// Global task UUID assigned before any launch
+    pub task: TaskId,
+    /// Machine that accepted the submit and owns callbacks
+    pub origin_machine: MachineId,
+    /// Machine that will run the task: the origin, or the spec's Fleet machine
+    pub execution_machine: MachineId,
+    /// Callback context captured from the submitting shell
+    pub callback: CallbackContext,
+    /// Normalized request content
+    pub spec: NormalizedSpec,
+}
+
 /// Exact identity and origin-owned context used to create a resource route
 #[derive(Debug, Clone)]
 pub struct NewResourceRoute {
@@ -558,6 +627,38 @@ impl OriginRoute {
     #[must_use]
     pub fn current_spec(&self) -> Option<&NormalizedSpec> {
         self.spec.current()
+    }
+
+    /// Create a route held on its origin until its dependencies succeed
+    ///
+    /// The task UUID is assigned now, so the eventual launch, its retries, and
+    /// every later event use the identity that the submit returned
+    #[must_use]
+    pub fn new_held(input: NewHeldRoute) -> Self {
+        let NewHeldRoute {
+            request,
+            task,
+            origin_machine,
+            execution_machine,
+            callback,
+            spec,
+        } = input;
+        Self {
+            request,
+            task,
+            origin_machine,
+            execution_machine,
+            thread: spec.thread,
+            callback,
+            spec: spec.into(),
+            submission: SubmissionState::Held {
+                phase: HeldPhase::Waiting,
+            },
+            last_execution_state: None,
+            last_updated_at: Some(Utc::now()),
+            last_accepted_seq: 0,
+            last_settled_seq: 0,
+        }
     }
 
     /// Create an initial origin route for one resource-waiting command
@@ -689,6 +790,7 @@ impl OriginRoute {
             SubmissionState::ResourceBackground { binding, phase } => {
                 return self.validate_background_route(binding, phase);
             }
+            SubmissionState::Held { phase } => return self.validate_held_route(phase),
             SubmissionState::AcceptanceUnknown
             | SubmissionState::Accepted
             | SubmissionState::Rejected { .. } => return Ok(()),
@@ -773,6 +875,28 @@ impl OriginRoute {
             }
             _ => Ok(()),
         }
+    }
+
+    fn validate_held_route(&self, phase: &HeldPhase) -> Result<(), ResourceRouteError> {
+        let Some(spec) = self.spec.current() else {
+            return Err(ResourceRouteError::InvalidMigratedRouteState);
+        };
+        if self.thread != spec.thread {
+            return Err(ResourceRouteError::ThreadMismatch);
+        }
+        // no executor event can reach a route that never launched; a
+        // cancelled one carries only the origin's own terminal event
+        let max_seq = match phase {
+            HeldPhase::Waiting | HeldPhase::Launching => 0,
+            HeldPhase::Cancelled { .. } => 1,
+        };
+        if self.last_accepted_seq > max_seq
+            || self.last_settled_seq > self.last_accepted_seq
+            || self.last_execution_state.is_some()
+        {
+            return Err(ResourceRouteError::InvalidEventCursor);
+        }
+        Ok(())
     }
 
     /// Shared checks for routes that carry one bounded command or container without a spec machine

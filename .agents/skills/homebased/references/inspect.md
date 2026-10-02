@@ -10,11 +10,11 @@ homebased --json task list --status running,queued         # in flight
 homebased --quiet task list --status running               # bare ids, one per line
 ```
 
-Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list.
+Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
 
 Each entry: `id`, `name`, `display_name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `display_name`. `name` is omitted only for tasks stored before it was required.
 
-`task list` reads tasks stored on this machine. It does not query every Fleet peer.
+`task list` reads tasks stored on this machine. It does not query every Fleet peer. It includes tasks held here, also those that will run on another machine, and held tasks that ended before they started. Those entries also have `after`: one `{"task", "state"}` per dependency, where `state` is `pending`, or `ended` with an `outcome` of `succeeded`, `failed`, `blocked`, `cancelled`, `lost`, or `unknown`. `unknown` means the task ended but no record says how; it never counts as success.
 
 ## Show
 
@@ -26,7 +26,8 @@ homebased --json task show <id>
 | --- | --- |
 | `name` | Submitted goal label. Omitted only for tasks stored before name was required. |
 | `display_name` | Non-empty label: the submitted name, or a workload fallback for unnamed stored rows. |
-| `status` | Process status, see above. |
+| `status` | Process status, or `held`, see above. |
+| `after` | Present for a task submitted with `after`: each dependency and its `state`, as in the list. A held task waits for every `pending` entry. |
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
 | `worker_thread` | Worker thread UUID. A Claude worker's session id, recorded when it starts running; send it new instructions with `message send --worker`. A Codex worker's thread, recorded when the task ends, including lost tasks, if Homebased found a valid session id in the first 64 KiB of `output.log`. Omitted when unknown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
@@ -41,6 +42,8 @@ homebased --json task show <id>
 | `check_timeout` | `pending` or `sent` for the inactivity reminder. |
 | `created_at` | Insert time. |
 | `updated_at` | Last row change. For a terminal task this is the finish time. |
+
+On the origin, a held task, or one that ended before it started, shows `availability` `held` or `not_started`, its `submission` phase, and the origin's own `last_event`. It has no log; `task log` returns `task_not_started`.
 
 Fleet-aware `show` results can also include `origin_machine`, `execution_machine`, `found_on`, `availability`, `submission`, `last_accepted_seq`, `last_settled_seq`, `last_update`, and `failed_events`. `submission` describes durable acceptance; it is not process status. A callback failure does not change the process status.
 
@@ -101,5 +104,7 @@ homebased --json task cancel <id>
 ```
 
 Sends SIGTERM to the worker, which forwards it to the child's process group, waits for the group to disappear, and sends SIGKILL after 10 seconds if descendants remain. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.
+
+Cancelling a held task on its origin cancels it before it starts, sends `TASK_CANCELLED` with `cancel_reason` `requested`, and cancels the tasks held on it. Run it on the machine that accepted the submit; another machine gets a `usage` error. Once a held remote task has begun to start, cancel follows the remote path below.
 
 When the task is not local, `task cancel` looks up its origin and executor, then saves a cancellation request on the machine where you ran the command. The local daemon retries delivery after a network failure or restart. The JSON response has `delivery.state`: `pending` means the executor has not acknowledged the request; `delivered` means it has saved the request. The executor result can still be `pending_application`, so check task status to learn when the child has stopped. A terminal task keeps its actual result. A task with incomplete Fleet lookup returns `cluster_lookup_incomplete`; it is not reported as cancelled.

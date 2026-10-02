@@ -12,8 +12,10 @@ use crate::callback::{last_event_for_row, notify_event};
 use crate::client::Client;
 use crate::daemon::api::views::TaskFollowupSource;
 use crate::daemon::fleet_api::MachinesBody;
+use crate::dependency::TaskDependencies;
 use crate::domain::{
-    ProcessStatus, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId, ThreadId,
+    ProcessStatus, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId, TaskStatus,
+    ThreadId,
 };
 use crate::error::AppError;
 use crate::spec::{self, load_spec};
@@ -75,9 +77,9 @@ pub enum TaskCommand {
     Schema,
     /// List tasks.
     List {
-        /// Filter by process status. Repeat or comma-separate.
+        /// Filter by status, including `held`. Repeat or comma-separate.
         #[arg(long, value_enum, value_delimiter = ',')]
-        status: Vec<ProcessStatus>,
+        status: Vec<TaskStatus>,
         /// Filter by Codex thread id.
         #[arg(long)]
         thread: Option<ThreadId>,
@@ -188,16 +190,30 @@ async fn submit(
 ) -> Result<ExitCode, AppError> {
     let spec = load_spec(spec_path)?;
     let normalized = spec::normalize(&spec)?;
-    submit_normalized(ctx, normalized, dry_run, request_id, allow_other_thread).await
+    let submission = Submission {
+        spec: normalized,
+        after: spec.after,
+    };
+    submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
+}
+
+/// One submit request: the normalized spec and the origin-only dependencies beside it
+struct Submission {
+    spec: crate::spec::NormalizedSpec,
+    after: Option<TaskDependencies>,
 }
 
 async fn submit_normalized(
     ctx: &Ctx,
-    normalized: crate::spec::NormalizedSpec,
+    submission: Submission,
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
     allow_other_thread: bool,
 ) -> Result<ExitCode, AppError> {
+    let Submission {
+        spec: normalized,
+        after,
+    } = submission;
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
     }
@@ -206,12 +222,15 @@ async fn submit_normalized(
     let callback_cwd = std::env::current_dir()?;
     let remote = normalized.machine.is_some();
     let request_id = request_id.map(RequestId).unwrap_or_default();
-    let body = json!({
+    let mut body = json!({
         "spec": normalized,
         "env": env,
         "callback_cwd": callback_cwd,
         "request_id": request_id,
     });
+    if let Some(after) = after {
+        body["after"] = json!(after);
+    }
 
     let client = Client::new(ctx.home.sock_path());
     if dry_run {
@@ -330,8 +349,11 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         let _ = object.remove("machine");
     }
     let parsed = spec::parse_spec_value(&submit_spec)?;
-    let normalized = spec::normalize(&parsed)?;
-    submit_normalized(ctx, normalized, dry_run, request_id, allow_other_thread).await
+    let submission = Submission {
+        spec: spec::normalize(&parsed)?,
+        after: None,
+    };
+    submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
 }
 
 fn followup_unavailable(task: TaskId, reason: crate::error::FollowupBlocker) -> AppError {
@@ -504,7 +526,7 @@ fn schema(ctx: &Ctx) -> Result<ExitCode, AppError> {
 
 async fn list(
     ctx: &Ctx,
-    status: Vec<ProcessStatus>,
+    status: Vec<TaskStatus>,
     thread: Option<ThreadId>,
 ) -> Result<ExitCode, AppError> {
     let mut path = String::from("/v1/tasks?");
@@ -513,7 +535,7 @@ async fn list(
         path.push_str(
             &status
                 .iter()
-                .map(ProcessStatus::as_str)
+                .map(TaskStatus::as_str)
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -575,10 +597,29 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
             if let Some(worker_thread) = value.get("worker_thread").and_then(Value::as_str) {
                 println!("  worker thread {worker_thread}");
             }
+            print_dependencies(&value);
             print_waiting_events(&value);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line per dependency in `after`: pending, or how it ended
+fn print_dependencies(value: &Value) {
+    let Some(after) = value.get("after").and_then(Value::as_array) else {
+        return;
+    };
+    for dependency in after {
+        let task = dependency
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        let state = match dependency.get("outcome").and_then(Value::as_str) {
+            Some(outcome) => format!("ended {outcome}"),
+            None => "pending".to_owned(),
+        };
+        println!("  after {task} {state}");
+    }
 }
 
 /// One line per callback that waits for its origin thread and when the wait ends

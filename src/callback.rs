@@ -19,11 +19,13 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
 use crate::container::GpuRequest;
+use crate::dependency::HeldCancellation;
 use crate::domain::{
     AgentKind, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow, TaskState,
     ThreadId, Workload,
 };
 use crate::error::AppError;
+use crate::spec::NormalizedSpec;
 use crate::submission::CallbackContext;
 
 use crate::t3::{ProviderThread, T3Env, WakeOutcome, owns_thread, wake_thread};
@@ -346,6 +348,9 @@ pub struct HomebasedEvent {
     pub timeout_secs: Option<u64>,
     /// Suggested next action.
     pub next_action: NextAction,
+    /// Why the origin cancelled a held task before it launched. Present only on that `TASK_CANCELLED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<HeldCancellation>,
 }
 
 impl HomebasedEvent {
@@ -397,6 +402,7 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         process: None,
         timeout_secs: Some(row.timeout.as_secs()),
         next_action: NextAction::InspectTask,
+        cancel_reason: None,
     }
 }
 
@@ -422,6 +428,58 @@ fn build_event(
         process,
         timeout_secs,
         next_action,
+        cancel_reason: None,
+    }
+}
+
+/// How the origin ended a held task that never launched
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnlaunchedEnding {
+    /// A dependency ended without success, or cancel was requested
+    Cancelled(HeldCancellation),
+    /// Every dependency succeeded, but the launch was refused for this reason
+    LaunchRefused(String),
+}
+
+/// Terminal event for a held task that the origin ended before any launch
+///
+/// No process ran, so there are no reports. A cancellation is `TASK_CANCELLED`
+/// with `cancel_reason`; a refused launch is `TASK_FAILED` with a
+/// `spawn_failed` process naming the refusal
+#[must_use]
+pub fn unlaunched_event(
+    task: TaskId,
+    spec: &NormalizedSpec,
+    evidence: PathBuf,
+    ending: UnlaunchedEnding,
+) -> HomebasedEvent {
+    let (event, process, cancel_reason) = match ending {
+        UnlaunchedEnding::Cancelled(reason) => (
+            EventKind::TaskCancelled,
+            ProcessPayload::Cancelled,
+            Some(reason),
+        ),
+        UnlaunchedEnding::LaunchRefused(message) => (
+            EventKind::TaskFailed,
+            ProcessPayload::SpawnFailed { message },
+            None,
+        ),
+    };
+    HomebasedEvent {
+        api_version: crate::domain::API_VERSION,
+        event,
+        task,
+        name: Some(spec.name.clone()),
+        display_name: spec.name.to_string(),
+        workload: WorkloadView::from(&crate::invocation::persist_workload(&spec.workload)),
+        thread: spec.thread,
+        cwd: spec.cwd.clone(),
+        evidence,
+        reports: Vec::new(),
+        process: Some(process),
+        timeout_secs: None,
+        next_action: NextAction::None,
+        cancel_reason,
     }
 }
 
@@ -442,6 +500,7 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         process: None,
         timeout_secs: None,
         next_action: NextAction::ReadReport,
+        cancel_reason: None,
     }
 }
 

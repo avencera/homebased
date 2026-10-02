@@ -6,12 +6,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, WorkloadView};
+use crate::dependency::DependencyState;
 use crate::domain::{
     API_VERSION, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason, ProcessStatus,
-    TaskId, TaskName, TaskReport, TaskRow, TerminalCallbackProjection, ThreadId, Workload,
+    TaskId, TaskName, TaskReport, TaskRow, TaskStatus, TerminalCallbackProjection, ThreadId,
+    Workload,
 };
 use crate::machine::MachineId;
-use crate::store::TaskPresentation;
+use crate::store::{TaskPresentation, UnlaunchedTask};
+use crate::submission::{HeldPhase, SubmissionState};
 
 /// `GET /v1/status`.
 #[derive(Debug, Clone, Serialize)]
@@ -52,8 +55,8 @@ pub struct TaskSummary {
     pub name: Option<TaskName>,
     /// Non-empty server-derived label for UI and CLI.
     pub display_name: String,
-    /// Process status.
-    pub status: ProcessStatus,
+    /// Process status, or `held` while the origin waits for dependencies.
+    pub status: TaskStatus,
     /// Workload view.
     pub workload: WorkloadView,
     /// Submitting Codex thread.
@@ -90,6 +93,20 @@ pub struct TaskSummary {
     pub created_at: DateTime<Utc>,
     /// Last row update. For a terminal task this is the finish time.
     pub updated_at: DateTime<Utc>,
+    /// Tasks that must succeed before this one starts, with their current state.
+    /// Present only for a task submitted with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Vec<DependencyView>>,
+}
+
+/// One entry of a task's `after` list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyView {
+    /// Dependency task.
+    pub task: TaskId,
+    /// `pending`, or `ended` with the dependency's `outcome`.
+    #[serde(flatten)]
+    pub state: DependencyState,
 }
 
 impl TaskSummary {
@@ -101,7 +118,7 @@ impl TaskSummary {
             id: row.id,
             name: row.name.clone(),
             display_name: row.display_name(),
-            status: row.status(),
+            status: row.status().into(),
             workload: WorkloadView::from(&row.workload),
             thread: row.thread,
             worker_thread: presentation.and_then(|presentation| presentation.worker_thread),
@@ -129,7 +146,67 @@ impl TaskSummary {
             cancel_requested_at: row.cancel_requested_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            after: None,
         }
+    }
+
+    /// Build the view of a task that never launched from its origin route alone.
+    ///
+    /// Its status is `held` while it waits, `cancelled` once the origin cancelled
+    /// it, and `failed` when its launch was refused.
+    #[must_use]
+    pub fn from_unlaunched(task: &UnlaunchedTask, after: Vec<DependencyView>) -> Option<Self> {
+        let route = &task.held.route;
+        let spec = route.current_spec()?;
+        let (status, exit_reason) = match &route.submission {
+            SubmissionState::Held {
+                phase: HeldPhase::Cancelled { .. },
+            } => (
+                TaskStatus::Process(ProcessStatus::Cancelled),
+                Some(ExitReason::Cancelled),
+            ),
+            SubmissionState::Held { .. } => (TaskStatus::Held, None),
+            SubmissionState::Rejected { reason } => (
+                TaskStatus::Process(ProcessStatus::Failed),
+                Some(ExitReason::SpawnFailed {
+                    message: reason.clone(),
+                }),
+            ),
+            _ => return None,
+        };
+        // a UUID v7 task id carries its creation time
+        let created_at = route
+            .task
+            .0
+            .get_timestamp()
+            .and_then(|stamp| {
+                let (seconds, nanos) = stamp.to_unix();
+                DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
+            })
+            .or(route.last_updated_at)
+            .unwrap_or_else(Utc::now);
+        Some(Self {
+            id: route.task,
+            name: Some(spec.name.clone()),
+            display_name: spec.name.to_string(),
+            status,
+            workload: WorkloadView::from(&crate::invocation::persist_workload(&spec.workload)),
+            thread: route.thread,
+            worker_thread: None,
+            cwd: spec.cwd.clone(),
+            project_root: None,
+            origin_machine: Some(route.origin_machine),
+            execution_machine: Some(route.execution_machine),
+            pid: None,
+            callback: task.callback,
+            timeout_secs: spec.timeout.as_secs(),
+            check_timeout: CheckTimeoutStatus::Pending,
+            exit_reason,
+            cancel_requested_at: None,
+            created_at,
+            updated_at: route.last_updated_at.unwrap_or(created_at),
+            after: Some(after),
+        })
     }
 }
 

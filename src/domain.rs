@@ -16,9 +16,9 @@ pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`
 ///
-/// Released versions 1, 2, and 27 through 32 migrate in place to this version
+/// Released versions 1, 2, and 27 through 33 migrate in place to this version
 /// Unreleased development versions 3 through 26 are refused
-pub const SCHEMA_VERSION: i64 = 33;
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;
@@ -429,6 +429,80 @@ impl ProcessStatus {
 impl fmt::Display for ProcessStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Public task status: the process status, or `held` before a held task launches
+///
+/// A held task has no process. Its origin keeps it until every dependency
+/// succeeds; a held task cancelled before launch reads `cancelled`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// Waiting on its origin for its dependencies to succeed
+    Held,
+    /// Process status of a launched task, or the ending of an unlaunched one
+    #[serde(untagged)]
+    Process(ProcessStatus),
+}
+
+impl TaskStatus {
+    const ALL: [Self; 7] = [
+        Self::Held,
+        Self::Process(ProcessStatus::Queued),
+        Self::Process(ProcessStatus::Running),
+        Self::Process(ProcessStatus::Succeeded),
+        Self::Process(ProcessStatus::Failed),
+        Self::Process(ProcessStatus::Cancelled),
+        Self::Process(ProcessStatus::Lost),
+    ];
+
+    /// Stable lowercase name
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Process(status) => status.as_str(),
+        }
+    }
+
+    /// Parse a status name, including `held`
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        if value == "held" {
+            return Ok(Self::Held);
+        }
+        ProcessStatus::from_storage(value).map(Self::Process)
+    }
+
+    /// Process status, or `None` while held
+    #[must_use]
+    pub fn process(self) -> Option<ProcessStatus> {
+        match self {
+            Self::Held => None,
+            Self::Process(status) => Some(status),
+        }
+    }
+}
+
+impl From<ProcessStatus> for TaskStatus {
+    fn from(status: ProcessStatus) -> Self {
+        Self::Process(status)
+    }
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl clap::ValueEnum for TaskStatus {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Self::ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
     }
 }
 
@@ -1185,6 +1259,23 @@ mod tests {
     use crate::error::AppError;
     use chrono::Utc;
     use std::str::FromStr;
+
+    #[test]
+    fn task_status_reads_held_and_every_process_status_as_plain_strings() {
+        use super::TaskStatus;
+
+        for status in [
+            TaskStatus::Held,
+            TaskStatus::Process(ProcessStatus::Queued),
+            TaskStatus::Process(ProcessStatus::Cancelled),
+        ] {
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire, serde_json::json!(status.as_str()));
+            assert_eq!(serde_json::from_value::<TaskStatus>(wire).unwrap(), status);
+            assert_eq!(TaskStatus::parse(status.as_str()).unwrap(), status);
+        }
+        assert!(TaskStatus::parse("waiting").is_err());
+    }
 
     #[test]
     fn callback_status_waiting_has_a_stable_storage_and_json_tag() {

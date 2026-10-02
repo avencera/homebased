@@ -346,6 +346,7 @@ mod tests {
             process: None,
             timeout_secs: None,
             next_action: NextAction::ReadReport,
+            cancel_reason: None,
         };
         let event = TaskEvent {
             task,

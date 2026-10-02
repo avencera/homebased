@@ -1023,7 +1023,10 @@ async fn direct_launch_still_starts_its_command() {
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
         spec: Box::new(spec),
-        request: RequestId::new(),
+        admission: crate::store::LocalAdmission::Submitted {
+            request: RequestId::new(),
+            after: None,
+        },
         reply,
     })
     .await
@@ -1091,7 +1094,10 @@ async fn resume_local_starts_a_committed_row_whose_launch_stopped() {
         row: Box::new(row),
         spec: Box::new(spec),
         machine,
-        request: RequestId::new(),
+        admission: crate::store::LocalAdmission::Submitted {
+            request: RequestId::new(),
+            after: None,
+        },
         codex: CallbackExecutable::available("/bin/echo".into()),
         reply,
     })
@@ -1171,7 +1177,10 @@ async fn direct_launch_keeps_an_unresolved_callback_codex_unavailable() {
     call(&supervisor, |reply| SupervisorMsg::Launch {
         row: Box::new(row),
         spec: Box::new(spec),
-        request: RequestId::new(),
+        admission: crate::store::LocalAdmission::Submitted {
+            request: RequestId::new(),
+            after: None,
+        },
         reply,
     })
     .await
@@ -1215,7 +1224,7 @@ fn direct_queued_tasks_keep_their_existing_startup_actions() {
         binary: "/bin/echo".into(),
     });
     assert_eq!(
-        startup_recovery_action(&row, None, false, None),
+        startup_recovery_action(&row, None, false, None, false),
         StartupRecoveryAction::Observe
     );
 
@@ -1232,12 +1241,12 @@ fn direct_queued_tasks_keep_their_existing_startup_actions() {
         state: ProcessStatus::Queued,
     });
     assert_eq!(
-        startup_recovery_action(&row, None, false, Some(&identity)),
+        startup_recovery_action(&row, None, false, Some(&identity), false),
         StartupRecoveryAction::LaunchAccepted
     );
     // a remote supervisor's bound watcher may already have spawned, so it is only observed
     assert_eq!(
-        startup_recovery_action(&row, None, true, Some(&identity)),
+        startup_recovery_action(&row, None, true, Some(&identity), false),
         StartupRecoveryAction::Observe
     );
 }
@@ -2900,5 +2909,188 @@ async fn unknown_launch_outcome_fails_as_unconfirmed_after_the_bound() {
         [(id, ResourceRequestState::Finished { .. })] if id == request_id
     ));
 
+    stop_supervisor(supervisor, handle).await;
+}
+
+/// Command task whose row and spec match, running `script` under `/bin/sh` in `/tmp`
+fn shell_task(script: &str) -> (TaskRow, NormalizedSpec) {
+    let spec: NormalizedSpec = serde_json::from_value(json!({
+        "api_version": 1,
+        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "name": "released task",
+        "cwd": "/tmp",
+        "timeout": "4h",
+        "workload": { "type": "task", "command": ["/bin/sh", "-c", script] }
+    }))
+    .unwrap();
+    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
+        panic!("released task test must use a command workload");
+    };
+    let row = new_queued_task(NewTask {
+        id: TaskId::new(),
+        name: Some(spec.name.clone()),
+        thread: spec.thread,
+        workload: Workload::Task(TaskWorkload {
+            command: workload.command,
+        }),
+        cwd: spec.cwd.clone(),
+        timeout: spec.timeout,
+        env: TaskEnv {
+            path: "/bin".into(),
+            home: "/tmp".into(),
+        },
+        binary: "/bin/sh".into(),
+    });
+    (row, spec)
+}
+
+/// Save the waiting held route a local submit with `after` saves for this task
+fn save_held_local_route(home: &Home, row: &TaskRow, spec: &NormalizedSpec) -> RequestId {
+    let machine = load_or_create_machine_id(home).unwrap();
+    let request = RequestId::new();
+    let route = OriginRoute::new_held(crate::submission::NewHeldRoute {
+        request,
+        task: row.id,
+        origin_machine: machine,
+        execution_machine: machine,
+        callback: CallbackContext {
+            env: row.env.clone(),
+            cwd: row.cwd.clone(),
+            codex: CallbackExecutable::available("/bin/echo".into()),
+        },
+        spec: spec.clone(),
+    });
+    let after = crate::dependency::TaskDependencies::new(vec![TaskId::new()]).unwrap();
+    Store::open(&home.db_path())
+        .unwrap()
+        .insert_origin_route_after(&route, Some(&after))
+        .unwrap();
+    request
+}
+
+async fn release_launch(
+    supervisor: &ActorRef<SupervisorMsg>,
+    row: &TaskRow,
+    spec: &NormalizedSpec,
+    request: RequestId,
+) -> Result<(), AppError> {
+    call(supervisor, |reply| SupervisorMsg::Launch {
+        row: Box::new(row.clone()),
+        spec: Box::new(spec.clone()),
+        admission: crate::store::LocalAdmission::Released { request },
+        reply,
+    })
+    .await
+}
+
+#[tokio::test]
+async fn startup_launches_a_released_task_whose_worker_never_started() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    configure_task_runner();
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let (row, spec) = shell_task("echo released");
+    let id = row.id;
+    let request = save_held_local_route(&home, &row, &spec);
+    // the release committed its row, then the daemon stopped before the worker started
+    home.prepare_task(id).unwrap();
+    Store::open(&home.db_path())
+        .unwrap()
+        .admit_local_task(
+            &row,
+            &spec,
+            load_or_create_machine_id(&home).unwrap(),
+            &crate::store::LocalAdmission::Released { request },
+            CallbackExecutable::available("/bin/echo".into()),
+        )
+        .unwrap();
+
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    let runner_lock = acquire_runner_lock_after_task_exit(&home, id).await;
+    assert_eq!(
+        std::fs::read_to_string(home.task_paths(id).output).unwrap(),
+        "released\n"
+    );
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+    let row = call(&store, |reply| StoreMsg::GetTask { id, reply })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status(), ProcessStatus::Succeeded);
+
+    drop(runner_lock);
+    stop_supervisor(supervisor, handle).await;
+}
+
+#[tokio::test]
+async fn a_resent_release_leaves_the_running_task_and_its_files_alone() {
+    let _guard = SUPERVISOR_TEST_LOCK.lock().await;
+    configure_task_runner();
+    let directory = tempdir().unwrap();
+    let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let gate = directory.path().join("gate");
+    let (row, spec) = shell_task(&format!(
+        "while [ ! -f '{}' ]; do sleep 0.1; done; echo released",
+        gate.display()
+    ));
+    let id = row.id;
+    let request = save_held_local_route(&home, &row, &spec);
+    let (supervisor, handle) = SupervisorActor::spawn(
+        None,
+        SupervisorActor,
+        SupervisorArgs::new(home.clone(), None),
+    )
+    .await
+    .unwrap();
+    let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply })
+        .await
+        .unwrap();
+
+    release_launch(&supervisor, &row, &spec, request)
+        .await
+        .unwrap();
+    // the loop resends a release whose first attempt timed out but still committed
+    release_launch(&supervisor, &row, &spec, request)
+        .await
+        .unwrap();
+    assert!(home.task_paths(id).dir.is_dir());
+
+    // a refused launch under the same task UUID keeps the committed task's files too
+    let refused = call(&supervisor, |reply| SupervisorMsg::Launch {
+        row: Box::new(row.clone()),
+        spec: Box::new(spec.clone()),
+        admission: crate::store::LocalAdmission::Submitted {
+            request: RequestId::new(),
+            after: None,
+        },
+        reply,
+    })
+    .await;
+    assert!(refused.is_err());
+    assert!(home.task_paths(id).dir.is_dir());
+
+    std::fs::write(&gate, "").unwrap();
+    let runner_lock = acquire_runner_lock_after_task_exit(&home, id).await;
+    assert_eq!(
+        std::fs::read_to_string(home.task_paths(id).output).unwrap(),
+        "released\n"
+    );
+    let row = call(&store, |reply| StoreMsg::GetTask { id, reply })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status(), ProcessStatus::Succeeded);
+
+    drop(runner_lock);
     stop_supervisor(supervisor, handle).await;
 }

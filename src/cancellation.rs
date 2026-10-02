@@ -8,7 +8,7 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::resource::ResourceId;
 use crate::submission::{
-    OriginRoute, RequestId, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
+    HeldPhase, OriginRoute, RequestId, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
     ResourceCancellationReceipt, ResourceRoutePhase, SubmissionState,
 };
 
@@ -63,6 +63,8 @@ pub enum CancellationRefusal {
     /// Only the launch's own retry may resolve it; a cancellation could fence
     /// the fixed identity before the authority accepts it
     LaunchUnresolved,
+    /// The task is held on its origin, which alone can cancel it before launch
+    HeldOnOrigin,
 }
 
 impl CancellationRefusal {
@@ -72,6 +74,12 @@ impl CancellationRefusal {
         match self {
             Self::RouteMismatch | Self::LaunchUnresolved => AppError::ClusterTaskConflict { task },
             Self::NotStarted => AppError::TaskNotStarted { task },
+            Self::HeldOnOrigin => AppError::Usage {
+                message: format!(
+                    "task {task} is held on its origin machine until its dependencies succeed; \
+                     cancel it on that machine"
+                ),
+            },
         }
     }
 }
@@ -108,7 +116,14 @@ impl CancellationOwner {
             return Err(CancellationRefusal::RouteMismatch);
         }
         match route.submission {
-            SubmissionState::Rejected { .. } => Err(CancellationRefusal::NotStarted),
+            SubmissionState::Rejected { .. }
+            | SubmissionState::Held {
+                phase: HeldPhase::Cancelled { .. },
+            } => Err(CancellationRefusal::NotStarted),
+            // the origin cancels a waiting held route itself, before this lookup
+            SubmissionState::Held {
+                phase: HeldPhase::Waiting,
+            } => Err(CancellationRefusal::HeldOnOrigin),
             SubmissionState::ResourceAction {
                 phase: ResourceActionRoutePhase::AcceptanceUnknown,
                 ..
@@ -135,8 +150,12 @@ impl CancellationOwner {
                     phase: phase.clone(),
                 }))
             }
+            // a launching held route may already be on its executor
             SubmissionState::AcceptanceUnknown
             | SubmissionState::Accepted
+            | SubmissionState::Held {
+                phase: HeldPhase::Launching,
+            }
             | SubmissionState::ResourceAction {
                 phase: ResourceActionRoutePhase::Accepted,
                 ..

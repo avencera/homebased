@@ -3,6 +3,7 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, resource_task_id_is_reserved};
+use crate::dependency::TaskDependencies;
 use crate::domain::{ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -12,10 +13,10 @@ use crate::resource::background_launch::{
 };
 use crate::resource::bound_action::ActionTaskReceipt;
 use crate::submission::{
-    ExecutionRecord, ExecutorIdentity, OriginRoute, PreAcceptanceRejection, RejectionTombstone,
-    RequestId, ResourceActionRoutePhase, ResourceBackgroundRoutePhase, ResourceCancellationOutcome,
-    ResourceCancellationReceipt, ResourceQueueOutcome, ResourceQueueReceipt, ResourceRoutePhase,
-    SubmissionState,
+    ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute, PreAcceptanceRejection,
+    RejectionTombstone, RequestId, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
+    ResourceCancellationOutcome, ResourceCancellationReceipt, ResourceQueueOutcome,
+    ResourceQueueReceipt, ResourceRoutePhase, SubmissionState,
 };
 
 /// A durable identity operation failed without changing its existing owner
@@ -355,25 +356,45 @@ impl Store {
         &mut self,
         route: &OriginRoute,
     ) -> Result<OriginRoute, IdentityError> {
+        self.insert_origin_route_after(route, None)
+    }
+
+    /// Insert an origin route with the dependencies it was submitted with
+    ///
+    /// The dependencies take part in the retry identity: the same request with
+    /// a different `after` list is a conflict. Only a route with dependencies
+    /// may start held
+    pub fn insert_origin_route_after(
+        &mut self,
+        route: &OriginRoute,
+        after: Option<&TaskDependencies>,
+    ) -> Result<OriginRoute, IdentityError> {
         validate_route(route)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let saved: Option<String> = tx
+        let saved: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT route_json FROM origin_routes WHERE request_id=?1",
+                "SELECT route_json,after_json FROM origin_routes WHERE request_id=?1",
                 [route.request.0.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(storage)?;
-        if let Some(saved) = saved {
+        if let Some((saved, saved_after)) = saved {
             let existing = decode_route(&saved)?;
-            if !same_route_identity(&existing, route)? {
+            let saved_after: Option<TaskDependencies> =
+                saved_after.as_deref().map(decode).transpose()?;
+            if !same_route_identity(&existing, route)? || saved_after.as_ref() != after {
                 return Err(IdentityError::Conflict);
             }
             return Ok(existing);
+        }
+        if let SubmissionState::Held { phase } = &route.submission
+            && (after.is_none() || !matches!(phase, HeldPhase::Waiting))
+        {
+            return Err(IdentityError::Conflict);
         }
         if let SubmissionState::Resource { phase, .. } = &route.submission
             && !matches!(phase, ResourceRoutePhase::AcceptanceUnknown)
@@ -403,9 +424,10 @@ impl Store {
         if occupied {
             return Err(IdentityError::Conflict);
         }
+        let after_json = after.map(encode).transpose()?;
         tx.execute(
-            "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json) VALUES (?1,?2,?3,?4,?5)",
-            params![route.request.0.to_string(), route.task.to_string(), route.execution_machine.as_uuid().to_string(), encode(&route.spec)?, encode(route)?],
+            "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json,after_json) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![route.request.0.to_string(), route.task.to_string(), route.execution_machine.as_uuid().to_string(), encode(&route.spec)?, encode(route)?, after_json],
         ).map_err(storage)?;
         tx.commit().map_err(storage)?;
         Ok(route.clone())
@@ -672,6 +694,9 @@ impl Store {
     }
 
     /// Set a definitive submission result only while acceptance is unknown
+    ///
+    /// A released held route resolves the same way. Nobody waits on its submit
+    /// response, so a refusal also queues its terminal event
     pub fn resolve_origin_route(
         &mut self,
         task: TaskId,
@@ -683,6 +708,7 @@ impl Store {
                 | SubmissionState::Resource { .. }
                 | SubmissionState::ResourceAction { .. }
                 | SubmissionState::ResourceBackground { .. }
+                | SubmissionState::Held { .. }
         ) {
             return Err(IdentityError::Conflict);
         }
@@ -708,6 +734,29 @@ impl Store {
                     params![encode(&route)?, task.to_string()],
                 )
                 .map_err(storage)?;
+                tx.commit().map_err(storage)?;
+                Ok(route)
+            }
+            SubmissionState::Held {
+                phase: HeldPhase::Launching,
+            } => {
+                let refused = match &outcome {
+                    SubmissionState::Rejected { reason } => {
+                        Some(super::dependency::refused_launch_ending(reason))
+                    }
+                    _ => None,
+                };
+                route.submission = outcome;
+                route.last_updated_at = Some(chrono::Utc::now());
+                match refused {
+                    Some(ending) => super::dependency::append_unlaunched_event_on(
+                        &tx,
+                        &self.tasks_dir,
+                        &mut route,
+                        ending,
+                    )?,
+                    None => save_route(&tx, &route)?,
+                }
                 tx.commit().map_err(storage)?;
                 Ok(route)
             }

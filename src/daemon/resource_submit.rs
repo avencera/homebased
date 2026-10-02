@@ -496,7 +496,8 @@ fn resource_from_route(route: &OriginRoute) -> Option<ResourceId> {
         | SubmissionState::Accepted
         | SubmissionState::Rejected { .. }
         | SubmissionState::ResourceAction { .. }
-        | SubmissionState::ResourceBackground { .. } => None,
+        | SubmissionState::ResourceBackground { .. }
+        | SubmissionState::Held { .. } => None,
     }
 }
 

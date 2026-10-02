@@ -5,6 +5,7 @@ pub mod api;
 mod cancel_delivery;
 pub mod cluster;
 pub mod content;
+mod dependencies;
 pub mod event_sender;
 pub mod fleet_api;
 pub mod fleet_tasks;
@@ -171,6 +172,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         state.fleet.clone(),
     ));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
+    let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let resource_recovery = tokio::spawn(resource_submit::recover(state.clone()));
     let action_recovery = tokio::spawn(resource_action::recover(state.clone()));
     let background_recovery = tokio::spawn(resource_background::recover(state.clone()));
@@ -215,6 +217,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     }
     sender.abort();
     recovery.abort();
+    dependency_release.abort();
     resource_recovery.abort();
     action_recovery.abort();
     background_recovery.abort();

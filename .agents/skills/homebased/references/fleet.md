@@ -106,5 +106,9 @@ saved executor identity and stores a local cancellation request before it
 returns. See [inspect.md](inspect.md) for offline state and cancellation
 results.
 
+Machines must run the same homebased version to see held tasks across the
+Fleet. Until an older machine updates, it reports a newer peer that has held
+tasks as unavailable.
+
 The Fleet protocol uses plain HTTP and has no authentication. Do not route it
 over a network that you do not trust.

@@ -4889,3 +4889,238 @@ async fn remote_resource_request_with_a_missing_cwd_is_rejected_at_acceptance() 
         .unwrap();
     assert_eq!(queued, 0);
 }
+
+/// Origin and executor daemons that know each other, with callbacks recorded on the origin
+fn dependency_fleet(name: &str) -> (Daemon, Daemon) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut origin = Daemon::start(&format!("{name}-origin"), true);
+    let executor = Daemon::start("remote-executor", true);
+    let codex = origin.user_home.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/callbacks\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    origin.codex_override = Some(codex);
+    origin.restart();
+    add_peer(&origin, &executor);
+    add_peer(&executor, &origin);
+    (origin, executor)
+}
+
+/// Submit a spec with `after` through the origin CLI and return the response
+fn submit_after(daemon: &Daemon, spec: &NormalizedSpec, after: &[TaskId]) -> Value {
+    let mut value = serde_json::to_value(spec).unwrap();
+    value["after"] = serde_json::json!(after);
+    let request = RequestId::new();
+    let path = daemon
+        ._dir
+        .path()
+        .join(format!("submit-{}.json", request.0));
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = submit_command(daemon, &path, request).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn gate_command(gate: &Path) -> String {
+    format!("while [ ! -f '{}' ]; do sleep 0.1; done", gate.display())
+}
+
+fn origin_route(origin: &Daemon, task: TaskId) -> OriginRoute {
+    Store::open(&origin.home.join("homebased.sqlite"))
+        .unwrap()
+        .origin_route_by_task(task)
+        .unwrap()
+        .unwrap()
+}
+
+fn accepted_on_executor(executor: &Daemon, task: TaskId) -> Option<ExecutionRecord> {
+    match Store::open(&executor.home.join("homebased.sqlite"))
+        .unwrap()
+        .executor_identity(task)
+        .unwrap()
+    {
+        Some(homebased::submission::ExecutorIdentity::Accepted(record)) => Some(record),
+        _ => None,
+    }
+}
+
+#[test]
+fn held_remote_task_launches_after_its_remote_dependency_succeeds() {
+    let (origin, executor) = dependency_fleet("dependency");
+    let gate = executor.user_home.join("gate");
+    let dependency_spec = cli_remote_spec(&executor, vec!["/bin/sh", "-c", &gate_command(&gate)]);
+    let dependency = submit_file(&origin, &dependency_spec, RequestId::new());
+    assert!(dependency.status.success());
+    let dependency: TaskId = serde_json::from_slice::<Value>(&dependency.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let held_spec = cli_remote_spec(
+        &executor,
+        vec!["/bin/sh", "-c", "echo released >> \"$HOME/released\""],
+    );
+    let held = submit_after(&origin, &held_spec, &[dependency]);
+    assert_eq!(held["status"], "held");
+    let held: TaskId = held["id"].as_str().unwrap().parse().unwrap();
+    assert!(accepted_on_executor(&executor, held).is_none());
+
+    fs::write(&gate, "").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || executor
+            .user_home
+            .join("released")
+            .exists()),
+        "held task never ran on its executor"
+    );
+    // the executor got the saved normalized spec under the pre-assigned task UUID
+    let record = accepted_on_executor(&executor, held).unwrap();
+    let route = origin_route(&origin, held);
+    assert_eq!(record.spec, route.spec);
+    let wire = serde_json::to_value(record.current_spec().unwrap()).unwrap();
+    assert!(wire.get("after").is_none());
+    assert!(wait_until(Duration::from_secs(10), || matches!(
+        origin_route(&origin, held).submission,
+        SubmissionState::Accepted
+    )));
+}
+
+#[test]
+fn held_remote_task_waits_for_an_unreachable_executor_then_launches() {
+    let (origin, mut executor) = dependency_fleet("unreachable");
+    let gate = origin.user_home.join("gate");
+    let mut local_spec = remote_spec(&executor, vec!["/bin/sh", "-c", &gate_command(&gate)]);
+    local_spec.cwd = origin.user_home.clone();
+    let dependency = submit_file(&origin, &local_spec, RequestId::new());
+    assert!(
+        dependency.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dependency.stderr)
+    );
+    let dependency: TaskId = serde_json::from_slice::<Value>(&dependency.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let held_spec = cli_remote_spec(
+        &executor,
+        vec!["/bin/sh", "-c", "echo released >> \"$HOME/released\""],
+    );
+    let held: TaskId = submit_after(&origin, &held_spec, &[dependency])["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    executor.stop();
+    fs::write(&gate, "").unwrap();
+    assert!(wait_until(Duration::from_secs(10), || {
+        Store::open(&origin.home.join("homebased.sqlite"))
+            .unwrap()
+            .dependency_states(&[dependency])
+            .unwrap()
+            == vec![(
+                dependency,
+                Some(homebased::dependency::DependencyState::Ended(
+                    homebased::dependency::TaskOutcome::Succeeded.into(),
+                )),
+            )]
+    }));
+    std::thread::sleep(Duration::from_secs(2));
+    // the release cannot reach the executor, so the task stays held and cancellable here
+    assert_eq!(
+        serde_json::to_value(origin_route(&origin, held).submission).unwrap(),
+        serde_json::json!({ "type": "held", "phase": { "type": "waiting" } })
+    );
+
+    executor.spawn();
+    assert!(
+        wait_until(Duration::from_secs(40), || executor
+            .user_home
+            .join("released")
+            .exists()),
+        "held task never ran after its executor came back"
+    );
+    assert!(accepted_on_executor(&executor, held).is_some());
+}
+
+/// Send a worker message from `sender` and return its error body
+fn worker_message_error(sender: &Daemon, task: TaskId) -> Value {
+    let task = task.to_string();
+    let id = MessageId::new().to_string();
+    let output = sender
+        .cmd()
+        .args([
+            "--json",
+            "message",
+            "send",
+            "--worker",
+            &task,
+            "--message",
+            "Also update the changelog",
+            "--message-id",
+            &id,
+            "--source-thread",
+            "018f0a48-f0ef-7d12-8f01-000000000001",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+#[test]
+fn worker_message_from_another_machine_explains_a_held_task() {
+    let (origin, executor) = dependency_fleet("held-message");
+    let gate = origin.user_home.join("gate");
+    let mut dependency_spec = remote_spec(&executor, vec!["/bin/sh", "-c", &gate_command(&gate)]);
+    dependency_spec.cwd = origin.user_home.clone();
+    let dependency = submit_file(&origin, &dependency_spec, RequestId::new());
+    assert!(
+        dependency.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dependency.stderr)
+    );
+    let dependency: TaskId = serde_json::from_slice::<Value>(&dependency.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut held_spec = remote_spec(&executor, vec!["/bin/sh", "-c", "true"]);
+    held_spec.cwd = origin.user_home.clone();
+    let held: TaskId = submit_after(&origin, &held_spec, &[dependency])["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // only the origin's route knows the task, and no worker exists while it is held
+    let waiting = worker_message_error(&executor, held);
+    assert_eq!(waiting["error"]["code"], "worker_message_unavailable");
+    assert_eq!(waiting["error"]["input"]["reason"], "no_worker_thread");
+
+    let cancelled = origin
+        .cmd()
+        .args(["--json", "task", "cancel", &held.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    let ended = worker_message_error(&executor, held);
+    assert_eq!(ended["error"]["code"], "worker_message_unavailable");
+    assert_eq!(ended["error"]["input"]["reason"], "terminal");
+
+    fs::write(&gate, "").unwrap();
+}

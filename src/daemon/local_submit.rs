@@ -8,18 +8,19 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::SubmitBody;
 use super::origin_submit::conflict;
-use crate::domain::{ProcessStatus, TaskId};
+use crate::dependency::TaskDependencies;
+use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus};
 use crate::error::AppError;
 use crate::invocation::{persist_workload, resolve_workload_binary};
-use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
-use crate::store::{self, NewTask};
-use crate::submission::{OriginRoute, RequestId, SubmissionState};
+use crate::spec::{self, NormalizedSpec};
+use crate::store::{self, LocalAdmission, NewTask};
+use crate::submission::{HeldPhase, OriginRoute, RequestId, SubmissionState};
 
 /// Accept a local task once per request UUID
 pub(super) async fn submit(
     state: &AppState,
     body: SubmitBody,
-) -> Result<(TaskId, ProcessStatus), AppError> {
+) -> Result<(TaskId, TaskStatus), AppError> {
     let spec = body.spec;
     if spec.machine.is_some() {
         return Err(AppError::Usage {
@@ -30,34 +31,17 @@ pub(super) async fn submit(
     let request = body.request;
     let _request_guard = state.locks.origin_submissions.lock(request).await;
     if let Some(route) = saved_route(state, request).await? {
-        return resume(state, route, &spec).await;
+        return resume(state, route, &spec, body.after.as_ref()).await;
     }
 
-    let binary = resolve_workload_binary(&spec.workload, &body.env.path, &spec.cwd)?;
     let id = TaskId::new();
-    let paths = state.home.prepare_task(id)?;
-    if let NormalizedWorkload::Agent(agent) = &spec.workload {
-        crate::runner::write_task_files(&paths, &agent.prompt, agent.report_trailer)?;
-    }
-    let row = store::new_queued_task(NewTask {
-        id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: persist_workload(&spec.workload),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: body.env,
-        binary,
-    });
-    let launched = call(&state.supervisor, |reply| SupervisorMsg::Launch {
-        row: Box::new(row),
-        spec: Box::new(spec.clone()),
+    let admission = LocalAdmission::Submitted {
         request,
-        reply,
-    })
-    .await;
+        after: body.after.clone(),
+    };
+    let launched = launch_row(state, id, &spec, body.env, admission).await;
     match launched {
-        Ok(()) => Ok((id, ProcessStatus::Queued)),
+        Ok(()) => Ok((id, ProcessStatus::Queued.into())),
         // the launch keeps running after this caller stops waiting, so the row may commit later
         Err(AppError::DaemonBusy) => Err(AppError::SubmissionOutcomeUnknown {
             request,
@@ -67,11 +51,114 @@ pub(super) async fn submit(
         Err(error) => {
             // an earlier attempt of this request may have committed while this one was queued
             match saved_route(state, request).await? {
-                Some(route) if route.task != id => resume(state, route, &spec).await,
+                Some(route) if route.task != id => {
+                    resume(state, route, &spec, body.after.as_ref()).await
+                }
                 _ => Err(error),
             }
         }
     }
+}
+
+/// Launch a held local task whose dependencies all succeeded
+///
+/// It runs with the spec and environment saved at submit and keeps its
+/// pre-assigned task UUID. A launch that can never succeed, such as a missing
+/// executable, closes the route and tells its thread; a busy daemon is retried
+pub(super) async fn release(state: &AppState, route: OriginRoute) -> Result<(), AppError> {
+    let _request_guard = state.locks.origin_submissions.lock(route.request).await;
+    let Some(route) = call(&state.store, |reply| StoreMsg::OriginRoute {
+        id: route.task,
+        reply,
+    })
+    .await?
+    else {
+        return Err(AppError::RouteNotFound { task: route.task });
+    };
+    if !matches!(
+        route.submission,
+        SubmissionState::Held {
+            phase: HeldPhase::Waiting
+        }
+    ) {
+        return Ok(());
+    }
+    let spec = route
+        .current_spec()
+        .cloned()
+        .ok_or_else(|| conflict(&route, "held task has no saved spec"))?;
+    let admission = LocalAdmission::Released {
+        request: route.request,
+    };
+    let checked = spec::check_spec_host(&spec).map_err(AppError::from);
+    let launched = match checked {
+        Ok(()) => {
+            launch_row(
+                state,
+                route.task,
+                &spec,
+                route.callback.env.clone(),
+                admission,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match launched {
+        Ok(()) => Ok(()),
+        Err(error) if is_transient(&error) => Err(error),
+        Err(error) => {
+            call(&state.store, |reply| StoreMsg::RefuseHeldLaunch {
+                id: route.task,
+                reason: error.to_string(),
+                reply,
+            })
+            .await?;
+            state
+                .supervisor
+                .cast(SupervisorMsg::DispatchInbox { id: route.task })?;
+            Ok(())
+        }
+    }
+}
+
+/// Whether a refused local launch may succeed when retried later
+///
+/// A busy store, another task resuming the same Codex thread, and a storage
+/// failure pass; anything else would refuse the same launch again
+fn is_transient(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::DaemonBusy | AppError::ResumeThreadBusy { .. } | AppError::Internal { .. }
+    )
+}
+
+/// Hand the queued row to the supervisor, which writes its files and launches it
+async fn launch_row(
+    state: &AppState,
+    id: TaskId,
+    spec: &NormalizedSpec,
+    env: TaskEnv,
+    admission: LocalAdmission,
+) -> Result<(), AppError> {
+    let binary = resolve_workload_binary(&spec.workload, &env.path, &spec.cwd)?;
+    let row = store::new_queued_task(NewTask {
+        id,
+        name: Some(spec.name.clone()),
+        thread: spec.thread,
+        workload: persist_workload(&spec.workload),
+        cwd: spec.cwd.clone(),
+        timeout: spec.timeout,
+        env,
+        binary,
+    });
+    call(&state.supervisor, |reply| SupervisorMsg::Launch {
+        row: Box::new(row),
+        spec: Box::new(spec.clone()),
+        admission,
+        reply,
+    })
+    .await
 }
 
 async fn saved_route(
@@ -90,7 +177,8 @@ async fn resume(
     state: &AppState,
     route: OriginRoute,
     spec: &NormalizedSpec,
-) -> Result<(TaskId, ProcessStatus), AppError> {
+    after: Option<&TaskDependencies>,
+) -> Result<(TaskId, TaskStatus), AppError> {
     let local = state.machine.identity.machine;
     if route.origin_machine != local || route.execution_machine != local {
         return Err(conflict(
@@ -98,14 +186,31 @@ async fn resume(
             "request UUID belongs to a remote submission",
         ));
     }
-    if !matches!(route.submission, SubmissionState::Accepted) {
-        return Err(conflict(&route, "request UUID belongs to a resource route"));
-    }
     if route.spec.current() != Some(spec) {
         return Err(conflict(
             &route,
             "request UUID has different normalized content",
         ));
+    }
+    let saved_after = call(&state.store, |reply| StoreMsg::RouteDependencies {
+        id: route.task,
+        reply,
+    })
+    .await?;
+    if saved_after.as_ref() != after {
+        return Err(conflict(&route, "request UUID has different dependencies"));
+    }
+    match &route.submission {
+        SubmissionState::Accepted => {}
+        SubmissionState::Held { phase } => return Ok((route.task, phase.status())),
+        SubmissionState::Rejected { reason } => {
+            return Err(AppError::SubmissionRejected {
+                request: route.request,
+                task: route.task,
+                reason: reason.clone(),
+            });
+        }
+        _ => return Err(conflict(&route, "request UUID belongs to a resource route")),
     }
     let id = route.task;
     match call(&state.supervisor, |reply| SupervisorMsg::ResumeLocal {
@@ -114,7 +219,7 @@ async fn resume(
     })
     .await?
     {
-        Some(status) => Ok((id, status)),
+        Some(status) => Ok((id, status.into())),
         None => Err(conflict(
             &route,
             "request UUID belongs to a resource launch",

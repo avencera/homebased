@@ -10,12 +10,14 @@ use tokio::task::JoinSet;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::api::views::TaskSummary;
 use crate::daemon::cluster::{
     CallbackFailureSummary, ExecutionBody, ExecutionView, IdentitySummary, IdentitySummaryBody,
     OriginBody, OriginSummary,
 };
-use crate::domain::{API_VERSION, ProcessStatus, TaskId, ThreadId};
+use crate::domain::{API_VERSION, ProcessStatus, TaskId, TaskStatus, ThreadId};
 use crate::error::{AppError, WorkerMessageBlocker};
+use crate::events::EventPayload;
 use crate::events::WaitingInboxEvent;
 use crate::fleet::address::MachineAddress;
 use crate::fleet::http::ClusterClient;
@@ -24,7 +26,8 @@ use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
 use crate::submission::{
-    ExecutorIdentity, ResourceActionRoutePhase, ResourceBackgroundRoutePhase, SubmissionState,
+    ExecutorIdentity, HeldPhase, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
+    SubmissionState,
 };
 
 /// Strict read query for a peer log, with an optional line limit
@@ -163,7 +166,28 @@ impl IdentitySummary {
 }
 
 /// Inspect a task from the local socket, regardless of execution machine
+///
+/// A task submitted here with `after` also shows its dependencies and their state
 pub(super) async fn show(state: &AppState, id: TaskId) -> Result<Value, AppError> {
+    let mut value = show_task(state, id).await?;
+    let after = call(&state.store, |reply| StoreMsg::RouteDependencies {
+        id,
+        reply,
+    })
+    .await?;
+    if let Some(after) = after
+        && let Some(object) = value.as_object_mut()
+    {
+        let views = crate::daemon::dependencies::views(state, &after).await?;
+        object.insert("after".into(), json!(views));
+    }
+    Ok(value)
+}
+
+async fn show_task(state: &AppState, id: TaskId) -> Result<Value, AppError> {
+    if let Some(value) = unlaunched_detail(state, id).await? {
+        return Ok(value);
+    }
     if call(&state.store, |reply| StoreMsg::GetTask { id, reply })
         .await?
         .is_some()
@@ -214,6 +238,56 @@ pub(super) async fn show(state: &AppState, id: TaskId) -> Result<Value, AppError
         return cached_route(&records, id);
     }
     absent(id, &records)
+}
+
+/// Detail of a task this origin holds, or ended before it launched
+///
+/// No machine has a task row for it, so the origin route is the whole record:
+/// the summary, the submission phase, and the origin's own terminal event
+async fn unlaunched_detail(state: &AppState, id: TaskId) -> Result<Option<Value>, AppError> {
+    let Some(task) = call(&state.store, |reply| StoreMsg::UnlaunchedTask { id, reply }).await?
+    else {
+        return Ok(None);
+    };
+    let after = crate::daemon::dependencies::views(state, &task.held.after).await?;
+    let Some(summary) = TaskSummary::from_unlaunched(&task, after) else {
+        return Ok(None);
+    };
+    let route = &task.held.route;
+    let last_event = call(&state.store, |reply| StoreMsg::InboundEvents { id, reply })
+        .await?
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry.event.payload {
+            EventPayload::Callback { event, .. } => Some(event),
+            EventPayload::State { .. } | EventPayload::Report { .. } => None,
+        });
+    let mut value = serde_json::to_value(summary)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("api_version".into(), json!(API_VERSION));
+        object.insert("submission".into(), json!(route.submission));
+        object.insert("reports".into(), json!([]));
+        object.insert("last_event".into(), json!(last_event));
+        object.insert("last_accepted_seq".into(), json!(route.last_accepted_seq));
+        object.insert("last_settled_seq".into(), json!(route.last_settled_seq));
+    }
+    let availability = match &route.submission {
+        SubmissionState::Held { phase } if phase.status() == TaskStatus::Held => "held",
+        _ => "not_started",
+    };
+    let local = state.machine.identity.machine;
+    annotate(
+        &mut value,
+        route.origin_machine,
+        route.execution_machine,
+        local,
+        availability,
+    );
+    if let Some(failed_events) = local_failures(state, id).await? {
+        value["failed_events"] = json!(failed_events);
+        value["waiting_events"] = json!(local_waiting(state, id).await?);
+    }
+    Ok(Some(value))
 }
 
 /// Read a task log through the local socket and its execution owner
@@ -270,7 +344,9 @@ fn execution_missing<T>(id: TaskId, records: &Records) -> Result<T, AppError> {
     }
     if let Some((_, route)) = records.route(id)? {
         return match route.submission {
-            SubmissionState::Rejected { .. } => Err(AppError::TaskNotStarted { task: id }),
+            SubmissionState::Rejected { .. } | SubmissionState::Held { .. } => {
+                Err(AppError::TaskNotStarted { task: id })
+            }
             _ => Err(AppError::TaskUnavailable {
                 task: id,
                 machine: route.execution_machine,
@@ -454,7 +530,7 @@ pub(super) async fn message_origin_route(
 /// Fields of a task detail that address its worker
 #[derive(Deserialize)]
 struct WorkerDetail {
-    status: ProcessStatus,
+    status: TaskStatus,
     worker_thread: Option<ThreadId>,
 }
 
@@ -474,9 +550,20 @@ pub(super) async fn message_worker_route(
         let summary = crate::daemon::api::local_detail(state, id).await?.summary;
         return worker_route(id, local, summary.status, summary.worker_thread);
     }
+    // a held task has no row anywhere until its origin launches it
+    if let Some(task) = call(&state.store, |reply| StoreMsg::UnlaunchedTask { id, reply }).await?
+        && let Some(summary) = TaskSummary::from_unlaunched(&task, Vec::new())
+    {
+        return worker_route(id, local, summary.status, None);
+    }
 
     let records = lookup(state, id).await?;
     let Some((machine, _)) = records.executions.first_key_value() else {
+        if let Some((_, route)) = records.route(id)?
+            && let Some(reason) = unlaunched_worker_blocker(route)
+        {
+            return Err(AppError::WorkerMessageUnavailable { task: id, reason });
+        }
         return execution_missing(id, &records);
     };
     let machine = *machine;
@@ -491,14 +578,37 @@ pub(super) async fn message_worker_route(
     worker_route(id, machine, detail.status, detail.worker_thread)
 }
 
+/// Why the worker of a task that its origin holds, or ended before launch, takes no message
+///
+/// The origin's route is the only record of such a task, so a peer reads
+/// it from the route summary. A refused held launch is rejected with the
+/// origin's own terminal event and no executor state; an ordinary refused
+/// submit has neither, and is `None` here
+fn unlaunched_worker_blocker(route: &OriginSummary) -> Option<WorkerMessageBlocker> {
+    match &route.submission {
+        SubmissionState::Held {
+            phase: HeldPhase::Waiting | HeldPhase::Launching,
+        } => Some(WorkerMessageBlocker::NoWorkerThread),
+        SubmissionState::Held {
+            phase: HeldPhase::Cancelled { .. },
+        } => Some(WorkerMessageBlocker::Terminal),
+        SubmissionState::Rejected { .. }
+            if route.last_accepted_seq > 0 && route.last_execution_state.is_none() =>
+        {
+            Some(WorkerMessageBlocker::Terminal)
+        }
+        _ => None,
+    }
+}
+
 fn worker_route(
     task: TaskId,
     machine: MachineId,
-    status: ProcessStatus,
+    status: TaskStatus,
     worker_thread: Option<ThreadId>,
 ) -> Result<(MachineId, ThreadId), AppError> {
     // a terminal Codex task keeps its thread for followup, but its worker is gone
-    if status.is_terminal() {
+    if status.process().is_some_and(ProcessStatus::is_terminal) {
         return Err(AppError::WorkerMessageUnavailable {
             task,
             reason: WorkerMessageBlocker::Terminal,
@@ -785,21 +895,9 @@ fn annotate(
 
 fn cached_route(records: &Records, id: TaskId) -> Result<Value, AppError> {
     let (found, route) = records.route(id)?.ok_or(AppError::TaskNotFound { id })?;
-    let status = match route.submission {
-        SubmissionState::AcceptanceUnknown => None,
-        SubmissionState::Accepted => route.last_execution_state,
-        SubmissionState::Rejected { .. } => None,
-        SubmissionState::Resource { .. } => route.last_execution_state,
-        SubmissionState::ResourceAction {
-            phase: ResourceActionRoutePhase::Accepted,
-            ..
-        } => route.last_execution_state,
-        SubmissionState::ResourceAction { .. } => None,
-        SubmissionState::ResourceBackground {
-            phase: ResourceBackgroundRoutePhase::Accepted,
-            ..
-        } => route.last_execution_state,
-        SubmissionState::ResourceBackground { .. } => None,
+    let status: Option<TaskStatus> = match &route.submission {
+        SubmissionState::Held { phase } => Some(phase.status()),
+        _ => cached_process_status(route).map(TaskStatus::from),
     };
     let mut value = json!({
         "api_version": API_VERSION,
@@ -837,6 +935,27 @@ fn cached_route(records: &Records, id: TaskId) -> Result<Value, AppError> {
         availability,
     );
     Ok(value)
+}
+
+/// Last process state a route can vouch for, without inventing one for an unresolved submit
+fn cached_process_status(route: &OriginSummary) -> Option<ProcessStatus> {
+    match route.submission {
+        SubmissionState::AcceptanceUnknown
+        | SubmissionState::Rejected { .. }
+        | SubmissionState::Held { .. } => None,
+        SubmissionState::Accepted => route.last_execution_state,
+        SubmissionState::Resource { .. } => route.last_execution_state,
+        SubmissionState::ResourceAction {
+            phase: ResourceActionRoutePhase::Accepted,
+            ..
+        } => route.last_execution_state,
+        SubmissionState::ResourceAction { .. } => None,
+        SubmissionState::ResourceBackground {
+            phase: ResourceBackgroundRoutePhase::Accepted,
+            ..
+        } => route.last_execution_state,
+        SubmissionState::ResourceBackground { .. } => None,
+    }
 }
 
 fn compact_identity(id: TaskId, machine: MachineId, identity: &IdentitySummary) -> Value {
@@ -1063,9 +1182,57 @@ mod tests {
     }
 
     #[test]
+    fn a_task_its_origin_never_launched_names_why_no_worker_reads_messages() {
+        use super::unlaunched_worker_blocker;
+        use crate::dependency::HeldCancellation;
+        use crate::error::WorkerMessageBlocker;
+        use crate::submission::HeldPhase;
+
+        let summary = |submission, last_accepted_seq| OriginSummary {
+            last_accepted_seq,
+            ..origin_summary(
+                TaskId::new(),
+                RequestId::new(),
+                MachineId::new(),
+                MachineId::new(),
+                submission,
+            )
+        };
+        let held = |phase| SubmissionState::Held { phase };
+        let rejected = || SubmissionState::Rejected {
+            reason: "cwd_not_found".into(),
+        };
+
+        for phase in [HeldPhase::Waiting, HeldPhase::Launching] {
+            assert_eq!(
+                unlaunched_worker_blocker(&summary(held(phase), 0)),
+                Some(WorkerMessageBlocker::NoWorkerThread)
+            );
+        }
+        let cancelled = HeldPhase::Cancelled {
+            cause: HeldCancellation::Requested,
+        };
+        assert_eq!(
+            unlaunched_worker_blocker(&summary(held(cancelled), 1)),
+            Some(WorkerMessageBlocker::Terminal)
+        );
+        // a refused held launch carries the origin's own terminal event
+        assert_eq!(
+            unlaunched_worker_blocker(&summary(rejected(), 1)),
+            Some(WorkerMessageBlocker::Terminal)
+        );
+        // an ordinary refused submit never had a task
+        assert_eq!(unlaunched_worker_blocker(&summary(rejected(), 0)), None);
+        assert_eq!(
+            unlaunched_worker_blocker(&summary(SubmissionState::Accepted, 3)),
+            None
+        );
+    }
+
+    #[test]
     fn worker_route_needs_a_live_task_with_a_recorded_thread() {
         use super::worker_route;
-        use crate::domain::ProcessStatus;
+        use crate::domain::{ProcessStatus, TaskStatus};
         use crate::error::WorkerMessageBlocker;
 
         let task = TaskId::new();
@@ -1077,16 +1244,30 @@ mod tests {
         };
 
         assert_eq!(
-            worker_route(task, machine, ProcessStatus::Running, Some(thread)).unwrap(),
+            worker_route(task, machine, ProcessStatus::Running.into(), Some(thread)).unwrap(),
             (machine, thread)
         );
         // a running Codex worker has no thread until it exits
         assert_eq!(
-            blocker(worker_route(task, machine, ProcessStatus::Running, None)),
+            blocker(worker_route(
+                task,
+                machine,
+                ProcessStatus::Running.into(),
+                None
+            )),
             Some(WorkerMessageBlocker::NoWorkerThread)
         );
         assert_eq!(
-            blocker(worker_route(task, machine, ProcessStatus::Queued, None)),
+            blocker(worker_route(
+                task,
+                machine,
+                ProcessStatus::Queued.into(),
+                None
+            )),
+            Some(WorkerMessageBlocker::NoWorkerThread)
+        );
+        assert_eq!(
+            blocker(worker_route(task, machine, TaskStatus::Held, None)),
             Some(WorkerMessageBlocker::NoWorkerThread)
         );
         for status in [
@@ -1096,7 +1277,7 @@ mod tests {
             ProcessStatus::Lost,
         ] {
             assert_eq!(
-                blocker(worker_route(task, machine, status, Some(thread))),
+                blocker(worker_route(task, machine, status.into(), Some(thread))),
                 Some(WorkerMessageBlocker::Terminal),
                 "{status}"
             );
