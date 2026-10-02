@@ -39,6 +39,7 @@ Errors go to stderr. With `--json` they are one object:
 | `too_many_reports` | 5 | A task holds at most 20 reports. | Stop reporting; the last outcome stands. |
 | `task_terminal` | 5 | Report or cancel target has already exited. | Nothing to do. Resubmit if more work is needed. |
 | `followup_unavailable` | 5 | The source task is not Codex, is not terminal, or has no recorded worker thread. `input.reason` is `not_codex`, `not_terminal`, or `no_worker_thread`. | Follow up only a terminal Codex task with `worker_thread`. A running task must finish first. |
+| `worker_message_unavailable` | 5 | `message send --worker` named a task whose worker cannot take a message. `input.reason` is `no_worker_thread` (queued, or a running Codex worker, which records its thread only at exit) or `terminal`. | Wait until a Claude task is running. Use `task followup` for a finished Codex worker. |
 | `followup_wrong_machine` | 2 | The local machine is neither the task's origin nor execution machine. The error names both machines. | Run `task followup` on the origin or execution machine. |
 | `resume_thread_busy` | 5 | Another queued or running task is already resuming the Codex thread. `input.task` names that task. | Wait for its event before following up the same worker again. |
 | `daemon_already_running` | 5 | `daemon serve` while another instance holds `daemon.lock`. | Use the existing daemon. |
@@ -81,4 +82,4 @@ Claude Code delivery uses an internal Claude Code socket protocol, not a public 
 | `message_outcome_unknown` | 1, retryable | The receiver may have queued the message, but the sender did not get a valid receipt. | Retry with the same `--message-id` and same destination. Use a machine UUID to pin the receiver. A repeat can reach Codex if the receiver stopped before it saved the receipt. |
 | `message_receiver_unavailable` | 1, retryable | The receiver could not inspect local Codex session metadata. | Check the receiver's session files and retry. |
 | `message_invalid` | 2 | A message, UUID, or receiver-side `cwd` failed validation. | Fix the reported value. |
-| `message_to_self` | 2 | The selected destination is the source thread. A `--task` destination resolves to its origin thread, not its worker. | Choose a different source or destination. Use `homebased task followup` to resume a finished Codex worker. |
+| `message_to_self` | 2 | The selected destination is the source thread, or a `--worker` destination is the source task's own worker. A `--task` destination resolves to its origin thread, not its worker. | Choose a different source or destination. Use `--worker` for a running Claude worker, or `homebased task followup` to resume a finished Codex worker. |

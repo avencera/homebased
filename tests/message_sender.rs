@@ -14,12 +14,14 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use homebased::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
+use homebased::domain::{
+    API_VERSION, Agent, AgentKind, AgentWorkload, TaskEnv, TaskId, ThreadId, Workload,
+};
 use homebased::fleet::address::MachineAddress;
 use homebased::machine::MachineId;
 use homebased::message::{MessageId, MessageSource};
 use homebased::spec;
-use homebased::store::Store;
+use homebased::store::{NewTask, Store, new_queued_task};
 use homebased::submission::{
     CallbackContext, CallbackExecutable, OriginRoute, PersistedSpec, RequestId, SubmissionState,
 };
@@ -34,6 +36,9 @@ struct Daemon {
     config: PathBuf,
     queue_log: PathBuf,
     codex: PathBuf,
+    claude: PathBuf,
+    /// A fake Claude worker runs until this file exists
+    claude_release: PathBuf,
     address: String,
     child: Option<Child>,
 }
@@ -184,6 +189,17 @@ impl Daemon {
         )
         .unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let claude_release = dir.path().join("release-claude");
+        let claude = dir.path().join("fake-claude");
+        fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0\n",
+                claude_release.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
         let address = format!("127.0.0.1:{}", free_port());
         let mut daemon = Self {
             _dir: dir,
@@ -192,6 +208,8 @@ impl Daemon {
             config,
             queue_log,
             codex,
+            claude,
+            claude_release,
             address,
             child: None,
         };
@@ -206,6 +224,7 @@ impl Daemon {
             .env("HOMEBASED_CONFIG", &self.config)
             .env("HOME", &self.user_home)
             .env("HOMEBASED_CODEX", &self.codex)
+            .env("HOMEBASED_CLAUDE", &self.claude)
             .env("HOMEBASED_QUEUE_LOG", &self.queue_log)
             .env_remove("HOMEBASED_TASK_ID")
             .env_remove("CODEX_THREAD_ID")
@@ -784,4 +803,156 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
         String::from_utf8_lossy(&task_source_output.stderr)
     );
     assert_eq!(sender.queue_calls().len(), 1);
+}
+
+fn send_worker(sender: &Daemon, task: &str, source: &[&str]) -> Output {
+    let id = MessageId::new().to_string();
+    let mut args = vec![
+        "--json",
+        "message",
+        "send",
+        "--worker",
+        task,
+        "--message",
+        "Also update the changelog",
+        "--message-id",
+        &id,
+    ];
+    args.extend_from_slice(source);
+    sender.cli(&args)
+}
+
+fn error_json(output: &Output) -> Value {
+    assert!(!output.status.success());
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+#[test]
+fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
+    let sender = Daemon::start("sender");
+    let receiver = Daemon::start("receiver");
+    add_peer(&sender, &receiver.address());
+    let source = ["--source-thread", "018f0a48-f0ef-7d12-8f01-000000000001"];
+
+    let origin = ThreadId(Uuid::now_v7());
+    let cwd = receiver.user_home.join("worker-workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    // submit finds the origin thread by the id in its rollout file name
+    write_session(
+        &receiver.user_home,
+        &format!("2026-09-22T00-00-00-{origin}"),
+        origin,
+        &cwd,
+    );
+    let spec_path = receiver.state_home.join("worker-spec.json");
+    fs::write(
+        &spec_path,
+        serde_json::to_vec(&json!({
+            "api_version": API_VERSION,
+            "thread": origin,
+            "name": "live worker",
+            "cwd": cwd,
+            "timeout": "30m",
+            "workload": { "type": "agent", "agent": "claude", "prompt": "work" },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let submitted = receiver.cli(&[
+        "--json",
+        "task",
+        "submit",
+        "--spec",
+        spec_path.to_str().unwrap(),
+    ]);
+    assert!(
+        submitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let task = read_json(&submitted)["id"].as_str().unwrap().to_string();
+    let status = |daemon: &Daemon| read_json(&daemon.cli(&["--json", "task", "show", &task]));
+    assert!(wait_until(Duration::from_secs(10), || {
+        status(&receiver)["status"] == "running"
+    }));
+
+    // the sender holds no row for this task, so it reads the executor's detail
+    let remote_view = status(&sender);
+    assert_eq!(remote_view["worker_thread"], task.as_str());
+    assert_eq!(
+        remote_view["execution_machine"],
+        receiver.machine_id().to_string()
+    );
+
+    // the fake worker publishes no Claude registry entry, so a Codex session with
+    // the same id makes the receiver's delivery visible in its queue log
+    let worker_thread: ThreadId = task.parse().unwrap();
+    write_session(&receiver.user_home, "worker", worker_thread, &cwd);
+    let sent = send_worker(&sender, &task, &source);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let receipt = read_json(&sent);
+    assert_eq!(
+        receipt["destination_machine"],
+        receiver.machine_id().to_string()
+    );
+    assert_eq!(receipt["destination_thread"], task.as_str());
+    let queued_lines = receiver.queue_calls();
+    assert_eq!(queued_lines.len(), 1);
+    assert!(queued_lines[0].contains(&task), "{queued_lines:?}");
+
+    let self_send = error_json(&send_worker(&receiver, &task, &["--source-task", &task]));
+    assert_eq!(self_send["error"]["code"], "message_to_self");
+    assert_eq!(self_send["error"]["input"]["thread"], task.as_str());
+
+    let unknown = error_json(&send_worker(&sender, &TaskId::new().to_string(), &source));
+    assert_eq!(unknown["error"]["code"], "task_not_found");
+
+    // the daemon starts queued rows only at startup, so this one stays queued
+    let queued = TaskId::new();
+    fs::create_dir_all(receiver.state_home.join("tasks").join(queued.to_string())).unwrap();
+    Store::open(&receiver.state_home.join("homebased.sqlite"))
+        .unwrap()
+        .insert_task(&new_queued_task(NewTask {
+            id: queued,
+            name: None,
+            thread: origin,
+            workload: Workload::Agent(AgentWorkload {
+                agent: Agent::new(AgentKind::Claude, None),
+                extra_args: vec![],
+                report_trailer: false,
+                resume_thread: None,
+            }),
+            cwd: cwd.clone(),
+            timeout: Duration::from_secs(1800),
+            env: TaskEnv {
+                path: "/bin".into(),
+                home: receiver.user_home.to_string_lossy().into_owned(),
+            },
+            binary: receiver.claude.clone(),
+        }))
+        .unwrap();
+    let not_started = error_json(&send_worker(&sender, &queued.to_string(), &source));
+    assert_eq!(not_started["error"]["code"], "worker_message_unavailable");
+    assert_eq!(not_started["error"]["input"]["reason"], "no_worker_thread");
+
+    fs::write(&receiver.claude_release, "").unwrap();
+    assert!(wait_until(Duration::from_secs(10), || {
+        status(&receiver)["status"]
+            .as_str()
+            .is_some_and(|status| status != "running")
+    }));
+    let finished = error_json(&send_worker(&sender, &task, &source));
+    assert_eq!(finished["error"]["code"], "worker_message_unavailable");
+    assert_eq!(finished["error"]["input"]["reason"], "terminal");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("homebased task followup")
+    );
+    assert_eq!(receiver.queue_calls().len(), 1);
 }

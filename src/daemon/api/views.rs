@@ -58,7 +58,8 @@ pub struct TaskSummary {
     pub workload: WorkloadView,
     /// Submitting Codex thread.
     pub thread: ThreadId,
-    /// Codex thread created by the task worker, when the worker printed one.
+    /// Worker thread: a Claude worker's session from launch, or a Codex
+    /// worker's thread once it exits, when the worker printed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_thread: Option<ThreadId>,
     /// Working directory.

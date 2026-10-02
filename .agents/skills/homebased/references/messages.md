@@ -1,8 +1,8 @@
 # Send a direct message to a session or thread
 
 `homebased message send` sends one message to a Claude Code session or a Codex
-thread on this or another Fleet machine. It does not send a prompt to a
-detached Homebased worker.
+thread on this or another Fleet machine, or to the running Claude worker of a
+Homebased task.
 
 ## Choose the destination
 
@@ -54,6 +54,36 @@ exists.
 source thread is also the destination, the send fails with `message_to_self`.
 Use `homebased task followup <task-id> --message "..."` to resume a finished
 Codex worker with new information. See [submit.md](submit.md).
+
+## Send to a running worker
+
+Use `--worker` alone, without `--machine`, `--thread`, `--cwd`, or `--task`, to
+give a running Claude worker new instructions:
+
+```bash
+homebased --json message send \
+  --worker <task-uuid> \
+  --message "Also update the changelog before you report."
+```
+
+The local daemon finds the task in the known Fleet and sends to its execution
+machine and its `worker_thread`. A Claude worker records `worker_thread` when it
+starts running. The worker reads the message at its next turn boundary. If it
+finishes its final turn first, the message is never read, and the sender cannot
+tell. Send while the worker still has work left, and confirm from its reports
+that it acted on the message.
+
+`--worker` returns:
+
+- `worker_message_unavailable` with `reason: no_worker_thread` for a queued
+  task, or a running task whose agent records no thread while it runs. A Codex
+  worker records its thread only when it finishes, so it cannot take a live
+  message.
+- `worker_message_unavailable` with `reason: terminal` once the task has ended.
+  Use `homebased task followup` to resume a finished Codex worker.
+- `task_not_found` or `cluster_lookup_incomplete` when no checked machine has
+  the task.
+- `message_to_self` when the source task is the worker's own task.
 
 ## Choose the source and conversation
 

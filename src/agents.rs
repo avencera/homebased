@@ -47,7 +47,7 @@ pub fn build_agent_invocation(
             generated_opencode_config(&identity.opencode_agent_name()),
         );
     }
-    build_standard_agent_invocation(inputs, binary, prompt_feed)
+    build_standard_agent_invocation(inputs, binary, prompt_feed, TaskIdentity::Preview)
 }
 
 /// Build an agent invocation with the identity and inherited child policy.
@@ -58,17 +58,23 @@ pub fn build_agent_invocation_for_identity(
     identity: TaskIdentity,
     inherited_opencode_config: Option<&str>,
 ) -> Result<ChildInvocation, AppError> {
-    if inputs.kind != AgentKind::OpenCode {
-        return Ok(build_standard_agent_invocation(inputs, binary, prompt_feed));
-    }
-
-    let name = identity.opencode_agent_name();
-    validate_opencode_extra_args(inputs.extra_args).map_err(|err| {
+    // rows stored before a submit-time rule existed are checked again here
+    validate_agent_extra_args(inputs.kind, inputs.extra_args).map_err(|err| {
         AppError::AgentConfiguration {
-            agent: AgentKind::OpenCode,
+            agent: inputs.kind,
             message: err.to_string(),
         }
     })?;
+    if inputs.kind != AgentKind::OpenCode {
+        return Ok(build_standard_agent_invocation(
+            inputs,
+            binary,
+            prompt_feed,
+            identity,
+        ));
+    }
+
+    let name = identity.opencode_agent_name();
     let config = compose_opencode_config(inherited_opencode_config, &name)?;
     Ok(build_opencode_invocation_with_config(
         inputs,
@@ -83,6 +89,7 @@ fn build_standard_agent_invocation(
     inputs: AgentArgvInputs<'_>,
     binary: &Path,
     prompt_feed: &Path,
+    identity: TaskIdentity,
 ) -> ChildInvocation {
     let (mut args, stdin) = match inputs.kind {
         AgentKind::Codex => {
@@ -109,6 +116,10 @@ fn build_standard_agent_invocation(
             args.push("--permission-mode".into());
             args.push("auto".into());
             args.push("--no-session-persistence".into());
+            // a fixed session id makes the running worker addressable by
+            // `message send --worker` without reading its output
+            args.push("--session-id".into());
+            args.push(identity.claude_session_id());
             add_claude_output_defaults(&mut args, inputs.extra_args);
             (args, StdinPolicy::PromptFeed)
         }
@@ -205,16 +216,58 @@ fn append_extra_args(args: &mut Vec<String>, extra_args: &[String], kind: AgentK
 fn managed_standalone_flags(kind: AgentKind) -> &'static [&'static str] {
     match kind {
         AgentKind::Codex => &["--dangerously-bypass-approvals-and-sandbox"],
-        AgentKind::Claude => &["-p", "--no-session-persistence", "--verbose"],
+        AgentKind::Claude => &[
+            "-p",
+            "--no-session-persistence",
+            "--session-id",
+            "--verbose",
+        ],
         AgentKind::Grok => &["--always-approve", "--verbatim"],
         AgentKind::OpenCode => &["--standalone", "--auto"],
     }
 }
 
-/// Validate OpenCode extra arguments before a task row is created.
-pub(crate) fn validate_opencode_extra_args(
+/// Validate agent extra arguments before a task row is created.
+pub(crate) fn validate_agent_extra_args(
+    kind: AgentKind,
     extra_args: &[String],
-) -> Result<(), OpenCodeExtraArgsError> {
+) -> Result<(), AgentExtraArgsError> {
+    match kind {
+        AgentKind::OpenCode => validate_opencode_extra_args(extra_args),
+        AgentKind::Claude => validate_claude_extra_args(extra_args),
+        AgentKind::Codex | AgentKind::Grok => Ok(()),
+    }
+}
+
+/// Claude workers run under the session id homebased assigns, which is how
+/// `message send --worker` reaches them. A second id would conflict with it,
+/// and resuming another session would move the worker off it
+fn validate_claude_extra_args(extra_args: &[String]) -> Result<(), AgentExtraArgsError> {
+    let Some((index, message)) = extra_args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| forbidden_claude_argument(arg).map(|message| (index, message)))
+    else {
+        return Ok(());
+    };
+    Err(AgentExtraArgsError {
+        index,
+        message: message.into(),
+    })
+}
+
+fn forbidden_claude_argument(arg: &str) -> Option<&'static str> {
+    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+    match flag {
+        "--session-id" => Some("--session-id is managed by homebased"),
+        "--resume" | "-r" | "--continue" | "-c" | "--fork-session" | "--from-pr" => {
+            Some("session continuation is not allowed; homebased assigns the worker session id")
+        }
+        _ => None,
+    }
+}
+
+fn validate_opencode_extra_args(extra_args: &[String]) -> Result<(), AgentExtraArgsError> {
     let mut pending_value = false;
     for (index, arg) in extra_args.iter().enumerate() {
         if pending_value && !arg.starts_with('-') {
@@ -224,16 +277,16 @@ pub(crate) fn validate_opencode_extra_args(
         pending_value = false;
 
         if arg == "--" {
-            return Err(OpenCodeExtraArgsError {
+            return Err(AgentExtraArgsError {
                 index,
                 message: "the prompt must be supplied through the prompt feed".into(),
             });
         }
         if let Some(message) = forbidden_opencode_argument(arg) {
-            return Err(OpenCodeExtraArgsError { index, message });
+            return Err(AgentExtraArgsError { index, message });
         }
         if !arg.starts_with('-') {
-            return Err(OpenCodeExtraArgsError {
+            return Err(AgentExtraArgsError {
                 index,
                 message: "positional prompt arguments are controlled by the prompt feed".into(),
             });
@@ -249,10 +302,10 @@ pub(crate) fn validate_opencode_extra_args(
     Ok(())
 }
 
-/// Validation failure for one OpenCode extra argument.
+/// Validation failure for one agent extra argument.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
-pub(crate) struct OpenCodeExtraArgsError {
+pub(crate) struct AgentExtraArgsError {
     /// Index in `workload.extra_args`.
     pub(crate) index: usize,
     /// Safe contract failure detail.
@@ -515,6 +568,8 @@ mod tests {
                 "--permission-mode",
                 "auto",
                 "--no-session-persistence",
+                "--session-id",
+                "<task-id>",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -534,6 +589,8 @@ mod tests {
                 "--permission-mode",
                 "auto",
                 "--no-session-persistence",
+                "--session-id",
+                "<task-id>",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -593,10 +650,16 @@ mod tests {
                     "-p".into(),
                     "--no-session-persistence".into(),
                     "--no-session-persistence".into(),
+                    "--session-id".into(),
                     "--verbose".into(),
                     "--verbose".into(),
                 ],
-                vec!["-p", "--no-session-persistence", "--verbose"],
+                vec![
+                    "-p",
+                    "--no-session-persistence",
+                    "--session-id",
+                    "--verbose",
+                ],
             ),
             (
                 AgentKind::Grok,
@@ -694,6 +757,82 @@ mod tests {
         .collect();
 
         assert!(args.ends_with(&expected_extra));
+    }
+
+    fn claude_for_task(
+        task: crate::domain::TaskId,
+        extra_args: &[String],
+    ) -> Result<ChildInvocation, AppError> {
+        build_agent_invocation_for_identity(
+            AgentArgvInputs {
+                kind: AgentKind::Claude,
+                model: None,
+                cwd: Path::new("/work"),
+                extra_args,
+                resume_thread: None,
+            },
+            Path::new("/bin/claude"),
+            Path::new("/state/tasks/id/prompt.feed.txt"),
+            TaskIdentity::Actual(task),
+            None,
+        )
+    }
+
+    #[test]
+    fn claude_worker_runs_under_one_session_id_derived_from_its_task() {
+        let task = TaskIdentityTest::id();
+        let extra = vec![
+            "-p".into(),
+            "--no-session-persistence".into(),
+            "--verbose".into(),
+            "--custom".into(),
+            "value".into(),
+        ];
+        let args = claude_for_task(task, &extra).unwrap().to_vec();
+        let session = task.claude_worker_thread().to_string();
+
+        assert_eq!(session, task.to_string());
+        assert_eq!(count_arg(&args, "--session-id"), 1);
+        assert_eq!(count_arg(&args, "--no-session-persistence"), 1);
+        assert_eq!(count_arg(&args, &session), 1);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--session-id", session.as_str()])
+        );
+    }
+
+    #[test]
+    fn claude_extra_args_cannot_choose_or_resume_a_session() {
+        for arg in [
+            "--session-id",
+            "--session-id=01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "--resume",
+            "--resume=01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "-r",
+            "--continue",
+            "-c",
+            "--fork-session",
+            "--from-pr",
+        ] {
+            let extra = vec!["--verbose".to_string(), arg.to_string()];
+            let error = validate_agent_extra_args(AgentKind::Claude, &extra).unwrap_err();
+            assert_eq!(error.index, 1, "{arg}");
+
+            let built = claude_for_task(TaskIdentityTest::id(), &extra).unwrap_err();
+            assert!(
+                matches!(
+                    built,
+                    AppError::AgentConfiguration {
+                        agent: AgentKind::Claude,
+                        ..
+                    }
+                ),
+                "{arg}"
+            );
+        }
+        let allowed = vec!["--model".to_string(), "fable".to_string()];
+        assert!(validate_agent_extra_args(AgentKind::Claude, &allowed).is_ok());
+        assert!(validate_agent_extra_args(AgentKind::Codex, &["-c".to_string()]).is_ok());
     }
 
     #[test]

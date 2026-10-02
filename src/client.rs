@@ -201,6 +201,20 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
+        "worker_message_unavailable" => {
+            let task = input
+                .get("task")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let reason = input
+                .get("reason")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (task, reason) {
+                (Some(task), Some(reason)) => AppError::WorkerMessageUnavailable { task, reason },
+                _ => AppError::Internal { message },
+            }
+        }
         "resume_thread_busy" => {
             let thread = input
                 .get("thread")
@@ -557,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn followup_and_message_to_self_errors_round_trip() {
+    fn followup_and_message_errors_round_trip() {
         let errors = [
             AppError::FollowupUnavailable {
                 task: crate::domain::TaskId::new(),
@@ -565,6 +579,17 @@ mod tests {
             },
             AppError::MessageToSelf {
                 thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
+            },
+            AppError::TaskNotFound {
+                id: crate::domain::TaskId::new(),
+            },
+            AppError::WorkerMessageUnavailable {
+                task: crate::domain::TaskId::new(),
+                reason: crate::error::WorkerMessageBlocker::NoWorkerThread,
+            },
+            AppError::WorkerMessageUnavailable {
+                task: crate::domain::TaskId::new(),
+                reason: crate::error::WorkerMessageBlocker::Terminal,
             },
             AppError::ResumeThreadBusy {
                 thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),

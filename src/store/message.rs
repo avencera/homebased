@@ -290,7 +290,7 @@ mod tests {
     fn requested_recipient(request: &MessageSendRequest) -> Recipient {
         match &request.target {
             MessageTarget::Machine { recipient, .. } => recipient.clone(),
-            MessageTarget::Task { .. } => unreachable!(),
+            MessageTarget::Task { .. } | MessageTarget::Worker { .. } => unreachable!(),
         }
     }
 

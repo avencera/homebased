@@ -14,8 +14,8 @@ use crate::daemon::cluster::{
     CallbackFailureSummary, ExecutionBody, ExecutionView, IdentitySummary, IdentitySummaryBody,
     OriginBody, OriginSummary,
 };
-use crate::domain::{API_VERSION, TaskId};
-use crate::error::AppError;
+use crate::domain::{API_VERSION, ProcessStatus, TaskId, ThreadId};
+use crate::error::{AppError, WorkerMessageBlocker};
 use crate::events::WaitingInboxEvent;
 use crate::fleet::address::MachineAddress;
 use crate::fleet::http::ClusterClient;
@@ -254,6 +254,11 @@ pub(super) async fn log(
         );
         return Ok(value);
     }
+    execution_missing(id, &records)
+}
+
+/// Error for a task whose execution record no checked machine returned
+fn execution_missing<T>(id: TaskId, records: &Records) -> Result<T, AppError> {
     if let Some((machine, identity)) = records.identities.first_key_value() {
         return match identity {
             IdentitySummary::Rejected { .. } => Err(AppError::TaskNotStarted { task: id }),
@@ -272,7 +277,7 @@ pub(super) async fn log(
             }),
         };
     }
-    absent(id, &records)
+    absent(id, records)
 }
 
 async fn local_identity_origin(
@@ -444,6 +449,66 @@ pub(super) async fn message_origin_route(
     }
 
     Err(AppError::TaskNotFound { id })
+}
+
+/// Fields of a task detail that address its worker
+#[derive(Deserialize)]
+struct WorkerDetail {
+    status: ProcessStatus,
+    worker_thread: Option<ThreadId>,
+}
+
+/// Resolve a task to its execution machine and recorded worker thread
+///
+/// The execution machine owns `worker_thread`, so a task that runs elsewhere
+/// is read from that machine's detail, never from a cached origin route
+pub(super) async fn message_worker_route(
+    state: &AppState,
+    id: TaskId,
+) -> Result<(MachineId, ThreadId), AppError> {
+    let local = state.machine.identity.machine;
+    if call(&state.store, |reply| StoreMsg::GetTask { id, reply })
+        .await?
+        .is_some()
+    {
+        let summary = crate::daemon::api::local_detail(state, id).await?.summary;
+        return worker_route(id, local, summary.status, summary.worker_thread);
+    }
+
+    let records = lookup(state, id).await?;
+    let Some((machine, _)) = records.executions.first_key_value() else {
+        return execution_missing(id, &records);
+    };
+    let machine = *machine;
+    let path = format!("/v1/cluster/tasks/{id}/detail");
+    let value = remote_read(state, &records, machine, &path, id)
+        .await
+        .map_err(|_| AppError::TaskUnavailable { task: id, machine })?;
+    let detail: WorkerDetail =
+        serde_json::from_value(value).map_err(|error| AppError::Internal {
+            message: format!("task detail from {machine} has no worker fields: {error}"),
+        })?;
+    worker_route(id, machine, detail.status, detail.worker_thread)
+}
+
+fn worker_route(
+    task: TaskId,
+    machine: MachineId,
+    status: ProcessStatus,
+    worker_thread: Option<ThreadId>,
+) -> Result<(MachineId, ThreadId), AppError> {
+    // a terminal Codex task keeps its thread for followup, but its worker is gone
+    if status.is_terminal() {
+        return Err(AppError::WorkerMessageUnavailable {
+            task,
+            reason: WorkerMessageBlocker::Terminal,
+        });
+    }
+    let thread = worker_thread.ok_or(AppError::WorkerMessageUnavailable {
+        task,
+        reason: WorkerMessageBlocker::NoWorkerThread,
+    })?;
+    Ok((machine, thread))
 }
 
 /// Resolve cancellation ownership from the same checked fleet snapshot as inspection
@@ -995,5 +1060,46 @@ mod tests {
             records.route(task),
             Err(AppError::ClusterTaskConflict { .. })
         ));
+    }
+
+    #[test]
+    fn worker_route_needs_a_live_task_with_a_recorded_thread() {
+        use super::worker_route;
+        use crate::domain::ProcessStatus;
+        use crate::error::WorkerMessageBlocker;
+
+        let task = TaskId::new();
+        let machine = MachineId::new();
+        let thread = task.claude_worker_thread();
+        let blocker = |result: Result<_, AppError>| match result {
+            Err(AppError::WorkerMessageUnavailable { reason, .. }) => Some(reason),
+            _ => None,
+        };
+
+        assert_eq!(
+            worker_route(task, machine, ProcessStatus::Running, Some(thread)).unwrap(),
+            (machine, thread)
+        );
+        // a running Codex worker has no thread until it exits
+        assert_eq!(
+            blocker(worker_route(task, machine, ProcessStatus::Running, None)),
+            Some(WorkerMessageBlocker::NoWorkerThread)
+        );
+        assert_eq!(
+            blocker(worker_route(task, machine, ProcessStatus::Queued, None)),
+            Some(WorkerMessageBlocker::NoWorkerThread)
+        );
+        for status in [
+            ProcessStatus::Succeeded,
+            ProcessStatus::Failed,
+            ProcessStatus::Cancelled,
+            ProcessStatus::Lost,
+        ] {
+            assert_eq!(
+                blocker(worker_route(task, machine, status, Some(thread))),
+                Some(WorkerMessageBlocker::Terminal),
+                "{status}"
+            );
+        }
     }
 }

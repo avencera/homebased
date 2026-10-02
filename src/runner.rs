@@ -160,8 +160,14 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     })?;
     home.ensure()?;
     let store = Store::open_with_busy_timeout(&home.db_path(), WORKER_BUSY_TIMEOUT)?;
+    let queued = store.require_task(id)?;
     let started = store
-        .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)?
+        .cas_status_with_worker_thread(
+            id,
+            ProcessStatus::Queued,
+            ProcessStatus::Running,
+            launch_worker_thread(&queued),
+        )?
         .is_some();
     let row = store.require_task(id)?;
     // a container keeps running under dockerd after its worker stops, so a running
@@ -274,6 +280,20 @@ fn record_exit(
 }
 
 const WORKER_THREAD_LOG_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Worker thread known before the child starts
+///
+/// A Claude worker runs under the session id derived from its task, so the
+/// thread is saved with the running state and can take messages from its first
+/// turn. Codex chooses its own thread, which is read from output at exit
+fn launch_worker_thread(row: &TaskRow) -> Option<ThreadId> {
+    match &row.workload {
+        Workload::Agent(agent) if agent.agent.kind == crate::domain::AgentKind::Claude => {
+            Some(row.id.claude_worker_thread())
+        }
+        _ => None,
+    }
+}
 
 /// Read the Codex worker thread from the task output when its workload is Codex
 pub(crate) fn worker_thread(row: &TaskRow, paths: &TaskPaths) -> Option<ThreadId> {

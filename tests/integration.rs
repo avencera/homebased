@@ -545,6 +545,60 @@ fn submit_then_fake_codex_receives_event() {
 }
 
 #[test]
+fn running_claude_worker_exposes_its_session_as_worker_thread() {
+    let h = Harness::new();
+    h.set_control("sleep", "30");
+    let id = h.submit(&Harness::spec("claude", "long work"));
+    let meta_path = h.record.join(format!("agent-meta-{id}.txt"));
+    assert!(wait_until(Duration::from_secs(10), || {
+        meta_path.exists() && h.show(&id)["status"] == "running"
+    }));
+
+    let running = h.show(&id);
+    assert_eq!(running["worker_thread"], id);
+    let meta = fs::read_to_string(&meta_path).unwrap();
+    let argv = meta
+        .lines()
+        .find_map(|line| line.strip_prefix("argv="))
+        .unwrap();
+    assert!(
+        argv.contains(&format!("--no-session-persistence --session-id {id} ")),
+        "{argv}"
+    );
+    assert_eq!(argv.matches("--session-id").count(), 1, "{argv}");
+
+    let list = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    assert!(list.status.success());
+    let listed: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == id.as_str() && task["worker_thread"] == id.as_str())
+    );
+
+    h.clear_controls();
+    let cancel = h.cmd().args(["task", "cancel", &id]).output().unwrap();
+    assert!(cancel.status.success());
+    let cancelled = h.wait_status(&id, "cancelled");
+    assert_eq!(cancelled["worker_thread"], id);
+}
+
+#[test]
+fn claude_extra_args_cannot_replace_the_worker_session() {
+    let h = Harness::new();
+    for extra in ["--session-id", "--resume", "--continue"] {
+        let mut spec = Harness::spec("claude", "use another session");
+        spec["workload"]["extra_args"] = json!(["--verbose", extra]);
+        let (code, error) = submit_error(&h, &spec, &["task", "submit"], None);
+        assert_eq!(code, 2, "{error}");
+        assert_eq!(error["error"]["code"], "invalid_spec", "{error}");
+        assert_eq!(error["error"]["input"]["pointer"], "/workload/extra_args/1");
+    }
+}
+
+#[test]
 fn codex_worker_thread_is_recorded_and_followup_resumes_the_worker() {
     let h = Harness::new();
     let cwd = h.dir.path().join("codex-workspace");

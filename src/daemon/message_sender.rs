@@ -120,6 +120,10 @@ async fn resolve_target(
             let (machine, thread) = super::inspection::message_origin_route(state, *task).await?;
             Ok((machine, Recipient::Thread { thread }))
         }
+        MessageTarget::Worker { task } => {
+            let (machine, thread) = super::inspection::message_worker_route(state, *task).await?;
+            Ok((machine, Recipient::Thread { thread }))
+        }
     }
 }
 
@@ -129,14 +133,26 @@ fn reject_message_to_self(
     destination: MachineId,
     recipient: &Recipient,
 ) -> Result<(), AppError> {
+    let Recipient::Thread {
+        thread: destination_thread,
+    } = recipient
+    else {
+        return Ok(());
+    };
     if destination == local
         && let MessageSourceSelector::Thread { thread } = &request.source
-        && let Recipient::Thread {
-            thread: destination_thread,
-        } = recipient
         && *thread == *destination_thread
     {
         return Err(AppError::MessageToSelf { thread: *thread });
+    }
+    // a worker that names its own task would queue the message into itself
+    if let MessageSourceSelector::Task { task: source } = &request.source
+        && let MessageTarget::Worker { task: target } = &request.target
+        && source == target
+    {
+        return Err(AppError::MessageToSelf {
+            thread: *destination_thread,
+        });
     }
     Ok(())
 }

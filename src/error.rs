@@ -73,6 +73,14 @@ pub enum AppError {
         /// Why this task cannot be resumed
         reason: FollowupBlocker,
     },
+    /// A task's worker cannot take a direct message
+    #[error("the worker for task {task} cannot take a message: {reason}")]
+    WorkerMessageUnavailable {
+        /// Task named by `message send --worker`
+        task: TaskId,
+        /// Why its worker cannot be addressed
+        reason: WorkerMessageBlocker,
+    },
     /// A Codex thread already has an active resume task
     #[error("thread {thread} is already being resumed by task {task}; wait for its event")]
     ResumeThreadBusy {
@@ -375,7 +383,7 @@ pub enum AppError {
     },
     /// A message destination is the sender's own thread
     #[error(
-        "destination thread {thread} is the sender's own thread; --task targets the task's origin thread, not its worker; use `homebased task followup` for a finished Codex worker"
+        "destination thread {thread} is the sender's own thread; --task targets the task's origin thread, not its worker; use --worker for a running worker or `homebased task followup` for a finished Codex worker"
     )]
     MessageToSelf {
         /// Thread that is both sender and destination
@@ -526,6 +534,24 @@ pub enum FollowupBlocker {
     NoWorkerThread,
 }
 
+/// Why a task's worker cannot take a direct message
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMessageBlocker {
+    /// The task is queued, or its agent records a worker thread only at exit
+    #[error(
+        "the task has no recorded worker thread yet; a Claude worker records one when it starts running, a Codex worker only when it finishes"
+    )]
+    NoWorkerThread,
+    /// The worker has exited and reads no further messages
+    #[error(
+        "the task is terminal; use `homebased task followup` to resume a finished Codex worker"
+    )]
+    Terminal,
+}
+
 impl AppError {
     /// Machine-readable code from `plan §CLI`
     #[must_use]
@@ -537,6 +563,7 @@ impl AppError {
             Self::TaskUnavailable { .. } => "task_unavailable",
             Self::TaskNotStarted { .. } => "task_not_started",
             Self::FollowupUnavailable { .. } => "followup_unavailable",
+            Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
             Self::InvalidCwd { .. } => "invalid_cwd",
@@ -641,6 +668,7 @@ impl AppError {
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::FollowupUnavailable { .. }
+            | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
@@ -696,6 +724,7 @@ impl AppError {
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
             | Self::FollowupUnavailable { .. }
+            | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
             | Self::TasksInFlight { .. }
@@ -763,6 +792,9 @@ impl AppError {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
             Self::FollowupUnavailable { task, reason } => {
+                json!({ "task": task, "reason": reason })
+            }
+            Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }
             Self::ClusterLookupIncomplete { task, unchecked } => {

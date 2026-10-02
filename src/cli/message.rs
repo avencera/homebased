@@ -24,17 +24,23 @@ pub enum MessageCommand {
     /// Send a direct message to a Claude Code session or Codex thread.
     Send {
         /// Destination machine name or UUID. Required with `--thread` or `--cwd`.
-        #[arg(long, conflicts_with = "task")]
+        #[arg(long, conflicts_with_all = ["task", "worker"])]
         machine: Option<String>,
         /// Exact destination Claude Code session or Codex thread UUID.
-        #[arg(long, conflicts_with_all = ["cwd", "task"])]
+        #[arg(long, conflicts_with_all = ["cwd", "task", "worker"])]
         thread: Option<ThreadId>,
         /// Destination working directory on the receiving machine. Selects Codex threads only.
-        #[arg(long, conflicts_with_all = ["thread", "task"])]
+        #[arg(long, conflicts_with_all = ["thread", "task", "worker"])]
         cwd: Option<PathBuf>,
         /// Send to this task's origin thread. Use alone, without `--machine`.
-        #[arg(long, conflicts_with_all = ["machine", "thread", "cwd"])]
+        #[arg(long, conflicts_with_all = ["machine", "thread", "cwd", "worker"])]
         task: Option<TaskId>,
+        /// Send to this task's running worker. Use alone, without `--machine`.
+        ///
+        /// Running Claude workers only. The worker reads the message at its next
+        /// turn boundary; a message sent after its final turn is never read.
+        #[arg(long, conflicts_with_all = ["machine", "thread", "cwd", "task"])]
+        worker: Option<TaskId>,
         /// Message text.
         #[arg(long, required = true)]
         message: String,
@@ -61,6 +67,7 @@ struct SendArgs {
     thread: Option<ThreadId>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
+    worker: Option<TaskId>,
     body: String,
     message_id: Option<MessageId>,
     reply_to: Option<MessageId>,
@@ -77,6 +84,7 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
             thread,
             cwd,
             task,
+            worker,
             message,
             message_id,
             reply_to,
@@ -91,6 +99,7 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
                     thread,
                     cwd,
                     task,
+                    worker,
                     body: message,
                     message_id,
                     reply_to,
@@ -105,7 +114,13 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
 }
 
 async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
-    let target = target(args.machine, args.thread, args.cwd, args.task)?;
+    let target = target(Destination {
+        machine: args.machine,
+        thread: args.thread,
+        cwd: args.cwd,
+        task: args.task,
+        worker: args.worker,
+    })?;
     let source = source(args.source_thread, args.source_task)?;
     let message_id = args.message_id.unwrap_or_default();
     let request = MessageSendRequest {
@@ -137,24 +152,37 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn target(
+/// Destination flags as the caller passed them
+#[derive(Default)]
+struct Destination {
     machine: Option<String>,
     thread: Option<ThreadId>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
-) -> Result<MessageTarget, AppError> {
-    match (machine, thread, cwd, task) {
-        (None, None, None, Some(task)) => Ok(MessageTarget::Task { task }),
-        (Some(machine), Some(thread), None, None) => Ok(MessageTarget::Machine {
+    worker: Option<TaskId>,
+}
+
+fn target(destination: Destination) -> Result<MessageTarget, AppError> {
+    let Destination {
+        machine,
+        thread,
+        cwd,
+        task,
+        worker,
+    } = destination;
+    match (machine, thread, cwd, task, worker) {
+        (None, None, None, Some(task), None) => Ok(MessageTarget::Task { task }),
+        (None, None, None, None, Some(task)) => Ok(MessageTarget::Worker { task }),
+        (Some(machine), Some(thread), None, None, None) => Ok(MessageTarget::Machine {
             machine,
             recipient: Recipient::Thread { thread },
         }),
-        (Some(machine), None, Some(cwd), None) => Ok(MessageTarget::Machine {
+        (Some(machine), None, Some(cwd), None, None) => Ok(MessageTarget::Machine {
             machine,
             recipient: Recipient::Cwd { cwd },
         }),
         _ => Err(AppError::Usage {
-            message: "use --task alone, or use --machine with exactly one of --thread or --cwd"
+            message: "use --task or --worker alone, or use --machine with exactly one of --thread or --cwd"
                 .into(),
         }),
     }
@@ -209,7 +237,7 @@ fn validate_response(
 ) -> Result<(), AppError> {
     let expected_machine = match &request.target {
         MessageTarget::Machine { machine, .. } => machine.parse::<MachineId>().ok(),
-        MessageTarget::Task { .. } => None,
+        MessageTarget::Task { .. } | MessageTarget::Worker { .. } => None,
     };
     let expected_thread = match &request.target {
         MessageTarget::Machine {
@@ -264,18 +292,56 @@ mod tests {
     fn target_requires_one_complete_destination_form() {
         let task = TaskId::new();
         assert!(matches!(
-            target(None, None, None, Some(task)),
+            target(Destination {
+                task: Some(task),
+                ..Destination::default()
+            }),
             Ok(MessageTarget::Task { task: found }) if found == task
         ));
-        assert!(target(Some("code".into()), None, None, None).is_err());
-        assert!(target(None, Some(ThreadId(Uuid::now_v7())), None, None).is_err());
+        assert!(matches!(
+            target(Destination {
+                worker: Some(task),
+                ..Destination::default()
+            }),
+            Ok(MessageTarget::Worker { task: found }) if found == task
+        ));
         assert!(
-            target(
-                Some("code".into()),
-                Some(ThreadId(Uuid::now_v7())),
-                Some(PathBuf::from("~/repo")),
-                None,
-            )
+            target(Destination {
+                task: Some(task),
+                worker: Some(task),
+                ..Destination::default()
+            })
+            .is_err()
+        );
+        assert!(
+            target(Destination {
+                machine: Some("code".into()),
+                worker: Some(task),
+                ..Destination::default()
+            })
+            .is_err()
+        );
+        assert!(
+            target(Destination {
+                machine: Some("code".into()),
+                ..Destination::default()
+            })
+            .is_err()
+        );
+        assert!(
+            target(Destination {
+                thread: Some(ThreadId(Uuid::now_v7())),
+                ..Destination::default()
+            })
+            .is_err()
+        );
+        assert!(
+            target(Destination {
+                machine: Some("code".into()),
+                thread: Some(ThreadId(Uuid::now_v7())),
+                cwd: Some(PathBuf::from("~/repo")),
+                ..Destination::default()
+            })
             .is_err()
         );
     }

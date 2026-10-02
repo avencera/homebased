@@ -355,8 +355,10 @@ homebased task log <id> --tail 200
 homebased --json task cancel <id>
 ```
 
-`task show` and `task list` include `worker_thread` for a Codex task that printed
-a session header, whether the task succeeds, fails, is cancelled, or is lost.
+`task show` and `task list` include `worker_thread`. A Claude task records its
+session id when it starts running. A Codex task records the thread from its
+session header when it ends, whether it succeeds, fails, is cancelled, or is
+lost.
 `task followup` accepts `--message` or `--message-file`, and resumes only a
 terminal Codex task with a recorded worker thread. Only one follow-up can resume
 a thread at a time. `resume_thread_busy`
@@ -435,6 +437,14 @@ thread that owns it. Pass the same
 and at-least-once. A receiver crash before it stores the receipt can lead to a
 duplicate message. Read [messages.md](.agents/skills/homebased/references/messages.md)
 for source, reply, and retry rules.
+
+Use `--worker <task-uuid>` alone to send new instructions to a running Claude
+worker. The daemon sends to the task's execution machine and `worker_thread`.
+The worker reads the message at its next turn boundary; if it finishes its final
+turn first, the message is never read, and the sender cannot tell. A queued
+task, or a running Codex worker, which records its thread only at exit, returns
+`worker_message_unavailable` with `reason: no_worker_thread`. A finished task
+returns `reason: terminal`.
 
 The operator skill [`.agents/skills/homebased/SKILL.md`](.agents/skills/homebased/SKILL.md) is the contract for submit, events, inspect, errors, and worker sessions.
 

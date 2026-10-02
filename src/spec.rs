@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::agents::{OpenCodeExtraArgsError, validate_opencode_extra_args};
+use crate::agents::{AgentExtraArgsError, validate_agent_extra_args};
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
 use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
@@ -443,10 +443,8 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
     match kind {
         "agent" => {
             let agent: NormalizedAgentWorkload = deserialize_under(&content, "/workload")?;
-            if agent.agent == AgentKind::OpenCode {
-                validate_opencode_extra_args(&agent.extra_args)
-                    .map_err(|err| invalid_agent_extra_args(&content, err))?;
-            }
+            validate_agent_extra_args(agent.agent, &agent.extra_args)
+                .map_err(|err| invalid_agent_extra_args(&content, err))?;
             Ok(NormalizedWorkload::Agent(agent))
         }
         "task" => {
@@ -588,10 +586,8 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
     match kind {
         "agent" => {
             let agent: SubmitAgentWorkload = deserialize_under(&content, "/workload")?;
-            if agent.agent == AgentKind::OpenCode {
-                validate_opencode_extra_args(&agent.extra_args)
-                    .map_err(|err| invalid_agent_extra_args(&content, err))?;
-            }
+            validate_agent_extra_args(agent.agent, &agent.extra_args)
+                .map_err(|err| invalid_agent_extra_args(&content, err))?;
             let prompt = PromptSource::from_wire(agent.prompt, agent.prompt_file, workload_raw)?;
             Ok(SubmitWorkloadValidated::Agent(SubmitAgent {
                 agent: agent.agent,
@@ -634,7 +630,7 @@ fn validate_resume_thread_field(kind: &str, workload: &Value) -> Result<(), AppE
     Ok(())
 }
 
-fn invalid_agent_extra_args(workload: &Value, error: OpenCodeExtraArgsError) -> AppError {
+fn invalid_agent_extra_args(workload: &Value, error: AgentExtraArgsError) -> AppError {
     let value = workload
         .get("extra_args")
         .and_then(Value::as_array)

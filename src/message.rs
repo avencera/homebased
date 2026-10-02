@@ -169,6 +169,14 @@ pub enum MessageTarget {
         /// Task whose origin route supplies the destination
         task: TaskId,
     },
+    /// The execution machine and recorded worker thread for a live task
+    ///
+    /// The worker reads the message at its next turn boundary. A message that
+    /// arrives after its final turn is not read, and the sender cannot tell
+    Worker {
+        /// Task whose running worker receives the message
+        task: TaskId,
+    },
 }
 
 /// Strict request accepted by the local Unix-socket message sender
@@ -236,12 +244,12 @@ impl MessageSendRequest {
                     });
                 }
             }
-            MessageTarget::Task { task } if task.0.is_nil() => {
+            MessageTarget::Task { task } | MessageTarget::Worker { task } if task.0.is_nil() => {
                 return Err(AppError::MessageInvalid {
                     message: "destination task UUID must not be nil".into(),
                 });
             }
-            MessageTarget::Task { .. } => {}
+            MessageTarget::Task { .. } | MessageTarget::Worker { .. } => {}
         }
         Ok(())
     }
@@ -313,8 +321,13 @@ impl OutboundMessageBinding {
                 },
                 resolved,
             ) => requested == resolved,
-            (MessageTarget::Task { .. }, Recipient::Thread { thread }) => !thread.0.is_nil(),
-            (MessageTarget::Task { .. }, Recipient::Cwd { .. }) => false,
+            (
+                MessageTarget::Task { .. } | MessageTarget::Worker { .. },
+                Recipient::Thread { thread },
+            ) => !thread.0.is_nil(),
+            (MessageTarget::Task { .. } | MessageTarget::Worker { .. }, Recipient::Cwd { .. }) => {
+                false
+            }
         };
         if !target_matches {
             return Err(AppError::MessageInvalid {

@@ -184,6 +184,17 @@ impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+
+    /// Claude Code session id that a Claude worker for this task runs under
+    ///
+    /// The task UUID is already unique per task, so reusing it gives each
+    /// worker a session id that every machine can derive without storing or
+    /// exchanging extra state. The types stay distinct, so this is the one
+    /// place a task id becomes an addressable thread
+    #[must_use]
+    pub const fn claude_worker_thread(self) -> ThreadId {
+        ThreadId(self.0)
+    }
 }
 
 impl Default for TaskId {
@@ -215,6 +226,15 @@ impl TaskIdentity {
     #[must_use]
     pub fn opencode_agent_name(self) -> String {
         format!("homebased-{self}")
+    }
+
+    /// Render the Claude worker session id for this identity
+    #[must_use]
+    pub fn claude_session_id(self) -> String {
+        match self {
+            Self::Preview => self.to_string(),
+            Self::Actual(id) => id.claude_worker_thread().to_string(),
+        }
     }
 }
 
