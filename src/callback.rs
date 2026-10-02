@@ -4,7 +4,7 @@
 pub(crate) mod claude_inbox;
 pub mod destination;
 
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::container::GpuRequest;
 use crate::dependency::HeldCancellation;
@@ -28,7 +29,7 @@ use crate::error::AppError;
 use crate::spec::NormalizedSpec;
 use crate::submission::CallbackContext;
 
-use crate::t3::{ProviderThread, T3Env, WakeOutcome, owns_thread, wake_thread};
+use crate::t3::{Protocol, ProviderThread, T3Env, WakeOutcome, owner, wake_thread};
 use claude_inbox::{ClaudeInbox, ClaudeSession};
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -559,6 +560,12 @@ pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), Stri
 pub(crate) enum OriginSession {
     /// A live Claude session can take the event now
     Reachable(ReachableOrigin),
+    /// A live Claude session that a T3 orchestration V2 thread owns
+    ///
+    /// V2 keeps the Claude process between turns, but shows a turn that a
+    /// socket message starts as "Background task completed.", so T3 takes the
+    /// event and the socket is the fallback
+    T3Claude(ReachableOrigin),
     /// A Claude session with a transcript but no live process
     Stopped,
     /// A Codex thread that may belong to T3 will be tried there first
@@ -591,10 +598,27 @@ pub(crate) fn find_saved_origin(
     thread: ThreadId,
 ) -> Result<OriginSession, String> {
     match ClaudeInbox::find(Path::new(&context.env.home), thread)? {
-        ClaudeSession::Live(inbox) => Ok(OriginSession::Reachable(ReachableOrigin(inbox))),
+        ClaudeSession::Live(inbox) => {
+            let origin = ReachableOrigin(inbox);
+            match owner(&t3_env(context), ProviderThread::Claude(thread)) {
+                Ok(Some(Protocol::V2)) => Ok(OriginSession::T3Claude(origin)),
+                Ok(Some(Protocol::V1) | None) => Ok(OriginSession::Reachable(origin)),
+                Err(error) => {
+                    warn!(%thread, "T3 ownership unknown, using the Claude session socket: {error}");
+                    Ok(OriginSession::Reachable(origin))
+                }
+            }
+        }
         ClaudeSession::Stopped => Ok(OriginSession::Stopped),
         ClaudeSession::Unknown => Ok(OriginSession::Codex),
     }
+}
+
+fn t3_env(context: &CallbackContext) -> T3Env {
+    T3Env::new(
+        PathBuf::from(&context.env.home),
+        context.env.path.clone().into(),
+    )
 }
 
 /// Find which saved origin owns `thread` for an inbox callback
@@ -603,38 +627,140 @@ pub(crate) fn find_saved_inbox_origin(
     thread: ThreadId,
 ) -> Result<OriginSession, String> {
     match find_saved_origin(context, thread)? {
-        OriginSession::Codex => {
-            let env = T3Env::new(
-                PathBuf::from(&context.env.home),
-                context.env.path.clone().into(),
-            );
-            match owns_thread(&env, ProviderThread::Codex(thread)) {
-                Ok(false) => Ok(OriginSession::Codex),
-                // try T3 when its state database could not confirm ownership
-                Ok(true) | Err(_) => Ok(OriginSession::T3Codex),
-            }
-        }
+        OriginSession::Codex => match owner(&t3_env(context), ProviderThread::Codex(thread)) {
+            Ok(None) => Ok(OriginSession::Codex),
+            // try T3 when its state database could not confirm ownership
+            Ok(Some(_)) | Err(_) => Ok(OriginSession::T3Codex),
+        },
         origin => Ok(origin),
     }
 }
 
+/// Durable record that T3 may already have taken one event
+///
+/// T3 drops a repeated command, so once a send's reply is lost every later
+/// attempt goes through T3 alone. A socket or `codex queue` fallback could
+/// deliver a second copy. The record survives a daemon restart
+pub(crate) struct PendingT3Send(PathBuf);
+
+impl PendingT3Send {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn get(&self, thread: ThreadId) -> Option<ProviderThread> {
+        match fs::read_to_string(&self.0).ok()?.trim() {
+            "claude" => Some(ProviderThread::Claude(thread)),
+            "codex" => Some(ProviderThread::Codex(thread)),
+            _ => None,
+        }
+    }
+
+    fn record(&self, provider_thread: ProviderThread) {
+        let provider = match provider_thread {
+            ProviderThread::Claude(_) => "claude",
+            ProviderThread::Codex(_) => "codex",
+        };
+        if let Err(error) = fs::write(&self.0, provider) {
+            warn!("record pending T3 send {}: {error}", self.0.display());
+        }
+    }
+
+    fn clear(&self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Result of a retry that may go only through T3
+pub(crate) enum PendingRetry {
+    /// T3 took the event, or already had it
+    Delivered,
+    /// T3 again may or may not have taken it
+    Uncertain(String),
+    /// T3 cannot take it now and nothing was sent
+    Blocked(String),
+}
+
+/// Retry through T3 alone when an earlier send may have reached it
+///
+/// `None` when no earlier T3 send is pending, so any route may deliver
+pub(crate) fn retry_pending_t3(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    pending: &PendingT3Send,
+) -> Option<PendingRetry> {
+    let provider_thread = pending.get(thread)?;
+    Some(
+        match wake_provider_thread(context, provider_thread, line, log_path, pending) {
+            WakeOutcome::Woken { .. } => PendingRetry::Delivered,
+            WakeOutcome::Uncertain(detail) => PendingRetry::Uncertain(detail),
+            WakeOutcome::NotT3Thread => PendingRetry::Blocked(
+                "T3 may already have this event; no T3 thread owns it now".into(),
+            ),
+            WakeOutcome::Unavailable(detail)
+            | WakeOutcome::Refused(detail)
+            | WakeOutcome::ApiChanged(detail) => PendingRetry::Blocked(format!(
+                "T3 may already have this event, so it waits for T3: {detail}"
+            )),
+        },
+    )
+}
+
 /// Make exactly one bounded direct-message delivery attempt
 ///
-/// A live Claude session takes the line through its socket inbox. A stopped
-/// Claude session gets a new turn from the T3 thread that owns it, because a
-/// host such as T3 Code runs no Claude process between turns. A Codex thread
-/// takes it through `codex queue`, so only that path needs the Codex executable
+/// A live Claude session takes the line through its socket inbox, or through
+/// T3 when a T3 V2 thread owns it. A stopped Claude session gets a new turn from
+/// the T3 thread that owns it, because a host such as T3 Code before V2 runs no
+/// Claude process between turns. A Codex thread takes it as a turn in the T3
+/// thread that owns it, else through `codex queue`, so only that path needs the
+/// Codex executable. After a T3 send whose reply was lost, only T3 is tried
 pub(crate) fn send_saved_queue_attempt(
     context: &CallbackContext,
     thread: ThreadId,
     line: &str,
     log_path: &Path,
     delivery_lock: &Path,
+    pending: &PendingT3Send,
 ) -> Result<(), String> {
-    match find_saved_origin(context, thread)? {
+    match retry_pending_t3(context, thread, line, log_path, pending) {
+        Some(PendingRetry::Delivered) => return Ok(()),
+        Some(PendingRetry::Uncertain(detail) | PendingRetry::Blocked(detail)) => {
+            return Err(format!(
+                "T3 may already have this message; retry with the same message id: {detail}"
+            ));
+        }
+        None => {}
+    }
+
+    match find_saved_inbox_origin(context, thread)? {
         OriginSession::Reachable(origin) => origin.send(thread, line, log_path, delivery_lock),
-        OriginSession::Stopped => wake_stopped_session(context, thread, line, log_path),
-        OriginSession::T3Codex | OriginSession::Codex => {
+        OriginSession::T3Claude(origin) => send_t3_claude(
+            context,
+            thread,
+            origin,
+            line,
+            log_path,
+            delivery_lock,
+            pending,
+        ),
+        OriginSession::Stopped => wake_stopped_session(context, thread, line, log_path, pending),
+        // T3 V2 runs a `codex queue` message without showing it in the thread,
+        // so a thread that T3 owns takes the message as a T3 turn
+        OriginSession::T3Codex => {
+            match wake_codex_thread(context, thread, line, log_path, pending) {
+                Ok(()) => Ok(()),
+                Err(CodexWakeError::Uncertain(detail)) => Err(format!(
+                    "T3 may have taken the message for Codex thread {thread}; retry with the same message id: {detail}"
+                )),
+                Err(CodexWakeError::NotStarted(_)) => {
+                    check_saved_callback(context)?;
+                    send_codex_queue_attempt(context, thread, line, log_path, delivery_lock)
+                }
+            }
+        }
+        OriginSession::Codex => {
             check_saved_callback(context)?;
             send_codex_queue_attempt(context, thread, line, log_path, delivery_lock)
         }
@@ -675,8 +801,15 @@ pub(crate) fn wake_stopped_session(
     thread: ThreadId,
     line: &str,
     log_path: &Path,
+    pending: &PendingT3Send,
 ) -> Result<(), String> {
-    match wake_provider_thread(context, ProviderThread::Claude(thread), line, log_path) {
+    match wake_provider_thread(
+        context,
+        ProviderThread::Claude(thread),
+        line,
+        log_path,
+        pending,
+    ) {
         WakeOutcome::Woken { .. } => Ok(()),
         WakeOutcome::NotT3Thread => Err(format!(
             "Claude session {thread} is not running; no T3 thread owns it"
@@ -687,10 +820,61 @@ pub(crate) fn wake_stopped_session(
         WakeOutcome::Refused(detail) => {
             Err(format!("T3 refused Claude session {thread}: {detail}"))
         }
+        WakeOutcome::Uncertain(detail) => Err(format!(
+            "T3 may have started a turn for Claude session {thread}: {detail}"
+        )),
         WakeOutcome::ApiChanged(detail) => Err(format!(
             "T3 API changed for Claude session {thread}: {detail}"
         )),
     }
+}
+
+/// Send to a live Claude session through the T3 thread that owns it
+///
+/// Falls back to the session socket whenever T3 did not take the event, so the
+/// agent always gets it even if T3 shows it poorly. A send whose reply was lost
+/// returns an error instead, and later attempts go only through T3
+pub(crate) fn send_t3_claude(
+    context: &CallbackContext,
+    thread: ThreadId,
+    origin: ReachableOrigin,
+    line: &str,
+    log_path: &Path,
+    delivery_lock: &Path,
+    pending: &PendingT3Send,
+) -> Result<(), String> {
+    let outcome = wake_provider_thread(
+        context,
+        ProviderThread::Claude(thread),
+        line,
+        log_path,
+        pending,
+    );
+    let reason = match outcome {
+        WakeOutcome::Woken { .. } => return Ok(()),
+        WakeOutcome::Uncertain(detail) => {
+            return Err(format!(
+                "T3 may have taken the event for Claude session {thread}; retrying through T3: {detail}"
+            ));
+        }
+        WakeOutcome::NotT3Thread => "no T3 thread owns the session".to_string(),
+        WakeOutcome::Unavailable(detail)
+        | WakeOutcome::Refused(detail)
+        | WakeOutcome::ApiChanged(detail) => detail,
+    };
+
+    if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(log, "t3 send failed, using the session socket: {reason}");
+    }
+    origin.send(thread, line, log_path, delivery_lock)
+}
+
+/// Why a T3 Codex wake did not deliver
+pub(crate) enum CodexWakeError {
+    /// T3 may have started the turn, so only a retry through T3 is safe
+    Uncertain(String),
+    /// T3 did not start the turn, so `codex queue` may deliver instead
+    NotStarted(String),
 }
 
 /// Start a T3 turn for a mapped Codex thread
@@ -699,31 +883,44 @@ pub(crate) fn wake_codex_thread(
     thread: ThreadId,
     line: &str,
     log_path: &Path,
-) -> Result<(), String> {
-    match wake_provider_thread(context, ProviderThread::Codex(thread), line, log_path) {
+    pending: &PendingT3Send,
+) -> Result<(), CodexWakeError> {
+    match wake_provider_thread(
+        context,
+        ProviderThread::Codex(thread),
+        line,
+        log_path,
+        pending,
+    ) {
         WakeOutcome::Woken { .. } => Ok(()),
-        WakeOutcome::NotT3Thread => Err("no T3 thread owns this Codex thread".into()),
-        WakeOutcome::Unavailable(detail) => Err(detail),
-        WakeOutcome::Refused(detail) => Err(detail),
-        WakeOutcome::ApiChanged(detail) => Err(detail),
+        WakeOutcome::NotT3Thread => Err(CodexWakeError::NotStarted(
+            "no T3 thread owns this Codex thread".into(),
+        )),
+        WakeOutcome::Uncertain(detail) => Err(CodexWakeError::Uncertain(detail)),
+        WakeOutcome::Unavailable(detail)
+        | WakeOutcome::Refused(detail)
+        | WakeOutcome::ApiChanged(detail) => Err(CodexWakeError::NotStarted(detail)),
     }
 }
 
+/// Ask T3 to start the turn, keeping `pending` in step with the outcome
 fn wake_provider_thread(
     context: &CallbackContext,
     provider_thread: ProviderThread,
     line: &str,
     log_path: &Path,
+    pending: &PendingT3Send,
 ) -> WakeOutcome {
-    let env = T3Env::new(
-        PathBuf::from(&context.env.home),
-        context.env.path.clone().into(),
-    );
-    let outcome = wake_thread(&env, provider_thread, line);
-    if let WakeOutcome::Woken { t3_thread } = &outcome
-        && let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path)
-    {
-        let _ = writeln!(log, "t3 wake thread={t3_thread}");
+    let outcome = wake_thread(&t3_env(context), provider_thread, line);
+    match &outcome {
+        WakeOutcome::Woken { t3_thread } => {
+            pending.clear();
+            if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
+                let _ = writeln!(log, "t3 wake thread={t3_thread}");
+            }
+        }
+        WakeOutcome::Uncertain(_) => pending.record(provider_thread),
+        _ => {}
     }
     outcome
 }
@@ -1007,8 +1204,16 @@ mod tests {
         ));
         let log = home.path().join("callback.log");
         let lock = home.path().join("delivery.lock");
-        let error = send_saved_queue_attempt(&context, thread, "HOMEBASED_MESSAGE {}", &log, &lock)
-            .unwrap_err();
+        let pending = PendingT3Send::new(home.path().join("t3-pending"));
+        let error = send_saved_queue_attempt(
+            &context,
+            thread,
+            "HOMEBASED_MESSAGE {}",
+            &log,
+            &lock,
+            &pending,
+        )
+        .unwrap_err();
         assert_eq!(
             error,
             format!("Claude session {thread} is not running; no T3 thread owns it")

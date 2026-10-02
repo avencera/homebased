@@ -12,11 +12,14 @@ use crate::notify::{Notice, NoticePriority, Notifier};
 use crate::t3::{ProbeReport, ProbeStatus, T3Env, probe};
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+// a new server can still be starting when its runtime file appears
+const PROBE_RETRIES: u8 = 5;
 
 #[derive(Default)]
 struct WatchState {
     last_runtime: Option<Vec<u8>>,
     last_alerted: Option<String>,
+    retries_left: u8,
 }
 
 impl WatchState {
@@ -24,6 +27,25 @@ impl WatchState {
         let changed = content.is_some() && content != self.last_runtime;
         self.last_runtime = content;
         changed
+    }
+
+    /// Probe after a runtime change, and again after a probe that could not finish
+    fn probe_due(&mut self, content: Option<Vec<u8>>) -> bool {
+        if self.changed_runtime(content) {
+            self.retries_left = PROBE_RETRIES;
+            return true;
+        }
+        if self.retries_left == 0 {
+            return false;
+        }
+        self.retries_left -= 1;
+        true
+    }
+
+    fn probe_finished(&mut self, status: ProbeStatus) {
+        if matches!(status, ProbeStatus::Compatible | ProbeStatus::Changed) {
+            self.retries_left = 0;
+        }
     }
 
     fn new_alert(&mut self, report: &ProbeReport) -> Option<String> {
@@ -65,7 +87,7 @@ pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
                 continue;
             }
         };
-        if !state.changed_runtime(content) {
+        if !state.probe_due(content) {
             continue;
         }
         let probe_env = env.clone();
@@ -77,11 +99,23 @@ pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
                 continue;
             }
         };
+        state.probe_finished(report.status);
+        let failures = report
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| format!("{}: {}", check.name, check.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
         match report.status {
-            ProbeStatus::Compatible => info!("T3 Code API compatible"),
-            ProbeStatus::Changed => warn!("T3 Code API changed"),
-            ProbeStatus::NotInstalled | ProbeStatus::NotRunning | ProbeStatus::Unavailable => {
-                debug!(status = ?report.status, "T3 Code API probe skipped");
+            ProbeStatus::Compatible => info!(
+                protocol = report.orchestration_protocol,
+                "T3 Code API compatible"
+            ),
+            ProbeStatus::Changed => warn!("T3 Code API changed: {failures}"),
+            ProbeStatus::Unavailable => warn!("T3 Code API probe incomplete: {failures}"),
+            ProbeStatus::NotInstalled | ProbeStatus::NotRunning => {
+                debug!(status = ?report.status, "T3 Code API probe skipped: {failures}");
             }
         }
         let Some(fingerprint) = state.new_alert(&report) else {
@@ -123,12 +157,28 @@ mod tests {
         ProbeReport {
             status,
             t3_version: None,
+            orchestration_protocol: None,
             checks: vec![ProbeCheck {
                 name: "api",
                 ok: false,
                 detail: detail.into(),
             }],
         }
+    }
+
+    #[test]
+    fn an_incomplete_probe_retries_a_bounded_number_of_times() {
+        let mut state = WatchState::default();
+        assert!(state.probe_due(Some(b"first".to_vec())));
+        state.probe_finished(ProbeStatus::Unavailable);
+        let retries = (0..10)
+            .take_while(|_| state.probe_due(Some(b"first".to_vec())))
+            .count();
+        assert_eq!(retries, usize::from(super::PROBE_RETRIES));
+
+        assert!(state.probe_due(Some(b"second".to_vec())));
+        state.probe_finished(ProbeStatus::Compatible);
+        assert!(!state.probe_due(Some(b"second".to_vec())));
     }
 
     #[test]

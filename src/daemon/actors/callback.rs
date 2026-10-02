@@ -10,8 +10,9 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tracing::warn;
 
 use crate::callback::{
-    HomebasedEvent, OriginSession, ReachableOrigin, append_fallback, check_saved_callback,
-    find_saved_inbox_origin, send_codex_queue_attempt, wake_codex_thread, wake_stopped_session,
+    CodexWakeError, HomebasedEvent, OriginSession, PendingRetry, PendingT3Send, ReachableOrigin,
+    append_fallback, check_saved_callback, find_saved_inbox_origin, retry_pending_t3,
+    send_codex_queue_attempt, send_t3_claude, wake_codex_thread, wake_stopped_session,
 };
 use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
@@ -87,6 +88,11 @@ pub enum WakeFailure {
         /// Why T3 did not wake the thread
         reason: String,
     },
+    /// Delivery gave up and the event went only to the fallback log
+    Undelivered {
+        /// Final delivery error
+        reason: String,
+    },
 }
 
 /// Startup args
@@ -138,7 +144,9 @@ impl CallbackState {
         event: TaskEvent,
         failure: WakeFailure,
     ) {
-        if !self.alerted_threads.insert(thread) {
+        // a final failure always alerts, even after an earlier waiting alert
+        let first_alert = self.alerted_threads.insert(thread);
+        if !first_alert && !matches!(failure, WakeFailure::Undelivered { .. }) {
             return;
         }
         let Some(notifier) = self.notifier.clone() else {
@@ -180,9 +188,18 @@ fn wake_failure_notice(
         WakeFailure::CodexQueued { reason } => format!(
             "{display_name} ({event_name}) is queued in Codex on {machine_name}: T3 could not wake the thread ({reason}). Open it to run the event."
         ),
+        WakeFailure::Undelivered { reason } => format!(
+            "{display_name} ({event_name}) was not delivered on {machine_name}: {reason}. It is in callback-fallback.log."
+        ),
+    };
+    let title = match failure {
+        WakeFailure::Undelivered { .. } => format!("Event not delivered: {title}"),
+        WakeFailure::Waiting { .. } | WakeFailure::CodexQueued { .. } => {
+            format!("Thread needs you: {title}")
+        }
     };
     Notice {
-        title: format!("Thread needs you: {title}"),
+        title,
         message,
         tags: vec!["hourglass".into()],
         priority: NoticePriority::High,
@@ -441,11 +458,14 @@ pub(crate) async fn dispatch_inbox(
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
+            let paths = home.task_paths(id);
+            let pending = PendingT3Send::new(paths.dir.join(format!("t3-pending-{}", seq.get())));
             let attempt = OriginAttempt {
                 context: route.callback.clone(),
                 thread: route.thread,
                 line,
-                paths: home.task_paths(id),
+                paths,
+                pending,
             };
             attempt.run(&callback).await?
         };
@@ -468,6 +488,14 @@ pub(crate) async fn dispatch_inbox(
                 if let Err(error) = append_fallback(&home.fallback_log_path(), &line, last_error) {
                     warn!(%id, seq = seq.get(), "origin callback fallback log: {error}");
                 }
+                warn!(%id, seq = seq.get(), "origin callback not delivered: {last_error}");
+                let _ = callback.cast(CallbackMsg::WakeFailed {
+                    thread: route.thread,
+                    event: settled.event.clone(),
+                    failure: WakeFailure::Undelivered {
+                        reason: last_error.clone(),
+                    },
+                });
             }
             DeliveryState::Delivered { .. } => {
                 if let Some(failure @ WakeFailure::CodexQueued { .. }) = failed_wake {
@@ -507,10 +535,33 @@ struct OriginAttempt {
     thread: ThreadId,
     line: String,
     paths: TaskPaths,
+    pending: PendingT3Send,
 }
 
 impl OriginAttempt {
     async fn run(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
+        let (attempt, retry) = run_blocking("pending T3 retry", move || {
+            let retry = retry_pending_t3(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+            );
+            (self, retry)
+        })
+        .await?;
+        match retry {
+            Some(PendingRetry::Delivered) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
+            Some(PendingRetry::Uncertain(reason)) => {
+                Ok(AttemptOutcome::Settle(DeliveryOutcome::Retryable(reason)))
+            }
+            Some(PendingRetry::Blocked(reason)) => Ok(AttemptOutcome::WakeFailed(reason)),
+            None => attempt.route(callback).await,
+        }
+    }
+
+    async fn route(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
         let lookup = self.context.clone();
         let thread = self.thread;
         let origin = run_blocking("origin callback lookup", move || {
@@ -519,6 +570,7 @@ impl OriginAttempt {
         .await?;
         match origin {
             Ok(OriginSession::Reachable(origin)) => self.send(origin).await,
+            Ok(OriginSession::T3Claude(origin)) => self.send_t3_claude(origin).await,
             Ok(OriginSession::Stopped) => self.wake(callback).await,
             Ok(OriginSession::T3Codex) => self.wake_codex().await,
             Ok(OriginSession::Codex) => self.send_codex(None).await,
@@ -533,6 +585,25 @@ impl OriginAttempt {
                 &self.line,
                 &self.paths.callback_log,
                 &self.paths.delivery_lock,
+            )
+        })
+        .await?;
+        Ok(AttemptOutcome::Settle(match sent {
+            Ok(()) => DeliveryOutcome::Delivered,
+            Err(error) => DeliveryOutcome::Retryable(error),
+        }))
+    }
+
+    async fn send_t3_claude(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
+        let sent = run_blocking("T3 Claude send", move || {
+            send_t3_claude(
+                &self.context,
+                self.thread,
+                origin,
+                &self.line,
+                &self.paths.callback_log,
+                &self.paths.delivery_lock,
+                &self.pending,
             )
         })
         .await?;
@@ -563,17 +634,24 @@ impl OriginAttempt {
     }
 
     async fn wake_codex(self) -> Result<AttemptOutcome, AppError> {
-        let context = self.context.clone();
-        let thread = self.thread;
-        let line = self.line.clone();
-        let log_path = self.paths.callback_log.clone();
-        let woken = run_blocking("T3 Codex wake", move || {
-            wake_codex_thread(&context, thread, &line, &log_path)
+        let (attempt, woken) = run_blocking("T3 Codex wake", move || {
+            let woken = wake_codex_thread(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+            );
+            (self, woken)
         })
         .await?;
         match woken {
             Ok(()) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
-            Err(reason) => self.send_codex(Some(reason)).await,
+            // `codex queue` could deliver a second copy of a turn T3 already started
+            Err(CodexWakeError::Uncertain(reason)) => {
+                Ok(AttemptOutcome::Settle(DeliveryOutcome::Retryable(reason)))
+            }
+            Err(CodexWakeError::NotStarted(reason)) => attempt.send_codex(Some(reason)).await,
         }
     }
 
@@ -586,7 +664,13 @@ impl OriginAttempt {
             ))));
         }
         let woken = run_blocking("T3 wake", move || {
-            wake_stopped_session(&self.context, thread, &self.line, &self.paths.callback_log)
+            wake_stopped_session(
+                &self.context,
+                thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+            )
         })
         .await?;
         Ok(match woken {

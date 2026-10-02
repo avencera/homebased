@@ -18,12 +18,38 @@ use crate::domain::ThreadId;
 /// Time a read waits for a store that another process is writing
 const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-// t3 keeps the provider thread id in the resume cursor: `threadId` for Codex,
-// `resume` for Claude Code, where `threadId` is the T3 thread id instead
-const T3_TITLE_SQL: &str = "
+// T3 orchestration V1 keeps the provider thread id in the resume cursor:
+// `threadId` for Codex, `resume` for Claude Code, where `threadId` is the T3
+// thread id instead. See `crate::t3::v1`
+const T3_V1_TITLE_SQL: &str = "
     SELECT t.title
     FROM provider_session_runtime r
     JOIN projection_threads t ON t.thread_id = r.thread_id
+    WHERE t.deleted_at IS NULL
+      AND CASE WHEN json_valid(r.resume_cursor_json)
+          THEN json_extract(r.resume_cursor_json, '$.threadId') = ?1
+            OR json_extract(r.resume_cursor_json, '$.resume') = ?1
+          ELSE 0 END
+    ORDER BY r.last_seen_at DESC
+    LIMIT 1";
+
+// T3 orchestration V2 maps native ids through provider threads; threads it
+// imported from V1 resolve only through the copied V1 session table. See
+// `crate::t3::v2`
+const T3_V2_TITLE_SQL: &str = "
+    SELECT t.title
+    FROM orchestration_v2_projection_provider_threads p
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+    WHERE t.deleted_at IS NULL
+      AND CASE WHEN json_valid(p.payload_json)
+          THEN json_extract(p.payload_json, '$.nativeThreadRef.nativeId') = ?1
+          ELSE 0 END
+    ORDER BY p.updated_at DESC
+    LIMIT 1";
+const T3_V2_IMPORTED_TITLE_SQL: &str = "
+    SELECT t.title
+    FROM provider_session_runtime r
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
     WHERE t.deleted_at IS NULL
       AND CASE WHEN json_valid(r.resume_cursor_json)
           THEN json_extract(r.resume_cursor_json, '$.threadId') = ?1
@@ -38,8 +64,8 @@ const CODEX_TITLE_SQL: &str = "SELECT name FROM threads WHERE id = ?1";
 /// Local stores that can name a thread
 #[derive(Debug, Clone)]
 pub struct TitleSources {
-    /// T3 Code server state database
-    t3_state: PathBuf,
+    /// T3 Code user data, which holds `statev2.sqlite` and `state.sqlite`
+    t3_userdata: PathBuf,
     /// Codex home, `$CODEX_HOME` or `~/.codex`
     codex_home: PathBuf,
     /// Claude Code config directory, `$CLAUDE_CONFIG_DIR` or `~/.claude`
@@ -61,7 +87,7 @@ impl TitleSources {
                 .map_or_else(|| home.join(fallback), PathBuf::from)
         };
         Some(Self {
-            t3_state: home.join(".t3/userdata/state.sqlite"),
+            t3_userdata: home.join(".t3/userdata"),
             codex_home: env_dir("CODEX_HOME", ".codex"),
             claude_home: env_dir("CLAUDE_CONFIG_DIR", ".claude"),
         })
@@ -69,9 +95,9 @@ impl TitleSources {
 
     /// Stores under explicit roots
     #[must_use]
-    pub fn new(t3_state: PathBuf, codex_home: PathBuf, claude_home: PathBuf) -> Self {
+    pub fn new(t3_userdata: PathBuf, codex_home: PathBuf, claude_home: PathBuf) -> Self {
         Self {
-            t3_state,
+            t3_userdata,
             codex_home,
             claude_home,
         }
@@ -80,7 +106,9 @@ impl TitleSources {
     /// Title of each thread, in input order. Blocking: reads SQLite and JSONL files
     #[must_use]
     pub fn titles(&self, threads: &[ThreadId]) -> Vec<Option<String>> {
-        let t3 = open_read_only(&self.t3_state);
+        // V2 stops writing state.sqlite after copying it, so its titles win
+        let t3_v2 = open_read_only(&self.t3_userdata.join("statev2.sqlite"));
+        let t3_v1 = open_read_only(&self.t3_userdata.join("state.sqlite"));
         let codex = latest_codex_state(&self.codex_home)
             .as_deref()
             .and_then(open_read_only);
@@ -88,8 +116,17 @@ impl TitleSources {
             .iter()
             .map(|thread| {
                 let id = thread.to_string();
-                t3.as_ref()
-                    .and_then(|db| query_title(db, T3_TITLE_SQL, &id))
+                t3_v2
+                    .as_ref()
+                    .and_then(|db| {
+                        query_title(db, T3_V2_TITLE_SQL, &id)
+                            .or_else(|| query_title(db, T3_V2_IMPORTED_TITLE_SQL, &id))
+                    })
+                    .or_else(|| {
+                        t3_v1
+                            .as_ref()
+                            .and_then(|db| query_title(db, T3_V1_TITLE_SQL, &id))
+                    })
                     .or_else(|| {
                         codex
                             .as_ref()
@@ -203,6 +240,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::t3::test_support::V2State;
 
     const CODEX_THREAD: &str = "01a0d118-ad25-7f62-9f45-e3548a3fd998";
     const CLAUDE_SESSION: &str = "1bbb2f98-291e-4f40-897d-7169ae99acdd";
@@ -214,6 +252,7 @@ mod tests {
     impl Stores {
         fn new() -> Self {
             let dir = TempDir::new().unwrap();
+            fs::create_dir_all(dir.path().join("t3")).unwrap();
             fs::create_dir_all(dir.path().join("codex")).unwrap();
             fs::create_dir_all(dir.path().join("claude/projects/-work-app")).unwrap();
             Self { dir }
@@ -221,14 +260,14 @@ mod tests {
 
         fn sources(&self) -> TitleSources {
             TitleSources::new(
-                self.dir.path().join("t3.sqlite"),
+                self.dir.path().join("t3"),
                 self.dir.path().join("codex"),
                 self.dir.path().join("claude"),
             )
         }
 
         fn t3(&self, rows: &[(&str, &str, &str)]) {
-            let db = Connection::open(self.dir.path().join("t3.sqlite")).unwrap();
+            let db = Connection::open(self.dir.path().join("t3/state.sqlite")).unwrap();
             db.execute_batch(
                 "CREATE TABLE projection_threads (thread_id TEXT PRIMARY KEY, title TEXT NOT NULL, deleted_at TEXT);
                  CREATE TABLE provider_session_runtime (thread_id TEXT PRIMARY KEY, resume_cursor_json TEXT, last_seen_at TEXT NOT NULL);",
@@ -305,6 +344,28 @@ mod tests {
         assert_eq!(
             title(&sources, CLAUDE_SESSION).as_deref(),
             Some("T3 claude")
+        );
+    }
+
+    #[test]
+    fn t3_v2_title_wins_and_covers_threads_imported_from_v1() {
+        let stores = Stores::new();
+        stores.t3(&[(
+            "t3-old",
+            &format!(r#"{{"threadId":"t3-old","resume":"{CLAUDE_SESSION}"}}"#),
+            "stale V1 title",
+        )]);
+        V2State::create(&stores.dir.path().join("t3/statev2.sqlite"))
+            .thread("t3-v2", "V2 codex", false)
+            .native("codex", CODEX_THREAD, "t3-v2")
+            .thread("t3-old", "Renamed in V2", false)
+            .legacy("claudeAgent", "resume", CLAUDE_SESSION, "t3-old");
+        let sources = stores.sources();
+
+        assert_eq!(title(&sources, CODEX_THREAD).as_deref(), Some("V2 codex"));
+        assert_eq!(
+            title(&sources, CLAUDE_SESSION).as_deref(),
+            Some("Renamed in V2")
         );
     }
 

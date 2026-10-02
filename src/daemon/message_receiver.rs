@@ -11,7 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::callback::claude_inbox::ClaudeInbox;
-use crate::callback::send_saved_queue_attempt;
+use crate::callback::{PendingT3Send, send_saved_queue_attempt};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::keyed_locks::{KeyedGuard, KeyedLocks};
@@ -320,6 +320,8 @@ async fn send_queue_line(
 
     let log_path = paths.queue_log;
     let lock_path = paths.delivery_lock;
+    // a retry with the same message id finds this and goes only through T3
+    let pending = PendingT3Send::new(paths.dir.join("t3-pending"));
     let queue_context = context.clone();
     tokio::task::spawn_blocking(move || {
         send_saved_queue_attempt(
@@ -328,6 +330,7 @@ async fn send_queue_line(
             &line,
             &log_path,
             &lock_path,
+            &pending,
         )
     })
     .await

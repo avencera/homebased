@@ -155,11 +155,27 @@ Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `syst
 
 Homebased can wake stopped Claude sessions and T3-owned Codex threads through
 T3 Code's undocumented local API; if a Codex wake fails, it queues the event
-with `codex queue`. Run `homebased t3 check` after T3 updates to check that the local
-API still works.
+with `codex queue`. Homebased asks the running T3 server which orchestration
+protocol it speaks and uses the matching API, so it works with T3 releases
+before and after the V2 orchestrator. V2 keeps a Claude process between turns,
+so an event for a live Claude session that a V2 thread owns also goes through
+T3, which shows it in the thread; the session socket is the fallback. An
+archived T3 thread is unarchived first, so the turn runs and you can see it. A
+thread that T3 imported from its older orchestrator continues in a new provider
+session with the earlier context handed over.
+
+If T3 may have taken an event but its reply was lost, every later attempt goes
+only through T3, which drops a repeated send, so the event never arrives twice
+through another route. When delivery finally gives up, homebased writes the
+event to `callback-fallback.log` and sends a push notification.
+
+Run `homebased t3 check` after T3 updates to check that the local API still
+works. It reports the protocol it found. V2 support was verified against the
+T3 Code 0.0.46 preview, before any stable release shipped it.
 
 A Claude session with a transcript but no live process is waiting, not gone.
-Some hosts, T3 Code among them, start a new `claude` process for each turn.
+Some hosts, such as T3 Code before its V2 orchestrator, start a new `claude`
+process for each turn.
 Homebased keeps the event in the task inbox and watches
 `~/.claude/sessions/`. When a live process for that session id appears, it
 sends the event, keeping the task's events in order. `homebased task show`
@@ -459,7 +475,9 @@ the origin thread for a task with `--task <task-uuid>` alone. This is the
 origin thread, not the task worker. A send to its own source thread returns
 `message_to_self`; use `task followup` for a finished Codex worker. A Claude
 session with no live process gets the message as a new turn in the T3 Code
-thread that owns it. Pass the same
+thread that owns it, and so does a live session that a T3 V2 thread owns. A
+Codex thread that T3 owns also gets it as a T3 turn, and any other Codex thread
+gets it through `codex queue`. Pass the same
 `--message-id <uuid>` to retry after a lost response. Delivery is synchronous
 and at-least-once. A receiver crash before it stores the receipt can lead to a
 duplicate message. Read [messages.md](.agents/skills/homebased/references/messages.md)

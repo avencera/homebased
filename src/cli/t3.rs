@@ -47,7 +47,13 @@ fn print_report(ctx: &Ctx, report: &ProbeReport) -> Result<(), AppError> {
             Ok(())
         }
         OutputMode::Human => {
-            println!("t3 check: {}", report.status.as_str());
+            match report.orchestration_protocol {
+                Some(protocol) => println!(
+                    "t3 check: {} (orchestration protocol {protocol})",
+                    report.status.as_str()
+                ),
+                None => println!("t3 check: {}", report.status.as_str()),
+            }
             for check in &report.checks {
                 let result = if check.ok { "ok" } else { "failed" };
                 println!("{result} {}: {}", check.name, check.detail);

@@ -2,46 +2,39 @@
 //!
 //! # T3 Code internals this depends on
 //!
-//! T3 Code has no public API for these operations. This client pins the local
-//! contract observed in T3 Code at commit `95030dc67` on 2026-09-26. An update
-//! can change these details without notice. Run `homebased t3 check` after a T3
-//! update
+//! T3 Code has no public API for these operations, so this client pins local
+//! contracts that an update can change without notice. Run `homebased t3 check`
+//! after a T3 update
 //!
-//! Verified with T3 Code stable `0.0.42` and nightly `0.0.43`
+//! T3 speaks one of two orchestration protocols: [`v1`] in stable `0.0.45` and
+//! earlier, and [`v2`] after pingdotgg/t3code#2829. Every wake and probe asks
+//! the running server which one it speaks, so an update that ships V2 needs no
+//! homebased change unless V2 changed again first
+//!
+//! Both protocols share:
 //!
 //! - User data lives in `~/.t3/userdata`; `server-runtime.json` has `version`,
 //!   `pid`, and `origin`. Version 1 and a live PID identify a running server.
 //!   The process check uses `kill(pid, None)`. The desktop app also writes
 //!   `host`, `port`, and `startedAt`; a service-managed server omits `host`
 //!   and adds `serviceManaged`, so the client ignores those fields
+//! - `GET /.well-known/t3/environment` needs no token and returns
+//!   `orchestrationProtocolVersion`, `1` or `2`
 //! - The `t3` CLI is the running server's executable
 //!   (`~/.t3/runtime/versions/<version>/t3`), found through `/proc/<pid>/exe`
 //!   or `ps`, else `t3` on PATH. The macOS desktop app does not put it on PATH
-//! - `state.sqlite` has `provider_session_runtime(provider_name,thread_id,
-//!   resume_cursor_json,last_seen_at)` and `projection_threads(thread_id,
-//!   deleted_at)`. Claude sessions use `provider_name = 'claudeAgent'` and
-//!   `json_extract(resume_cursor_json, '$.resume')`; Codex threads use
-//!   `provider_name = 'codex'` and `json_extract(resume_cursor_json,
-//!   '$.threadId')`. `thread_id` is T3's thread id. A join on `thread_id`
-//!   excludes deleted threads, and the newest `last_seen_at` wins
 //! - `t3 auth session issue --json --ttl 5m --label homebased` returns
 //!   `sessionId` and `token` for a bearer session. Revoke it with
 //!   `t3 auth session revoke <sessionId>` after every use; `t3 --version`
 //!   supplies the optional probe version
-//! - `GET /api/orchestration/threads/{threadId}?turnLimit=1` returns a `thread`
-//!   with `id`, `runtimeMode`, `interactionMode`, `archivedAt`, and `deletedAt`
-//!   on HTTP 200. HTTP 401 or 403 with a fresh token indicates a changed API;
-//!   HTTP 404 has a typed error object with `_tag` and optional `reason`
-//! - `POST /api/orchestration/dispatch` accepts `thread.turn.start` with
-//!   `commandId`, `threadId`, `message`, `runtimeMode`, `interactionMode`, and
-//!   `createdAt`; its `message` has `messageId`, `role`, `text`, and
-//!   `attachments`. `modelSelection` is omitted. HTTP 200 returns integer
-//!   `sequence`; HTTP 400 indicates a changed command shape. Unknown thread ids
-//!   return HTTP 500 with `reason: orchestration_dispatch_failed`. HTTP 401 or
-//!   403 indicates a changed API, and HTTP 404 can return a typed error object
 //!
-//! Calls use the blocking system `curl` helper and `t3` commands with a
-//! deadline. The callback dispatcher must call this module from `spawn_blocking`
+//! Calls use the blocking system `curl` helper, a blocking WebSocket, and `t3`
+//! commands with a deadline. The callback dispatcher must call this module from
+//! `spawn_blocking`
+
+mod rpc;
+mod v1;
+mod v2;
 
 use std::ffi::OsString;
 use std::fs;
@@ -53,48 +46,25 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{SecondsFormat, Utc};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use uuid::{Builder, Uuid};
+use uuid::Builder;
 
 use crate::curl::{CurlMethod, CurlRequest, CurlResponse};
 use crate::domain::ThreadId;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+// the descriptor read gates live Claude deliveries, so a stalled T3 must not hold them long
+const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
-const PROVIDER_THREAD_SQL: &str = "
-    SELECT r.thread_id
-    FROM provider_session_runtime r
-    JOIN projection_threads t ON t.thread_id = r.thread_id
-    WHERE t.deleted_at IS NULL
-      AND r.provider_name = ?1
-      AND CASE WHEN json_valid(r.resume_cursor_json)
-          THEN json_extract(r.resume_cursor_json, ?2) = ?3
-          ELSE 0 END
-    ORDER BY r.last_seen_at DESC
-    LIMIT 1";
-const REQUIRED_STATE_SQL: &str = "
-    SELECT r.thread_id, r.provider_name, r.resume_cursor_json, r.last_seen_at,
-           t.thread_id, t.deleted_at
-    FROM provider_session_runtime r
-    JOIN projection_threads t ON t.thread_id = r.thread_id
-    LIMIT 0";
-const LATEST_THREAD_SQL: &str = "
-    SELECT r.thread_id
-    FROM provider_session_runtime r
-    JOIN projection_threads t ON t.thread_id = r.thread_id
-    WHERE t.deleted_at IS NULL
-    ORDER BY r.last_seen_at DESC
-    LIMIT 1";
 
 /// Where to find T3 Code for one user
 #[derive(Debug, Clone)]
@@ -126,22 +96,39 @@ impl T3Env {
     fn userdata(&self) -> PathBuf {
         self.home.join(".t3/userdata")
     }
+}
 
-    fn state_path(&self) -> PathBuf {
-        self.userdata().join("state.sqlite")
+/// T3 orchestration protocol, which decides the state database and turn API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// `state.sqlite` and HTTP dispatch, see [`v1`]
+    V1,
+    /// `statev2.sqlite` and WebSocket RPC dispatch, see [`v2`]
+    V2,
+}
+
+impl Protocol {
+    /// Wire number that T3 reports as `orchestrationProtocolVersion`
+    #[must_use]
+    pub fn number(self) -> u32 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
     }
 }
 
 /// Provider session that T3 can resume in its owning thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderThread {
-    /// Claude session id stored at `resume_cursor_json.$.resume`
+    /// Claude session id
     Claude(ThreadId),
-    /// Codex thread id stored at `resume_cursor_json.$.threadId`
+    /// Codex thread id
     Codex(ThreadId),
 }
 
 impl ProviderThread {
+    /// T3 provider name, the V1 resume cursor path, and the native id
     fn mapping(self) -> (&'static str, &'static str, ThreadId) {
         match self {
             Self::Claude(thread) => ("claudeAgent", "$.resume", thread),
@@ -161,6 +148,10 @@ pub enum WakeOutcome {
     Unavailable(String),
     /// T3 is reachable but will not run the turn
     Refused(String),
+    /// The request reached T3 but its reply did not come back, so T3 may have
+    /// started the turn. Only a retry through T3 is safe, because T3 drops a
+    /// repeated command
+    Uncertain(String),
     /// A response did not match the pinned T3 contract
     ApiChanged(String),
 }
@@ -213,6 +204,8 @@ pub struct ProbeReport {
     pub status: ProbeStatus,
     /// T3 CLI version, when `t3 --version` succeeds
     pub t3_version: Option<String>,
+    /// Orchestration protocol the server reported, when it answered
+    pub orchestration_protocol: Option<u32>,
     /// Checks in probe order
     pub checks: Vec<ProbeCheck>,
 }
@@ -233,37 +226,58 @@ impl ProbeReport {
             .collect::<Vec<_>>();
         (!failures.is_empty()).then(|| failures.join("\n"))
     }
+
+    fn finish(mut self, status: ProbeStatus) -> Self {
+        self.status = status;
+        self
+    }
 }
 
-/// Check whether T3 has a non-deleted thread for this provider session
-pub fn owns_thread(env: &T3Env, provider_thread: ProviderThread) -> Result<bool, String> {
+/// Protocol of the T3 thread that owns this provider session, if one does
+///
+/// Reads every state database on disk first, so a session that no database
+/// maps needs no request to T3. A mapped session counts only in the database of
+/// the running server's protocol; an error means T3 could not say which
+pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<Option<Protocol>, String> {
     let userdata = env.userdata();
-    if !userdata.is_dir() || !env.state_path().is_file() {
-        return Ok(false);
+    if !userdata.is_dir() {
+        return Ok(None);
     }
 
-    find_provider_thread(&env.state_path(), provider_thread).map(|thread| thread.is_some())
+    let lookups = Store::lookups(&userdata, provider_thread);
+    if lookups.iter().all(|(_, found)| matches!(found, Ok(None))) {
+        return Ok(None);
+    }
+    let server = connect(&userdata).map_err(|failure| failure.detail())?;
+    match Store::active(lookups, server.protocol) {
+        Some((store, Ok(Some(_)))) => Ok(Some(store.protocol())),
+        Some((_, Err(detail))) => Err(detail),
+        Some((_, Ok(None))) | None => Ok(None),
+    }
 }
 
 /// Start a T3 turn for the thread that owns this provider session
 #[must_use]
 pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
     let userdata = env.userdata();
-    if !userdata.is_dir() || !env.state_path().is_file() {
+    if !userdata.is_dir() {
         return WakeOutcome::NotT3Thread;
     }
 
-    let t3_thread = match find_provider_thread(&env.state_path(), provider_thread) {
-        Ok(Some(t3_thread)) => t3_thread,
-        Ok(None) => return WakeOutcome::NotT3Thread,
-        Err(detail) => return WakeOutcome::Unavailable(detail),
+    let lookups = Store::lookups(&userdata, provider_thread);
+    if lookups.iter().all(|(_, found)| matches!(found, Ok(None))) {
+        return WakeOutcome::NotT3Thread;
+    }
+    let server = match connect(&userdata) {
+        Ok(server) => server,
+        Err(failure) => return failure.into_wake_outcome(),
     };
-
-    let runtime = match load_runtime(&userdata) {
-        Ok(runtime) => runtime,
-        Err(detail) => return WakeOutcome::Unavailable(detail),
+    let (store, t3_thread) = match Store::active(lookups, server.protocol) {
+        Some((store, Ok(Some(t3_thread)))) => (store, t3_thread),
+        Some((_, Err(detail))) => return WakeOutcome::Unavailable(detail),
+        Some((_, Ok(None))) | None => return WakeOutcome::NotT3Thread,
     };
-    let cli = match T3Cli::resolve(env, runtime.pid) {
+    let cli = match T3Cli::resolve(env, server.pid) {
         Ok(cli) => cli,
         Err(detail) => return WakeOutcome::Unavailable(detail),
     };
@@ -272,27 +286,13 @@ pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> 
         Err(IssueError::Unavailable(detail)) => return WakeOutcome::Unavailable(detail),
         Err(IssueError::Changed(detail)) => return WakeOutcome::ApiChanged(detail),
     };
-    let snapshot = match fetch_snapshot(&runtime.origin, &t3_thread, &token.value) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return error.into_wake_outcome(),
+    let started = match store {
+        Store::V1(_) => v1::start_turn(&server.origin, &t3_thread, text, &token.value),
+        Store::V2(path) => v2::start_turn(&server.origin, &path, &t3_thread, text, &token.value),
     };
-    if snapshot.archived {
-        return WakeOutcome::Refused("T3 thread is archived".into());
-    }
-    if snapshot.deleted {
-        return WakeOutcome::Refused("T3 thread is deleted".into());
-    }
-
-    match dispatch_turn(
-        &runtime.origin,
-        &t3_thread,
-        &snapshot.runtime_mode,
-        &snapshot.interaction_mode,
-        text,
-        &token.value,
-    ) {
+    match started {
         Ok(()) => WakeOutcome::Woken { t3_thread },
-        Err(error) => error.into_wake_outcome(),
+        Err(failure) => failure.into_wake_outcome(),
     }
 }
 
@@ -300,118 +300,231 @@ pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> 
 #[must_use]
 pub fn probe(env: &T3Env) -> ProbeReport {
     let userdata = env.userdata();
+    let mut report = ProbeReport {
+        status: ProbeStatus::Compatible,
+        t3_version: None,
+        orchestration_protocol: None,
+        checks: Vec::new(),
+    };
     if !userdata.is_dir() {
-        return report(
-            ProbeStatus::NotInstalled,
-            None,
-            vec![failed("userdata", "T3 user data directory is missing")],
-        );
+        report
+            .checks
+            .push(failed("userdata", "T3 user data directory is missing"));
+        return report.finish(ProbeStatus::NotInstalled);
     }
+    report
+        .checks
+        .push(passed("userdata", "T3 user data directory exists"));
 
-    let mut checks = vec![passed("userdata", "T3 user data directory exists")];
     let runtime = match load_runtime(&userdata) {
         Ok(runtime) => runtime,
         Err(detail) => {
-            checks.push(failed("server", detail));
-            return report(ProbeStatus::NotRunning, None, checks);
+            report.checks.push(failed("server", detail));
+            return report.finish(ProbeStatus::NotRunning);
         }
     };
-    checks.push(passed(
+    report.checks.push(passed(
         "server",
         "T3 server runtime is valid and its process is alive",
     ));
 
     let cli = T3Cli::resolve(env, runtime.pid);
-    let version = cli.as_ref().ok().and_then(T3Cli::version);
+    report.t3_version = cli.as_ref().ok().and_then(T3Cli::version);
 
-    if !state_schema_matches(&env.state_path()) {
-        checks.push(failed(
+    let protocol = match server_protocol(&runtime.origin) {
+        Ok(protocol) => protocol,
+        Err(failure) => {
+            report.checks.push(failed("protocol", failure.detail()));
+            return report.finish(failure.probe_status());
+        }
+    };
+    report.orchestration_protocol = Some(protocol.number());
+    report.checks.push(passed(
+        "protocol",
+        &format!("server speaks orchestration protocol {}", protocol.number()),
+    ));
+
+    let store = Store::path(&userdata, protocol);
+    if !store.schema_matches() {
+        report.checks.push(failed(
             "state_schema",
-            "state.sqlite does not have the required thread columns",
+            format!(
+                "{} does not have the required thread columns",
+                store.file_name()
+            ),
         ));
-        return report(ProbeStatus::Changed, version, checks);
+        return report.finish(ProbeStatus::Changed);
     }
-    checks.push(passed(
+    report.checks.push(passed(
         "state_schema",
-        "required state.sqlite columns exist",
+        &format!("required {} columns exist", store.file_name()),
     ));
 
     let cli = match cli {
         Ok(cli) => cli,
         Err(detail) => {
-            checks.push(failed("token_issue", detail));
-            return report(ProbeStatus::Unavailable, version, checks);
+            report.checks.push(failed("token_issue", detail));
+            return report.finish(ProbeStatus::Unavailable);
         }
     };
     let token = match cli.issue_token() {
         Ok(token) => token,
         Err(IssueError::Unavailable(detail)) => {
-            checks.push(failed("token_issue", detail));
-            return report(ProbeStatus::Unavailable, version, checks);
+            report.checks.push(failed("token_issue", detail));
+            return report.finish(ProbeStatus::Unavailable);
         }
         Err(IssueError::Changed(detail)) => {
-            checks.push(failed("token_issue", detail));
-            return report(ProbeStatus::Changed, version, checks);
+            report.checks.push(failed("token_issue", detail));
+            return report.finish(ProbeStatus::Changed);
         }
     };
-    checks.push(passed("token_issue", "short-lived session token issued"));
+    report
+        .checks
+        .push(passed("token_issue", "short-lived session token issued"));
 
-    let latest_thread = match latest_thread(&env.state_path()) {
-        Ok(thread) => thread,
-        Err(detail) => {
-            checks.push(failed("thread_snapshot", detail));
-            return report(ProbeStatus::Changed, version, checks);
-        }
+    let status = match &store {
+        Store::V1(path) => v1::probe_api(&runtime.origin, path, &token.value, &mut report.checks),
+        Store::V2(_) => v2::probe_api(&runtime.origin, &token.value, &mut report.checks),
     };
-    if let Some(thread_id) = latest_thread {
-        match fetch_snapshot(&runtime.origin, &thread_id, &token.value) {
-            Ok(_) => checks.push(passed(
-                "thread_snapshot",
-                "thread snapshot has the required fields",
-            )),
-            Err(error) => {
-                checks.push(failed("thread_snapshot", error.detail()));
-                return report(ProbeStatus::Changed, version, checks);
-            }
+    report.finish(status)
+}
+
+/// T3 thread that one state database maps a provider session to
+type Lookup = Result<Option<String>, String>;
+
+/// State database of one orchestration protocol
+enum Store {
+    /// `state.sqlite`
+    V1(PathBuf),
+    /// `statev2.sqlite`
+    V2(PathBuf),
+}
+
+impl Store {
+    fn path(userdata: &Path, protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::V1 => Self::V1(userdata.join("state.sqlite")),
+            Protocol::V2 => Self::V2(userdata.join("statev2.sqlite")),
         }
-    } else {
-        checks.push(passed(
-            "thread_snapshot",
-            "skipped because no non-deleted T3 thread is available",
-        ));
     }
 
-    let unknown_thread = Uuid::now_v7().to_string();
-    let probe_body = dispatch_body(
-        &unknown_thread,
-        &Uuid::now_v7().to_string(),
-        &Uuid::now_v7().to_string(),
-        "homebased compatibility probe",
-        "full-access",
-        "default",
-    );
-    let response = match send_json(
-        CurlMethod::Post,
-        &format!("{}/api/orchestration/dispatch", runtime.origin),
-        &token.value,
-        &probe_body,
-    ) {
-        Ok(response) => response,
-        Err(detail) => {
-            checks.push(failed("dispatch", detail));
-            return report(ProbeStatus::Changed, version, checks);
-        }
-    };
-    if !is_unknown_thread_response(&response) {
-        checks.push(failed("dispatch", dispatch_probe_failure(&response)));
-        return report(ProbeStatus::Changed, version, checks);
+    /// The lookup of `provider_thread` in each state database on disk
+    ///
+    /// Each database answers on its own, so an unreadable inactive database
+    /// cannot hide a mapping in the active one
+    fn lookups(userdata: &Path, provider_thread: ProviderThread) -> Vec<(Self, Lookup)> {
+        [Protocol::V2, Protocol::V1]
+            .into_iter()
+            .map(|protocol| Self::path(userdata, protocol))
+            .filter(|store| store.file().is_file())
+            .map(|store| {
+                let found = store.find_thread(provider_thread);
+                (store, found)
+            })
+            .collect()
     }
-    checks.push(passed(
-        "dispatch",
-        "unknown thread returned orchestration_dispatch_failed",
-    ));
 
-    report(ProbeStatus::Compatible, version, checks)
+    /// The lookup in the running server's database
+    ///
+    /// V2 copies `state.sqlite` into `statev2.sqlite` once and then stops
+    /// writing `state.sqlite`, so only that database is current
+    fn active(lookups: Vec<(Self, Lookup)>, protocol: Protocol) -> Option<(Self, Lookup)> {
+        lookups
+            .into_iter()
+            .find(|(store, _)| store.protocol() == protocol)
+    }
+
+    fn file(&self) -> &Path {
+        match self {
+            Self::V1(path) | Self::V2(path) => path,
+        }
+    }
+
+    fn file_name(&self) -> &'static str {
+        match self {
+            Self::V1(_) => "state.sqlite",
+            Self::V2(_) => "statev2.sqlite",
+        }
+    }
+
+    fn protocol(&self) -> Protocol {
+        match self {
+            Self::V1(_) => Protocol::V1,
+            Self::V2(_) => Protocol::V2,
+        }
+    }
+
+    fn find_thread(&self, provider_thread: ProviderThread) -> Result<Option<String>, String> {
+        match self {
+            Self::V1(path) => v1::find_thread(path, provider_thread),
+            Self::V2(path) => v2::find_thread(path, provider_thread),
+        }
+    }
+
+    fn schema_matches(&self) -> bool {
+        match self {
+            Self::V1(path) => v1::schema_matches(path),
+            Self::V2(path) => v2::schema_matches(path),
+        }
+    }
+}
+
+/// Running T3 server and the orchestration protocol it reports
+#[derive(Debug, Clone)]
+struct Server {
+    pid: i32,
+    origin: String,
+    protocol: Protocol,
+}
+
+fn connect(userdata: &Path) -> Result<Server, ApiFailure> {
+    let runtime = load_runtime(userdata).map_err(ApiFailure::Unavailable)?;
+    let protocol = server_protocol(&runtime.origin)?;
+    Ok(Server {
+        pid: runtime.pid,
+        origin: runtime.origin,
+        protocol,
+    })
+}
+
+fn server_protocol(origin: &str) -> Result<Protocol, ApiFailure> {
+    let response = crate::curl::send(&CurlRequest {
+        method: CurlMethod::Get,
+        url: &format!("{origin}/.well-known/t3/environment"),
+        bearer: None,
+        json_body: None,
+        timeout: DESCRIPTOR_TIMEOUT,
+    })
+    .map_err(ApiFailure::Unavailable)?;
+    if response.status >= 500 {
+        return Err(ApiFailure::Unavailable(format!(
+            "environment descriptor returned HTTP {}",
+            response.status
+        )));
+    }
+    if response.status != 200 {
+        return Err(ApiFailure::Changed(format!(
+            "environment descriptor returned HTTP {}",
+            response.status
+        )));
+    }
+
+    let value: Value = serde_json::from_str(&response.body)
+        .map_err(|_| ApiFailure::Changed("environment descriptor is not valid JSON".into()))?;
+    let version = match value.get("orchestrationProtocolVersion") {
+        None | Some(Value::Null) => None,
+        Some(version) => Some(version.as_u64().ok_or_else(|| {
+            ApiFailure::Changed("orchestrationProtocolVersion is not an integer".into())
+        })?),
+    };
+    match version {
+        // T3 `0.0.42` and earlier omit the field, which T3 defines as protocol 1
+        None | Some(1) => Ok(Protocol::V1),
+        Some(2) => Ok(Protocol::V2),
+        Some(version) => Err(ApiFailure::Changed(format!(
+            "server speaks unsupported orchestration protocol {version}"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,29 +573,6 @@ fn state_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     let connection = Connection::open_with_flags(path, flags)?;
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(connection)
-}
-
-fn find_provider_thread(
-    path: &Path,
-    provider_thread: ProviderThread,
-) -> Result<Option<String>, String> {
-    let (provider, cursor, session) = provider_thread.mapping();
-    query_thread(
-        path,
-        PROVIDER_THREAD_SQL,
-        rusqlite::params![provider, cursor, session.to_string()],
-    )
-}
-
-fn state_schema_matches(path: &Path) -> bool {
-    let Ok(db) = state_connection(path) else {
-        return false;
-    };
-    db.prepare(REQUIRED_STATE_SQL).is_ok()
-}
-
-fn latest_thread(path: &Path) -> Result<Option<String>, String> {
-    query_thread(path, LATEST_THREAD_SQL, [])
 }
 
 fn query_thread(
@@ -559,10 +649,13 @@ impl T3Cli {
     /// A hung `t3` would otherwise hold a callback worker and a blocking
     /// thread forever
     fn run(&self, label: &str, args: &[&str]) -> Result<CliOutput, String> {
+        // `t3` prefers an inherited `T3CODE_HOME` over `HOME`, so pin it to the
+        // user data this client reads; a shell inside T3 Code sets it
         let mut child = Command::new(&self.executable)
             .args(args)
             .env("PATH", &self.env.path)
             .env("HOME", &self.env.home)
+            .env("T3CODE_HOME", self.env.home.join(".t3"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -704,26 +797,22 @@ impl Drop for TokenRevoker {
     }
 }
 
-struct ThreadSnapshot {
-    runtime_mode: String,
-    interaction_mode: String,
-    archived: bool,
-    deleted: bool,
-}
-
 #[derive(Debug)]
 enum ApiFailure {
     Unavailable(String),
     Refused(String),
+    /// Sent, but the reply was lost; see [`WakeOutcome::Uncertain`]
+    Uncertain(String),
     Changed(String),
 }
 
 impl ApiFailure {
     fn detail(&self) -> String {
         match self {
-            Self::Unavailable(detail) | Self::Refused(detail) | Self::Changed(detail) => {
-                detail.clone()
-            }
+            Self::Unavailable(detail)
+            | Self::Refused(detail)
+            | Self::Uncertain(detail)
+            | Self::Changed(detail) => detail.clone(),
         }
     }
 
@@ -731,179 +820,24 @@ impl ApiFailure {
         match self {
             Self::Unavailable(detail) => WakeOutcome::Unavailable(detail),
             Self::Refused(detail) => WakeOutcome::Refused(detail),
+            Self::Uncertain(detail) => WakeOutcome::Uncertain(detail),
             Self::Changed(detail) => WakeOutcome::ApiChanged(detail),
         }
     }
-}
 
-fn fetch_snapshot(
-    origin: &str,
-    thread_id: &str,
-    token: &str,
-) -> Result<ThreadSnapshot, ApiFailure> {
-    let url = format!(
-        "{origin}/api/orchestration/threads/{}?turnLimit=1",
-        encode_path_segment(thread_id)
-    );
-    let response = send_empty(CurlMethod::Get, &url, token).map_err(ApiFailure::Unavailable)?;
-    if response.status == 401 || response.status == 403 {
-        return Err(ApiFailure::Changed(format!(
-            "thread snapshot returned HTTP {} with a fresh session token",
-            response.status
-        )));
+    fn probe_status(&self) -> ProbeStatus {
+        match self {
+            Self::Unavailable(_) | Self::Refused(_) | Self::Uncertain(_) => {
+                ProbeStatus::Unavailable
+            }
+            Self::Changed(_) => ProbeStatus::Changed,
+        }
     }
-    if response.status == 404 {
-        return Err(classify_typed_404(&response.body, "thread snapshot"));
-    }
-    if response.status != 200 {
-        return Err(ApiFailure::Unavailable(format!(
-            "thread snapshot returned HTTP {}",
-            response.status
-        )));
-    }
-
-    let value: Value = serde_json::from_str(&response.body)
-        .map_err(|_| ApiFailure::Changed("thread snapshot is not valid JSON".into()))?;
-    let Some(thread) = value.get("thread").and_then(Value::as_object) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no thread object".into(),
-        ));
-    };
-    let Some(id) = thread.get("id").and_then(Value::as_str) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no thread id".into(),
-        ));
-    };
-    if id != thread_id {
-        return Err(ApiFailure::Changed(
-            "thread snapshot id does not match the requested thread".into(),
-        ));
-    }
-    let Some(runtime_mode) = non_empty_string(thread.get("runtimeMode")) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no valid runtimeMode".into(),
-        ));
-    };
-    let Some(interaction_mode) = non_empty_string(thread.get("interactionMode")) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no valid interactionMode".into(),
-        ));
-    };
-    let Some(archived_at) = timestamp_field(thread.get("archivedAt")) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no valid archivedAt".into(),
-        ));
-    };
-    let Some(deleted_at) = timestamp_field(thread.get("deletedAt")) else {
-        return Err(ApiFailure::Changed(
-            "thread snapshot has no valid deletedAt".into(),
-        ));
-    };
-
-    Ok(ThreadSnapshot {
-        runtime_mode,
-        interaction_mode,
-        archived: archived_at,
-        deleted: deleted_at,
-    })
 }
 
 fn non_empty_string(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?;
     (!value.trim().is_empty()).then(|| value.to_owned())
-}
-
-fn timestamp_field(value: Option<&Value>) -> Option<bool> {
-    match value? {
-        Value::Null => Some(false),
-        Value::String(timestamp) if !timestamp.trim().is_empty() => Some(true),
-        _ => None,
-    }
-}
-
-fn dispatch_turn(
-    origin: &str,
-    thread_id: &str,
-    runtime_mode: &str,
-    interaction_mode: &str,
-    text: &str,
-    token: &str,
-) -> Result<(), ApiFailure> {
-    let command_id = deterministic_id("homebased-t3-command", thread_id, text);
-    let message_id = deterministic_id("homebased-t3-message", thread_id, text);
-    let body = dispatch_body(
-        thread_id,
-        &command_id,
-        &message_id,
-        text,
-        runtime_mode,
-        interaction_mode,
-    );
-    let response = send_json(
-        CurlMethod::Post,
-        &format!("{origin}/api/orchestration/dispatch"),
-        token,
-        &body,
-    )
-    .map_err(ApiFailure::Unavailable)?;
-    if response.status == 401 || response.status == 403 {
-        return Err(ApiFailure::Changed(format!(
-            "turn dispatch returned HTTP {} with a fresh session token",
-            response.status
-        )));
-    }
-    if response.status == 404 {
-        return Err(classify_typed_404(&response.body, "turn dispatch"));
-    }
-    if response.status == 400 {
-        return Err(ApiFailure::Changed(
-            "turn dispatch returned HTTP 400".into(),
-        ));
-    }
-    if response.status == 500 && has_dispatch_failed_reason(&response.body) {
-        return Err(ApiFailure::Refused(
-            "T3 could not dispatch the turn for this thread".into(),
-        ));
-    }
-    if response.status != 200 {
-        return Err(ApiFailure::Unavailable(format!(
-            "turn dispatch returned HTTP {}",
-            response.status
-        )));
-    }
-
-    let value: Value = serde_json::from_str(&response.body)
-        .map_err(|_| ApiFailure::Changed("turn dispatch response is not valid JSON".into()))?;
-    if value.get("sequence").and_then(Value::as_u64).is_none() {
-        return Err(ApiFailure::Changed(
-            "turn dispatch response has no integer sequence".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn dispatch_body(
-    thread_id: &str,
-    command_id: &str,
-    message_id: &str,
-    text: &str,
-    runtime_mode: &str,
-    interaction_mode: &str,
-) -> Value {
-    json!({
-        "type": "thread.turn.start",
-        "commandId": command_id,
-        "threadId": thread_id,
-        "message": {
-            "messageId": message_id,
-            "role": "user",
-            "text": text,
-            "attachments": []
-        },
-        "runtimeMode": runtime_mode,
-        "interactionMode": interaction_mode,
-        "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-    })
 }
 
 fn deterministic_id(salt: &str, thread_id: &str, text: &str) -> String {
@@ -944,62 +878,10 @@ fn send_json(
     })
 }
 
-fn classify_typed_404(body: &str, operation: &str) -> ApiFailure {
-    let typed_error = serde_json::from_str::<Value>(body)
-        .ok()
-        .filter(Value::is_object);
-    if let Some(tag) = typed_error
-        .as_ref()
-        .and_then(|value| value.get("_tag"))
-        .and_then(Value::as_str)
-        .filter(|tag| !tag.trim().is_empty())
-    {
-        let reason = typed_error
-            .as_ref()
-            .and_then(|value| value.get("reason"))
-            .and_then(Value::as_str)
-            .filter(|reason| !reason.trim().is_empty());
-        let detail = reason.map_or_else(
-            || format!("{operation} returned typed T3 error {tag}"),
-            |reason| format!("{operation} returned typed T3 error {tag}: {reason}"),
-        );
-        ApiFailure::Refused(detail)
-    } else {
-        ApiFailure::Changed(format!(
-            "{operation} returned HTTP 404 without a typed T3 error"
-        ))
-    }
-}
-
-fn has_dispatch_failed_reason(body: &str) -> bool {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .is_some_and(|reason| reason == "orchestration_dispatch_failed")
-}
-
-fn is_unknown_thread_response(response: &CurlResponse) -> bool {
-    response.status == 500 && has_dispatch_failed_reason(&response.body)
-}
-
-fn dispatch_probe_failure(response: &CurlResponse) -> String {
-    if response.status == 400 {
-        return "dispatch returned HTTP 400; command shape changed".into();
-    }
-    if response.status == 500 {
-        return "dispatch did not return orchestration_dispatch_failed".into();
-    }
-    format!("dispatch contract probe returned HTTP {}", response.status)
-}
-
-fn encode_path_segment(segment: &str) -> String {
-    let mut encoded = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
+/// Percent-encode everything except RFC 3986 unreserved bytes
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             encoded.push(char::from(byte));
         } else {
@@ -1007,14 +889,6 @@ fn encode_path_segment(segment: &str) -> String {
         }
     }
     encoded
-}
-
-fn report(status: ProbeStatus, t3_version: Option<String>, checks: Vec<ProbeCheck>) -> ProbeReport {
-    ProbeReport {
-        status,
-        t3_version,
-        checks,
-    }
 }
 
 fn passed(name: &'static str, detail: &str) -> ProbeCheck {
@@ -1034,152 +908,25 @@ fn failed(name: &'static str, detail: impl Into<String>) -> ProbeCheck {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
-    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
     use serde_json::{Value, json};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
+    use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
     use super::*;
 
     const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
     const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
     const TOKEN: &str = "fake-secret-token";
-
-    #[derive(Clone)]
-    struct FakeResponse {
-        status: u16,
-        body: String,
-    }
-
-    #[derive(Debug, Clone)]
-    struct RecordedRequest {
-        method: String,
-        path: String,
-        headers: String,
-        body: String,
-    }
-
-    struct FakeServer {
-        origin: String,
-        requests: Arc<Mutex<Vec<RecordedRequest>>>,
-        worker: Option<JoinHandle<()>>,
-    }
-
-    impl FakeServer {
-        fn start(responses: Vec<FakeResponse>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let recorded = Arc::clone(&requests);
-            let worker = thread::spawn(move || {
-                for response in responses {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    let (mut stream, _) = loop {
-                        match listener.accept() {
-                            Ok(connection) => break connection,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                if Instant::now() >= deadline {
-                                    return;
-                                }
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            Err(_) => return,
-                        }
-                    };
-                    let request = read_request(&mut stream);
-                    if let Ok(request) = request
-                        && let Ok(mut requests) = recorded.lock()
-                    {
-                        requests.push(request);
-                    }
-                    let reason = match response.status {
-                        200 => "OK",
-                        400 => "Bad Request",
-                        401 => "Unauthorized",
-                        403 => "Forbidden",
-                        404 => "Not Found",
-                        500 => "Internal Server Error",
-                        _ => "Response",
-                    };
-                    let response_text = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response.status,
-                        reason,
-                        response.body.len(),
-                        response.body
-                    );
-                    let _ = stream.write_all(response_text.as_bytes());
-                    let _ = stream.flush();
-                }
-            });
-            Self {
-                origin: format!("http://{address}"),
-                requests,
-                worker: Some(worker),
-            }
-        }
-
-        fn requests(&self) -> Vec<RecordedRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for FakeServer {
-        fn drop(&mut self) {
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> std::io::Result<RecordedRequest> {
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut first_line = String::new();
-        reader.read_line(&mut first_line)?;
-        let mut headers = String::new();
-        let mut content_length = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line == "\r\n" || line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                content_length = value.trim().parse::<usize>().unwrap();
-            }
-            headers.push_str(&line);
-        }
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body)?;
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next().unwrap().to_owned();
-        let path = parts.next().unwrap().to_owned();
-        Ok(RecordedRequest {
-            method,
-            path,
-            headers,
-            body: String::from_utf8(body).unwrap(),
-        })
-    }
-
-    fn response(status: u16, body: Value) -> FakeResponse {
-        FakeResponse {
-            status,
-            body: serde_json::to_string(&body).unwrap(),
-        }
-    }
 
     fn snapshot(thread_id: &str) -> Value {
         json!({
@@ -1199,7 +946,34 @@ mod tests {
     }
 
     fn dispatch_ok() -> FakeResponse {
-        response(200, json!({ "sequence": 10 }))
+        FakeResponse::http(200, &json!({ "sequence": 10 }))
+    }
+
+    fn ticket() -> FakeResponse {
+        FakeResponse::http(
+            200,
+            &json!({ "ticket": "fake-ticket", "expiresAt": "later" }),
+        )
+    }
+
+    fn dispatched() -> FakeResponse {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            json!({ "_tag": "Success", "value": { "sequence": 47 } }),
+        )])
+    }
+
+    fn unknown_thread_error() -> FakeResponse {
+        FakeResponse::WebSocket(vec![rpc_exit(json!({
+            "_tag": "Failure",
+            "cause": [{
+                "_tag": "Fail",
+                "error": {
+                    "_tag": "OrchestrationV2DispatchCommandError",
+                    "commandType": "message.dispatch",
+                    "message": "No orchestration projection exists for thread 0000."
+                }
+            }]
+        }))])
     }
 
     fn curl_available() -> bool {
@@ -1219,26 +993,30 @@ mod tests {
     }
 
     struct Fixture {
-        _dir: TempDir,
+        dir: TempDir,
         env: T3Env,
         revoke_log: PathBuf,
     }
 
     impl Fixture {
-        fn new(server: Option<&FakeServer>, mapped: bool, pid: i32) -> Self {
+        fn new(server: Option<&FakeT3Server>, mapped: bool, pid: i32) -> Self {
             let mapping = mapped.then_some(("claudeAgent", "resume", SESSION_ID));
             Self::with_mapping(server, mapping, pid)
         }
 
+        /// A V1 `state.sqlite`, optionally mapping one provider session
         fn with_mapping(
-            server: Option<&FakeServer>,
+            server: Option<&FakeT3Server>,
             mapping: Option<(&str, &str, &str)>,
             pid: i32,
         ) -> Self {
-            let dir = TempDir::new().unwrap();
-            let userdata = dir.path().join(".t3/userdata");
-            fs::create_dir_all(&userdata).unwrap();
-            let db = Connection::open(userdata.join("state.sqlite")).unwrap();
+            let fixture = Self::empty(server, pid);
+            fixture.v1_state(mapping);
+            fixture
+        }
+
+        fn v1_state(&self, mapping: Option<(&str, &str, &str)>) {
+            let db = Connection::open(self.userdata().join("state.sqlite")).unwrap();
             db.execute_batch(
                 "CREATE TABLE provider_session_runtime (
                     thread_id TEXT PRIMARY KEY,
@@ -1258,48 +1036,34 @@ mod tests {
                  );",
             )
             .unwrap();
-            if let Some((provider, cursor, session_id)) = mapping {
-                db.execute(
-                    "INSERT INTO projection_threads (thread_id, title) VALUES (?1, 'Fake thread')",
-                    [T3_THREAD_ID],
-                )
-                .unwrap();
-                db.execute(
-                    "INSERT INTO provider_session_runtime
-                     (thread_id, provider_name, last_seen_at, resume_cursor_json)
-                     VALUES (?1, ?2, '2026-09-26T17:00:00Z', ?3)",
-                    rusqlite::params![
-                        T3_THREAD_ID,
-                        provider,
-                        json!({(cursor): session_id}).to_string()
-                    ],
-                )
-                .unwrap();
-            }
-            drop(db);
-
-            let origin = server.map_or_else(
-                || "http://127.0.0.1:1".to_string(),
-                |server| server.origin.clone(),
-            );
-            let port = origin
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .unwrap_or(1);
-            // the service-managed shape: no `host`, plus `serviceManaged`
-            let runtime = json!({
-                "version": 1,
-                "pid": pid,
-                "port": port,
-                "origin": origin,
-                "startedAt": "2026-09-26T17:03:50.514Z",
-                "serviceManaged": true
-            });
-            fs::write(
-                userdata.join("server-runtime.json"),
-                serde_json::to_vec(&runtime).unwrap(),
+            let Some((provider, cursor, session_id)) = mapping else {
+                return;
+            };
+            db.execute(
+                "INSERT INTO projection_threads (thread_id, title) VALUES (?1, 'Fake thread')",
+                [T3_THREAD_ID],
             )
             .unwrap();
+            db.execute(
+                "INSERT INTO provider_session_runtime
+                 (thread_id, provider_name, last_seen_at, resume_cursor_json)
+                 VALUES (?1, ?2, '2026-09-26T17:00:00Z', ?3)",
+                rusqlite::params![
+                    T3_THREAD_ID,
+                    provider,
+                    json!({(cursor): session_id}).to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        /// User data with a runtime file and a fake `t3` CLI, but no state database
+        fn empty(server: Option<&FakeT3Server>, pid: i32) -> Self {
+            let dir = TempDir::new().unwrap();
+            let userdata = dir.path().join(".t3/userdata");
+            fs::create_dir_all(&userdata).unwrap();
+            let origin = server.map_or("http://127.0.0.1:1", |server| server.origin.as_str());
+            write_runtime(&userdata, origin, pid);
 
             let bin = dir.path().join("bin");
             fs::create_dir_all(&bin).unwrap();
@@ -1310,15 +1074,21 @@ mod tests {
                 shell_quote(&revoke_log.to_string_lossy())
             );
             fs::write(&script_path, script).unwrap();
-            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).unwrap();
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
             Self {
                 env: T3Env::new(dir.path().to_path_buf(), bin.into_os_string()),
-                _dir: dir,
+                dir,
                 revoke_log,
             }
+        }
+
+        fn userdata(&self) -> PathBuf {
+            self.dir.path().join(".t3/userdata")
+        }
+
+        fn v2_state(&self) -> V2State {
+            V2State::create(&self.userdata().join("statev2.sqlite"))
         }
 
         fn revocations(&self) -> Vec<String> {
@@ -1343,15 +1113,21 @@ mod tests {
         if !curl_available() {
             return;
         }
-        let server = FakeServer::start(vec![
-            response(200, snapshot(T3_THREAD_ID)),
-            dispatch_ok(),
-            response(200, snapshot(T3_THREAD_ID)),
-            dispatch_ok(),
-        ]);
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                dispatch_ok(),
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                dispatch_ok(),
+            ],
+        );
         let fixture = Fixture::new(Some(&server), true, live_pid());
-        assert!(owns_thread(&fixture.env, claude_thread()).unwrap());
-        assert!(!owns_thread(&fixture.env, codex_thread()).unwrap());
+        assert_eq!(
+            owner(&fixture.env, claude_thread()).unwrap(),
+            Some(Protocol::V1)
+        );
+        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
         let first = wake_thread(&fixture.env, claude_thread(), "resume this task");
         let second = wake_thread(&fixture.env, claude_thread(), "resume this task");
 
@@ -1386,18 +1162,20 @@ mod tests {
 
     #[test]
     fn provider_mapping_keeps_claude_and_codex_sessions_separate() {
+        // no T3 server answers here: an unmapped session needs none, and a
+        // mapped one cannot be confirmed without it
         let codex_fixture =
             Fixture::with_mapping(None, Some(("codex", "threadId", SESSION_ID)), live_pid());
-        assert!(owns_thread(&codex_fixture.env, codex_thread()).unwrap());
-        assert!(!owns_thread(&codex_fixture.env, claude_thread()).unwrap());
+        assert!(owner(&codex_fixture.env, codex_thread()).is_err());
+        assert_eq!(owner(&codex_fixture.env, claude_thread()).unwrap(), None);
         assert_eq!(
             wake_thread(&codex_fixture.env, claude_thread(), "message"),
             WakeOutcome::NotT3Thread
         );
 
         let claude_fixture = Fixture::new(None, true, live_pid());
-        assert!(owns_thread(&claude_fixture.env, claude_thread()).unwrap());
-        assert!(!owns_thread(&claude_fixture.env, codex_thread()).unwrap());
+        assert!(owner(&claude_fixture.env, claude_thread()).is_err());
+        assert_eq!(owner(&claude_fixture.env, codex_thread()).unwrap(), None);
         assert_eq!(
             wake_thread(&claude_fixture.env, codex_thread(), "message"),
             WakeOutcome::NotT3Thread
@@ -1409,15 +1187,21 @@ mod tests {
         if !curl_available() {
             return;
         }
-        let server = FakeServer::start(vec![response(200, snapshot(T3_THREAD_ID)), dispatch_ok()]);
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                dispatch_ok(),
+            ],
+        );
         let fixture = Fixture::with_mapping(
             Some(&server),
             Some(("codex", "threadId", SESSION_ID)),
             live_pid(),
         );
 
-        assert!(owns_thread(&fixture.env, codex_thread()).unwrap());
-        assert!(!owns_thread(&fixture.env, claude_thread()).unwrap());
+        assert!(owner(&fixture.env, codex_thread()).unwrap().is_some());
+        assert_eq!(owner(&fixture.env, claude_thread()).unwrap(), None);
         assert_eq!(
             wake_thread(&fixture.env, codex_thread(), "resume this task"),
             WakeOutcome::Woken {
@@ -1449,20 +1233,36 @@ mod tests {
     }
 
     #[test]
-    fn wake_refuses_archived_threads_and_revokes_the_token() {
+    fn wake_unarchives_an_archived_thread_before_its_turn() {
         if !curl_available() {
             return;
         }
+        // V1 records a turn in an archived thread but never starts it
         let mut archived = snapshot(T3_THREAD_ID);
         archived["thread"]["archivedAt"] = json!("2026-09-26T17:00:00Z");
-        let server = FakeServer::start(vec![response(200, archived)]);
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &archived),
+                FakeResponse::http(200, &json!({ "sequence": 11 })),
+                dispatch_ok(),
+            ],
+        );
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         assert_eq!(
             wake_thread(&fixture.env, claude_thread(), "message"),
-            WakeOutcome::Refused("T3 thread is archived".into())
+            WakeOutcome::Woken {
+                t3_thread: T3_THREAD_ID.into()
+            }
         );
-        assert_eq!(server.requests().len(), 1);
+        let types = server
+            .requests()
+            .iter()
+            .skip(1)
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap()["type"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["thread.unarchive", "thread.turn.start"]);
         assert_eq!(fixture.revocations(), ["fake-session"]);
     }
 
@@ -1471,10 +1271,13 @@ mod tests {
         if !curl_available() {
             return;
         }
-        let server = FakeServer::start(vec![
-            response(200, snapshot(T3_THREAD_ID)),
-            response(400, json!({})),
-        ]);
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                FakeResponse::http(400, &json!({})),
+            ],
+        );
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         assert_eq!(
@@ -1489,23 +1292,28 @@ mod tests {
         if !curl_available() {
             return;
         }
-        let server = FakeServer::start(vec![
-            response(200, snapshot(T3_THREAD_ID)),
-            response(
-                500,
-                json!({
-                    "_tag": "EnvironmentInternalError",
-                    "code": "internal_error",
-                    "reason": "orchestration_dispatch_failed",
-                    "traceId": "discard-this"
-                }),
-            ),
-        ]);
+        // T3 `0.0.42` and earlier have no protocol field, which means V1
+        let server = FakeT3Server::start(
+            None,
+            vec![
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                FakeResponse::http(
+                    500,
+                    &json!({
+                        "_tag": "EnvironmentInternalError",
+                        "code": "internal_error",
+                        "reason": "orchestration_dispatch_failed",
+                        "traceId": "discard-this"
+                    }),
+                ),
+            ],
+        );
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         let report = probe(&fixture.env);
         assert_eq!(report.status, ProbeStatus::Compatible);
         assert_eq!(report.t3_version.as_deref(), Some("t3 1.2.3"));
+        assert_eq!(report.orchestration_protocol, Some(1));
         assert!(report.checks.iter().all(|check| check.ok));
         assert!(fixture.revocations().contains(&"fake-session".to_string()));
         let requests = server.requests();
@@ -1526,8 +1334,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("runtimeMode");
-        let server =
-            FakeServer::start(vec![response(200, invalid.clone()), response(200, invalid)]);
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &invalid),
+                FakeResponse::http(200, &invalid),
+            ],
+        );
         let fixture = Fixture::new(Some(&server), true, live_pid());
 
         let first = probe(&fixture.env);
@@ -1540,6 +1353,209 @@ mod tests {
         );
         assert_eq!(first.fingerprint(), second.fingerprint());
         assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
+    }
+
+    #[test]
+    fn v2_wake_dispatches_a_message_over_the_websocket_with_stable_ids() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(
+            Some(2),
+            vec![ticket(), dispatched(), ticket(), dispatched()],
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        // V2 stops writing state.sqlite, so its mappings must not count
+        fixture.v1_state(Some(("codex", "threadId", SESSION_ID)));
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "V2 thread", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+
+        assert_eq!(
+            owner(&fixture.env, claude_thread()).unwrap(),
+            Some(Protocol::V2)
+        );
+        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
+        let first = wake_thread(&fixture.env, claude_thread(), "resume this task");
+        let second = wake_thread(&fixture.env, claude_thread(), "resume this task");
+
+        assert_eq!(
+            first,
+            WakeOutcome::Woken {
+                t3_thread: T3_THREAD_ID.into()
+            }
+        );
+        assert_eq!(second, first);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/auth/websocket-ticket");
+        assert!(requests[0].headers.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(requests[1].method, "WS");
+        assert_eq!(
+            requests[1].path,
+            "/ws?wsTicket=fake-ticket&orchestrationProtocol=2"
+        );
+        let first_rpc: Value = serde_json::from_str(&requests[1].body).unwrap();
+        let second_rpc: Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(first_rpc["_tag"], "Request");
+        assert_eq!(first_rpc["tag"], "orchestration.dispatchCommand");
+        let payload = &first_rpc["payload"];
+        assert_eq!(payload["type"], "message.dispatch");
+        assert_eq!(payload["threadId"], T3_THREAD_ID);
+        assert_eq!(payload["text"], "resume this task");
+        assert_eq!(payload["deliveryIntent"], "auto");
+        assert_eq!(payload["commandId"], second_rpc["payload"]["commandId"]);
+        assert_eq!(payload["messageId"], second_rpc["payload"]["messageId"]);
+        assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
+    }
+
+    #[test]
+    fn v2_wakes_an_imported_v1_session_and_unarchives_its_thread_first() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(
+            Some(2),
+            vec![ticket(), dispatched(), ticket(), dispatched()],
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Imported thread", true)
+            .legacy("claudeAgent", "resume", SESSION_ID, T3_THREAD_ID);
+
+        assert_eq!(
+            owner(&fixture.env, claude_thread()).unwrap(),
+            Some(Protocol::V2)
+        );
+        assert_eq!(
+            wake_thread(&fixture.env, claude_thread(), "message"),
+            WakeOutcome::Woken {
+                t3_thread: T3_THREAD_ID.into()
+            }
+        );
+        let types = server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "WS")
+            .map(|request| {
+                serde_json::from_str::<Value>(&request.body).unwrap()["payload"]["type"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["thread.unarchive", "message.dispatch"]);
+    }
+
+    #[test]
+    fn v2_reply_after_the_request_left_is_uncertain_unless_t3_refused() {
+        if !curl_available() {
+            return;
+        }
+        let malformed = FakeResponse::WebSocket(vec![rpc_exit(json!({ "_tag": "Weird" }))]);
+        let lost = FakeResponse::WebSocket(Vec::new());
+        let server = FakeT3Server::start(
+            Some(2),
+            vec![
+                ticket(),
+                malformed,
+                ticket(),
+                lost,
+                ticket(),
+                unknown_thread_error(),
+            ],
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "V2 thread", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+
+        let wake = || wake_thread(&fixture.env, claude_thread(), "message");
+        assert!(matches!(wake(), WakeOutcome::Uncertain(_)));
+        assert!(matches!(wake(), WakeOutcome::Uncertain(_)));
+        assert!(matches!(wake(), WakeOutcome::Refused(_)));
+    }
+
+    #[test]
+    fn an_unreadable_inactive_database_does_not_hide_the_active_one() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(1), Vec::new());
+        let fixture = Fixture::new(Some(&server), true, live_pid());
+        fs::write(fixture.userdata().join("statev2.sqlite"), b"not a database").unwrap();
+
+        assert_eq!(
+            owner(&fixture.env, claude_thread()).unwrap(),
+            Some(Protocol::V1)
+        );
+        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
+    }
+
+    #[test]
+    fn v2_probe_reports_the_protocol_and_accepts_the_typed_unknown_thread_error() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(2), vec![ticket(), unknown_thread_error()]);
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture.v2_state();
+
+        let report = probe(&fixture.env);
+
+        assert_eq!(report.status, ProbeStatus::Compatible, "{report:?}");
+        assert_eq!(report.orchestration_protocol, Some(2));
+        assert!(report.checks.iter().all(|check| check.ok));
+        let rpc: Value = serde_json::from_str(&server.requests()[1].body).unwrap();
+        assert_eq!(rpc["payload"]["type"], "message.dispatch");
+        assert_ne!(rpc["payload"]["threadId"], T3_THREAD_ID);
+        assert_eq!(fixture.revocations(), ["fake-session"]);
+    }
+
+    #[test]
+    fn v2_probe_flags_a_rejected_websocket_protocol() {
+        if !curl_available() {
+            return;
+        }
+        let rejected = FakeResponse::http(
+            426,
+            &json!({ "code": "orchestration_protocol_incompatible", "orchestrationProtocolVersion": 3 }),
+        );
+        let server = FakeT3Server::start(Some(2), vec![ticket(), rejected]);
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture.v2_state();
+
+        let report = probe(&fixture.env);
+
+        assert_eq!(report.status, ProbeStatus::Changed);
+        assert_eq!(
+            report.fingerprint().as_deref(),
+            Some(
+                "dispatch: WebSocket upgrade returned HTTP 426; T3 no longer accepts orchestration protocol 2"
+            )
+        );
+    }
+
+    #[test]
+    fn unsupported_protocol_is_an_api_change() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(3), Vec::new());
+        let fixture = Fixture::new(Some(&server), true, live_pid());
+
+        let report = probe(&fixture.env);
+
+        assert_eq!(report.status, ProbeStatus::Changed);
+        assert_eq!(
+            report.fingerprint().as_deref(),
+            Some("protocol: server speaks unsupported orchestration protocol 3")
+        );
+        assert!(matches!(
+            wake_thread(&fixture.env, claude_thread(), "message"),
+            WakeOutcome::ApiChanged(_)
+        ));
     }
 
     #[test]
@@ -1605,17 +1621,6 @@ mod tests {
 
         assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn typed_404_drops_trace_id_from_refusal_detail() {
-        let error = classify_typed_404(
-            r#"{"_tag":"SomeT3Error","reason":"thread_closed","traceId":"secret-trace"}"#,
-            "thread snapshot",
-        );
-        assert!(
-            matches!(error, ApiFailure::Refused(detail) if detail == "thread snapshot returned typed T3 error SomeT3Error: thread_closed")
-        );
     }
 
     #[test]

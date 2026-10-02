@@ -104,12 +104,22 @@ the source route to reply.
 The receiver delivers the line in one of three ways:
 
 - A live Claude Code session gets it as its next user turn through its
-  messaging socket.
+  messaging socket. When a T3 Code thread on the V2 orchestrator owns the
+  session, T3 takes the message instead so the thread shows it, and the socket
+  is the fallback.
 - A Claude Code session with no live process gets it as a new turn in the T3
-  Code thread that owns the session. T3 Code runs no Claude process between
-  turns, so this is the usual case for an idle T3 session. If no T3 thread owns
-  the session, the send fails with `message_delivery_failed`.
-- A Codex thread gets it through `codex queue`.
+  Code thread that owns the session. T3 Code before V2 runs no Claude process
+  between turns, so this is the usual case for an idle T3 session there. If no
+  T3 thread owns the session, the send fails with `message_delivery_failed`.
+- A Codex thread that a T3 Code thread owns gets it as a new turn in that
+  thread, so T3 shows it. If T3 cannot take it, or no T3 thread owns the Codex
+  thread, it goes through `codex queue`.
+
+An archived T3 thread is unarchived before the turn. If T3 may have taken the
+message but its reply was lost, the send fails with `message_delivery_failed`,
+and a retry with the same `--message-id` goes only through T3, which drops the
+repeat. With T3 unreachable, that retry keeps failing instead of sending a
+second copy another way.
 
 `--reply-to <message-uuid>` links a reply to an earlier message. Use
 `--conversation <uuid>` to set a shared conversation UUID. By default, the

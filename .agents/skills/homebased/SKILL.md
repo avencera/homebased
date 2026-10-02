@@ -10,7 +10,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 ## Rules that hold everywhere
 
 - Never run `codex queue` yourself, never write to a Claude Code messaging socket yourself, and never tell a worker to do either. Delivery belongs to `homebased`.
-- A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`.
+- A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`. When a T3 Code thread owns the session or Codex thread, the daemon starts the turn through T3 instead, so the thread shows it; [messages.md](references/messages.md) has the exact rules.
 - Submit through the daemon on the machine that owns the Codex thread. To run the child elsewhere, enable Fleet and set `machine` in the JSON spec. The submitting machine remains the origin and sends callbacks to the original thread; the selected Fleet machine executes the child.
 - Put task fields in the JSON spec and submit with `homebased task submit --spec <file|->`. Use `--request-id <uuid>` when a caller needs a stable retry identity.
 - Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
