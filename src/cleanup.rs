@@ -5,6 +5,9 @@
 //! carries the run's `HOMEBASED_TASK_ID` in its environment, so a sweep reads
 //! every process's environment and stops the ones that carry the marker.
 //!
+//! Same-user processes with unreadable environments that started at or after
+//! the workload start hold cleanup for a person to check, but are never signalled
+//!
 //! Cleanup reports whether attributable cleanup completed. It is not proof
 //! that a GPU is free: a process with a cleared environment, another user's
 //! process, or an Apple platform binary (which exposes an empty environment on
@@ -48,8 +51,8 @@ use macos as os;
 /// Kernel start time of a process, in an OS-specific unit
 ///
 /// macOS reports microseconds since the epoch and Linux reports clock ticks
-/// since boot. Values are compared only for equality on the same machine, to
-/// tell a process apart from a later one that reused its PID
+/// since boot. Compare values only on the same machine and in the same OS unit,
+/// to identify a process or to bound when run descendants could have started
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -155,6 +158,11 @@ pub enum CleanupFailure {
         /// Remaining targets
         survivors: Vec<ProcessIdentity>,
     },
+    /// Same-user processes started during the run, but their markers could not be read
+    UnreadableSuspects {
+        /// Processes that need a person to check their PID and kernel start time
+        suspects: Vec<ProcessIdentity>,
+    },
     /// A protected process, such as the daemon or a task worker, carried the
     /// marker; it was never signalled
     ProtectedCarriesMarker {
@@ -227,6 +235,14 @@ impl fmt::Display for CleanupFailure {
             Self::TargetsSurvived { survivors } => {
                 write!(f, "{} marked processes survived SIGKILL", survivors.len())
             }
+            Self::UnreadableSuspects { suspects } => {
+                write!(f, "could not read run markers; check same-user processes")?;
+                for suspect in suspects {
+                    write!(f, "; {suspect}")?;
+                }
+
+                Ok(())
+            }
             Self::ProtectedCarriesMarker { pids } => {
                 write!(f, "protected processes {pids:?} carry the run marker")
             }
@@ -247,7 +263,7 @@ impl fmt::Display for CleanupFailure {
 /// What a marker sweep established
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SweepOutcome {
-    /// No attributable process carries the marker any more
+    /// No attributable process carries the marker and no unreadable suspect remains
     Completed {
         /// Targets that were sent at least one signal
         signalled: Vec<ProcessIdentity>,
@@ -283,15 +299,20 @@ pub enum GroupOutcome {
 /// [`CleanupTiming::rounds`] rounds or [`CleanupTiming::deadline`]. Rescans
 /// catch descendants that appeared during cleanup. A process in `protected`,
 /// and this process, are never signalled; if one carries the marker the
-/// outcome is incomplete
+/// outcome is incomplete. With `run_start`, a same-user process whose environment
+/// read is refused and whose start is at or after that bound prevents an empty
+/// confirmation. Such suspects are never signalled and are reported incomplete
+/// if they remain at the cleanup bound. `run_start` must be the recorded workload
+/// child's kernel start time on this machine. `None` ignores unreadable processes
 #[must_use]
 pub fn sweep_marker(
     marker: TaskId,
+    run_start: Option<ProcessStartTime>,
     protected: &BTreeSet<Pid>,
     timing: CleanupTiming,
 ) -> SweepOutcome {
     match SystemProcesses::new() {
-        Ok(mut source) => sweep_marker_with(&mut source, marker, protected, timing),
+        Ok(mut source) => sweep_marker_with(&mut source, marker, run_start, protected, timing),
         Err(error) => SweepOutcome::Incomplete(CleanupFailure::EnumerationFailed {
             message: error.to_string(),
         }),
@@ -322,10 +343,11 @@ pub fn cleanup_lost_group(
 pub(crate) fn sweep_marker_with<S: ProcessSource>(
     source: &mut S,
     marker: TaskId,
+    run_start: Option<ProcessStartTime>,
     protected: &BTreeSet<Pid>,
     timing: CleanupTiming,
 ) -> SweepOutcome {
-    let mut sweeper = Sweeper::new(source, marker, protected, timing);
+    let mut sweeper = Sweeper::new(source, marker, run_start, protected, timing);
     let result = sweeper.sweep();
     let signalled: Vec<_> = sweeper.signalled.iter().copied().collect();
     if let Err(failure) = result {
@@ -352,7 +374,7 @@ pub(crate) fn cleanup_lost_group_with<S: ProcessSource>(
     protected: &BTreeSet<Pid>,
     timing: CleanupTiming,
 ) -> GroupOutcome {
-    let mut sweeper = Sweeper::new(source, marker, protected, timing);
+    let mut sweeper = Sweeper::new(source, marker, None, protected, timing);
     match sweeper.lost_group(leader) {
         Ok(attribution) => GroupOutcome::Completed(attribution),
         Err(failure) => {
@@ -481,10 +503,18 @@ impl ProcessSource for SystemProcesses {
     }
 }
 
-/// Marked processes seen by one scan, keyed by PID
+/// What a live process's environment establishes about the run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    Marked(ProcessIdentity),
+    Suspect(ProcessIdentity),
+}
+
+/// Marked targets and unreadable suspects seen by one scan
 #[derive(Debug, Default)]
 struct Scan {
     targets: BTreeMap<Pid, ProcessIdentity>,
+    suspects: BTreeSet<ProcessIdentity>,
     confirmed_empty: bool,
 }
 
@@ -502,6 +532,7 @@ struct Sweeper<'a, S> {
     source: &'a mut S,
     marker: TaskId,
     marker_value: Vec<u8>,
+    run_start: Option<ProcessStartTime>,
     protected: BTreeSet<Pid>,
     timing: CleanupTiming,
     own_uid: u32,
@@ -516,6 +547,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     fn new(
         source: &'a mut S,
         marker: TaskId,
+        run_start: Option<ProcessStartTime>,
         protected: &BTreeSet<Pid>,
         timing: CleanupTiming,
     ) -> Self {
@@ -526,6 +558,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             source,
             marker,
             marker_value: marker.to_string().into_bytes(),
+            run_start,
             protected,
             timing,
             own_uid: geteuid().as_raw(),
@@ -572,6 +605,11 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         if scan.is_clear() && Instant::now() < deadline {
             return Ok(());
         }
+        if !scan.suspects.is_empty() {
+            return Err(CleanupFailure::UnreadableSuspects {
+                suspects: scan.suspects.iter().copied().collect(),
+            });
+        }
         if scan.targets.is_empty() {
             return Err(CleanupFailure::EmptyUnconfirmed);
         }
@@ -616,7 +654,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
                 return false;
             }
         };
-        if self.observe(target.pid) != Some(target) {
+        if self.observe(target.pid) != Some(Observation::Marked(target)) {
             info!(marker = %self.marker, %target, "Skipped {signal}: identity or marker changed");
             return false;
         }
@@ -639,9 +677,15 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             })?;
         let mut scan = Scan::default();
         for pid in pids {
-            let Some(identity) = self.observe(pid) else {
-                continue;
+            let identity = match self.observe(pid) {
+                Some(Observation::Marked(identity)) => identity,
+                Some(Observation::Suspect(identity)) => {
+                    scan.suspects.insert(identity);
+                    continue;
+                }
+                None => continue,
             };
+
             if self.protected.contains(&pid) {
                 if self.protected_hits.insert(pid) {
                     warn!(marker = %self.marker, %pid, "Protected process carries the run marker");
@@ -657,7 +701,9 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         // machine short-lived processes exit during every scan. A chain of
         // marked processes that each fork and exit within every poll can
         // still escape
-        if !scan.targets.is_empty() {
+        // unreadable suspects cannot prove an empty scan, but they remain
+        // separate from targets because their marker cannot authorize a signal
+        if !scan.targets.is_empty() || !scan.suspects.is_empty() {
             self.empty_since = None;
         } else {
             let now = Instant::now();
@@ -669,8 +715,8 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         Ok(scan)
     }
 
-    /// Identity of `pid` if it is live and its readable environment carries the marker
-    fn observe(&mut self, pid: Pid) -> Option<ProcessIdentity> {
+    /// A live marked target or a same-user unreadable suspect within the run bound
+    fn observe(&mut self, pid: Pid) -> Option<Observation> {
         let info = match self.source.info(pid) {
             Read::Found(info) if !info.zombie => info,
             Read::Found(_) | Read::Exited(_) | Read::Gone | Read::Refused(_) => return None,
@@ -679,8 +725,9 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             Read::Found(environment) => environment,
             Read::Exited(_) | Read::Gone => return None,
             Read::Refused(errno) => {
-                self.note_refusal(pid, info, errno);
-                return None;
+                return self
+                    .note_refusal(pid, info, errno)
+                    .map(Observation::Suspect);
             }
         };
         // the identity must still hold after the environment read, or the
@@ -688,10 +735,10 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         if !self.still_same(pid, info) || !environment.carries(&self.marker_value) {
             return None;
         }
-        Some(ProcessIdentity {
+        Some(Observation::Marked(ProcessIdentity {
             pid,
             start: info.start,
-        })
+        }))
     }
 
     fn still_same(&mut self, pid: Pid, info: ProcessInfo) -> bool {
@@ -701,13 +748,29 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         }
     }
 
-    /// Other users' processes are out of scope; a same-user refusal is unexpected
-    fn note_refusal(&mut self, pid: Pid, info: ProcessInfo, errno: Errno) {
+    /// Warn once per same-user refusal and identify suspects within the run bound
+    fn note_refusal(
+        &mut self,
+        pid: Pid,
+        info: ProcessInfo,
+        errno: Errno,
+    ) -> Option<ProcessIdentity> {
         // a refused environment read can also mean the process vanished
-        if !self.still_same(pid, info) || info.uid != self.own_uid || !self.warned.insert(pid) {
-            return;
+        if !self.still_same(pid, info) || info.uid != self.own_uid {
+            return None;
         }
-        warn!(marker = %self.marker, %pid, "Same-user environment read refused: {errno}");
+        if self.warned.insert(pid) {
+            warn!(marker = %self.marker, %pid, "Same-user environment read refused: {errno}");
+        }
+
+        // older processes cannot be run descendants; long-lived agents may
+        // deny environment reads, so they must not hold a later run's resource
+        self.run_start
+            .filter(|start| info.start >= *start)
+            .map(|_| ProcessIdentity {
+                pid,
+                start: info.start,
+            })
     }
 
     fn lost_group(&mut self, leader: ProcessIdentity) -> Result<GroupAttribution, CleanupFailure> {
@@ -767,7 +830,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             return Ok(Some(GroupAttribution::Leader));
         }
         for member in members {
-            if let Some(identity) = self.observe(member) {
+            if let Some(Observation::Marked(identity)) = self.observe(member) {
                 return Ok(Some(GroupAttribution::MarkedMember(identity)));
             }
         }

@@ -439,7 +439,12 @@ fn cleanup_run(row: &TaskRow, protected: &BTreeSet<Pid>) -> Result<(), CleanupFa
     } else if row.process_group_exit_evidence == ProcessGroupExitEvidence::Unconfirmed {
         return Err(CleanupFailure::ProcessGroupUnconfirmed);
     }
-    match cleanup::sweep_marker(row.id, protected, CleanupTiming::STANDARD) {
+    match cleanup::sweep_marker(
+        row.id,
+        row.child.map(|child| child.start),
+        protected,
+        CleanupTiming::STANDARD,
+    ) {
         SweepOutcome::Completed { .. } => Ok(()),
         SweepOutcome::Incomplete(failure) => Err(failure.into()),
     }

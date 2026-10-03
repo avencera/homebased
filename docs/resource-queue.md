@@ -55,6 +55,10 @@ The web listener serves queue reads and move, cancel, and release. Job submit an
 
 `Attention` means Homebased could not finish cleanup safely. The resource stays held until a person checks the machine and releases that exact Attention UUID. Other resources can continue to serve work. A job result does not prove that its resource is clear.
 
+If a same-user process started at or after the run's recorded workload start and its environment cannot be read, cleanup treats it as a suspect. It is never signalled without a readable run marker. Its scan is not empty. If it remains unreadable at the cleanup bound, the resource enters `Attention`; the cleanup message names its PID and kernel start time. Check that exact process on the authority machine. Unreadable processes that started before the run, and unreadable processes under another user, are ignored. If the workload start was not recorded, unreadable processes are ignored as before.
+
+Cleanup cannot reliably find work with a cleared environment, work under another user, or Apple platform binaries in a new session. A successful cleanup does not prove that these processes are absent.
+
 1. Read resource list with `--json`. Save the resource, task, and Attention UUID from the active run phase. Read job show for cleanup details and the last stop cause.
 2. On the authority machine, inspect processes and GPU use. On Linux, read `nvidia-smi` output. On macOS, use Activity Monitor and inspect the run's processes. Inspect Docker containers for container runs.
 3. Read the run logs. Find and stop remaining work from the run. Check for work passed to another user, session, server, service manager, or remote machine. Homebased cannot reliably attribute these escapes.

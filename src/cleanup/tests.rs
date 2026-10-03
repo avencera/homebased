@@ -298,7 +298,7 @@ fn sweep_kills_marked_processes_that_left_the_group_and_spares_others() {
     let unmarked = spawned.start(helper_command("sleep", None).new_session(), None);
     let other_run = spawned.start(&mut helper_command("sleep", None), Some(TaskId::new()));
 
-    let outcome = sweep_marker(marker, &BTreeSet::new(), FAST);
+    let outcome = sweep_marker(marker, None, &BTreeSet::new(), FAST);
 
     let signalled = signalled(&outcome);
     assert!(signalled.contains(&daemon), "{outcome:?}");
@@ -329,7 +329,7 @@ fn rescans_catch_a_descendant_created_during_cleanup() {
         .map(|identity| identity.pid)
         .collect();
 
-    let outcome = sweep_marker(marker, &BTreeSet::new(), FAST);
+    let outcome = sweep_marker(marker, None, &BTreeSet::new(), FAST);
 
     spawned.reap(spawner.pid);
     let signalled = signalled(&outcome);
@@ -362,7 +362,7 @@ fn protected_process_with_the_marker_is_reported_and_never_signalled() {
     let protected = spawned.start(&mut helper_command("sleep", None), Some(marker));
     let other = spawned.start(&mut helper_command("sleep", None), Some(marker));
 
-    let outcome = sweep_marker(marker, &BTreeSet::from([protected.pid]), FAST);
+    let outcome = sweep_marker(marker, None, &BTreeSet::from([protected.pid]), FAST);
 
     assert_eq!(
         outcome,
@@ -446,7 +446,7 @@ fn identity_change_between_scan_and_signal_skips_the_signal() {
         sent: Vec::new(),
     };
 
-    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), FAST);
+    let outcome = sweep_marker_with(&mut source, marker, None, &BTreeSet::new(), FAST);
 
     assert!(source.reused, "the sweep must have found the target");
     assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
@@ -488,7 +488,7 @@ impl ProcessSource for Unreadable {
 #[test]
 fn failed_enumeration_is_incomplete_not_empty() {
     let marker = TaskId::new();
-    let outcome = sweep_marker_with(&mut Unreadable, marker, &BTreeSet::new(), FAST);
+    let outcome = sweep_marker_with(&mut Unreadable, marker, None, &BTreeSet::new(), FAST);
     assert!(matches!(
         outcome,
         SweepOutcome::Incomplete(CleanupFailure::EnumerationFailed { .. })
@@ -503,6 +503,163 @@ fn failed_enumeration_is_incomplete_not_empty() {
         outcome,
         GroupOutcome::Incomplete(CleanupFailure::EnumerationFailed { .. })
     ));
+}
+
+/// A live process whose environment is refused, with an optional exit on a later scan
+struct RefusedEnvironment {
+    identity: ProcessIdentity,
+    uid: u32,
+    scans: u32,
+    exit_on_scan: Option<u32>,
+}
+
+impl ProcessSource for RefusedEnvironment {
+    type Handle = Pid;
+
+    fn list(&mut self) -> io::Result<Vec<Pid>> {
+        self.scans += 1;
+        Ok(vec![self.identity.pid])
+    }
+
+    fn info(&mut self, _: Pid) -> Read<ProcessInfo> {
+        if self.exit_on_scan.is_some_and(|scan| self.scans >= scan) {
+            return Read::Gone;
+        }
+
+        Read::Found(ProcessInfo {
+            start: self.identity.start,
+            pgid: self.identity.pid,
+            uid: self.uid,
+            zombie: false,
+        })
+    }
+
+    fn environment(&mut self, _: Pid) -> Read<Environment> {
+        Read::Refused(Errno::EPERM)
+    }
+
+    fn pin(&mut self, _: Pid) -> Read<Pid> {
+        panic!("an unreadable process must never be a signal target")
+    }
+
+    fn send(&mut self, _: &Pid, _: Signal) -> Result<(), Errno> {
+        panic!("an unreadable process must never be signalled")
+    }
+
+    fn send_group(&mut self, _: Pid, _: Signal) -> Result<(), Errno> {
+        panic!("a marker sweep must never signal a group")
+    }
+}
+
+const REFUSAL_TIMING: CleanupTiming = CleanupTiming {
+    term_grace: Duration::from_millis(50),
+    kill_grace: Duration::from_millis(50),
+    poll: Duration::from_millis(1),
+    rounds: 1,
+    deadline: Duration::from_secs(2),
+};
+
+#[test]
+fn unreadable_environment_rules_use_run_start_and_user() {
+    let own_uid = nix::unistd::geteuid().as_raw();
+    let run_start = ProcessStartTime(100);
+    let cases = [
+        ("after run start", own_uid, 101, Some(run_start), true),
+        ("at run start", own_uid, 100, Some(run_start), true),
+        ("before run start", own_uid, 99, Some(run_start), false),
+        (
+            "other user",
+            own_uid.wrapping_add(1),
+            101,
+            Some(run_start),
+            false,
+        ),
+        ("no run start", own_uid, 101, None, false),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    // check both the round bound and the deadline without skipping compatibility cases
+    for timing in [
+        REFUSAL_TIMING,
+        CleanupTiming {
+            rounds: 3,
+            term_grace: Duration::from_secs(2),
+            deadline: Duration::from_secs(1),
+            ..REFUSAL_TIMING
+        },
+    ] {
+        for (name, uid, start, bound, suspect) in cases {
+            let identity = ProcessIdentity {
+                pid: Pid::from_raw(12345),
+                start: ProcessStartTime(start),
+            };
+            let mut source = RefusedEnvironment {
+                identity,
+                uid,
+                scans: 0,
+                exit_on_scan: None,
+            };
+            let outcome =
+                sweep_marker_with(&mut source, TaskId::new(), bound, &BTreeSet::new(), timing);
+            actual.push((name, outcome));
+            expected.push((
+                name,
+                if suspect {
+                    SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects {
+                        suspects: vec![identity],
+                    })
+                } else {
+                    SweepOutcome::Completed { signalled: vec![] }
+                },
+            ));
+        }
+    }
+
+    assert_eq!(actual, expected);
+
+    let SweepOutcome::Incomplete(failure) = &actual[0].1 else {
+        panic!("the newer same-user process must need Attention");
+    };
+    let queue_failure = crate::queue::CleanupFailure::from(failure.clone());
+    let message = queue_failure.to_string();
+    assert!(message.contains("pid 12345 started 101"), "{message}");
+    let encoded = serde_json::to_value(&queue_failure).unwrap();
+    assert_eq!(encoded["failure"]["kind"], "unreadable_suspects");
+    assert_eq!(encoded["failure"]["suspects"][0]["pid"], 12345);
+    assert_eq!(encoded["failure"]["suspects"][0]["start"], 101);
+    assert_eq!(
+        serde_json::from_value::<crate::queue::CleanupFailure>(encoded).unwrap(),
+        queue_failure
+    );
+}
+
+#[test]
+fn unreadable_suspect_exit_requires_two_new_empty_scans() {
+    let mut source = RefusedEnvironment {
+        identity: ProcessIdentity {
+            pid: Pid::from_raw(12345),
+            start: ProcessStartTime(101),
+        },
+        uid: nix::unistd::geteuid().as_raw(),
+        scans: 0,
+        exit_on_scan: Some(4),
+    };
+    let outcome = sweep_marker_with(
+        &mut source,
+        TaskId::new(),
+        Some(ProcessStartTime(100)),
+        &BTreeSet::new(),
+        CleanupTiming {
+            poll: Duration::from_millis(1),
+            ..FAST
+        },
+    );
+    assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
+    assert!(
+        source.scans >= 5,
+        "cleanup finished after {} scans, before the suspect exited and two empty scans followed",
+        source.scans
+    );
 }
 
 #[test]
@@ -607,7 +764,7 @@ fn apple_platform_binary_exposes_an_empty_environment() {
 
     let mut source = SystemProcesses::new().unwrap();
     let environment = source.environment(pid);
-    let outcome = sweep_marker(marker, &BTreeSet::new(), FAST);
+    let outcome = sweep_marker(marker, None, &BTreeSet::new(), FAST);
     let alive = process_identity(pid).is_ok();
     let _ = child.kill();
     let _ = child.wait();
@@ -710,7 +867,7 @@ fn review_fix_cleanup_rescans_a_parent_that_forks_then_exits() {
         poll: Duration::from_millis(1),
         ..FAST
     };
-    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), timing);
+    let outcome = sweep_marker_with(&mut source, marker, None, &BTreeSet::new(), timing);
     assert!(matches!(outcome, SweepOutcome::Completed { .. }));
     assert_eq!(source.sent, vec![Pid::from_raw(12346)]);
     assert!(!source.alive);
@@ -737,7 +894,7 @@ fn cleanup_finishes_while_listed_processes_keep_exiting() {
         poll: Duration::from_millis(1),
         ..FAST
     };
-    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), timing);
+    let outcome = sweep_marker_with(&mut source, marker, None, &BTreeSet::new(), timing);
     assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
     assert!(source.sent.is_empty());
 }
