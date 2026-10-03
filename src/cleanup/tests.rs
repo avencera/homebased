@@ -163,6 +163,11 @@ impl Spawned {
 
     /// Start a helper, marked with `marker` when given, and return its identity
     fn start(&mut self, command: &mut Command, marker: Option<TaskId>) -> ProcessIdentity {
+        wait_for_identity(self.launch(command, marker))
+    }
+
+    /// Start a helper without waiting for it, for one that may exit at once
+    fn launch(&mut self, command: &mut Command, marker: Option<TaskId>) -> Pid {
         match marker {
             Some(marker) => command.env(run_env::TASK_ID, marker.to_string()),
             None => command.env_remove(run_env::TASK_ID),
@@ -170,7 +175,7 @@ impl Spawned {
         let child = command.spawn().unwrap();
         let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
         self.children.push(child);
-        wait_for_identity(pid)
+        pid
     }
 
     /// Wait until `pidfile` lists `count` PIDs and track each one
@@ -284,9 +289,11 @@ fn sweep_kills_marked_processes_that_left_the_group_and_spares_others() {
     let (mut spawned, pidfile) = Spawned::new();
 
     // a double-forked daemon: its parent exits, leaving it in a new session
-    let parent = spawned.start(&mut helper_command("escape", Some(&pidfile)), Some(marker));
+    // the parent exits as soon as it records the orphan, so it can be a zombie
+    // before its identity is read; only the orphan matters here
+    let parent = spawned.launch(&mut helper_command("escape", Some(&pidfile)), Some(marker));
     let daemon = spawned.recorded(&pidfile, 1)[0];
-    spawned.reap(parent.pid);
+    spawned.reap(parent);
     let detached = spawned.start(helper_command("sleep", None).new_session(), Some(marker));
     let unmarked = spawned.start(helper_command("sleep", None).new_session(), None);
     let other_run = spawned.start(&mut helper_command("sleep", None), Some(TaskId::new()));

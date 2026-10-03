@@ -65,7 +65,9 @@ impl Daemon {
             port: 0,
             listen_host: host.to_string(),
             mdns,
-            codex_override: None,
+            // submit resolves `codex` for the callback even when no test reads
+            // the callback, and CI hosts have no `codex`, so default to a no-op
+            codex_override: Some(PathBuf::from("/usr/bin/true")),
             child: None,
         };
         daemon.write_config(name, fleet);
