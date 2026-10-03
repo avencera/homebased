@@ -166,6 +166,14 @@ fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, String, usize)> {
     Some((request, path, header_end))
 }
 
+/// Why a daemon start did not become ready
+enum Launch {
+    /// Another process bound the chosen port first
+    PortTaken,
+    /// The daemon exited for another reason or never answered
+    NotReady(String),
+}
+
 impl Daemon {
     fn start(name: &str) -> Self {
         let dir = TempDir::new().unwrap();
@@ -213,7 +221,7 @@ impl Daemon {
             address,
             child: None,
         };
-        daemon.spawn();
+        daemon.start_on_free_port();
         daemon
     }
 
@@ -236,7 +244,34 @@ impl Daemon {
         command
     }
 
+    /// First start of a daemon on a port from `free_port`
+    ///
+    /// Another test's process can bind that port between `free_port` releasing
+    /// it and this daemon binding it, so a start that fails with the address in
+    /// use retries on a fresh port. Restarts go through `spawn` and keep their
+    /// address, because peers already point at it
+    fn start_on_free_port(&mut self) {
+        for _ in 0..3 {
+            match self.launch() {
+                Ok(()) => return,
+                Err(Launch::PortTaken) => {
+                    self.address = format!("127.0.0.1:{}", free_port());
+                }
+                Err(Launch::NotReady(message)) => panic!("{message}"),
+            }
+        }
+        panic!("daemon found no free port after 3 attempts");
+    }
+
     fn spawn(&mut self) {
+        match self.launch() {
+            Ok(()) => {}
+            Err(Launch::PortTaken) => panic!("daemon port {} is taken", self.address),
+            Err(Launch::NotReady(message)) => panic!("{message}"),
+        }
+    }
+
+    fn launch(&mut self) -> Result<(), Launch> {
         let log = self.state_home.join("daemon-stderr.log");
         let child = self
             .command()
@@ -247,18 +282,27 @@ impl Daemon {
             .spawn()
             .unwrap();
         self.child = Some(child);
-        if wait_until(Duration::from_secs(10), || self.http_ready()) {
-            return;
+        let mut exited = None;
+        let ready = wait_until(Duration::from_secs(10), || {
+            exited = self
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten());
+            exited.is_none() && self.http_ready()
+        });
+        if ready {
+            return Ok(());
         }
 
-        // say whether the daemon exited, for example on a port another test took,
-        // or is still starting, so an intermittent failure carries its cause
-        let exited = self.child.as_mut().map(Child::try_wait);
         let stderr = fs::read_to_string(&log).unwrap_or_default();
-        panic!(
+        if exited.is_some() && stderr.contains("Address already in use") {
+            self.child = None;
+            return Err(Launch::PortTaken);
+        }
+        Err(Launch::NotReady(format!(
             "daemon on {} was not ready after 10s; exit status: {exited:?}\n{stderr}",
             self.address
-        );
+        )))
     }
 
     fn http_ready(&self) -> bool {
