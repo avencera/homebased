@@ -10,7 +10,7 @@ homebased --json task list --status running,queued         # in flight
 homebased --quiet task list --status running               # bare ids, one per line
 ```
 
-Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
+Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
 
 Each entry: `id`, `name`, `display_name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `display_name`. `name` is omitted only for tasks stored before it was required.
 
@@ -77,7 +77,9 @@ curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit and cancel are refused there with 405; they belong to the Unix socket. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
+
+A queue run can be `preempted` while its job waits to resume. Use [resource-queue.md](resource-queue.md) to inspect the job and its run history. Run task IDs cannot be used in `after`.
 
 ## Task directory
 

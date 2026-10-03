@@ -1,5 +1,7 @@
 # Submit a task
 
+For GPU work, use [resource-queue.md](resource-queue.md) instead of `task submit`. Run task UUIDs from jobs cannot be used in `after`. Job dependencies are not supported.
+
 ## 1. Find the thread id
 
 The spec needs the UUID of the Codex thread or Claude Code session that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the thread.

@@ -85,3 +85,21 @@ Claude Code delivery uses an internal Claude Code socket protocol, not a public 
 | `message_receiver_unavailable` | 1, retryable | The receiver could not inspect local Codex session metadata. | Check the receiver's session files and retry. |
 | `message_invalid` | 2 | A message, UUID, or receiver-side `cwd` failed validation. | Fix the reported value. |
 | `message_to_self` | 2 | The selected destination is the source thread, or a `--worker` destination is the source task's own worker. A `--task` destination resolves to its origin thread, not its worker. | Choose a different source or destination. Use `--worker` for a running Claude worker, or `homebased task followup` to resume a finished Codex worker. |
+
+## Queue errors
+
+| Code | Exit | Do this |
+| --- | --- | --- |
+| `invalid_queue_input` | 2 | Fix the full UUID, level, resource name, step count, or restart window. |
+| `move_refused` | 2 | Give one valid placement. Check target existence, state, and level. |
+| `job_not_found` | 3 | Check the full job UUID and authority machine. |
+| `resource_not_found` | 3 | Read resource list on the target machine. |
+| `attention_not_found` | 3 | Refresh resource list. Do not release a different Attention without another machine check. |
+| `job_terminal` | 5 | Read the result. Submit a new job only for new work. |
+| `job_conflict` | 5 | Restore the original spec for this job UUID. Use a new UUID for a different job. |
+| `operation_conflict` | 5 | Restore the original operation content. Use a new UUID for a new action. |
+| `resource_conflict` | 5 | Use the existing resource. Names and device indices must be unique. |
+| `stale_run` | 5 | Refresh job and resource state. Do not act on an old run. |
+| `internal` | 1 | Keep the error and state evidence. Ask the operator to check it. Do not edit the database. |
+
+See [resource-queue.md](resource-queue.md) for job and operation retry identities. A run task in `after` returns `usage` (exit 2). Wait for the job result and submit once its inputs are ready.

@@ -13,6 +13,10 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 [Ask your agent to install it](#for-agents), or follow the [manual install steps](#install). Homebased runs on Linux and macOS.
 
+## GPU priority queue
+
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
+
 ## For agents
 
 Tell an agent to install this:
