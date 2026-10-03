@@ -435,7 +435,7 @@ async fn apply_exit(
     let id = row.id;
     let paths = actor.home.task_paths(id);
     let worker_thread = runner::worker_thread(&row, &paths);
-    let cas = call(&actor.store, |reply| StoreMsg::CasExitWithWorkerThread {
+    let cas = call(&actor.store, |reply| StoreMsg::CasExit {
         id,
         from: row.status(),
         reason: reason.clone(),

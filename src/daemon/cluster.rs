@@ -17,7 +17,7 @@ use crate::events::{EventAcceptance, TaskEvent};
 use crate::fleet::advertisement::{MACHINE_PROBE_PATH, MachineAdvertisement};
 use crate::fleet::protocol::{ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS};
 use crate::fleet::runtime::FleetHandle;
-use crate::invocation::{StdinPolicy, invocation_from_normalized_for_identity};
+use crate::invocation::{StdinPolicy, invocation_from_normalized};
 use crate::machine::MachineId;
 use crate::message::{MessageRequest, MessageResponse};
 use crate::spec::{self, NormalizedSpec};
@@ -447,7 +447,7 @@ async fn preview_execution(
     })?;
     let env = TaskEnv::capture();
     let feed = state.home.root().join("tasks/<task-id>/prompt.feed.txt");
-    let invocation = invocation_from_normalized_for_identity(
+    let invocation = invocation_from_normalized(
         &spec.workload,
         &env.path,
         &cwd,
@@ -618,7 +618,7 @@ async fn submit_execution(
     let cwd = cwd?;
     let env = TaskEnv::capture();
     let feed = state.home.task_paths(body.task).feed;
-    let binary = invocation_from_normalized_for_identity(
+    let binary = invocation_from_normalized(
         &spec.workload,
         &env.path,
         &cwd,

@@ -709,7 +709,7 @@ fn report(
         }
     };
     let store = Store::open(&ctx.home.db_path())?;
-    let reports = store.append_report_with_notification(id, outcome, &summary, notify)?;
+    let reports = store.append_report(id, outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
     let row = store.require_task(id)?;
     let last_event = match (notify, reports.last()) {

@@ -27,31 +27,12 @@ pub struct AgentArgvInputs<'a> {
     pub resume_thread: Option<ThreadId>,
 }
 
-/// Build unattended argv for an agent workload.
+/// Build unattended argv for an agent workload with the task identity and
+/// inherited child policy.
 ///
 /// `prompt_feed` is always the evidence-path feed file. Codex, Claude, and
 /// OpenCode read it from stdin; Grok takes it as `--prompt-file`.
-#[must_use]
 pub fn build_agent_invocation(
-    inputs: AgentArgvInputs<'_>,
-    binary: &Path,
-    prompt_feed: &Path,
-) -> ChildInvocation {
-    if inputs.kind == AgentKind::OpenCode {
-        let identity = TaskIdentity::Preview;
-        return build_opencode_invocation_with_config(
-            inputs,
-            binary,
-            prompt_feed,
-            identity,
-            generated_opencode_config(&identity.opencode_agent_name()),
-        );
-    }
-    build_standard_agent_invocation(inputs, binary, prompt_feed, TaskIdentity::Preview)
-}
-
-/// Build an agent invocation with the identity and inherited child policy.
-pub fn build_agent_invocation_for_identity(
     inputs: AgentArgvInputs<'_>,
     binary: &Path,
     prompt_feed: &Path,
@@ -428,16 +409,6 @@ fn compose_opencode_config(
     Ok(OpenCodeConfig { value })
 }
 
-fn generated_opencode_config(generated_agent: &str) -> OpenCodeConfig {
-    let mut root = serde_json::Map::new();
-    let mut agents = serde_json::Map::new();
-    agents.insert(generated_agent.to_string(), generated_agent_value());
-    root.insert("agent".into(), Value::Object(agents));
-    OpenCodeConfig {
-        value: Value::Object(root),
-    }
-}
-
 fn generated_agent_value() -> Value {
     json!({
         "mode": "primary",
@@ -490,6 +461,26 @@ mod tests {
 
     use super::*;
 
+    /// Preview argv without the extra-args check, as tests build rows the
+    /// submit rules would refuse
+    fn preview_invocation(
+        inputs: AgentArgvInputs<'_>,
+        binary: &Path,
+        prompt_feed: &Path,
+    ) -> ChildInvocation {
+        if inputs.kind == AgentKind::OpenCode {
+            let identity = TaskIdentity::Preview;
+            return build_opencode_invocation_with_config(
+                inputs,
+                binary,
+                prompt_feed,
+                identity,
+                compose_opencode_config(None, &identity.opencode_agent_name()).unwrap(),
+            );
+        }
+        build_standard_agent_invocation(inputs, binary, prompt_feed, TaskIdentity::Preview)
+    }
+
     fn build(kind: AgentKind, feed: &Path) -> ChildInvocation {
         let extra = vec!["--verbose".into()];
         build_with_extra(kind, Some("fable"), feed, &extra)
@@ -501,7 +492,7 @@ mod tests {
         feed: &Path,
         extra_args: &[String],
     ) -> ChildInvocation {
-        build_agent_invocation(
+        preview_invocation(
             AgentArgvInputs {
                 kind,
                 model,
@@ -533,7 +524,7 @@ mod tests {
         identity: TaskIdentity,
         inherited: Option<&str>,
     ) -> Result<ChildInvocation, AppError> {
-        build_agent_invocation_for_identity(
+        build_agent_invocation(
             AgentArgvInputs {
                 kind: AgentKind::OpenCode,
                 model,
@@ -763,7 +754,7 @@ mod tests {
         task: crate::domain::TaskId,
         extra_args: &[String],
     ) -> Result<ChildInvocation, AppError> {
-        build_agent_invocation_for_identity(
+        build_agent_invocation(
             AgentArgvInputs {
                 kind: AgentKind::Claude,
                 model: None,
@@ -905,7 +896,7 @@ mod tests {
     fn codex_resume_argv_appends_resume_after_extra_args() {
         let thread: ThreadId = "01a0e487-b877-76e2-9dc2-806bff0bf685".parse().unwrap();
         let extra_args = vec!["-c".into(), "model_reasoning_effort=\"high\"".into()];
-        let argv = build_agent_invocation(
+        let argv = preview_invocation(
             AgentArgvInputs {
                 kind: AgentKind::Codex,
                 model: Some("gpt-6-luna"),
@@ -1130,7 +1121,7 @@ mod tests {
             AgentKind::Grok,
             AgentKind::OpenCode,
         ] {
-            let argv = build_agent_invocation(
+            let argv = preview_invocation(
                 AgentArgvInputs {
                     kind,
                     model: None,

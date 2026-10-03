@@ -116,15 +116,6 @@ impl ImageReference {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Short label: the repository name, or the first 12 digest characters
-    #[must_use]
-    pub fn short_name(&self) -> &str {
-        match self.0.split_once('@') {
-            Some((name, _)) => name,
-            None => &self.0[..self.0.len().min("sha256:".len() + 12)],
-        }
-    }
 }
 
 impl fmt::Display for ImageReference {

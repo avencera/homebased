@@ -642,6 +642,7 @@ fn attention_holds_lane_and_release_is_exact() {
             ProcessStatus::Running,
             &ExitReason::Exit { code: 0 },
             crate::domain::ProcessGroupExitEvidence::ConfirmedExited,
+            None,
         )
         .unwrap();
     let marked = h.helper(task);
@@ -824,6 +825,7 @@ fn recovery_terminal_cleanup_and_abandoned_reservation() {
             ProcessStatus::Running,
             &ExitReason::Exit { code: 0 },
             crate::domain::ProcessGroupExitEvidence::ConfirmedExited,
+            None,
         )
         .unwrap();
     assert!(matches!(

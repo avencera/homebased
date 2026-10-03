@@ -27,7 +27,7 @@ use crate::domain::{
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
-use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
+use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
 use crate::report::REPORT_TRAILER;
 use crate::run_env;
 use crate::store::{self, Store};
@@ -230,7 +230,7 @@ async fn run_host_workload(
     store: &Store,
     sigterm: &mut SignalStream,
 ) -> Result<TaskRunExit, AppError> {
-    let invocation = match invocation_from_workload_for_identity(
+    let invocation = match invocation_from_workload(
         &row.workload,
         &row.binary,
         &row.cwd,
@@ -276,16 +276,10 @@ fn record_exit(
     evidence: TaskExitEvidence,
     row: &TaskRow,
 ) -> Result<(), AppError> {
-    store::write_exit_json_with_evidence(&paths.exit_json, reason, evidence.clone())?;
+    store::write_exit_json(&paths.exit_json, reason, evidence.clone())?;
     let worker_thread = worker_thread(row, paths);
     if store
-        .cas_exit_with_evidence_and_worker_thread(
-            id,
-            ProcessStatus::Running,
-            reason,
-            evidence,
-            worker_thread,
-        )?
+        .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence, worker_thread)?
         .is_none()
     {
         let current = store.require_task(id)?;

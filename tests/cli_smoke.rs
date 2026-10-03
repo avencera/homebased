@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use homebased::agents::{AgentArgvInputs, build_agent_invocation};
-use homebased::domain::AgentKind;
+use homebased::domain::{AgentKind, TaskIdentity};
 use homebased::invocation::ChildInvocation;
 use tempfile::TempDir;
 
@@ -153,7 +153,10 @@ fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> C
         },
         &live_binary(kind),
         feed,
+        TaskIdentity::Preview,
+        None,
     )
+    .unwrap()
 }
 
 fn live_binary(kind: AgentKind) -> PathBuf {

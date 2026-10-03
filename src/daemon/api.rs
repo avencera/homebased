@@ -31,9 +31,7 @@ use crate::files::{
     ContentOriginBody, DirectoryListing, PathToken, ResolveBody, ResolvedPath, list_directory,
     resolve_absolute_path,
 };
-use crate::invocation::{
-    ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized_for_identity,
-};
+use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::CancelResult;
 use crate::submission::RequestId;
@@ -329,7 +327,7 @@ pub(super) fn local_dry_run(
 ) -> Result<DryRunResponse, AppError> {
     spec::check_spec_host(&spec)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
-    let invocation = invocation_from_normalized_for_identity(
+    let invocation = invocation_from_normalized(
         &spec.workload,
         &env.path,
         &spec.cwd,

@@ -624,23 +624,14 @@ impl OriginAttempt {
 
     async fn run(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
         let (attempt, retry) = run_blocking("pending T3 retry", move || {
-            let retry = match self.before_send.as_ref() {
-                Some(_) => crate::callback::retry_pending_t3_checked(
-                    &self.context,
-                    self.thread,
-                    &self.line,
-                    &self.paths.callback_log,
-                    &self.pending,
-                    self.gate(),
-                ),
-                None => Ok(retry_pending_t3(
-                    &self.context,
-                    self.thread,
-                    &self.line,
-                    &self.paths.callback_log,
-                    &self.pending,
-                )),
-            };
+            let retry = retry_pending_t3(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+                self.gate(),
+            );
             (self, retry)
         })
         .await?;
@@ -676,29 +667,21 @@ impl OriginAttempt {
     }
 
     async fn send(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("origin callback", move || match self.before_send.as_ref() {
-            Some(_) => origin.send_checked(
+        let sent = run_blocking("origin callback", move || {
+            origin.send(
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
                 self.gate(),
-            ),
-            None => origin
-                .send(
-                    self.thread,
-                    &self.line,
-                    &self.paths.callback_log,
-                    &self.paths.delivery_lock,
-                )
-                .map_err(Into::into),
+            )
         })
         .await?;
         Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_t3_claude(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("T3 Claude send", move || match self.before_send.as_ref() {
-            Some(_) => crate::callback::send_t3_claude_checked(
+        let sent = run_blocking("T3 Claude send", move || {
+            send_t3_claude(
                 &self.context,
                 self.thread,
                 origin,
@@ -706,39 +689,21 @@ impl OriginAttempt {
                 &self.paths.callback_log,
                 self.gate(),
                 &self.pending,
-            ),
-            None => send_t3_claude(
-                &self.context,
-                self.thread,
-                origin,
-                &self.line,
-                &self.paths.callback_log,
-                &self.paths.delivery_lock,
-                &self.pending,
             )
-            .map_err(Into::into),
         })
         .await?;
         Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("origin callback", move || match self.before_send.as_ref() {
-            Some(_) => crate::callback::send_codex_queue_attempt_checked(
+        let sent = run_blocking("origin callback", move || {
+            send_codex_queue_attempt(
                 &self.context,
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
                 self.gate(),
-            ),
-            None => send_codex_queue_attempt(
-                &self.context,
-                self.thread,
-                &self.line,
-                &self.paths.callback_log,
-                &self.paths.delivery_lock,
             )
-            .map_err(Into::into),
         })
         .await?;
         Ok(match sent {
@@ -752,23 +717,14 @@ impl OriginAttempt {
 
     async fn wake_codex(self) -> Result<AttemptOutcome, AppError> {
         let (attempt, woken) = run_blocking("T3 Codex wake", move || {
-            let woken = match self.before_send.as_ref() {
-                Some(_) => crate::callback::wake_codex_thread_checked(
-                    &self.context,
-                    self.thread,
-                    &self.line,
-                    &self.paths.callback_log,
-                    &self.pending,
-                    self.gate(),
-                ),
-                None => Ok(wake_codex_thread(
-                    &self.context,
-                    self.thread,
-                    &self.line,
-                    &self.paths.callback_log,
-                    &self.pending,
-                )),
-            };
+            let woken = wake_codex_thread(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+                self.gate(),
+            );
             (self, woken)
         })
         .await?;
@@ -794,23 +750,15 @@ impl OriginAttempt {
                 "Claude session {thread} is not running; T3 wake retried later"
             ))));
         }
-        let woken = run_blocking("T3 wake", move || match self.before_send.as_ref() {
-            Some(_) => crate::callback::wake_stopped_session_checked(
+        let woken = run_blocking("T3 wake", move || {
+            wake_stopped_session(
                 &self.context,
                 thread,
                 &self.line,
                 &self.paths.callback_log,
                 &self.pending,
                 self.gate(),
-            ),
-            None => wake_stopped_session(
-                &self.context,
-                thread,
-                &self.line,
-                &self.paths.callback_log,
-                &self.pending,
             )
-            .map_err(Into::into),
         })
         .await?;
         Ok(match woken {

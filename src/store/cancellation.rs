@@ -3,6 +3,7 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::Store;
+use super::identity::{insert_identity_on, task_row_exists};
 use crate::cancellation::{
     CancellationDelivery, CancellationReceipt, CancellationRequest, CancellationRequestIdentity,
     ExecutorCancelState,
@@ -192,12 +193,7 @@ impl Store {
                 }
             }
         } else {
-            let task_exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
-                [request.task.to_string()],
-                |row| row.get(0),
-            )?;
-            if task_exists {
+            if task_row_exists(&tx, request.task)? {
                 return Err(conflict(request.task));
             }
             let reason = PreAcceptanceRejection::Cancelled.as_str().to_string();
@@ -207,10 +203,7 @@ impl Store {
                 execution_machine: request.execution_machine,
                 reason: reason.clone(),
             });
-            tx.execute(
-                "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
-                params![request.task.to_string(), request.origin_machine.to_string(), encode(&tombstone)?],
-            )?;
+            insert_identity_on(&tx, request.task, request.origin_machine, &tombstone)?;
             ExecutorCancelState::PreventedBeforeStart { reason }
         };
         let receipt = CancellationReceipt { request, state };

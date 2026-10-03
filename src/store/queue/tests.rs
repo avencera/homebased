@@ -142,6 +142,7 @@ impl Fixture {
                 ProcessStatus::Running,
                 &reason,
                 ProcessGroupExitEvidence::ConfirmedExited,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -909,6 +910,7 @@ fn a_late_terminal_commit_of_an_old_run_changes_nothing() {
             ProcessStatus::Running,
             &ExitReason::Exit { code: 1 },
             ProcessGroupExitEvidence::ConfirmedExited,
+            None,
         )
         .unwrap();
     assert!(duplicate.is_none());

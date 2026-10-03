@@ -9,7 +9,7 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::agents::{AgentArgvInputs, build_agent_invocation_for_identity};
+use crate::agents::{AgentArgvInputs, build_agent_invocation};
 use crate::container::ContainerUser;
 use crate::container::docker::CreateContext;
 use crate::domain::{AgentKind, AgentWorkload, TaskId, TaskIdentity, TaskWorkload, Workload};
@@ -340,27 +340,11 @@ pub(crate) fn resolve_agent_binary_with(
     })
 }
 
-/// Build a child invocation from a normalized workload
+/// Build a child invocation from a normalized workload for a task identity
 ///
 /// Agent workloads always receive a prompt-feed path; the agent policy decides
 /// whether that path is an argv argument or only a stdin source
 pub fn invocation_from_normalized(
-    workload: &NormalizedWorkload,
-    env_path: &str,
-    cwd: &Path,
-    prompt_feed: Option<&Path>,
-) -> Result<ChildInvocation, AppError> {
-    invocation_from_normalized_for_identity(
-        workload,
-        env_path,
-        cwd,
-        prompt_feed,
-        TaskIdentity::Preview,
-    )
-}
-
-/// Build a normalized workload invocation for a specific task identity
-pub fn invocation_from_normalized_for_identity(
     workload: &NormalizedWorkload,
     env_path: &str,
     cwd: &Path,
@@ -374,7 +358,7 @@ pub fn invocation_from_normalized_for_identity(
                 message: "agent invocation requires a prompt feed path".into(),
             })?;
             let inherited_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-            build_agent_invocation_for_identity(
+            build_agent_invocation(
                 AgentArgvInputs {
                     kind: agent.agent,
                     model: agent.model.as_deref(),
@@ -426,7 +410,7 @@ pub fn invocation_from_normalized_for_identity(
 }
 
 /// Build a persisted workload invocation for a worker task identity
-pub fn invocation_from_workload_for_identity(
+pub fn invocation_from_workload(
     workload: &Workload,
     binary: &Path,
     cwd: &Path,
@@ -436,7 +420,7 @@ pub fn invocation_from_workload_for_identity(
     match workload {
         Workload::Agent(agent) => {
             let inherited_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-            build_agent_invocation_for_identity(
+            build_agent_invocation(
                 AgentArgvInputs {
                     kind: agent.agent.kind,
                     model: agent.agent.model.as_deref(),

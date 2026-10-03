@@ -199,29 +199,10 @@ impl ClaudeInbox {
 
     /// Queue `line` as the session's next user turn
     ///
-    /// Holds `delivery_lock` for the whole send so no other delivery for the
-    /// task can overlap it
+    /// Holds the gate's delivery lock for the whole send, so no other delivery
+    /// for the task can overlap it, and checks notice eligibility just before
+    /// the frame write
     pub(crate) fn send(
-        &self,
-        thread: ThreadId,
-        line: &str,
-        log_path: &Path,
-        delivery_lock: &Path,
-    ) -> Result<(), String> {
-        self.send_checked(
-            thread,
-            line,
-            log_path,
-            super::send_check::SendGate {
-                path: delivery_lock,
-                check: None,
-            },
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// Check notice eligibility under the delivery lock immediately before the frame write
-    pub(crate) fn send_checked(
         &self,
         thread: ThreadId,
         line: &str,
@@ -492,7 +473,10 @@ mod tests {
                 thread(),
                 line,
                 &home.path().join("callback.log"),
-                &home.path().join("delivery.lock"),
+                crate::callback::send_check::SendGate {
+                    path: &home.path().join("delivery.lock"),
+                    check: None,
+                },
             )
             .unwrap();
 
@@ -597,7 +581,7 @@ mod tests {
         let ClaudeSession::Live(inbox) = ClaudeInbox::find(home.path(), thread()).unwrap() else {
             panic!("session must be live");
         };
-        let result = inbox.send_checked(
+        let result = inbox.send(
             thread(),
             "HOMEBASED_EVENT JOB_BLOCKED",
             &home.path().join("callback.log"),

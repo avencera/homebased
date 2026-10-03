@@ -56,13 +56,8 @@ pub(crate) fn parse_plist_home(text: &str) -> Option<PathBuf> {
     home_from_program_arguments(&args)
 }
 
-/// Render the plist.
-pub fn render(home: &Home) -> Result<String, AppError> {
-    render_with_config(home, None)
-}
-
 /// Render the plist with an optional explicit config file.
-pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
+pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env = String::new();
@@ -123,14 +118,9 @@ pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, 
     ))
 }
 
-/// Write, lint, and bootstrap.
-pub fn install(home: &Home) -> Result<(), AppError> {
-    install_with_config(home, None)
-}
-
 /// Write, lint, and bootstrap with an optional explicit config file.
-pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
-    let text = render_with_config(home, config)?;
+pub fn install(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
+    let text = render(home, config)?;
     let path = plist_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -355,7 +345,7 @@ mod tests {
     #[test]
     fn plist_contains_required_fields() {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(text.contains("AbandonProcessGroup"), "{text}");
         assert!(text.contains("<true/>"), "{text}");
         assert!(text.contains("KeepAlive"), "{text}");
@@ -375,7 +365,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let config = Path::new("/tmp/config & <quoted\".toml>");
 
-        let text = render_with_config(&home, Some(config)).unwrap();
+        let text = render(&home, Some(config)).unwrap();
 
         assert_eq!(
             parse_string_value(&text, CONFIG_ENV),
@@ -395,7 +385,7 @@ mod tests {
     fn plist_makes_a_relative_home_absolute() {
         let home = Home::resolve(Some(PathBuf::from("relative-state"))).unwrap();
         let expected = std::path::absolute(home.root()).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(
             text.contains(&format!("<string>{}</string>", expected.display())),
             "{text}"

@@ -64,13 +64,8 @@ pub(crate) fn parse_unit_home(text: &str) -> Option<PathBuf> {
     }
 }
 
-/// Render the unit text.
-pub fn render(home: &Home) -> Result<String, AppError> {
-    render_with_config(home, None)
-}
-
 /// Render the unit with an optional explicit config file.
-pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
+pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env_lines = String::new();
@@ -106,14 +101,9 @@ pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, 
     ))
 }
 
-/// Write, verify, enable, and start the unit.
-pub fn install(home: &Home) -> Result<(), AppError> {
-    install_with_config(home, None)
-}
-
 /// Write, verify, enable, and start with an optional explicit config file.
-pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
-    let text = render_with_config(home, config)?;
+pub fn install(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
+    let text = render(home, config)?;
     let path = unit_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -242,10 +232,7 @@ fn home_from_daemon_argv(args: &[&str]) -> Option<PathBuf> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{
-        inspect_host_unit_at, parse_unit_home, quote_systemd_environment, render,
-        render_with_config,
-    };
+    use super::{inspect_host_unit_at, parse_unit_home, quote_systemd_environment, render};
     use crate::config::CONFIG_ENV;
     use crate::home::Home;
     use crate::install::{HostUnitState, classify_configured_home};
@@ -272,7 +259,7 @@ mod tests {
     #[test]
     fn unit_contains_required_fields() {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(text.contains("KillMode=process"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("ExecStop=")),
@@ -297,7 +284,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let config = Path::new("/tmp/config with \"quotes\" \\ and $value %specifier.toml");
 
-        let text = render_with_config(&home, Some(config)).unwrap();
+        let text = render(&home, Some(config)).unwrap();
 
         assert!(
             text.lines().any(|line| line
@@ -319,7 +306,7 @@ mod tests {
     fn unit_makes_a_relative_home_absolute() {
         let home = Home::resolve(Some(PathBuf::from("relative-state"))).unwrap();
         let expected = std::path::absolute(home.root()).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(
             text.contains(&format!("daemon serve --home {}", expected.display())),
             "{text}"

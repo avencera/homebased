@@ -669,6 +669,7 @@ async fn fail_queued_task(
         from: ProcessStatus::Queued,
         reason,
         evidence: ProcessGroupExitEvidence::NoChildSpawned.into(),
+        worker_thread: None,
         reply,
     })
     .await?;

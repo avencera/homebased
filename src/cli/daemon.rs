@@ -100,7 +100,7 @@ pub async fn run(ctx: &Ctx, command: DaemonCommand) -> Result<ExitCode, AppError
 
 fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
     let config = ctx.config_location()?.validated_host_unit_override()?;
-    let text = install::render_with_config(&ctx.home, config.as_deref())?;
+    let text = install::render(&ctx.home, config.as_deref())?;
     if dry_run {
         match ctx.output {
             super::OutputMode::Json => {
@@ -116,7 +116,7 @@ fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    install::install_with_config(&ctx.home, config.as_deref())?;
+    install::install(&ctx.home, config.as_deref())?;
     ctx.print_id(
         "installed",
         &format!("installed {}", install::unit_path().display()),

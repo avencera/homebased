@@ -258,13 +258,8 @@ pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<Option<Prot
 }
 
 /// Start a T3 turn for the thread that owns this provider session
-#[must_use]
-pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
-    wake_thread_checked(env, provider_thread, text, None)
-        .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
-}
-
-/// Recheck an unsent notice at the final T3 dispatch boundary
+///
+/// `before_send` rechecks an unsent notice at the final dispatch boundary
 pub(crate) fn wake_thread_checked(
     env: &T3Env,
     provider_thread: ProviderThread,
@@ -950,9 +945,15 @@ mod tests {
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
     use super::{
         ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, WakeOutcome, deterministic_id,
-        load_runtime, owner, probe, wake_thread,
+        load_runtime, owner, probe, wake_thread_checked,
     };
     use crate::domain::ThreadId;
+
+    /// Start a T3 turn with no notice to recheck
+    fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
+        wake_thread_checked(env, provider_thread, text, None)
+            .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+    }
 
     const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
     const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
