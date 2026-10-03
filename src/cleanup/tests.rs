@@ -877,6 +877,93 @@ fn review_fix_cleanup_rescans_a_parent_that_forks_then_exits() {
     );
 }
 
+/// A chain of marked processes, each forking its successor and exiting while
+/// the scan that listed it inspects it, then a long-lived marked descendant
+struct ForkChain {
+    marker: TaskId,
+    generations: u32,
+    scans: u32,
+    alive: bool,
+    sent: Vec<Pid>,
+}
+
+const CHAIN_DESCENDANT: i32 = 22000;
+
+impl ProcessSource for ForkChain {
+    type Handle = Pid;
+
+    fn list(&mut self) -> io::Result<Vec<Pid>> {
+        self.scans += 1;
+        let pid = if self.scans <= self.generations {
+            21000 + i32::try_from(self.scans).unwrap()
+        } else {
+            CHAIN_DESCENDANT
+        };
+        Ok(if pid == CHAIN_DESCENDANT && !self.alive {
+            vec![]
+        } else {
+            vec![Pid::from_raw(pid)]
+        })
+    }
+
+    fn info(&mut self, pid: Pid) -> Read<ProcessInfo> {
+        if pid.as_raw() != CHAIN_DESCENDANT || !self.alive {
+            return Read::Gone;
+        }
+        Read::Found(ProcessInfo {
+            start: ProcessStartTime(1),
+            pgid: pid,
+            uid: nix::unistd::geteuid().as_raw(),
+            zombie: false,
+        })
+    }
+
+    fn environment(&mut self, _: Pid) -> Read<Environment> {
+        Read::Found(Environment(
+            format!("HOMEBASED_TASK_ID={}\0", self.marker).into_bytes(),
+        ))
+    }
+
+    fn pin(&mut self, pid: Pid) -> Read<Pid> {
+        Read::Found(pid)
+    }
+
+    fn send(&mut self, pid: &Pid, _: Signal) -> Result<(), Errno> {
+        self.sent.push(*pid);
+        self.alive = false;
+        Ok(())
+    }
+
+    fn send_group(&mut self, _: Pid, _: Signal) -> Result<(), Errno> {
+        unreachable!()
+    }
+}
+
+// two processes in a row exit while their scans inspect them, so neither
+// scan may count as empty, and the descendant they left is found and stopped
+#[test]
+fn cleanup_keeps_scanning_after_a_two_generation_fork_chain() {
+    let marker = TaskId::new();
+    let mut source = ForkChain {
+        marker,
+        generations: 2,
+        scans: 0,
+        alive: true,
+        sent: vec![],
+    };
+    let timing = CleanupTiming {
+        poll: Duration::from_millis(1),
+        ..FAST
+    };
+    let outcome = sweep_marker_with(&mut source, marker, None, &BTreeSet::new(), timing);
+    assert!(
+        matches!(outcome, SweepOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(source.sent, vec![Pid::from_raw(CHAIN_DESCENDANT)]);
+    assert!(!source.alive);
+}
+
 // on a busy machine short-lived processes exit between enumeration and
 // inspection in every scan; that must not keep cleanup from finishing
 #[test]

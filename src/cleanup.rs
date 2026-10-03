@@ -108,6 +108,10 @@ pub fn process_identity(pid: Pid) -> io::Result<ProcessIdentity> {
     }
 }
 
+/// Consecutive empty scans that finish cleanup even when listed processes
+/// keep exiting before inspection, as they do on a busy machine
+const BUSY_EMPTY_SCANS: u32 = 8;
+
 /// Waits and bounds for one cleanup
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupTiming {
@@ -508,6 +512,9 @@ impl ProcessSource for SystemProcesses {
 enum Observation {
     Marked(ProcessIdentity),
     Suspect(ProcessIdentity),
+    /// The process exited between enumeration and inspection, so a child it
+    /// forked first may be missing from this scan's PID list
+    Vanished,
 }
 
 /// Marked targets and unreadable suspects seen by one scan
@@ -515,6 +522,8 @@ enum Observation {
 struct Scan {
     targets: BTreeMap<Pid, ProcessIdentity>,
     suspects: BTreeSet<ProcessIdentity>,
+    /// A listed process exited before it was inspected
+    unsettled: bool,
     confirmed_empty: bool,
 }
 
@@ -540,7 +549,12 @@ struct Sweeper<'a, S> {
     protected_hits: BTreeSet<Pid>,
     /// Same-user refusals already logged, so rescans do not repeat the warning
     warned: BTreeSet<Pid>,
+    /// Start of the current run of consecutive empty scans, and its length
     empty_since: Option<Instant>,
+    empty_scans: u32,
+    /// Start of the current run of consecutive empty scans in which no listed
+    /// process exited before inspection
+    settled_since: Option<Instant>,
 }
 
 impl<'a, S: ProcessSource> Sweeper<'a, S> {
@@ -566,6 +580,8 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             protected_hits: BTreeSet::new(),
             warned: BTreeSet::new(),
             empty_since: None,
+            empty_scans: 0,
+            settled_since: None,
         }
     }
 
@@ -683,6 +699,10 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
                     scan.suspects.insert(identity);
                     continue;
                 }
+                Some(Observation::Vanished) => {
+                    scan.unsettled = true;
+                    continue;
+                }
                 None => continue,
             };
 
@@ -694,24 +714,35 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             }
             scan.targets.insert(pid, identity);
         }
-        // a marked parent that forks and exits during a scan leaves its child
-        // outside that scan's PID list, but the child is listed by the next
-        // scan, so cleanup finishes only after two empty scans a full poll
-        // apart. Processes that vanish mid-scan do not reset this: on a busy
-        // machine short-lived processes exit during every scan. A chain of
-        // marked processes that each fork and exit within every poll can
-        // still escape
         // unreadable suspects cannot prove an empty scan, but they remain
         // separate from targets because their marker cannot authorize a signal
         if !scan.targets.is_empty() || !scan.suspects.is_empty() {
             self.empty_since = None;
-        } else {
-            let now = Instant::now();
-            scan.confirmed_empty = self
-                .empty_since
-                .is_some_and(|since| now.duration_since(since) >= self.timing.poll);
-            self.empty_since.get_or_insert(now);
+            self.empty_scans = 0;
+            self.settled_since = None;
+            return Ok(scan);
         }
+
+        // a marked parent that forks and exits during a scan leaves its child
+        // outside that scan's PID list, but the next scan lists the child. So
+        // cleanup finishes on two empty scans a poll apart in which no listed
+        // process exited before inspection. On a busy machine short-lived
+        // processes exit during almost every scan, so a longer run of empty
+        // scans also finishes. A chain that escapes it must replace itself
+        // during every one of those scans, and GPU contexts do not survive fork
+        let now = Instant::now();
+        let empty_since = *self.empty_since.get_or_insert(now);
+        self.empty_scans += 1;
+        let settled = if scan.unsettled {
+            self.settled_since = None;
+            false
+        } else {
+            let since = *self.settled_since.get_or_insert(now);
+            now.duration_since(since) >= self.timing.poll
+        };
+        let busy = self.empty_scans >= BUSY_EMPTY_SCANS
+            && now.duration_since(empty_since) >= self.timing.poll;
+        scan.confirmed_empty = settled || busy;
         Ok(scan)
     }
 
@@ -719,11 +750,12 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     fn observe(&mut self, pid: Pid) -> Option<Observation> {
         let info = match self.source.info(pid) {
             Read::Found(info) if !info.zombie => info,
-            Read::Found(_) | Read::Exited(_) | Read::Gone | Read::Refused(_) => return None,
+            Read::Found(_) | Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
+            Read::Refused(_) => return None,
         };
         let environment = match self.source.environment(pid) {
             Read::Found(environment) => environment,
-            Read::Exited(_) | Read::Gone => return None,
+            Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
             Read::Refused(errno) => {
                 return self
                     .note_refusal(pid, info, errno)
@@ -732,7 +764,10 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         };
         // the identity must still hold after the environment read, or the
         // environment may belong to a process that reused the PID
-        if !self.still_same(pid, info) || !environment.carries(&self.marker_value) {
+        if !self.still_same(pid, info) {
+            return Some(Observation::Vanished);
+        }
+        if !environment.carries(&self.marker_value) {
             return None;
         }
         Some(Observation::Marked(ProcessIdentity {
