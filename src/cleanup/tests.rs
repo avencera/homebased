@@ -580,8 +580,9 @@ fn identity_of_a_live_process_is_stable_and_a_missing_one_errors() {
     assert_eq!(error.raw_os_error(), Some(Errno::ESRCH as i32));
 }
 
-/// Known limitation: Apple platform binaries expose an empty environment, so
-/// a marked `/bin/sleep` in its own session escapes the sweep
+/// Known limitation: with System Integrity Protection on, Apple platform
+/// binaries expose an empty environment, so a marked `/bin/sleep` in its own
+/// session escapes the sweep
 #[cfg(target_os = "macos")]
 #[test]
 fn apple_platform_binary_exposes_an_empty_environment() {
@@ -604,12 +605,22 @@ fn apple_platform_binary_exposes_an_empty_environment() {
     let _ = child.kill();
     let _ = child.wait();
 
-    assert_eq!(environment, Read::Found(Environment::default()));
-    assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
-    assert!(
-        alive,
-        "the sweep cannot see the marker, so it leaves the process"
-    );
+    // with System Integrity Protection on, macOS hides a platform binary's
+    // environment, so the sweep cannot attribute it; hosts without that
+    // protection, such as some CI runners, expose it and the sweep stops it
+    if environment == Read::Found(Environment::default()) {
+        assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
+        assert!(
+            alive,
+            "the sweep cannot see the marker, so it leaves the process"
+        );
+        return;
+    }
+    let Read::Found(readable) = environment else {
+        panic!("unexpected read of a live child: {environment:?}");
+    };
+    assert!(readable.carries(marker.to_string().as_bytes()));
+    assert!(matches!(outcome, SweepOutcome::Completed { signalled } if !signalled.is_empty()));
 }
 
 /// Fork a marked child after enumeration, then lose the parent before inspection
