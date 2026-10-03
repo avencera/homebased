@@ -12,6 +12,7 @@ use crate::dependency::DependencyOutcome;
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
+use crate::queue::QueueError;
 use crate::spec::CwdProblem;
 use crate::submission::RequestId;
 
@@ -450,6 +451,9 @@ pub enum AppError {
     /// still complete after the caller stops waiting
     #[error("daemon busy: an internal call timed out; the operation may still complete")]
     DaemonBusy,
+    /// The GPU priority queue refused a request
+    #[error(transparent)]
+    Queue(#[from] QueueError),
     /// Unexpected internal failure
     #[error("{message}")]
     Internal {
@@ -554,6 +558,7 @@ impl AppError {
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::DaemonBusy => "daemon_busy",
+            Self::Queue(error) => error.code(),
             Self::Internal { .. } => "internal",
         }
     }
@@ -619,6 +624,7 @@ impl AppError {
             Self::MessageDeliveryFailed { .. }
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. } => 1,
+            Self::Queue(error) => error.exit_code(),
         }
     }
 
@@ -683,6 +689,7 @@ impl AppError {
             | Self::LockHeld { .. }
             | Self::NotifyFailed { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Queue(error) => error.http_status(),
         }
     }
 
@@ -842,6 +849,7 @@ impl AppError {
             Self::DaemonUnavailable { message } => json!({ "message": message }),
             Self::DaemonAlreadyRunning => json!({}),
             Self::LockHeld { path } => json!({ "path": path }),
+            Self::Queue(error) => error.input(),
         }
     }
 

@@ -24,6 +24,7 @@ pub mod machine;
 pub mod message;
 pub mod notify;
 pub mod power;
+pub mod queue;
 pub mod report;
 pub mod run_env;
 pub mod runner;

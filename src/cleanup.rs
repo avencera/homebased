@@ -50,7 +50,10 @@ use macos as os;
 /// macOS reports microseconds since the epoch and Linux reports clock ticks
 /// since boot. Values are compared only for equality on the same machine, to
 /// tell a process apart from a later one that reused its PID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct ProcessStartTime(u64);
 
 impl ProcessStartTime {
@@ -68,9 +71,12 @@ impl ProcessStartTime {
 }
 
 /// One process, told apart from any later process that reuses its PID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ProcessIdentity {
     /// Process ID
+    #[serde(with = "pid_serde")]
     pub pid: Pid,
     /// Kernel start time
     pub start: ProcessStartTime,
@@ -132,7 +138,10 @@ impl Default for CleanupTiming {
 }
 
 /// Why cleanup could not finish; the resource needs a person to check the machine
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It is stored with the resource's `Attention`, so it has a serde form
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CleanupFailure {
     /// The process table could not be read, so an empty result proves nothing
     EnumerationFailed {
@@ -148,26 +157,62 @@ pub enum CleanupFailure {
     /// marker; it was never signalled
     ProtectedCarriesMarker {
         /// Protected processes that carried the marker
+        #[serde(with = "pids_serde")]
         pids: Vec<Pid>,
     },
     /// A lost worker's process group holds a protected process; it was never signalled
     ProtectedInGroup {
         /// Process group
+        #[serde(with = "pid_serde")]
         pgid: Pid,
         /// Protected members
+        #[serde(with = "pids_serde")]
         pids: Vec<Pid>,
     },
     /// A lost worker's process group still exists, but neither its leader nor a
     /// readable member ties it to the run
     GroupUnattributed {
         /// Process group
+        #[serde(with = "pid_serde")]
         pgid: Pid,
     },
     /// A lost worker's process group still had members after SIGKILL
     GroupSurvived {
         /// Process group
+        #[serde(with = "pid_serde")]
         pgid: Pid,
     },
+}
+
+/// A PID as its raw number, since `nix` gives `Pid` no serde form
+mod pid_serde {
+    use nix::unistd::Pid;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(pid: &Pid, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i32(pid.as_raw())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Pid, D::Error> {
+        i32::deserialize(deserializer).map(Pid::from_raw)
+    }
+}
+
+/// A PID list as raw numbers
+mod pids_serde {
+    use nix::unistd::Pid;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(pids: &[Pid], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(pids.iter().map(|pid| pid.as_raw()))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Pid>, D::Error> {
+        let raw = Vec::<i32>::deserialize(deserializer)?;
+        Ok(raw.into_iter().map(Pid::from_raw).collect())
+    }
 }
 
 impl fmt::Display for CleanupFailure {

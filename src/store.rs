@@ -35,6 +35,7 @@ mod dependency;
 mod events;
 mod identity;
 mod message;
+mod queue;
 pub use container::TaskContainerRecord;
 pub use dependency::{HeldCancel, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
@@ -433,10 +434,145 @@ SELECT request_id, task_id, execution_machine, spec_json, route_json, after_json
 DROP TABLE origin_routes_before_preempted;
 ";
 
+/// Create the GPU priority queue
+///
+/// `resources` holds each resource's single active run in its `run_*`
+/// columns, so one active run per resource is structural, and a unique index
+/// on `run_job` keeps one active run per job. The CHECKs tie each run column
+/// to the phases that use it. Jobs reference resources, and resources their
+/// active job, through `(id, machine)` keys, so a run, its job, and a pinned
+/// target always share one machine queue.
+///
+/// Every non-terminal job holds a slot `(priority, position)` that is unique
+/// in its machine queue; terminal jobs hold none. The store keeps positions
+/// dense by renumbering the affected levels in each transaction. A run is an
+/// ordinary task row with `resource_job_id`, `run_number`, and `step_index`,
+/// set together, and `(resource_job_id, run_number)` is unique. Only run
+/// reservation writes them, in the transaction that checks the job, so
+/// `resource_job_id` has no foreign key and the column stays droppable
+const MIGRATE_34_TO_35_QUEUE: &str = r"
+CREATE TABLE resources (
+    id TEXT PRIMARY KEY,
+    machine TEXT NOT NULL,
+    name TEXT NOT NULL,
+    device INTEGER CHECK (device IS NULL OR device >= 0),
+    created_at TEXT NOT NULL,
+    run_job TEXT,
+    run_task TEXT UNIQUE REFERENCES tasks(id),
+    run_number INTEGER CHECK (run_number IS NULL OR run_number >= 1),
+    run_step INTEGER CHECK (run_step IS NULL OR run_step >= 0),
+    run_phase TEXT
+        CHECK (run_phase IN ('launching', 'executing', 'stopping', 'cleaning', 'attention')),
+    run_reserved_at TEXT,
+    run_started_at TEXT,
+    run_stop_cause TEXT CHECK (run_stop_cause IN ('yield', 'restart', 'user_cancel')),
+    run_stop_requested_at TEXT,
+    run_cleanup_attempt INTEGER CHECK (run_cleanup_attempt IS NULL OR run_cleanup_attempt >= 1),
+    run_attention_id TEXT UNIQUE,
+    run_attention_failure TEXT,
+    UNIQUE (machine, name),
+    UNIQUE (id, machine),
+    FOREIGN KEY (run_job, machine) REFERENCES resource_jobs(id, machine),
+    CHECK ((run_phase IS NULL) = (run_job IS NULL)),
+    CHECK ((run_phase IS NULL) = (run_task IS NULL)),
+    CHECK ((run_phase IS NULL) = (run_number IS NULL)),
+    CHECK ((run_phase IS NULL) = (run_step IS NULL)),
+    CHECK ((COALESCE(run_phase, '') = 'launching') = (run_reserved_at IS NOT NULL)),
+    CHECK (CASE COALESCE(run_phase, '')
+        WHEN 'executing' THEN run_started_at IS NOT NULL
+        WHEN 'stopping' THEN 1
+        ELSE run_started_at IS NULL
+    END),
+    CHECK ((COALESCE(run_phase, '') = 'stopping') = (run_stop_cause IS NOT NULL)),
+    CHECK ((COALESCE(run_phase, '') = 'stopping') = (run_stop_requested_at IS NOT NULL)),
+    CHECK ((COALESCE(run_phase, '') = 'cleaning') = (run_cleanup_attempt IS NOT NULL)),
+    CHECK ((COALESCE(run_phase, '') = 'attention') = (run_attention_id IS NOT NULL)),
+    CHECK ((COALESCE(run_phase, '') = 'attention') = (run_attention_failure IS NOT NULL))
+);
+CREATE UNIQUE INDEX resources_device ON resources(machine, device) WHERE device IS NOT NULL;
+CREATE UNIQUE INDEX resources_run_job ON resources(run_job) WHERE run_job IS NOT NULL;
+
+CREATE TABLE resource_jobs (
+    id TEXT PRIMARY KEY,
+    machine TEXT NOT NULL,
+    origin_machine TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    spec_digest TEXT NOT NULL,
+    env_path TEXT NOT NULL,
+    env_home TEXT NOT NULL,
+    target_resource TEXT,
+    priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+    position INTEGER CHECK (position IS NULL OR position >= 1),
+    state TEXT NOT NULL
+        CHECK (state IN ('queued', 'active', 'succeeded', 'failed', 'cancelled')),
+    active_resource TEXT,
+    failed_run TEXT REFERENCES tasks(id),
+    next_step INTEGER NOT NULL CHECK (next_step >= 0),
+    resume INTEGER NOT NULL CHECK (resume IN (0, 1)),
+    last_run_number INTEGER NOT NULL CHECK (last_run_number >= 0),
+    event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (id, machine),
+    FOREIGN KEY (target_resource, machine) REFERENCES resources(id, machine),
+    FOREIGN KEY (active_resource, machine) REFERENCES resources(id, machine),
+    CHECK ((state IN ('queued', 'active')) = (position IS NOT NULL)),
+    CHECK ((state = 'active') = (active_resource IS NOT NULL)),
+    CHECK ((state = 'failed') = (failed_run IS NOT NULL)),
+    CHECK (
+        target_resource IS NULL OR active_resource IS NULL OR active_resource = target_resource
+    )
+);
+CREATE UNIQUE INDEX resource_jobs_slot
+    ON resource_jobs(machine, priority, position) WHERE position IS NOT NULL;
+
+CREATE TABLE resource_job_events (
+    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    event_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+);
+
+CREATE TABLE resource_operations (
+    id TEXT PRIMARY KEY,
+    machine TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('move', 'cancel', 'release')),
+    content_digest TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE resource_blocked_notices (
+    id INTEGER PRIMARY KEY,
+    machine TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
+    blocked_since TEXT NOT NULL,
+    notified_at TEXT,
+    ended_at TEXT
+);
+CREATE UNIQUE INDEX resource_blocked_notices_open
+    ON resource_blocked_notices(machine) WHERE ended_at IS NULL;
+
+ALTER TABLE tasks ADD COLUMN resource_job_id TEXT;
+ALTER TABLE tasks ADD COLUMN run_number INTEGER CHECK (
+    (run_number IS NULL) = (resource_job_id IS NULL)
+    AND (run_number IS NULL OR run_number >= 1)
+);
+ALTER TABLE tasks ADD COLUMN step_index INTEGER CHECK (
+    (step_index IS NULL) = (resource_job_id IS NULL)
+    AND (step_index IS NULL OR step_index >= 0)
+);
+CREATE UNIQUE INDEX tasks_resource_run
+    ON tasks(resource_job_id, run_number) WHERE resource_job_id IS NOT NULL;
+";
+
 /// Move a v0.13 database to the current schema
 fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_34_TO_35)?;
-    conn.execute_batch(MIGRATE_34_TO_35_TASKS)
+    conn.execute_batch(MIGRATE_34_TO_35_TASKS)?;
+    conn.execute_batch(MIGRATE_34_TO_35_QUEUE)
 }
 
 /// Why `Store::open` refuses a database version
@@ -1653,6 +1789,10 @@ impl Store {
     ) -> Result<Option<TaskRow>, AppError> {
         check_status_transition(from, to)?;
         self.immediate(|| {
+            // a run of a queued job ends through its job's classification
+            if to.is_terminal() && self.job_run_link(id)?.is_some() {
+                return self.commit_job_run_end(id, from, None, None, worker_thread);
+            }
             let n = self.conn.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2,
                     worker_thread = COALESCE(?3, worker_thread)
@@ -1745,6 +1885,11 @@ impl Store {
         evidence: &TaskExitEvidence,
         worker_thread: Option<ThreadId>,
     ) -> Result<Option<TaskRow>, AppError> {
+        // a run of a queued job ends through its job's classification, which
+        // may store another outcome than the raw exit and produces no task event
+        if self.job_run_link(id)?.is_some() {
+            return self.commit_job_run_end(id, from, Some(reason), Some(evidence), worker_thread);
+        }
         let to = ProcessStatus::from(reason);
         let now = fmt_time(Utc::now());
         let reason_json = serde_json::to_string(reason)?;
@@ -3871,7 +4016,8 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                    "{DROP_QUEUE_SCHEMA}
+                     ALTER TABLE tasks DROP COLUMN child_start_time;
                      ALTER TABLE tasks DROP COLUMN child_pid;
                      ALTER TABLE origin_routes DROP COLUMN after_json;
                      ALTER TABLE origin_routes DROP COLUMN outcome;
@@ -3923,7 +4069,8 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                    "{DROP_QUEUE_SCHEMA}
+                     ALTER TABLE tasks DROP COLUMN child_start_time;
                      ALTER TABLE tasks DROP COLUMN child_pid;
                      ALTER TABLE tasks DROP COLUMN worker_thread;
                      ALTER TABLE origin_routes DROP COLUMN after_json;
@@ -3959,15 +4106,26 @@ CREATE TABLE reports (
         assert!(enabled);
     }
 
+    /// Tables of the GPU priority queue, which reuse the `resource` prefix
+    const QUEUE_TABLES: [&str; 5] = [
+        "resources",
+        "resource_jobs",
+        "resource_job_events",
+        "resource_operations",
+        "resource_blocked_notices",
+    ];
+
     fn assert_no_loan_tables(store: &Store) {
         let loan_tables: Vec<String> = store
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table'
-                   AND (name IN ('resources', 'loans', 'trainer_attempt_associations')
-                        OR name LIKE 'resource!_%' ESCAPE '!')",
-            )
+                   AND (name IN ('loans', 'trainer_attempt_associations')
+                        OR name LIKE 'resource%')
+                   AND name NOT IN ({})",
+                QUEUE_TABLES.map(|table| format!("'{table}'")).join(", ")
+            ))
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -3977,6 +4135,15 @@ CREATE TABLE reports (
             loan_tables.is_empty(),
             "loan tables remain: {loan_tables:?}"
         );
+        for table in QUEUE_TABLES {
+            let rows: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "loan rows reached {table}");
+        }
     }
 
     /// GPU loan tables of the last release that had them
@@ -4113,7 +4280,22 @@ CREATE TABLE reports (
         .unwrap();
     }
 
+    /// Remove the GPU priority queue, which no released schema has
+    const DROP_QUEUE_SCHEMA: &str = "
+        DROP INDEX tasks_resource_run;
+        ALTER TABLE tasks DROP COLUMN step_index;
+        ALTER TABLE tasks DROP COLUMN run_number;
+        ALTER TABLE tasks DROP COLUMN resource_job_id;
+        DROP TABLE resource_blocked_notices;
+        DROP TABLE resource_operations;
+        DROP TABLE resource_job_events;
+        DROP TABLE resources;
+        DROP TABLE resource_jobs;
+    ";
+
     /// Restore the shape of released schema `version` on a current database
+    ///
+    /// The queue's schema must already be gone; see [`DROP_QUEUE_SCHEMA`]
     fn downgrade_to_released(store: &Store, version: i64) {
         let mut sql = String::new();
         if version < SCHEMA_VERSION {
@@ -4194,6 +4376,8 @@ CREATE TABLE reports (
             {
                 let store = Store::open(&path).unwrap();
                 insert_local(&store, ordinary_task);
+                // the queue's tables go first, since the loan tables reuse `resources`
+                store.conn.execute_batch(DROP_QUEUE_SCHEMA).unwrap();
                 seed_loan_rows(&store, ordinary_task, loan_task);
                 downgrade_to_released(&store, version);
             }
@@ -4248,7 +4432,8 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                    "{DROP_QUEUE_SCHEMA}
+                     ALTER TABLE tasks DROP COLUMN child_start_time;
                      ALTER TABLE tasks DROP COLUMN child_pid;
                      ALTER TABLE tasks DROP COLUMN worker_thread;
                      ALTER TABLE origin_routes DROP COLUMN after_json;
