@@ -1,20 +1,27 @@
 //! Durable job delivery; inbox acceptance and route cursors commit together
 
+use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
+use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
 use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
-use crate::queue::{JobId, QueueError, Target};
+use crate::queue::{JobEventKind, JobId, QueueError, Target};
 use crate::store::Store;
 
 impl Store {
     /// Read the origin's job route, including its accepted and delivered cursors
     pub fn job_route(&self, job: JobId) -> Result<Option<JobRoute>, AppError> {
-        let saved: Option<(String, i64, i64)> = self.conn.query_row(
-            "SELECT route_json, accepted_seq, settled_seq FROM resource_job_routes WHERE job_id=?1",
-            [job.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?;
+        let saved: Option<(String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT route_json, accepted_seq, settled_seq FROM resource_job_routes
+                 WHERE job_id = ?1",
+                [job.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
         saved
             .map(|(json, accepted, settled)| {
                 let mut route: JobRoute = serde_json::from_str(&json)?;
@@ -251,16 +258,21 @@ impl Store {
         let sql_seq = sql_seq(seq)?;
         self.immediate(|| {
             let json: String = self.conn.query_row(
-                "SELECT event_json FROM resource_job_inbox WHERE job_id=?1 AND seq=?2",
-                params![job.to_string(), sql_seq], |row| row.get(0),
+                "SELECT event_json FROM resource_job_inbox WHERE job_id = ?1 AND seq = ?2",
+                params![job.to_string(), sql_seq],
+                |row| row.get(0),
             )?;
             let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
-            if envelope.event.event != crate::queue::JobEventKind::JobBlocked {
-                return Err(QueueError::Invariant { message: "only a blocked notice can be suppressed".into() }.into());
+            if envelope.event.event != JobEventKind::JobBlocked {
+                return Err(QueueError::Invariant {
+                    message: "only a blocked notice can be suppressed".into(),
+                }
+                .into());
             }
             self.conn.execute(
-                "UPDATE resource_job_inbox SET suppressed_at=COALESCE(suppressed_at,?3) WHERE job_id=?1 AND seq=?2",
-                params![job.to_string(), sql_seq, super::fmt_time(chrono::Utc::now())],
+                "UPDATE resource_job_inbox SET suppressed_at = COALESCE(suppressed_at, ?3)
+                 WHERE job_id = ?1 AND seq = ?2",
+                params![job.to_string(), sql_seq, fmt_time(Utc::now())],
             )?;
             self.settle_job_event_inner(job, seq, sql_seq)
         })

@@ -4291,5 +4291,5 @@ fn restart_applies_dependency_endings_that_arrived_while_the_daemon_was_down() {
     assert_eq!(event["cancel_reason"]["dependency"], failing.as_str());
 }
 
-#[path = "integration/phase5.rs"]
-mod phase5;
+#[path = "integration/resource_jobs.rs"]
+mod resource_jobs;

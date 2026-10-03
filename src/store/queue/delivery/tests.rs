@@ -59,7 +59,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
 }
 
 #[test]
-fn phase5_job_inbox_checks_owners_content_gaps_and_settlement_after_restart() {
+fn job_inbox_checks_owners_content_gaps_and_settlement_after_restart() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("db");
     let store = Store::open(&path).unwrap();
@@ -117,7 +117,7 @@ fn phase5_job_inbox_checks_owners_content_gaps_and_settlement_after_restart() {
 }
 
 #[test]
-fn phase5_job_route_retries_keep_context_and_refuse_spec_or_authority_changes() {
+fn job_route_retries_keep_context_and_refuse_spec_or_authority_changes() {
     let dir = tempdir().unwrap();
     let store = Store::open(&dir.path().join("db")).unwrap();
     let saved = route();
@@ -134,7 +134,7 @@ fn phase5_job_route_retries_keep_context_and_refuse_spec_or_authority_changes() 
 }
 
 #[test]
-fn phase5_schema35_upgrade_preserves_jobs_and_active_runs() {
+fn schema35_upgrade_preserves_jobs_and_active_runs() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("db");
     let store = Store::open(&path).unwrap();
@@ -187,7 +187,7 @@ fn phase5_schema35_upgrade_preserves_jobs_and_active_runs() {
 }
 
 #[test]
-fn review_fix_suppressed_inbox_notice_retains_content_and_settles_in_order() {
+fn suppressed_inbox_notice_retains_content_and_settles_in_order() {
     let dir = tempdir().unwrap();
     let store = Store::open(&dir.path().join("db")).unwrap();
     let route = route();
@@ -219,7 +219,7 @@ fn review_fix_suppressed_inbox_notice_retains_content_and_settles_in_order() {
 }
 
 #[test]
-fn review_fix_schema36_upgrade_retains_manual_registration_and_inbox_content() {
+fn schema36_upgrade_retains_manual_registration_and_inbox_content() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("db");
     let store = Store::open(&path).unwrap();

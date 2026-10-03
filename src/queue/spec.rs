@@ -22,7 +22,9 @@ use crate::domain::{API_VERSION, MIN_TIMEOUT, TaskName, TaskWorkload, ThreadId};
 use crate::error::AppError;
 use crate::invocation::{CommandLine, resolve_executable};
 use crate::machine::{MachineId, MachineName};
-use crate::spec::{cwd_problem, default_timeout, escape_token, json_pointer};
+use crate::spec::{
+    cwd_problem, default_timeout, escape_token, invalid_spec_from_de, workload_content,
+};
 
 use super::{Preemption, Priority, ResourceSelector, StepWorkload, Steps};
 
@@ -234,6 +236,13 @@ impl JobSpec {
     }
 }
 
+impl<'de> Deserialize<'de> for JobSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::parse_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Wire shape before field rules. Unknown keys fail here
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -398,12 +407,8 @@ fn parse_steps(steps: &Value) -> Result<Steps, AppError> {
 
 /// Parse one step and check its structure; `prefix` is its JSON pointer
 fn parse_step(step: &Value, prefix: &str) -> Result<StepWorkload, AppError> {
-    let kind = step.get("type").and_then(Value::as_str);
-    let mut content = step.clone();
-    if let Value::Object(map) = &mut content {
-        map.remove("type");
-    }
-    match kind {
+    let content = workload_content(step);
+    match step.get("type").and_then(Value::as_str) {
         Some("task") => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -540,31 +545,15 @@ fn deserialize_under<T: for<'de> Deserialize<'de>>(
     value: &Value,
     prefix: &str,
 ) -> Result<T, AppError> {
-    serde_path_to_error::deserialize(value).map_err(|err| {
-        let mut inner = json_pointer(err.path());
-        if inner.is_empty()
-            && let Some(name) = missing_field_name(err.inner())
-        {
-            inner = format!("/{}", escape_token(&name));
-        }
-        let field_value = value.pointer(&inner).cloned().unwrap_or(Value::Null);
-        invalid(format!("{prefix}{inner}"), field_value, err.to_string())
+    serde_path_to_error::deserialize(value).map_err(|err| match invalid_spec_from_de(value, &err) {
+        AppError::InvalidSpec {
+            pointer,
+            value,
+            message,
+        } => invalid(format!("{prefix}{pointer}"), value, message),
+        other => other,
     })
-}
-
-fn missing_field_name(err: &serde_json::Error) -> Option<String> {
-    let message = err.to_string();
-    let rest = message.strip_prefix("missing field `")?;
-    let name = rest.split('`').next()?;
-    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[cfg(test)]
 mod tests;
-
-impl<'de> Deserialize<'de> for JobSpec {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        Self::parse_value(&value).map_err(serde::de::Error::custom)
-    }
-}

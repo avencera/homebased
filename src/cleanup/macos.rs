@@ -41,7 +41,7 @@ pub(super) fn list_pids() -> io::Result<Vec<Pid>> {
     }
 }
 
-/// Start time, group, owner, and zombie state from `PROC_PIDTBSDINFO`
+/// Start time, group, and owner from `PROC_PIDTBSDINFO`; a zombie is `Exited`
 pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let Ok(size) = c_int::try_from(mem::size_of::<libc::proc_bsdinfo>()) else {
         return Read::Refused(Errno::EOVERFLOW);
@@ -72,15 +72,18 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let Ok(pgid) = i32::try_from(info.pbi_pgid) else {
         return Read::Refused(Errno::EIO);
     };
-    let start = info
-        .pbi_start_tvsec
-        .saturating_mul(1_000_000)
-        .saturating_add(info.pbi_start_tvusec);
+    let start = ProcessStartTime(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    );
+    if info.pbi_status == libc::SZOMB {
+        return Read::Exited(ProcessIdentity { pid, start });
+    }
     Read::Found(ProcessInfo {
-        start: ProcessStartTime(start),
+        start,
         pgid: Pid::from_raw(pgid),
         uid: info.pbi_uid,
-        zombie: info.pbi_status == libc::SZOMB,
     })
 }
 

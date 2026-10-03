@@ -140,7 +140,10 @@ fn probe_nvidia_smi(command: &mut Command) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetectedResource, Platform, ResourceName, parse_nvidia_smi_list, resources_for};
+    use super::{
+        DetectedResource, Platform, ResourceName, parse_nvidia_smi_list, probe_nvidia_smi,
+        resources_for,
+    };
 
     const TWO_GPUS: &str = "\
 GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-6f3c1d2e-0000-1111-2222-333344445555)
@@ -205,31 +208,25 @@ GPU 1: NVIDIA A100-SXM4-40GB (UUID: GPU-22222222-2222-3333-4444-555555555555)
         assert_eq!(resources, vec![DetectedResource::unindexed()]);
         assert_eq!(resources[0].name.as_str(), "gpu0");
     }
-}
 
-#[cfg(test)]
-mod review_fix_tests {
     #[test]
-    fn review_fix_linux_unusable_probe_does_not_create_a_lane() {
+    fn linux_unusable_probe_does_not_create_a_lane() {
         for output in ["", "No devices were found\n", "NVIDIA-SMI has failed\n"] {
-            assert!(super::resources_for(super::Platform::Linux, Some(output)).is_empty());
+            assert!(resources_for(Platform::Linux, Some(output)).is_empty());
         }
         assert_eq!(
-            super::resources_for(super::Platform::Linux, None),
-            vec![super::DetectedResource::unindexed()]
+            resources_for(Platform::Linux, None),
+            vec![DetectedResource::unindexed()]
         );
     }
-}
 
-#[cfg(test)]
-mod probe_tests {
     #[test]
-    fn review_fix_probe_distinguishes_missing_from_installed_but_failing() {
+    fn probe_distinguishes_missing_from_installed_but_failing() {
         let dir = tempfile::tempdir().unwrap();
         let mut missing = std::process::Command::new(dir.path().join("missing"));
-        assert_eq!(super::probe_nvidia_smi(&mut missing).unwrap(), None);
+        assert_eq!(probe_nvidia_smi(&mut missing).unwrap(), None);
         let mut failing = std::process::Command::new("/bin/sh");
         failing.args(["-c", "exit 1"]);
-        assert!(super::probe_nvidia_smi(&mut failing).is_err());
+        assert!(probe_nvidia_smi(&mut failing).is_err());
     }
 }

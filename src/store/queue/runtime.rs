@@ -1,8 +1,9 @@
 //! Run launch context and atomic notice production
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use rusqlite::params;
-use std::collections::HashSet;
 
 use super::{Store, event_run, fmt_time};
 use crate::domain::{ProcessStatus, TaskId};
@@ -11,7 +12,8 @@ use crate::home::{LockMode, flock_exclusive};
 use crate::machine::MachineId;
 use crate::queue::checkpoint::{Checkpoint, StepKind};
 use crate::queue::schedule::{NoticeThresholds, StoredEpisode, decide};
-use crate::queue::{BlockedNotice, JobEventKind, RunPhase};
+use crate::queue::{BlockedNotice, JobEvent, JobEventKind, JobId, QueueError, RunPhase, StopCause};
+use crate::store::CancelResult;
 
 impl Store {
     /// Read the checkpoint contract of the exact run while it holds its resource
@@ -93,14 +95,11 @@ impl Store {
     }
 
     /// Publish the worker marker for a committed restart or user stop without changing its cause
-    pub fn signal_committed_run_stop(
-        &self,
-        task: TaskId,
-    ) -> Result<crate::store::CancelResult, AppError> {
+    pub fn signal_committed_run_stop(&self, task: TaskId) -> Result<CancelResult, AppError> {
         self.immediate(|| {
             let row = self.require_task(task)?;
             if row.state.is_terminal() {
-                return Ok(crate::store::CancelResult::AlreadyTerminal(row));
+                return Ok(CancelResult::AlreadyTerminal(row));
             }
             let checkpoint = self
                 .run_checkpoint(task)?
@@ -108,7 +107,7 @@ impl Store {
             if !matches!(
                 checkpoint.run.phase,
                 RunPhase::Stopping {
-                    cause: crate::queue::StopCause::Restart | crate::queue::StopCause::UserCancel,
+                    cause: StopCause::Restart | StopCause::UserCancel,
                     ..
                 }
             ) {
@@ -122,32 +121,49 @@ impl Store {
     }
 
     /// Check an authority notice at delivery and retain suppression evidence if its episode ended
-    pub fn job_notice_is_current(
-        &self,
-        job: crate::queue::JobId,
-        seq: u64,
-    ) -> Result<bool, AppError> {
+    pub fn job_notice_is_current(&self, job: JobId, seq: u64) -> Result<bool, AppError> {
         let seq = super::delivery::sql_seq(seq)?;
         self.immediate(|| {
-            let record = self.job(job)?.ok_or(crate::queue::QueueError::JobNotFound { job })?;
+            let record = self.job(job)?.ok_or(QueueError::JobNotFound { job })?;
             let (json, suppressed): (String, bool) = self.conn.query_row(
-                "SELECT event_json, suppressed_at IS NOT NULL FROM resource_job_events WHERE job_id=?1 AND seq=?2",
-                params![job.to_string(), seq], |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT event_json, suppressed_at IS NOT NULL FROM resource_job_events
+                 WHERE job_id = ?1 AND seq = ?2",
+                params![job.to_string(), seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let event: crate::queue::JobEvent = serde_json::from_str(&json)?;
-            if event.event != JobEventKind::JobBlocked { return Err(super::corrupt("notice eligibility requires JOB_BLOCKED").into()) }
-            let notice = event.blocked.ok_or_else(|| super::corrupt("blocked event has no episode"))?;
+            let event: JobEvent = serde_json::from_str(&json)?;
+            if event.event != JobEventKind::JobBlocked {
+                return Err(super::corrupt("notice eligibility requires JOB_BLOCKED").into());
+            }
+            let notice = event
+                .blocked
+                .ok_or_else(|| super::corrupt("blocked event has no episode"))?;
             let open: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM resource_blocked_notices WHERE id=?1 AND job_id=?2 AND machine=?3 AND ended_at IS NULL)",
-                params![notice.episode, job.to_string(), record.machine.to_string()], |row| row.get(0),
+                "SELECT EXISTS(SELECT 1 FROM resource_blocked_notices
+                 WHERE id = ?1 AND job_id = ?2 AND machine = ?3 AND ended_at IS NULL)",
+                params![notice.episode, job.to_string(), record.machine.to_string()],
+                |row| row.get(0),
             )?;
-            let current = !suppressed && open && decide(&self.queue_snapshot(record.machine, Utc::now(), NoticeThresholds::default())?)
-                .blocked.is_some_and(|head| head.job == job);
+            let current = !suppressed
+                && open
+                && decide(&self.queue_snapshot(
+                    record.machine,
+                    Utc::now(),
+                    NoticeThresholds::default(),
+                )?)
+                .blocked
+                .is_some_and(|head| head.job == job);
             if !current {
-                self.conn.execute("UPDATE resource_blocked_notices SET ended_at=COALESCE(ended_at,?2) WHERE id=?1",
-                    params![notice.episode, fmt_time(Utc::now())])?;
-                self.conn.execute("UPDATE resource_job_events SET suppressed_at=COALESCE(suppressed_at,?3) WHERE job_id=?1 AND seq=?2",
-                    params![job.to_string(), seq, fmt_time(Utc::now())])?;
+                self.conn.execute(
+                    "UPDATE resource_blocked_notices SET ended_at = COALESCE(ended_at, ?2)
+                     WHERE id = ?1",
+                    params![notice.episode, fmt_time(Utc::now())],
+                )?;
+                self.conn.execute(
+                    "UPDATE resource_job_events SET suppressed_at = COALESCE(suppressed_at, ?3)
+                     WHERE job_id = ?1 AND seq = ?2",
+                    params![job.to_string(), seq, fmt_time(Utc::now())],
+                )?;
             }
             Ok(current)
         })
@@ -159,20 +175,32 @@ impl Store {
     /// running-state check, so a terminal commit wins against a late timer
     pub fn produce_job_check_due(&self, task: TaskId) -> Result<bool, AppError> {
         self.immediate(|| {
-            let Some(checkpoint) = self.run_checkpoint(task)? else { return Ok(false) };
-            if !matches!(checkpoint.run.phase, RunPhase::Executing { .. } | RunPhase::Stopping { .. })
-                || self.require_task(task)?.status() != ProcessStatus::Running
+            let Some(checkpoint) = self.run_checkpoint(task)? else {
+                return Ok(false);
+            };
+            if !matches!(
+                checkpoint.run.phase,
+                RunPhase::Executing { .. } | RunPhase::Stopping { .. }
+            ) || self.require_task(task)?.status() != ProcessStatus::Running
             {
                 return Ok(false);
             }
             let changed = self.conn.execute(
-                "UPDATE tasks SET attention_state = 'delivered', timeout_notified_at = ?1, updated_at = ?1
+                "UPDATE tasks SET attention_state = 'delivered', timeout_notified_at = ?1,
+                    updated_at = ?1
                  WHERE id = ?2 AND status = 'running' AND attention_state = 'pending'",
                 params![fmt_time(Utc::now()), task.to_string()],
             )?;
-            if changed == 0 { return Ok(false) }
-            self.append_job_event(checkpoint.run.job, JobEventKind::JobCheckDue,
-                Some(event_run(&checkpoint.run)), None, None)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            self.append_job_event(
+                checkpoint.run.job,
+                JobEventKind::JobCheckDue,
+                Some(event_run(&checkpoint.run)),
+                None,
+                None,
+            )?;
             Ok(true)
         })
     }

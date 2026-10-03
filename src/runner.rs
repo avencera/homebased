@@ -370,7 +370,7 @@ async fn run_child(
         cmd.env(key, value);
     }
     if let Some(checkpoint) = store.run_checkpoint(id)? {
-        for (key, value) in checkpoint.environment(home, false) {
+        for (key, value) in checkpoint.host_environment(home) {
             cmd.env(key, value);
         }
     }
@@ -990,14 +990,9 @@ mod tests {
             "an exit probe after the kill grace must not hide the grace timeout"
         );
     }
-}
-
-#[cfg(test)]
-mod review_fix_tests {
-    use super::{ExitReason, stop_child};
 
     #[tokio::test]
-    async fn review_fix_cancel_preserves_an_already_exited_child() {
+    async fn cancel_preserves_an_already_exited_child() {
         for code in [0, 7] {
             let mut command = tokio::process::Command::new("/bin/sh");
             command
@@ -1011,12 +1006,9 @@ mod review_fix_tests {
             assert_eq!(exit.reason, ExitReason::Exit { code });
         }
     }
-}
 
-#[cfg(test)]
-mod enforced_stop_tests {
     #[tokio::test]
-    async fn review_fix_child_exit_after_homebased_signal_stays_cancelled() {
+    async fn child_exit_after_homebased_signal_stays_cancelled() {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let mut command = tokio::process::Command::new("/bin/sh");
@@ -1036,8 +1028,8 @@ mod enforced_stop_tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let exit = super::stop_child(&mut child, pgid, crate::domain::ExitReason::Cancelled).await;
-        assert_eq!(exit.reason, crate::domain::ExitReason::Cancelled);
+        let exit = stop_child(&mut child, pgid, ExitReason::Cancelled).await;
+        assert_eq!(exit.reason, ExitReason::Cancelled);
         assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(0));
     }
 }

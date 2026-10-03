@@ -177,26 +177,37 @@ pub enum MoveRefusal {
 }
 
 impl QueueError {
-    /// Machine-readable code
+    /// The public code of a refusal; `None` for an internal error
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub const fn queue_code(&self) -> Option<QueueCode> {
         match self {
-            Self::Remote { code, .. } => code.as_str(),
+            Self::Remote { code, .. } => Some(*code),
             Self::InvalidId { .. }
             | Self::InvalidPriority { .. }
             | Self::InvalidRestartWindow { .. }
             | Self::InvalidResourceName { .. }
-            | Self::InvalidStepCount { .. } => "invalid_queue_input",
-            Self::JobNotFound { .. } => "job_not_found",
-            Self::JobTerminal { .. } => "job_terminal",
-            Self::JobConflict { .. } => "job_conflict",
-            Self::OperationConflict { .. } => "operation_conflict",
-            Self::MoveRefused { .. } => "move_refused",
-            Self::ResourceNotFound { .. } => "resource_not_found",
-            Self::ResourceNameTaken { .. } | Self::DeviceTaken { .. } => "resource_conflict",
-            Self::AttentionNotFound { .. } => "attention_not_found",
-            Self::StaleRun { .. } => "stale_run",
-            Self::Invariant { .. } | Self::Corrupt { .. } => "internal",
+            | Self::InvalidStepCount { .. } => Some(QueueCode::InvalidQueueInput),
+            Self::JobNotFound { .. } => Some(QueueCode::JobNotFound),
+            Self::JobTerminal { .. } => Some(QueueCode::JobTerminal),
+            Self::JobConflict { .. } => Some(QueueCode::JobConflict),
+            Self::OperationConflict { .. } => Some(QueueCode::OperationConflict),
+            Self::MoveRefused { .. } => Some(QueueCode::MoveRefused),
+            Self::ResourceNotFound { .. } => Some(QueueCode::ResourceNotFound),
+            Self::ResourceNameTaken { .. } | Self::DeviceTaken { .. } => {
+                Some(QueueCode::ResourceConflict)
+            }
+            Self::AttentionNotFound { .. } => Some(QueueCode::AttentionNotFound),
+            Self::StaleRun { .. } => Some(QueueCode::StaleRun),
+            Self::Invariant { .. } | Self::Corrupt { .. } => None,
+        }
+    }
+
+    /// Machine-readable code
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self.queue_code() {
+            Some(code) => code.as_str(),
+            None => "internal",
         }
     }
 
@@ -204,24 +215,9 @@ impl QueueError {
     /// found, 5 conflict, 1 internal
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
-        match self {
-            Self::Remote { code, .. } => code.exit_code(),
-            Self::InvalidId { .. }
-            | Self::InvalidPriority { .. }
-            | Self::InvalidRestartWindow { .. }
-            | Self::InvalidResourceName { .. }
-            | Self::InvalidStepCount { .. }
-            | Self::MoveRefused { .. } => 2,
-            Self::JobNotFound { .. }
-            | Self::ResourceNotFound { .. }
-            | Self::AttentionNotFound { .. } => 3,
-            Self::JobTerminal { .. }
-            | Self::JobConflict { .. }
-            | Self::OperationConflict { .. }
-            | Self::ResourceNameTaken { .. }
-            | Self::DeviceTaken { .. }
-            | Self::StaleRun { .. } => 5,
-            Self::Invariant { .. } | Self::Corrupt { .. } => 1,
+        match self.queue_code() {
+            Some(code) => code.exit_code(),
+            None => 1,
         }
     }
 
@@ -312,13 +308,17 @@ impl QueueCode {
         }
     }
 
-    /// Exit-code grouping shared with authority-side queue errors
+    /// Process exit code: 2 input, 3 not found, 5 conflict
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
             Self::InvalidQueueInput | Self::MoveRefused => 2,
             Self::JobNotFound | Self::ResourceNotFound | Self::AttentionNotFound => 3,
-            _ => 5,
+            Self::JobTerminal
+            | Self::JobConflict
+            | Self::OperationConflict
+            | Self::ResourceConflict
+            | Self::StaleRun => 5,
         }
     }
 }

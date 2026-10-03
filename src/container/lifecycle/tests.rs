@@ -939,7 +939,7 @@ async fn an_unconfirmed_removal_keeps_the_exit_code_but_not_the_witness() {
 }
 
 #[tokio::test]
-async fn review_fix_cancel_preserves_exact_container_natural_exit() {
+async fn cancel_preserves_exact_container_natural_exit() {
     for code in [0, 7] {
         let mut h = Harness::new();
         let id = h.docker.add(
@@ -966,7 +966,7 @@ async fn review_fix_cancel_preserves_exact_container_natural_exit() {
 }
 
 #[tokio::test]
-async fn review_gap_container_exit_between_probe_and_stop_is_natural() {
+async fn container_exit_between_probe_and_stop_is_natural() {
     for code in [0, 7] {
         let mut h = Harness::new();
         let id = h.docker.add(&h.name(), ContainerStatus::Running, h.label());
@@ -987,7 +987,7 @@ async fn review_gap_container_exit_between_probe_and_stop_is_natural() {
 }
 
 #[tokio::test]
-async fn review_gap_container_exit_after_stop_stays_cancelled() {
+async fn container_exit_after_stop_stays_cancelled() {
     for code in [0, 143] {
         let mut h = Harness::new();
         h.docker.state().stop_exit_code = Some(code);

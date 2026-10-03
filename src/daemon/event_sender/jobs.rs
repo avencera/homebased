@@ -1,8 +1,11 @@
 //! Ordered job outbox and callback delivery using the existing Fleet and origin senders
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ractor::ActorRef;
+use serde_json::Value;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
@@ -12,13 +15,14 @@ use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::deliver_job_event;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
-use crate::daemon::queue_api::ClusterJobEvent;
+use crate::daemon::queue_api::{ClusterJobEvent, forward};
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, EventAcceptance};
 use crate::fleet::http::ClusterClient;
-use crate::queue::JobId;
 use crate::queue::delivery::{JobRoute, RoutedJobEvent};
+use crate::queue::{JobEvent, JobEventKind, JobId};
+use crate::store::queue::interface::QueueRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Stage {
@@ -45,17 +49,22 @@ pub(crate) async fn run(state: AppState) {
             result = workers.join_next(), if !workers.is_empty() => {
                 if let Some(Ok((key, result))) = result {
                     active.remove(&key);
-                    match result {
-                        Ok(()) => { retries.remove(&key); }
-                        Err(error) => {
-                            warn!(job = %key.1, stage = ?key.0, "job event delivery deferred: {error}");
-                            retries.insert(key, Retry::after_failure(retries.get(&key).copied(), Instant::now()));
-                        }
-                    }
+                    record_delivery(&mut retries, key, result);
                 }
             }
         }
     }
+}
+
+/// Clear a finished sender's backoff, or extend it after a failure
+fn record_delivery(retries: &mut HashMap<Key, Retry>, key: Key, result: Result<(), AppError>) {
+    let Err(error) = result else {
+        retries.remove(&key);
+        return;
+    };
+    warn!(job = %key.1, stage = ?key.0, "job event delivery deferred: {error}");
+    let retry = Retry::after_failure(retries.get(&key).copied(), Instant::now());
+    retries.insert(key, retry);
 }
 
 async fn schedule(
@@ -111,48 +120,7 @@ async fn deliver_authority(state: &AppState, mut event: RoutedJobEvent) -> Resul
             })
             .await?
         } else {
-            let fleet = state
-                .fleet
-                .handle()
-                .ok_or_else(|| AppError::MachineNotFound {
-                    machine: event.origin.to_string(),
-                })?;
-            let destination = match fleet.connect(event.origin).await {
-                Ok(destination) => destination,
-                Err(_) => {
-                    fleet.discover_now().await;
-                    fleet.connect(event.origin).await?
-                }
-            };
-            let body = ClusterJobEvent {
-                api_version: API_VERSION,
-                protocol_version: destination.protocol.0,
-                destination_machine: event.origin,
-                event: event.clone(),
-            };
-            let response = ClusterClient::default()
-                .post_json(&destination.address, "/v1/cluster/job-events", &body)
-                .await
-                .map_err(|error| AppError::MachineUnavailable {
-                    machine: event.origin,
-                    message: error.to_string(),
-                })?;
-            if !response.status.is_success() {
-                return Err(crate::client::map_error(response.status, &response.body));
-            }
-            #[derive(serde::Deserialize)]
-            struct Ack {
-                api_version: u32,
-                protocol_version: u32,
-                result: EventAcceptance,
-            }
-            let ack: Ack = serde_json::from_slice(&response.body)?;
-            if ack.api_version != API_VERSION || ack.protocol_version != destination.protocol.0 {
-                return Err(AppError::Usage {
-                    message: "job event acknowledgement version differs".into(),
-                });
-            }
-            ack.result
+            send_to_origin(state, &event).await?
         };
         match result {
             EventAcceptance::Acknowledged { seq } if seq == event.event.seq => {
@@ -182,11 +150,57 @@ async fn deliver_authority(state: &AppState, mut event: RoutedJobEvent) -> Resul
     Err(AppError::DaemonBusy)
 }
 
-async fn stored_event(
+/// Offer one event to a remote origin over Fleet and read its acceptance
+async fn send_to_origin(
     state: &AppState,
-    job: JobId,
-    seq: u64,
-) -> Result<crate::queue::JobEvent, AppError> {
+    event: &RoutedJobEvent,
+) -> Result<EventAcceptance, AppError> {
+    #[derive(serde::Deserialize)]
+    struct Ack {
+        api_version: u32,
+        protocol_version: u32,
+        result: EventAcceptance,
+    }
+
+    let fleet = state
+        .fleet
+        .handle()
+        .ok_or_else(|| AppError::MachineNotFound {
+            machine: event.origin.to_string(),
+        })?;
+    let destination = match fleet.connect(event.origin).await {
+        Ok(destination) => destination,
+        Err(_) => {
+            fleet.discover_now().await;
+            fleet.connect(event.origin).await?
+        }
+    };
+    let body = ClusterJobEvent {
+        api_version: API_VERSION,
+        protocol_version: destination.protocol.0,
+        destination_machine: event.origin,
+        event: event.clone(),
+    };
+    let response = ClusterClient::default()
+        .post_json(&destination.address, "/v1/cluster/job-events", &body)
+        .await
+        .map_err(|error| AppError::MachineUnavailable {
+            machine: event.origin,
+            message: error.to_string(),
+        })?;
+    if !response.status.is_success() {
+        return Err(crate::client::map_error(response.status, &response.body));
+    }
+    let ack: Ack = serde_json::from_slice(&response.body)?;
+    if ack.api_version != API_VERSION || ack.protocol_version != destination.protocol.0 {
+        return Err(AppError::Usage {
+            message: "job event acknowledgement version differs".into(),
+        });
+    }
+    Ok(ack.result)
+}
+
+async fn stored_event(state: &AppState, job: JobId, seq: u64) -> Result<JobEvent, AppError> {
     call(&state.store, |reply| StoreMsg::QueueEvents { job, reply })
         .await?
         .into_iter()
@@ -201,7 +215,7 @@ async fn deliver_origin(
     route: JobRoute,
     event: RoutedJobEvent,
 ) -> Result<(), AppError> {
-    let before_send = if event.event.event == crate::queue::JobEventKind::JobBlocked {
+    let before_send = if event.event.event == JobEventKind::JobBlocked {
         // the authority owns the episode, including when the origin was offline
         if !notice_current(state, &route, event.event.seq).await? {
             return call(&state.store, |reply| StoreMsg::SuppressJobNotice {
@@ -215,13 +229,14 @@ async fn deliver_origin(
         let route = route.clone();
         let seq = event.event.seq;
         let runtime = tokio::runtime::Handle::current();
-        let check: SendCheck = std::sync::Arc::new(move || {
-            match runtime.block_on(notice_current(&state, &route, seq)) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(SendFailure::Suppressed),
-                Err(error) => Err(SendFailure::Failed(error.to_string())),
-            }
-        });
+        let check: SendCheck =
+            Arc::new(
+                move || match runtime.block_on(notice_current(&state, &route, seq)) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(SendFailure::Suppressed),
+                    Err(error) => Err(SendFailure::Failed(error.to_string())),
+                },
+            );
         Some(check)
     } else {
         None
@@ -237,7 +252,7 @@ async fn deliver_origin(
 
 /// Settle delivered or suppressed callbacks without removing numbered payloads
 pub(crate) async fn settle_callback(
-    store: &ractor::ActorRef<StoreMsg>,
+    store: &ActorRef<StoreMsg>,
     job: JobId,
     seq: u64,
     outcome: Option<DeliveryOutcome>,
@@ -263,10 +278,10 @@ pub(crate) async fn settle_callback(
 }
 
 async fn notice_current(state: &AppState, route: &JobRoute, seq: u64) -> Result<bool, AppError> {
-    let value = crate::daemon::queue_api::forward(
+    let value = forward(
         state,
         route.authority,
-        crate::store::queue::interface::QueueRequest::NoticeCurrent {
+        QueueRequest::NoticeCurrent {
             job: route.job,
             seq,
         },
@@ -274,7 +289,7 @@ async fn notice_current(state: &AppState, route: &JobRoute, seq: u64) -> Result<
     .await?;
     value
         .get("current")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .ok_or_else(|| AppError::Internal {
             message: "notice eligibility response has no boolean current field".into(),
         })

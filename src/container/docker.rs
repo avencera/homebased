@@ -602,7 +602,7 @@ mod tests {
         assert!(decode("unknown", 0).is_err());
     }
     #[test]
-    fn review_gap_inspect_preserves_exact_finished_at() {
+    fn inspect_preserves_exact_finished_at() {
         let decode = |finished_at: serde_json::Value| {
             serde_json::from_value::<InspectedContainer>(json!({
                 "Id": "a".repeat(64),

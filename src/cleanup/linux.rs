@@ -55,7 +55,6 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
             start: ProcessStartTime(start),
             pgid: Pid::from_raw(pgid),
             uid,
-            zombie: false,
         }),
         None => Read::Refused(Errno::EBADMSG),
     }

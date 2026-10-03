@@ -10,7 +10,7 @@ use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
@@ -20,7 +20,7 @@ use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
 use crate::machine::MachineId;
 use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
-use crate::queue::spec::{JobSpec, MachineSelector};
+use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{AttentionId, JobId, OperationId, Placement, QueueError, ResourceName};
 use crate::store::queue::JobAccepted;
 use crate::store::queue::interface::QueueRequest;
@@ -155,8 +155,8 @@ pub(super) struct ClusterJobEvent {
 }
 
 async fn schema() -> Result<Json<Value>, AppError> {
-    let mut schema = crate::queue::spec::schema_json()?;
-    schema["api_version"] = serde_json::json!(API_VERSION);
+    let mut schema = schema_json()?;
+    schema["api_version"] = json!(API_VERSION);
     Ok(Json(schema))
 }
 
@@ -502,7 +502,7 @@ async fn cluster_request(
     super::cluster::check_api_version(body.api_version)?;
     super::cluster::check_protocol(body.protocol_version, body.destination_machine)?;
     let mut value = execute(&state, body.request, TaskEnv::capture()).await?;
-    value["protocol_version"] = serde_json::json!(body.protocol_version);
+    value["protocol_version"] = json!(body.protocol_version);
     Ok(Json(value))
 }
 
@@ -527,7 +527,9 @@ async fn cluster_event(
         reply,
     })
     .await?;
-    Ok(Json(
-        serde_json::json!({ "api_version": API_VERSION, "protocol_version": body.protocol_version, "result": result }),
-    ))
+    Ok(Json(json!({
+        "api_version": API_VERSION,
+        "protocol_version": body.protocol_version,
+        "result": result,
+    })))
 }

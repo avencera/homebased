@@ -530,7 +530,6 @@ impl ProcessSource for RefusedEnvironment {
             start: self.identity.start,
             pgid: self.identity.pid,
             uid: self.uid,
-            zombie: false,
         })
     }
 
@@ -827,7 +826,6 @@ impl ProcessSource for ForkThenExit {
             start: ProcessStartTime(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
-            zombie: false,
         })
     }
 
@@ -853,7 +851,7 @@ impl ProcessSource for ForkThenExit {
 }
 
 #[test]
-fn review_fix_cleanup_rescans_a_parent_that_forks_then_exits() {
+fn cleanup_rescans_a_parent_that_forks_then_exits() {
     let marker = TaskId::new();
     let mut source = ForkThenExit {
         marker,
@@ -914,7 +912,6 @@ impl ProcessSource for ForkChain {
             start: ProcessStartTime(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
-            zombie: false,
         })
     }
 
@@ -988,14 +985,14 @@ fn cleanup_finishes_while_listed_processes_keep_exiting() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn review_fix_unreaped_child_is_exited_not_a_fresh_disappearance() {
+fn unreaped_child_is_exited_not_a_fresh_disappearance() {
     let mut child = Command::new("/usr/bin/true").spawn().unwrap();
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
     let mut source = SystemProcesses::new().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let observed = loop {
         let observed = source.info(pid);
-        if !matches!(observed, Read::Found(info) if !info.zombie) {
+        if !matches!(observed, Read::Found(_)) {
             break observed;
         }
         if Instant::now() >= deadline {
@@ -1006,13 +1003,6 @@ fn review_fix_unreaped_child_is_exited_not_a_fresh_disappearance() {
         std::thread::sleep(Duration::from_millis(10));
     };
     child.wait().unwrap();
-    // depending on timing the kernel reports the unreaped child as a zombie
-    // or as exited; cleanup treats both as not a target
-    assert!(
-        matches!(
-            observed,
-            Read::Exited(_) | Read::Found(ProcessInfo { zombie: true, .. })
-        ),
-        "{observed:?}"
-    );
+    // the unreaped child is a zombie, which is not a target
+    assert!(matches!(observed, Read::Exited(_)), "{observed:?}");
 }

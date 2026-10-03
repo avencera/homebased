@@ -12,13 +12,17 @@ use crate::cleanup::{self, CleanupTiming, GroupOutcome, SweepOutcome};
 use crate::daemon::actors::supervisor::SupervisorMsg;
 use crate::daemon::actors::task::stop_run_task;
 use crate::daemon::actors::{StoreMsg, call};
-use crate::domain::{ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, Workload};
+use crate::domain::{
+    ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, WorkExitEvidence, Workload,
+};
 use crate::error::AppError;
 use crate::home::Home;
 use crate::invocation::{resolve_docker_binary, resolve_executable};
 use crate::machine::MachineId;
 use crate::queue::schedule::{NoticeThresholds, decide};
-use crate::queue::{ActiveRun, CleanupFailure, ResourceId, RunPhase, StopCause};
+use crate::queue::{
+    ActiveRun, CleanupFailure, JobId, ResourceId, RunPhase, StepWorkload, StopCause,
+};
 
 /// A reserved worker has this long to claim its task before the launch is abandoned
 pub(crate) const LAUNCH_CONFIRMATION_BOUND: Duration = Duration::from_secs(10);
@@ -116,22 +120,17 @@ impl Actor for QueueActor {
         {
             // the sweep is done before this message; a failed commit can safely
             // start a new idempotent attempt on the next stored-state scan
-            match call(&state.args.store, |reply| StoreMsg::QueueCleanupResult {
+            let committed = call(&state.args.store, |reply| StoreMsg::QueueCleanupResult {
                 resource,
                 task,
                 attempt,
                 result,
                 reply,
             })
-            .await
-            {
-                Ok(_) => {
-                    state.cleanups.remove(&task);
-                }
-                Err(error) => {
-                    state.cleanups.remove(&task);
-                    tracing::warn!(%task, "queue cleanup commit: {error}");
-                }
+            .await;
+            state.cleanups.remove(&task);
+            if let Err(error) = committed {
+                tracing::warn!(%task, "queue cleanup commit: {error}");
             }
         }
         if let Err(error) = reconcile(&myself, state).await {
@@ -298,11 +297,7 @@ async fn enact_stop(args: &QueueArgs, task: TaskId, cause: StopCause) -> Result<
     Ok(())
 }
 
-async fn launch_job(
-    args: &QueueArgs,
-    job: crate::queue::JobId,
-    resource: ResourceId,
-) -> Result<(), AppError> {
+async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Result<(), AppError> {
     let record = call(&args.store, |reply| StoreMsg::QueueJob { id: job, reply })
         .await?
         .ok_or_else(|| AppError::Internal {
@@ -315,18 +310,13 @@ async fn launch_job(
         .ok_or_else(|| AppError::Internal {
             message: format!("scheduled job {job} has no next step"),
         })?;
-    let binary = match step.to_workload() {
-        Workload::Task(workload) => resolve_executable(
+    let binary = match step {
+        StepWorkload::Task(workload) => resolve_executable(
             workload.command.program(),
             &record.env.path,
             &record.spec.cwd,
         ),
-        Workload::Container(_) => resolve_docker_binary(&record.env.path, &record.spec.cwd),
-        Workload::Agent(_) => {
-            return Err(AppError::Internal {
-                message: "queue contains an agent".into(),
-            });
-        }
+        StepWorkload::Container(_) => resolve_docker_binary(&record.env.path, &record.spec.cwd),
     };
     let task = TaskId::new();
     let binary = match binary {
@@ -421,9 +411,7 @@ async fn start_cleanup(
 fn cleanup_run(row: &TaskRow, protected: &BTreeSet<Pid>) -> Result<(), CleanupFailure> {
     if matches!(row.workload, Workload::Container(_)) {
         return match row.work_exit_evidence() {
-            crate::domain::WorkExitEvidence::Unconfirmed => {
-                Err(CleanupFailure::ContainerUnconfirmed)
-            }
+            WorkExitEvidence::Unconfirmed => Err(CleanupFailure::ContainerUnconfirmed),
             _ => Ok(()),
         };
     }

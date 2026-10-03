@@ -12,7 +12,7 @@ use crate::callback::destination::SubmitOrigin;
 use crate::client::Client;
 use crate::domain::TaskEnv;
 use crate::error::AppError;
-use crate::queue::spec::{JobSpec, MachineSelector};
+use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, ResourceName,
 };
@@ -134,7 +134,7 @@ pub struct MoveArgs {
 pub async fn run(ctx: &Ctx, command: ResourceCommand) -> Result<ExitCode, AppError> {
     let client = Client::new(ctx.home.sock_path());
     match command {
-        ResourceCommand::Schema => ctx.print_json(crate::queue::spec::schema_json()?)?,
+        ResourceCommand::Schema => ctx.print_json(schema_json()?)?,
         ResourceCommand::Register { name, device } => {
             let value = client
                 .post("/v1/resources", &json!({ "name": name, "device": device }))
@@ -243,7 +243,12 @@ async fn submit(
     };
     let spec = JobSpec::parse_bytes(&bytes)?;
     SubmitOrigin::capture(&ctx.home)?.check(spec.thread, allow_other_thread)?;
-    let body = json!({ "job_id": job_id, "spec": spec, "env": TaskEnv::capture(), "callback_cwd": std::env::current_dir()? });
+    let body = json!({
+        "job_id": job_id,
+        "spec": spec,
+        "env": TaskEnv::capture(),
+        "callback_cwd": std::env::current_dir()?,
+    });
     let value = post_retry(client, "/v1/resource/jobs", &body).await?;
     print_result(ctx, &value, "submitted", &job_id.to_string())
 }
@@ -256,22 +261,24 @@ fn path(base: &str, machine: &MachineArgs) -> String {
 }
 
 async fn post_retry(client: &Client, path: &str, body: &Value) -> Result<Value, AppError> {
+    const ATTEMPTS: u64 = 3;
+
     // the immutable body holds the same job or operation identity on every retry
-    for attempt in 0..3 {
+    let mut attempt = 1;
+    loop {
         let result = client.post(path, body).await;
-        if attempt == 2
-            || !matches!(
-                &result,
-                Err(AppError::DaemonUnavailable { .. }
-                    | AppError::DaemonBusy
-                    | AppError::MachineUnavailable { .. })
-            )
-        {
+        let transient = matches!(
+            &result,
+            Err(AppError::DaemonUnavailable { .. }
+                | AppError::DaemonBusy
+                | AppError::MachineUnavailable { .. })
+        );
+        if !transient || attempt == ATTEMPTS {
             return result;
         }
-        tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+        tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
+        attempt += 1;
     }
-    unreachable!("the last attempt returns")
 }
 
 fn print_result(ctx: &Ctx, value: &Value, action: &str, id: &str) -> Result<(), AppError> {

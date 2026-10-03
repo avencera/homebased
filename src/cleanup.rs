@@ -3,7 +3,7 @@
 //! A run's process group is cleaned up by its worker. Work that left the
 //! group, such as a double-forked daemon or a child in a new session, still
 //! carries the run's `HOMEBASED_TASK_ID` in its environment, so a sweep reads
-//! every process's environment and stops the ones that carry the marker.
+//! every process's environment and stops the ones that carry the marker
 //!
 //! Same-user processes with unreadable environments that started at or after
 //! the workload start hold cleanup for a person to check, but are never signalled
@@ -11,14 +11,14 @@
 //! Cleanup reports whether attributable cleanup completed. It is not proof
 //! that a GPU is free: a process with a cleared environment, another user's
 //! process, or an Apple platform binary (which exposes an empty environment on
-//! macOS) cannot be attributed and is never signalled.
+//! macOS) cannot be attributed and is never signalled
 //!
 //! Every target is identified by `(pid, start time)`. Before each signal the
 //! sweep rereads both the start time and the marker and skips the process if
 //! either changed. On Linux the signal goes through a pidfd opened before that
 //! reread, so the checked process is the one signalled. On macOS a small window
 //! between the check and `kill` remains; reusing the PID inside it requires the
-//! PID space to wrap.
+//! PID space to wrap
 //!
 //! The calls block on system calls and sleeps for up to
 //! [`CleanupTiming::deadline`], so async callers run them on a blocking thread
@@ -99,11 +99,11 @@ impl fmt::Display for ProcessIdentity {
 /// returned for the read
 pub fn process_identity(pid: Pid) -> io::Result<ProcessIdentity> {
     match os::process_info(pid) {
-        Read::Found(info) if !info.zombie => Ok(ProcessIdentity {
+        Read::Found(info) => Ok(ProcessIdentity {
             pid,
             start: info.start,
         }),
-        Read::Found(_) | Read::Exited(_) | Read::Gone => Err(io::Error::from(Errno::ESRCH)),
+        Read::Exited(_) | Read::Gone => Err(io::Error::from(Errno::ESRCH)),
         Read::Refused(errno) => Err(io::Error::from(errno)),
     }
 }
@@ -391,9 +391,10 @@ pub(crate) fn cleanup_lost_group_with<S: ProcessSource>(
 /// Result of one read about another process
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Read<T> {
-    /// The read succeeded
+    /// The read succeeded, and the process is live
     Found(T),
     /// The kernel confirms an exited process whose PID has not yet been reaped
+    /// (a zombie); it holds no resources
     Exited(ProcessIdentity),
     /// The process does not exist
     Gone,
@@ -401,14 +402,12 @@ pub(crate) enum Read<T> {
     Refused(Errno),
 }
 
-/// What the kernel reports about one process
+/// What the kernel reports about one live process
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessInfo {
     pub(crate) start: ProcessStartTime,
     pub(crate) pgid: Pid,
     pub(crate) uid: u32,
-    /// An exited process that its parent has not reaped; it holds no resources
-    pub(crate) zombie: bool,
 }
 
 /// A process's environment block: `KEY=VALUE` entries, each ending in NUL
@@ -684,13 +683,17 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         }
     }
 
-    fn scan(&mut self) -> Result<Scan, CleanupFailure> {
-        let pids = self
-            .source
+    /// Every PID; a failed listing is never an empty table
+    fn list(&mut self) -> Result<Vec<Pid>, CleanupFailure> {
+        self.source
             .list()
             .map_err(|error| CleanupFailure::EnumerationFailed {
                 message: error.to_string(),
-            })?;
+            })
+    }
+
+    fn scan(&mut self) -> Result<Scan, CleanupFailure> {
+        let pids = self.list()?;
         let mut scan = Scan::default();
         for pid in pids {
             let identity = match self.observe(pid) {
@@ -749,8 +752,8 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     /// A live marked target or a same-user unreadable suspect within the run bound
     fn observe(&mut self, pid: Pid) -> Option<Observation> {
         let info = match self.source.info(pid) {
-            Read::Found(info) if !info.zombie => info,
-            Read::Found(_) | Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
+            Read::Found(info) => info,
+            Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
             Read::Refused(_) => return None,
         };
         let environment = match self.source.environment(pid) {
@@ -778,7 +781,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
 
     fn still_same(&mut self, pid: Pid, info: ProcessInfo) -> bool {
         match self.source.info(pid) {
-            Read::Found(after) if !after.zombie && after.start == info.start => true,
+            Read::Found(after) if after.start == info.start => true,
             Read::Found(_) | Read::Exited(_) | Read::Gone | Read::Refused(_) => false,
         }
     }
@@ -858,7 +861,6 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             });
         }
         if let Read::Found(info) = self.source.info(leader.pid)
-            && !info.zombie
             && info.start == leader.start
             && info.pgid == pgid
         {
@@ -872,19 +874,12 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         Err(CleanupFailure::GroupUnattributed { pgid })
     }
 
-    /// Live, non-zombie processes in the group
+    /// Live processes in the group
     fn group_members(&mut self, pgid: Pid) -> Result<Vec<Pid>, CleanupFailure> {
-        let pids = self
-            .source
-            .list()
-            .map_err(|error| CleanupFailure::EnumerationFailed {
-                message: error.to_string(),
-            })?;
+        let pids = self.list()?;
         Ok(pids
             .into_iter()
-            .filter(|pid| {
-                matches!(self.source.info(*pid), Read::Found(info) if info.pgid == pgid && !info.zombie)
-            })
+            .filter(|pid| matches!(self.source.info(*pid), Read::Found(info) if info.pgid == pgid))
             .collect())
     }
 

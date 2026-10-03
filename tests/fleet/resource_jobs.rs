@@ -128,7 +128,7 @@ fn wait_event(origin: &Daemon, job: JobId, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn phase5_fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
+async fn fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
     let (origin, executor) = dependency_fleet("job-route");
     let job = JobId::new();
     let _jobs = Jobs {
@@ -161,7 +161,12 @@ async fn phase5_fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
         digest: route.digest,
         event: store(&executor).job_events(job).unwrap().remove(0),
     };
-    let body = json!({ "api_version": 1, "protocol_version": 2, "destination_machine": origin.machine_id(), "event": envelope });
+    let body = json!({
+        "api_version": 1,
+        "protocol_version": 2,
+        "destination_machine": origin.machine_id(),
+        "event": envelope,
+    });
     let response = ClusterClient::default()
         .post_json(&origin.address(), "/v1/cluster/job-events", &body)
         .await
@@ -183,7 +188,7 @@ async fn phase5_fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
 }
 
 #[test]
-fn phase5_fleet_lost_submit_response_retries_and_conflicts_without_duplicate_work() {
+fn fleet_lost_submit_response_retries_and_conflicts_without_duplicate_work() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
@@ -194,9 +199,25 @@ fn phase5_fleet_lost_submit_response_retries_and_conflicts_without_duplicate_wor
         ids: vec![job],
     };
     let spec = spec(&origin, &executor, "echo one >> count; exit 0");
-    let body = serde_json::to_vec(&json!({ "job_id": job, "spec": spec, "env": TaskEnv { path: std::env::var("PATH").unwrap(), home: origin.user_home.display().to_string() }, "callback_cwd": origin.user_home })).unwrap();
+    let env = TaskEnv {
+        path: std::env::var("PATH").unwrap(),
+        home: origin.user_home.display().to_string(),
+    };
+    let body = serde_json::to_vec(&json!({
+        "job_id": job,
+        "spec": spec,
+        "env": env,
+        "callback_cwd": origin.user_home,
+    }))
+    .unwrap();
     let mut socket = UnixStream::connect(origin.home.join("homebased.sock")).unwrap();
-    write!(socket, "POST /v1/resource/jobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+    let length = body.len();
+    write!(
+        socket,
+        "POST /v1/resource/jobs HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+    )
+    .unwrap();
     socket.write_all(&body).unwrap();
     assert!(wait_until(Duration::from_secs(10), || store(&executor)
         .job(job)
@@ -224,7 +245,7 @@ fn phase5_fleet_lost_submit_response_retries_and_conflicts_without_duplicate_wor
 }
 
 #[test]
-fn phase5_fleet_offline_origin_receives_stored_job_events_after_return() {
+fn fleet_offline_origin_receives_stored_job_events_after_return() {
     let (mut origin, executor) = dependency_fleet("job-offline");
     let job = JobId::new();
     let _jobs = Jobs {
@@ -266,7 +287,7 @@ fn phase5_fleet_offline_origin_receives_stored_job_events_after_return() {
 }
 
 #[test]
-fn phase5_fleet_moves_and_cancels_use_saved_authority_and_explicit_machine() {
+fn fleet_moves_and_cancels_use_saved_authority_and_explicit_machine() {
     let (origin, executor) = dependency_fleet("job-operations");
     let a = JobId::new();
     let b = JobId::new();
@@ -346,7 +367,7 @@ fn phase5_fleet_moves_and_cancels_use_saved_authority_and_explicit_machine() {
 }
 
 #[test]
-fn review_fix_fleet_offline_origin_suppresses_an_ended_blocked_notice() {
+fn fleet_offline_origin_suppresses_an_ended_blocked_notice() {
     use homebased::queue::schedule::NoticeThresholds;
     let (mut origin, executor) = dependency_fleet("notice-offline");
     let low = JobId::new();

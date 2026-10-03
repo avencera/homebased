@@ -503,7 +503,7 @@ fn parse_container(content: &Value) -> Result<Box<ContainerWorkload>, AppError> 
 ///
 /// `serde_path_to_error` leaves the path empty when a required field is
 /// absent, so the missing name is recovered from the inner serde message
-fn invalid_spec_from_de(
+pub(crate) fn invalid_spec_from_de(
     value: &Value,
     err: &serde_path_to_error::Error<serde_json::Error>,
 ) -> AppError {
@@ -694,7 +694,7 @@ fn invalid_agent_extra_args(workload: &Value, error: AgentExtraArgsError) -> App
 }
 
 /// Drop the discriminant so content structs with `deny_unknown_fields` accept the body
-fn workload_content(workload_raw: &Value) -> Value {
+pub(crate) fn workload_content(workload_raw: &Value) -> Value {
     match workload_raw {
         Value::Object(map) => {
             let mut content = map.clone();

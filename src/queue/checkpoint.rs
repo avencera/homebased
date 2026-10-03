@@ -9,6 +9,19 @@ use crate::home::Home;
 use crate::queue::{ActiveRun, Resource, StepWorkload};
 use crate::run_env;
 
+/// Container mount of the job directory, under the reserved root that job
+/// specs may not mount over
+const CONTAINER_JOB_DIR: &str = "/homebased/job";
+
+/// Read-only container mount of the run's control directory
+const CONTAINER_RUN_DIR: &str = "/homebased/run";
+
+/// The yield file as a container sees it
+const CONTAINER_YIELD_FILE: &str = "/homebased/run/yield";
+
+/// Name of the yield file in the run's control directory
+const YIELD_FILE_NAME: &str = "yield";
+
 /// Run-owned paths and child environment, derived from the reserved resource
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
@@ -72,7 +85,7 @@ impl Checkpoint {
     /// Publish the exact run's checkpoint request, safely repeatable after a crash
     pub fn request_yield(&self, home: &Home) -> Result<(), AppError> {
         self.prepare_control(home)?;
-        let path = self.control_dir(home).join("yield");
+        let path = self.control_dir(home).join(YIELD_FILE_NAME);
         std::fs::write(&path, b"")?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
         Ok(())
@@ -98,16 +111,36 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// Variables for the workload child, never for the daemon or task worker
-    pub fn environment(&self, home: &Home, container: bool) -> Vec<(&'static str, String)> {
-        let (job_dir, yield_file) = if container {
-            ("/homebased/job".into(), "/homebased/run/yield".into())
-        } else {
-            (
-                self.job_dir(home).display().to_string(),
-                self.control_dir(home).join("yield").display().to_string(),
-            )
-        };
+    /// Variables for a host step's workload child, never for the daemon or
+    /// task worker
+    pub fn host_environment(&self, home: &Home) -> Vec<(&'static str, String)> {
+        self.environment(
+            self.job_dir(home).display().to_string(),
+            self.control_dir(home)
+                .join(YIELD_FILE_NAME)
+                .display()
+                .to_string(),
+            self.resource.device,
+        )
+    }
+
+    /// Variables for a container step, at the fixed mount paths
+    fn container_environment(&self) -> Vec<(&'static str, String)> {
+        // docker exposes one selected host GPU as CUDA ordinal zero
+        let ordinal = self.resource.device.map(|_| 0);
+        self.environment(
+            CONTAINER_JOB_DIR.into(),
+            CONTAINER_YIELD_FILE.into(),
+            ordinal,
+        )
+    }
+
+    fn environment(
+        &self,
+        job_dir: String,
+        yield_file: String,
+        cuda_ordinal: Option<u32>,
+    ) -> Vec<(&'static str, String)> {
         let mut env = vec![
             (run_env::TASK_ID, self.run.task.to_string()),
             (run_env::JOB_ID, self.run.job.to_string()),
@@ -118,9 +151,7 @@ impl Checkpoint {
             (run_env::YIELD_FILE, yield_file),
             (run_env::RESOURCE, self.resource.name.to_string()),
         ];
-        if let Some(device) = self.resource.device {
-            // docker exposes one selected host GPU as CUDA ordinal zero
-            let ordinal = if container { 0 } else { device };
+        if let Some(ordinal) = cuda_ordinal {
             env.push((run_env::CUDA_VISIBLE_DEVICES, ordinal.to_string()));
         }
         env
@@ -141,12 +172,12 @@ impl Checkpoint {
         workload.mounts.extend([
             ContainerMount {
                 source: self.job_dir(home),
-                target: "/homebased/job".into(),
+                target: CONTAINER_JOB_DIR.into(),
                 read_only: false,
             },
             ContainerMount {
                 source: self.control_dir(home),
-                target: "/homebased/run".into(),
+                target: CONTAINER_RUN_DIR.into(),
                 read_only: true,
             },
         ]);
@@ -154,10 +185,29 @@ impl Checkpoint {
             .resource
             .device
             .map(|device| GpuRequest::Devices(vec![device]));
-        for (key, value) in self.environment(home, true) {
+        for (key, value) in self.container_environment() {
             let key = EnvName::parse(key).map_err(|message| AppError::Internal { message })?;
             workload.env.insert(key, value);
         }
         Ok(workload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{CONTAINER_JOB_DIR, CONTAINER_RUN_DIR, CONTAINER_YIELD_FILE, YIELD_FILE_NAME};
+    use crate::queue::spec::RESERVED_MOUNT_ROOT;
+
+    #[test]
+    fn container_paths_sit_under_the_root_job_specs_may_not_mount() {
+        for path in [CONTAINER_JOB_DIR, CONTAINER_RUN_DIR, CONTAINER_YIELD_FILE] {
+            assert!(Path::new(path).starts_with(RESERVED_MOUNT_ROOT), "{path}");
+        }
+        assert_eq!(
+            Path::new(CONTAINER_RUN_DIR).join(YIELD_FILE_NAME),
+            Path::new(CONTAINER_YIELD_FILE)
+        );
     }
 }

@@ -89,6 +89,9 @@ impl Drop for Jobs<'_> {
     }
 }
 
+/// Report readiness, then run until the test creates `finish`, for at most 15 seconds
+const WAIT_FOR_FINISH: &str = "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 0";
+
 fn spec(h: &Harness, priority: &str, mode: &str, script: &str) -> Value {
     json!({ "api_version": 1, "thread": THREAD, "name": "CLI queue test", "cwd": h.home,
         "priority": priority, "preempt": { "mode": mode }, "resource": "gpu0",
@@ -114,7 +117,7 @@ fn show(h: &Harness, job: JobId) -> Value {
 fn wait_state(h: &Harness, job: JobId, state: &str) -> Value {
     assert!(
         wait_until(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             || show(h, job)["job"]["state"]["state"] == state
         ),
         "job {job}: {}",
@@ -147,7 +150,7 @@ fn wait_callbacks(h: &Harness, job: JobId, count: usize) -> Vec<Value> {
 }
 
 #[test]
-fn phase5_cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
+fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
     let mut steps = spec(&h, "medium", "wait", "exit 0");
@@ -157,7 +160,9 @@ fn phase5_cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies
         { "type": "task", "command": ["/bin/sh", "-c", "echo second > second; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 0"] }
     ]);
     let job = jobs.submit(&steps);
-    assert!(wait_until(Duration::from_secs(10), || h
+    // the next step starts only after cleanup confirms, which takes several
+    // scans while parallel tests keep starting and exiting processes
+    assert!(wait_until(Duration::from_secs(30), || h
         .home
         .join("second")
         .exists()));
@@ -210,10 +215,11 @@ fn machine(h: &Harness) -> MachineId {
 }
 
 #[test]
-fn phase5_yield_callbacks_are_ordered_and_keep_each_thread() {
+fn yield_callbacks_are_ordered_and_keep_each_thread() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let low = jobs.submit(&spec(&h, "low", "yield", "if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; echo ready > ready; n=0; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 75"));
+    let body = "if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; echo ready > ready; n=0; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 75";
+    let low = jobs.submit(&spec(&h, "low", "yield", body));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
@@ -242,10 +248,10 @@ fn phase5_yield_callbacks_are_ordered_and_keep_each_thread() {
 }
 
 #[test]
-fn phase5_cli_queue_moves_replay_stored_results_and_cancel() {
+fn cli_queue_moves_replay_stored_results_and_cancel() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "medium", "wait", "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done"));
+    let active = jobs.submit(&spec(&h, "medium", "wait", WAIT_FOR_FINISH));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
@@ -327,7 +333,7 @@ fn phase5_cli_queue_moves_replay_stored_results_and_cancel() {
 }
 
 #[test]
-fn phase5_attention_release_refuses_stale_identity_and_replays() {
+fn attention_release_refuses_stale_identity_and_replays() {
     let mut h = Harness::new();
     assert!(
         cli(&h, &["resource", "list"])["resources"]
@@ -452,10 +458,10 @@ fn phase5_attention_release_refuses_stale_identity_and_replays() {
 }
 
 #[test]
-fn phase5_blocked_and_check_due_callbacks_only_reach_the_affected_job() {
+fn blocked_and_check_due_callbacks_only_reach_the_affected_job() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "low", "wait", "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 0"));
+    let active = jobs.submit(&spec(&h, "low", "wait", WAIT_FOR_FINISH));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
@@ -521,7 +527,7 @@ fn phase5_blocked_and_check_due_callbacks_only_reach_the_affected_job() {
 }
 
 #[test]
-fn phase5_web_serves_only_guarded_queue_controls() {
+fn web_serves_only_guarded_queue_controls() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -529,7 +535,14 @@ fn phase5_web_serves_only_guarded_queue_controls() {
     let addr = super::dashboard_addr(&h);
     let request = |path: &str, origin: &str, body: &str| {
         let mut stream = TcpStream::connect(&addr).unwrap();
-        write!(stream, "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let length = body.len();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n\
+             Content-Type: application/json\r\nContent-Length: {length}\r\n\
+             Connection: close\r\n\r\n{body}"
+        )
+        .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
@@ -559,7 +572,7 @@ fn phase5_web_serves_only_guarded_queue_controls() {
 }
 
 #[test]
-fn phase5_job_submit_checks_worker_parent_thread_and_accepts_stdin() {
+fn job_submit_checks_worker_parent_thread_and_accepts_stdin() {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -629,14 +642,14 @@ fn phase5_job_submit_checks_worker_parent_thread_and_accepts_stdin() {
 }
 
 #[test]
-fn phase5_cli_transport_retry_keeps_generated_operation_identity() {
+fn cli_transport_retry_keeps_generated_operation_identity() {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "medium", "wait", "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done"));
+    let active = jobs.submit(&spec(&h, "medium", "wait", WAIT_FOR_FINISH));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
@@ -730,7 +743,7 @@ fn phase5_cli_transport_retry_keeps_generated_operation_identity() {
 }
 
 #[test]
-fn phase5_cli_failure_reports_the_job_and_run_without_task_callbacks() {
+fn cli_failure_reports_the_job_and_run_without_task_callbacks() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
     let mut failing = spec(&h, "medium", "wait", "exit 0");
@@ -760,7 +773,7 @@ fn phase5_cli_failure_reports_the_job_and_run_without_task_callbacks() {
 }
 
 #[test]
-fn review_fix_task_cancel_during_yield_commits_user_cancel_before_signalling() {
+fn task_cancel_during_yield_commits_user_cancel_before_signalling() {
     use homebased::queue::StopCause;
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;

@@ -1831,7 +1831,7 @@ fn queue_state_survives_reopening_the_database() {
 }
 
 #[test]
-fn review_fix_detection_reconciles_fallback_and_preserves_manual_resources() {
+fn detection_reconciles_fallback_and_preserves_manual_resources() {
     let f = Fixture::new();
     let machine = MachineId::new();
     let fallback = f
@@ -1866,7 +1866,7 @@ fn review_fix_detection_reconciles_fallback_and_preserves_manual_resources() {
 }
 
 #[test]
-fn review_fix_detection_defers_all_phases_of_an_active_fallback() {
+fn detection_defers_all_phases_of_an_active_fallback() {
     for phase in [
         "launching",
         "executing",
@@ -1948,7 +1948,7 @@ fn review_fix_detection_defers_all_phases_of_an_active_fallback() {
 }
 
 #[test]
-fn review_fix_task_cancel_upgrades_yield_before_exit_75() {
+fn task_cancel_upgrades_yield_before_exit_75() {
     let f = Fixture::new();
     let job = f.submit(Priority::Low);
     let run = f.start(job, "gpu0", Utc::now());
@@ -1961,7 +1961,7 @@ fn review_fix_task_cancel_upgrades_yield_before_exit_75() {
 }
 
 #[test]
-fn review_fix_preemption_rechecks_move_and_head_cancel() {
+fn preemption_rechecks_move_and_head_cancel() {
     for cancel_head in [false, true] {
         let f = Fixture::new();
         let mut low_spec = spec(Priority::Low, 1);
@@ -2011,19 +2011,22 @@ fn review_fix_preemption_rechecks_move_and_head_cancel() {
 }
 
 #[test]
-fn review_fix_checkpoint_control_modes_ignore_umask() {
+fn checkpoint_control_modes_ignore_umask() {
     const HELPER: &str = "HOMEBASED_TEST_CONTROL_UMASK";
     if std::env::var_os(HELPER).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "store::queue::tests::review_fix_checkpoint_control_modes_ignore_umask",
+                "store::queue::tests::checkpoint_control_modes_ignore_umask",
                 "--exact",
                 "--nocapture",
             ])
             .env(HELPER, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        // a stale test name filters out every test and still exits 0
+        assert!(stdout.contains("1 passed"), "{stdout}");
         return;
     }
     // SAFETY: only this isolated test process creates files after changing its umask
@@ -2059,7 +2062,7 @@ fn review_fix_checkpoint_control_modes_ignore_umask() {
 }
 
 #[test]
-fn review_fix_ended_blocked_notice_is_suppressed_without_a_sequence_gap() {
+fn ended_blocked_notice_is_suppressed_without_a_sequence_gap() {
     let f = Fixture::new();
     let low = f.submit(Priority::Low);
     let run = f.start(low, "gpu0", Utc::now());
@@ -2111,7 +2114,7 @@ fn review_fix_ended_blocked_notice_is_suppressed_without_a_sequence_gap() {
 }
 
 #[test]
-fn review_fix_queue_restart_marker_does_not_become_user_cancel() {
+fn queue_restart_marker_does_not_become_user_cancel() {
     let f = Fixture::new();
     let job = f.submit(Priority::Low);
     let run = f.start(job, "gpu0", Utc::now());
@@ -2130,7 +2133,7 @@ fn review_fix_queue_restart_marker_does_not_become_user_cancel() {
 }
 
 #[test]
-fn review_fix_detection_uses_first_nonzero_device_and_never_adds_a_fallback_beside_it() {
+fn detection_uses_first_nonzero_device_and_never_adds_a_fallback_beside_it() {
     let f = Fixture::new();
     let machine = MachineId::new();
     let fallback = f
@@ -2161,7 +2164,7 @@ fn review_fix_detection_uses_first_nonzero_device_and_never_adds_a_fallback_besi
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn review_gap_notice_ends_during_callback_preparation() {
+async fn notice_ends_during_callback_preparation() {
     const LOCK_HELPER: &str = "HOMEBASED_TEST_NOTICE_LOCK";
     if let Some(path) = std::env::var_os(LOCK_HELPER) {
         let path = std::path::PathBuf::from(path);
@@ -2300,7 +2303,7 @@ async fn review_gap_notice_ends_during_callback_preparation() {
 
     let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
-            "store::queue::tests::review_gap_notice_ends_during_callback_preparation",
+            "store::queue::tests::notice_ends_during_callback_preparation",
             "--exact",
         ])
         .env(LOCK_HELPER, &delivery)

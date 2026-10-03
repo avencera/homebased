@@ -3,11 +3,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::domain::{ProcessStatus, TaskEnv, TaskId};
+use crate::dependency::TaskOutcome;
+use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::queue::spec::JobSpec;
-use crate::queue::{AttentionId, JobId, OperationId, Placement, QueueError, ResourceName};
+use crate::queue::{
+    AttentionId, CleanupFailure, JobId, OperationId, Placement, QueueError, ResourceId,
+    ResourceName, StopCause,
+};
 use crate::store::Store;
 
 use super::NewJob;
@@ -96,13 +100,13 @@ pub struct JobRunView {
     /// Task process state
     pub status: ProcessStatus,
     /// Run outcome, present once terminal
-    pub outcome: Option<crate::dependency::TaskOutcome>,
+    pub outcome: Option<TaskOutcome>,
     /// Resource assigned to the attempt; unknown for ended attempts before this schema
-    pub resource: Option<crate::queue::ResourceId>,
+    pub resource: Option<ResourceId>,
     /// Last committed stop cause
-    pub stop_cause: Option<crate::queue::StopCause>,
+    pub stop_cause: Option<StopCause>,
     /// Attributable cleanup result, present once cleanup finished
-    pub cleanup: Option<Result<(), crate::queue::CleanupFailure>>,
+    pub cleanup: Option<Result<(), CleanupFailure>>,
 }
 
 impl Store {
@@ -113,7 +117,7 @@ impl Store {
         request: &QueueRequest,
         env: &TaskEnv,
     ) -> Result<Value, AppError> {
-        let result = match request {
+        let mut result = match request {
             QueueRequest::Resources => {
                 json!({ "machine": machine, "resources": self.resources_on(machine)? })
             }
@@ -132,8 +136,13 @@ impl Store {
                     .find(|run| run.job == *job);
                 let runs = self.job_runs(*job)?;
                 let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
-                json!({ "job": record, "active_run": active, "runs": runs,
-                    "last_stop_cause": last_stop_cause, "events": self.job_events(*job)? })
+                json!({
+                    "job": record,
+                    "active_run": active,
+                    "runs": runs,
+                    "last_stop_cause": last_stop_cause,
+                    "events": self.job_events(*job)?,
+                })
             }
             QueueRequest::NoticeCurrent { job, seq } => {
                 self.require_machine_job(machine, *job)?;
@@ -169,17 +178,19 @@ impl Store {
                 self.release_resource_attention(machine, *operation, *attention)?,
             )?,
         };
-        let mut result = result;
         if let Some(object) = result.as_object_mut() {
-            object.insert("api_version".into(), json!(crate::domain::API_VERSION));
+            object.insert("api_version".into(), json!(API_VERSION));
         }
         Ok(result)
     }
 
     /// Every run of the job, even after the resource starts other work
     pub fn job_runs(&self, job: JobId) -> Result<Vec<JobRunView>, AppError> {
-        let mut statement = self.conn.prepare("SELECT t.id,t.run_number,t.step_index,h.resource_id,h.stop_cause,h.cleanup_json
-            FROM tasks t LEFT JOIN resource_run_history h ON h.task_id=t.id WHERE t.resource_job_id=?1 ORDER BY t.run_number")?;
+        let mut statement = self.conn.prepare(
+            "SELECT t.id, t.run_number, t.step_index, h.resource_id, h.stop_cause, h.cleanup_json
+             FROM tasks t LEFT JOIN resource_run_history h ON h.task_id = t.id
+             WHERE t.resource_job_id = ?1 ORDER BY t.run_number",
+        )?;
         let rows = statement
             .query_map([job.to_string()], |row| {
                 Ok((
@@ -203,7 +214,7 @@ impl Store {
                     run_number,
                     step,
                     status: row.status(),
-                    outcome: crate::dependency::TaskOutcome::from_storage(row.status().as_str()),
+                    outcome: TaskOutcome::from_storage(row.status().as_str()),
                     resource: resource.map(|value| value.parse()).transpose()?,
                     stop_cause: cause
                         .map(|value| serde_json::from_str(&value))

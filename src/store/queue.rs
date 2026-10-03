@@ -22,20 +22,21 @@ use uuid::Uuid;
 
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId,
-    check_status_transition,
+    TaskRow, ThreadId, check_status_transition,
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::queue::classify::{JobTransition, RunEnd, RunOutcome, classify};
 use crate::queue::gpu::DetectedResource;
 use crate::queue::schedule::{
-    JobView, NoticeThresholds, QueuedState, ResourceView, Snapshot, StoredEpisode,
+    JobView, NoticeThresholds, Preempt, QueuedState, ResourceView, Snapshot, StoredEpisode, decide,
 };
 use crate::queue::spec::JobSpec;
 use crate::queue::{
-    ActiveRun, AttentionId, CleanupFailure, EventRun, JobEvent, JobEventKind, JobId, JobState,
-    LevelEnd, MoveRefusal, OperationId, Placement, Priority, QueueError, Resource, ResourceId,
-    ResourceName, ResourceSelector, RunNumber, RunPhase, Side, StepIndex, StopCause, Target,
+    ActiveRun, AttentionId, BlockedNotice, CleanupFailure, EventRun, JobEvent, JobEventKind, JobId,
+    JobState, LevelEnd, MoveRefusal, OperationId, Placement, Priority, QueueError, Resource,
+    ResourceId, ResourceName, ResourceSelector, RunNumber, RunPhase, Side, StepIndex, StepWorkload,
+    StopCause, Target,
 };
 
 use super::{NewTask, Store, find_project_root, fmt_time, new_queued_task, parse_time};
@@ -68,6 +69,26 @@ pub enum ResourceOrigin {
     DetectedDevice,
     /// A person registered this resource
     Manual,
+}
+
+impl ResourceOrigin {
+    /// Storage tag
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DetectedFallback => "detected_fallback",
+            Self::DetectedDevice => "detected_device",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, QueueError> {
+        match raw {
+            "detected_fallback" => Ok(Self::DetectedFallback),
+            "detected_device" => Ok(Self::DetectedDevice),
+            "manual" => Ok(Self::Manual),
+            other => Err(corrupt(format!("unknown resource origin {other:?}"))),
+        }
+    }
 }
 
 /// A resource with its machine and single active run
@@ -210,12 +231,18 @@ enum RunEndSource {
     LaunchAbandoned,
 }
 
-/// Placement of the job's columns after a run ends
+/// Where a move inserts the job within its new level
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    /// An end of the level
+    End(LevelEnd),
+    /// Beside another job of the level
+    Next { target: JobId, side: Side },
+}
+
+/// Where a run's end leaves its job, and the event that records it
 struct JobAfterRun {
-    state: &'static str,
-    next_step: StepIndex,
-    resume: bool,
-    failed_run: Option<TaskId>,
+    state: JobState,
     event: Option<JobEventKind>,
 }
 
@@ -234,50 +261,120 @@ impl Store {
     ) -> Result<Vec<ResourceRecord>, AppError> {
         self.immediate(|| {
             let existing = self.resources_on(machine)?;
-            let fallback = existing.iter().find(|record| record.origin == ResourceOrigin::DetectedFallback);
             let first_device = detected.iter().find_map(|resource| resource.device);
-            if first_device.is_none() && existing.iter().any(|record| record.resource.device.is_some()) {
+            let Some(device) = first_device else {
+                // a fallback is never added beside an indexed resource
+                if existing
+                    .iter()
+                    .any(|record| record.resource.device.is_some())
+                {
+                    return Ok(existing);
+                }
+                self.insert_detected(machine, detected)?;
+                return self.resources_on(machine);
+            };
+
+            let fallback = existing
+                .iter()
+                .find(|record| record.origin == ResourceOrigin::DetectedFallback);
+            if let Some(fallback) = fallback
+                && !self.adopt_fallback_device(machine, &existing, fallback, device)?
+            {
                 return Ok(existing);
             }
-            if let (Some(fallback), Some(device)) = (fallback, first_device) {
-                if fallback.run.is_some() {
-                    tracing::warn!(%machine, resource = %fallback.resource.id, "GPU detection deferred while the fallback has an active run");
-                    return Ok(existing);
-                }
-                if existing.iter().any(|record| record.resource.device == Some(device)) {
-                    tracing::warn!(%machine, device, "GPU detection deferred because the fallback device is already registered");
-                    return Ok(existing);
-                }
-                let detected_name = ResourceName::gpu(device);
-                let name = if existing.iter().any(|record| {
-                    record.resource.id != fallback.resource.id && record.resource.name == detected_name
-                }) {
-                    tracing::warn!(%machine, resource = %fallback.resource.id, name = %detected_name, "GPU fallback keeps its name because the detected device name is already registered");
-                    &fallback.resource.name
-                } else {
-                    &detected_name
-                };
-                self.conn.execute(
-                    "UPDATE resources SET device=?2, name=?3, origin='detected_device' WHERE id=?1",
-                    params![fallback.resource.id.to_string(), i64::from(device), name.as_str()],
-                )?;
-            }
-            for resource in detected {
-                let device = resource.device.map(i64::from);
-                let origin = if device.is_some() { "detected_device" } else { "detected_fallback" };
-                self.conn.execute(
-                    "INSERT INTO resources (id, machine, name, device, created_at, origin)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM resources WHERE machine = ?2
-                           AND (name = ?3 OR (?4 IS NOT NULL AND device = ?4))
-                     )",
-                    params![ResourceId::new().to_string(), machine.to_string(), resource.name.as_str(),
-                        device, fmt_time(Utc::now()), origin],
-                )?;
-            }
+            self.insert_detected(machine, detected)?;
             self.resources_on(machine)
         })
+    }
+
+    /// Give an idle fallback the first detected device, keeping its UUID
+    ///
+    /// Returns `false` when detection must wait for a later start: the fallback
+    /// has an active run, or another resource already holds the device
+    fn adopt_fallback_device(
+        &self,
+        machine: MachineId,
+        existing: &[ResourceRecord],
+        fallback: &ResourceRecord,
+        device: u32,
+    ) -> Result<bool, AppError> {
+        let id = fallback.resource.id;
+        if fallback.run.is_some() {
+            tracing::warn!(
+                %machine,
+                resource = %id,
+                "GPU detection deferred while the fallback has an active run"
+            );
+            return Ok(false);
+        }
+        if existing
+            .iter()
+            .any(|record| record.resource.device == Some(device))
+        {
+            tracing::warn!(
+                %machine,
+                device,
+                "GPU detection deferred because the fallback device is already registered"
+            );
+            return Ok(false);
+        }
+
+        let detected_name = ResourceName::gpu(device);
+        let name_taken = existing
+            .iter()
+            .any(|record| record.resource.id != id && record.resource.name == detected_name);
+        let name = if name_taken {
+            tracing::warn!(
+                %machine,
+                resource = %id,
+                name = %detected_name,
+                "GPU fallback keeps its name because the detected device name is already registered"
+            );
+            &fallback.resource.name
+        } else {
+            &detected_name
+        };
+        self.conn.execute(
+            "UPDATE resources SET device = ?2, name = ?3, origin = ?4 WHERE id = ?1",
+            params![
+                id.to_string(),
+                i64::from(device),
+                name.as_str(),
+                ResourceOrigin::DetectedDevice.as_str()
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Insert each detected resource whose name and device are both free
+    fn insert_detected(
+        &self,
+        machine: MachineId,
+        detected: &[DetectedResource],
+    ) -> Result<(), AppError> {
+        for resource in detected {
+            let origin = match resource.device {
+                Some(_) => ResourceOrigin::DetectedDevice,
+                None => ResourceOrigin::DetectedFallback,
+            };
+            self.conn.execute(
+                "INSERT INTO resources (id, machine, name, device, created_at, origin)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM resources WHERE machine = ?2
+                       AND (name = ?3 OR (?4 IS NOT NULL AND device = ?4))
+                 )",
+                params![
+                    ResourceId::new().to_string(),
+                    machine.to_string(),
+                    resource.name.as_str(),
+                    resource.device.map(i64::from),
+                    fmt_time(Utc::now()),
+                    origin.as_str()
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// Register a resource on `machine` by hand
@@ -560,8 +657,8 @@ impl Store {
             .into());
         }
         let refuse = |reason| QueueError::MoveRefused { job: id, reason };
-        let (level, anchor) = match placement {
-            Placement::Edge { priority, end } => (priority.unwrap_or(job.priority), Err(end)),
+        let (level, slot) = match placement {
+            Placement::Edge { priority, end } => (priority.unwrap_or(job.priority), Slot::End(end)),
             Placement::Relative {
                 target,
                 side,
@@ -587,7 +684,7 @@ impl Store {
                     })
                     .into());
                 }
-                (anchor.priority, Ok((target, side)))
+                (anchor.priority, Slot::Next { target, side })
             }
         };
 
@@ -596,10 +693,10 @@ impl Store {
             .into_iter()
             .filter(|other| *other != id)
             .collect();
-        let index = match anchor {
-            Err(LevelEnd::Front) => 0,
-            Err(LevelEnd::Back) => order.len(),
-            Ok((target, side)) => {
+        let index = match slot {
+            Slot::End(LevelEnd::Front) => 0,
+            Slot::End(LevelEnd::Back) => order.len(),
+            Slot::Next { target, side } => {
                 let at = order
                     .iter()
                     .position(|other| *other == target)
@@ -669,7 +766,7 @@ impl Store {
                 })
             }
             JobState::Queued { .. } => {
-                self.end_job(&job, "cancelled", None)?;
+                self.end_job(&job, JobState::Cancelled)?;
                 self.append_job_event(id, JobEventKind::JobCancelled, None, None, None)?;
                 Ok(CancelResult::Cancelled)
             }
@@ -869,10 +966,11 @@ impl Store {
             ],
         )?;
         self.conn.execute(
-            "UPDATE resource_jobs SET state = 'active', active_resource = ?1,
-                    last_run_number = ?2, updated_at = ?3
-                 WHERE id = ?4",
+            "UPDATE resource_jobs SET state = ?1, active_resource = ?2,
+                    last_run_number = ?3, updated_at = ?4
+                 WHERE id = ?5",
             params![
+                JobState::Active { resource }.as_str(),
                 resource.to_string(),
                 run_number.get(),
                 fmt_time(now),
@@ -915,12 +1013,9 @@ impl Store {
                 .steps
                 .get(record.next_step)
                 .ok_or_else(|| corrupt("job next step missing"))?;
-            let program = match step.to_workload() {
-                crate::domain::Workload::Task(workload) => workload.command.program().to_owned(),
-                crate::domain::Workload::Container(_) => "docker".into(),
-                crate::domain::Workload::Agent(_) => {
-                    return Err(corrupt("agent queue workload").into());
-                }
+            let program = match step {
+                StepWorkload::Task(workload) => workload.command.program().to_owned(),
+                StepWorkload::Container(_) => "docker".into(),
             };
             self.reserve_run_inner(machine, job, resource, task, PathBuf::from(program), now)?;
             self.commit_terminal(
@@ -989,7 +1084,7 @@ impl Store {
     /// committed stop stays valid and returns its stored cause
     pub fn commit_preemption(
         &self,
-        stop: crate::queue::schedule::Preempt,
+        stop: Preempt,
         now: DateTime<Utc>,
     ) -> Result<Option<ActiveRun>, AppError> {
         self.immediate(|| {
@@ -1002,7 +1097,7 @@ impl Store {
                 return Ok(Some(run));
             }
             let snapshot = self.queue_snapshot(record.machine, now, NoticeThresholds::default())?;
-            if crate::queue::schedule::decide(&snapshot).preemption != Some(stop) {
+            if decide(&snapshot).preemption != Some(stop) {
                 return Ok(None);
             }
             self.request_stop(stop.resource, Some(stop.task), stop.cause, now)
@@ -1184,8 +1279,8 @@ impl Store {
         from: ProcessStatus,
         reason: Option<&ExitReason>,
         evidence: Option<&TaskExitEvidence>,
-        worker_thread: Option<crate::domain::ThreadId>,
-    ) -> Result<Option<crate::domain::TaskRow>, AppError> {
+        worker_thread: Option<ThreadId>,
+    ) -> Result<Option<TaskRow>, AppError> {
         match (reason, evidence) {
             (Some(reason), Some(evidence)) => self.commit_terminal(
                 task,
@@ -1205,9 +1300,9 @@ impl Store {
         from: ProcessStatus,
         reason: &ExitReason,
         evidence: &TaskExitEvidence,
-        worker_thread: Option<crate::domain::ThreadId>,
+        worker_thread: Option<ThreadId>,
         source: RunEndSource,
-    ) -> Result<Option<crate::domain::TaskRow>, AppError> {
+    ) -> Result<Option<TaskRow>, AppError> {
         let current = self.require_task(task)?;
         if current.status() != from {
             return Ok(None);
@@ -1263,8 +1358,8 @@ impl Store {
         &self,
         task: TaskId,
         from: ProcessStatus,
-        worker_thread: Option<crate::domain::ThreadId>,
-    ) -> Result<Option<crate::domain::TaskRow>, AppError> {
+        worker_thread: Option<ThreadId>,
+    ) -> Result<Option<TaskRow>, AppError> {
         check_status_transition(from, ProcessStatus::Lost)?;
         let (run, job) = self.run_for_task(task)?;
         let updated = self.conn.execute(
@@ -1324,34 +1419,38 @@ impl Store {
         transition: Option<JobTransition>,
         process: Option<ExitReason>,
     ) -> Result<(), AppError> {
-        let resume = job.resume;
         let after = match transition {
-            None => JobAfterRun::queued(run.step, resume, None),
+            None => JobAfterRun::queued(run.step, job.resume, None),
             Some(JobTransition::NextStep) => JobAfterRun::queued(run.step.next(), false, None),
             Some(JobTransition::Requeue { resume }) => {
                 JobAfterRun::queued(run.step, resume, Some(JobEventKind::JobPreempted))
             }
             Some(JobTransition::Succeeded) => {
-                JobAfterRun::ended("succeeded", run.step, None, JobEventKind::JobSucceeded)
+                JobAfterRun::ended(JobState::Succeeded, JobEventKind::JobSucceeded)
             }
             Some(JobTransition::Failed) => {
-                JobAfterRun::ended("failed", run.step, Some(run.task), JobEventKind::JobFailed)
+                JobAfterRun::ended(JobState::Failed { run: run.task }, JobEventKind::JobFailed)
             }
             Some(JobTransition::Cancelled) => {
-                JobAfterRun::ended("cancelled", run.step, None, JobEventKind::JobCancelled)
+                JobAfterRun::ended(JobState::Cancelled, JobEventKind::JobCancelled)
             }
         };
-        let terminal = after.state != "queued";
+        // a terminal job keeps the step it ended on, for `resource job show`
+        let (next_step, resume) = match after.state {
+            JobState::Queued { next_step, resume } => (next_step, resume),
+            _ => (run.step, false),
+        };
+        let terminal = after.state.is_terminal();
         self.conn.execute(
             "UPDATE resource_jobs SET state = ?1, active_resource = NULL, next_step = ?2,
                 resume = ?3, failed_run = ?4, position = CASE WHEN ?5 THEN NULL ELSE position END,
                 updated_at = ?6
              WHERE id = ?7",
             params![
-                after.state,
-                after.next_step.get(),
-                after.resume,
-                after.failed_run.map(|task| task.to_string()),
+                after.state.as_str(),
+                next_step.get(),
+                resume,
+                failed_run(after.state),
                 terminal,
                 fmt_time(Utc::now()),
                 job.id.to_string(),
@@ -1372,19 +1471,20 @@ impl Store {
     }
 
     /// Take a job out of the queue with a terminal state
-    fn end_job(
-        &self,
-        job: &JobRecord,
-        state: &'static str,
-        failed_run: Option<TaskId>,
-    ) -> Result<(), AppError> {
+    fn end_job(&self, job: &JobRecord, state: JobState) -> Result<(), AppError> {
+        if !state.is_terminal() {
+            return Err(QueueError::Invariant {
+                message: format!("job {} cannot end as {}", job.id, state.as_str()),
+            }
+            .into());
+        }
         self.conn.execute(
             "UPDATE resource_jobs SET state = ?1, position = NULL, active_resource = NULL,
                 failed_run = ?2, updated_at = ?3
              WHERE id = ?4",
             params![
-                state,
-                failed_run.map(|task| task.to_string()),
+                state.as_str(),
+                failed_run(state),
                 fmt_time(Utc::now()),
                 job.id.to_string()
             ],
@@ -1418,7 +1518,7 @@ impl Store {
         run: Option<EventRun>,
         process: Option<ExitReason>,
         attention: Option<AttentionId>,
-        blocked: Option<crate::queue::BlockedNotice>,
+        blocked: Option<BlockedNotice>,
     ) -> Result<JobEvent, AppError> {
         self.conn.execute(
             "UPDATE resource_jobs SET event_seq = event_seq + 1 WHERE id = ?1",
@@ -1656,27 +1756,24 @@ impl Store {
 impl JobAfterRun {
     fn queued(next_step: StepIndex, resume: bool, event: Option<JobEventKind>) -> Self {
         Self {
-            state: "queued",
-            next_step,
-            resume,
-            failed_run: None,
+            state: JobState::Queued { next_step, resume },
             event,
         }
     }
 
-    fn ended(
-        state: &'static str,
-        step: StepIndex,
-        failed_run: Option<TaskId>,
-        event: JobEventKind,
-    ) -> Self {
+    fn ended(state: JobState, event: JobEventKind) -> Self {
         Self {
             state,
-            next_step: step,
-            resume: false,
-            failed_run,
             event: Some(event),
         }
+    }
+}
+
+/// The `failed_run` column of a job in `state`
+fn failed_run(state: JobState) -> Option<String> {
+    match state {
+        JobState::Failed { run } => Some(run.to_string()),
+        _ => None,
     }
 }
 
@@ -1758,8 +1855,8 @@ fn opt_u32(value: Option<i64>, what: &str) -> Result<Option<u32>, QueueError> {
         .transpose()
 }
 
-fn opt_time(value: Option<String>) -> Result<Option<DateTime<Utc>>, AppError> {
-    value.as_deref().map(parse_time).transpose()
+fn opt_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>, AppError> {
+    value.map(parse_time).transpose()
 }
 
 /// Resource columns as read, before checks
@@ -1806,6 +1903,48 @@ impl RawResource {
         })
     }
 
+    /// The active run's phase from `run_phase` and its phase-specific columns
+    fn phase(&self) -> Result<RunPhase, AppError> {
+        let phase = match self.run_phase.as_deref().unwrap_or_default() {
+            "launching" => RunPhase::Launching {
+                reserved_at: required_time(self.reserved_at.as_deref(), "reserved_at")?,
+            },
+            "executing" => RunPhase::Executing {
+                started_at: required_time(self.started_at.as_deref(), "started_at")?,
+            },
+            "stopping" => RunPhase::Stopping {
+                started_at: opt_time(self.started_at.as_deref())?,
+                cause: StopCause::parse(
+                    self.stop_cause
+                        .as_deref()
+                        .ok_or_else(|| corrupt("stopping run has no cause"))?,
+                )?,
+                requested_at: required_time(
+                    self.stop_requested_at.as_deref(),
+                    "stop_requested_at",
+                )?,
+            },
+            "cleaning" => RunPhase::Cleaning {
+                attempt: opt_u32(self.cleanup_attempt, "cleanup attempt")?
+                    .ok_or_else(|| corrupt("cleaning run has no attempt"))?,
+            },
+            "attention" => RunPhase::Attention {
+                id: AttentionId::from_uuid(parse_uuid(
+                    self.attention_id
+                        .as_deref()
+                        .ok_or_else(|| corrupt("attention has no id"))?,
+                )?),
+                failure: serde_json::from_str(
+                    self.attention_failure
+                        .as_deref()
+                        .ok_or_else(|| corrupt("attention has no failure"))?,
+                )?,
+            },
+            other => return Err(corrupt(format!("unknown run phase {other:?}")).into()),
+        };
+        Ok(phase)
+    }
+
     fn parse(self) -> Result<ResourceRecord, AppError> {
         let id = ResourceId::from_uuid(parse_uuid(&self.id)?);
         let resource = Resource {
@@ -1815,69 +1954,27 @@ impl RawResource {
         };
         let machine: MachineId = self.machine.parse()?;
         let run = match (
-            self.run_phase.as_deref(),
-            self.run_job,
-            self.run_task,
+            self.run_phase.is_some(),
+            &self.run_job,
+            &self.run_task,
             self.run_number,
             self.run_step,
         ) {
-            (None, None, None, None, None) => None,
-            (Some(phase), Some(job), Some(task), Some(number), Some(step)) => {
-                let phase = match phase {
-                    "launching" => RunPhase::Launching {
-                        reserved_at: required_time(self.reserved_at, "reserved_at")?,
-                    },
-                    "executing" => RunPhase::Executing {
-                        started_at: required_time(self.started_at, "started_at")?,
-                    },
-                    "stopping" => RunPhase::Stopping {
-                        started_at: opt_time(self.started_at)?,
-                        cause: StopCause::parse(
-                            self.stop_cause
-                                .as_deref()
-                                .ok_or_else(|| corrupt("stopping run has no cause"))?,
-                        )?,
-                        requested_at: required_time(self.stop_requested_at, "stop_requested_at")?,
-                    },
-                    "cleaning" => RunPhase::Cleaning {
-                        attempt: opt_u32(self.cleanup_attempt, "cleanup attempt")?
-                            .ok_or_else(|| corrupt("cleaning run has no attempt"))?,
-                    },
-                    "attention" => RunPhase::Attention {
-                        id: AttentionId::from_uuid(parse_uuid(
-                            self.attention_id
-                                .as_deref()
-                                .ok_or_else(|| corrupt("attention has no id"))?,
-                        )?),
-                        failure: serde_json::from_str(
-                            self.attention_failure
-                                .as_deref()
-                                .ok_or_else(|| corrupt("attention has no failure"))?,
-                        )?,
-                    },
-                    other => return Err(corrupt(format!("unknown run phase {other:?}")).into()),
-                };
-                Some(ActiveRun {
-                    resource: id,
-                    job: JobId::from_uuid(parse_uuid(&job)?),
-                    task: TaskId(parse_uuid(&task)?),
-                    run_number: RunNumber::new(
-                        u32::try_from(number).map_err(|_| corrupt("bad run number"))?,
-                    )?,
-                    step: StepIndex::new(u32::try_from(step).map_err(|_| corrupt("bad run step"))?),
-                    phase,
-                })
-            }
+            (false, None, None, None, None) => None,
+            (true, Some(job), Some(task), Some(number), Some(step)) => Some(ActiveRun {
+                resource: id,
+                job: JobId::from_uuid(parse_uuid(job)?),
+                task: TaskId(parse_uuid(task)?),
+                run_number: RunNumber::new(
+                    u32::try_from(number).map_err(|_| corrupt("bad run number"))?,
+                )?,
+                step: StepIndex::new(u32::try_from(step).map_err(|_| corrupt("bad run step"))?),
+                phase: self.phase()?,
+            }),
             _ => return Err(corrupt(format!("resource {id} has a partial active run")).into()),
         };
-        let origin = match self.origin.as_str() {
-            "detected_fallback" => ResourceOrigin::DetectedFallback,
-            "detected_device" => ResourceOrigin::DetectedDevice,
-            "manual" => ResourceOrigin::Manual,
-            other => return Err(corrupt(format!("unknown resource origin {other:?}")).into()),
-        };
         Ok(ResourceRecord {
-            origin,
+            origin: ResourceOrigin::parse(&self.origin)?,
             machine,
             resource,
             run,
@@ -1885,7 +1982,7 @@ impl RawResource {
     }
 }
 
-fn required_time(value: Option<String>, what: &str) -> Result<DateTime<Utc>, AppError> {
+fn required_time(value: Option<&str>, what: &str) -> Result<DateTime<Utc>, AppError> {
     opt_time(value)?.ok_or_else(|| corrupt(format!("run has no {what}")).into())
 }
 

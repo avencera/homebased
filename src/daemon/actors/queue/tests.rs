@@ -156,7 +156,10 @@ impl Harness {
     ) -> JobId {
         let steps: Vec<_> = scripts
             .iter()
-            .map(|script| json!({ "type": "task", "command": ["/bin/sh", "-c", format!("set -eu; {script}")] }))
+            .map(|script| {
+                let command = ["/bin/sh", "-c", &format!("set -eu; {script}")].map(String::from);
+                json!({ "type": "task", "command": command })
+            })
             .collect();
         let mut value = json!({
             "api_version": 1, "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
@@ -346,7 +349,7 @@ fn wait_mode() -> Value {
 }
 
 #[test]
-fn phase4_launch_steps_failure_and_checkpoint_environment() {
+fn launch_steps_failure_and_checkpoint_environment() {
     let h = Harness::new("30m");
     let trace = h.path("trace");
     let command = format!(
@@ -373,7 +376,7 @@ fn phase4_launch_steps_failure_and_checkpoint_environment() {
 }
 
 #[test]
-fn phase4_yield_resumes_same_directory_without_overlap() {
+fn yield_resumes_same_directory_without_overlap() {
     let h = Harness::new("30m");
     let order = h.path("order");
     let directory = h.path("job-dir");
@@ -443,11 +446,14 @@ fn phase4_yield_resumes_same_directory_without_overlap() {
 }
 
 #[test]
-fn phase4_restart_and_wait_window_preserve_run_age() {
+fn restart_and_wait_window_preserve_run_age() {
     let mut h = Harness::new("30m");
     let ready = h.path("ready");
-    let low = h.submit("low", json!({"mode":"restart"}), &script(&format!(
-        "echo \"$HOMEBASED_RESUME:$HOMEBASED_RUN_NUMBER\" >> {ready}; if [ \"$HOMEBASED_RUN_NUMBER\" = 1 ]; then while :; do sleep 0.02; done; fi", ready=quote(&ready))), None);
+    let body = format!(
+        "echo \"$HOMEBASED_RESUME:$HOMEBASED_RUN_NUMBER\" >> {ready}; if [ \"$HOMEBASED_RUN_NUMBER\" = 1 ]; then while :; do sleep 0.02; done; fi",
+        ready = quote(&ready)
+    );
+    let low = h.submit("low", json!({"mode":"restart"}), &script(&body), None);
     h.executing(low);
     wait(|| ready.exists());
     let first = h.task(low);
@@ -518,7 +524,7 @@ fn phase4_restart_and_wait_window_preserve_run_age() {
 }
 
 #[test]
-fn phase4_cancel_active_and_queued() {
+fn cancel_active_and_queued() {
     let h = Harness::new("30m");
     let active = h.submit(
         "low",
@@ -538,7 +544,7 @@ fn phase4_cancel_active_and_queued() {
 }
 
 #[test]
-fn phase4_two_resources_pinning_and_device_environment() {
+fn two_resources_pinning_and_device_environment() {
     let h = Harness::new("30m");
     h.store()
         .register_resource(h.machine, ResourceName::parse("gpu1").unwrap(), Some(7))
@@ -551,7 +557,8 @@ fn phase4_two_resources_pinning_and_device_environment() {
     );
     h.executing(low);
     let pin = h.submit("high", wait_mode(), &script("exit 0"), Some("gpu0"));
-    let any = h.submit("medium", wait_mode(), &script("test \"$HOMEBASED_RESOURCE\" = gpu1 && test \"$CUDA_VISIBLE_DEVICES\" = 7; while [ ! -e done ]; do sleep 0.02; done"), None);
+    let body = "test \"$HOMEBASED_RESOURCE\" = gpu1 && test \"$CUDA_VISIBLE_DEVICES\" = 7; while [ ! -e done ]; do sleep 0.02; done";
+    let any = h.submit("medium", wait_mode(), &script(body), None);
     h.executing(any);
     assert!(matches!(h.job(pin).state, JobState::Queued { .. }));
     assert_eq!(
@@ -573,7 +580,7 @@ fn phase4_two_resources_pinning_and_device_environment() {
 }
 
 #[test]
-fn phase4_cleanup_kills_detached_helper_before_next_launch() {
+fn cleanup_kills_detached_helper_before_next_launch() {
     let mut h = Harness::new("30m");
     let pidfile = h.path("detached");
     let command = format!(
@@ -603,7 +610,7 @@ fn phase4_cleanup_kills_detached_helper_before_next_launch() {
 }
 
 #[test]
-fn phase4_attention_holds_lane_and_release_is_exact() {
+fn attention_holds_lane_and_release_is_exact() {
     let mut h = Harness::new("30m");
     h.stop();
     h.store()
@@ -702,7 +709,7 @@ fn phase4_attention_holds_lane_and_release_is_exact() {
 }
 
 #[test]
-fn phase4_notices_fire_once_per_episode_and_survive_restart() {
+fn notices_fire_once_per_episode_and_survive_restart() {
     let mut h = Harness::new("500ms");
     let low = h.submit(
         "low",
@@ -740,9 +747,10 @@ fn phase4_notices_fire_once_per_episode_and_survive_restart() {
 }
 
 #[test]
-fn phase4_recovery_executing_and_committed_stops() {
+fn recovery_executing_and_committed_stops() {
     let mut h = Harness::new("30m");
-    let low = h.submit("low", json!({"mode":"yield"}), &script("if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; exit 75"), None);
+    let body = "if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; exit 75";
+    let low = h.submit("low", json!({"mode":"yield"}), &script(body), None);
     h.executing(low);
     let task = h.task(low);
     h.restart();
@@ -787,7 +795,7 @@ fn phase4_recovery_executing_and_committed_stops() {
 }
 
 #[test]
-fn phase4_recovery_terminal_cleanup_and_abandoned_reservation() {
+fn recovery_terminal_cleanup_and_abandoned_reservation() {
     let mut h = Harness::new("30m");
     h.stop();
     let job = h.submit("low", wait_mode(), &script("exit 0"), None);
@@ -845,7 +853,7 @@ fn phase4_recovery_terminal_cleanup_and_abandoned_reservation() {
 }
 
 #[test]
-fn phase4_check_due_is_a_job_event_and_never_stops_the_run() {
+fn check_due_is_a_job_event_and_never_stops_the_run() {
     let mut h = Harness::new("30m");
     let job = h.submit(
         "low",
@@ -887,7 +895,7 @@ fn phase4_check_due_is_a_job_event_and_never_stops_the_run() {
 }
 
 #[test]
-fn phase4_recovery_user_cancel_before_marker_and_lost_worker_children() {
+fn recovery_user_cancel_before_marker_and_lost_worker_children() {
     let mut h = Harness::new("30m");
     let job = h.submit(
         "low",
@@ -943,7 +951,7 @@ fn phase4_recovery_user_cancel_before_marker_and_lost_worker_children() {
 }
 
 #[test]
-fn phase4_spawn_failure_serves_the_next_job() {
+fn spawn_failure_serves_the_next_job() {
     let mut h = Harness::new("30m");
     h.stop();
     let job = h.submit("low", wait_mode(), &script("exit 0"), None);
@@ -974,7 +982,7 @@ fn phase4_spawn_failure_serves_the_next_job() {
 }
 
 #[test]
-fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
+fn container_contract_uses_resource_and_fixed_mounts() {
     use crate::container::docker::{CreateContext, create_args};
     use crate::container::{ContainerUser, ContainerWorkload};
     let mut h = Harness::new("30m");
@@ -1017,7 +1025,7 @@ fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
     assert_eq!(env["CUDA_VISIBLE_DEVICES"], "0");
     assert!(
         checkpoint
-            .environment(&h.home, false)
+            .host_environment(&h.home)
             .contains(&("CUDA_VISIBLE_DEVICES", "3".into()))
     );
     let paths = h.home.task_paths(task);
@@ -1037,9 +1045,11 @@ fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
     let workload = checkpoint
         .container_workload(
             &h.home,
-            &ContainerWorkload::from_value(
-                &json!({"image":format!("sha256:{}", "0".repeat(64)), "memory":"1g", "env":{"CUDA_VISIBLE_DEVICES":"99"}}),
-            )
+            &ContainerWorkload::from_value(&json!({
+                "image": format!("sha256:{}", "0".repeat(64)),
+                "memory": "1g",
+                "env": { "CUDA_VISIBLE_DEVICES": "99" },
+            }))
             .unwrap(),
         )
         .unwrap();
@@ -1060,7 +1070,7 @@ fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
     );
     assert!(
         !checkpoint
-            .environment(&h.home, false)
+            .host_environment(&h.home)
             .iter()
             .any(|(key, _)| *key == "CUDA_VISIBLE_DEVICES")
     );
@@ -1069,7 +1079,7 @@ fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
 }
 
 #[test]
-fn phase4_two_yields_keep_distinct_tasks_and_control_files() {
+fn two_yields_keep_distinct_tasks_and_control_files() {
     let h = Harness::new("30m");
     let command = "echo \"$HOMEBASED_TASK_ID\" >> attempts; if [ \"$HOMEBASED_RUN_NUMBER\" = 3 ]; then test \"$HOMEBASED_RESUME\" = 1; test ! -e \"$HOMEBASED_YIELD_FILE\"; exit 0; fi; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; exit 75";
     let low = h.submit("low", json!({"mode":"yield"}), &script(command), None);
@@ -1103,10 +1113,11 @@ fn phase4_two_yields_keep_distinct_tasks_and_control_files() {
 }
 
 #[test]
-fn phase4_moves_and_cancel_do_not_withdraw_a_committed_yield() {
+fn moves_and_cancel_do_not_withdraw_a_committed_yield() {
     use crate::queue::{LevelEnd, Placement, Priority};
     let h = Harness::new("30m");
-    let low = h.submit("low", json!({"mode":"yield"}), &script("if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; touch saw-yield; while [ ! -e finish-yield ]; do sleep 0.02; done; exit 75"), None);
+    let body = "if [ \"$HOMEBASED_RESUME\" = 1 ]; then exit 0; fi; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; touch saw-yield; while [ ! -e finish-yield ]; do sleep 0.02; done; exit 75";
+    let low = h.submit("low", json!({"mode":"yield"}), &script(body), None);
     h.executing(low);
     // an equal-priority job cannot preempt until the move raises its level
     let head = h.submit("low", wait_mode(), &script("exit 0"), None);
@@ -1147,7 +1158,7 @@ fn phase4_moves_and_cancel_do_not_withdraw_a_committed_yield() {
 }
 
 #[test]
-fn phase4_step_boundary_is_success_and_restart_only_repeats_current_step() {
+fn step_boundary_is_success_and_restart_only_repeats_current_step() {
     let h = Harness::new("30m");
     let low = h.submit("low", json!({"mode":"yield"}), &[
         "echo step0 >> order; while [ ! -e \"$HOMEBASED_YIELD_FILE\" ]; do sleep 0.02; done; exit 0".into(),
@@ -1184,7 +1195,7 @@ fn phase4_step_boundary_is_success_and_restart_only_repeats_current_step() {
 }
 
 #[test]
-fn phase4_missing_executable_fails_once_and_does_not_block_the_queue() {
+fn missing_executable_fails_once_and_does_not_block_the_queue() {
     use std::os::unix::fs::PermissionsExt;
     let mut h = Harness::new("30m");
     h.stop();
@@ -1217,7 +1228,7 @@ fn phase4_missing_executable_fails_once_and_does_not_block_the_queue() {
 }
 
 #[test]
-fn phase4_unconfirmed_cleanup_waits_for_release_and_fresh_reservation_waits_for_bound() {
+fn unconfirmed_cleanup_waits_for_release_and_fresh_reservation_waits_for_bound() {
     let mut h = Harness::new("30m");
     h.stop();
     let resource = h.resource("gpu0");

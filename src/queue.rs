@@ -4,7 +4,7 @@
 //! A job is a finite command or container split into 1 to 32 steps. Each
 //! attempt of a step is a run, executed by one ordinary task. Jobs serve by
 //! `(level desc, position asc)`, and only a strictly higher level preempts a
-//! running job, at the job's next checkpoint unless it opted into restarts.
+//! running job, at the job's next checkpoint unless it opted into restarts
 //!
 //! This module holds the types and pure rules. The store keeps the queue and
 //! enforces its invariants in transactions, and the queue actor executes it
@@ -156,16 +156,6 @@ impl Priority {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-        }
-    }
-
-    /// Order of the level in storage, so SQL can sort by it
-    #[must_use]
-    pub const fn rank(self) -> i64 {
-        match self {
-            Self::Low => 0,
-            Self::Medium => 1,
-            Self::High => 2,
         }
     }
 }
