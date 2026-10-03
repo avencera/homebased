@@ -224,6 +224,7 @@ impl Store {
     ///
     /// Idempotent: an existing resource keeps its UUID, and a detected GPU
     /// whose name is taken by a hand-registered resource is left alone.
+    /// An idle fallback adopts its first device's name unless that name is taken
     /// Detected resources are never removed, so a GPU that disappears leaves
     /// its resource in place
     pub fn ensure_detected_resources(
@@ -247,9 +248,18 @@ impl Store {
                     tracing::warn!(%machine, device, "GPU detection deferred because the fallback device is already registered");
                     return Ok(existing);
                 }
+                let detected_name = ResourceName::gpu(device);
+                let name = if existing.iter().any(|record| {
+                    record.resource.id != fallback.resource.id && record.resource.name == detected_name
+                }) {
+                    tracing::warn!(%machine, resource = %fallback.resource.id, name = %detected_name, "GPU fallback keeps its name because the detected device name is already registered");
+                    &fallback.resource.name
+                } else {
+                    &detected_name
+                };
                 self.conn.execute(
-                    "UPDATE resources SET device=?2, origin='detected_device' WHERE id=?1",
-                    params![fallback.resource.id.to_string(), i64::from(device)],
+                    "UPDATE resources SET device=?2, name=?3, origin='detected_device' WHERE id=?1",
+                    params![fallback.resource.id.to_string(), i64::from(device), name.as_str()],
                 )?;
             }
             for resource in detected {

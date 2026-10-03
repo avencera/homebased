@@ -1494,6 +1494,158 @@ fn detected_resources_are_created_once_and_keep_their_ids() {
 }
 
 #[test]
+fn queue_detection_renames_the_fallback_to_the_only_nonzero_device() {
+    let fixture = Fixture::new();
+    let machine = MachineId::new();
+    let fallback = fixture
+        .store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap()[0]
+        .resource
+        .id;
+    let detected = crate::queue::gpu::resources_for(
+        crate::queue::gpu::Platform::Linux,
+        Some("GPU 1: NVIDIA GPU (UUID: GPU-test)\n"),
+    );
+    let resources = fixture
+        .store
+        .ensure_detected_resources(machine, &detected)
+        .unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].resource.id, fallback);
+    assert_eq!(resources[0].resource.device, Some(1));
+    assert_eq!(resources[0].resource.name, ResourceName::gpu(1));
+    assert_eq!(resources[0].origin, super::ResourceOrigin::DetectedDevice);
+    assert_eq!(
+        fixture
+            .store
+            .ensure_detected_resources(machine, &detected)
+            .unwrap(),
+        resources
+    );
+    assert_eq!(
+        fixture
+            .store
+            .resolve_resource(
+                machine,
+                &crate::queue::ResourceSelector::Name(ResourceName::gpu(1))
+            )
+            .unwrap()
+            .resource
+            .id,
+        fallback
+    );
+}
+
+#[test]
+fn queue_detection_keeps_the_fallback_name_when_a_manual_resource_owns_the_device_name() {
+    let fixture = Fixture::new();
+    let machine = MachineId::new();
+    let fallback = fixture
+        .store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap()[0]
+        .resource
+        .id;
+    let manual = fixture
+        .store
+        .register_resource(machine, ResourceName::gpu(1), None)
+        .unwrap();
+    let detected = [DetectedResource {
+        name: ResourceName::gpu(1),
+        device: Some(1),
+    }];
+    let resources = fixture
+        .store
+        .ensure_detected_resources(machine, &detected)
+        .unwrap();
+    assert_eq!(resources.len(), 2);
+    let fallback = fixture.store.resource(fallback).unwrap().unwrap();
+    assert_eq!(fallback.resource.name, ResourceName::gpu(0));
+    assert_eq!(fallback.resource.device, Some(1));
+    assert_eq!(fallback.origin, super::ResourceOrigin::DetectedDevice);
+    assert_eq!(
+        fixture.store.resource(manual.resource.id).unwrap().unwrap(),
+        manual
+    );
+}
+
+#[test]
+fn queue_preemption_rechecks_the_first_job_with_an_eligible_victim() {
+    for change in [
+        "none",
+        "cancel any",
+        "victim raised",
+        "preemption in flight",
+    ] {
+        let fixture = Fixture::new();
+        let mut wait_spec = spec(Priority::Low, 1);
+        wait_spec["preempt"] = json!({ "mode": "wait" });
+        let wait = fixture.submit_spec(wait_spec);
+        fixture.start(wait, "gpu0", Utc::now());
+        let low = fixture.submit(Priority::Low);
+        let victim = fixture.start(low, "gpu1", Utc::now());
+        let mut pinned_spec = spec(Priority::High, 1);
+        pinned_spec["resource"] = json!("gpu0");
+        fixture.submit_spec(pinned_spec);
+        let any = fixture.submit(Priority::High);
+        let now = Utc::now();
+        let stop = decide(
+            &fixture
+                .store
+                .queue_snapshot(fixture.machine, now, NoticeThresholds::default())
+                .unwrap(),
+        )
+        .preemption
+        .unwrap();
+        assert_eq!(stop.task, victim.task);
+        match change {
+            "cancel any" => {
+                fixture.cancel(any);
+            }
+            "victim raised" => {
+                fixture
+                    .move_job(
+                        low,
+                        Placement::Edge {
+                            priority: Some(Priority::High),
+                            end: LevelEnd::Front,
+                        },
+                    )
+                    .unwrap();
+            }
+            "preemption in flight" => {
+                fixture
+                    .store
+                    .register_resource(fixture.machine, ResourceName::gpu(2), Some(2))
+                    .unwrap();
+                let other = fixture.submit(Priority::Low);
+                let run = fixture.start(other, "gpu2", now);
+                fixture
+                    .store
+                    .commit_stop(run.resource, run.task, StopCause::Yield, now)
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let committed = fixture.store.commit_preemption(stop, now).unwrap();
+        assert_eq!(committed.is_some(), change == "none", "{change}");
+        let phase = fixture.run_on("gpu1").unwrap().phase;
+        if change == "none" {
+            assert!(matches!(
+                phase,
+                RunPhase::Stopping {
+                    cause: StopCause::Yield,
+                    ..
+                }
+            ));
+        } else {
+            assert_eq!(phase, victim.phase, "{change}");
+        }
+    }
+}
+
+#[test]
 fn register_refuses_a_taken_name_or_device() {
     let fixture = Fixture::new();
     let name = |raw| ResourceName::parse(raw).unwrap();

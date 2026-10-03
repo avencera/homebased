@@ -107,7 +107,7 @@ pub struct Launch {
     pub resource: ResourceId,
 }
 
-/// Stop one executing run for the head
+/// Stop one executing run for the first queued job with an eligible victim
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preempt {
     /// Resource whose run stops
@@ -166,7 +166,7 @@ pub struct BlockedHead {
 pub struct Decisions {
     /// Runs to reserve and start, in serving order
     pub launches: Vec<Launch>,
-    /// At most one stop for the head
+    /// At most one stop for a queued job
     pub preemption: Option<Preempt>,
     /// The blocked head; `None` ends any open episode
     pub blocked: Option<BlockedHead>,
@@ -181,10 +181,11 @@ pub struct Decisions {
 ///    resource. A job whose previous run is still being cleaned up, on any
 ///    resource, waits for that cleanup, since leftovers of that run may still
 ///    write to its job directory
-/// 2. Preempt for the head, the first job still queued: among its resources,
-///    pick one executing run of a strictly lower level whose mode allows a
-///    stop now, unless one of those resources is already stopping. The lowest
-///    level goes first, then the cheapest stop, then the most recent start
+/// 2. Walk the jobs still queued in serving order and preempt for the first
+///    with an executing run of a strictly lower level on an allowed resource
+///    whose mode allows a stop now. No new preemption starts while any resource
+///    is stopping for preemption. The lowest level goes first, then the cheapest
+///    stop, then the most recent start. The first queued job remains the notice head
 #[must_use]
 pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut free: Vec<&ResourceView> = snapshot
@@ -195,13 +196,13 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     free.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut launches = Vec::new();
-    let mut head = None;
+    let mut waiting = Vec::new();
     for job in snapshot.queue.iter().filter(|job| startable(snapshot, job)) {
         let Some(index) = free
             .iter()
             .position(|resource| job.target.allows(resource.id))
         else {
-            head.get_or_insert(job);
+            waiting.push(job);
             continue;
         };
         let resource = free.remove(index);
@@ -211,8 +212,25 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
         });
     }
 
-    let preemption = head.and_then(|head| preempt_for(snapshot, head));
-    let blocked = head.map(|head| blocked_head(snapshot, head, preemption.as_ref()));
+    let preemption_in_flight = snapshot.resources.iter().any(|resource| {
+        resource.run.as_ref().is_some_and(|run| {
+            matches!(
+                run.phase,
+                RunPhase::Stopping {
+                    cause: StopCause::Yield | StopCause::Restart,
+                    ..
+                }
+            )
+        })
+    });
+    let preemption = if preemption_in_flight {
+        None
+    } else {
+        waiting.iter().find_map(|job| preempt_for(snapshot, job))
+    };
+    let blocked = waiting
+        .first()
+        .map(|head| blocked_head(snapshot, head, preemption.as_ref()));
     Decisions {
         launches,
         preemption,
@@ -230,28 +248,23 @@ fn startable(snapshot: &Snapshot, job: &JobView) -> bool {
             .any(|run| run.job == job.id)
 }
 
-fn preempt_for(snapshot: &Snapshot, head: &JobView) -> Option<Preempt> {
-    let allowed = || {
-        snapshot
-            .resources
-            .iter()
-            .filter(|resource| head.target.allows(resource.id))
-            .filter_map(|resource| resource.run.as_ref())
-    };
-    if allowed().any(|run| matches!(run.phase, RunPhase::Stopping { .. })) {
-        return None;
-    }
-    let candidates = allowed().filter_map(|run| {
-        let RunPhase::Executing { started_at } = run.phase else {
-            return None;
-        };
-        let job = snapshot.queue.iter().find(|job| job.id == run.job)?;
-        if job.priority >= head.priority {
-            return None;
-        }
-        let stop = job.preempt.stop_at(started_at, snapshot.now)?;
-        Some((job.priority, stop, Reverse(started_at), run))
-    });
+fn preempt_for(snapshot: &Snapshot, waiting: &JobView) -> Option<Preempt> {
+    let candidates = snapshot
+        .resources
+        .iter()
+        .filter(|resource| waiting.target.allows(resource.id))
+        .filter_map(|resource| resource.run.as_ref())
+        .filter_map(|run| {
+            let RunPhase::Executing { started_at } = run.phase else {
+                return None;
+            };
+            let job = snapshot.queue.iter().find(|job| job.id == run.job)?;
+            if job.priority >= waiting.priority {
+                return None;
+            }
+            let stop = job.preempt.stop_at(started_at, snapshot.now)?;
+            Some((job.priority, stop, Reverse(started_at), run))
+        });
     let (_, stop, _, run) = candidates
         .min_by_key(|(level, stop, started, run)| (*level, *stop, *started, run.resource))?;
     Some(Preempt {
@@ -267,7 +280,8 @@ fn preempt_for(snapshot: &Snapshot, head: &JobView) -> Option<Preempt> {
 
 fn blocked_head(snapshot: &Snapshot, head: &JobView, preemption: Option<&Preempt>) -> BlockedHead {
     let mut blockers = Vec::new();
-    let mut asked_to_yield = preemption.is_some_and(|stop| stop.cause == StopCause::Yield);
+    let mut asked_to_yield = preemption
+        .is_some_and(|stop| stop.cause == StopCause::Yield && head.target.allows(stop.resource));
     for resource in snapshot
         .resources
         .iter()

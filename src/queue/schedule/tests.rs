@@ -471,6 +471,137 @@ fn preemption_looks_only_at_the_heads_allowed_resources() {
 }
 
 #[test]
+fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
+    struct Case {
+        name: &'static str,
+        head_run: Preemption,
+        other_run: Preemption,
+        other_priority: Priority,
+        stopping: Option<StopCause>,
+        any_target: bool,
+        victim: Option<(&'static str, StopCause)>,
+    }
+    let cases = [
+        Case {
+            name: "pinned wait head does not block a later any job's restart",
+            head_run: WAIT,
+            other_run: Preemption::Restart,
+            other_priority: Priority::Low,
+            stopping: None,
+            any_target: true,
+            victim: Some(("gpu1", StopCause::Restart)),
+        },
+        Case {
+            name: "pinned wait head does not block a later any job's yield",
+            head_run: WAIT,
+            other_run: YIELD,
+            other_priority: Priority::Low,
+            stopping: None,
+            any_target: true,
+            victim: Some(("gpu1", StopCause::Yield)),
+        },
+        Case {
+            name: "head wins even when the later job has a cheaper lower level victim",
+            head_run: YIELD,
+            other_run: Preemption::Restart,
+            other_priority: Priority::Low,
+            stopping: None,
+            any_target: true,
+            victim: Some(("gpu0", StopCause::Yield)),
+        },
+        Case {
+            name: "equal levels never preempt",
+            head_run: WAIT,
+            other_run: Preemption::Restart,
+            other_priority: Priority::High,
+            stopping: None,
+            any_target: true,
+            victim: None,
+        },
+        Case {
+            name: "yield in flight outside queued targets blocks another preemption",
+            head_run: YIELD,
+            other_run: Preemption::Restart,
+            other_priority: Priority::Low,
+            stopping: Some(StopCause::Yield),
+            any_target: false,
+            victim: None,
+        },
+        Case {
+            name: "restart in flight outside queued targets blocks another preemption",
+            head_run: YIELD,
+            other_run: Preemption::Restart,
+            other_priority: Priority::Low,
+            stopping: Some(StopCause::Restart),
+            any_target: false,
+            victim: None,
+        },
+        Case {
+            name: "user cancellation is not a preemption in flight",
+            head_run: YIELD,
+            other_run: Preemption::Restart,
+            other_priority: Priority::Low,
+            stopping: Some(StopCause::UserCancel),
+            any_target: false,
+            victim: Some(("gpu0", StopCause::Yield)),
+        },
+    ];
+    for case in cases {
+        let mut machine = Machine::new(&["gpu0", "gpu1", "gpu2"]);
+        machine.running("gpu0", Priority::Medium, case.head_run, executing(t0()));
+        machine.running("gpu1", case.other_priority, case.other_run, executing(t0()));
+        let phase = case
+            .stopping
+            .map_or(executing(t0()), |cause| RunPhase::Stopping {
+                started_at: Some(t0()),
+                cause,
+                requested_at: at(30),
+            });
+        machine.running("gpu2", Priority::Low, WAIT, phase);
+        let head = machine.queued(
+            Priority::High,
+            Target::Pinned(machine.resource("gpu0")),
+            YIELD,
+        );
+        let target = if case.any_target {
+            Target::Any
+        } else {
+            Target::Pinned(machine.resource("gpu1"))
+        };
+        machine.queued(Priority::High, target, YIELD);
+
+        let decisions = decide(&machine.snapshot(at(60)));
+        assert!(decisions.launches.is_empty(), "{}", case.name);
+        let expected = case.victim.map(|(name, cause)| {
+            let resource = machine.resource(name);
+            let run = machine
+                .resources
+                .iter()
+                .find(|view| view.id == resource)
+                .unwrap()
+                .run
+                .as_ref()
+                .unwrap();
+            Preempt {
+                resource,
+                job: run.job,
+                task: run.task,
+                cause,
+            }
+        });
+        assert_eq!(decisions.preemption, expected, "{}", case.name);
+        let blocked = decisions.blocked.unwrap();
+        assert_eq!(blocked.job, head, "{}", case.name);
+        let threshold = if case.victim == Some(("gpu0", StopCause::Yield)) {
+            Duration::from_secs(15 * 60)
+        } else {
+            Duration::from_secs(30 * 60)
+        };
+        assert_eq!(blocked.threshold, threshold, "{}", case.name);
+    }
+}
+
+#[test]
 fn blocked_notice_timing_follows_the_stored_episode() {
     let mut machine = Machine::new(&["gpu0"]);
     machine.running("gpu0", Priority::Low, WAIT, executing(t0()));
