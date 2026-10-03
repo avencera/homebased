@@ -437,7 +437,8 @@ fn phase4_yield_resumes_same_directory_without_overlap() {
         .permissions()
         .mode()
             & 0o777,
-        0o777
+        0o700,
+        "a host step's job directory is owner-only"
     );
 }
 
@@ -986,7 +987,16 @@ fn phase4_container_contract_uses_resource_and_fixed_mounts() {
         .unwrap();
     let mut checkpoint = h.store().run_checkpoint(task).unwrap().unwrap();
     checkpoint.resource.device = Some(3);
+    checkpoint.step = crate::queue::checkpoint::StepKind::Container;
     checkpoint.prepare(&h.home).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(checkpoint.job_dir(&h.home))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o777, "a container user may have another UID");
+    }
     checkpoint.request_yield(&h.home).unwrap();
     let workload = ContainerWorkload::from_value(
         &json!({"image":format!("sha256:{}", "0".repeat(64)), "memory":"1g"}),

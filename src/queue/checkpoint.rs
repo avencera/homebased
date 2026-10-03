@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::container::{ContainerMount, ContainerWorkload, EnvName, GpuRequest};
 use crate::error::AppError;
 use crate::home::Home;
-use crate::queue::{ActiveRun, Resource};
+use crate::queue::{ActiveRun, Resource, StepWorkload};
 use crate::run_env;
 
 /// Run-owned paths and child environment, derived from the reserved resource
@@ -18,6 +18,41 @@ pub struct Checkpoint {
     pub resource: Resource,
     /// Whether this attempt resumes a yielded step
     pub resume: bool,
+    /// What this attempt's step runs
+    pub step: StepKind,
+}
+
+/// Whether a step runs on the host or in a container
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// A command on the host, running as the job directory's owner
+    Task,
+    /// A container, whose user may have another UID
+    Container,
+}
+
+impl From<&StepWorkload> for StepKind {
+    fn from(step: &StepWorkload) -> Self {
+        match step {
+            StepWorkload::Task(_) => Self::Task,
+            StepWorkload::Container(_) => Self::Container,
+        }
+    }
+}
+
+impl StepKind {
+    /// Job directory mode for this step
+    ///
+    /// A host step runs as the directory's owner, so owner-only access is
+    /// enough. A container user can have another UID, so a container step opens
+    /// the directory to everyone; the `0700` state root still keeps other host
+    /// users out
+    fn job_dir_mode(self) -> u32 {
+        match self {
+            Self::Task => 0o700,
+            Self::Container => 0o777,
+        }
+    }
 }
 
 impl Checkpoint {
@@ -46,7 +81,10 @@ impl Checkpoint {
         home.prepare_task(self.run.task)?;
         let job_dir = self.job_dir(home);
         std::fs::create_dir_all(&job_dir)?;
-        std::fs::set_permissions(job_dir, std::fs::Permissions::from_mode(0o777))?;
+        std::fs::set_permissions(
+            job_dir,
+            std::fs::Permissions::from_mode(self.step.job_dir_mode()),
+        )?;
         std::fs::create_dir_all(self.control_dir(home))?;
         Ok(())
     }

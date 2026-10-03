@@ -9,7 +9,7 @@ use crate::domain::{ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::home::{LockMode, flock_exclusive};
 use crate::machine::MachineId;
-use crate::queue::checkpoint::Checkpoint;
+use crate::queue::checkpoint::{Checkpoint, StepKind};
 use crate::queue::schedule::{NoticeThresholds, StoredEpisode, decide};
 use crate::queue::{BlockedNotice, JobEventKind, RunPhase};
 
@@ -26,10 +26,17 @@ impl Store {
             .job(job)?
             .ok_or_else(|| super::corrupt("run job missing"))?;
         let resource = self.require_resource(run.resource)?.resource;
+        let step = job
+            .spec
+            .steps
+            .get(run.step)
+            .map(StepKind::from)
+            .ok_or_else(|| super::corrupt("run step missing from its job"))?;
         Ok(Some(Checkpoint {
             run,
             resource,
             resume: job.resume,
+            step,
         }))
     }
 
