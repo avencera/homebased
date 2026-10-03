@@ -15,8 +15,10 @@
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import Capsule from '$lib/components/Capsule.svelte';
+	import QueuePanel from '$lib/components/QueuePanel.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
-	import { DaemonStore } from '$lib/daemon.svelte';
+	import { DaemonStore, QueueStore } from '$lib/daemon.svelte';
+	import { queueHasWork } from '$lib/queue-view';
 	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import { EM_DASH, projectName, shortId } from '$lib/format';
 	import { cn } from '$lib/utils';
@@ -29,6 +31,8 @@
 	const inFlightOnly = $derived(!showFinished && statuses.length === IN_FLIGHT_STATUSES.length);
 
 	const store = new DaemonStore(() => ({ statuses, thread }));
+	const queue = new QueueStore();
+	const showQueue = $derived(queueHasWork(queue.resources, queue.jobs));
 
 	const visibleTasks = $derived(
 		project ? store.tasks.filter((entry) => projectName(entry.task) === project) : store.tasks
@@ -172,6 +176,7 @@
 				{/each}
 			</span>
 		{/if}
+		<a href={resolve('/queue')} class="text-primary hover:underline">queue</a>
 		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
@@ -266,9 +271,18 @@
 		{/if}
 	</div>
 
-	<!-- the page fits the screen and the task box scrolls on its own, as tall as its content up to
-	     the full height -->
-	<div class="mt-3 grid min-h-0 flex-1 grid-rows-[minmax(0,auto)] content-start">
+	<!-- the page fits the screen and each box scrolls on its own, as tall as its content up to the
+	     full height. While the GPU queue has work, narrow screens stack the boxes and share the
+	     height; wide screens put the queue beside the tasks, and the task column keeps the width its
+	     table layout needs -->
+	<div
+		class={cn(
+			'mt-3 grid min-h-0 flex-1 content-start gap-3',
+			showQueue
+				? 'grid-rows-[minmax(0,auto)_minmax(0,auto)] xl:grid-cols-[minmax(57rem,1fr)_minmax(18rem,22rem)] xl:grid-rows-[minmax(0,auto)] xl:items-start xl:[&>*]:max-h-full'
+				: 'grid-rows-[minmax(0,auto)]'
+		)}
+	>
 		<TaskList
 			tasks={visibleTasks}
 			machines={store.machines}
@@ -291,5 +305,13 @@
 				</p>
 			{/snippet}
 		</TaskList>
+		{#if showQueue}
+			<QueuePanel
+				resources={queue.resources}
+				jobs={queue.jobs}
+				jobName={(id) => queue.jobName(id)}
+				class="min-h-0"
+			/>
+		{/if}
 	</div>
 </div>
