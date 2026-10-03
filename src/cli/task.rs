@@ -686,7 +686,7 @@ fn report(
 ) -> Result<ExitCode, AppError> {
     let id = match id {
         Some(id) => id,
-        None => std::env::var("HOMEBASED_TASK_ID")
+        None => std::env::var(crate::run_env::TASK_ID)
             .map_err(|_| AppError::Usage {
                 message: "missing --id and HOMEBASED_TASK_ID".into(),
             })?

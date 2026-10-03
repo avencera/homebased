@@ -237,6 +237,8 @@ pub enum EventKind {
     TaskFailed,
     /// Success.
     TaskSucceeded,
+    /// Stopped for higher-priority work; its job is queued again.
+    TaskPreempted,
 }
 
 /// Suggested orchestrator next step.
@@ -384,6 +386,19 @@ pub fn lost_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> H
         Some(ProcessPayload::RunnerLost),
         None,
     )
+}
+
+/// Build the event of a run stopped for higher-priority work
+///
+/// The process payload still says how the process ended, such as exit 75 after
+/// a yield, but the run did not fail, so nothing needs inspecting
+#[must_use]
+pub fn preempted_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
+    HomebasedEvent {
+        event: EventKind::TaskPreempted,
+        next_action: NextAction::None,
+        ..exit_event(row, reports, evidence)
+    }
 }
 
 /// Output-inactivity reminder. Never changes task status.
@@ -1098,12 +1113,14 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
 }
 
 /// The event a terminal row owes its thread: `TASK_LOST` for a lost runner,
-/// otherwise the exit event. Every exit-callback path builds its event here so
+/// `TASK_PREEMPTED` for a run stopped for higher-priority work, otherwise the
+/// exit event. Every exit-callback path builds its event here so
 /// the lost-versus-exit choice lives in one place.
 #[must_use]
 pub fn terminal_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
     match row.state {
         TaskState::Finished { .. } => exit_event(row, reports, evidence),
+        TaskState::Preempted { .. } => preempted_event(row, reports, evidence),
         TaskState::Queued | TaskState::Running { .. } | TaskState::Lost => {
             lost_event(row, reports, evidence)
         }
@@ -1138,6 +1155,7 @@ pub fn last_event_for_row(
         }
         TaskState::Lost => Some(lost_event(row, reports, evidence)),
         TaskState::Finished { .. } => Some(exit_event(row, reports, evidence)),
+        TaskState::Preempted { .. } => Some(preempted_event(row, reports, evidence)),
     }
 }
 
@@ -1172,6 +1190,7 @@ mod tests {
             state,
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
             container_exit_evidence: crate::domain::ContainerExitEvidence::Unconfirmed,
+            child: None,
             callback_status: CallbackStatus::Pending,
             attention: AttentionState::Pending,
             cancel_requested_at: None,

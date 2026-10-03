@@ -114,8 +114,14 @@ impl Harness {
     }
 
     fn start_daemon(&mut self) {
-        let child = self
-            .cmd()
+        self.start_daemon_with_env(&[]);
+    }
+
+    /// Start the daemon with extra environment, as if inherited from its launcher
+    fn start_daemon_with_env(&mut self, env: &[(&str, &str)]) {
+        let mut command = self.cmd();
+        command.envs(env.iter().copied());
+        let child = command
             .args(["daemon", "serve", "--home"])
             .arg(&self.home)
             .stdin(Stdio::null())
@@ -134,13 +140,17 @@ impl Harness {
     }
 
     fn restart_daemon(&mut self) {
+        self.restart_daemon_with_env(&[]);
+    }
+
+    fn restart_daemon_with_env(&mut self, env: &[(&str, &str)]) {
         if let Some(mut child) = self.daemon.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
         let sock = self.home.join("homebased.sock");
         let _ = fs::remove_file(&sock);
-        self.start_daemon();
+        self.start_daemon_with_env(env);
     }
 
     fn submit(&self, spec: &Value) -> String {
@@ -1057,6 +1067,103 @@ fn daemon_restart_keeps_worker() {
     h.wait_status(&id, "succeeded");
     let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
     assert_eq!(msgs.len(), 1, "{msgs:?}");
+}
+
+/// Environment of another process, as `KEY=VALUE` entries
+fn process_environment(pid: i32) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read(format!("/proc/{pid}/environ"))
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `ps -E` appends the environment to the command; a value with spaces
+        // splits, which these checks tolerate
+        let out = Command::new("ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[test]
+fn inherited_run_markers_reach_neither_the_worker_nor_the_task_child() {
+    const INHERITED: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e431";
+    let mut h = Harness::new();
+    h.restart_daemon_with_env(&[
+        ("HOMEBASED_TASK_ID", INHERITED),
+        ("HOMEBASED_JOB_ID", INHERITED),
+        ("HOMEBASED_YIELD_FILE", "/tmp/inherited-yield"),
+    ]);
+    let id = h.submit(&Harness::task_spec(&["/bin/sh", "-c", "env; sleep 5"]));
+    let running = h.wait_status(&id, "running");
+    let worker = running["pid"].as_i64().unwrap() as i32;
+    assert!(wait_until(Duration::from_secs(10), || {
+        fs::read_to_string(h.output_log(&id)).is_ok_and(|log| log.contains("HOMEBASED_TASK_ID="))
+    }));
+
+    // only Homebased entries are kept, so a failure does not print the
+    // environment's other values into test logs
+    let worker_env: Vec<String> = process_environment(worker)
+        .into_iter()
+        .filter(|entry| entry.starts_with("HOMEBASED_"))
+        .collect();
+    assert!(
+        worker_env
+            .iter()
+            .any(|entry| entry.starts_with("HOMEBASED_HOME=")),
+        "configuration must still reach the worker: {worker_env:?}"
+    );
+    assert!(
+        !worker_env
+            .iter()
+            .any(|entry| entry.starts_with("HOMEBASED_TASK_ID=")
+                || entry.starts_with("HOMEBASED_JOB_ID=")
+                || entry.starts_with("HOMEBASED_YIELD_FILE=")),
+        "inherited markers reached the worker: {worker_env:?}"
+    );
+
+    let log = fs::read_to_string(h.output_log(&id)).unwrap();
+    let child_env: Vec<&str> = log.lines().collect();
+    assert!(child_env.contains(&format!("HOMEBASED_TASK_ID={id}").as_str()));
+    assert!(
+        child_env
+            .iter()
+            .any(|line| line.starts_with("HOMEBASED_HOME="))
+    );
+    assert!(
+        !child_env
+            .iter()
+            .any(|line| line.starts_with("HOMEBASED_JOB_ID=")
+                || line.starts_with("HOMEBASED_YIELD_FILE=")),
+        "inherited markers reached the child"
+    );
+
+    let task: homebased::domain::TaskId = id.parse().unwrap();
+    let child = h
+        .store()
+        .require_task(task)
+        .unwrap()
+        .child
+        .expect("the worker records its child at spawn");
+    assert_ne!(child.pid.as_raw(), worker);
+    assert_eq!(
+        homebased::cleanup::process_identity(child.pid).unwrap(),
+        child,
+        "the recorded identity is the live child's"
+    );
+
+    let cancel = h.cmd().args(["task", "cancel", &id]).output().unwrap();
+    assert!(cancel.status.success());
+    h.wait_status(&id, "cancelled");
 }
 
 #[cfg(target_os = "linux")]

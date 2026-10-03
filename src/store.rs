@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use nix::unistd::Pid;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::Value;
 
-use crate::callback::{
-    EventKind, ReportView, check_due_event, exit_event, lost_event, notify_event, terminal_event,
-};
+use crate::callback::{EventKind, ReportView, check_due_event, notify_event, terminal_event};
+use crate::cleanup::{ProcessIdentity, ProcessStartTime};
 use crate::dependency::TaskDependencies;
 use crate::domain::{
     AttentionState, CallbackStatus, ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence,
@@ -213,7 +213,7 @@ CREATE TABLE outbound_message_bindings (
 const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, callback_status,
     attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at,
-    process_group_exit_evidence, container_exit_evidence
+    process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time
  FROM tasks";
 
 /// Schema version of the v0.5.0 release
@@ -400,9 +400,43 @@ DROP TABLE IF EXISTS loans;
 DROP TABLE IF EXISTS resources;
 ";
 
+/// Record each task's child and accept the `preempted` outcome
+///
+/// `child_pid` and `child_start_time` identify the worker's child, so cleanup
+/// after a lost worker can tell its process group from a later process that
+/// reused the PID. They are set together, once, at spawn.
+///
+/// SQLite cannot change a CHECK constraint in place, so `origin_routes` is
+/// rebuilt with the wider outcome list. No foreign key or index names it
+const MIGRATE_34_TO_35_TASKS: &str = r"
+ALTER TABLE tasks ADD COLUMN child_pid INTEGER CHECK (child_pid > 0);
+ALTER TABLE tasks ADD COLUMN child_start_time INTEGER CHECK (
+    (child_start_time IS NULL) = (child_pid IS NULL)
+    AND (child_start_time IS NULL OR child_start_time >= 0)
+);
+
+ALTER TABLE origin_routes RENAME TO origin_routes_before_preempted;
+CREATE TABLE origin_routes (
+    request_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    execution_machine TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    route_json TEXT NOT NULL,
+    after_json TEXT,
+    outcome TEXT
+        CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted'))
+);
+INSERT INTO origin_routes
+    (request_id, task_id, execution_machine, spec_json, route_json, after_json, outcome)
+SELECT request_id, task_id, execution_machine, spec_json, route_json, after_json, outcome
+    FROM origin_routes_before_preempted;
+DROP TABLE origin_routes_before_preempted;
+";
+
 /// Move a v0.13 database to the current schema
 fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_34_TO_35)
+    conn.execute_batch(MIGRATE_34_TO_35)?;
+    conn.execute_batch(MIGRATE_34_TO_35_TASKS)
 }
 
 /// Why `Store::open` refuses a database version
@@ -430,14 +464,15 @@ fn insert_task_with_project_root_on(
     project_root: Option<&Path>,
 ) -> Result<(), AppError> {
     reject_busy_resume_thread_on(conn, row)?;
+    let (child_pid, child_start_time) = child_to_storage(row.child)?;
     conn.execute(
         "INSERT INTO tasks (
             id, thread_id, name, workload_json, cwd, timeout_secs,
             env_path, env_home, binary, status, exit_reason,
             callback_status, attention_state, timeout_notified_at,
             pid, cancel_requested_at, created_at, updated_at, project_root,
-            process_group_exit_evidence, container_exit_evidence
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![
             row.id.to_string(),
             row.thread.to_string(),
@@ -460,6 +495,8 @@ fn insert_task_with_project_root_on(
             project_root.map(|root| root.to_string_lossy().into_owned()),
             row.process_group_exit_evidence.as_str(),
             row.container_exit_evidence.to_storage()?,
+            child_pid,
+            child_start_time,
         ],
     )?;
     Ok(())
@@ -1318,6 +1355,7 @@ impl Store {
                 ProcessStatus::Failed,
                 ProcessStatus::Cancelled,
                 ProcessStatus::Lost,
+                ProcessStatus::Preempted,
             ],
             None,
         )?;
@@ -1754,11 +1792,7 @@ impl Store {
         let payload = if row.state.is_terminal() {
             let reports = self.reports(row.id)?;
             let evidence = self.tasks_dir.join(row.id.to_string());
-            let callback = if row.status() == ProcessStatus::Lost {
-                lost_event(row, &reports, evidence)
-            } else {
-                exit_event(row, &reports, evidence)
-            };
+            let callback = terminal_event(row, &reports, evidence);
             EventPayload::Callback {
                 event: Box::new(callback),
                 state: Some(row.status()),
@@ -1789,13 +1823,28 @@ impl Store {
         Ok(())
     }
 
+    /// Record the worker's child once, while the task runs
+    ///
+    /// Returns whether the identity was saved. A task that already has a child,
+    /// or that is no longer running, keeps its row unchanged
+    pub fn set_child_identity(&self, id: TaskId, child: ProcessIdentity) -> Result<bool, AppError> {
+        let (pid, start) = child_to_storage(Some(child))?;
+        let updated = self.conn.execute(
+            "UPDATE tasks SET child_pid = ?1, child_start_time = ?2, updated_at = ?3
+             WHERE id = ?4 AND status = 'running' AND child_pid IS NULL",
+            params![pid, start, fmt_time(Utc::now()), id.to_string()],
+        )?;
+        Ok(updated == 1)
+    }
+
     /// Mark cancel requested. Terminal tasks are unchanged (idempotent)
     pub fn request_cancel(&self, id: TaskId) -> Result<CancelResult, AppError> {
         self.immediate(|| {
             self.require_task(id)?;
             self.conn.execute(
                 "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
-                 WHERE id = ?2 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')",
+                 WHERE id = ?2
+                   AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost', 'preempted')",
                 params![fmt_time(Utc::now()), id.to_string()],
             )?;
             if let Some(row) = self.cas_exit_inner(
@@ -2088,6 +2137,40 @@ fn check_exit_evidence(
     }
 }
 
+/// `child_pid` and `child_start_time` columns for a recorded child
+fn child_to_storage(
+    child: Option<ProcessIdentity>,
+) -> Result<(Option<i32>, Option<i64>), AppError> {
+    let Some(child) = child else {
+        return Ok((None, None));
+    };
+    let start = i64::try_from(child.start.as_raw()).map_err(|_| AppError::Internal {
+        message: format!("child start time exceeds SQLite range: {child}"),
+    })?;
+    Ok((Some(child.pid.as_raw()), Some(start)))
+}
+
+fn child_from_storage(
+    pid: Option<i32>,
+    start: Option<i64>,
+) -> Result<Option<ProcessIdentity>, AppError> {
+    match (pid, start) {
+        (None, None) => Ok(None),
+        (Some(pid), Some(start)) if pid > 0 => {
+            let start = u64::try_from(start).map_err(|_| AppError::Internal {
+                message: format!("negative child start time {start}"),
+            })?;
+            Ok(Some(ProcessIdentity {
+                pid: Pid::from_raw(pid),
+                start: ProcessStartTime::from_raw(start),
+            }))
+        }
+        (pid, start) => Err(AppError::Internal {
+            message: format!("invalid child identity: pid={pid:?} start={start:?}"),
+        }),
+    }
+}
+
 fn fmt_time(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -2145,6 +2228,8 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let updated_at: String = row.get(17)?;
     let process_group_exit_evidence: Option<String> = row.get(18)?;
     let container_exit_evidence: Option<String> = row.get(19)?;
+    let child_pid: Option<i32> = row.get(20)?;
+    let child_start_time: Option<i64> = row.get(21)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
@@ -2173,7 +2258,10 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     };
     let status = ProcessStatus::from_storage(&status).map_err(parse_err)?;
     let (process_group_exit_evidence, container_exit_evidence) = match status {
-        ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled => (
+        ProcessStatus::Succeeded
+        | ProcessStatus::Failed
+        | ProcessStatus::Cancelled
+        | ProcessStatus::Preempted => (
             ProcessGroupExitEvidence::from_storage(process_group_exit_evidence.as_deref()),
             ContainerExitEvidence::from_storage(container_exit_evidence.as_deref()),
         ),
@@ -2208,6 +2296,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         state: TaskState::from_storage(status, exit_reason, pid).map_err(parse_err)?,
         process_group_exit_evidence,
         container_exit_evidence,
+        child: child_from_storage(child_pid, child_start_time).map_err(parse_err)?,
         callback_status,
         attention,
         cancel_requested_at,
@@ -2252,6 +2341,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         state: TaskState::Queued,
         process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         container_exit_evidence: ContainerExitEvidence::Unconfirmed,
+        child: None,
         callback_status: CallbackStatus::Pending,
         attention: AttentionState::Pending,
         cancel_requested_at: None,
@@ -3654,6 +3744,112 @@ CREATE TABLE reports (
     }
 
     #[test]
+    fn child_identity_is_recorded_once_while_the_task_runs() {
+        use crate::cleanup::{ProcessIdentity, ProcessStartTime};
+        use nix::unistd::Pid;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        let child = ProcessIdentity {
+            pid: Pid::from_raw(4242),
+            start: ProcessStartTime::from_raw(1_790_000_000_123_456),
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            assert!(!store.set_child_identity(id, child).unwrap(), "queued");
+            store
+                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+                .unwrap();
+            assert!(store.set_child_identity(id, child).unwrap());
+            let later = ProcessIdentity {
+                pid: Pid::from_raw(4343),
+                ..child
+            };
+            assert!(!store.set_child_identity(id, later).unwrap(), "already set");
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.require_task(id).unwrap().child, Some(child));
+    }
+
+    #[test]
+    fn preempted_run_keeps_its_state_event_and_outcome_and_is_never_success() {
+        use crate::callback::{EventKind, NextAction};
+        use crate::dependency::{DependencyState, TaskOutcome};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = TaskId::new();
+        {
+            let mut store = Store::open(&path).unwrap();
+            insert_local(&store, id);
+            store
+                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+                .unwrap();
+            // nothing produces a preemption before the queue's terminal commit
+            // exists, so the row takes the state that commit will write
+            store
+                .conn
+                .execute(
+                    "UPDATE tasks SET status = 'preempted', exit_reason = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&ExitReason::Exit { code: 75 }).unwrap(),
+                        id.to_string()
+                    ],
+                )
+                .unwrap();
+            let row = store.require_task(id).unwrap();
+            store.produce_state_event(&row).unwrap();
+            deliver_outbound_events(&mut store, id, |_| DeliveryOutcome::Delivered);
+        }
+
+        let store = Store::open(&path).unwrap();
+        let row = store.require_task(id).unwrap();
+        assert_eq!(
+            row.state,
+            TaskState::Preempted {
+                reason: ExitReason::Exit { code: 75 }
+            }
+        );
+        assert_eq!(row.status(), ProcessStatus::Preempted);
+
+        let last = store.inbound_events(id).unwrap().pop().unwrap();
+        let EventPayload::Callback { event, state } = &last.event.payload else {
+            panic!("terminal event is a callback: {last:?}");
+        };
+        assert_eq!(*state, Some(ProcessStatus::Preempted));
+        assert_eq!(event.event, EventKind::TaskPreempted);
+        assert_eq!(event.next_action, NextAction::None);
+        let wire = serde_json::to_value(event).unwrap();
+        assert_eq!(wire["event"], "TASK_PREEMPTED");
+        assert_eq!(
+            wire["process"],
+            serde_json::json!({"kind": "exit", "code": 75})
+        );
+
+        let outcome: String = store
+            .conn
+            .query_row(
+                "SELECT outcome FROM origin_routes WHERE task_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "preempted");
+        let states = store.dependency_states(&[id]).unwrap();
+        assert_eq!(
+            states,
+            vec![(
+                id,
+                Some(DependencyState::Ended(TaskOutcome::Preempted.into()))
+            )]
+        );
+        assert!(!TaskOutcome::Preempted.is_success());
+    }
+
+    #[test]
     fn released_v0_11_schema_backfills_outcomes_only_from_definitive_evidence() {
         use crate::dependency::{DependencyOutcome, DependencyState, TaskOutcome};
 
@@ -3675,7 +3871,9 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE origin_routes DROP COLUMN after_json;
+                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                     ALTER TABLE tasks DROP COLUMN child_pid;
+                     ALTER TABLE origin_routes DROP COLUMN after_json;
                      ALTER TABLE origin_routes DROP COLUMN outcome;
                      PRAGMA user_version = {RELEASED_V0_11_SCHEMA_VERSION};"
                 ))
@@ -3725,7 +3923,9 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN worker_thread;
+                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                     ALTER TABLE tasks DROP COLUMN child_pid;
+                     ALTER TABLE tasks DROP COLUMN worker_thread;
                      ALTER TABLE origin_routes DROP COLUMN after_json;
                      ALTER TABLE origin_routes DROP COLUMN outcome;
                      PRAGMA user_version = {RELEASED_V0_8_7_SCHEMA_VERSION};"
@@ -3916,6 +4116,15 @@ CREATE TABLE reports (
     /// Restore the shape of released schema `version` on a current database
     fn downgrade_to_released(store: &Store, version: i64) {
         let mut sql = String::new();
+        if version < SCHEMA_VERSION {
+            sql.push_str(
+                "ALTER TABLE tasks DROP COLUMN child_start_time;
+                 ALTER TABLE tasks DROP COLUMN child_pid;
+                 ALTER TABLE origin_routes DROP COLUMN outcome;
+                 ALTER TABLE origin_routes ADD COLUMN outcome TEXT
+                     CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost'));",
+            );
+        }
         if version < RELEASED_V0_13_SCHEMA_VERSION {
             sql.push_str(
                 "ALTER TABLE origin_routes DROP COLUMN after_json;
@@ -4039,7 +4248,9 @@ CREATE TABLE reports (
             store
                 .conn
                 .execute_batch(&format!(
-                    "ALTER TABLE tasks DROP COLUMN worker_thread;
+                    "ALTER TABLE tasks DROP COLUMN child_start_time;
+                     ALTER TABLE tasks DROP COLUMN child_pid;
+                     ALTER TABLE tasks DROP COLUMN worker_thread;
                      ALTER TABLE origin_routes DROP COLUMN after_json;
                      ALTER TABLE origin_routes DROP COLUMN outcome;
                      ALTER TABLE tasks DROP COLUMN container_exit_evidence;

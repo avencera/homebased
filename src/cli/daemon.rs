@@ -269,7 +269,10 @@ pub(crate) async fn restart_daemon(ctx: &Ctx) -> Result<(), AppError> {
                 message: err.to_string(),
             })?;
             let mut cmd = Command::new(exe);
-            cmd.arg("daemon")
+            // a daemon started from inside a task must not carry that task's
+            // marker, or every cleanup of that run finds a protected process
+            crate::run_env::scrub(&mut cmd)
+                .arg("daemon")
                 .arg("serve")
                 .arg("--home")
                 .arg(ctx.home.root())

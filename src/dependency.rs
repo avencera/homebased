@@ -107,6 +107,9 @@ pub enum TaskOutcome {
     Cancelled,
     /// `TASK_LOST`
     Lost,
+    /// `TASK_PREEMPTED`: the run stopped for higher-priority work and its job
+    /// runs again in a new task, so this run did not succeed
+    Preempted,
 }
 
 impl TaskOutcome {
@@ -119,6 +122,7 @@ impl TaskOutcome {
             EventKind::TaskBlocked => Some(Self::Blocked),
             EventKind::TaskCancelled => Some(Self::Cancelled),
             EventKind::TaskLost => Some(Self::Lost),
+            EventKind::TaskPreempted => Some(Self::Preempted),
             EventKind::TaskReported | EventKind::TaskCheckDue => None,
         }
     }
@@ -138,6 +142,7 @@ impl TaskOutcome {
             Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
             Self::Lost => "lost",
+            Self::Preempted => "preempted",
         }
     }
 
@@ -150,6 +155,7 @@ impl TaskOutcome {
             "blocked" => Some(Self::Blocked),
             "cancelled" => Some(Self::Cancelled),
             "lost" => Some(Self::Lost),
+            "preempted" => Some(Self::Preempted),
             _ => None,
         }
     }
@@ -371,6 +377,7 @@ mod tests {
             (EventKind::TaskBlocked, false),
             (EventKind::TaskCancelled, false),
             (EventKind::TaskLost, false),
+            (EventKind::TaskPreempted, false),
         ] {
             let outcome = TaskOutcome::from_event(kind).unwrap();
             assert_eq!(DependencyOutcome::from(outcome).is_success(), success);

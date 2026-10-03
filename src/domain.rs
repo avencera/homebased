@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cleanup::ProcessIdentity;
 use crate::error::AppError;
 
 /// Public JSON schema version
@@ -385,6 +386,9 @@ pub enum ProcessStatus {
     Cancelled,
     /// Lock free and no `exit.json`
     Lost,
+    /// Stopped so higher-priority work could use its resource; its queued job
+    /// runs again later in a new task
+    Preempted,
 }
 
 impl ProcessStatus {
@@ -393,7 +397,7 @@ impl ProcessStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost | Self::Preempted
         )
     }
 
@@ -407,6 +411,7 @@ impl ProcessStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Lost => "lost",
+            Self::Preempted => "preempted",
         }
     }
 
@@ -419,6 +424,7 @@ impl ProcessStatus {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             "lost" => Ok(Self::Lost),
+            "preempted" => Ok(Self::Preempted),
             other => Err(AppError::Internal {
                 message: format!("unknown process status: {other}"),
             }),
@@ -447,7 +453,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Held,
         Self::Process(ProcessStatus::Queued),
         Self::Process(ProcessStatus::Running),
@@ -455,6 +461,7 @@ impl TaskStatus {
         Self::Process(ProcessStatus::Failed),
         Self::Process(ProcessStatus::Cancelled),
         Self::Process(ProcessStatus::Lost),
+        Self::Process(ProcessStatus::Preempted),
     ];
 
     /// Stable lowercase name
@@ -964,6 +971,12 @@ pub enum TaskState {
     },
     /// Lock free and no `exit.json`
     Lost,
+    /// Stopped for higher-priority work; `reason` is how the process ended,
+    /// such as exit 75 after a yield or a cancel for a restart
+    Preempted {
+        /// How the process ended
+        reason: ExitReason,
+    },
 }
 
 impl TaskState {
@@ -977,6 +990,7 @@ impl TaskState {
             (ProcessStatus::Queued, _) => Ok(Self::Queued),
             (ProcessStatus::Running, _) => Ok(Self::Running { pid }),
             (ProcessStatus::Lost, _) => Ok(Self::Lost),
+            (ProcessStatus::Preempted, Some(reason)) => Ok(Self::Preempted { reason }),
             (
                 ProcessStatus::Succeeded | ProcessStatus::Failed | ProcessStatus::Cancelled,
                 Some(reason),
@@ -995,6 +1009,7 @@ impl TaskState {
             Self::Running { .. } => ProcessStatus::Running,
             Self::Finished { reason } => ProcessStatus::from(reason),
             Self::Lost => ProcessStatus::Lost,
+            Self::Preempted { .. } => ProcessStatus::Preempted,
         }
     }
 
@@ -1002,7 +1017,7 @@ impl TaskState {
     #[must_use]
     pub fn exit_reason(&self) -> Option<&ExitReason> {
         match self {
-            Self::Finished { reason } => Some(reason),
+            Self::Finished { reason } | Self::Preempted { reason } => Some(reason),
             Self::Queued | Self::Running { .. } | Self::Lost => None,
         }
     }
@@ -1012,14 +1027,17 @@ impl TaskState {
     pub fn pid(&self) -> Option<i32> {
         match self {
             Self::Running { pid } => *pid,
-            Self::Queued | Self::Finished { .. } | Self::Lost => None,
+            Self::Queued | Self::Finished { .. } | Self::Lost | Self::Preempted { .. } => None,
         }
     }
 
     /// Whether the task can no longer change process status
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Finished { .. } | Self::Lost)
+        matches!(
+            self,
+            Self::Finished { .. } | Self::Lost | Self::Preempted { .. }
+        )
     }
 }
 
@@ -1048,6 +1066,10 @@ pub struct TaskRow {
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
     /// Durable evidence for a container task's container
     pub container_exit_evidence: ContainerExitEvidence,
+    /// The worker's child, recorded once at spawn so cleanup after a lost
+    /// worker can tell its process group from a later one that reused the PID.
+    /// `None` before spawn and for container tasks, whose container is the witness
+    pub child: Option<ProcessIdentity>,
     /// Terminal callback delivery. A second axis: it outlives the process state
     pub callback_status: CallbackStatus,
     /// Attention-reminder delivery state
@@ -1077,7 +1099,9 @@ impl TaskRow {
     #[must_use]
     pub fn process_group_exit_evidence(&self) -> ProcessGroupExitEvidence {
         match &self.state {
-            TaskState::Finished { .. } => self.process_group_exit_evidence,
+            TaskState::Finished { .. } | TaskState::Preempted { .. } => {
+                self.process_group_exit_evidence
+            }
             TaskState::Queued | TaskState::Running { .. } | TaskState::Lost => {
                 ProcessGroupExitEvidence::Unconfirmed
             }
@@ -1091,7 +1115,7 @@ impl TaskRow {
     /// group evidence
     #[must_use]
     pub fn work_exit_evidence(&self) -> WorkExitEvidence {
-        let TaskState::Finished { .. } = &self.state else {
+        let (TaskState::Finished { .. } | TaskState::Preempted { .. }) = &self.state else {
             return WorkExitEvidence::Unconfirmed;
         };
         // the task layer records NoChildSpawned only when no worker child and no
@@ -1209,6 +1233,7 @@ pub fn check_status_transition(
                 | ProcessStatus::Failed
                 | ProcessStatus::Cancelled
                 | ProcessStatus::Lost
+                | ProcessStatus::Preempted
         )
     );
     if allowed {
@@ -1491,6 +1516,7 @@ mod tests {
                 state,
                 process_group_exit_evidence: process_group,
                 container_exit_evidence: container_evidence,
+                child: None,
                 callback_status: crate::domain::CallbackStatus::Pending,
                 attention: AttentionState::Pending,
                 cancel_requested_at: None,
@@ -1513,6 +1539,7 @@ mod tests {
         assert!(ProcessStatus::Failed.is_terminal());
         assert!(ProcessStatus::Cancelled.is_terminal());
         assert!(ProcessStatus::Lost.is_terminal());
+        assert!(ProcessStatus::Preempted.is_terminal());
     }
 
     #[test]

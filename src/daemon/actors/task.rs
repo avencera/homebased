@@ -303,7 +303,9 @@ async fn start_attention_reminder(
             return Ok(AttentionStep::Deferred(schedule_attention_retry(&myself)));
         }
         TaskState::Running { .. } => {}
-        TaskState::Finished { .. } | TaskState::Lost => return Ok(AttentionStep::Done),
+        TaskState::Finished { .. } | TaskState::Lost | TaskState::Preempted { .. } => {
+            return Ok(AttentionStep::Done);
+        }
     }
 
     let output = actor.home.task_paths(id).output;

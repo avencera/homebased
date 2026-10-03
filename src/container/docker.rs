@@ -137,6 +137,7 @@ impl DockerCli {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        crate::run_env::scrub(command.as_std_mut());
         command
             .env("PATH", &self.env.path)
             .env("HOME", &self.env.home)

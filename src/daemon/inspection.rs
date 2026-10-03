@@ -1191,6 +1191,7 @@ mod tests {
             ProcessStatus::Failed,
             ProcessStatus::Cancelled,
             ProcessStatus::Lost,
+            ProcessStatus::Preempted,
         ] {
             assert_eq!(
                 blocker(worker_route(task, machine, status.into(), Some(thread))),

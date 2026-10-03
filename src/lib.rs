@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod callback;
 pub mod cancellation;
+pub mod cleanup;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod message;
 pub mod notify;
 pub mod power;
 pub mod report;
+pub mod run_env;
 pub mod runner;
 pub mod spec;
 pub mod store;

@@ -20,6 +20,7 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
+use crate::cleanup;
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
     TaskRow, TaskState, ThreadId, Workload,
@@ -28,6 +29,7 @@ use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
 use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
 use crate::report::REPORT_TRAILER;
+use crate::run_env;
 use crate::store::{self, Store};
 
 mod container;
@@ -91,7 +93,8 @@ pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppErr
         }
     };
     let mut cmd = StdCommand::new(&exe);
-    cmd.arg("task-run")
+    run_env::scrub(&mut cmd)
+        .arg("task-run")
         .arg("--home")
         .arg(home.root())
         .arg("--id")
@@ -343,11 +346,12 @@ async fn run_child(
     let stderr = log;
 
     let mut cmd = TokioCommand::new(&invocation.program);
+    run_env::scrub(cmd.as_std_mut());
     cmd.args(&invocation.args)
         .current_dir(&row.cwd)
         .env("PATH", &row.env.path)
         .env("HOME", &row.env.home)
-        .env("HOMEBASED_TASK_ID", id.to_string())
+        .env(run_env::TASK_ID, id.to_string())
         .env("HOMEBASED_HOME", home.root())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -385,6 +389,7 @@ async fn run_child(
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         });
     };
+    record_child_identity(store, id, child_pgid);
     if invocation.stdin == StdinPolicy::PromptFeed
         && let Some(feed) = feed
         && let Some(mut stdin) = child.stdin.take()
@@ -451,6 +456,25 @@ async fn run_child(
         reason,
         process_group_exit_evidence,
     })
+}
+
+/// Save the child's identity for cleanup after a lost worker
+///
+/// The child is not reaped yet, so its PID cannot be reused before the read. A
+/// failure only weakens later lost-worker cleanup, so the task keeps running
+fn record_child_identity(store: &Store, id: TaskId, pid: i32) {
+    let identity = match cleanup::process_identity(Pid::from_raw(pid)) {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(%id, pid, "read child identity: {err}");
+            return;
+        }
+    };
+    match store.set_child_identity(id, identity) {
+        Ok(true) => {}
+        Ok(false) => warn!(%id, %identity, "child identity not recorded: task row changed"),
+        Err(err) => warn!(%id, %identity, "record child identity: {err}"),
+    }
 }
 
 /// A Unix wait status is either an exit code or a terminating signal.

@@ -11,9 +11,12 @@ const REQUEST_TIMEOUT_MS = 5000;
 
 const API_BASE = '/v1';
 
-/** Task lifecycle, `TaskStatus` in the daemon: `held` waits on its origin for dependencies. */
+/**
+ * Task lifecycle, `TaskStatus` in the daemon: `held` waits on its origin for dependencies, and
+ * `preempted` is a run stopped for higher-priority work whose queued job runs again later.
+ */
 export type ProcessStatus =
-	'held' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost';
+	'held' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost' | 'preempted';
 
 /** Every status, in lifecycle order. */
 export const PROCESS_STATUSES: readonly ProcessStatus[] = [
@@ -23,7 +26,8 @@ export const PROCESS_STATUSES: readonly ProcessStatus[] = [
 	'succeeded',
 	'failed',
 	'cancelled',
-	'lost'
+	'lost',
+	'preempted'
 ];
 
 /** Statuses of a task that can still change on its own. */
@@ -261,7 +265,8 @@ const ProcessStatusSchema = Schema.Literal(
 	'succeeded',
 	'failed',
 	'cancelled',
-	'lost'
+	'lost',
+	'preempted'
 );
 const AgentKindSchema = Schema.Literal('codex', 'claude', 'grok', 'opencode');
 const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'waiting', 'sent', 'failed');

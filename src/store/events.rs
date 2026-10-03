@@ -126,6 +126,19 @@ fn validate(event: &TaskEvent) -> Result<(), EventError> {
             message: "callback task or API version does not match event envelope".into(),
         });
     }
+    // a preempted run is not a failure; its event and state must agree, so a
+    // dependency reads the same outcome from either
+    if let EventPayload::Callback {
+        event: callback,
+        state,
+    } = &event.payload
+        && (callback.event == EventKind::TaskPreempted)
+            != (*state == Some(ProcessStatus::Preempted))
+    {
+        return Err(EventError::Invalid {
+            message: "TASK_PREEMPTED and the preempted state must appear together".into(),
+        });
+    }
     let reports: &[crate::callback::ReportView] = match &event.payload {
         EventPayload::Callback { event, .. } => &event.reports,
         EventPayload::Report { report } => std::slice::from_ref(report),
@@ -1247,6 +1260,36 @@ mod tests {
                  SET settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-31 days');",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn preempted_event_and_state_must_agree() {
+        let route = route();
+        let with_kind = |kind: &str, state| {
+            let mut event = callback_event(&route, 1, state);
+            let EventPayload::Callback {
+                event: callback, ..
+            } = &mut event.payload
+            else {
+                unreachable!("callback_event builds a callback");
+            };
+            callback.event = serde_json::from_value(serde_json::json!(kind)).unwrap();
+            event
+        };
+
+        assert!(
+            super::validate(&with_kind("TASK_PREEMPTED", Some(ProcessStatus::Preempted))).is_ok()
+        );
+        for event in [
+            with_kind("TASK_PREEMPTED", Some(ProcessStatus::Failed)),
+            with_kind("TASK_PREEMPTED", None),
+            with_kind("TASK_FAILED", Some(ProcessStatus::Preempted)),
+        ] {
+            assert!(
+                matches!(super::validate(&event), Err(EventError::Invalid { .. })),
+                "{event:?}"
+            );
+        }
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn source(
         (None, None) => {}
     }
 
-    if let Some(value) = std::env::var_os("HOMEBASED_TASK_ID") {
+    if let Some(value) = std::env::var_os(crate::run_env::TASK_ID) {
         let value = value.to_str().ok_or_else(|| AppError::Usage {
             message: "HOMEBASED_TASK_ID must be a UUID".into(),
         })?;
