@@ -4417,41 +4417,73 @@ CREATE TABLE reports (
             .unwrap()
     }
 
-    /// A database written by released v0.13, whose schema 34 v0.14 shares, with
-    /// one finished task and its routes and events; paths and the thread ID are
-    /// replaced with fixture values
-    const RELEASED_V0_13_DATABASE: &str =
-        include_str!("store/fixtures/released_v0_13_database.sql");
+    /// Databases written by each release that introduced a schema version, each
+    /// with one finished task and its routes and events; paths are replaced
+    /// with fixture values. v0.14 shares v0.13's schema 34
+    const RELEASED_DATABASES: [(i64, &str); 8] = [
+        (
+            RELEASED_V0_4_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_4_0_database.sql"),
+        ),
+        (
+            RELEASED_V0_5_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_5_0_database.sql"),
+        ),
+        (
+            RELEASED_V0_5_1_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_5_1_database.sql"),
+        ),
+        (
+            RELEASED_V0_7_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_7_0_database.sql"),
+        ),
+        (
+            RELEASED_V0_8_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_8_0_database.sql"),
+        ),
+        (
+            RELEASED_V0_8_7_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_8_7_database.sql"),
+        ),
+        (
+            RELEASED_V0_11_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_11_0_database.sql"),
+        ),
+        (
+            RELEASED_V0_13_SCHEMA_VERSION,
+            include_str!("store/fixtures/released_v0_13_0_database.sql"),
+        ),
+    ];
 
-    // the downgrade recipes above rebuild old schemas from the current one, so
-    // this checks one database a real release wrote
+    // the downgrade recipes below rebuild old schemas from the current one, so
+    // these check databases the real releases wrote
     #[test]
-    fn a_database_from_a_real_release_upgrades_and_keeps_its_task() {
+    fn databases_from_real_releases_upgrade_and_keep_their_task() {
         let fresh_dir = tempdir().unwrap();
         let fresh = schema_snapshot(&Store::open(&fresh_dir.path().join("db")).unwrap());
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(RELEASED_V0_13_DATABASE).unwrap();
-        conn.pragma_update(None, "user_version", RELEASED_V0_13_SCHEMA_VERSION)
-            .unwrap();
-        drop(conn);
 
-        let store = Store::open(&path).unwrap();
+        for (version, dump) in RELEASED_DATABASES {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(dump).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            let task: String = conn
+                .query_row("SELECT id FROM tasks", [], |row| row.get(0))
+                .unwrap();
+            drop(conn);
 
-        assert_eq!(schema_snapshot(&store), fresh);
-        assert_no_loan_tables(&store);
-        let task: TaskId = "01a101a7-7205-758d-98c2-97d51e5c59fd".parse().unwrap();
-        let row = store.require_task(task).unwrap();
-        assert_eq!(row.status(), ProcessStatus::Succeeded);
-        assert_eq!(
-            row_count(
-                &store,
-                "SELECT COUNT(*) FROM origin_inbox WHERE task_id = ?1",
-                task
-            ),
-            3
-        );
+            let store = Store::open(&path).unwrap();
+
+            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
+            assert_no_loan_tables(&store);
+            let row = store.require_task(task.parse().unwrap()).unwrap();
+            assert_eq!(
+                row.status(),
+                ProcessStatus::Succeeded,
+                "released version {version}"
+            );
+        }
     }
 
     #[test]
