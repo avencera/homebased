@@ -186,18 +186,7 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = bytes::Bytes::from_request(req, state)
-            .await
-            .map_err(|err| AppError::InvalidSpec {
-                pointer: String::new(),
-                value: Value::Null,
-                message: format!("invalid request body: {err}"),
-            })?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|err| AppError::InvalidSpec {
-            pointer: String::new(),
-            value: Value::Null,
-            message: format!("invalid JSON: {err}"),
-        })?;
+        let value = json_body(req, state).await?;
         let envelope: SubmitEnvelope =
             serde_path_to_error::deserialize(&value).map_err(|err| invalid_at(&value, "", &err))?;
         let env_value = envelope.env.ok_or_else(|| missing_field("/env", "env"))?;
@@ -219,6 +208,23 @@ where
             after,
         }))
     }
+}
+
+/// Read a request body as JSON; a body that is unreadable or not JSON is an
+/// `invalid_spec` at the root, like any other refused field
+pub(super) async fn json_body<S: Send + Sync>(req: Request, state: &S) -> Result<Value, AppError> {
+    let bytes = bytes::Bytes::from_request(req, state)
+        .await
+        .map_err(|err| AppError::InvalidSpec {
+            pointer: String::new(),
+            value: Value::Null,
+            message: format!("invalid request body: {err}"),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|err| AppError::InvalidSpec {
+        pointer: String::new(),
+        value: Value::Null,
+        message: format!("invalid JSON: {err}"),
+    })
 }
 
 pub(super) fn missing_field(pointer: &str, name: &str) -> AppError {

@@ -13,7 +13,6 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::container::ContainerWorkload;
@@ -198,8 +197,7 @@ impl JobSpec {
     ///
     /// A submit retry with the same job id must carry the same digest
     pub fn digest(&self) -> Result<String, AppError> {
-        let digest = Sha256::digest(self.to_canonical_json()?.as_bytes());
-        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+        Ok(super::sha256_hex(self.to_canonical_json()?.as_bytes()))
     }
 
     /// JSON pointer of step `index` in the canonical form

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::container::ContainerWorkload;
@@ -29,6 +30,14 @@ pub mod schedule;
 pub mod spec;
 
 pub use error::{MoveRefusal, QueueCode, QueueError};
+
+/// Lowercase hex SHA-256, the stored form of job spec and operation digests
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Declare a UUID identity with string, serde, and schema forms
 macro_rules! uuid_id {
@@ -146,9 +155,6 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// Every level, highest first, which is the serving order
-    pub const SERVING_ORDER: [Self; 3] = [Self::High, Self::Medium, Self::Low];
-
     /// Stable lowercase name, also the storage tag
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -192,12 +198,6 @@ impl RestartWindow {
     pub const MIN: Duration = Duration::from_secs(60);
     /// Longest accepted window
     pub const MAX: Duration = Duration::from_secs(24 * 60 * 60);
-
-    /// The window's length
-    #[must_use]
-    pub const fn as_duration(self) -> Duration {
-        self.0
-    }
 
     /// Whether a run that started at `started_at` is still inside the window
     ///

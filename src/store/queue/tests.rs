@@ -1056,29 +1056,37 @@ fn cancel_queued_and_terminal_jobs() {
 
 #[test]
 fn a_user_cancel_upgrades_a_pending_yield_and_survives_later_requests() {
-    let fixture = Fixture::new();
-    let job = fixture.submit(Priority::Low);
-    let run = fixture.start(job, "gpu0", Utc::now());
-    let yielded = fixture
-        .store
-        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
-        .unwrap();
-    let RunPhase::Stopping { requested_at, .. } = yielded.phase else {
-        panic!("{yielded:?}");
-    };
-    fixture.cancel(job);
-    let after = fixture
-        .store
-        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
-        .unwrap();
-    assert!(matches!(
-        after.phase,
-        RunPhase::Stopping { cause: StopCause::UserCancel, requested_at: at, .. } if at == requested_at
-    ));
-    fixture.exit(&run, ExitReason::Exit { code: 75 });
-    assert_eq!(fixture.job(job).state, JobState::Cancelled);
+    for task_cancel in [false, true] {
+        let fixture = Fixture::new();
+        let job = fixture.submit(Priority::Low);
+        let run = fixture.start(job, "gpu0", Utc::now());
+        let yielded = fixture
+            .store
+            .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
+            .unwrap();
+        let RunPhase::Stopping { requested_at, .. } = yielded.phase else {
+            panic!("{yielded:?}");
+        };
+        if task_cancel {
+            fixture.store.request_cancel(run.task).unwrap();
+        } else {
+            fixture.cancel(job);
+        }
+        let after = fixture
+            .store
+            .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
+            .unwrap();
+        assert!(
+            matches!(
+                after.phase,
+                RunPhase::Stopping { cause: StopCause::UserCancel, requested_at: at, .. } if at == requested_at
+            ),
+            "task cancel {task_cancel}"
+        );
+        fixture.exit(&run, ExitReason::Exit { code: 75 });
+        assert_eq!(fixture.job(job).state, JobState::Cancelled);
+    }
 }
-
 #[test]
 fn a_launching_run_can_be_cancelled_but_not_preempted() {
     let fixture = Fixture::new();
@@ -1494,51 +1502,63 @@ fn detected_resources_are_created_once_and_keep_their_ids() {
 }
 
 #[test]
-fn queue_detection_renames_the_fallback_to_the_only_nonzero_device() {
-    let fixture = Fixture::new();
-    let machine = MachineId::new();
-    let fallback = fixture
-        .store
-        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
-        .unwrap()[0]
-        .resource
-        .id;
-    let detected = crate::queue::gpu::resources_for(
-        crate::queue::gpu::Platform::Linux,
-        Some("GPU 1: NVIDIA GPU (UUID: GPU-test)\n"),
-    );
-    let resources = fixture
-        .store
-        .ensure_detected_resources(machine, &detected)
-        .unwrap();
-    assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0].resource.id, fallback);
-    assert_eq!(resources[0].resource.device, Some(1));
-    assert_eq!(resources[0].resource.name, ResourceName::gpu(1));
-    assert_eq!(resources[0].origin, super::ResourceOrigin::DetectedDevice);
-    assert_eq!(
-        fixture
+fn detection_moves_the_fallback_onto_the_first_detected_device() {
+    for devices in [vec![1], vec![0, 1], vec![2, 3]] {
+        let f = Fixture::new();
+        let machine = MachineId::new();
+        let unindexed = [DetectedResource::unindexed()];
+        let fallback = f
+            .store
+            .ensure_detected_resources(machine, &unindexed)
+            .unwrap()[0]
+            .resource
+            .id;
+        let detected: Vec<_> = devices
+            .iter()
+            .map(|&device| DetectedResource {
+                name: ResourceName::gpu(device),
+                device: Some(device),
+            })
+            .collect();
+        let resources = f
             .store
             .ensure_detected_resources(machine, &detected)
-            .unwrap(),
-        resources
-    );
-    assert_eq!(
-        fixture
-            .store
-            .resolve_resource(
-                machine,
-                &crate::queue::ResourceSelector::Name(ResourceName::gpu(1))
-            )
-            .unwrap()
-            .resource
-            .id,
-        fallback
-    );
-}
+            .unwrap();
+        assert_eq!(resources.len(), devices.len(), "{devices:?}");
 
+        let first = devices[0];
+        let adopted = f.store.resource(fallback).unwrap().unwrap();
+        assert_eq!(adopted.resource.device, Some(first), "{devices:?}");
+        assert_eq!(
+            adopted.resource.name,
+            ResourceName::gpu(first),
+            "{devices:?}"
+        );
+        assert_eq!(adopted.origin, super::ResourceOrigin::DetectedDevice);
+        assert_eq!(
+            f.store
+                .resolve_resource(
+                    machine,
+                    &crate::queue::ResourceSelector::Name(ResourceName::gpu(first))
+                )
+                .unwrap()
+                .resource
+                .id,
+            fallback
+        );
+
+        // repeated detection is idempotent and never adds a fallback beside a device
+        for again in [&detected[..], &unindexed[..]] {
+            assert_eq!(
+                f.store.ensure_detected_resources(machine, again).unwrap(),
+                resources,
+                "{devices:?}"
+            );
+        }
+    }
+}
 #[test]
-fn queue_detection_keeps_the_fallback_name_when_a_manual_resource_owns_the_device_name() {
+fn detection_never_renames_or_replaces_a_manual_resource() {
     let fixture = Fixture::new();
     let machine = MachineId::new();
     let fallback = fixture
@@ -1568,10 +1588,28 @@ fn queue_detection_keeps_the_fallback_name_when_a_manual_resource_owns_the_devic
         fixture.store.resource(manual.resource.id).unwrap().unwrap(),
         manual
     );
-}
 
+    // without a fallback, a manual resource keeps a detected device's name
+    let manual_machine = MachineId::new();
+    let manual = fixture
+        .store
+        .register_resource(manual_machine, ResourceName::gpu(0), None)
+        .unwrap();
+    let detected = [0, 1].map(|device| DetectedResource {
+        name: ResourceName::gpu(device),
+        device: Some(device),
+    });
+    fixture
+        .store
+        .ensure_detected_resources(manual_machine, &detected)
+        .unwrap();
+    assert_eq!(
+        fixture.store.resource(manual.resource.id).unwrap().unwrap(),
+        manual
+    );
+}
 #[test]
-fn queue_preemption_rechecks_the_first_job_with_an_eligible_victim() {
+fn preemption_rechecks_the_first_job_with_an_eligible_victim() {
     for change in [
         "none",
         "cancel any",
@@ -1831,41 +1869,6 @@ fn queue_state_survives_reopening_the_database() {
 }
 
 #[test]
-fn detection_reconciles_fallback_and_preserves_manual_resources() {
-    let f = Fixture::new();
-    let machine = MachineId::new();
-    let fallback = f
-        .store
-        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
-        .unwrap()[0]
-        .resource
-        .id;
-    let detected = [0, 1].map(|device| DetectedResource {
-        name: ResourceName::gpu(device),
-        device: Some(device),
-    });
-    let resources = f
-        .store
-        .ensure_detected_resources(machine, &detected)
-        .unwrap();
-    assert_eq!(resources.len(), 2);
-    assert_eq!(resources[0].resource.id, fallback);
-    assert_eq!(resources[0].resource.device, Some(0));
-    let manual_machine = MachineId::new();
-    let manual = f
-        .store
-        .register_resource(manual_machine, ResourceName::gpu(0), None)
-        .unwrap();
-    f.store
-        .ensure_detected_resources(manual_machine, &detected)
-        .unwrap();
-    assert_eq!(
-        f.store.resource(manual.resource.id).unwrap().unwrap(),
-        manual
-    );
-}
-
-#[test]
 fn detection_defers_all_phases_of_an_active_fallback() {
     for phase in [
         "launching",
@@ -1944,69 +1947,6 @@ fn detection_defers_all_phases_of_an_active_fallback() {
                 Some(0)
             );
         }
-    }
-}
-
-#[test]
-fn task_cancel_upgrades_yield_before_exit_75() {
-    let f = Fixture::new();
-    let job = f.submit(Priority::Low);
-    let run = f.start(job, "gpu0", Utc::now());
-    f.store
-        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
-        .unwrap();
-    f.store.request_cancel(run.task).unwrap();
-    f.exit(&run, ExitReason::Exit { code: 75 });
-    assert_eq!(f.job(job).state, JobState::Cancelled);
-}
-
-#[test]
-fn preemption_rechecks_move_and_head_cancel() {
-    for cancel_head in [false, true] {
-        let f = Fixture::new();
-        let mut low_spec = spec(Priority::Low, 1);
-        low_spec["preempt"] = json!({"mode":"restart"});
-        let low = f.submit_spec(low_spec);
-        let run = f.start(low, "gpu0", Utc::now());
-        let mut high_spec = spec(Priority::High, 1);
-        high_spec["resource"] = json!("gpu0");
-        let head = f.submit_spec(high_spec);
-        let stop = decide(
-            &f.store
-                .queue_snapshot(f.machine, Utc::now(), NoticeThresholds::default())
-                .unwrap(),
-        )
-        .preemption
-        .unwrap();
-        if cancel_head {
-            f.cancel(head);
-        } else {
-            f.move_job(
-                low,
-                Placement::Edge {
-                    priority: Some(Priority::High),
-                    end: LevelEnd::Front,
-                },
-            )
-            .unwrap();
-        }
-        assert!(
-            f.store
-                .commit_preemption(stop, Utc::now())
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            f.run_on("gpu0").unwrap().phase,
-            RunPhase::Executing { .. }
-        ));
-        assert!(
-            f.store
-                .require_task(run.task)
-                .unwrap()
-                .cancel_requested_at
-                .is_none()
-        );
     }
 }
 
@@ -2114,7 +2054,7 @@ fn ended_blocked_notice_is_suppressed_without_a_sequence_gap() {
 }
 
 #[test]
-fn queue_restart_marker_does_not_become_user_cancel() {
+fn a_restart_marker_does_not_become_a_user_cancel() {
     let f = Fixture::new();
     let job = f.submit(Priority::Low);
     let run = f.start(job, "gpu0", Utc::now());
@@ -2129,37 +2069,6 @@ fn queue_restart_marker_does_not_become_user_cancel() {
             next_step: StepIndex::new(0),
             resume: false
         }
-    );
-}
-
-#[test]
-fn detection_uses_first_nonzero_device_and_never_adds_a_fallback_beside_it() {
-    let f = Fixture::new();
-    let machine = MachineId::new();
-    let fallback = f
-        .store
-        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
-        .unwrap()[0]
-        .resource
-        .id;
-    let detected = [2, 3].map(|device| DetectedResource {
-        name: ResourceName::gpu(device),
-        device: Some(device),
-    });
-    let resources = f
-        .store
-        .ensure_detected_resources(machine, &detected)
-        .unwrap();
-    assert_eq!(resources.len(), 2);
-    assert_eq!(
-        f.store.resource(fallback).unwrap().unwrap().resource.device,
-        Some(2)
-    );
-    assert_eq!(
-        f.store
-            .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
-            .unwrap(),
-        resources
     );
 }
 

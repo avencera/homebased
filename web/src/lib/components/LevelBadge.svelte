@@ -1,8 +1,8 @@
 <script lang="ts" module>
 	import { tv } from 'tailwind-variants';
 
-	/** Level colors, warmer as the level rises; also used for the level rail in the queue. */
-	export const levelTone = tv({
+	/** Level colors, warmer as the level rises. */
+	const levelTone = tv({
 		variants: {
 			priority: {
 				high: 'text-rose-700 dark:text-rose-300',

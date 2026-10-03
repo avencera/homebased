@@ -168,13 +168,7 @@ async fn send_to_origin(
         .ok_or_else(|| AppError::MachineNotFound {
             machine: event.origin.to_string(),
         })?;
-    let destination = match fleet.connect(event.origin).await {
-        Ok(destination) => destination,
-        Err(_) => {
-            fleet.discover_now().await;
-            fleet.connect(event.origin).await?
-        }
-    };
+    let destination = fleet.connect_rediscovering(event.origin).await?;
     let body = ClusterJobEvent {
         api_version: API_VERSION,
         protocol_version: destination.protocol.0,

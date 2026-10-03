@@ -37,19 +37,7 @@ where
     type Rejection = AppError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = bytes::Bytes::from_request(request, state)
-            .await
-            .map_err(|error| AppError::InvalidSpec {
-                pointer: String::new(),
-                value: Value::Null,
-                message: format!("invalid request body: {error}"),
-            })?;
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|error| AppError::InvalidSpec {
-                pointer: String::new(),
-                value: Value::Null,
-                message: format!("invalid JSON: {error}"),
-            })?;
+        let value = super::api::json_body(request, state).await?;
         serde_path_to_error::deserialize(&value)
             .map(Self)
             .map_err(|error| super::api::invalid_at(&value, "", &error))

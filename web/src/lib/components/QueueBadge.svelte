@@ -22,7 +22,7 @@
 	});
 
 	/** Every state the badge colors. */
-	export type QueueBadgeState = keyof typeof queueBadge.variants.state;
+	type QueueBadgeState = keyof typeof queueBadge.variants.state;
 </script>
 
 <script lang="ts">

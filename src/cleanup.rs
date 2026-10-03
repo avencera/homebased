@@ -138,12 +138,6 @@ impl CleanupTiming {
     };
 }
 
-impl Default for CleanupTiming {
-    fn default() -> Self {
-        Self::STANDARD
-    }
-}
-
 /// Why cleanup could not finish; the resource needs a person to check the machine
 ///
 /// It is stored with the resource's `Attention`, so it has a serde form

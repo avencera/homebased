@@ -580,7 +580,7 @@ mod tests {
         assert!(error.contains("peer protocol"), "{error}");
     }
     #[test]
-    fn review_gap_claude_notice_check_holds_lock_before_frame() {
+    fn claude_notice_check_runs_under_the_lock_before_the_frame() {
         use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
         let (home, socket) = home_with_session(live_pid(), PEER_PROTOCOL);
         let listener = UnixListener::bind(&socket).unwrap();

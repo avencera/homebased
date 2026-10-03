@@ -77,17 +77,6 @@ pub enum QueueRequest {
     },
 }
 
-impl QueueRequest {
-    /// Whether this request changes queue state
-    #[must_use]
-    pub const fn is_write(&self) -> bool {
-        !matches!(
-            self,
-            Self::Resources | Self::Jobs | Self::Show { .. } | Self::NoticeCurrent { .. }
-        )
-    }
-}
-
 /// One historical attempt, including cleanup and the last committed stop cause
 #[derive(Debug, Clone, Serialize)]
 pub struct JobRunView {

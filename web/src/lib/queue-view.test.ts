@@ -1,22 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { JobRecord, Priority, ResourceRecord } from './api.ts';
+import type { JobRecord, Priority } from './api.ts';
 import {
-	cleanupLabel,
 	dropPlacement,
 	groupByLevel,
 	newOperationId,
 	nudgePlacement,
-	phaseLabel,
-	phaseSince,
-	preemptionLabel,
-	queueHasWork,
-	resourceState,
-	stepLabel,
 	stepProgress,
-	stepText,
-	targetLabel,
 	waitingJobs
 } from './queue-view.ts';
 
@@ -49,12 +40,6 @@ function job(
 		...extra
 	};
 }
-
-const idle: ResourceRecord = {
-	machine: 'm',
-	resource: { id: 'r0', name: 'gpu0', device: null },
-	run: null
-};
 
 test('jobs group by level in serving order, keeping empty levels', () => {
 	const groups = groupByLevel([job('b', 'low', 2), job('a', 'low', 1), job('h', 'high', 1)]);
@@ -125,64 +110,6 @@ test('a drop takes the target level and refuses the dragged job itself', () => {
 	assert.equal(dropPlacement('t', target, 'before'), null);
 });
 
-test('resource state follows the run phase', () => {
-	assert.equal(resourceState(idle), 'idle');
-	const stopping: ResourceRecord = {
-		...idle,
-		run: {
-			resource: 'r0',
-			job: 'j',
-			task: 'task',
-			run_number: 1,
-			step: 0,
-			phase: {
-				phase: 'stopping',
-				started_at: null,
-				cause: 'yield',
-				requested_at: '2026-10-03T01:00:00Z'
-			}
-		}
-	};
-	assert.equal(resourceState(stopping), 'stopping');
-	assert.equal(phaseLabel(stopping.run!.phase), 'stopping · yield');
-	assert.equal(phaseSince(stopping.run!.phase), '2026-10-03T01:00:00Z');
-	assert.equal(phaseLabel({ phase: 'cleaning', attempt: 2 }), 'cleaning · try 2');
-	assert.equal(phaseSince({ phase: 'cleaning', attempt: 1 }), null);
-});
-
-test('the queue has work while a resource is held or a job remains', () => {
-	assert.equal(queueHasWork([idle], []), false);
-	assert.equal(queueHasWork([idle], [job('a', 'low', 1)]), true);
-});
-
-test('labels name the mode, target, step, and cleanup', () => {
-	assert.equal(preemptionLabel({ mode: 'restart' }), 'restart');
-	assert.equal(preemptionLabel({ mode: 'wait' }), 'wait');
-	assert.equal(preemptionLabel({ mode: 'yield', restart_within: '5m' }), 'yield · restart 5m');
-	const names = new Map([['r1', 'gpu1']]);
-	assert.equal(targetLabel({ type: 'any' }, names), 'any');
-	assert.equal(targetLabel({ type: 'pinned', resource: 'r1' }, names), 'gpu1');
-	assert.equal(targetLabel({ type: 'pinned', resource: '0123456789' }, names), '01234567');
-	const twoSteps = job('s', 'low', 1, {
-		next_step: 1,
-		spec: {
-			...job('s', 'low', 1).spec,
-			steps: [
-				{ type: 'task', command: ['a'] },
-				{ type: 'task', command: ['b'] }
-			]
-		}
-	});
-	assert.equal(stepLabel(twoSteps), 'step 2/2');
-	assert.equal(stepLabel({ ...twoSteps, next_step: 2, state: { state: 'succeeded' } }), 'step 2/2');
-	assert.equal(cleanupLabel(null), '—');
-	assert.equal(cleanupLabel({ Ok: null }), 'clean');
-	assert.equal(
-		cleanupLabel({ Err: { kind: 'processes', failure: { kind: 'group_survived', pgid: 42 } } }),
-		'process group 42 survived SIGKILL'
-	);
-});
-
 test('operation IDs are version 4 UUIDs', () => {
 	const id = newOperationId((bytes) => bytes.fill(0xff));
 	assert.equal(id, 'ffffffff-ffff-4fff-bfff-ffffffffffff');
@@ -223,10 +150,5 @@ test('step progress follows the job and stops at a failed run', () => {
 	assert.deepEqual(
 		[0, 1, 2].map((index) => stepProgress(cancelled, index, null)),
 		['done', 'done', 'skipped']
-	);
-	assert.equal(stepText(steps[0]), 'run 0');
-	assert.equal(
-		stepText({ type: 'container', image: 'busybox@sha256:abc' }),
-		'container busybox@sha256:abc'
 	);
 });

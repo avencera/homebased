@@ -1,4 +1,4 @@
-//! Phase 4 integration tests: real daemon and task workers, with direct store inputs
+//! Queue actor tests: a real daemon and task workers, with direct store inputs
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use crate::queue::{
 use crate::store::Store;
 use crate::store::queue::{JobRecord, NewJob};
 
-static PHASE4_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static QUEUE_DAEMON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const WAIT: Duration = Duration::from_secs(25);
 
@@ -64,7 +64,7 @@ impl Harness {
         )
         .unwrap();
         let mut harness = Self {
-            _guard: PHASE4_TEST_LOCK
+            _guard: QUEUE_DAEMON_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             directory,
@@ -163,7 +163,7 @@ impl Harness {
             .collect();
         let mut value = json!({
             "api_version": 1, "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "name": "phase 4 command", "cwd": self.directory.path(), "timeout": "30m",
+            "name": "queue command", "cwd": self.directory.path(), "timeout": "30m",
             "priority": priority, "preempt": preempt, "steps": steps,
         });
         if let Some(pin) = pin {
@@ -270,22 +270,14 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         if thread::panicking() {
-            let evidence = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("_scratch/gpu-priority-queue/phase4");
-            let _ = fs::create_dir_all(&evidence);
-            let _ = fs::copy(
-                self.path("daemon.log"),
-                evidence.join(format!("failed-{}.log", self.machine)),
-            );
+            let log = fs::read_to_string(self.path("daemon.log")).unwrap_or_default();
+            eprintln!("daemon log:\n{log}");
             if let Ok(store) = Store::open(&self.home.db_path()) {
-                let _ = fs::write(
-                    evidence.join(format!("failed-{}-state.txt", self.machine)),
-                    format!(
-                        "resources={:?}\nqueue={:?}\ntasks={:?}\n",
-                        store.resources_on(self.machine),
-                        store.machine_queue(self.machine),
-                        store.non_terminal()
-                    ),
+                eprintln!(
+                    "resources={:?}\nqueue={:?}\ntasks={:?}",
+                    store.resources_on(self.machine),
+                    store.machine_queue(self.machine),
+                    store.non_terminal()
                 );
             }
         }

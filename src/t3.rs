@@ -1654,7 +1654,7 @@ mod tests {
         assert_ne!(first, deterministic_id("message", T3_THREAD_ID, "text"));
     }
     #[test]
-    fn review_gap_t3_notice_rechecks_after_preparation() {
+    fn t3_notice_rechecks_eligibility_after_preparation() {
         use crate::callback::send_check::{SendCheck, SendFailure};
         if !curl_available() {
             return;

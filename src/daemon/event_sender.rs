@@ -242,13 +242,7 @@ impl Sender {
                     "local machine identity is duplicated".into(),
                 ));
             }
-            let verified = match fleet.connect(origin).await {
-                Ok(verified) => verified,
-                Err(_) => {
-                    fleet.discover_now().await;
-                    fleet.connect(origin).await?
-                }
-            };
+            let verified = fleet.connect_rediscovering(origin).await?;
             Some((fleet.clone(), verified))
         };
         let client = ClusterClient::default();

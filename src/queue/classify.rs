@@ -158,7 +158,7 @@ mod tests {
         Classification { outcome, job }
     }
 
-    /// Every row of the plan's table, expanded over each cause it covers
+    /// Every row of the classification table, expanded over each cause it covers
     #[test]
     fn every_row_of_the_classification_table() {
         use JobTransition as Job;
@@ -212,12 +212,15 @@ mod tests {
                 last,
                 row(Run::Preempted, Job::Requeue { resume: false }),
             ));
-            cases.push((
-                RunEnd::Cancelled,
-                Some(UserCancel),
-                last,
-                row(Run::Cancelled, Job::Cancelled),
-            ));
+            // a worker cancel that no queue cause explains came from a person
+            for cause in [None, Some(Yield), Some(UserCancel)] {
+                cases.push((
+                    RunEnd::Cancelled,
+                    cause,
+                    last,
+                    row(Run::Cancelled, Job::Cancelled),
+                ));
+            }
             for cause in [None, Some(Yield), Some(Restart)] {
                 cases.push((
                     RunEnd::OtherFailure,
@@ -246,35 +249,6 @@ mod tests {
                 classify(end, cause, last),
                 expected,
                 "end={end:?} cause={cause:?} last_step={last}"
-            );
-        }
-    }
-
-    #[test]
-    fn user_cancel_overrides_a_yield_and_exit_zero_wins_over_a_restart() {
-        // the cause was upgraded from yield to user cancel before exit 75
-        let upgraded = StopCause::Yield.upgrade(StopCause::UserCancel);
-        assert_eq!(
-            classify(RunEnd::Exit75, Some(upgraded), false).job,
-            JobTransition::Cancelled
-        );
-        // a later yield never downgrades a user cancel
-        assert_eq!(
-            StopCause::UserCancel.upgrade(StopCause::Yield),
-            StopCause::UserCancel
-        );
-        assert_eq!(
-            classify(RunEnd::Exit0, Some(StopCause::Restart), false),
-            row(RunOutcome::Succeeded, JobTransition::NextStep)
-        );
-    }
-
-    #[test]
-    fn a_worker_cancel_with_no_queue_cause_cancels_the_job() {
-        for cause in [None, Some(StopCause::Yield)] {
-            assert_eq!(
-                classify(RunEnd::Cancelled, cause, false),
-                row(RunOutcome::Cancelled, JobTransition::Cancelled)
             );
         }
     }

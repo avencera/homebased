@@ -17,7 +17,6 @@ use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::{
@@ -36,7 +35,7 @@ use crate::queue::{
     ActiveRun, AttentionId, BlockedNotice, CleanupFailure, EventRun, JobEvent, JobEventKind, JobId,
     JobState, LevelEnd, MoveRefusal, OperationId, Placement, Priority, QueueError, Resource,
     ResourceId, ResourceName, ResourceSelector, RunNumber, RunPhase, Side, StepIndex, StepWorkload,
-    StopCause, Target,
+    StopCause, Target, sha256_hex,
 };
 
 use super::{NewTask, Store, find_project_root, fmt_time, new_queued_task, parse_time};
@@ -828,7 +827,7 @@ impl Store {
         content: &serde_json::Value,
         apply: impl FnOnce() -> Result<R, AppError>,
     ) -> Result<R, AppError> {
-        let digest = hex_digest(
+        let digest = sha256_hex(
             serde_json::to_string(&serde_json::json!({
                 "kind": kind,
                 "machine": machine,
@@ -1840,13 +1839,6 @@ fn sql_position(position: usize) -> Result<i64, AppError> {
         }
         .into()
     })
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn opt_u32(value: Option<i64>, what: &str) -> Result<Option<u32>, QueueError> {

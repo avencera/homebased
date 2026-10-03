@@ -10,8 +10,8 @@ use crate::queue::{Preemption, Priority, ResourceSelector, RestartWindow, StepWo
 
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// The plan's example spec
-fn plan_example() -> Value {
+/// A two-step spec using every top-level field
+fn two_step_example() -> Value {
     json!({
         "api_version": 1,
         "thread": "77777777-7777-4777-8777-777777777777",
@@ -68,8 +68,8 @@ fn pointer_of(error: &AppError) -> &str {
 }
 
 #[test]
-fn the_plan_example_parses() {
-    let spec = JobSpec::parse_value(&plan_example()).unwrap();
+fn a_two_step_spec_parses() {
+    let spec = JobSpec::parse_value(&two_step_example()).unwrap();
     assert_eq!(spec.priority, Priority::Medium);
     assert_eq!(
         spec.preempt,
@@ -366,10 +366,10 @@ fn authority_refuses_every_escape_entry_point_by_resolved_basename() {
 }
 
 #[test]
-fn schema_accepts_the_plan_example_and_rejects_refused_shapes() {
+fn schema_accepts_a_two_step_spec_and_rejects_refused_shapes() {
     let validator = jsonschema::validator_for(&schema_json().unwrap()).unwrap();
     let task = json!({ "type": "task", "command": ["true"] });
-    assert!(validator.is_valid(&plan_example()));
+    assert!(validator.is_valid(&two_step_example()));
     assert!(validator.is_valid(&single(task.clone())));
     assert!(validator.is_valid(&single(container(json!({})))));
 

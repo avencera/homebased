@@ -364,6 +364,21 @@ impl FleetHandle {
         result
     }
 
+    /// [`Self::connect`], retried once after a fresh probe round
+    ///
+    /// For background senders whose destination may have moved since the
+    /// last scheduled round
+    pub async fn connect_rediscovering(
+        &self,
+        machine: MachineId,
+    ) -> Result<VerifiedDestination, AppError> {
+        if let Ok(destination) = self.connect(machine).await {
+            return Ok(destination);
+        }
+        self.discover_now().await;
+        self.connect(machine).await
+    }
+
     /// Resolve a destination UUID to an address that answers for it now
     ///
     /// Tries addresses in preference order and probes each one. An address
