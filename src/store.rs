@@ -4417,6 +4417,43 @@ CREATE TABLE reports (
             .unwrap()
     }
 
+    /// A database written by released v0.13, whose schema 34 v0.14 shares, with
+    /// one finished task and its routes and events; paths and the thread ID are
+    /// replaced with fixture values
+    const RELEASED_V0_13_DATABASE: &str =
+        include_str!("store/fixtures/released_v0_13_database.sql");
+
+    // the downgrade recipes above rebuild old schemas from the current one, so
+    // this checks one database a real release wrote
+    #[test]
+    fn a_database_from_a_real_release_upgrades_and_keeps_its_task() {
+        let fresh_dir = tempdir().unwrap();
+        let fresh = schema_snapshot(&Store::open(&fresh_dir.path().join("db")).unwrap());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(RELEASED_V0_13_DATABASE).unwrap();
+        conn.pragma_update(None, "user_version", RELEASED_V0_13_SCHEMA_VERSION)
+            .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(schema_snapshot(&store), fresh);
+        assert_no_loan_tables(&store);
+        let task: TaskId = "01a101a7-7205-758d-98c2-97d51e5c59fd".parse().unwrap();
+        let row = store.require_task(task).unwrap();
+        assert_eq!(row.status(), ProcessStatus::Succeeded);
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM origin_inbox WHERE task_id = ?1",
+                task
+            ),
+            3
+        );
+    }
+
     #[test]
     fn every_released_schema_upgrades_to_the_fresh_schema_without_loan_data() {
         let fresh_dir = tempdir().unwrap();
