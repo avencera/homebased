@@ -10,7 +10,7 @@ use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-use super::{Environment, ProcessInfo, ProcessStartTime, Read};
+use super::{Environment, ProcessIdentity, ProcessInfo, ProcessStartTime, Read};
 
 /// A pidfd pins the process, so a signal sent through it cannot reach a later
 /// process that reused the PID
@@ -45,11 +45,17 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
         Err(error) => return read_error(&error),
     };
     match parse_stat(&stat) {
-        Some((state, pgid, start)) => Read::Found(ProcessInfo {
+        // an unreaped zombie keeps its stat entry, so report its exit with the
+        // identity it ran under, as the macOS reader does
+        Some(('Z' | 'X', _, start)) => Read::Exited(ProcessIdentity {
+            pid,
+            start: ProcessStartTime(start),
+        }),
+        Some((_, pgid, start)) => Read::Found(ProcessInfo {
             start: ProcessStartTime(start),
             pgid: Pid::from_raw(pgid),
             uid,
-            zombie: matches!(state, 'Z' | 'X'),
+            zombie: false,
         }),
         None => Read::Refused(Errno::EBADMSG),
     }
