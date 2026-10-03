@@ -208,17 +208,38 @@ impl ClaudeInbox {
         log_path: &Path,
         delivery_lock: &Path,
     ) -> Result<(), String> {
+        self.send_checked(
+            thread,
+            line,
+            log_path,
+            super::send_check::SendGate {
+                path: delivery_lock,
+                check: None,
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Check notice eligibility under the delivery lock immediately before the frame write
+    pub(crate) fn send_checked(
+        &self,
+        thread: ThreadId,
+        line: &str,
+        log_path: &Path,
+        gate: super::send_check::SendGate<'_>,
+    ) -> Result<(), super::send_check::SendFailure> {
         let frame = frame(&self.token, thread, line)?;
-        let _lock = lock_delivery(delivery_lock)?;
+        let _lock = lock_delivery(gate.path)?;
         let transcript = format!(
             "claude inbox pid={} socket={}\n",
             self.pid,
             self.socket.display()
         );
+        gate.check()?;
         let result = write_frame(&self.socket, &frame)
             .map_err(|error| format!("claude inbox {}: {error}", self.socket.display()));
         let _ = fs::write(log_path, transcript);
-        result
+        result.map_err(Into::into)
     }
 }
 
@@ -557,5 +578,38 @@ mod tests {
         let (home, _socket) = home_with_session(live_pid(), PEER_PROTOCOL + 1);
         let error = ClaudeInbox::find(home.path(), thread()).unwrap_err();
         assert!(error.contains("peer protocol"), "{error}");
+    }
+    #[test]
+    fn review_gap_claude_notice_check_holds_lock_before_frame() {
+        use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
+        let (home, socket) = home_with_session(live_pid(), PEER_PROTOCOL);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let lock = home.path().join("delivery.lock");
+        let checked_lock = lock.clone();
+        let check: SendCheck = std::sync::Arc::new(move || {
+            assert!(matches!(
+                crate::home::flock_exclusive(&checked_lock, crate::home::LockMode::NonBlocking),
+                Err(crate::error::AppError::LockHeld { .. })
+            ));
+            Err(SendFailure::Suppressed)
+        });
+        let ClaudeSession::Live(inbox) = ClaudeInbox::find(home.path(), thread()).unwrap() else {
+            panic!("session must be live");
+        };
+        let result = inbox.send_checked(
+            thread(),
+            "HOMEBASED_EVENT JOB_BLOCKED",
+            &home.path().join("callback.log"),
+            SendGate {
+                path: &lock,
+                check: Some(&check),
+            },
+        );
+        assert!(matches!(result, Err(SendFailure::Suppressed)));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

@@ -491,7 +491,22 @@ pub(crate) async fn cancel_task(
     id: TaskId,
 ) -> Result<CancelResult, AppError> {
     let result = call(store, |reply| StoreMsg::RequestCancel { id, reply }).await?;
-    match &result {
+    signal_stop(id, &result);
+    Ok(result)
+}
+
+/// Signal the worker after the queue has committed a restart or user stop
+pub(crate) async fn stop_run_task(
+    store: &ActorRef<StoreMsg>,
+    id: TaskId,
+) -> Result<CancelResult, AppError> {
+    let result = call(store, |reply| StoreMsg::QueueSignalStop { id, reply }).await?;
+    signal_stop(id, &result);
+    Ok(result)
+}
+
+fn signal_stop(id: TaskId, result: &CancelResult) {
+    match result {
         CancelResult::AlreadyTerminal(_) => {}
         CancelResult::CancelledQueued(_) => {}
         // signal the worker pid, not `-pid`: `task-run` forwards to the child's own process group
@@ -506,7 +521,6 @@ pub(crate) async fn cancel_task(
             }
         }
     }
-    Ok(result)
 }
 
 async fn require_task(store: &ActorRef<StoreMsg>, id: TaskId) -> Result<TaskRow, AppError> {

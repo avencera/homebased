@@ -1677,3 +1677,535 @@ fn queue_state_survives_reopening_the_database() {
     assert_eq!(link, (job.to_string(), 1, 0));
     assert_eq!(task.cwd, PathBuf::from("/tmp"));
 }
+
+#[test]
+fn review_fix_detection_reconciles_fallback_and_preserves_manual_resources() {
+    let f = Fixture::new();
+    let machine = MachineId::new();
+    let fallback = f
+        .store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap()[0]
+        .resource
+        .id;
+    let detected = [0, 1].map(|device| DetectedResource {
+        name: ResourceName::gpu(device),
+        device: Some(device),
+    });
+    let resources = f
+        .store
+        .ensure_detected_resources(machine, &detected)
+        .unwrap();
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].resource.id, fallback);
+    assert_eq!(resources[0].resource.device, Some(0));
+    let manual_machine = MachineId::new();
+    let manual = f
+        .store
+        .register_resource(manual_machine, ResourceName::gpu(0), None)
+        .unwrap();
+    f.store
+        .ensure_detected_resources(manual_machine, &detected)
+        .unwrap();
+    assert_eq!(
+        f.store.resource(manual.resource.id).unwrap().unwrap(),
+        manual
+    );
+}
+
+#[test]
+fn review_fix_detection_defers_all_phases_of_an_active_fallback() {
+    for phase in [
+        "launching",
+        "executing",
+        "stopping",
+        "cleaning",
+        "attention",
+    ] {
+        let f = Fixture::new();
+        let machine = MachineId::new();
+        let resource = f
+            .store
+            .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+            .unwrap()[0]
+            .resource
+            .id;
+        let job = JobId::new();
+        f.store
+            .submit_job(&new_job(job, machine, spec(Priority::Low, 1)))
+            .unwrap();
+        let task = TaskId::new();
+        let run = f
+            .store
+            .reserve_run(machine, job, resource, task, "/bin/true".into(), Utc::now())
+            .unwrap()
+            .run;
+        if phase != "launching" {
+            f.store
+                .cas_status(task, ProcessStatus::Queued, ProcessStatus::Running)
+                .unwrap();
+            f.store
+                .mark_run_executing(resource, task, Utc::now())
+                .unwrap();
+        }
+        if phase == "stopping" {
+            f.store
+                .commit_stop(resource, task, StopCause::Yield, Utc::now())
+                .unwrap();
+        }
+        if phase == "cleaning" || phase == "attention" {
+            f.exit(&run, ExitReason::Exit { code: 0 });
+        }
+        if phase == "attention" {
+            f.store
+                .apply_cleanup_result(
+                    resource,
+                    task,
+                    1,
+                    Err(CleanupFailure::ProcessGroupUnconfirmed),
+                )
+                .unwrap();
+        }
+        let detected = [0, 1].map(|device| DetectedResource {
+            name: ResourceName::gpu(device),
+            device: Some(device),
+        });
+        let resources = f
+            .store
+            .ensure_detected_resources(machine, &detected)
+            .unwrap();
+        assert_eq!(resources.len(), 1, "{phase}");
+        assert_eq!(resources[0].resource.device, None, "{phase}");
+        if phase == "cleaning" {
+            f.store
+                .apply_cleanup_result(resource, task, 1, Ok(()))
+                .unwrap();
+            assert_eq!(
+                f.store
+                    .ensure_detected_resources(machine, &detected)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                f.store.resource(resource).unwrap().unwrap().resource.device,
+                Some(0)
+            );
+        }
+    }
+}
+
+#[test]
+fn review_fix_task_cancel_upgrades_yield_before_exit_75() {
+    let f = Fixture::new();
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", Utc::now());
+    f.store
+        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
+        .unwrap();
+    f.store.request_cancel(run.task).unwrap();
+    f.exit(&run, ExitReason::Exit { code: 75 });
+    assert_eq!(f.job(job).state, JobState::Cancelled);
+}
+
+#[test]
+fn review_fix_preemption_rechecks_move_and_head_cancel() {
+    for cancel_head in [false, true] {
+        let f = Fixture::new();
+        let mut low_spec = spec(Priority::Low, 1);
+        low_spec["preempt"] = json!({"mode":"restart"});
+        let low = f.submit_spec(low_spec);
+        let run = f.start(low, "gpu0", Utc::now());
+        let mut high_spec = spec(Priority::High, 1);
+        high_spec["resource"] = json!("gpu0");
+        let head = f.submit_spec(high_spec);
+        let stop = decide(
+            &f.store
+                .queue_snapshot(f.machine, Utc::now(), NoticeThresholds::default())
+                .unwrap(),
+        )
+        .preemption
+        .unwrap();
+        if cancel_head {
+            f.cancel(head);
+        } else {
+            f.move_job(
+                low,
+                Placement::Edge {
+                    priority: Some(Priority::High),
+                    end: LevelEnd::Front,
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            f.store
+                .commit_preemption(stop, Utc::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            f.run_on("gpu0").unwrap().phase,
+            RunPhase::Executing { .. }
+        ));
+        assert!(
+            f.store
+                .require_task(run.task)
+                .unwrap()
+                .cancel_requested_at
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn review_fix_checkpoint_control_modes_ignore_umask() {
+    const HELPER: &str = "HOMEBASED_TEST_CONTROL_UMASK";
+    if std::env::var_os(HELPER).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "store::queue::tests::review_fix_checkpoint_control_modes_ignore_umask",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    // SAFETY: only this isolated test process creates files after changing its umask
+    unsafe {
+        nix::libc::umask(0o077);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let home = crate::home::Home::resolve(Some(f._dir.path().to_path_buf())).unwrap();
+    home.ensure().unwrap();
+    let job = f.submit(Priority::Low);
+    let run = f.reserve(job, "gpu0").run;
+    let checkpoint = f.store.run_checkpoint(run.task).unwrap().unwrap();
+    checkpoint.prepare(&home).unwrap();
+    checkpoint.request_yield(&home).unwrap();
+    checkpoint.prepare(&home).unwrap();
+    assert_eq!(
+        std::fs::metadata(checkpoint.control_dir(&home))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(checkpoint.control_dir(&home).join("yield"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn review_fix_ended_blocked_notice_is_suppressed_without_a_sequence_gap() {
+    let f = Fixture::new();
+    let low = f.submit(Priority::Low);
+    let run = f.start(low, "gpu0", Utc::now());
+    let mut queued = spec(Priority::High, 1);
+    queued["resource"] = json!("gpu0");
+    let head = f.submit_spec(queued);
+    let now = Utc::now();
+    let episode = f
+        .store
+        .record_blocked_head(f.machine, Some((head, now)))
+        .unwrap()
+        .unwrap();
+    let thresholds = NoticeThresholds {
+        after_yield: Duration::ZERO,
+        after_wait: Duration::ZERO,
+    };
+    assert!(
+        f.store
+            .produce_job_blocked(f.machine, episode, thresholds, now)
+            .unwrap()
+    );
+    assert!(f.store.job_notice_is_current(head, 1).unwrap());
+    // the origin stays offline while the blocking episode ends and the job runs
+    f.exit(&run, ExitReason::Exit { code: 0 });
+    f.clean("gpu0");
+    let head_run = f.start(head, "gpu0", Utc::now());
+    f.exit(&head_run, ExitReason::Exit { code: 0 });
+    f.store.record_blocked_head(f.machine, None).unwrap();
+    assert!(!f.store.job_notice_is_current(head, 1).unwrap());
+    assert_eq!(
+        f.store
+            .job_events(head)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let suppressed: bool = f
+        .store
+        .conn
+        .query_row(
+            "SELECT suppressed_at IS NOT NULL FROM resource_job_events WHERE job_id=?1 AND seq=1",
+            [head.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(suppressed);
+}
+
+#[test]
+fn review_fix_queue_restart_marker_does_not_become_user_cancel() {
+    let f = Fixture::new();
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", Utc::now());
+    f.store
+        .commit_stop(run.resource, run.task, StopCause::Restart, Utc::now())
+        .unwrap();
+    f.store.signal_committed_run_stop(run.task).unwrap();
+    f.exit(&run, ExitReason::Cancelled);
+    assert_eq!(
+        f.job(job).state,
+        JobState::Queued {
+            next_step: StepIndex::new(0),
+            resume: false
+        }
+    );
+}
+
+#[test]
+fn review_fix_detection_uses_first_nonzero_device_and_never_adds_a_fallback_beside_it() {
+    let f = Fixture::new();
+    let machine = MachineId::new();
+    let fallback = f
+        .store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap()[0]
+        .resource
+        .id;
+    let detected = [2, 3].map(|device| DetectedResource {
+        name: ResourceName::gpu(device),
+        device: Some(device),
+    });
+    let resources = f
+        .store
+        .ensure_detected_resources(machine, &detected)
+        .unwrap();
+    assert_eq!(resources.len(), 2);
+    assert_eq!(
+        f.store.resource(fallback).unwrap().unwrap().resource.device,
+        Some(2)
+    );
+    assert_eq!(
+        f.store
+            .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+            .unwrap(),
+        resources
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_gap_notice_ends_during_callback_preparation() {
+    const LOCK_HELPER: &str = "HOMEBASED_TEST_NOTICE_LOCK";
+    if let Some(path) = std::env::var_os(LOCK_HELPER) {
+        let path = std::path::PathBuf::from(path);
+        let _lock = crate::home::flock_exclusive(
+            &path.join("delivery.lock"),
+            crate::home::LockMode::Blocking,
+        )
+        .unwrap();
+        std::fs::write(path.join("locked"), "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.join("release").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return;
+    }
+    use crate::callback::send_check::{SendCheck, SendFailure};
+    use crate::daemon::actors::StoreActor;
+    use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, deliver_job_event};
+    use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
+    use crate::submission::{CallbackContext, CallbackExecutable};
+    use ractor::Actor;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    let f = Fixture::new();
+    let home = crate::home::Home::resolve(Some(f._dir.path().join("state"))).unwrap();
+    home.ensure().unwrap();
+    let low = f.submit(Priority::Low);
+    let run = f.start(low, "gpu0", Utc::now());
+    let mut queued = spec(Priority::High, 1);
+    queued["resource"] = json!("gpu0");
+    let head = f.submit_spec(queued);
+    let episode = f
+        .store
+        .record_blocked_head(f.machine, Some((head, Utc::now())))
+        .unwrap()
+        .unwrap();
+    f.store
+        .produce_job_blocked(
+            f.machine,
+            episode,
+            NoticeThresholds {
+                after_yield: Duration::ZERO,
+                after_wait: Duration::ZERO,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let binary = f._dir.path().join("codex");
+    let received = f._dir.path().join("received");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            received.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = f.job(head);
+    let route = JobRoute {
+        job: head,
+        origin: f.machine,
+        authority: f.machine,
+        thread: job.spec.thread,
+        callback: CallbackContext {
+            env: TaskEnv {
+                path: "/usr/bin:/bin".into(),
+                home: f._dir.path().to_string_lossy().into_owned(),
+            },
+            cwd: f._dir.path().to_path_buf(),
+            codex: CallbackExecutable::available(binary),
+        },
+        digest: job.spec.digest().unwrap(),
+        spec: job.spec,
+        target: None,
+        submission: JobSubmission::Unknown,
+        last_accepted_seq: 0,
+        last_settled_seq: 0,
+    };
+    f.store.insert_job_route(&route).unwrap();
+    let notice = RoutedJobEvent {
+        origin: f.machine,
+        authority: f.machine,
+        digest: route.digest.clone(),
+        event: f.store.job_events(head).unwrap()[0].clone(),
+    };
+    f.store.accept_job_event(&notice).unwrap();
+    let delivery = home
+        .root()
+        .join("jobs")
+        .join(head.to_string())
+        .join("delivery");
+    std::fs::create_dir_all(&delivery).unwrap();
+    let check_lock = delivery.join("delivery.lock");
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let check_count = checks.clone();
+    let database = f._dir.path().join("db");
+    let check: SendCheck = Arc::new(move || {
+        if check_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            assert!(
+                matches!(
+                    crate::home::flock_exclusive(&check_lock, crate::home::LockMode::NonBlocking),
+                    Err(AppError::LockHeld { .. })
+                ),
+                "the final check must hold the delivery lock"
+            );
+        }
+        let current = Store::open(&database)
+            .and_then(|store| store.job_notice_is_current(head, 1))
+            .map_err(|error| SendFailure::Failed(error.to_string()))?;
+        if current {
+            Ok(())
+        } else {
+            Err(SendFailure::Suppressed)
+        }
+    });
+    // the first exact-notice response is true before callback preparation starts
+    check().unwrap();
+    let (store_actor, store_handle) = Actor::spawn(None, StoreActor, f._dir.path().join("db"))
+        .await
+        .unwrap();
+    let (callback, callback_handle) = Actor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store_actor.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+            claude_sessions: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "store::queue::tests::review_gap_notice_ends_during_callback_preparation",
+            "--exact",
+        ])
+        .env(LOCK_HELPER, &delivery)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !delivery.join("locked").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending = deliver_job_event(&home, &route, &notice.event, &callback, Some(check));
+    tokio::pin!(pending);
+    // poll preparation while the sender cannot pass the held delivery lock
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    f.exit(&run, ExitReason::Exit { code: 0 });
+    f.clean("gpu0");
+    let head_run = f.start(head, "gpu0", Utc::now());
+    f.exit(&head_run, ExitReason::Exit { code: 0 });
+    f.store.record_blocked_head(f.machine, None).unwrap();
+    let success = RoutedJobEvent {
+        event: f.store.job_events(head).unwrap()[1].clone(),
+        ..notice.clone()
+    };
+    f.store.accept_job_event(&success).unwrap();
+    std::fs::write(delivery.join("release"), "").unwrap();
+    assert!(holder.wait().unwrap().success());
+    let outcome = pending.await.unwrap();
+    assert!(outcome.is_none(), "the ended notice must be suppressed");
+    assert!(!received.exists(), "JOB_BLOCKED reached the callback");
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+    crate::daemon::event_sender::jobs::settle_callback(&store_actor, head, 1, outcome)
+        .await
+        .unwrap();
+    assert_eq!(f.store.pending_job_inbox().unwrap()[0].1.event.seq, 2);
+    let outcome = deliver_job_event(&home, &route, &success.event, &callback, None)
+        .await
+        .unwrap();
+    crate::daemon::event_sender::jobs::settle_callback(&store_actor, head, 2, outcome)
+        .await
+        .unwrap();
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store_actor.stop(None);
+    store_handle.await.unwrap();
+    let sent = std::fs::read_to_string(&received).unwrap();
+    assert!(!sent.contains("JOB_BLOCKED"));
+    assert!(sent.contains("JOB_SUCCEEDED"));
+    assert_eq!(sent.lines().count(), 1);
+    assert_eq!(
+        f.store.job_route(head).unwrap().unwrap().last_settled_seq,
+        2
+    );
+    assert!(f.store.pending_job_inbox().unwrap().is_empty());
+    assert_eq!(f.store.job_events(head).unwrap().len(), 2);
+}

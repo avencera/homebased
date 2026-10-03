@@ -35,7 +35,7 @@ Each attempt gets a new task UUID and run directory. Save checkpoints in `HOMEBA
 | `HOMEBASED_RESUME` | `1` after a yield of this step, otherwise `0`. |
 | `HOMEBASED_YIELD_FILE` | File that appears when this run must yield. Host: `<home>/tasks/<task>/control/yield`. Container: `/homebased/run/yield`. |
 | `HOMEBASED_RESOURCE` | Assigned resource name. |
-| `CUDA_VISIBLE_DEVICES` | Assigned GPU index when the resource has one. Removed when it has no index. |
+| `CUDA_VISIBLE_DEVICES` | Assigned host GPU index for host steps; `0` inside containers, where Docker exposes only the selected host GPU. Removed when the resource has no index. |
 
 `HOMEBASED_HOME` is installation configuration, not a run marker. Do not replace run variables. In containers, `/homebased/job` is writable and `/homebased/run` is read-only. Do not set `gpus`, mount at or under `/homebased`, or set `HOMEBASED_*` in the container spec. Homebased owns these values.
 

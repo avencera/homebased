@@ -414,7 +414,7 @@ async fn resolve_machine(
     }
 }
 
-async fn forward(
+pub(super) async fn forward(
     state: &AppState,
     machine: MachineId,
     request: QueueRequest,

@@ -167,7 +167,9 @@ fn phase5_schema35_upgrade_preserves_jobs_and_active_runs() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE resource_run_history; DROP TABLE resource_job_delivery;
+            "ALTER TABLE resources DROP COLUMN origin;
+        ALTER TABLE resource_job_events DROP COLUMN suppressed_at;
+        DROP TABLE resource_run_history; DROP TABLE resource_job_delivery;
         DROP TABLE resource_job_inbox; DROP TABLE resource_job_routes; PRAGMA user_version=35;",
         )
         .unwrap();
@@ -182,4 +184,66 @@ fn phase5_schema35_upgrade_preserves_jobs_and_active_runs() {
     assert_eq!(history[0].resource, Some(resource));
     assert_eq!(history[0].task, task);
     assert!(store.pending_job_inbox().unwrap().is_empty());
+}
+
+#[test]
+fn review_fix_suppressed_inbox_notice_retains_content_and_settles_in_order() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let route = route();
+    store.insert_job_route(&route).unwrap();
+    let mut notice = event(&route, 1);
+    notice.event.event = JobEventKind::JobBlocked;
+    let success = event(&route, 2);
+    store.accept_job_event(&notice).unwrap();
+    store.accept_job_event(&success).unwrap();
+    assert!(store.suppress_job_notice(route.job, 2).is_err());
+    store.suppress_job_notice(route.job, 1).unwrap();
+    store.suppress_job_notice(route.job, 1).unwrap();
+    assert_eq!(
+        store.accept_job_event(&notice).unwrap(),
+        EventAcceptance::Acknowledged { seq: 1 }
+    );
+    assert_eq!(store.pending_job_inbox().unwrap()[0].1, success);
+    let suppressed: bool = store
+        .conn
+        .query_row(
+            "SELECT suppressed_at IS NOT NULL FROM resource_job_inbox WHERE job_id=?1 AND seq=1",
+            [route.job.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(suppressed);
+    store.settle_job_event(route.job, 2).unwrap();
+    assert!(store.pending_job_inbox().unwrap().is_empty());
+}
+
+#[test]
+fn review_fix_schema36_upgrade_retains_manual_registration_and_inbox_content() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let route = route();
+    let resource = store
+        .register_resource(route.authority, ResourceName::gpu(0), None)
+        .unwrap();
+    store.insert_job_route(&route).unwrap();
+    let envelope = event(&route, 1);
+    store.accept_job_event(&envelope).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "ALTER TABLE resources DROP COLUMN origin;
+        ALTER TABLE resource_job_events DROP COLUMN suppressed_at;
+        ALTER TABLE resource_job_inbox DROP COLUMN suppressed_at;
+        PRAGMA user_version=36;",
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.resource(resource.resource.id).unwrap().unwrap(),
+        resource
+    );
+    assert_eq!(store.pending_job_inbox().unwrap()[0].1, envelope);
 }

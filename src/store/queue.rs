@@ -46,7 +46,7 @@ const RENUMBER_OFFSET: i64 = 1 << 40;
 
 const RESOURCE_SELECT: &str = "SELECT id, machine, name, device, run_job, run_task, run_number,
     run_step, run_phase, run_reserved_at, run_started_at, run_stop_cause,
-    run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure
+    run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin
  FROM resources";
 
 const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest, env_path,
@@ -58,11 +58,25 @@ const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_di
 const SERVING_ORDER: &str = "ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 \
      ELSE 2 END, position";
 
+/// How a resource entered the queue; only detected fallbacks are reconciled
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceOrigin {
+    /// The platform had no indexed GPU
+    DetectedFallback,
+    /// Detection selected a physical device
+    DetectedDevice,
+    /// A person registered this resource
+    Manual,
+}
+
 /// A resource with its machine and single active run
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceRecord {
     /// Machine whose queue the resource serves
     pub machine: MachineId,
+    /// Registration owner, retained across detection retries
+    pub origin: ResourceOrigin,
     /// The resource
     pub resource: Resource,
     /// Its active run; `None` means idle
@@ -218,22 +232,38 @@ impl Store {
         detected: &[DetectedResource],
     ) -> Result<Vec<ResourceRecord>, AppError> {
         self.immediate(|| {
+            let existing = self.resources_on(machine)?;
+            let fallback = existing.iter().find(|record| record.origin == ResourceOrigin::DetectedFallback);
+            let first_device = detected.iter().find_map(|resource| resource.device);
+            if first_device.is_none() && existing.iter().any(|record| record.resource.device.is_some()) {
+                return Ok(existing);
+            }
+            if let (Some(fallback), Some(device)) = (fallback, first_device) {
+                if fallback.run.is_some() {
+                    tracing::warn!(%machine, resource = %fallback.resource.id, "GPU detection deferred while the fallback has an active run");
+                    return Ok(existing);
+                }
+                if existing.iter().any(|record| record.resource.device == Some(device)) {
+                    tracing::warn!(%machine, device, "GPU detection deferred because the fallback device is already registered");
+                    return Ok(existing);
+                }
+                self.conn.execute(
+                    "UPDATE resources SET device=?2, origin='detected_device' WHERE id=?1",
+                    params![fallback.resource.id.to_string(), i64::from(device)],
+                )?;
+            }
             for resource in detected {
                 let device = resource.device.map(i64::from);
+                let origin = if device.is_some() { "detected_device" } else { "detected_fallback" };
                 self.conn.execute(
-                    "INSERT INTO resources (id, machine, name, device, created_at)
-                     SELECT ?1, ?2, ?3, ?4, ?5
+                    "INSERT INTO resources (id, machine, name, device, created_at, origin)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6
                      WHERE NOT EXISTS (
                          SELECT 1 FROM resources WHERE machine = ?2
                            AND (name = ?3 OR (?4 IS NOT NULL AND device = ?4))
                      )",
-                    params![
-                        ResourceId::new().to_string(),
-                        machine.to_string(),
-                        resource.name.as_str(),
-                        device,
-                        fmt_time(Utc::now()),
-                    ],
+                    params![ResourceId::new().to_string(), machine.to_string(), resource.name.as_str(),
+                        device, fmt_time(Utc::now()), origin],
                 )?;
             }
             self.resources_on(machine)
@@ -943,7 +973,34 @@ impl Store {
         self.immediate(|| self.request_stop(resource, Some(task), cause, now))
     }
 
-    fn request_stop(
+    /// Rerun scheduling and commit only the same candidate in one transaction
+    ///
+    /// Returns no run when queue changes invalidated the decision. An already
+    /// committed stop stays valid and returns its stored cause
+    pub fn commit_preemption(
+        &self,
+        stop: crate::queue::schedule::Preempt,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ActiveRun>, AppError> {
+        self.immediate(|| {
+            let record = self.require_resource(stop.resource)?;
+            let Some(run) = record.run.filter(|run| run.task == stop.task) else {
+                return Ok(None);
+            };
+            // a committed stop remains valid even when the queue later changes
+            if matches!(run.phase, RunPhase::Stopping { .. }) {
+                return Ok(Some(run));
+            }
+            let snapshot = self.queue_snapshot(record.machine, now, NoticeThresholds::default())?;
+            if crate::queue::schedule::decide(&snapshot).preemption != Some(stop) {
+                return Ok(None);
+            }
+            self.request_stop(stop.resource, Some(stop.task), stop.cause, now)
+                .map(Some)
+        })
+    }
+
+    pub(super) fn request_stop(
         &self,
         resource: ResourceId,
         task: Option<TaskId>,
@@ -1415,7 +1472,7 @@ impl Store {
     }
 
     /// The active run of `job` on any resource, in any phase
-    fn run_of_job(&self, job: JobId) -> Result<Option<ActiveRun>, AppError> {
+    pub(super) fn run_of_job(&self, job: JobId) -> Result<Option<ActiveRun>, AppError> {
         self.conn
             .query_row(
                 &format!("{RESOURCE_SELECT} WHERE run_job = ?1"),
@@ -1713,6 +1770,7 @@ struct RawResource {
     cleanup_attempt: Option<i64>,
     attention_id: Option<String>,
     attention_failure: Option<String>,
+    origin: String,
 }
 
 impl RawResource {
@@ -1734,6 +1792,7 @@ impl RawResource {
             cleanup_attempt: row.get(13)?,
             attention_id: row.get(14)?,
             attention_failure: row.get(15)?,
+            origin: row.get(16)?,
         })
     }
 
@@ -1801,7 +1860,14 @@ impl RawResource {
             }
             _ => return Err(corrupt(format!("resource {id} has a partial active run")).into()),
         };
+        let origin = match self.origin.as_str() {
+            "detected_fallback" => ResourceOrigin::DetectedFallback,
+            "detected_device" => ResourceOrigin::DetectedDevice,
+            "manual" => ResourceOrigin::Manual,
+            other => return Err(corrupt(format!("unknown resource origin {other:?}")).into()),
+        };
         Ok(ResourceRecord {
+            origin,
             machine,
             resource,
             run,

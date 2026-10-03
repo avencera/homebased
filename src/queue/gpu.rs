@@ -2,9 +2,9 @@
 //!
 //! On startup the daemon ensures one resource per detected GPU, named `gpu0`,
 //! `gpu1`, and so on. Linux counts NVIDIA GPUs with `nvidia-smi -L`. A Mac has
-//! one GPU, which becomes `gpu0` with no device index. A machine where
-//! detection finds nothing still gets `gpu0` with no device index, so it has
-//! an exclusive lane
+//! one GPU, which becomes `gpu0` with no device index. A Linux machine that
+//! has no `nvidia-smi` still gets an unindexed exclusive lane. An installed
+//! probe that fails or returns no usable devices defers detection until a later start
 
 use std::process::Command;
 
@@ -80,8 +80,12 @@ pub fn resources_for(platform: Platform, nvidia_smi: Option<&str>) -> Vec<Detect
         Platform::MacOs => Vec::new(),
         Platform::Linux => nvidia_smi.map(parse_nvidia_smi_list).unwrap_or_default(),
     };
-    if indices.is_empty() {
+    if platform == Platform::MacOs || nvidia_smi.is_none() {
         return vec![DetectedResource::unindexed()];
+    }
+    if indices.is_empty() {
+        warn!("nvidia-smi returned no usable devices; GPU detection deferred");
+        return Vec::new();
     }
     indices
         .into_iter()
@@ -94,36 +98,43 @@ pub fn resources_for(platform: Platform, nvidia_smi: Option<&str>) -> Vec<Detect
 
 /// Detect this machine's resources
 ///
-/// A missing or failing `nvidia-smi` is not an error: the machine still gets
-/// its unindexed `gpu0`
+/// A missing `nvidia-smi` gives an unindexed lane. An installed but failing
+/// probe defers resource detection until a later start
 #[must_use]
 pub fn detect() -> Vec<DetectedResource> {
     let platform = Platform::current();
     let output = match platform {
         Platform::MacOs => None,
-        Platform::Linux => run_nvidia_smi(),
+        Platform::Linux => match run_nvidia_smi() {
+            Ok(output) => output,
+            Err(message) => {
+                warn!("{message}; GPU detection deferred");
+                return Vec::new();
+            }
+        },
     };
     let resources = resources_for(platform, output.as_deref());
     info!(count = resources.len(), "Detected GPU resources");
     resources
 }
 
-fn run_nvidia_smi() -> Option<String> {
+fn run_nvidia_smi() -> Result<Option<String>, String> {
     let mut command = Command::new("nvidia-smi");
     crate::run_env::scrub(&mut command).arg("-L");
+    probe_nvidia_smi(&mut command)
+}
+
+fn probe_nvidia_smi(command: &mut Command) -> Result<Option<String>, String> {
     match command.output() {
         Ok(output) if output.status.success() => {
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
         }
-        Ok(output) => {
-            let status = output.status;
-            warn!("nvidia-smi -L exited with {status}; using one unindexed resource");
-            None
+        Ok(output) => Err(format!("nvidia-smi -L exited with {}", output.status)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            info!("nvidia-smi is not installed; using one unindexed resource");
+            Ok(None)
         }
-        Err(error) => {
-            info!("nvidia-smi unavailable ({error}); using one unindexed resource");
-            None
-        }
+        Err(error) => Err(format!("nvidia-smi -L could not run: {error}")),
     }
 }
 
@@ -190,10 +201,35 @@ GPU 1: NVIDIA A100-SXM4-40GB (UUID: GPU-22222222-2222-3333-4444-555555555555)
 
     #[test]
     fn no_gpu_found_still_gives_an_unindexed_gpu0() {
-        for output in [None, Some(""), Some("No devices were found\n")] {
-            let resources = resources_for(Platform::Linux, output);
-            assert_eq!(resources, vec![DetectedResource::unindexed()], "{output:?}");
-            assert_eq!(resources[0].name.as_str(), "gpu0");
+        let resources = resources_for(Platform::Linux, None);
+        assert_eq!(resources, vec![DetectedResource::unindexed()]);
+        assert_eq!(resources[0].name.as_str(), "gpu0");
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    #[test]
+    fn review_fix_linux_unusable_probe_does_not_create_a_lane() {
+        for output in ["", "No devices were found\n", "NVIDIA-SMI has failed\n"] {
+            assert!(super::resources_for(super::Platform::Linux, Some(output)).is_empty());
         }
+        assert_eq!(
+            super::resources_for(super::Platform::Linux, None),
+            vec![super::DetectedResource::unindexed()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    #[test]
+    fn review_fix_probe_distinguishes_missing_from_installed_but_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = std::process::Command::new(dir.path().join("missing"));
+        assert_eq!(super::probe_nvidia_smi(&mut missing).unwrap(), None);
+        let mut failing = std::process::Command::new("/bin/sh");
+        failing.args(["-c", "exit 1"]);
+        assert!(super::probe_nvidia_smi(&mut failing).is_err());
     }
 }

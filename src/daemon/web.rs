@@ -2,8 +2,11 @@
 //! fleet is enabled, the `/v1/cluster/*` routes
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
-//! is reachable from any web page the user has open, so this router never
-//! exposes task submit or cancel, or job submit and resource registration.
+//! is reachable from web pages. Ordinary task submit and cancel, job submit,
+//! and resource registration stay on the Unix socket. With fleet enabled,
+//! `/v1/cluster/*` accepts task executions, queue requests (including submit
+//! and registration), and job events from peers within the existing trusted
+//! LAN and tailnet boundary. Peer authentication is deferred
 //! Queue controls that move, cancel, or release accepted jobs require
 //! same-origin JSON
 

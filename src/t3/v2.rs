@@ -125,6 +125,7 @@ pub(super) fn start_turn(
     thread_id: &str,
     text: &str,
     token: &str,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
 ) -> Result<(), ApiFailure> {
     // the turn reaches the agent either way, so a failed unarchive only costs visibility
     if is_archived(state, thread_id) {
@@ -140,7 +141,14 @@ pub(super) fn start_turn(
     let command_id = deterministic_id("homebased-t3-command", thread_id, text);
     let message_id = deterministic_id("homebased-t3-message", thread_id, text);
     let payload = dispatch_payload(thread_id, &command_id, &message_id, text);
-    match rpc::call(origin, token, DISPATCH_METHOD, &payload, RPC_TIMEOUT) {
+    match rpc::call_checked(
+        origin,
+        token,
+        DISPATCH_METHOD,
+        &payload,
+        RPC_TIMEOUT,
+        before_send,
+    ) {
         Ok(Exit::Success) => Ok(()),
         // only T3's typed refusal proves it did not take the message
         Ok(Exit::Failure(cause)) => match dispatch_failure(&cause) {
@@ -180,7 +188,7 @@ pub(super) fn probe_api(origin: &str, token: &str, checks: &mut Vec<ProbeCheck>)
         Err(error) => error.failure,
     };
     match failure {
-        ApiFailure::Refused(_) => {
+        ApiFailure::Delivery(_) | ApiFailure::Refused(_) => {
             checks.push(passed(
                 "dispatch",
                 "unknown thread returned OrchestrationV2DispatchCommandError",

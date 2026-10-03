@@ -100,7 +100,7 @@ pub fn process_identity(pid: Pid) -> io::Result<ProcessIdentity> {
             pid,
             start: info.start,
         }),
-        Read::Found(_) | Read::Gone => Err(io::Error::from(Errno::ESRCH)),
+        Read::Found(_) | Read::Exited(_) | Read::Gone => Err(io::Error::from(Errno::ESRCH)),
         Read::Refused(errno) => Err(io::Error::from(errno)),
     }
 }
@@ -148,6 +148,8 @@ pub enum CleanupFailure {
         /// The kernel's error
         message: String,
     },
+    /// Empty scans did not reach a stable confirmation within the cleanup bounds
+    EmptyUnconfirmed,
     /// These targets still carried the marker after the last round
     TargetsSurvived {
         /// Remaining targets
@@ -221,6 +223,7 @@ impl fmt::Display for CleanupFailure {
             Self::EnumerationFailed { message } => {
                 write!(f, "could not list processes: {message}")
             }
+            Self::EmptyUnconfirmed => write!(f, "no stable empty process scan was confirmed"),
             Self::TargetsSurvived { survivors } => {
                 write!(f, "{} marked processes survived SIGKILL", survivors.len())
             }
@@ -364,6 +367,8 @@ pub(crate) fn cleanup_lost_group_with<S: ProcessSource>(
 pub(crate) enum Read<T> {
     /// The read succeeded
     Found(T),
+    /// The kernel confirms an exited process whose PID has not yet been reaped
+    Exited(ProcessIdentity),
     /// The process does not exist
     Gone,
     /// The kernel refused the read
@@ -480,11 +485,12 @@ impl ProcessSource for SystemProcesses {
 #[derive(Debug, Default)]
 struct Scan {
     targets: BTreeMap<Pid, ProcessIdentity>,
+    confirmed_empty: bool,
 }
 
 impl Scan {
-    fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+    fn is_clear(&self) -> bool {
+        self.confirmed_empty
     }
 
     fn survivors(&self) -> Vec<ProcessIdentity> {
@@ -503,6 +509,9 @@ struct Sweeper<'a, S> {
     protected_hits: BTreeSet<Pid>,
     /// Same-user refusals already logged, so rescans do not repeat the warning
     warned: BTreeSet<Pid>,
+    observation_unstable: bool,
+    empty_since: Option<Instant>,
+    exited: BTreeSet<ProcessIdentity>,
 }
 
 impl<'a, S: ProcessSource> Sweeper<'a, S> {
@@ -525,6 +534,9 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             signalled: BTreeSet::new(),
             protected_hits: BTreeSet::new(),
             warned: BTreeSet::new(),
+            observation_unstable: false,
+            empty_since: None,
+            exited: BTreeSet::new(),
         }
     }
 
@@ -532,7 +544,10 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         let deadline = Instant::now() + self.timing.deadline;
         let mut scan = self.scan()?;
         for _ in 0..self.timing.rounds {
-            if scan.is_empty() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if scan.is_clear() {
                 return Ok(());
             }
 
@@ -544,10 +559,13 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             scan = self.wait_until_clear(until, |sweeper, scan| {
                 sweeper.signal_new(scan, &mut termed, Signal::SIGTERM);
             })?;
-            if scan.is_empty() {
+            if scan.is_clear() && Instant::now() < deadline {
                 return Ok(());
             }
 
+            if Instant::now() >= deadline {
+                break;
+            }
             self.signal_new(&scan, &mut BTreeSet::new(), Signal::SIGKILL);
             let until = bounded(self.timing.kill_grace, deadline);
             scan = self.wait_until_clear(until, |_, _| {})?;
@@ -555,8 +573,11 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
                 break;
             }
         }
-        if scan.is_empty() {
+        if scan.is_clear() && Instant::now() < deadline {
             return Ok(());
+        }
+        if scan.targets.is_empty() {
+            return Err(CleanupFailure::EmptyUnconfirmed);
         }
         Err(CleanupFailure::TargetsSurvived {
             survivors: scan.survivors(),
@@ -573,7 +594,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             let now = Instant::now();
             std::thread::sleep(self.timing.poll.min(until.saturating_duration_since(now)));
             let scan = self.scan()?;
-            if scan.is_empty() || Instant::now() >= until {
+            if scan.is_clear() || Instant::now() >= until {
                 return Ok(scan);
             }
             on_scan(self, &scan);
@@ -593,7 +614,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     fn signal_verified(&mut self, target: ProcessIdentity, signal: Signal) -> bool {
         let handle = match self.source.pin(target.pid) {
             Read::Found(handle) => handle,
-            Read::Gone => return false,
+            Read::Exited(_) | Read::Gone => return false,
             Read::Refused(errno) => {
                 warn!(marker = %self.marker, %target, "pin before {signal}: {errno}");
                 return false;
@@ -620,6 +641,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             .map_err(|error| CleanupFailure::EnumerationFailed {
                 message: error.to_string(),
             })?;
+        self.observation_unstable = false;
         let mut scan = Scan::default();
         for pid in pids {
             let Some(identity) = self.observe(pid) else {
@@ -633,6 +655,17 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             }
             scan.targets.insert(pid, identity);
         }
+        // a vanished parent can leave a child outside the enumerated PID list
+        // only two stable empty scans separated by a full poll can finish cleanup
+        if !scan.targets.is_empty() || self.observation_unstable {
+            self.empty_since = None;
+        } else {
+            let now = Instant::now();
+            scan.confirmed_empty = self
+                .empty_since
+                .is_some_and(|since| now.duration_since(since) >= self.timing.poll);
+            self.empty_since.get_or_insert(now);
+        }
         Ok(scan)
     }
 
@@ -640,43 +673,75 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     fn observe(&mut self, pid: Pid) -> Option<ProcessIdentity> {
         let info = match self.source.info(pid) {
             Read::Found(info) if !info.zombie => info,
-            Read::Found(_) | Read::Gone | Read::Refused(_) => return None,
+            Read::Gone => {
+                self.observation_unstable = true;
+                return None;
+            }
+            Read::Found(info) => {
+                self.note_exited(ProcessIdentity {
+                    pid,
+                    start: info.start,
+                });
+                return None;
+            }
+            Read::Exited(identity) => {
+                self.note_exited(identity);
+                return None;
+            }
+            Read::Refused(_) => return None,
         };
         let environment = match self.source.environment(pid) {
             Read::Found(environment) => environment,
-            Read::Gone => return None,
+            Read::Gone => {
+                self.observation_unstable = true;
+                return None;
+            }
+            Read::Exited(_) => {
+                self.observation_unstable = true;
+                return None;
+            }
             Read::Refused(errno) => {
                 self.note_refusal(pid, info, errno);
                 return None;
             }
         };
-        // Apple platform binaries expose an empty environment, so they never
-        // carry the marker; such a process cannot be attributed, which is a
-        // documented escape
-        if !environment.carries(&self.marker_value) {
+        // the identity must still hold after the environment read, even for an
+        // unmarked process, or this process table scan was not stable
+        if !self.still_same(pid, info) || !environment.carries(&self.marker_value) {
             return None;
         }
-        // the identity must still hold after the environment read, or the
-        // environment may belong to a process that reused the PID
+        Some(ProcessIdentity {
+            pid,
+            start: info.start,
+        })
+    }
+
+    fn note_exited(&mut self, identity: ProcessIdentity) {
+        // a newly observed zombie may have forked after enumeration; only an
+        // already observed exited identity cannot introduce another descendant
+        if self.exited.insert(identity) {
+            self.observation_unstable = true;
+        }
+    }
+
+    fn still_same(&mut self, pid: Pid, info: ProcessInfo) -> bool {
         match self.source.info(pid) {
-            Read::Found(after) if !after.zombie && after.start == info.start => {
-                Some(ProcessIdentity {
-                    pid,
-                    start: info.start,
-                })
+            Read::Found(after) if !after.zombie && after.start == info.start => true,
+            Read::Found(_) | Read::Exited(_) | Read::Gone => {
+                self.observation_unstable = true;
+                false
             }
-            Read::Found(_) | Read::Gone | Read::Refused(_) => None,
+            Read::Refused(_) => {
+                self.observation_unstable = true;
+                false
+            }
         }
     }
 
     /// Other users' processes are out of scope; a same-user refusal is unexpected
     fn note_refusal(&mut self, pid: Pid, info: ProcessInfo, errno: Errno) {
-        if info.uid != self.own_uid || !self.warned.insert(pid) {
-            return;
-        }
-        // the process may have exited between the reads, which is not a refusal
-        if !matches!(self.source.info(pid), Read::Found(after) if after.start == info.start && !after.zombie)
-        {
+        // a refused environment read can also mean the process vanished
+        if !self.still_same(pid, info) || info.uid != self.own_uid || !self.warned.insert(pid) {
             return;
         }
         warn!(marker = %self.marker, %pid, "Same-user environment read refused: {errno}");

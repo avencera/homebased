@@ -974,7 +974,7 @@ fn phase4_spawn_failure_serves_the_next_job() {
 }
 
 #[test]
-fn phase4_container_contract_uses_resource_and_fixed_mounts() {
+fn review_fix_container_contract_uses_resource_and_fixed_mounts() {
     use crate::container::docker::{CreateContext, create_args};
     use crate::container::{ContainerUser, ContainerWorkload};
     let mut h = Harness::new("30m");
@@ -1014,7 +1014,12 @@ fn phase4_container_contract_uses_resource_and_fixed_mounts() {
         .collect();
     assert_eq!(env["HOMEBASED_JOB_DIR"], "/homebased/job");
     assert_eq!(env["HOMEBASED_YIELD_FILE"], "/homebased/run/yield");
-    assert_eq!(env["CUDA_VISIBLE_DEVICES"], "3");
+    assert_eq!(env["CUDA_VISIBLE_DEVICES"], "0");
+    assert!(
+        checkpoint
+            .environment(&h.home, false)
+            .contains(&("CUDA_VISIBLE_DEVICES", "3".into()))
+    );
     let paths = h.home.task_paths(task);
     let args = create_args(
         &workload,

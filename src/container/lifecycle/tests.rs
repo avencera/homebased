@@ -34,6 +34,7 @@ struct FakeContainer {
     id: ContainerId,
     name: String,
     status: ContainerStatus,
+    finished_at: Option<DateTime<Utc>>,
     task_label: Option<String>,
 }
 
@@ -53,6 +54,10 @@ struct FakeState {
     create_lost_reply: Option<String>,
     /// start fails with this message and leaves the container created
     start_refused: Option<String>,
+    /// the final running probe returns before this scripted natural exit
+    exit_after_probe: Option<i32>,
+    /// the stopped container exits with this code instead of 143
+    stop_exit_code: Option<i32>,
     /// stop leaves the container running
     ignore_stop: bool,
     /// removal fails while the engine stays up
@@ -103,6 +108,7 @@ impl FakeDocker {
             id: id.clone(),
             name: name.to_owned(),
             status,
+            finished_at: status.exit_code().map(|_| Utc::now()),
             task_label,
         });
         id
@@ -112,6 +118,7 @@ impl FakeDocker {
         let mut state = self.state();
         if let Some(container) = state.containers.iter_mut().find(|c| c.id == *id) {
             container.status = status;
+            container.finished_at = status.exit_code().map(|_| Utc::now());
         }
         drop(state);
         self.changed.notify_waiters();
@@ -129,6 +136,7 @@ impl FakeDocker {
         ContainerProbe::Present(ContainerObservation {
             id: container.id.clone(),
             status: container.status,
+            finished_at: container.finished_at,
             task_label: container.task_label.clone(),
         })
     }
@@ -178,12 +186,19 @@ impl ContainerEngine for FakeDocker {
 
     async fn probe_id(&self, id: &ContainerId) -> Result<ContainerProbe, EngineError> {
         self.answer()?;
-        let state = self.state();
-        Ok(state
+        let mut state = self.state();
+        let probe = state
             .containers
             .iter()
             .find(|c| c.id == *id)
-            .map_or(ContainerProbe::Absent, |c| self.observe(c)))
+            .map_or(ContainerProbe::Absent, |c| self.observe(c));
+        if let Some(code) = state.exit_after_probe.take()
+            && let Some(container) = state.containers.iter_mut().find(|c| c.id == *id)
+        {
+            container.status = ContainerStatus::Exited { exit_code: code };
+            container.finished_at = Some(Utc::now());
+        }
+        Ok(probe)
     }
 
     async fn probe_name(&self, name: &str) -> Result<ContainerProbe, EngineError> {
@@ -218,7 +233,8 @@ impl ContainerEngine for FakeDocker {
         self.record(format!("stop {}", &id.as_str()[..2]));
         self.answer()?;
         if !self.state().ignore_stop && self.status(id).is_some_and(ContainerStatus::is_live) {
-            self.set_status(id, ContainerStatus::Exited { exit_code: 143 });
+            let exit_code = self.state().stop_exit_code.unwrap_or(143);
+            self.set_status(id, ContainerStatus::Exited { exit_code });
         }
         Ok(())
     }
@@ -920,4 +936,71 @@ async fn an_unconfirmed_removal_keeps_the_exit_code_but_not_the_witness() {
         }
     );
     assert!(harness.output().contains("removal is not confirmed"));
+}
+
+#[tokio::test]
+async fn review_fix_cancel_preserves_exact_container_natural_exit() {
+    for code in [0, 7] {
+        let mut h = Harness::new();
+        let id = h.docker.add(
+            &h.name(),
+            ContainerStatus::Exited { exit_code: code },
+            h.label(),
+        );
+        let mut run = ContainerRun::new(
+            &h.docker,
+            &h.ledger,
+            &mut h.interrupts,
+            h.task,
+            h.output.clone(),
+            TIMING,
+        );
+        let end = run.cancel(&id, None).await;
+        assert_eq!(end, confirmed(ExitReason::Exit { code }, &id, code));
+        assert!(
+            !h.calls()
+                .iter()
+                .any(|call| call.starts_with("stop") || call.starts_with("kill"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_gap_container_exit_between_probe_and_stop_is_natural() {
+    for code in [0, 7] {
+        let mut h = Harness::new();
+        let id = h.docker.add(&h.name(), ContainerStatus::Running, h.label());
+        h.docker.state().exit_after_probe = Some(code);
+        let mut run = ContainerRun::new(
+            &h.docker,
+            &h.ledger,
+            &mut h.interrupts,
+            h.task,
+            h.output.clone(),
+            TIMING,
+        );
+        let end = run.cancel(&id, None).await;
+        assert_eq!(end, confirmed(ExitReason::Exit { code }, &id, code));
+        assert!(h.calls().iter().any(|call| call.starts_with("stop")));
+        assert!(!h.calls().iter().any(|call| call.starts_with("kill")));
+    }
+}
+
+#[tokio::test]
+async fn review_gap_container_exit_after_stop_stays_cancelled() {
+    for code in [0, 143] {
+        let mut h = Harness::new();
+        h.docker.state().stop_exit_code = Some(code);
+        let id = h.docker.add(&h.name(), ContainerStatus::Running, h.label());
+        let mut run = ContainerRun::new(
+            &h.docker,
+            &h.ledger,
+            &mut h.interrupts,
+            h.task,
+            h.output.clone(),
+            TIMING,
+        );
+        let end = run.cancel(&id, None).await;
+        assert_eq!(end, confirmed(ExitReason::Cancelled, &id, code));
+    }
 }

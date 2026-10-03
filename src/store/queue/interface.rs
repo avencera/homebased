@@ -25,6 +25,13 @@ pub enum QueueRequest {
         /// Job identity
         job: JobId,
     },
+    /// Check whether a blocked notice's authority episode is still open
+    NoticeCurrent {
+        /// Job whose notice is about to reach its callback
+        job: JobId,
+        /// Exact numbered notice, retained even when suppressed
+        seq: u64,
+    },
     /// Register a hand-managed exclusive lane
     Register {
         /// Machine-local name
@@ -70,7 +77,10 @@ impl QueueRequest {
     /// Whether this request changes queue state
     #[must_use]
     pub const fn is_write(&self) -> bool {
-        !matches!(self, Self::Resources | Self::Jobs | Self::Show { .. })
+        !matches!(
+            self,
+            Self::Resources | Self::Jobs | Self::Show { .. } | Self::NoticeCurrent { .. }
+        )
     }
 }
 
@@ -124,6 +134,10 @@ impl Store {
                 let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
                 json!({ "job": record, "active_run": active, "runs": runs,
                     "last_stop_cause": last_stop_cause, "events": self.job_events(*job)? })
+            }
+            QueueRequest::NoticeCurrent { job, seq } => {
+                self.require_machine_job(machine, *job)?;
+                json!({ "current": self.job_notice_is_current(*job, *seq)? })
             }
             QueueRequest::Register { name, device } => {
                 serde_json::to_value(self.register_resource(machine, name.clone(), *device)?)?

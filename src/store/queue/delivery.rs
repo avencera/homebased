@@ -243,28 +243,50 @@ impl Store {
     /// Settle a callback only after delivery; a crash before this commit may repeat it
     pub fn settle_job_event(&self, job: JobId, seq: u64) -> Result<(), AppError> {
         let sql_seq = sql_seq(seq)?;
+        self.immediate(|| self.settle_job_event_inner(job, seq, sql_seq))
+    }
+
+    /// Retain an obsolete blocked event and settle it without a callback
+    pub fn suppress_job_notice(&self, job: JobId, seq: u64) -> Result<(), AppError> {
+        let sql_seq = sql_seq(seq)?;
         self.immediate(|| {
-            let changed = self.conn.execute(
-                "UPDATE resource_job_routes SET settled_seq=?2
-                WHERE job_id=?1 AND settled_seq=?2-1 AND accepted_seq>=?2",
-                params![job.to_string(), sql_seq],
+            let json: String = self.conn.query_row(
+                "SELECT event_json FROM resource_job_inbox WHERE job_id=?1 AND seq=?2",
+                params![job.to_string(), sql_seq], |row| row.get(0),
             )?;
-            if changed == 0
-                && self
-                    .job_route(job)?
-                    .is_none_or(|r| r.last_settled_seq < seq)
-            {
-                return Err(QueueError::Invariant {
-                    message: "job settlement has a sequence gap".into(),
-                }
-                .into());
+            let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
+            if envelope.event.event != crate::queue::JobEventKind::JobBlocked {
+                return Err(QueueError::Invariant { message: "only a blocked notice can be suppressed".into() }.into());
             }
-            Ok(())
+            self.conn.execute(
+                "UPDATE resource_job_inbox SET suppressed_at=COALESCE(suppressed_at,?3) WHERE job_id=?1 AND seq=?2",
+                params![job.to_string(), sql_seq, super::fmt_time(chrono::Utc::now())],
+            )?;
+            self.settle_job_event_inner(job, seq, sql_seq)
         })
+    }
+
+    fn settle_job_event_inner(&self, job: JobId, seq: u64, sql_seq: i64) -> Result<(), AppError> {
+        let changed = self.conn.execute(
+            "UPDATE resource_job_routes SET settled_seq=?2
+                WHERE job_id=?1 AND settled_seq=?2-1 AND accepted_seq>=?2",
+            params![job.to_string(), sql_seq],
+        )?;
+        if changed == 0
+            && self
+                .job_route(job)?
+                .is_none_or(|r| r.last_settled_seq < seq)
+        {
+            return Err(QueueError::Invariant {
+                message: "job settlement has a sequence gap".into(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
-fn sql_seq(seq: u64) -> Result<i64, AppError> {
+pub(super) fn sql_seq(seq: u64) -> Result<i64, AppError> {
     i64::try_from(seq).map_err(|_| AppError::Usage {
         message: "job event sequence is too large".into(),
     })

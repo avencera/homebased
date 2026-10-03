@@ -115,6 +115,12 @@ pub(crate) enum StoreMsg {
             >,
         >,
     },
+    /// Settle an obsolete blocked notice without callback delivery
+    SuppressJobNotice {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// Advance only after callback delivery succeeds
     SettleJobEvent {
         job: crate::queue::JobId,
@@ -175,11 +181,9 @@ pub(crate) enum StoreMsg {
     },
     /// Typed queue store operation
     QueueStop {
-        resource: crate::queue::ResourceId,
-        task: TaskId,
-        cause: crate::queue::StopCause,
+        stop: crate::queue::schedule::Preempt,
         now: chrono::DateTime<chrono::Utc>,
-        reply: RpcReplyPort<Result<crate::queue::ActiveRun, AppError>>,
+        reply: RpcReplyPort<Result<Option<crate::queue::ActiveRun>, AppError>>,
     },
     /// Typed queue store operation
     QueueBeginCleanup {
@@ -554,6 +558,11 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Option<crate::store::TaskContainerRecord>, AppError>>,
     },
+    /// Publish a committed run stop without upgrading a restart to user cancellation
+    QueueSignalStop {
+        id: TaskId,
+        reply: RpcReplyPort<Result<CancelResult, AppError>>,
+    },
     /// Request cancel
     RequestCancel {
         id: TaskId,
@@ -654,6 +663,9 @@ impl Actor for StoreActor {
                 send_reply(reply, state.accept_job_event(&event))
             }
             StoreMsg::PendingJobInbox { reply } => send_reply(reply, state.pending_job_inbox()),
+            StoreMsg::SuppressJobNotice { job, seq, reply } => {
+                send_reply(reply, state.suppress_job_notice(job, seq))
+            }
             StoreMsg::SettleJobEvent { job, seq, reply } => {
                 send_reply(reply, state.settle_job_event(job, seq))
             }
@@ -702,13 +714,9 @@ impl Actor for StoreActor {
                 reply,
                 state.reserve_run(machine, job, resource, task, binary, now),
             ),
-            StoreMsg::QueueStop {
-                resource,
-                task,
-                cause,
-                now,
-                reply,
-            } => send_reply(reply, state.commit_stop(resource, task, cause, now)),
+            StoreMsg::QueueStop { stop, now, reply } => {
+                send_reply(reply, state.commit_preemption(stop, now))
+            }
             StoreMsg::QueueBeginCleanup {
                 resource,
                 task,
@@ -1029,6 +1037,9 @@ impl Actor for StoreActor {
             }
             StoreMsg::TaskContainer { id, reply } => send_reply(reply, state.task_container(id)),
             StoreMsg::RequestCancel { id, reply } => send_reply(reply, state.request_cancel(id)),
+            StoreMsg::QueueSignalStop { id, reply } => {
+                send_reply(reply, state.signal_committed_run_stop(id))
+            }
             StoreMsg::ProduceAttentionEvent { id, reply } => {
                 send_reply(reply, state.produce_attention_event(id));
             }

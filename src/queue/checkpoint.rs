@@ -71,8 +71,10 @@ impl Checkpoint {
 
     /// Publish the exact run's checkpoint request, safely repeatable after a crash
     pub fn request_yield(&self, home: &Home) -> Result<(), AppError> {
-        std::fs::create_dir_all(self.control_dir(home))?;
-        std::fs::write(self.control_dir(home).join("yield"), b"")?;
+        self.prepare_control(home)?;
+        let path = self.control_dir(home).join("yield");
+        std::fs::write(&path, b"")?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
         Ok(())
     }
 
@@ -85,7 +87,14 @@ impl Checkpoint {
             job_dir,
             std::fs::Permissions::from_mode(self.step.job_dir_mode()),
         )?;
-        std::fs::create_dir_all(self.control_dir(home))?;
+        self.prepare_control(home)?;
+        Ok(())
+    }
+
+    fn prepare_control(&self, home: &Home) -> Result<(), AppError> {
+        let path = self.control_dir(home);
+        std::fs::create_dir_all(&path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
 
@@ -110,7 +119,9 @@ impl Checkpoint {
             (run_env::RESOURCE, self.resource.name.to_string()),
         ];
         if let Some(device) = self.resource.device {
-            env.push((run_env::CUDA_VISIBLE_DEVICES, device.to_string()));
+            // docker exposes one selected host GPU as CUDA ordinal zero
+            let ordinal = if container { 0 } else { device };
+            env.push((run_env::CUDA_VISIBLE_DEVICES, ordinal.to_string()));
         }
         env
     }

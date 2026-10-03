@@ -4,7 +4,7 @@ Use the resource queue for all GPU work on a machine that has it. Each machine h
 
 ## Check resources and jobs
 
-At daemon startup, Linux detects NVIDIA GPU indices with `nvidia-smi -L` and creates `gpu0`, `gpu1`, and so on. macOS gets `gpu0` without a device index. If detection finds no GPUs or fails, the machine still gets an unindexed `gpu0`. This exclusive lane does not prove that a physical GPU is available.
+At daemon startup, Linux detects NVIDIA GPU indices with `nvidia-smi -L` and creates `gpu0`, `gpu1`, and so on. macOS gets `gpu0` without a device index. If `nvidia-smi` is not installed, Linux gets an unindexed `gpu0`. If an installed probe fails or returns no usable devices, Homebased logs a warning and waits until a later start to detect resources. This exclusive lane does not prove that a physical GPU is available. A later successful detection assigns the first device to a detected fallback and keeps its UUID. Detection waits if that fallback has a run in any phase, including cleanup or Attention. Manual registrations do not change.
 
 ```sh
 homebased --json resource list
@@ -28,7 +28,7 @@ Registration is local and socket-only. Add a lane only for a separate exclusive 
 homebased --json resource register --name auxiliary
 ```
 
-For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUDA_VISIBLE_DEVICES` and selects it for containers. An unindexed resource removes that variable. Registration does not test the physical device.
+For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUDA_VISIBLE_DEVICES` for host steps. For containers, Docker selects that host device with `--gpus device=<index>` and `CUDA_VISIBLE_DEVICES=0` selects the one exposed GPU inside the container. An unindexed resource removes that variable. Registration does not test the physical device.
 
 ## Inspect, move, or cancel
 

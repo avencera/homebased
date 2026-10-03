@@ -79,7 +79,7 @@ pub struct StoredEpisode {
     pub job: JobId,
     /// When the episode started
     pub blocked_since: DateTime<Utc>,
-    /// Whether its one notice was already sent
+    /// Whether its one notice was recorded; callback delivery can still be pending
     pub notified: bool,
 }
 

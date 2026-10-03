@@ -8,6 +8,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
 use super::Retry;
+use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::deliver_job_event;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
@@ -200,21 +201,81 @@ async fn deliver_origin(
     route: JobRoute,
     event: RoutedJobEvent,
 ) -> Result<(), AppError> {
-    let callback = call(&state.supervisor, |reply| SupervisorMsg::GetCallback {
-        reply,
-    })
-    .await?;
-    match deliver_job_event(&state.home, &route, &event.event, &callback).await? {
-        DeliveryOutcome::Delivered => {
-            call(&state.store, |reply| StoreMsg::SettleJobEvent {
+    let before_send = if event.event.event == crate::queue::JobEventKind::JobBlocked {
+        // the authority owns the episode, including when the origin was offline
+        if !notice_current(state, &route, event.event.seq).await? {
+            return call(&state.store, |reply| StoreMsg::SuppressJobNotice {
                 job: route.job,
                 seq: event.event.seq,
                 reply,
             })
+            .await;
+        }
+        let state = state.clone();
+        let route = route.clone();
+        let seq = event.event.seq;
+        let runtime = tokio::runtime::Handle::current();
+        let check: SendCheck = std::sync::Arc::new(move || {
+            match runtime.block_on(notice_current(&state, &route, seq)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(SendFailure::Suppressed),
+                Err(error) => Err(SendFailure::Failed(error.to_string())),
+            }
+        });
+        Some(check)
+    } else {
+        None
+    };
+    let callback = call(&state.supervisor, |reply| SupervisorMsg::GetCallback {
+        reply,
+    })
+    .await?;
+    let outcome =
+        deliver_job_event(&state.home, &route, &event.event, &callback, before_send).await?;
+    settle_callback(&state.store, route.job, event.event.seq, outcome).await
+}
+
+/// Settle delivered or suppressed callbacks without removing numbered payloads
+pub(crate) async fn settle_callback(
+    store: &ractor::ActorRef<StoreMsg>,
+    job: JobId,
+    seq: u64,
+    outcome: Option<DeliveryOutcome>,
+) -> Result<(), AppError> {
+    match outcome {
+        Some(DeliveryOutcome::Delivered) => {
+            call(store, |reply| StoreMsg::SettleJobEvent { job, seq, reply }).await
+        }
+        None => {
+            call(store, |reply| StoreMsg::SuppressJobNotice {
+                job,
+                seq,
+                reply,
+            })
             .await
         }
-        DeliveryOutcome::Retryable(message)
-        | DeliveryOutcome::Deferred(message)
-        | DeliveryOutcome::Permanent(message) => Err(AppError::Internal { message }),
+        Some(
+            DeliveryOutcome::Retryable(message)
+            | DeliveryOutcome::Deferred(message)
+            | DeliveryOutcome::Permanent(message),
+        ) => Err(AppError::Internal { message }),
     }
+}
+
+async fn notice_current(state: &AppState, route: &JobRoute, seq: u64) -> Result<bool, AppError> {
+    let value = crate::daemon::queue_api::forward(
+        state,
+        route.authority,
+        crate::store::queue::interface::QueueRequest::NoticeCurrent {
+            job: route.job,
+            seq,
+        },
+    )
+    .await?;
+    value
+        .get("current")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| AppError::Internal {
+            message: "notice eligibility response has no boolean current field".into(),
+        })
 }

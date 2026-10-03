@@ -9,7 +9,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use super::{Environment, ProcessInfo, ProcessStartTime, Read};
+use super::{Environment, ProcessIdentity, ProcessInfo, ProcessStartTime, Read};
 
 /// macOS has no pidfd, so a signal goes to the PID after the identity check
 pub(crate) type SignalHandle = Pid;
@@ -61,7 +61,7 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     };
     if written <= 0 {
         return match Errno::last() {
-            Errno::ESRCH => Read::Gone,
+            Errno::ESRCH => exited_identity(pid).map_or(Read::Gone, Read::Exited),
             errno => Read::Refused(errno),
         };
     }
@@ -81,6 +81,62 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
         pgid: Pid::from_raw(pgid),
         uid: info.pbi_uid,
         zombie: info.pbi_status == libc::SZOMB,
+    })
+}
+
+// libc has no kinfo_proc binding; this is the leading extern_proc layout
+// from sys/proc.h, through p_pid. No trailing fields are interpreted
+#[repr(C)]
+struct ProcStatusPrefix {
+    start: libc::timeval,
+    _vmspace: *mut libc::c_void,
+    _sigacts: *mut libc::c_void,
+    _flags: c_int,
+    status: u8,
+    pid: libc::pid_t,
+}
+
+fn exited_identity(pid: Pid) -> Option<ProcessIdentity> {
+    // proc_pidinfo excludes unreaped zombies, but KERN_PROC_PID reports their
+    // status and start time, so they need not look newly vanished on every scan
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid.as_raw(),
+    ];
+    let mut buffer = [0_u8; 1024];
+    let mut size = buffer.len();
+    // safety: the kernel writes at most size bytes into the initialized buffer
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size < mem::size_of::<ProcStatusPrefix>() || size > buffer.len() {
+        return None;
+    }
+    // safety: this initialized prefix consists only of integers and raw pointers;
+    // read_unaligned does not require the byte buffer to have struct alignment
+    let info = unsafe { buffer.as_ptr().cast::<ProcStatusPrefix>().read_unaligned() };
+    if info.pid != pid.as_raw() || u32::from(info.status) != libc::SZOMB {
+        return None;
+    }
+    let seconds = u64::try_from(info.start.tv_sec)
+        .ok()
+        .filter(|seconds| *seconds > 0)?;
+    let micros = u64::try_from(info.start.tv_usec)
+        .ok()
+        .filter(|micros| *micros < 1_000_000)?;
+    let start = seconds.checked_mul(1_000_000)?.checked_add(micros)?;
+    Some(ProcessIdentity {
+        pid,
+        start: ProcessStartTime(start),
     })
 }
 

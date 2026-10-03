@@ -3,6 +3,7 @@
 
 pub(crate) mod claude_inbox;
 pub mod destination;
+pub(crate) mod send_check;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -31,6 +32,7 @@ use crate::submission::CallbackContext;
 
 use crate::t3::{Protocol, ProviderThread, T3Env, WakeOutcome, owner, wake_thread};
 use claude_inbox::{ClaudeInbox, ClaudeSession};
+use send_check::{SendFailure, SendGate};
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
@@ -603,6 +605,17 @@ impl ReachableOrigin {
     ) -> Result<(), String> {
         self.0.send(thread, line, log_path, delivery_lock)
     }
+
+    /// Recheck a notice after taking the socket delivery lock
+    pub(crate) fn send_checked(
+        self,
+        thread: ThreadId,
+        line: &str,
+        log_path: &Path,
+        gate: SendGate<'_>,
+    ) -> Result<(), SendFailure> {
+        self.0.send_checked(thread, line, log_path, gate)
+    }
 }
 
 /// Find which saved origin owns `thread` for a direct message
@@ -790,6 +803,27 @@ pub(crate) fn send_codex_queue_attempt(
     log_path: &Path,
     delivery_lock: &Path,
 ) -> Result<(), String> {
+    send_codex_queue_attempt_checked(
+        context,
+        thread,
+        line,
+        log_path,
+        SendGate {
+            path: delivery_lock,
+            check: None,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Recheck a notice under the lock inherited by the queue process
+pub(crate) fn send_codex_queue_attempt_checked(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    gate: SendGate<'_>,
+) -> Result<(), SendFailure> {
     let binary = context.codex.path().ok_or_else(|| {
         context
             .codex
@@ -797,14 +831,14 @@ pub(crate) fn send_codex_queue_attempt(
             .unwrap_or("saved Codex executable is unavailable")
             .to_owned()
     })?;
-    queue_command_once(
+    queue_command_once_checked(
         binary,
         thread,
         &context.env,
         &context.cwd,
         line,
         log_path,
-        delivery_lock,
+        gate,
     )
 }
 
@@ -927,7 +961,17 @@ fn wake_provider_thread(
     pending: &PendingT3Send,
 ) -> WakeOutcome {
     let outcome = wake_thread(&t3_env(context), provider_thread, line);
-    match &outcome {
+    record_wake(&outcome, provider_thread, log_path, pending);
+    outcome
+}
+
+fn record_wake(
+    outcome: &WakeOutcome,
+    provider_thread: ProviderThread,
+    log_path: &Path,
+    pending: &PendingT3Send,
+) {
+    match outcome {
         WakeOutcome::Woken { t3_thread } => {
             pending.clear();
             if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
@@ -937,57 +981,178 @@ fn wake_provider_thread(
         WakeOutcome::Uncertain(_) => pending.record(provider_thread),
         _ => {}
     }
-    outcome
 }
 
-fn queue_command_once(
+/// Retry a possibly sent T3 notice without using another transport
+pub(crate) fn retry_pending_t3_checked(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    pending: &PendingT3Send,
+    gate: SendGate<'_>,
+) -> Result<Option<PendingRetry>, SendFailure> {
+    let Some(provider) = pending.get(thread) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        match wake_provider_thread_checked(context, provider, line, log_path, pending, gate)? {
+            WakeOutcome::Woken { .. } => PendingRetry::Delivered,
+            WakeOutcome::Uncertain(detail) => PendingRetry::Uncertain(detail),
+            outcome => PendingRetry::Blocked(format!(
+                "T3 may already have this event, so it waits for T3: {outcome:?}"
+            )),
+        },
+    ))
+}
+
+/// Wake a stopped session only if its notice is still eligible at dispatch
+pub(crate) fn wake_stopped_session_checked(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    pending: &PendingT3Send,
+    gate: SendGate<'_>,
+) -> Result<(), SendFailure> {
+    match wake_provider_thread_checked(
+        context,
+        ProviderThread::Claude(thread),
+        line,
+        log_path,
+        pending,
+        gate,
+    )? {
+        WakeOutcome::Woken { .. } => Ok(()),
+        outcome => Err(SendFailure::Failed(format!(
+            "T3 could not wake Claude session {thread}: {outcome:?}"
+        ))),
+    }
+}
+
+/// Recheck a T3 Claude notice before T3 dispatch and again before a socket fallback
+pub(crate) fn send_t3_claude_checked(
+    context: &CallbackContext,
+    thread: ThreadId,
+    origin: ReachableOrigin,
+    line: &str,
+    log_path: &Path,
+    gate: SendGate<'_>,
+    pending: &PendingT3Send,
+) -> Result<(), SendFailure> {
+    match wake_provider_thread_checked(
+        context,
+        ProviderThread::Claude(thread),
+        line,
+        log_path,
+        pending,
+        gate,
+    )? {
+        WakeOutcome::Woken { .. } => Ok(()),
+        WakeOutcome::Uncertain(detail) => Err(SendFailure::Failed(format!(
+            "T3 may have taken the event for Claude session {thread}; retrying through T3: {detail}"
+        ))),
+        _ => origin.send_checked(thread, line, log_path, gate),
+    }
+}
+
+/// Preserve uncertain T3 delivery while rechecking unsent Codex notices
+pub(crate) fn wake_codex_thread_checked(
+    context: &CallbackContext,
+    thread: ThreadId,
+    line: &str,
+    log_path: &Path,
+    pending: &PendingT3Send,
+    gate: SendGate<'_>,
+) -> Result<Result<(), CodexWakeError>, SendFailure> {
+    Ok(
+        match wake_provider_thread_checked(
+            context,
+            ProviderThread::Codex(thread),
+            line,
+            log_path,
+            pending,
+            gate,
+        )? {
+            WakeOutcome::Woken { .. } => Ok(()),
+            WakeOutcome::NotT3Thread => Err(CodexWakeError::NotStarted(
+                "no T3 thread owns this Codex thread".into(),
+            )),
+            WakeOutcome::Uncertain(detail) => Err(CodexWakeError::Uncertain(detail)),
+            WakeOutcome::Unavailable(detail)
+            | WakeOutcome::Refused(detail)
+            | WakeOutcome::ApiChanged(detail) => Err(CodexWakeError::NotStarted(detail)),
+        },
+    )
+}
+
+fn wake_provider_thread_checked(
+    context: &CallbackContext,
+    provider_thread: ProviderThread,
+    line: &str,
+    log_path: &Path,
+    pending: &PendingT3Send,
+    gate: SendGate<'_>,
+) -> Result<WakeOutcome, SendFailure> {
+    let _lock = gate.lock()?;
+    let outcome =
+        crate::t3::wake_thread_checked(&t3_env(context), provider_thread, line, gate.check)?;
+    record_wake(&outcome, provider_thread, log_path, pending);
+    Ok(outcome)
+}
+
+fn queue_command_once_checked(
     binary: &Path,
     thread: ThreadId,
     env: &crate::domain::TaskEnv,
     cwd: &Path,
     line: &str,
     log_path: &Path,
-    delivery_lock: &Path,
-) -> Result<(), String> {
+    gate: SendGate<'_>,
+) -> Result<(), SendFailure> {
     let mut cmd = Command::new(binary);
     cmd.args(["queue", "--thread", &thread.to_string(), "--message", line])
         .env("PATH", &env.path)
         .env("HOME", &env.home)
         .current_dir(cwd);
-    match run_command_deadline(&mut cmd, QUEUE_ATTEMPT_TIMEOUT, delivery_lock) {
-        Ok(out) => {
+    match run_command_deadline_checked(&mut cmd, QUEUE_ATTEMPT_TIMEOUT, gate) {
+        Ok(Some(out)) => {
             let _ = std::fs::write(log_path, transcript(&out));
             if out.status.success() {
                 Ok(())
             } else {
-                Err(format!(
+                Err(SendFailure::Failed(format!(
                     "codex queue exit={} stderr={}",
                     out.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&out.stderr)
-                ))
+                )))
             }
         }
-        Err(error) => Err(error),
+        Ok(None) => Err(SendFailure::Suppressed),
+        Err(error) => Err(SendFailure::Failed(error)),
     }
 }
 
 /// Drive one child to completion or deadline. Drains stdout/stderr on helper
 /// threads so a chatty child cannot deadlock a filled pipe, and kills the
 /// process group when the deadline elapses.
-fn run_command_deadline(
+fn run_command_deadline_checked(
     cmd: &mut Command,
     timeout: Duration,
-    delivery_lock: &Path,
-) -> Result<std::process::Output, String> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(delivery_lock)
-        .map_err(|err| format!("open delivery lock {}: {err}", delivery_lock.display()))?;
+    gate: SendGate<'_>,
+) -> Result<Option<std::process::Output>, String> {
+    let held = gate.lock().map_err(|error| error.to_string())?;
+    let lock = match held {
+        Some(lock) => lock,
+        None => OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(gate.path)
+            .map_err(|err| format!("open delivery lock {}: {err}", gate.path.display()))?,
+    };
     let lock_fd = lock.as_raw_fd();
-    clear_close_on_exec(lock_fd).map_err(|err| format!("prepare delivery lock: {err}"))?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -995,6 +1160,12 @@ fn run_command_deadline(
     unsafe {
         cmd.pre_exec(move || lock_delivery_in_child(lock_fd));
     }
+    match gate.check() {
+        Ok(()) => {}
+        Err(SendFailure::Suppressed) => return Ok(None),
+        Err(SendFailure::Failed(message)) => return Err(message),
+    }
+    clear_close_on_exec(lock_fd).map_err(|err| format!("prepare delivery lock: {err}"))?;
     let mut child = cmd.spawn().map_err(|err| err.to_string())?;
     // the queue process and any descendants now own the locked open-file
     // description; the daemon must not keep its inherited copy alive
@@ -1064,11 +1235,11 @@ fn run_command_deadline(
     let drain_timeout = Duration::from_secs(QUEUE_PIPE_DRAIN_TIMEOUT_SECS);
     let stdout = rx_out.recv_timeout(drain_timeout).unwrap_or_default();
     let stderr = rx_err.recv_timeout(drain_timeout).unwrap_or_default();
-    Ok(std::process::Output {
+    Ok(Some(std::process::Output {
         status,
         stdout,
         stderr,
-    })
+    }))
 }
 
 fn clear_close_on_exec(fd: i32) -> io::Result<()> {
@@ -1161,6 +1332,22 @@ pub fn last_event_for_row(
 
 #[cfg(test)]
 mod tests {
+    fn run_command_deadline(
+        cmd: &mut Command,
+        timeout: Duration,
+        delivery_lock: &Path,
+    ) -> Result<std::process::Output, String> {
+        run_command_deadline_checked(
+            cmd,
+            timeout,
+            SendGate {
+                path: delivery_lock,
+                check: None,
+            },
+        )?
+        .ok_or_else(|| "unconditional callback was suppressed".into())
+    }
+
     use super::*;
     use crate::domain::{
         Agent, AgentWorkload, AttentionState, CallbackStatus, ProcessGroupExitEvidence, TaskEnv,

@@ -758,3 +758,55 @@ fn phase5_cli_failure_reports_the_job_and_run_without_task_callbacks() {
                 && event["event"].as_str().unwrap().starts_with("TASK_"))
     );
 }
+
+#[test]
+fn review_fix_task_cancel_during_yield_commits_user_cancel_before_signalling() {
+    use homebased::queue::StopCause;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    struct ResumeWorker(Pid);
+    impl Drop for ResumeWorker {
+        fn drop(&mut self) {
+            let _ = kill(self.0, Signal::SIGCONT);
+        }
+    }
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let job = jobs.submit(&spec(&h, "low", "yield",
+        "echo ready > ready; n=0; while [ ! -f \"$HOMEBASED_YIELD_FILE\" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done; echo yield > yielded; while [ ! -f finish ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done; exit 75"));
+    assert!(wait_until(Duration::from_secs(10), || h
+        .home
+        .join("ready")
+        .exists()));
+    let store = Store::open(&h.home.join("homebased.sqlite")).unwrap();
+    let checkpoint = store
+        .resources_on(machine(&h))
+        .unwrap()
+        .into_iter()
+        .find_map(|record| record.run.filter(|run| run.job == job))
+        .unwrap();
+    store
+        .commit_stop(
+            checkpoint.resource,
+            checkpoint.task,
+            StopCause::Yield,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(10), || h
+        .home
+        .join("yielded")
+        .exists()));
+    let row = store.require_task(checkpoint.task).unwrap();
+    let worker = ResumeWorker(Pid::from_raw(row.pid().unwrap()));
+    kill(worker.0, Signal::SIGSTOP).unwrap();
+    cli(&h, &["task", "cancel", &checkpoint.task.to_string()]);
+    assert_eq!(
+        store.job_runs(job).unwrap()[0].stop_cause,
+        Some(StopCause::UserCancel)
+    );
+    fs::write(h.home.join("finish"), "").unwrap();
+    drop(worker);
+    wait_state(&h, job, "cancelled");
+    assert_eq!(wait_callbacks(&h, job, 1)[0]["event"], "JOB_CANCELLED");
+}

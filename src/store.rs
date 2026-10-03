@@ -573,7 +573,8 @@ fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_34_TO_35)?;
     conn.execute_batch(MIGRATE_34_TO_35_TASKS)?;
     conn.execute_batch(MIGRATE_34_TO_35_QUEUE)?;
-    conn.execute_batch(MIGRATE_35_TO_36)
+    conn.execute_batch(MIGRATE_35_TO_36)?;
+    conn.execute_batch(MIGRATE_36_TO_37)
 }
 
 /// Save job routes, ordered inboxes, and authority acknowledgement cursors
@@ -601,6 +602,16 @@ CREATE TABLE resource_job_delivery (
     job_id TEXT PRIMARY KEY REFERENCES resource_jobs(id),
     acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
 );
+";
+
+/// Retain registration ownership and settlement evidence for obsolete notices
+const MIGRATE_36_TO_37: &str = r"
+ALTER TABLE resources ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'
+    CHECK (origin IN ('manual', 'detected_fallback', 'detected_device'))
+    CHECK ((origin != 'detected_fallback' OR device IS NULL)
+        AND (origin != 'detected_device' OR device IS NOT NULL));
+ALTER TABLE resource_job_events ADD COLUMN suppressed_at TEXT;
+ALTER TABLE resource_job_inbox ADD COLUMN suppressed_at TEXT;
 ";
 
 /// Why `Store::open` refuses a database version
@@ -936,7 +947,11 @@ impl Store {
                 | RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
                 RELEASED_V0_11_SCHEMA_VERSION => migrate_33_to_current(&transaction)?,
                 RELEASED_V0_13_SCHEMA_VERSION => migrate_34_to_current(&transaction)?,
-                35 => transaction.execute_batch(MIGRATE_35_TO_36)?,
+                35 => {
+                    transaction.execute_batch(MIGRATE_35_TO_36)?;
+                    transaction.execute_batch(MIGRATE_36_TO_37)?;
+                }
+                36 => transaction.execute_batch(MIGRATE_36_TO_37)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2019,28 +2034,43 @@ impl Store {
     /// Mark cancel requested. Terminal tasks are unchanged (idempotent)
     pub fn request_cancel(&self, id: TaskId) -> Result<CancelResult, AppError> {
         self.immediate(|| {
-            self.require_task(id)?;
-            self.conn.execute(
-                "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
+            let task = self.require_task(id)?;
+            if !task.state.is_terminal()
+                && let Some(job) = self.job_run_link(id)?
+                && let Some(run) = self.run_of_job(job)?.filter(|run| run.task == id)
+            {
+                self.request_stop(
+                    run.resource,
+                    Some(id),
+                    crate::queue::StopCause::UserCancel,
+                    Utc::now(),
+                )?;
+            }
+            self.request_cancel_inner(id)
+        })
+    }
+
+    fn request_cancel_inner(&self, id: TaskId) -> Result<CancelResult, AppError> {
+        self.conn.execute(
+            "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
                  WHERE id = ?2 AND cancel_requested_at IS NULL
                    AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost', 'preempted')",
-                params![fmt_time(Utc::now()), id.to_string()],
-            )?;
-            if let Some(row) = self.cas_exit_inner(
-                id,
-                ProcessStatus::Queued,
-                &ExitReason::Cancelled,
-                &ProcessGroupExitEvidence::NoChildSpawned.into(),
-            )? {
-                return Ok(CancelResult::CancelledQueued(row));
-            }
-            let row = self.require_task(id)?;
-            if row.state.is_terminal() {
-                Ok(CancelResult::AlreadyTerminal(row))
-            } else {
-                Ok(CancelResult::SignalWorker(row))
-            }
-        })
+            params![fmt_time(Utc::now()), id.to_string()],
+        )?;
+        if let Some(row) = self.cas_exit_inner(
+            id,
+            ProcessStatus::Queued,
+            &ExitReason::Cancelled,
+            &ProcessGroupExitEvidence::NoChildSpawned.into(),
+        )? {
+            return Ok(CancelResult::CancelledQueued(row));
+        }
+        let row = self.require_task(id)?;
+        if row.state.is_terminal() {
+            Ok(CancelResult::AlreadyTerminal(row))
+        } else {
+            Ok(CancelResult::SignalWorker(row))
+        }
     }
 
     /// Run `body` inside `BEGIN IMMEDIATE`, rolling back on error

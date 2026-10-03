@@ -10,7 +10,7 @@ use tokio::task::AbortHandle;
 
 use crate::cleanup::{self, CleanupTiming, GroupOutcome, SweepOutcome};
 use crate::daemon::actors::supervisor::SupervisorMsg;
-use crate::daemon::actors::task::cancel_task;
+use crate::daemon::actors::task::stop_run_task;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, Workload};
 use crate::error::AppError;
@@ -168,15 +168,17 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
         launch_job(args, launch.job, launch.resource).await?;
     }
     if let Some(stop) = decisions.preemption {
-        call(&args.store, |reply| StoreMsg::QueueStop {
-            resource: stop.resource,
-            task: stop.task,
-            cause: stop.cause,
+        let committed = call(&args.store, |reply| StoreMsg::QueueStop {
+            stop,
             now: Utc::now(),
             reply,
         })
         .await?;
-        enact_stop(args, stop.task, stop.cause).await?;
+        if let Some(run) = committed
+            && let RunPhase::Stopping { cause, .. } = run.phase
+        {
+            enact_stop(args, run.task, cause).await?;
+        }
     }
 
     let head = decisions
@@ -281,7 +283,7 @@ async fn enact_stop(args: &QueueArgs, task: TaskId, cause: StopCause) -> Result<
         // the worker polls its durable marker; repeated recovery scans must not
         // send another signal or reset the stop time after the first request
         if row.cancel_requested_at.is_none() && !row.state.is_terminal() {
-            cancel_task(&args.store, task).await?;
+            stop_run_task(&args.store, task).await?;
         }
         return Ok(());
     }

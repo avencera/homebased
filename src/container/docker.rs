@@ -389,6 +389,8 @@ struct InspectedState {
     status: String,
     #[serde(default)]
     exit_code: i32,
+    #[serde(default)]
+    finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +426,11 @@ impl InspectedContainer {
         Ok(ContainerObservation {
             id,
             status,
+            // Docker uses year 1 as its not-yet-finished sentinel
+            finished_at: self
+                .state
+                .finished_at
+                .filter(|time| time.timestamp() != -62_135_596_800),
             task_label,
         })
     }
@@ -593,5 +600,34 @@ mod tests {
             Some("t")
         );
         assert!(decode("unknown", 0).is_err());
+    }
+    #[test]
+    fn review_gap_inspect_preserves_exact_finished_at() {
+        let decode = |finished_at: serde_json::Value| {
+            serde_json::from_value::<InspectedContainer>(json!({
+                "Id": "a".repeat(64),
+                "State": { "Status": "exited", "ExitCode": 0, "FinishedAt": finished_at }
+            }))
+            .map(|container| container.observation().unwrap())
+        };
+        let timestamp = "2026-10-03T12:34:56.123456789Z";
+        assert_eq!(
+            decode(json!(timestamp)).unwrap().finished_at,
+            Some(timestamp.parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+        );
+        assert_eq!(
+            decode(json!("0001-01-01T00:00:00Z")).unwrap().finished_at,
+            None
+        );
+        assert_eq!(decode(serde_json::Value::Null).unwrap().finished_at, None);
+        assert_eq!(
+            decode(json!("1970-01-01T00:00:00Z")).unwrap().finished_at,
+            Some(
+                "1970-01-01T00:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            )
+        );
+        assert!(decode(json!("not a timestamp")).is_err());
     }
 }

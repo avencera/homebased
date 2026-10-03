@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tracing::warn;
 
+use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
 use crate::callback::{
     CodexWakeError, HomebasedEvent, OriginSession, PendingRetry, PendingT3Send, ReachableOrigin,
     append_fallback, check_saved_callback, find_saved_inbox_origin, retry_pending_t3,
@@ -382,6 +383,8 @@ async fn start_inbox_worker(myself: &ActorRef<CallbackMsg>, state: &mut Callback
 enum AttemptOutcome {
     /// Settle the event with this outcome
     Settle(DeliveryOutcome),
+    /// The blocked episode ended before any callback bytes were written
+    Suppressed,
     /// A claimed T3 wake failed, so the event waits and the thread may need a push
     WakeFailed(String),
     /// The T3 wake failed, but `codex queue` accepted the event
@@ -389,8 +392,9 @@ enum AttemptOutcome {
 }
 
 impl AttemptOutcome {
-    fn into_settlement(self) -> (DeliveryOutcome, Option<WakeFailure>) {
-        match self {
+    fn into_settlement(self) -> Option<(DeliveryOutcome, Option<WakeFailure>)> {
+        Some(match self {
+            Self::Suppressed => return None,
             Self::Settle(outcome) => (outcome, None),
             Self::WakeFailed(reason) => (
                 DeliveryOutcome::Deferred(reason.clone()),
@@ -400,6 +404,14 @@ impl AttemptOutcome {
                 DeliveryOutcome::Delivered,
                 Some(WakeFailure::CodexQueued { reason }),
             ),
+        })
+    }
+
+    fn from_send(sent: Result<(), SendFailure>) -> Self {
+        match sent {
+            Ok(()) => Self::Settle(DeliveryOutcome::Delivered),
+            Err(SendFailure::Suppressed) => Self::Suppressed,
+            Err(SendFailure::Failed(message)) => Self::Settle(DeliveryOutcome::Retryable(message)),
         }
     }
 }
@@ -469,10 +481,16 @@ pub(crate) async fn dispatch_inbox(
                     delivery_lock: paths.delivery_lock,
                 },
                 pending,
+                before_send: None,
             };
             attempt.run(&callback).await?
         };
-        let (outcome, failed_wake) = outcome.into_settlement();
+        let (outcome, failed_wake) =
+            outcome
+                .into_settlement()
+                .ok_or_else(|| AppError::Internal {
+                    message: "an ordinary task callback cannot be suppressed".into(),
+                })?;
         let settled = call(&store, |reply| StoreMsg::SettleInboxAttempt {
             id,
             seq,
@@ -539,12 +557,15 @@ struct CallbackPaths {
 }
 
 /// Deliver one job event through the same Claude, Codex, and T3 routing as task events
+///
+/// Returns `None` only when a blocked notice ended before the callback write
 pub(crate) async fn deliver_job_event(
     home: &Home,
     route: &crate::queue::delivery::JobRoute,
     event: &crate::queue::JobEvent,
     callback: &ActorRef<CallbackMsg>,
-) -> Result<DeliveryOutcome, AppError> {
+    before_send: Option<SendCheck>,
+) -> Result<Option<DeliveryOutcome>, AppError> {
     let dir = home
         .root()
         .join("jobs")
@@ -570,14 +591,17 @@ pub(crate) async fn deliver_job_event(
             delivery_lock: dir.join("delivery.lock"),
         },
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
+        before_send: before_send.filter(|_| event.event == crate::queue::JobEventKind::JobBlocked),
     };
-    let (outcome, _) = attempt.run(callback).await?.into_settlement();
+    let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
+        return Ok(None);
+    };
     if matches!(outcome, DeliveryOutcome::Delivered) {
         let _ = callback.cast(CallbackMsg::Delivered {
             thread: route.thread,
         });
     }
-    Ok(outcome)
+    Ok(Some(outcome))
 }
 
 /// One reserved attempt on a saved origin route
@@ -587,21 +611,43 @@ struct OriginAttempt {
     line: String,
     paths: CallbackPaths,
     pending: PendingT3Send,
+    before_send: Option<SendCheck>,
 }
 
 impl OriginAttempt {
+    fn gate(&self) -> SendGate<'_> {
+        SendGate {
+            path: &self.paths.delivery_lock,
+            check: self.before_send.as_ref(),
+        }
+    }
+
     async fn run(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
         let (attempt, retry) = run_blocking("pending T3 retry", move || {
-            let retry = retry_pending_t3(
-                &self.context,
-                self.thread,
-                &self.line,
-                &self.paths.callback_log,
-                &self.pending,
-            );
+            let retry = match self.before_send.as_ref() {
+                Some(_) => crate::callback::retry_pending_t3_checked(
+                    &self.context,
+                    self.thread,
+                    &self.line,
+                    &self.paths.callback_log,
+                    &self.pending,
+                    self.gate(),
+                ),
+                None => Ok(retry_pending_t3(
+                    &self.context,
+                    self.thread,
+                    &self.line,
+                    &self.paths.callback_log,
+                    &self.pending,
+                )),
+            };
             (self, retry)
         })
         .await?;
+        let retry = match retry {
+            Ok(retry) => retry,
+            Err(error) => return Ok(AttemptOutcome::from_send(Err(error))),
+        };
         match retry {
             Some(PendingRetry::Delivered) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
             Some(PendingRetry::Uncertain(reason)) => {
@@ -630,24 +676,38 @@ impl OriginAttempt {
     }
 
     async fn send(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("origin callback", move || {
-            origin.send(
+        let sent = run_blocking("origin callback", move || match self.before_send.as_ref() {
+            Some(_) => origin.send_checked(
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
-                &self.paths.delivery_lock,
-            )
+                self.gate(),
+            ),
+            None => origin
+                .send(
+                    self.thread,
+                    &self.line,
+                    &self.paths.callback_log,
+                    &self.paths.delivery_lock,
+                )
+                .map_err(Into::into),
         })
         .await?;
-        Ok(AttemptOutcome::Settle(match sent {
-            Ok(()) => DeliveryOutcome::Delivered,
-            Err(error) => DeliveryOutcome::Retryable(error),
-        }))
+        Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_t3_claude(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("T3 Claude send", move || {
-            send_t3_claude(
+        let sent = run_blocking("T3 Claude send", move || match self.before_send.as_ref() {
+            Some(_) => crate::callback::send_t3_claude_checked(
+                &self.context,
+                self.thread,
+                origin,
+                &self.line,
+                &self.paths.callback_log,
+                self.gate(),
+                &self.pending,
+            ),
+            None => send_t3_claude(
                 &self.context,
                 self.thread,
                 origin,
@@ -656,23 +716,29 @@ impl OriginAttempt {
                 &self.paths.delivery_lock,
                 &self.pending,
             )
+            .map_err(Into::into),
         })
         .await?;
-        Ok(AttemptOutcome::Settle(match sent {
-            Ok(()) => DeliveryOutcome::Delivered,
-            Err(error) => DeliveryOutcome::Retryable(error),
-        }))
+        Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
-        let sent = run_blocking("origin callback", move || {
-            send_codex_queue_attempt(
+        let sent = run_blocking("origin callback", move || match self.before_send.as_ref() {
+            Some(_) => crate::callback::send_codex_queue_attempt_checked(
+                &self.context,
+                self.thread,
+                &self.line,
+                &self.paths.callback_log,
+                self.gate(),
+            ),
+            None => send_codex_queue_attempt(
                 &self.context,
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
                 &self.paths.delivery_lock,
             )
+            .map_err(Into::into),
         })
         .await?;
         Ok(match sent {
@@ -680,22 +746,36 @@ impl OriginAttempt {
                 Some(reason) => AttemptOutcome::DeliveredWakeFailed(reason),
                 None => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
             },
-            Err(error) => AttemptOutcome::Settle(DeliveryOutcome::Retryable(error)),
+            Err(error) => AttemptOutcome::from_send(Err(error)),
         })
     }
 
     async fn wake_codex(self) -> Result<AttemptOutcome, AppError> {
         let (attempt, woken) = run_blocking("T3 Codex wake", move || {
-            let woken = wake_codex_thread(
-                &self.context,
-                self.thread,
-                &self.line,
-                &self.paths.callback_log,
-                &self.pending,
-            );
+            let woken = match self.before_send.as_ref() {
+                Some(_) => crate::callback::wake_codex_thread_checked(
+                    &self.context,
+                    self.thread,
+                    &self.line,
+                    &self.paths.callback_log,
+                    &self.pending,
+                    self.gate(),
+                ),
+                None => Ok(wake_codex_thread(
+                    &self.context,
+                    self.thread,
+                    &self.line,
+                    &self.paths.callback_log,
+                    &self.pending,
+                )),
+            };
             (self, woken)
         })
         .await?;
+        let woken = match woken {
+            Ok(woken) => woken,
+            Err(error) => return Ok(AttemptOutcome::from_send(Err(error))),
+        };
         match woken {
             Ok(()) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
             // `codex queue` could deliver a second copy of a turn T3 already started
@@ -714,19 +794,29 @@ impl OriginAttempt {
                 "Claude session {thread} is not running; T3 wake retried later"
             ))));
         }
-        let woken = run_blocking("T3 wake", move || {
-            wake_stopped_session(
+        let woken = run_blocking("T3 wake", move || match self.before_send.as_ref() {
+            Some(_) => crate::callback::wake_stopped_session_checked(
+                &self.context,
+                thread,
+                &self.line,
+                &self.paths.callback_log,
+                &self.pending,
+                self.gate(),
+            ),
+            None => wake_stopped_session(
                 &self.context,
                 thread,
                 &self.line,
                 &self.paths.callback_log,
                 &self.pending,
             )
+            .map_err(Into::into),
         })
         .await?;
         Ok(match woken {
             Ok(()) => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
-            Err(reason) => AttemptOutcome::WakeFailed(reason),
+            Err(SendFailure::Suppressed) => AttemptOutcome::Suppressed,
+            Err(SendFailure::Failed(reason)) => AttemptOutcome::WakeFailed(reason),
         })
     }
 }
@@ -749,8 +839,9 @@ mod tests {
 
     #[test]
     fn codex_queue_fallback_settles_as_delivered_with_a_wake_failure() {
-        let result =
-            AttemptOutcome::DeliveredWakeFailed("T3 is unavailable".into()).into_settlement();
+        let result = AttemptOutcome::DeliveredWakeFailed("T3 is unavailable".into())
+            .into_settlement()
+            .unwrap();
 
         assert!(matches!(result.0, DeliveryOutcome::Delivered));
         assert!(matches!(

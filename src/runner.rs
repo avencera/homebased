@@ -405,7 +405,7 @@ async fn run_child(
     };
     record_child_identity(store, id, child_pgid);
     if let Err(error) = store.confirm_job_run_started(id) {
-        let evidence = cancel_child_group(&mut child, child_pgid).await;
+        let (evidence, _) = cancel_child_group(&mut child, child_pgid).await;
         return Ok(TaskRunExit {
             reason: ExitReason::SpawnFailed {
                 message: format!("confirm job child start: {error}"),
@@ -469,16 +469,12 @@ async fn run_child(
             warn!(%id, cancelled, "SIGTERM: forwarding to child group")
         }
     }
-    let process_group_exit_evidence = cancel_child_group(&mut child, child_pgid).await;
     let reason = if cancelled {
         ExitReason::Cancelled
     } else {
         ExitReason::Signal { signal: 15 }
     };
-    Ok(TaskRunExit {
-        reason,
-        process_group_exit_evidence,
-    })
+    Ok(stop_child(&mut child, child_pgid, reason).await)
 }
 
 /// Save the child's identity for cleanup after a lost worker
@@ -541,35 +537,97 @@ fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
 }
 
 /// Reap the direct child while giving the full group one shared TERM grace.
+async fn stop_child(
+    child: &mut tokio::process::Child,
+    pgid: i32,
+    reason: ExitReason,
+) -> TaskRunExit {
+    let (process_group_exit_evidence, natural) = cancel_child_group(child, pgid).await;
+    TaskRunExit {
+        reason: natural.unwrap_or(reason),
+        process_group_exit_evidence,
+    }
+}
+
+struct ChildStop<'a> {
+    child: &'a mut tokio::process::Child,
+    reaped: bool,
+    signalled: bool,
+    natural: Option<ExitReason>,
+}
+
+impl ChildStop<'_> {
+    fn reap(&mut self, pgid: i32) {
+        if self.reaped {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.reaped = true;
+                if !self.signalled {
+                    self.natural = status_to_reason(Ok(status)).ok();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(pgid, "reap cancelled child: {error}");
+            }
+        }
+    }
+
+    fn signal(&mut self, pgid: i32, signal: Signal) -> Result<(), Errno> {
+        // selection of the cancellation branch is not evidence that the child is live
+        self.reap(pgid);
+        // a natural exit inside the next call is recorded as cancellation: after
+        // the group signal, it is indistinguishable from a TERM handler's exit 0
+        let result = kill(Pid::from_raw(-pgid), signal);
+        if result.is_ok() {
+            self.signalled = true;
+        }
+        result
+    }
+}
+
 async fn cancel_child_group(
     child: &mut tokio::process::Child,
     child_pgid: i32,
-) -> ProcessGroupExitEvidence {
-    let mut child_reaped = false;
+) -> (ProcessGroupExitEvidence, Option<ExitReason>) {
+    let state = std::sync::Mutex::new(ChildStop {
+        child,
+        reaped: false,
+        signalled: false,
+        natural: None,
+    });
     let evidence = cleanup_process_group_with(
         child_pgid,
         || process_group_probe(child_pgid),
-        |signal| kill(Pid::from_raw(-child_pgid), signal),
+        |signal| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .signal(child_pgid, signal)
+        },
         || {
-            if child_reaped {
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => child_reaped = true,
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(child_pgid, "reap cancelled child: {err}");
-                    child_reaped = true;
-                }
-            }
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reap(child_pgid)
         },
         CLEANUP_TIMING,
     )
     .await;
-    if !child_reaped && let Err(err) = time::timeout(KILL_REAP_GRACE, child.wait()).await {
-        warn!(child_pgid, "reap cancelled child timed out: {err}");
+    let mut state = state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.reaped {
+        match time::timeout(KILL_REAP_GRACE, state.child.wait()).await {
+            Ok(Ok(status)) if !state.signalled => state.natural = status_to_reason(Ok(status)).ok(),
+            Ok(Err(error)) => warn!(child_pgid, "reap cancelled child: {error}"),
+            Err(error) => warn!(child_pgid, "reap cancelled child timed out: {error}"),
+            Ok(Ok(_)) => {}
+        }
     }
-    evidence
+    (evidence, state.natural)
 }
 
 /// Terminate remaining members of the child process group and confirm the result.
@@ -816,7 +874,7 @@ mod tests {
         let child_pgid = child.id().unwrap() as i32;
 
         assert_eq!(
-            cancel_child_group(&mut child, child_pgid).await,
+            cancel_child_group(&mut child, child_pgid).await.0,
             ProcessGroupExitEvidence::ConfirmedExited
         );
         assert!(child.try_wait().unwrap().is_some());
@@ -931,5 +989,55 @@ mod tests {
             ProcessGroupExitEvidence::Unconfirmed,
             "an exit probe after the kill grace must not hide the grace timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::{ExitReason, stop_child};
+
+    #[tokio::test]
+    async fn review_fix_cancel_preserves_an_already_exited_child() {
+        for code in [0, 7] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", &format!("exit {code}")])
+                .process_group(0)
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let pgid = i32::try_from(child.id().unwrap()).unwrap();
+            child.wait().await.unwrap();
+            let exit = stop_child(&mut child, pgid, ExitReason::Cancelled).await;
+            assert_eq!(exit.reason, ExitReason::Exit { code });
+        }
+    }
+}
+
+#[cfg(test)]
+mod enforced_stop_tests {
+    #[tokio::test]
+    async fn review_fix_child_exit_after_homebased_signal_stays_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap 'exit 0' TERM; echo ready > \"$1\"; while :; do :; done",
+                "sh",
+            ])
+            .arg(&ready)
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let pgid = i32::try_from(child.id().unwrap()).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let exit = super::stop_child(&mut child, pgid, crate::domain::ExitReason::Cancelled).await;
+        assert_eq!(exit.reason, crate::domain::ExitReason::Cancelled);
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(0));
     }
 }

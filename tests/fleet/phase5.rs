@@ -344,3 +344,71 @@ fn phase5_fleet_moves_and_cancels_use_saved_authority_and_explicit_machine() {
     assert_eq!(wait_event(&origin, a, 1)[0]["event"], "JOB_CANCELLED");
     assert_eq!(wait_event(&origin, c, 1)[0]["event"], "JOB_SUCCEEDED");
 }
+
+#[test]
+fn review_fix_fleet_offline_origin_suppresses_an_ended_blocked_notice() {
+    use homebased::queue::schedule::NoticeThresholds;
+    let (mut origin, executor) = dependency_fleet("notice-offline");
+    let low = JobId::new();
+    let head = JobId::new();
+    let _jobs = Jobs {
+        executor: &executor,
+        ids: vec![low, head],
+    };
+    submit_ok(
+        &origin,
+        low,
+        &spec(
+            &origin,
+            &executor,
+            "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done; exit 0",
+        ),
+    );
+    assert!(wait_until(Duration::from_secs(10), || executor
+        .home
+        .join("ready")
+        .exists()));
+    let mut head_spec = spec(&origin, &executor, "exit 0");
+    head_spec["priority"] = json!("high");
+    submit_ok(&origin, head, &head_spec);
+    origin.stop();
+    assert!(wait_until(Duration::from_secs(10), || store(&executor)
+        .blocked_episode(executor.machine_id())
+        .unwrap()
+        .is_some_and(|episode| episode.job == head)));
+    let authority = store(&executor);
+    let episode = authority
+        .blocked_episode(executor.machine_id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        authority
+            .produce_job_blocked(
+                executor.machine_id(),
+                episode,
+                NoticeThresholds {
+                    after_yield: Duration::ZERO,
+                    after_wait: Duration::ZERO
+                },
+                chrono::Utc::now()
+            )
+            .unwrap()
+    );
+    fs::write(executor.home.join("finish"), "").unwrap();
+    assert!(wait_until(Duration::from_secs(15), || store(&executor)
+        .job_events(head)
+        .unwrap()
+        .len()
+        == 2));
+    assert!(events(&origin, head).is_empty());
+    origin.restart();
+    let received = wait_event(&origin, head, 2);
+    assert_eq!(
+        received.len(),
+        1,
+        "an obsolete blocked notice must not reach the callback"
+    );
+    assert_eq!(received[0]["event"], "JOB_SUCCEEDED");
+    assert_eq!(received[0]["seq"], 2);
+    assert_eq!(store(&executor).job_events(head).unwrap().len(), 2);
+}

@@ -410,6 +410,7 @@ impl ProcessSource for ReusedPid {
         }
         match self.inner.pin(pid) {
             Read::Found(handle) => Read::Found((pid, handle)),
+            Read::Exited(identity) => Read::Exited(identity),
             Read::Gone => Read::Gone,
             Read::Refused(errno) => Read::Refused(errno),
         }
@@ -609,4 +610,162 @@ fn apple_platform_binary_exposes_an_empty_environment() {
         alive,
         "the sweep cannot see the marker, so it leaves the process"
     );
+}
+
+/// Fork a marked child after enumeration, then lose the parent before inspection
+struct ForkThenExit {
+    marker: TaskId,
+    scans: u32,
+    hidden: bool,
+    dead_parent: bool,
+    alive: bool,
+    sent: Vec<Pid>,
+}
+
+impl ProcessSource for ForkThenExit {
+    type Handle = Pid;
+
+    fn list(&mut self) -> io::Result<Vec<Pid>> {
+        self.scans += 1;
+        Ok(
+            if self.scans == 1 || (self.dead_parent && self.scans == 2) || self.hidden {
+                vec![Pid::from_raw(12345)]
+            } else if self.alive {
+                vec![Pid::from_raw(12346)]
+            } else {
+                vec![]
+            },
+        )
+    }
+
+    fn info(&mut self, pid: Pid) -> Read<ProcessInfo> {
+        if pid.as_raw() == 12345 && self.dead_parent {
+            return Read::Exited(ProcessIdentity {
+                pid,
+                start: ProcessStartTime(u64::from(self.scans)),
+            });
+        }
+        if pid.as_raw() == 12345 || !self.alive {
+            return Read::Gone;
+        }
+        Read::Found(ProcessInfo {
+            start: ProcessStartTime(1),
+            pgid: pid,
+            uid: nix::unistd::geteuid().as_raw(),
+            zombie: false,
+        })
+    }
+
+    fn environment(&mut self, _: Pid) -> Read<Environment> {
+        Read::Found(Environment(
+            format!("HOMEBASED_TASK_ID={}\0", self.marker).into_bytes(),
+        ))
+    }
+
+    fn pin(&mut self, pid: Pid) -> Read<Pid> {
+        Read::Found(pid)
+    }
+
+    fn send(&mut self, pid: &Pid, _: Signal) -> Result<(), Errno> {
+        self.sent.push(*pid);
+        self.alive = false;
+        Ok(())
+    }
+
+    fn send_group(&mut self, _: Pid, _: Signal) -> Result<(), Errno> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn review_fix_cleanup_rescans_a_parent_that_forks_then_exits() {
+    let marker = TaskId::new();
+    let mut source = ForkThenExit {
+        marker,
+        scans: 0,
+        hidden: false,
+        dead_parent: false,
+        alive: true,
+        sent: vec![],
+    };
+    let timing = CleanupTiming {
+        poll: Duration::from_millis(1),
+        ..FAST
+    };
+    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), timing);
+    assert!(matches!(outcome, SweepOutcome::Completed { .. }));
+    assert_eq!(source.sent, vec![Pid::from_raw(12346)]);
+    assert!(!source.alive);
+    assert!(
+        source.scans >= 4,
+        "two stable empty scans must follow cleanup"
+    );
+}
+
+#[test]
+fn review_fix_cleanup_reports_incomplete_without_stable_empty_confirmation() {
+    let marker = TaskId::new();
+    let mut source = ForkThenExit {
+        marker,
+        scans: 0,
+        hidden: true,
+        dead_parent: false,
+        alive: true,
+        sent: vec![],
+    };
+    let timing = CleanupTiming {
+        term_grace: Duration::from_millis(3),
+        kill_grace: Duration::from_millis(3),
+        poll: Duration::from_millis(1),
+        rounds: 1,
+        deadline: Duration::from_millis(6),
+    };
+    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), timing);
+    assert!(matches!(outcome, SweepOutcome::Incomplete(_)));
+    assert!(source.alive);
+    assert!(source.sent.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn review_fix_unreaped_child_is_exited_not_a_fresh_disappearance() {
+    let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    let mut source = SystemProcesses::new().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observed = loop {
+        let observed = source.info(pid);
+        if !matches!(observed, Read::Found(info) if !info.zombie) {
+            break observed;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    child.wait().unwrap();
+    assert!(matches!(observed, Read::Exited(_)), "{observed:?}");
+}
+
+#[test]
+fn review_fix_cleanup_never_confirms_two_newly_exited_parent_scans() {
+    let marker = TaskId::new();
+    let mut source = ForkThenExit {
+        marker,
+        scans: 0,
+        hidden: false,
+        dead_parent: true,
+        alive: true,
+        sent: vec![],
+    };
+    let timing = CleanupTiming {
+        poll: Duration::from_millis(1),
+        ..FAST
+    };
+    let outcome = sweep_marker_with(&mut source, marker, &BTreeSet::new(), timing);
+    assert!(matches!(outcome, SweepOutcome::Completed { .. }));
+    assert_eq!(source.sent, vec![Pid::from_raw(12346)]);
+    assert!(!source.alive);
 }
