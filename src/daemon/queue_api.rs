@@ -65,11 +65,20 @@ pub fn read_routes() -> Router<AppState> {
         .route("/v1/resource/schema", get(schema))
 }
 
-/// Resource and job writes; the web router adds browser write protection
-pub fn write_routes() -> Router<AppState> {
+/// Writes that create work or resources, served only on the Unix socket
+///
+/// A job runs arbitrary commands, so submitting one over the TCP listener
+/// would let any host that reaches it execute code, as task submit would
+pub fn submit_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/resources", post(register))
         .route("/v1/resource/jobs", post(submit))
+}
+
+/// Writes that only reorder, stop, or release accepted work; the web router
+/// adds browser write protection
+pub fn control_routes() -> Router<AppState> {
+    Router::new()
         .route("/v1/resource/jobs/{job}/move", post(move_job))
         .route("/v1/resource/jobs/{job}/cancel", post(cancel))
         .route("/v1/resource/release", post(release))

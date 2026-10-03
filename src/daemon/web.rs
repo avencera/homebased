@@ -3,7 +3,9 @@
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
 //! is reachable from any web page the user has open, so this router never
-//! exposes task submit or cancel; queue writes require same-origin JSON
+//! exposes task submit or cancel, or job submit and resource registration.
+//! Queue controls that move, cancel, or release accepted jobs require
+//! same-origin JSON
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -85,7 +87,7 @@ pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read API, guarded queue writes, and the embedded single-page app
+/// Read API, guarded queue controls, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -93,7 +95,7 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         None => api::read_routes(),
     };
     routes
-        .merge(super::queue_api::write_routes().layer(middleware::from_fn(browser_write_guard)))
+        .merge(super::queue_api::control_routes().layer(middleware::from_fn(browser_write_guard)))
         .fallback(asset)
         .layer(middleware::from_fn(move |request: Request, next: Next| {
             let policy = policy.clone();

@@ -521,36 +521,39 @@ fn phase5_blocked_and_check_due_callbacks_only_reach_the_affected_job() {
 }
 
 #[test]
-fn phase5_web_queue_writes_require_same_origin_json_and_bound_bodies() {
+fn phase5_web_serves_only_guarded_queue_controls() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
     let h = Harness::with_dashboard();
     let addr = super::dashboard_addr(&h);
-    let request = |origin: &str, body: &str| {
+    let request = |path: &str, origin: &str, body: &str| {
         let mut stream = TcpStream::connect(&addr).unwrap();
-        write!(stream, "POST /v1/resources HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        write!(stream, "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
     };
-    assert!(request("http://other.example", "{\"name\":\"browser\"}").starts_with("HTTP/1.1 403"));
-    assert!(request("null", "{\"name\":\"browser\"}").starts_with("HTTP/1.1 403"));
-    assert!(
-        request(&format!("http://{addr}"), "{\"name\":\"browser\"}").starts_with("HTTP/1.1 200")
-    );
-    assert!(
-        request(
-            &format!("http://{addr}"),
-            "{\"name\":\"bad\",\"unknown\":true}"
-        )
-        .contains("invalid_spec")
-    );
-    let huge = format!("{{\"name\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
-    assert!(request(&format!("http://{addr}"), &huge).contains("invalid_spec"));
+    let same = format!("http://{addr}");
+
+    // a job runs arbitrary commands, so the TCP listener must never accept one
+    for path in ["/v1/resources", "/v1/resource/jobs"] {
+        let response = request(path, &same, "{}");
+        assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
+    }
+
+    let cancel = format!("/v1/resource/jobs/{}/cancel", JobId::new());
+    let body = format!("{{\"operation_id\":\"{}\"}}", uuid::Uuid::now_v7());
+    assert!(request(&cancel, "http://other.example", &body).starts_with("HTTP/1.1 403"));
+    assert!(request(&cancel, "null", &body).starts_with("HTTP/1.1 403"));
+    let allowed = request(&cancel, &same, &body);
+    assert!(!allowed.starts_with("HTTP/1.1 403"), "{allowed}");
+    assert!(allowed.contains("\"error\""), "{allowed}");
+    let huge = format!("{{\"operation_id\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
+    assert!(request(&cancel, &same, &huge).contains("invalid_spec"));
+
     let resources = super::http_get(&addr, "/v1/resources");
     assert_eq!(resources.status, 200);
-    assert!(resources.body.contains("browser"));
     let schema = cli(&h, &["resource", "schema"]);
     assert!(schema["properties"].is_object());
 }
