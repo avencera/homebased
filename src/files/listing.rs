@@ -1,7 +1,7 @@
-//! Path resolution and directory listing.
+//! Path resolution and directory listing
 
 use std::cmp::Ordering;
-use std::fs::{self, Metadata};
+use std::fs::{self, DirEntry, Metadata};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -13,107 +13,108 @@ use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::files::token::{PathToken, decode_path, encode_path, name_display, path_display};
 
-/// Kind of a navigable directory entry.
+/// Kind of a navigable directory entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
-    /// Directory.
+    /// Directory
     Directory,
-    /// Regular file.
+    /// Regular file
     File,
-    /// Symbolic link (target kind is resolved for navigation when possible).
+    /// Symbolic link (target kind is resolved for navigation when possible)
     Symlink,
-    /// Other (shown in listings but not opened as content).
+    /// Other (shown in listings but not opened as content)
     Other,
 }
 
-/// One entry in a directory listing.
+/// One entry in a directory listing
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileEntry {
-    /// Lossy display name.
+    /// Lossy display name
     pub name: String,
-    /// Entry kind.
+    /// Entry kind
     pub kind: EntryKind,
-    /// Resolved target kind for a symbolic link.
+    /// Resolved target kind for a symbolic link
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_kind: Option<EntryKind>,
-    /// Opaque token for this entry's path.
+    /// Opaque token for this entry's path
     pub token: PathToken,
-    /// Exact UTF-8 path for mirrored content URLs. Absent for non-UTF-8 paths.
+    /// Exact UTF-8 path for mirrored content URLs. Absent for non-UTF-8 paths
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_path: Option<String>,
-    /// Size in bytes for regular files.
+    /// Size in bytes for regular files
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Modification time when available.
+    /// Modification time when available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified: Option<DateTime<Utc>>,
 }
 
-/// Resolved absolute path metadata.
+/// Resolved absolute path metadata
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedPath {
-    /// Schema version.
+    /// Schema version
     pub api_version: u32,
-    /// Path the caller entered.
+    /// Path the caller entered
     pub requested: String,
-    /// Canonical resolved path when it differs from `requested`.
+    /// Canonical resolved path when it differs from `requested`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
-    /// Entry kind after following the final symlink for metadata.
+    /// Entry kind after following the final symlink for metadata
     pub kind: EntryKind,
-    /// Opaque token for the resolved path.
+    /// Opaque token for the resolved path
     pub token: PathToken,
-    /// Exact UTF-8 path for mirrored content URLs. Absent for non-UTF-8 paths.
+    /// Exact UTF-8 path for mirrored content URLs. Absent for non-UTF-8 paths
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_path: Option<String>,
-    /// Size for regular files.
+    /// Size for regular files
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Modification time when available.
+    /// Modification time when available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified: Option<DateTime<Utc>>,
 }
 
-/// `GET /v1/files/{token}` directory body.
+/// `GET /v1/files/{token}` directory body
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DirectoryListing {
-    /// Schema version.
+    /// Schema version
     pub api_version: u32,
-    /// Display path of the directory.
+    /// Display path of the directory
     pub path: String,
-    /// Token for this directory.
+    /// Token for this directory
     pub token: PathToken,
-    /// Parent directory token, absent at filesystem root.
+    /// Parent directory token, absent at filesystem root
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<PathToken>,
-    /// Sorted entries.
+    /// Sorted entries
     pub entries: Vec<FileEntry>,
 }
 
-/// `POST /v1/files/resolve` body.
+/// `POST /v1/files/resolve` body
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolveBody {
-    /// Absolute UTF-8 path.
+    /// Absolute UTF-8 path
     pub path: String,
 }
 
-/// Content-origin discovery for the web client.
+/// Content-origin discovery for the web client
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentOriginBody {
-    /// Schema version.
+    /// Schema version
     pub api_version: u32,
-    /// TCP port of the content listener on the same host as the dashboard.
+    /// TCP port of the content listener on the same host as the dashboard
     pub port: u16,
 }
 
-/// Resolve a user-entered absolute UTF-8 path.
+/// Resolve a user-entered absolute UTF-8 path
 pub fn resolve_absolute_path(raw: &str) -> Result<ResolvedPath, AppError> {
     if raw.is_empty() {
         return Err(AppError::Usage {
             message: "path must not be blank".into(),
         });
     }
+
     let requested = raw;
     let path = Path::new(requested);
     if !path.is_absolute() {
@@ -121,10 +122,12 @@ pub fn resolve_absolute_path(raw: &str) -> Result<ResolvedPath, AppError> {
             message: "path must be absolute".into(),
         });
     }
+
     let meta = symlink_metadata(path)?;
     if !(meta.is_dir() || meta.is_file() || meta.file_type().is_symlink()) {
         return reject_special(&meta);
     }
+
     let resolved_path = canonicalize_existing(path)?;
     let resolved_meta = metadata(&resolved_path)?;
     if !(resolved_meta.is_dir() || resolved_meta.is_file()) {
@@ -135,6 +138,7 @@ pub fn resolve_absolute_path(raw: &str) -> Result<ResolvedPath, AppError> {
             ),
         });
     }
+
     let kind = classify_meta(&resolved_meta, meta.file_type().is_symlink());
     let requested_display = path_display(path);
     let resolved_display = path_display(&resolved_path);
@@ -154,7 +158,7 @@ pub fn resolve_absolute_path(raw: &str) -> Result<ResolvedPath, AppError> {
     })
 }
 
-/// List one directory identified by an opaque token.
+/// List one directory identified by an opaque token
 pub fn list_directory(token: &PathToken) -> Result<DirectoryListing, AppError> {
     let path = decode_path(token)?;
     let meta = metadata(&path)?;
@@ -163,6 +167,7 @@ pub fn list_directory(token: &PathToken) -> Result<DirectoryListing, AppError> {
             message: format!("{} is not a directory", path_display(&path)),
         });
     }
+
     let read_dir = fs::read_dir(&path).map_err(map_io(&path))?;
     let mut entries = Vec::new();
     for entry in read_dir {
@@ -171,58 +176,10 @@ pub fn list_directory(token: &PathToken) -> Result<DirectoryListing, AppError> {
         if is_dot_or_dotdot(&name) {
             continue;
         }
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|err| map_changed(&path, err))?;
-        let (kind, target_kind, size, modified) = if file_type.is_symlink() {
-            match metadata(&entry_path) {
-                Ok(target) => {
-                    let target_kind = if target.is_dir() {
-                        EntryKind::Directory
-                    } else if target.is_file() {
-                        EntryKind::File
-                    } else {
-                        EntryKind::Other
-                    };
-                    (
-                        EntryKind::Symlink,
-                        Some(target_kind),
-                        size_for(&target, target_kind),
-                        modified_at(&target)
-                            .or_else(|| entry.metadata().ok().as_ref().and_then(modified_at)),
-                    )
-                }
-                Err(_) => (
-                    EntryKind::Symlink,
-                    None,
-                    None,
-                    entry.metadata().ok().as_ref().and_then(modified_at),
-                ),
-            }
-        } else if file_type.is_dir() {
-            let meta = entry.metadata().map_err(|err| map_changed(&path, err))?;
-            (EntryKind::Directory, None, None, modified_at(&meta))
-        } else if file_type.is_file() {
-            let meta = entry.metadata().map_err(|err| map_changed(&path, err))?;
-            (EntryKind::File, None, Some(meta.len()), modified_at(&meta))
-        } else {
-            let meta = entry.metadata().ok();
-            (
-                EntryKind::Other,
-                None,
-                None,
-                meta.as_ref().and_then(modified_at),
-            )
-        };
-        entries.push(FileEntry {
-            name: name_display(&name),
-            kind,
-            target_kind,
-            token: encode_path(&entry_path),
-            content_path: entry_path.to_str().map(str::to_owned),
-            size,
-            modified,
-        });
+
+        entries.push(list_entry(&entry, &path)?);
     }
+
     entries.sort_by(cmp_entries);
     Ok(DirectoryListing {
         api_version: API_VERSION,
@@ -230,6 +187,69 @@ pub fn list_directory(token: &PathToken) -> Result<DirectoryListing, AppError> {
         token: encode_path(&path),
         parent: parent_token(&path),
         entries,
+    })
+}
+
+fn list_entry(entry: &DirEntry, directory: &Path) -> Result<FileEntry, AppError> {
+    let name = entry.file_name();
+    let entry_path = entry.path();
+    let file_type = entry
+        .file_type()
+        .map_err(|err| map_changed(directory, err))?;
+    let (kind, target_kind, size, modified) = if file_type.is_symlink() {
+        match metadata(&entry_path) {
+            Ok(target) => {
+                let target_kind = if target.is_dir() {
+                    EntryKind::Directory
+                } else if target.is_file() {
+                    EntryKind::File
+                } else {
+                    EntryKind::Other
+                };
+
+                (
+                    EntryKind::Symlink,
+                    Some(target_kind),
+                    size_for(&target, target_kind),
+                    modified_at(&target)
+                        .or_else(|| entry.metadata().ok().as_ref().and_then(modified_at)),
+                )
+            }
+            Err(_) => (
+                EntryKind::Symlink,
+                None,
+                None,
+                entry.metadata().ok().as_ref().and_then(modified_at),
+            ),
+        }
+    } else if file_type.is_dir() {
+        let meta = entry
+            .metadata()
+            .map_err(|err| map_changed(directory, err))?;
+        (EntryKind::Directory, None, None, modified_at(&meta))
+    } else if file_type.is_file() {
+        let meta = entry
+            .metadata()
+            .map_err(|err| map_changed(directory, err))?;
+        (EntryKind::File, None, Some(meta.len()), modified_at(&meta))
+    } else {
+        let meta = entry.metadata().ok();
+        (
+            EntryKind::Other,
+            None,
+            None,
+            meta.as_ref().and_then(modified_at),
+        )
+    };
+
+    Ok(FileEntry {
+        name: name_display(&name),
+        kind,
+        target_kind,
+        token: encode_path(&entry_path),
+        content_path: entry_path.to_str().map(str::to_owned),
+        size,
+        modified,
     })
 }
 
@@ -307,6 +327,7 @@ fn reject_special<T>(meta: &Metadata) -> Result<T, AppError> {
             message: "special files are not browsable".into(),
         });
     }
+
     Err(AppError::UnsupportedFile {
         message: "unsupported file type".into(),
     })
@@ -342,9 +363,12 @@ fn map_changed(path: &Path, err: std::io::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{EntryKind, list_directory, resolve_absolute_path};
+    use crate::error::AppError;
+    use crate::files::token::{decode_path, path_display};
     #[cfg(not(target_os = "macos"))]
     use std::ffi::OsString;
+    use std::fs;
     #[cfg(not(target_os = "macos"))]
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;

@@ -7,11 +7,9 @@ use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::AbortHandle;
 
-use crate::callback::ATTENTION_SETTLE;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{
-    AttentionState, ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskRow, TaskState,
-    Workload,
+    ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskRow, TaskState, Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
@@ -39,8 +37,6 @@ pub enum TaskMsg {
     LockReleased,
     /// Output-inactivity timer fired
     AttentionDue,
-    /// A legacy attention sender can no longer be alive
-    AttentionRecoveryDue,
 }
 
 /// Holds refs; `Arguments` is the `TaskId`
@@ -51,15 +47,12 @@ pub struct TaskActor {
     pub(crate) store: ActorRef<StoreMsg>,
 }
 
-/// In-memory attention phase for one watch actor. Armed and recovering cannot
-/// overlap
+/// In-memory attention phase for one watch actor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttentionPhase {
-    /// Timer may still fire; no send is in flight
+    /// Timer may still fire
     Armed,
-    /// A legacy sender may still own the old persisted claim until its bound passes
-    Recovering,
-    /// Delivered, or the task went terminal; no further reminder
+    /// Produced, or the task went terminal; no further reminder
     Done,
 }
 
@@ -104,20 +97,13 @@ impl Actor for TaskActor {
         let row = call(&self.store, |reply| StoreMsg::GetTask { id, reply })
             .await?
             .ok_or(AppError::TaskNotFound { id })?;
-        let (attention, attention_timer) = match (&row.attention, row.state.is_terminal()) {
-            (_, true) | (AttentionState::Delivered { .. }, false) => (AttentionPhase::Done, None),
-            (AttentionState::Sending, false) => (
-                AttentionPhase::Recovering,
-                Some(schedule_attention_recovery(&myself)),
-            ),
-            (AttentionState::Pending, false) => (
-                AttentionPhase::Armed,
-                Some(arm_attention_timer(
-                    myself.clone(),
-                    &row,
-                    self.home.task_paths(id).output,
-                )),
-            ),
+        let (attention, attention_timer) = if row.state.is_terminal() || row.check_due_at.is_some()
+        {
+            (AttentionPhase::Done, None)
+        } else {
+            let output = self.home.task_paths(id).output;
+            let timer = arm_attention_timer(myself.clone(), &row, output);
+            (AttentionPhase::Armed, Some(timer))
         };
         Ok(TaskWatch {
             id,
@@ -161,19 +147,6 @@ impl Actor for TaskActor {
                         state.replace_attention_timer(schedule_attention_retry(&myself));
                     }
                 }
-            }
-            TaskMsg::AttentionRecoveryDue => {
-                state.cancel_attention_timer();
-                if state.attention != AttentionPhase::Recovering {
-                    return Ok(());
-                }
-                call(&self.store, |reply| StoreMsg::ReleaseAttention {
-                    id: state.id,
-                    reply,
-                })
-                .await?;
-                state.attention = AttentionPhase::Armed;
-                myself.cast(TaskMsg::AttentionDue)?;
             }
         }
         Ok(())
@@ -274,12 +247,6 @@ fn schedule_attention_retry(myself: &ActorRef<TaskMsg>) -> AbortHandle {
         .abort_handle()
 }
 
-fn schedule_attention_recovery(myself: &ActorRef<TaskMsg>) -> AbortHandle {
-    myself
-        .send_after(ATTENTION_SETTLE, || TaskMsg::AttentionRecoveryDue)
-        .abort_handle()
-}
-
 /// Outcome of starting one attention attempt
 enum AttentionStep {
     /// The task has not started or output resumed, so another check is armed
@@ -298,12 +265,17 @@ async fn start_attention_reminder(
         return Ok(AttentionStep::Done);
     };
 
+    if row.check_due_at.is_some() {
+        return Ok(AttentionStep::Done);
+    }
     match row.state {
         TaskState::Queued => {
             return Ok(AttentionStep::Deferred(schedule_attention_retry(&myself)));
         }
         TaskState::Running { .. } => {}
-        TaskState::Finished { .. } | TaskState::Lost => return Ok(AttentionStep::Done),
+        TaskState::Finished { .. } | TaskState::Lost | TaskState::Preempted { .. } => {
+            return Ok(AttentionStep::Done);
+        }
     }
 
     let output = actor.home.task_paths(id).output;
@@ -320,6 +292,24 @@ async fn start_attention_reminder(
         )));
     }
 
+    if call(&actor.store, |reply| StoreMsg::QueueTaskJob {
+        task: id,
+        reply,
+    })
+    .await?
+    .is_some()
+    {
+        let produced = call(&actor.store, |reply| StoreMsg::QueueCheckDue {
+            task: id,
+            reply,
+        })
+        .await?;
+        return Ok(if produced {
+            AttentionStep::Done
+        } else {
+            AttentionStep::Deferred(schedule_attention_retry(&myself))
+        });
+    }
     if !call(&actor.store, |reply| StoreMsg::IsEventTask { id, reply }).await? {
         return Err(AppError::Internal {
             message: format!("task {id} has no durable event identity"),
@@ -370,7 +360,7 @@ async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<AfterLock, Ap
 /// The container runs under dockerd, so the task stays running while it runs.
 /// The new worker finds the container by its saved ID, ID file, or name, and
 /// finishes the witness. A streak of workers that never reach the container
-/// ends with the task lost, which keeps any resource loan reserved
+/// ends with the task lost
 async fn adopt_container(actor: &TaskActor, row: TaskRow) -> Result<AfterLock, AppError> {
     let id = row.id;
     let claimed = call(&actor.store, |reply| StoreMsg::ClaimContainerAdoption {
@@ -445,7 +435,7 @@ async fn apply_exit(
     let id = row.id;
     let paths = actor.home.task_paths(id);
     let worker_thread = runner::worker_thread(&row, &paths);
-    let cas = call(&actor.store, |reply| StoreMsg::CasExitWithWorkerThread {
+    let cas = call(&actor.store, |reply| StoreMsg::CasExit {
         id,
         from: row.status(),
         reason: reason.clone(),
@@ -468,7 +458,22 @@ pub(crate) async fn cancel_task(
     id: TaskId,
 ) -> Result<CancelResult, AppError> {
     let result = call(store, |reply| StoreMsg::RequestCancel { id, reply }).await?;
-    match &result {
+    signal_stop(id, &result);
+    Ok(result)
+}
+
+/// Signal the worker after the queue has committed a restart or user stop
+pub(crate) async fn stop_run_task(
+    store: &ActorRef<StoreMsg>,
+    id: TaskId,
+) -> Result<CancelResult, AppError> {
+    let result = call(store, |reply| StoreMsg::QueueSignalStop { id, reply }).await?;
+    signal_stop(id, &result);
+    Ok(result)
+}
+
+fn signal_stop(id: TaskId, result: &CancelResult) {
+    match result {
         CancelResult::AlreadyTerminal(_) => {}
         CancelResult::CancelledQueued(_) => {}
         // signal the worker pid, not `-pid`: `task-run` forwards to the child's own process group
@@ -483,7 +488,6 @@ pub(crate) async fn cancel_task(
             }
         }
     }
-    Ok(result)
 }
 
 async fn require_task(store: &ActorRef<StoreMsg>, id: TaskId) -> Result<TaskRow, AppError> {
@@ -495,7 +499,6 @@ async fn require_task(store: &ActorRef<StoreMsg>, id: TaskId) -> Result<TaskRow,
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::str::FromStr;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -638,7 +641,7 @@ mod tests {
 
     use crate::daemon::actors::{StoreActor, StoreMsg, call};
     use crate::domain::{
-        Agent, AgentKind, AgentWorkload, ProcessStatus, TaskEnv, TaskId, ThreadId, Workload,
+        Agent, AgentKind, AgentWorkload, ProcessStatus, TaskEnv, TaskId, Workload,
     };
     use crate::home::Home;
     use crate::store::{CancelResult, NewTask, new_queued_task};
@@ -654,20 +657,29 @@ mod tests {
             .unwrap();
 
         let id = TaskId::new();
+        let cwd = dir.path().to_path_buf();
+        let spec: crate::spec::NormalizedSpec = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "cancel test",
+            "cwd": cwd,
+            "timeout": "4h",
+            "workload": { "type": "task", "command": ["/bin/true"] }
+        }))
+        .unwrap();
         let row = new_queued_task(NewTask {
             id,
-            name: None,
-            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
+            name: spec.name.clone(),
+            thread: spec.thread,
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, None),
                 extra_args: vec![],
                 report_trailer: false,
                 resume_thread: None,
             }),
-            cwd: dir.path().to_path_buf(),
-            timeout: Duration::from_secs(4 * 3600),
+            cwd,
+            timeout: spec.timeout,
             env: TaskEnv {
-                // empty PATH so migration keeps an unavailable callback context
                 path: dir.path().join("empty-bin").display().to_string(),
                 home: dir.path().display().to_string(),
             },
@@ -675,15 +687,16 @@ mod tests {
         });
         crate::store::Store::open(&home.db_path())
             .unwrap()
-            .insert_task(&row)
+            .insert_local_task(
+                &row,
+                &spec,
+                crate::machine::MachineId::new(),
+                crate::submission::RequestId::new(),
+                crate::submission::CallbackExecutable::Unavailable {
+                    reason: "no codex in this test".into(),
+                },
+            )
             .unwrap();
-
-        call(&store, |reply| StoreMsg::MigrateLegacyLocal {
-            machine: crate::machine::MachineId::new(),
-            reply,
-        })
-        .await
-        .unwrap();
 
         let result = cancel_task(&store, id).await.unwrap();
         assert!(matches!(result, CancelResult::CancelledQueued(_)));
@@ -693,17 +706,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(final_row.status(), ProcessStatus::Cancelled);
-        assert_eq!(
-            final_row.callback_status,
-            crate::domain::CallbackStatus::Pending
-        );
-        let event = call(&store, |reply| StoreMsg::FirstPendingOutbound { id, reply })
-            .await
+        let outbound = crate::store::Store::open(&home.db_path())
             .unwrap()
+            .pending_outbound_events(id)
             .unwrap();
-        assert_eq!(event.event.seq.get(), 1);
+        let terminal = outbound.last().unwrap();
+        assert_eq!(terminal.event.seq.get(), 2);
         assert!(matches!(
-            event.event.payload,
+            terminal.event.payload,
             crate::events::EventPayload::Callback {
                 state: Some(ProcessStatus::Cancelled),
                 ..

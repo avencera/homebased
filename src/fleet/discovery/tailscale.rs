@@ -1,9 +1,9 @@
-//! Optional Tailscale peer discovery.
+//! Optional Tailscale peer discovery
 //!
 //! Reads `tailscale status --json` and reports each online peer's Tailscale
 //! IPv4 address on the configured Homebased port. Tailscale does not know
 //! whether a peer runs Homebased, so most candidates fail their probe; that is
-//! expected and costs one bounded request per peer and round.
+//! expected and costs one bounded request per peer and round
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -20,15 +20,15 @@ use crate::fleet::address::MachineAddress;
 use crate::fleet::directory::{Sighting, SightingProvider};
 use crate::fleet::discovery::{DiscoveryEvent, DiscoverySender};
 
-/// macOS App Store and standalone builds ship the CLI inside the app bundle.
+/// macOS App Store and standalone builds ship the CLI inside the app bundle
 const MACOS_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
-/// Tailscale timing.
+/// Tailscale timing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailscaleTimings {
-    /// Time between scans.
+    /// Time between scans
     pub interval: Duration,
-    /// Time limit for one `tailscale status` call.
+    /// Time limit for one `tailscale status` call
     pub timeout: Duration,
 }
 
@@ -41,13 +41,13 @@ impl Default for TailscaleTimings {
     }
 }
 
-/// Running Tailscale scanner.
+/// Running Tailscale scanner
 pub struct TailscaleProvider {
     scan: JoinHandle<()>,
 }
 
 impl TailscaleProvider {
-    /// Start periodic scans that report peers on `port`.
+    /// Start periodic scans that report peers on `port`
     #[must_use]
     pub fn start(port: u16, events: DiscoverySender, timings: TailscaleTimings) -> Self {
         Self {
@@ -55,7 +55,7 @@ impl TailscaleProvider {
         }
     }
 
-    /// Stop scanning.
+    /// Stop scanning
     pub fn shutdown(self) {
         self.scan.abort();
     }
@@ -85,11 +85,13 @@ async fn scan_loop(port: u16, events: DiscoverySender, timings: TailscaleTimings
                 message,
             }],
         };
+
         for report in reports {
             if events.send(report).await.is_err() {
                 return;
             }
         }
+
         tokio::time::sleep(timings.interval).await;
     }
 }
@@ -111,6 +113,7 @@ async fn scan(port: u16, timeout: Duration) -> Result<Vec<MachineAddress>, Strin
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("tailscale status failed: {}", stderr.trim()));
     }
+
     parse_status(&output.stdout, port)
 }
 
@@ -118,12 +121,13 @@ fn cli_path() -> Option<PathBuf> {
     if let Ok(path) = which::which("tailscale") {
         return Some(path);
     }
+
     let app = PathBuf::from(MACOS_APP_CLI);
     app.is_file().then_some(app)
 }
 
 /// Fields read from `tailscale status --json`. Everything else is ignored:
-/// this is another program's output, not a Homebased boundary.
+/// this is another program's output, not a Homebased boundary
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Status {
@@ -150,6 +154,7 @@ fn parse_status(stdout: &[u8], port: u16) -> Result<Vec<MachineAddress>, String>
         .filter_map(|peer| peer.tailscale_ips.iter().find(|ip| ip.is_ipv4()))
         .map(|ip| MachineAddress::from_socket(SocketAddr::new(*ip, port)))
         .collect();
+
     addresses.sort();
     addresses.dedup();
     Ok(addresses)
@@ -157,7 +162,7 @@ fn parse_status(stdout: &[u8], port: u16) -> Result<Vec<MachineAddress>, String>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::parse_status;
 
     #[test]
     fn parses_online_peers_ipv4_only() {

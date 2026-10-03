@@ -1,5 +1,7 @@
 //! Ordered executor outbox delivery and recovery
 
+pub(crate) mod jobs;
+
 use crate::fleet::probe::VerifiedDestination;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
@@ -227,10 +229,6 @@ impl Sender {
         let destination = if origin == self.local {
             None
         } else {
-            // the authority observes its own task row, so a remote callback outage
-            // cannot hide a confirmed start from the resource owner
-            self.supervisor
-                .cast(SupervisorMsg::RemoteOriginEvent { id: task })?;
             let FleetState::Enabled(fleet) = &self.fleet else {
                 return Ok(DeliveryResult::Retry(
                     "fleet is disabled for remote origin".into(),
@@ -244,13 +242,7 @@ impl Sender {
                     "local machine identity is duplicated".into(),
                 ));
             }
-            let verified = match fleet.connect(origin).await {
-                Ok(verified) => verified,
-                Err(_) => {
-                    fleet.discover_now().await;
-                    fleet.connect(origin).await?
-                }
-            };
+            let verified = fleet.connect_rediscovering(origin).await?;
             Some((fleet.clone(), verified))
         };
         let client = ClusterClient::default();

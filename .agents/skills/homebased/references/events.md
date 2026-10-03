@@ -10,8 +10,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `seq` | Per-task event sequence. Present on new events. Use with `task` as the event identity. It is separate from the `seq` on each worker report. |
 | `origin_machine` | Stable UUID of the machine that owns the Codex thread and sends the callback. Present on new events. |
 | `execution_machine` | Stable UUID of the machine that ran the child. Present on new events. |
-| `name` | Submitted task name. Omitted only for tasks stored before name was required. |
-| `display_name` | Non-empty server-derived label: the submitted name, or a workload fallback for unnamed stored rows. |
+| `name` | Submitted task name. |
 | `workload` | Discriminated union: `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. |
 | `thread` | The thread the event was addressed to. |
 | `cwd` | The child's working directory. |
@@ -23,6 +22,10 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `cancel_reason` | Present only when the origin cancelled a held task before it started: `{"type":"dependency_ended","dependency":"<uuid>","outcome":"failed"}`, or `{"type":"requested"}` after `task cancel`. `outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown` when the dependency ended but no record says how. |
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.
+
+## Job events
+
+For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, and `JOB_CHECK_DUE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
 
 ## Event table
 

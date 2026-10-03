@@ -21,7 +21,7 @@ use crate::home::Home;
 use crate::store::Store;
 
 /// Env var that marks the submitter as a Homebased worker
-const TASK_ID_ENV: &str = "HOMEBASED_TASK_ID";
+const TASK_ID_ENV: &str = crate::run_env::TASK_ID;
 
 /// Shortest shared run of hex digits at either end that marks a likely typo
 ///

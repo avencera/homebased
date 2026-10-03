@@ -271,7 +271,10 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::{ClusterTaskList, merge_records};
+    use crate::daemon::api::views::TaskSummary;
+    use crate::domain::API_VERSION;
+    use crate::machine::MachineId;
 
     const MAIN: &str = "00000000-0000-4000-8000-000000000001";
     const CODE: &str = "00000000-0000-4000-8000-000000000002";
@@ -288,7 +291,7 @@ mod tests {
     ) -> TaskSummary {
         let mut value = json!({
             "id": id,
-            "display_name": "train",
+            "name": "train",
             "status": status,
             "workload": { "type": "task", "command": ["true"] },
             "thread": "01a0b19f-f048-7832-8e98-01618ccf44d7",
@@ -368,7 +371,7 @@ mod tests {
             "machine": CODE,
             "tasks": [{
                 "id": "01a0d100-0000-7000-8000-000000000003",
-                "display_name": "train",
+                "name": "train",
                 "status": "running",
                 "workload": { "type": "container", "image": "img@sha256:00", "args": [], "gpus": "all" },
                 "thread": "01a0b19f-f048-7832-8e98-01618ccf44d7",

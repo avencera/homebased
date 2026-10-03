@@ -5,7 +5,6 @@ pub mod daemon;
 pub mod fleet;
 pub mod message;
 pub mod notify;
-pub mod release_watcher;
 pub mod resource;
 pub mod t3;
 pub mod task;
@@ -95,17 +94,17 @@ pub enum Command {
         #[command(subcommand)]
         command: notify::NotifyCommand,
     },
-    /// Register and manage shared exclusive resources
-    Resource {
-        /// Resource subcommand
-        #[command(subcommand)]
-        command: resource::ResourceCommand,
-    },
     /// Submit, inspect, cancel, and report tasks
     Task {
         /// Task subcommand
         #[command(subcommand)]
         command: task::TaskCommand,
+    },
+    /// Manage exclusive resources and priority jobs
+    Resource {
+        /// Resource subcommand
+        #[command(subcommand)]
+        command: resource::ResourceCommand,
     },
     /// Check the T3 Code local API
     T3 {
@@ -117,9 +116,6 @@ pub enum Command {
     Update(update::UpdateArgs),
     /// Print the version
     Version,
-    /// Hidden authority-bound resource release watcher run as one task
-    #[command(name = "resource-release-watcher", hide = true)]
-    ResourceReleaseWatcher(release_watcher::ReleaseWatcherArgs),
     /// Hidden worker parent of one agent
     #[command(name = "task-run", hide = true)]
     TaskRun {
@@ -274,11 +270,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Fleet { command } => fleet::run(&ctx, command).await,
         Command::Message { command } => message::run(&ctx, command).await,
         Command::Notify { command } => notify::run(&ctx, command).await,
-        Command::Resource { command } => resource::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
+        Command::Resource { command } => resource::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
-        Command::ResourceReleaseWatcher(args) => release_watcher::run(&ctx, args).await,
         Command::Version => {
             version(&ctx)?;
             Ok(ExitCode::SUCCESS)

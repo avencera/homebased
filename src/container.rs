@@ -2,11 +2,11 @@
 //!
 //! Homebased never runs a `docker` command line from a submitter. It builds the
 //! Docker CLI calls from [`ContainerWorkload`], starts and watches the container
-//! itself, and proves that the exact container stopped before it releases a
-//! resource. The container runs under `dockerd`, outside the task-run process
-//! group, so the container's own state is the witness, not a client process
+//! itself, and proves that the exact container stopped before the task ends.
+//! The container runs under `dockerd`, outside the task-run process group, so
+//! the container's own state is the witness, not a client process
 //!
-//! Version 1 targets Docker Engine on a Linux resource authority
+//! Version 1 targets Docker Engine on Linux
 
 pub mod docker;
 pub mod lifecycle;

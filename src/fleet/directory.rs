@@ -24,8 +24,8 @@ use crate::fleet::identity::{IdentityStatus, IdentityVerdict};
 use crate::fleet::protocol::{Compatibility, ProtocolRange};
 use crate::machine::{BootId, LocalIdentity, MachineId, MachineName, write_synced};
 
-/// Default time a machine stays reachable after its last successful probe.
-pub const DEFAULT_REACHABLE_TTL: Duration = Duration::seconds(90);
+/// Time a machine stays reachable after its last successful probe.
+pub const REACHABLE_TTL: Duration = Duration::seconds(90);
 
 /// Automatic discovery provider that reported an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -322,7 +322,6 @@ impl From<NameError> for AppError {
 #[derive(Debug, Clone)]
 pub struct PeerDirectory {
     local: LocalMachine,
-    reachable_ttl: Duration,
     addresses: BTreeMap<MachineAddress, AddressRecord>,
     machines: BTreeMap<MachineId, MachineRecord>,
 }
@@ -333,17 +332,9 @@ impl PeerDirectory {
     pub fn new(local: LocalMachine) -> Self {
         Self {
             local,
-            reachable_ttl: DEFAULT_REACHABLE_TTL,
             addresses: BTreeMap::new(),
             machines: BTreeMap::new(),
         }
-    }
-
-    /// Override the reachable window. Tests and slow networks use this.
-    #[must_use]
-    pub fn with_reachable_ttl(mut self, ttl: Duration) -> Self {
-        self.reachable_ttl = ttl;
-        self
     }
 
     /// Local machine.
@@ -688,7 +679,7 @@ impl PeerDirectory {
     }
 
     fn is_reachable(&self, record: &MachineRecord, now: DateTime<Utc>) -> bool {
-        now - record.last_seen <= self.reachable_ttl
+        now - record.last_seen <= REACHABLE_TTL
     }
 
     fn ranked_addresses(&self, machine: MachineId, now: DateTime<Utc>) -> Vec<RankedAddress> {
@@ -850,11 +841,24 @@ impl PeerDirectory {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fleet::advertisement::MachineAdvertisement;
-    use crate::fleet::protocol::{
-        CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, SUPPORTED_PROTOCOLS,
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use chrono::{DateTime, Duration, Utc};
+
+    use super::{
+        AddressBinding, LocalMachine, NameError, NameTarget, PeerDirectory, Reachability,
+        RouteError, Sighting, SightingProvider,
     };
+    use crate::fleet::address::{AddressSource, MachineAddress};
+    use crate::fleet::advertisement::{
+        Capabilities, MachineAdvertisement, MachineHeader, ProbedMachine,
+    };
+    use crate::fleet::identity::{IdentityStatus, IdentityVerdict};
+    use crate::fleet::protocol::{
+        CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+    };
+    use crate::machine::{BootId, LocalIdentity, MachineId, MachineName};
 
     fn local() -> LocalMachine {
         LocalMachine {

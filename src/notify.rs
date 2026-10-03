@@ -28,12 +28,14 @@ impl NtfyTopic {
         if raw.is_empty() || raw.len() > 64 {
             return Err("ntfy topic must contain 1 to 64 characters".into());
         }
+
         if raw
             .chars()
             .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-')))
         {
             return Err("ntfy topic may contain only ASCII letters, digits, '_' and '-'".into());
         }
+
         Ok(Self(raw.to_string()))
     }
 
@@ -284,7 +286,11 @@ fn response_excerpt(body: &str, token: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+
+    use super::{
+        Notice, NoticePriority, Notifier, NtfyConfig, NtfyTopic, TOKEN_FILE_LIMIT, read_token,
+    };
 
     #[test]
     fn topic_accepts_only_one_to_sixty_four_allowed_characters() {

@@ -9,8 +9,7 @@ use crate::callback::{HomebasedEvent, WorkloadView};
 use crate::dependency::DependencyState;
 use crate::domain::{
     API_VERSION, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason, ProcessStatus,
-    TaskId, TaskName, TaskReport, TaskRow, TaskStatus, TerminalCallbackProjection, ThreadId,
-    Workload,
+    TaskId, TaskName, TaskReport, TaskRow, TaskStatus, ThreadId, Workload,
 };
 use crate::machine::MachineId;
 use crate::store::{TaskPresentation, UnlaunchedTask};
@@ -50,11 +49,8 @@ pub enum CheckTimeoutStatus {
 pub struct TaskSummary {
     /// Task id.
     pub id: TaskId,
-    /// Submitted name. Omitted only for rows stored before name was required.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<TaskName>,
-    /// Non-empty server-derived label for UI and CLI.
-    pub display_name: String,
+    /// Submitted name.
+    pub name: TaskName,
     /// Process status, or `held` while the origin waits for dependencies.
     pub status: TaskStatus,
     /// Workload view.
@@ -78,9 +74,10 @@ pub struct TaskSummary {
     pub execution_machine: Option<MachineId>,
     /// Worker pid while running. Display only.
     pub pid: Option<i32>,
-    /// Terminal callback delivery state. The `pending` value is a compatibility
-    /// placeholder on executor-owned rows when the origin owns delivery.
-    pub callback: CallbackStatus,
+    /// Terminal callback delivery state, or null when this machine delivers no
+    /// callback for the task: the executor of a task whose origin is another
+    /// machine, or a queue run, which reports through its job.
+    pub callback: Option<CallbackStatus>,
     /// Output-inactivity timeout in seconds.
     pub timeout_secs: u64,
     /// Whether the inactivity reminder is pending or sent.
@@ -117,7 +114,6 @@ impl TaskSummary {
         Self {
             id: row.id,
             name: row.name.clone(),
-            display_name: row.display_name(),
             status: row.status().into(),
             workload: WorkloadView::from(&row.workload),
             thread: row.thread,
@@ -127,15 +123,10 @@ impl TaskSummary {
             origin_machine: owners.map(|owners| owners.origin_machine),
             execution_machine: owners.map(|owners| owners.execution_machine),
             pid: row.pid(),
-            callback: match presentation.map(|presentation| presentation.terminal_callback) {
-                Some(TerminalCallbackProjection::Legacy(status))
-                | Some(TerminalCallbackProjection::OriginInbox(status)) => status,
-                Some(TerminalCallbackProjection::NotOwned) => CallbackStatus::Pending,
-                None => row.callback_status,
-            },
+            callback: presentation.and_then(|presentation| presentation.terminal_callback),
             timeout_secs: row.timeout.as_secs(),
             check_timeout: if presentation.map_or_else(
-                || row.attention.is_delivered(),
+                || row.check_due_at.is_some(),
                 |presentation| presentation.attention_delivered,
             ) {
                 CheckTimeoutStatus::Sent
@@ -157,7 +148,7 @@ impl TaskSummary {
     #[must_use]
     pub fn from_unlaunched(task: &UnlaunchedTask, after: Vec<DependencyView>) -> Option<Self> {
         let route = &task.held.route;
-        let spec = route.current_spec()?;
+        let spec = &route.spec;
         let (status, exit_reason) = match &route.submission {
             SubmissionState::Held {
                 phase: HeldPhase::Cancelled { .. },
@@ -183,12 +174,10 @@ impl TaskSummary {
                 let (seconds, nanos) = stamp.to_unix();
                 DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
             })
-            .or(route.last_updated_at)
-            .unwrap_or_else(Utc::now);
+            .unwrap_or(route.last_updated_at);
         Some(Self {
             id: route.task,
-            name: Some(spec.name.clone()),
-            display_name: spec.name.to_string(),
+            name: spec.name.clone(),
             status,
             workload: WorkloadView::from(&crate::invocation::persist_workload(&spec.workload)),
             thread: route.thread,
@@ -198,13 +187,13 @@ impl TaskSummary {
             origin_machine: Some(route.origin_machine),
             execution_machine: Some(route.execution_machine),
             pid: None,
-            callback: task.callback,
+            callback: Some(task.callback),
             timeout_secs: spec.timeout.as_secs(),
             check_timeout: CheckTimeoutStatus::Pending,
             exit_reason,
             cancel_requested_at: None,
             created_at,
-            updated_at: route.last_updated_at.unwrap_or(created_at),
+            updated_at: route.last_updated_at,
             after: Some(after),
         })
     }

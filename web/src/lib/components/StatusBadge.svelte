@@ -12,7 +12,8 @@
 				succeeded: 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/40 dark:text-emerald-300',
 				failed: 'bg-red-500/10 text-red-700 ring-red-500/40 dark:text-red-300',
 				cancelled: 'bg-amber-500/10 text-amber-700 ring-amber-500/40 dark:text-amber-300',
-				lost: 'bg-fuchsia-500/10 text-fuchsia-700 ring-fuchsia-500/40 dark:text-fuchsia-300'
+				lost: 'bg-fuchsia-500/10 text-fuchsia-700 ring-fuchsia-500/40 dark:text-fuchsia-300',
+				preempted: 'bg-indigo-500/10 text-indigo-700 ring-indigo-500/40 dark:text-indigo-300'
 			}
 		}
 	});

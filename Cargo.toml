@@ -24,6 +24,7 @@ hyper = { version = "1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 if-addrs = "0.15.0"
 jsonc-parser = { version = "0.33.2", features = ["serde"] }
+libc = "0.2.189"
 mdns-sd = "0.21.4"
 mime_guess = "2"
 nix = { version = "0.31.3", features = ["fs", "hostname", "process", "signal", "user"] }

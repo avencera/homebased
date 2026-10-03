@@ -1,4 +1,4 @@
-//! Fleet endpoint work for durable direct-message and supervisor-notice delivery
+//! Fleet endpoint work for durable direct-message delivery
 
 use crate::domain::API_VERSION;
 use std::fs::{self, File};
@@ -19,15 +19,12 @@ use crate::domain::{AgentKind, TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::invocation::resolve_agent_binary;
 use crate::message::{
-    MESSAGE_BODY_MAX_BYTES, MessageAttempt, MessageId, MessageReceipt, MessageRequest,
-    MessageSource, Recipient,
+    MessageAttempt, MessageId, MessageReceipt, MessageRequest, MessageSource, Recipient,
 };
-use crate::resource::{SupervisorNoticeReceipt, SupervisorNoticeRequest};
 use crate::submission::{CallbackContext, CallbackExecutable};
 
 const SESSION_META_MAX_BYTES: usize = 64 * 1024;
 const MESSAGE_PREFIX: &str = "HOMEBASED_MESSAGE ";
-const RESOURCE_NOTICE_PREFIX: &str = "HOMEBASED_RESOURCE_NOTICE ";
 
 /// Per-message delivery permits prevent concurrent retries from queueing one UUID twice
 #[derive(Clone, Default)]
@@ -94,108 +91,6 @@ impl MessageReceiver {
         self.deliver(state, attempt).await
     }
 
-    /// Resolve, persist, and deliver one exact supervisor-notice attempt
-    pub(crate) async fn receive_supervisor_notice(
-        &self,
-        state: &AppState,
-        request: SupervisorNoticeRequest,
-    ) -> Result<SupervisorNoticeReceipt, AppError> {
-        request.validate()?;
-        state
-            .machine
-            .identity
-            .check_destination(request.destination.machine)?;
-        let backing_request = notice_backing_request(&request)?;
-        let message_id = backing_request.message_id;
-        let (_attempt_permit, attempt_was_contended) = self.attempt_permit(message_id).await;
-        let saved = call(&state.store, |reply| StoreMsg::MessageDelivery {
-            id: message_id,
-            reply,
-        })
-        .await?;
-        let attempt = match saved.attempt {
-            Some(mut attempt) => {
-                if attempt.request.identity() != backing_request.identity() {
-                    return Err(AppError::MessageConflict { id: message_id });
-                }
-                if attempt.destination_thread != request.destination.thread {
-                    return Err(AppError::Internal {
-                        message: "saved supervisor notice attempt has a different thread".into(),
-                    });
-                }
-                if let Some(receipt) = saved.receipt {
-                    return supervisor_notice_receipt(
-                        &request,
-                        receipt.for_protocol_version(request.protocol_version),
-                    );
-                }
-                if attempt_was_contended {
-                    return Err(attempt_wait_failed(message_id));
-                }
-                attempt.request = backing_request.clone();
-                call(&state.store, |reply| StoreMsg::BindMessageAttempt {
-                    attempt,
-                    reply,
-                })
-                .await?
-            }
-            None => {
-                if saved.receipt.is_some() {
-                    return Err(AppError::Internal {
-                        message: "message receipt has no saved attempt".into(),
-                    });
-                }
-                let (destination_thread, destination_cwd) =
-                    resolve_destination(&Recipient::Thread {
-                        thread: request.destination.thread,
-                    })
-                    .await?;
-                if destination_thread != request.destination.thread {
-                    return Err(AppError::Internal {
-                        message: "supervisor notice resolved to a different thread".into(),
-                    });
-                }
-                call(&state.store, |reply| StoreMsg::BindMessageAttempt {
-                    attempt: MessageAttempt {
-                        request: backing_request,
-                        destination_thread,
-                        destination_cwd,
-                    },
-                    reply,
-                })
-                .await?
-            }
-        };
-
-        let payload = serde_json::to_string(&request)
-            .map_err(|error| notice_delivery_failed(message_id, error))?;
-        let line = format!("{RESOURCE_NOTICE_PREFIX}{payload}");
-        send_queue_line(
-            state,
-            message_id,
-            attempt.destination_thread,
-            attempt.destination_cwd.clone(),
-            line,
-        )
-        .await
-        .map_err(|error| notice_delivery_failed(message_id, error))?;
-
-        let receipt = MessageReceipt {
-            api_version: API_VERSION,
-            protocol_version: request.protocol_version,
-            message_id,
-            destination_thread: attempt.destination_thread,
-            destination_cwd: attempt.destination_cwd,
-            delivered_at: chrono::Utc::now(),
-        };
-        let receipt = call(&state.store, |reply| StoreMsg::CommitMessageReceipt {
-            receipt,
-            reply,
-        })
-        .await?;
-        supervisor_notice_receipt(&request, receipt)
-    }
-
     async fn attempt_permit(&self, id: MessageId) -> (KeyedGuard<MessageId>, bool) {
         match self.attempts.try_lock(id) {
             Some(permit) => (permit, false),
@@ -238,59 +133,6 @@ impl MessageReceiver {
         })
         .await
     }
-}
-
-fn notice_backing_request(request: &SupervisorNoticeRequest) -> Result<MessageRequest, AppError> {
-    let message_id = MessageId::from_uuid(request.attempt_id.as_uuid())?;
-    let body = serde_json::to_string(request)?;
-    if body.len() > MESSAGE_BODY_MAX_BYTES {
-        return Err(AppError::MessageInvalid {
-            message: format!(
-                "supervisor notice request exceeds {MESSAGE_BODY_MAX_BYTES} UTF-8 bytes"
-            ),
-        });
-    }
-    // keep the exact notice content in the existing durable UUID-keyed attempt ledger
-    Ok(MessageRequest {
-        api_version: request.api_version,
-        protocol_version: request.protocol_version,
-        message_id,
-        destination_machine: request.destination.machine,
-        source: MessageSource::ResourceNotice {
-            machine: request.source_machine,
-            notice_id: request.notice_id,
-        },
-        recipient: Recipient::Thread {
-            thread: request.destination.thread,
-        },
-        body,
-        reply_to: None,
-        conversation_id: request.notice_id.as_uuid(),
-    })
-}
-
-fn supervisor_notice_receipt(
-    request: &SupervisorNoticeRequest,
-    receipt: MessageReceipt,
-) -> Result<SupervisorNoticeReceipt, AppError> {
-    if receipt.message_id.as_uuid() != request.attempt_id.as_uuid()
-        || receipt.api_version != API_VERSION
-        || receipt.protocol_version != request.protocol_version
-        || receipt.destination_thread != request.destination.thread
-    {
-        return Err(AppError::Internal {
-            message: "saved supervisor notice receipt does not match its attempt".into(),
-        });
-    }
-    Ok(SupervisorNoticeReceipt {
-        api_version: receipt.api_version,
-        protocol_version: receipt.protocol_version,
-        notice_id: request.notice_id,
-        attempt_id: request.attempt_id,
-        destination_machine: request.destination.machine,
-        destination_thread: receipt.destination_thread,
-        delivered_at: receipt.delivered_at,
-    })
 }
 
 async fn send_queue_line(
@@ -376,16 +218,6 @@ fn attempt_wait_failed(message_id: MessageId) -> AppError {
         id: message_id,
         message: "another attempt completed without a receipt; retry the same UUID explicitly"
             .into(),
-    }
-}
-
-fn notice_delivery_failed(message_id: MessageId, error: impl std::fmt::Display) -> AppError {
-    tracing::warn!(attempt_id = %message_id, "supervisor notice delivery attempt failed: {error}");
-    AppError::MessageDeliveryFailed {
-        id: message_id,
-        message: format!(
-            "delivery attempt failed: {error}; retry the same delivery attempt UUID explicitly"
-        ),
     }
 }
 
@@ -601,11 +433,10 @@ mod tests {
     use crate::domain::API_VERSION;
     use std::time::Duration;
 
-    use super::{MESSAGE_PREFIX, MessageReceiver, QueuedMessage, notice_backing_request};
+    use super::{MESSAGE_PREFIX, MessageReceiver, QueuedMessage};
     use crate::domain::{TaskId, ThreadId};
     use crate::machine::MachineId;
     use crate::message::{MessageAttempt, MessageId, MessageRequest, MessageSource, Recipient};
-    use crate::resource::SupervisorNoticeRequest;
     use serde_json::json;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -679,43 +510,5 @@ mod tests {
         assert_eq!(body["body"], "Please review this change");
         assert_eq!(body["source"]["kind"], "task");
         assert!(body["source"].get("task").is_some());
-    }
-
-    #[test]
-    fn notice_backing_request_uses_notice_identity_instead_of_a_fake_thread() {
-        let request = SupervisorNoticeRequest {
-            api_version: API_VERSION,
-            protocol_version: 1,
-            source_machine: MachineId::new(),
-            destination: crate::resource::SupervisorAddress {
-                machine: MachineId::new(),
-                thread: ThreadId(Uuid::now_v7()),
-            },
-            notice_id: crate::resource::NoticeId::new(),
-            loan_id: crate::resource::LoanId::new(),
-            action_id: crate::resource::ActionId::new(),
-            state_revision: crate::resource::ResourceRevision::new(4),
-            assignment_revision: crate::resource::AssignmentRevision::new(2),
-            attempt_id: crate::resource::DeliveryAttemptId::new(),
-            payload: crate::resource::SupervisorNoticePayload::AttentionRequired {
-                reason: "needs supervisor review".into(),
-            },
-        };
-
-        let backing = notice_backing_request(&request).unwrap();
-        assert_eq!(
-            backing.source,
-            MessageSource::ResourceNotice {
-                machine: request.source_machine,
-                notice_id: request.notice_id,
-            }
-        );
-        let source = serde_json::to_value(&backing.source).unwrap();
-        assert_eq!(source["kind"], "resource_notice");
-        assert_eq!(source["machine"], serde_json::json!(request.source_machine));
-        assert_eq!(source["notice_id"], serde_json::json!(request.notice_id));
-        assert!(source.get("thread").is_none());
-        assert_eq!(backing.destination_machine, request.destination.machine);
-        assert_eq!(backing.conversation_id, request.notice_id.as_uuid());
     }
 }

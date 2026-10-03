@@ -63,15 +63,10 @@ pub(super) async fn run(
                     row,
                 );
             }
-            let resource = store.resource_for_task(id).unwrap_or_else(|error| {
-                warn!(%id, "read resource of container task: {error}");
-                None
-            });
             let args = create_args(
                 workload,
                 &CreateContext {
                     task: id,
-                    resource,
                     cidfile: &paths.container_cid,
                     default_user: ContainerUser::current(),
                 },
@@ -127,7 +122,8 @@ impl ContainerLedger for StoreLedger<'_> {
     }
 
     fn record_started(&self) -> Result<(), AppError> {
-        self.store.record_task_container_started(self.task)
+        self.store.record_task_container_started(self.task)?;
+        self.store.confirm_job_run_started(self.task)
     }
 
     fn record_observed(&self) -> Result<(), AppError> {

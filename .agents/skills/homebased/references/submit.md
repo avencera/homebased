@@ -1,5 +1,7 @@
 # Submit a task
 
+For GPU work, use [resource-queue.md](resource-queue.md) instead of `task submit`. Run task UUIDs from jobs cannot be used in `after`. Job dependencies are not supported.
+
 ## 1. Find the thread id
 
 The spec needs the UUID of the Codex thread or Claude Code session that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the thread.
@@ -32,7 +34,7 @@ Copy the id; do not retype it. Submit checks the id against the Claude Code sess
 
 A `task` runs an argv array with no shell. A caller that needs shell syntax must request it explicitly, for example `["sh", "-lc", "..."]`.
 
-A `container` runs a pinned image. Do not submit a `docker run` command as a `task`: its client can exit while the container keeps running, and resource work refuses it. For a `container`, Homebased creates the container, saves its ID, starts it, streams its logs to `output.log`, waits for it, and then removes it. The task exit code is the container exit code.
+A `container` runs a pinned image. Do not submit a `docker run` command as a `task`: its client can exit while the container keeps running. For a `container`, Homebased creates the container, saves its ID, starts it, streams its logs to `output.log`, waits for it, and then removes it. The task exit code is the container exit code.
 
 ## 3. Write the prompt file (agent only)
 
@@ -159,7 +161,7 @@ Container-only fields under `workload`:
 | `image` | yes | Pinned by digest: `sha256:<64 hex>` image ID or `name@sha256:<64 hex>`. A tag is refused. The image must already be on the execution machine; Homebased does not pull it. |
 | `entrypoint` | no | Argv array that replaces the image entrypoint. |
 | `args` | no | Argv array after the image. Passed unchanged; not a shell string. |
-| `gpus` | no | `"all"` or an array of device indices. Required for resource work. |
+| `gpus` | no | `"all"` or an array of device indices. |
 | `memory` | yes | Byte count, or a size such as `512m` or `24g` (binary units). Also the swap limit. At least 6 MiB. |
 | `user` | no | Numeric `uid:gid`. Defaults to the daemon's user. |
 | `workdir` | no | Absolute working directory in the container. Put a container path here, not in `cwd`. |

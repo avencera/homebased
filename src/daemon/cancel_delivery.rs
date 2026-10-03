@@ -12,8 +12,7 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::cluster::{CancelBody, CancelExecution};
 use crate::cancellation::{
-    CancellationDelivery, CancellationReceipt, CancellationRequest, CancellationTarget,
-    ExecutorCancelState, ResourceCancellationRequestIdentity,
+    CancellationDelivery, CancellationReceipt, CancellationRequest, ExecutorCancelState,
 };
 use crate::domain::{API_VERSION, ProcessStatus, TaskId};
 use crate::error::AppError;
@@ -21,9 +20,7 @@ use crate::fleet::http::ClusterClient;
 use crate::fleet::protocol::ClusterProtocolVersion;
 use crate::machine::MachineId;
 use crate::store::CancelResult;
-use crate::submission::{
-    ExecutorIdentity, ResourceCancellationOutcome, ResourceCancellationReceipt,
-};
+use crate::submission::ExecutorIdentity;
 
 struct Retry {
     next: Instant,
@@ -91,19 +88,6 @@ pub(super) async fn run(state: AppState) {
 }
 
 async fn deliver(state: &AppState, request: &CancellationRequest) -> Result<(), AppError> {
-    match &request.target {
-        CancellationTarget::Execution { .. } => {}
-        CancellationTarget::Resource(target) => {
-            if target.task_id != request.task
-                || target.origin_machine != request.origin_machine
-                || target.authority_machine != request.execution_machine
-            {
-                return Err(AppError::ClusterTaskConflict { task: request.task });
-            }
-            return deliver_resource(state, request).await;
-        }
-    }
-
     let receipt = if request.execution_machine == state.machine.identity.machine {
         call(&state.store, |reply| StoreMsg::ReceiveCancellation {
             request: request.identity(),
@@ -148,122 +132,6 @@ async fn deliver(state: &AppState, request: &CancellationRequest) -> Result<(), 
         reply,
     })
     .await?;
-    Ok(())
-}
-
-async fn deliver_resource(state: &AppState, request: &CancellationRequest) -> Result<(), AppError> {
-    let identity = request
-        .resource_identity()
-        .ok_or(AppError::ClusterTaskConflict { task: request.task })?;
-    if identity.requester_machine != identity.origin_machine
-        || identity.authority_machine != request.execution_machine
-    {
-        return Err(AppError::ClusterTaskConflict { task: request.task });
-    }
-    let receipt = if identity.authority_machine == state.machine.identity.machine {
-        super::cluster::process_resource_cancellation(state, identity.clone()).await?
-    } else {
-        deliver_remote_resource(state, &identity).await?
-    };
-    verify_resource_receipt(&identity, &receipt)?;
-    if matches!(
-        &receipt.outcome,
-        ResourceCancellationOutcome::PreventedBeforeAcceptance
-            | ResourceCancellationOutcome::CancelledBeforeLaunch
-    ) {
-        call(&state.store, |reply| {
-            StoreMsg::CancelResourceRouteBeforeLaunch {
-                receipt: receipt.clone(),
-                reply,
-            }
-        })
-        .await?;
-    }
-    call(&state.store, |reply| {
-        StoreMsg::AcknowledgeResourceCancellation { receipt, reply }
-    })
-    .await?;
-    Ok(())
-}
-
-async fn deliver_remote_resource(
-    state: &AppState,
-    identity: &ResourceCancellationRequestIdentity,
-) -> Result<ResourceCancellationReceipt, AppError> {
-    let fleet = state.fleet.handle().ok_or(AppError::MachineUnavailable {
-        machine: identity.authority_machine,
-        message: "fleet is disabled".into(),
-    })?;
-    let destination = fleet.connect(identity.authority_machine).await?;
-    let body = super::cluster::CancelResourceRequest {
-        api_version: API_VERSION,
-        protocol_version: destination.protocol.0,
-        destination_machine: identity.authority_machine,
-        request: identity.clone(),
-    };
-    let response = ClusterClient::default()
-        .post_json(
-            &destination.address,
-            "/v1/cluster/resource-requests/cancel",
-            &body,
-        )
-        .await
-        .map_err(|error| AppError::MachineUnavailable {
-            machine: identity.authority_machine,
-            message: error.to_string(),
-        })?;
-    if response.status != StatusCode::OK {
-        return Err(AppError::MachineUnavailable {
-            machine: identity.authority_machine,
-            message: format!("resource cancellation response status {}", response.status),
-        });
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&response.body).map_err(|error| AppError::MachineUnavailable {
-            machine: identity.authority_machine,
-            message: format!("invalid resource cancellation acknowledgement: {error}"),
-        })?;
-    if value.get("api_version").and_then(serde_json::Value::as_u64) != Some(u64::from(API_VERSION))
-    {
-        return Err(AppError::MachineUnavailable {
-            machine: identity.authority_machine,
-            message: "resource cancellation acknowledgement uses an unsupported API version".into(),
-        });
-    }
-    let body: super::cluster::CancelResourceBody =
-        serde_json::from_value(value).map_err(|error| AppError::MachineUnavailable {
-            machine: identity.authority_machine,
-            message: format!("invalid resource cancellation acknowledgement: {error}"),
-        })?;
-    if body.api_version != API_VERSION
-        || body.protocol_version != destination.protocol.0
-        || body.destination_machine != identity.authority_machine
-    {
-        return Err(AppError::ClusterTaskConflict {
-            task: identity.task,
-        });
-    }
-    verify_resource_receipt(identity, &body.receipt)?;
-    Ok(body.receipt)
-}
-
-fn verify_resource_receipt(
-    identity: &ResourceCancellationRequestIdentity,
-    receipt: &ResourceCancellationReceipt,
-) -> Result<(), AppError> {
-    if receipt.cancellation != identity.cancellation
-        || receipt.requester_machine != identity.requester_machine
-        || receipt.request != identity.request
-        || receipt.task != identity.task
-        || receipt.origin_machine != identity.origin_machine
-        || receipt.authority_machine != identity.authority_machine
-        || receipt.resource != identity.resource
-        || receipt.target_phase != identity.target_phase
-    {
-        return Err(AppError::ClusterTaskConflict {
-            task: identity.task,
-        });
-    }
     Ok(())
 }
 
@@ -376,10 +244,6 @@ pub(super) enum CancelDeliveryResponse {
     Pending,
     /// The executor acknowledged durable receipt
     Delivered { executor: ExecutorCancelState },
-    /// The resource authority returned a durable typed receipt
-    ResourceDelivered {
-        resource: ResourceCancellationReceipt,
-    },
 }
 
 impl From<&CancellationDelivery> for CancelDeliveryResponse {
@@ -388,9 +252,6 @@ impl From<&CancellationDelivery> for CancelDeliveryResponse {
             CancellationDelivery::Pending => Self::Pending,
             CancellationDelivery::Delivered { result } => Self::Delivered {
                 executor: result.clone(),
-            },
-            CancellationDelivery::ResourceDelivered { result } => Self::ResourceDelivered {
-                resource: result.clone(),
             },
         }
     }
@@ -467,7 +328,7 @@ mod tests {
     #[test]
     fn cancellation_acknowledgement_uses_the_selected_protocol_version() {
         let request = request();
-        let selected = ClusterProtocolVersion(2);
+        let selected = crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 
         assert_eq!(
             decode_acknowledgement(acknowledgement(&request, selected), &request, selected)
@@ -477,7 +338,7 @@ mod tests {
         );
         assert!(matches!(
             decode_acknowledgement(
-                acknowledgement(&request, ClusterProtocolVersion(1)),
+                acknowledgement(&request, ClusterProtocolVersion(selected.0 - 1)),
                 &request,
                 selected
             ),

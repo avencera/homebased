@@ -13,7 +13,7 @@ use crate::message::MessageId;
 /// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
 /// SQLite database file name under `$HOMEBASED_HOME`.
-pub const DB_NAME: &str = "homebased.sqlite";
+pub const DB_NAME: &str = "homebased_v1.sqlite";
 /// Daemon singleton lock file name under `$HOMEBASED_HOME`.
 pub const DAEMON_LOCK: &str = "daemon.lock";
 /// Log that records callbacks `codex queue` could not deliver.
@@ -68,6 +68,9 @@ impl Home {
     /// Create the root directory if needed.
     pub fn ensure(&self) -> Result<(), AppError> {
         fs::create_dir_all(self.tasks_dir())?;
+        // job state directories are 0777 so container users can write, so the
+        // root must keep other host users out
+        fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 

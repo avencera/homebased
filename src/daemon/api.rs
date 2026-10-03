@@ -13,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::callback::last_event_for_row;
-use crate::cancellation::{
-    CancellationOwner, CancellationPlan, CancellationRoute, CancellationTarget,
-};
+use crate::cancellation::{CancellationOwner, CancellationRoute};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
     ContainerDetail, DependencyView, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList,
@@ -33,9 +31,7 @@ use crate::files::{
     ContentOriginBody, DirectoryListing, PathToken, ResolveBody, ResolvedPath, list_directory,
     resolve_absolute_path,
 };
-use crate::invocation::{
-    ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized_for_identity,
-};
+use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::CancelResult;
 use crate::submission::RequestId;
@@ -50,8 +46,8 @@ impl IntoResponse for AppError {
 /// Routes that only read state. Safe to expose on the TCP listener
 pub fn read_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::daemon::queue_api::read_routes())
         .merge(crate::daemon::fleet_api::read_routes())
-        .merge(crate::daemon::resource_api::read_routes())
         .merge(crate::daemon::fleet_tasks::read_routes())
         .merge(crate::daemon::thread_titles::read_routes())
         .route("/v1/status", get(status))
@@ -67,6 +63,8 @@ pub fn read_routes() -> Router<AppState> {
 /// loopback port is reachable from any page the user has open
 pub fn write_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::daemon::queue_api::submit_routes())
+        .merge(crate::daemon::queue_api::control_routes())
         .route("/v1/tasks", post(submit))
         .route("/v1/tasks/dry-run", post(dry_run))
         .route("/v1/tasks/{id}/cancel", post(cancel))
@@ -78,9 +76,6 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(write_routes())
         .route("/v1/tasks/{id}/followup-source", get(followup_source))
         .merge(crate::daemon::fleet_api::socket_routes())
-        .merge(crate::daemon::release_watcher_api::socket_routes())
-        .merge(crate::daemon::resource_action::socket_routes())
-        .merge(crate::daemon::resource_api::socket_routes())
         .with_state(state)
 }
 
@@ -94,10 +89,7 @@ async fn followup_source(
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
-    let spec = route.spec.current().ok_or_else(|| AppError::Internal {
-        message: format!("task {id} has no saved workload for followup"),
-    })?;
-    match &spec.workload {
+    match &route.spec.workload {
         NormalizedWorkload::Agent(agent) if agent.agent == AgentKind::Codex => {
             Ok(Json(TaskFollowupSource {
                 api_version: API_VERSION,
@@ -189,18 +181,7 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = bytes::Bytes::from_request(req, state)
-            .await
-            .map_err(|err| AppError::InvalidSpec {
-                pointer: String::new(),
-                value: Value::Null,
-                message: format!("invalid request body: {err}"),
-            })?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|err| AppError::InvalidSpec {
-            pointer: String::new(),
-            value: Value::Null,
-            message: format!("invalid JSON: {err}"),
-        })?;
+        let value = json_body(req, state).await?;
         let envelope: SubmitEnvelope =
             serde_path_to_error::deserialize(&value).map_err(|err| invalid_at(&value, "", &err))?;
         let env_value = envelope.env.ok_or_else(|| missing_field("/env", "env"))?;
@@ -222,6 +203,23 @@ where
             after,
         }))
     }
+}
+
+/// Read a request body as JSON; a body that is unreadable or not JSON is an
+/// `invalid_spec` at the root, like any other refused field
+pub(super) async fn json_body<S: Send + Sync>(req: Request, state: &S) -> Result<Value, AppError> {
+    let bytes = bytes::Bytes::from_request(req, state)
+        .await
+        .map_err(|err| AppError::InvalidSpec {
+            pointer: String::new(),
+            value: Value::Null,
+            message: format!("invalid request body: {err}"),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|err| AppError::InvalidSpec {
+        pointer: String::new(),
+        value: Value::Null,
+        message: format!("invalid JSON: {err}"),
+    })
 }
 
 pub(super) fn missing_field(pointer: &str, name: &str) -> AppError {
@@ -329,7 +327,7 @@ pub(super) fn local_dry_run(
 ) -> Result<DryRunResponse, AppError> {
     spec::check_spec_host(&spec)?;
     let prompt_feed = agent_feed_placeholder(state.home.root(), &spec.workload);
-    let invocation = invocation_from_normalized_for_identity(
+    let invocation = invocation_from_normalized(
         &spec.workload,
         &env.path,
         &spec.cwd,
@@ -397,13 +395,13 @@ impl TaskFilter {
         Ok(Self { statuses, thread })
     }
 
-    /// Query pairs that parse back into this filter, `&`-terminated when non-empty
     /// Whether a task with this status and thread passes the filter
     fn matches(&self, status: TaskStatus, thread: ThreadId) -> bool {
         (self.statuses.is_empty() || self.statuses.contains(&status))
             && self.thread.is_none_or(|wanted| wanted == thread)
     }
 
+    /// Query pairs that parse back into this filter, `&`-terminated when non-empty
     pub(super) fn query_prefix(&self) -> String {
         let mut prefix = String::new();
         if !self.statuses.is_empty() {
@@ -588,34 +586,19 @@ async fn cancel(
     }
 
     let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
-    if local.is_some() && local_task_already_cancelled(&state, id).await? {
-        return Ok(Json(CancelResponse::status(id, ProcessStatus::Cancelled)));
-    }
-
     if local.is_none() {
         let owner = crate::daemon::inspection::cancellation_owner(&state, id).await?;
-        let plan = owner
-            .plan(state.machine.identity.machine, id, uuid::Uuid::now_v7())
+        let request = owner
+            .request(state.machine.identity.machine, id, uuid::Uuid::now_v7())
             .map_err(|refusal| refusal.into_error(id))?;
-        let response = match plan {
-            CancellationPlan::AlreadyCancelled => {
-                CancelResponse::status(id, ProcessStatus::Cancelled)
-            }
-            CancellationPlan::Deliver(request) => {
-                let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
-                    request: *request,
-                    reply,
-                })
-                .await?;
-                CancelResponse::intent(&saved)
-            }
-            CancellationPlan::ForwardToOrigin(target) => {
-                crate::daemon::cluster::forward_resource_cancellation_intent(&state, &target)
-                    .await?
-            }
-        };
-        return Ok(Json(response));
+        let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
+            request,
+            reply,
+        })
+        .await?;
+        return Ok(Json(CancelResponse::intent(&saved)));
     }
+    check_local_cancellation_owner(&state, id).await?;
     let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
         id,
         reply,
@@ -629,7 +612,8 @@ async fn cancel(
     Ok(Json(response))
 }
 
-async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bool, AppError> {
+/// Refuse to cancel a local row through the supervisor unless this machine executes it
+async fn check_local_cancellation_owner(state: &AppState, id: TaskId) -> Result<(), AppError> {
     let machine = state.machine.identity.machine;
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply }).await?;
     let owner = if let Some(route) = route {
@@ -642,27 +626,15 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
         })
         .await?;
         if identity.is_none() {
-            return Ok(false);
+            return Ok(());
         }
         crate::daemon::inspection::cancellation_owner(state, id).await?
     };
 
-    let plan = owner
-        .plan(machine, id, uuid::Uuid::now_v7())
-        .map_err(|refusal| refusal.into_error(id))?;
-    match plan {
-        CancellationPlan::AlreadyCancelled => Ok(true),
-        // only an ordinary execution intent aimed at this machine may use the local row
-        CancellationPlan::Deliver(request)
-            if request.execution_machine == machine
-                && matches!(request.target, CancellationTarget::Execution { .. }) =>
-        {
-            Ok(false)
-        }
-        CancellationPlan::Deliver(_) | CancellationPlan::ForwardToOrigin(_) => {
-            Err(AppError::ClusterTaskConflict { task: id })
-        }
+    if owner.execution_machine != machine {
+        return Err(AppError::ClusterTaskConflict { task: id });
     }
+    Ok(())
 }
 
 #[cfg(test)]

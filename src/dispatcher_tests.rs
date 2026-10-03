@@ -1,6 +1,5 @@
 //! Origin inbox dispatcher tests with a fake saved Codex executable
 
-use crate::daemon::actors::StoreActor;
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
@@ -15,13 +14,13 @@ use tempfile::TempDir;
 use crate::daemon::actors::callback::{
     CallbackActor, CallbackArgs, CallbackMsg, WakeFailure, dispatch_inbox,
 };
-use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::actors::{StoreActor, StoreMsg, call};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId};
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
 use crate::machine::MachineId;
 use crate::store::Store;
-use crate::submission::{CallbackContext, OriginRoute, PersistedSpec, RequestId, SubmissionState};
+use crate::submission::{CallbackContext, OriginRoute, RequestId, SubmissionState};
 use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
 
 const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
@@ -98,29 +97,8 @@ fn configure_t3_codex(route: &mut OriginRoute, origin: &str, pid: i32) -> PathBu
 /// Register a live Claude session for `route.thread` and return its socket
 fn live_claude_session(route: &OriginRoute) -> UnixListener {
     let callback_home = PathBuf::from(&route.callback.env.home);
-    let sessions = callback_home.join(".claude/sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
     let socket = callback_home.join("inbox.sock");
-    let pid = std::process::id();
-    std::fs::write(
-        sessions.join(format!("{pid}.json")),
-        serde_json::json!({
-            "pid": pid,
-            "sessionId": route.thread.to_string(),
-            "messagingSocketPath": socket,
-            "peerProtocol": 1,
-            "updatedAt": 1,
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let digest = Sha256::digest(socket.as_os_str().as_encoded_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    std::fs::write(
-        sessions.join(format!("{pid}.{hex}.key")),
-        serde_json::json!({ "peerToken": "test-token" }).to_string(),
-    )
-    .unwrap();
+    register_live_claude_session(&callback_home, &route.thread.to_string(), &socket);
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     listener
@@ -172,10 +150,10 @@ fn fixture(script: &str) -> (TempDir, Home, OriginRoute) {
             cwd: callback_cwd,
             codex: codex.into(),
         },
-        spec: spec.into(),
+        spec,
         submission: SubmissionState::AcceptanceUnknown,
         last_execution_state: None,
-        last_updated_at: Some(chrono::Utc::now()),
+        last_updated_at: chrono::Utc::now(),
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
@@ -187,7 +165,7 @@ fn event(route: &OriginRoute, seq: u64, callback: bool) -> TaskEvent {
         EventPayload::Callback {
             event: Box::new(serde_json::from_value(serde_json::json!({
                 "api_version": 1, "event": "TASK_REPORTED", "task": route.task,
-                "display_name": "origin inbox", "workload": { "type": "task", "command": ["echo", "remote"] },
+                "name": "origin inbox", "workload": { "type": "task", "command": ["echo", "remote"] },
                 "thread": route.thread, "cwd": "/tmp", "evidence": "/tmp/evidence",
                 "reports": [], "process": null, "next_action": "read_report"
             })).unwrap()),
@@ -636,14 +614,12 @@ async fn local_terminal_event_delivers_once_after_restart() {
 
     let (_dir, home, mut route) =
         fixture("#!/bin/sh\nprintf 'callback\\n' >> \"$HOME/commands\"\n");
-    let PersistedSpec::Current(spec) = &mut route.spec else {
-        panic!("test fixture must have normalized spec");
-    };
+    let spec = &mut route.spec;
     spec.cwd = route.callback.cwd.clone();
     let machine = MachineId::new();
     let row = new_queued_task(NewTask {
         id: route.task,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: route.thread,
         workload: Workload::Task(TaskWorkload {
             command: CommandLine::try_from_argv(vec!["echo".into(), "local".into()]).unwrap(),
@@ -667,7 +643,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
         .cas_status(row.id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     store
-        .append_report_with_notification(row.id, ReportOutcome::Succeeded, "done", false)
+        .append_report(row.id, ReportOutcome::Succeeded, "done", false)
         .unwrap();
     store
         .cas_exit(
@@ -701,7 +677,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
             .inbound_events(row.id)
             .unwrap()
             .iter()
-            .filter(|event| event.notification_required)
+            .filter(|event| event.event.payload.notification_required())
             .count(),
         1
     );
@@ -796,7 +772,7 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
     callback
         .cast(CallbackMsg::DispatchInbox { id: route.task })
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let settled = call(&store, |reply| StoreMsg::EarliestInbox {
                 id: route.task,
@@ -807,7 +783,7 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
             if settled.is_none() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -931,7 +907,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
     callback
         .cast(CallbackMsg::DispatchInbox { id: route.task })
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let entry = call(&store, |reply| StoreMsg::EarliestInbox {
                 id: route.task,
@@ -947,12 +923,12 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
                 ));
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if call(&callback, |reply| CallbackMsg::InspectAlert {
                 thread,
@@ -963,7 +939,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -980,29 +956,8 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
     assert!(!home.fallback_log_path().exists());
     drop(persisted);
 
-    let sessions = callback_home.join(".claude/sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
     let socket = callback_home.join("inbox.sock");
-    let pid = std::process::id();
-    std::fs::write(
-        sessions.join(format!("{pid}.json")),
-        serde_json::json!({
-            "pid": pid,
-            "sessionId": route.thread.to_string(),
-            "messagingSocketPath": socket,
-            "peerProtocol": 1,
-            "updatedAt": 1,
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let digest = Sha256::digest(socket.as_os_str().as_encoded_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    std::fs::write(
-        sessions.join(format!("{pid}.{hex}.key")),
-        serde_json::json!({ "peerToken": "test-token" }).to_string(),
-    )
-    .unwrap();
+    register_live_claude_session(&callback_home, &route.thread.to_string(), &socket);
     let listener = UnixListener::bind(&socket).unwrap();
     let receiver = std::thread::spawn(move || {
         let mut messages = Vec::new();
@@ -1015,7 +970,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
         messages
     });
     callback.cast(CallbackMsg::RetryInbox).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let entry = call(&store, |reply| StoreMsg::EarliestInbox {
                 id: route.task,
@@ -1026,7 +981,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
             if entry.is_none() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await

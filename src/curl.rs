@@ -251,14 +251,15 @@ fn append_stderr(message: String, stderr: &[u8], bearer: Option<&str>) -> String
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::Command;
     use std::thread;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
 
-    use super::*;
+    use super::{CurlMethod, CurlRequest, curl_args, render_config, send};
 
     #[test]
     fn config_quotes_and_escapes_values_without_putting_secrets_in_arguments() {

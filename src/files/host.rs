@@ -1,4 +1,4 @@
-//! Host header checks that limit DNS rebinding without adding a user login step.
+//! Host header checks that limit DNS rebinding without adding a user login step
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -10,15 +10,15 @@ use serde_json::json;
 
 use crate::domain::API_VERSION;
 
-/// Addresses and names accepted on the dashboard and content listeners.
+/// Addresses and names accepted on the dashboard and content listeners
 #[derive(Debug, Clone)]
 pub struct HostPolicy {
-    /// Literal bind address of this listener.
+    /// Literal bind address of this listener
     pub bind: SocketAddr,
 }
 
 impl HostPolicy {
-    /// Whether the `Host` header value is accepted for this bind.
+    /// Whether the `Host` header value is accepted for this bind
     #[must_use]
     pub fn allows(&self, host_header: &str) -> bool {
         let host = strip_port(host_header.trim()).trim_end_matches('.');
@@ -35,7 +35,7 @@ impl HostPolicy {
     }
 }
 
-/// Axum middleware that rejects unexpected `Host` values.
+/// Axum middleware that rejects unexpected `Host` values
 pub async fn host_guard(policy: HostPolicy, request: Request, next: Next) -> Response {
     let allowed = request
         .headers()
@@ -80,7 +80,7 @@ fn is_local_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Tailscale userspace addresses live in 100.64.0.0/10.
+/// Tailscale userspace addresses live in 100.64.0.0/10
 fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -124,8 +124,9 @@ fn is_dns_labels(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{HostPolicy, is_tailscale_ip};
 
     fn policy(bind: &str) -> HostPolicy {
         HostPolicy {

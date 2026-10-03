@@ -58,6 +58,18 @@ pub(super) fn call(
     payload: &Value,
     timeout: Duration,
 ) -> Result<Exit, CallError> {
+    call_checked(origin, token, tag, payload, timeout, None)
+}
+
+/// Check eligibility after connection setup, before writing request bytes
+pub(super) fn call_checked(
+    origin: &str,
+    token: &str,
+    tag: &str,
+    payload: &Value,
+    timeout: Duration,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
+) -> Result<Exit, CallError> {
     let deadline = Instant::now() + timeout;
     let ticket = issue_ticket(origin, token, timeout)?;
     let mut socket = connect(origin, &ticket, deadline)?;
@@ -72,6 +84,9 @@ pub(super) fn call(
         "payload": payload,
         "headers": []
     });
+    if let Some(check) = before_send {
+        check().map_err(ApiFailure::Delivery)?;
+    }
     socket
         .send(Message::text(request.to_string()))
         .map_err(|error| sent(ApiFailure::Unavailable(format!("send RPC {tag}: {error}"))))?;

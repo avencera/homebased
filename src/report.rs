@@ -1,6 +1,6 @@
-//! Fixed reporting trailer fed to the agent.
+//! Fixed reporting trailer fed to the agent
 
-/// Fixed reporting trailer, versioned with `api_version`.
+/// Fixed reporting trailer, versioned with `api_version`
 pub const REPORT_TRAILER: &str = r#"--- homebased ---
 When your work is complete, run exactly one of:
   homebased task report --outcome succeeded --summary "<one paragraph>"
@@ -14,7 +14,7 @@ orchestrator must see that report before you finish.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::REPORT_TRAILER;
 
     #[test]
     fn trailer_mentions_task_report_and_not_codex_queue() {

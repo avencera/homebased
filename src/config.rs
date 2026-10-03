@@ -1,10 +1,10 @@
-//! `config.toml`: declarative machine and fleet settings.
+//! `config.toml`: declarative machine and fleet settings
 //!
 //! The file is the source of truth for managed peers. Machine UUIDs, the
 //! discovery cache, and runtime state stay in the state directory. The file is
 //! optional at its default path; a path chosen with `--config` or
 //! `HOMEBASED_CONFIG` must exist, because a managed installation that points at
-//! a missing file is misconfigured.
+//! a missing file is misconfigured
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -20,22 +20,22 @@ use crate::machine::{MachineName, host_machine_name};
 use crate::notify::{Notify, NtfyConfig, NtfyTopic};
 use crate::power::SleepPolicy;
 
-/// Environment variable that selects the config file.
+/// Environment variable that selects the config file
 pub const CONFIG_ENV: &str = "HOMEBASED_CONFIG";
 
-/// Which config file to read and how it was chosen.
+/// Which config file to read and how it was chosen
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", content = "path", rename_all = "snake_case")]
 pub enum ConfigLocation {
-    /// `--config` or `HOMEBASED_CONFIG`. Must exist.
+    /// `--config` or `HOMEBASED_CONFIG`. Must exist
     Explicit(PathBuf),
-    /// `~/.config/homebased/config.toml`. Optional.
+    /// `~/.config/homebased/config.toml`. Optional
     Default(PathBuf),
 }
 
 impl ConfigLocation {
     /// Resolve from the CLI value, which clap already fills from
-    /// `HOMEBASED_CONFIG`, or fall back to `$HOME/.config/homebased/config.toml`.
+    /// `HOMEBASED_CONFIG`, or fall back to `$HOME/.config/homebased/config.toml`
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self, AppError> {
         if let Some(path) = explicit.filter(|path| !path.as_os_str().is_empty()) {
             return Ok(Self::Explicit(path));
@@ -50,7 +50,7 @@ impl ConfigLocation {
         ))
     }
 
-    /// File path.
+    /// File path
     #[must_use]
     pub fn path(&self) -> &Path {
         match self {
@@ -58,7 +58,7 @@ impl ConfigLocation {
         }
     }
 
-    /// Read and validate the file.
+    /// Read and validate the file
     pub fn load(&self) -> Result<Config, AppError> {
         let text = match fs::read_to_string(self.path()) {
             Ok(text) => text,
@@ -85,7 +85,7 @@ impl ConfigLocation {
     }
 
     /// Validate the selected file for daemon installation and return an
-    /// explicit path in absolute form for the installed host unit.
+    /// explicit path in absolute form for the installed host unit
     pub fn validated_host_unit_override(&self) -> Result<Option<PathBuf>, AppError> {
         let explicit = match self {
             Self::Explicit(path) => Some(std::path::absolute(path)?),
@@ -99,77 +99,86 @@ impl ConfigLocation {
     }
 }
 
-/// Validated configuration.
+/// Validated configuration
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Config {
-    /// Name from `fleet.machine_name`, when set.
+    /// Name from `fleet.machine_name`, when set
     pub machine_name: Option<MachineName>,
-    /// Fleet support.
+    /// Fleet support
     pub fleet: Fleet,
-    /// Optional push notification settings.
+    /// Optional push notification settings
     pub notify: Notify,
-    /// Whether the daemon keeps the host awake, from `power.keep_awake`.
+    /// Whether the daemon keeps the host awake, from `power.keep_awake`
     pub sleep: SleepPolicy,
+    /// Notice thresholds for the local resource queue
+    pub resource: ResourceConfig,
 }
 
-/// Whether this machine joins a fleet.
+/// Resource queue notice settings; these never stop a job
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ResourceConfig {
+    /// Time to wait before recording a notice for the blocked head
+    pub notify_blocked_after: crate::queue::schedule::NoticeThresholds,
+}
+
+/// Whether this machine joins a fleet
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Fleet {
-    /// Local tasks only. No cluster routes, discovery, or advertisement.
+    /// Local tasks only. No cluster routes, discovery, or advertisement
     #[default]
     Disabled,
-    /// Cluster routes, discovery, and advertisement are on.
+    /// Cluster routes, discovery, and advertisement are on
     Enabled(FleetSettings),
 }
 
-/// Settings that apply only when the fleet is enabled.
+/// Settings that apply only when the fleet is enabled
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FleetSettings {
-    /// Automatic discovery providers.
+    /// Automatic discovery providers
     pub discovery: Discovery,
-    /// Declared peer addresses, unique after normalization.
+    /// Declared peer addresses, unique after normalization
     pub machines: Vec<MachineAddress>,
 }
 
-/// Automatic discovery providers.
+/// Automatic discovery providers
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Discovery {
-    /// DNS-SD over mDNS for `_homebased._tcp.local`.
+    /// DNS-SD over mDNS for `_homebased._tcp.local`
     pub mdns: bool,
-    /// Tailscale peer discovery, when enabled.
+    /// Tailscale peer discovery, when enabled
     pub tailscale: Option<TailscaleDiscovery>,
 }
 
-/// Tailscale peer discovery settings.
+/// Tailscale peer discovery settings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TailscaleDiscovery {
     /// Homebased port to try on each Tailscale peer. Tailscale does not know
-    /// which port a peer's daemon listens on.
+    /// which port a peer's daemon listens on
     pub port: u16,
 }
 
-/// Where the effective machine name came from.
+/// Where the effective machine name came from
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineNameSource {
-    /// `fleet.machine_name`.
+    /// `fleet.machine_name`
     Configured,
-    /// Derived from the host name.
+    /// Derived from the host name
     Hostname,
-    /// Neither gave a usable name.
+    /// Neither gave a usable name
     Fallback,
 }
 
 impl Config {
     /// Parse and validate TOML text. The error is a human-readable message
-    /// that includes the TOML location when the parser has one.
+    /// that includes the TOML location when the parser has one
     pub fn parse(text: &str) -> Result<Self, String> {
         let raw: RawConfig = toml::from_str(text).map_err(|err| err.to_string())?;
         raw.validate()
     }
 
-    /// Effective machine name and its source.
+    /// Effective machine name and its source
     #[must_use]
     pub fn machine_name(&self) -> (MachineName, MachineNameSource) {
         if let Some(name) = &self.machine_name {
@@ -181,7 +190,7 @@ impl Config {
         (MachineName::fallback(), MachineNameSource::Fallback)
     }
 
-    /// Fleet settings when enabled.
+    /// Fleet settings when enabled
     #[must_use]
     pub fn fleet_settings(&self) -> Option<&FleetSettings> {
         match &self.fleet {
@@ -200,6 +209,55 @@ struct RawConfig {
     notify: RawNotify,
     #[serde(default)]
     power: RawPower,
+    #[serde(default)]
+    resource: RawResource,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResource {
+    #[serde(default)]
+    notify_blocked_after: RawBlockedThresholds,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBlockedThresholds {
+    #[serde(rename = "yield")]
+    after_yield: Option<String>,
+    #[serde(rename = "wait")]
+    after_wait: Option<String>,
+}
+
+impl RawResource {
+    fn validate(self) -> Result<ResourceConfig, String> {
+        let mut thresholds = crate::queue::schedule::NoticeThresholds::default();
+        for (name, raw, target) in [
+            (
+                "yield",
+                self.notify_blocked_after.after_yield,
+                &mut thresholds.after_yield,
+            ),
+            (
+                "wait",
+                self.notify_blocked_after.after_wait,
+                &mut thresholds.after_wait,
+            ),
+        ] {
+            let Some(raw) = raw else { continue };
+            let duration = humantime::parse_duration(&raw)
+                .map_err(|error| format!("resource.notify_blocked_after.{name}: {error}"))?;
+            if duration.is_zero() || chrono::Duration::from_std(duration).is_err() {
+                return Err(format!(
+                    "resource.notify_blocked_after.{name}: duration must be positive and fit the clock"
+                ));
+            }
+            *target = duration;
+        }
+        Ok(ResourceConfig {
+            notify_blocked_after: thresholds,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -303,6 +361,7 @@ impl RawConfig {
         } = self.fleet;
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
+        let resource = self.resource.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -328,6 +387,7 @@ impl RawConfig {
             fleet,
             notify,
             sleep,
+            resource,
         })
     }
 }
@@ -352,7 +412,34 @@ impl RawDiscovery {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::{Config, ConfigLocation, MachineNameSource, TailscaleDiscovery};
+    use crate::daemon::web::DEFAULT_PORT;
+    use crate::power::SleepPolicy;
+
+    #[test]
+    fn resource_notice_settings_validate_durations_and_keys() {
+        let config =
+            Config::parse("[resource.notify_blocked_after]\nyield = \"200ms\"\nwait = \"2s\"\n")
+                .unwrap();
+        assert_eq!(
+            config.resource.notify_blocked_after.after_yield,
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            config.resource.notify_blocked_after.after_wait,
+            std::time::Duration::from_secs(2)
+        );
+        for text in [
+            "[resource.notify_blocked_after]\nyield = \"0s\"\n",
+            "[resource.notify_blocked_after]\nwait = \"bad\"\n",
+            "[resource.notify_blocked_after]\nyeld = \"1m\"\n",
+        ] {
+            assert!(Config::parse(text).is_err());
+        }
+    }
 
     #[test]
     fn empty_file_disables_fleet() {

@@ -1,18 +1,21 @@
-//! Optional TCP listener: dashboard assets, the read-only API, the three typed
-//! resource controls, and, when the fleet is enabled, the `/v1/cluster/*` routes
+//! Optional TCP listener: dashboard assets, the read-only API, and, when the
+//! fleet is enabled, the `/v1/cluster/*` routes
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
-//! is reachable from any web page the user has open, so this router never
-//! exposes task submit or cancel. The only browser write is
-//! `POST /v1/resources/{id}/actions`, which requires the exact dashboard
-//! `Origin`, a JSON body within a small limit, and no CORS response headers
+//! is reachable from web pages. Ordinary task submit and cancel, job submit,
+//! and resource registration stay on the Unix socket. With fleet enabled,
+//! `/v1/cluster/*` accepts task executions, queue requests (including submit
+//! and registration), and job events from peers within the existing trusted
+//! LAN and tailnet boundary. Peer authentication is deferred
+//! Queue controls that move, cancel, or release accepted jobs require
+//! same-origin JSON
 
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use axum::extract::{DefaultBodyLimit, Request};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::extract::Request;
+use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
@@ -21,14 +24,11 @@ use tokio::net::TcpListener;
 use tracing::warn;
 
 use crate::daemon::AppState;
-use crate::daemon::{api, cluster, resource_api};
+use crate::daemon::{api, cluster};
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::files::{HostPolicy, host_guard};
 use serde_json::json;
-
-/// Largest JSON body accepted by the dashboard resource-action route
-const BROWSER_ACTION_MAX_BYTES: usize = 16 * 1024;
 
 /// Usual dashboard port when an operator opts in
 pub const DEFAULT_PORT: u16 = 7677;
@@ -90,7 +90,7 @@ pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read-only API, the typed resource controls, and the embedded single-page app
+/// Read API, guarded queue controls, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -98,7 +98,7 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         None => api::read_routes(),
     };
     routes
-        .merge(browser_action_routes())
+        .merge(super::queue_api::control_routes().layer(middleware::from_fn(browser_write_guard)))
         .fallback(asset)
         .layer(middleware::from_fn(move |request: Request, next: Next| {
             let policy = policy.clone();
@@ -107,51 +107,35 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         .with_state(state)
 }
 
-/// The resource-action route with its browser-only request checks
-fn browser_action_routes() -> Router<AppState> {
-    resource_api::action_routes()
-        .layer(DefaultBodyLimit::max(BROWSER_ACTION_MAX_BYTES))
-        .layer(middleware::from_fn(same_origin_guard))
-}
-
-/// Refuse a browser write unless it comes from this dashboard's own origin
-///
-/// The Host guard runs first, so the Host value is one this listener serves
-/// Browsers always send `Origin` on a cross-origin POST, and a missing value is
-/// refused too, so a page on another origin cannot use this route
-async fn same_origin_guard(request: Request, next: Next) -> Response {
-    match check_same_origin(request.headers()) {
-        Ok(()) => next.run(request).await,
-        Err(message) => AppError::Permission {
-            message: message.into(),
-        }
-        .into_response(),
-    }
-}
-
-fn check_same_origin(headers: &HeaderMap) -> Result<(), &'static str> {
-    let header_text = |name| headers.get(name).and_then(|value| value.to_str().ok());
-    let host = header_text(header::HOST).ok_or("resource actions require a Host header")?;
-    let origin = header_text(header::ORIGIN).ok_or("resource actions require an Origin header")?;
-    if origin != format!("http://{host}") {
-        return Err("resource actions require the exact dashboard Origin");
-    }
+/// Reject browser writes from another origin; non-browser JSON Fleet clients have no Origin
+pub(super) async fn browser_write_guard(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let origin = headers.get(header::ORIGIN);
     let fetch_site = headers
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok());
-    if fetch_site.is_some_and(|site| site != "same-origin") {
-        return Err("resource actions require a same-origin browser request");
+    let allowed = !matches!(fetch_site, Some("cross-site" | "same-site"))
+        && origin.is_none_or(|origin| {
+            host.is_some_and(|host| origin.to_str().ok() == Some(format!("http://{host}").as_str()))
+        })
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media| media.trim() == "application/json")
+            });
+    if allowed {
+        return next.run(request).await;
     }
-    let json = header_text(header::CONTENT_TYPE).is_some_and(|value| {
-        value
-            .split(';')
-            .next()
-            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
-    });
-    if !json {
-        return Err("resource actions require an application/json body");
-    }
-    Ok(())
+    (StatusCode::FORBIDDEN, Json(json!({ "api_version": API_VERSION, "error": {
+        "code": "permission", "message": "write requires same-origin JSON", "retryable": false, "input": {}
+    } }))).into_response()
 }
 
 /// Output of `npm run build` in `web/`. Empty until the dashboard is built;

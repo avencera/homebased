@@ -2,11 +2,15 @@
 // initialisation: they own `$effect`s and runed utilities.
 
 import { IsDocumentVisible, useInterval } from 'runed';
+import { SvelteMap } from 'svelte/reactivity';
 import {
 	IN_FLIGHT_STATUSES,
 	asApiError,
+	fetchJob,
+	fetchJobs,
 	fetchLogTail,
 	fetchFleetTasks,
+	fetchResources,
 	fetchStatus,
 	fetchTask,
 	isInFlight,
@@ -14,20 +18,14 @@ import {
 	type DaemonStatus,
 	type FleetMachine,
 	type FleetTask,
+	type JobDetail,
+	type JobRecord,
 	type LogTail,
+	type ResourceRecord,
 	type TaskDetail,
 	type TaskQuery
 } from './api';
-import { resourceQueue, type ResourceQueue } from './resource-state';
-import {
-	fetchPendingActions,
-	fetchResourceDetail,
-	fetchResourceOverview,
-	type PendingAction,
-	type PendingActionResult,
-	type ResourceDetail,
-	type ResourceOverview
-} from './resources';
+import { newOperationId } from './queue-view';
 
 /** Every queued and running task, from every thread. */
 const IN_FLIGHT_QUERY: TaskQuery = { statuses: IN_FLIGHT_STATUSES };
@@ -182,10 +180,17 @@ export class TaskStore {
 	}
 }
 
-/** Resource overview and authority availability. */
-export class ResourceOverviewStore {
-	/** Last validated resource list. */
-	overview = $state<ResourceOverview | null>(null);
+/** This machine's GPU queue: its resources and every job that has not ended. */
+export class QueueStore {
+	/** By name. */
+	resources = $state<readonly ResourceRecord[]>([]);
+	/** Serving order. */
+	jobs = $state<readonly JobRecord[]>([]);
+	/**
+	 * Names of ended jobs whose run still holds a resource while it cleans up or waits for a release.
+	 * The queue list holds only jobs that have not ended, and a job's name never changes.
+	 */
+	endedJobNames = new SvelteMap<string, string>();
 	/** Error from the last attempt, cleared by the next success. */
 	error = $state<ApiError | null>(null);
 	/** Epoch milliseconds of the last settled attempt. */
@@ -196,20 +201,105 @@ export class ResourceOverviewStore {
 
 	constructor() {
 		startPolling({
-			key: () => 'resources',
+			key: () => '',
 			active: () => this.#visible.current,
 			run: () => void this.refresh()
 		});
 	}
 
-	/** Fetch the resource list and authority state. */
+	/** Fetch resources and jobs together so a run and its job agree. */
 	async refresh(): Promise<void> {
 		const generation = ++this.#generation;
 		try {
-			const overview = await fetchResourceOverview();
+			const [resources, jobs] = await Promise.all([fetchResources(), fetchJobs()]);
 			if (generation !== this.#generation) return;
-			this.overview = overview;
+			this.resources = resources.resources;
+			this.jobs = jobs.jobs;
 			this.error = null;
+			void this.#loadEndedJobNames(resources.machine);
+		} catch (cause) {
+			if (generation !== this.#generation) return;
+			this.error = asApiError(cause);
+		}
+		this.lastFetched = Date.now();
+	}
+
+	/** Name of a job, from the queue or the ended-job lookup. */
+	jobName(id: string): string | null {
+		return this.jobs.find((job) => job.id === id)?.spec.name ?? this.endedJobNames.get(id) ?? null;
+	}
+
+	async #loadEndedJobNames(machine: string): Promise<void> {
+		const missing = this.resources.flatMap((record) =>
+			record.run && this.jobName(record.run.job) === null ? [record.run.job] : []
+		);
+		if (missing.length === 0) return;
+		const found = await Promise.allSettled(missing.map((id) => fetchJob(id, machine)));
+		for (const result of found) {
+			if (result.status === 'fulfilled') {
+				this.endedJobNames.set(result.value.job.id, result.value.job.spec.name);
+			}
+		}
+	}
+}
+
+/** Job page: one job with every run, and the resources of the machine that runs it. */
+export class JobStore {
+	/** Last successful `GET /v1/resource/jobs/{job}`. */
+	detail = $state<JobDetail | null>(null);
+	/** Resources of the job's machine, for their names. */
+	resources = $state<readonly ResourceRecord[]>([]);
+	/** Machine that serves this dashboard. */
+	localMachine = $state<string | null>(null);
+	/** Error from the last attempt, cleared by the next success. */
+	error = $state<ApiError | null>(null);
+	/** Epoch milliseconds of the last settled attempt. */
+	lastFetched = $state<number | null>(null);
+
+	#id: () => string;
+	#visible = new IsDocumentVisible();
+	#generation = 0;
+	#loadedId = '';
+	/** An ended job whose last cleanup finished cannot change again, so the timer stops. */
+	#pollable = $derived(
+		this.detail === null ||
+			this.detail.job.position !== null ||
+			this.detail.active_run !== null ||
+			this.detail.runs.some((run) => run.cleanup === null)
+	);
+
+	constructor(id: () => string) {
+		this.#id = id;
+		startPolling({
+			key: id,
+			active: () => this.#visible.current && this.#pollable,
+			run: () => void this.refresh()
+		});
+	}
+
+	/** Whether the job's machine serves this dashboard, so run tasks have local pages. */
+	get local(): boolean {
+		return this.detail === null || this.detail.job.machine === this.localMachine;
+	}
+
+	/** Fetch the job, then its machine's resources. */
+	async refresh(): Promise<void> {
+		const generation = ++this.#generation;
+		const id = this.#id();
+		if (this.#loadedId !== id) {
+			this.detail = null;
+			this.resources = [];
+		}
+		try {
+			const [detail, local] = await Promise.all([fetchJob(id), fetchResources()]);
+			const remote = detail.job.machine !== local.machine;
+			const resources = remote ? await fetchResources(detail.job.machine) : local;
+			if (generation !== this.#generation) return;
+			this.detail = detail;
+			this.resources = resources.resources;
+			this.localMachine = local.machine;
+			this.error = null;
+			this.#loadedId = id;
 		} catch (cause) {
 			if (generation !== this.#generation) return;
 			this.error = asApiError(cause);
@@ -218,148 +308,52 @@ export class ResourceOverviewStore {
 	}
 }
 
-/** Holder and queue of every resource, for the task list's side panel. */
-export class ResourceQueueStore {
-	/** Resources in overview order. */
-	queues = $state<readonly ResourceQueue[]>([]);
-	/** Error from the last attempt, cleared by the next success. */
+/** Transport attempts for one queue operation, all with the same operation ID. */
+const OPERATION_ATTEMPTS = 3;
+
+/** Sends one queue control at a time and keeps the daemon's last refusal on screen. */
+export class QueueControl {
+	/** Key of the action in flight, such as a job or attention ID. */
+	pending = $state<string | null>(null);
+	/** The daemon's refusal or a transport failure from the last action. */
 	error = $state<ApiError | null>(null);
 
-	#visible = new IsDocumentVisible();
-	#generation = 0;
+	#refresh: () => Promise<void>;
 
-	constructor() {
-		startPolling({
-			key: () => 'resource-queues',
-			active: () => this.#visible.current,
-			run: () => void this.refresh()
-		});
+	constructor(refresh: () => Promise<void>) {
+		this.#refresh = refresh;
 	}
 
-	/** Fetch the overview, then each detail, because only detail carries the queue. */
-	async refresh(): Promise<void> {
-		const generation = ++this.#generation;
-		try {
-			const overview = await fetchResourceOverview();
-			const details = await Promise.all(
-				overview.resources.map((item) => fetchResourceDetail(item.resource.id))
-			);
-			if (generation !== this.#generation) return;
-			this.queues = details.map(resourceQueue);
-			this.error = null;
-		} catch (cause) {
-			if (generation !== this.#generation) return;
-			this.error = asApiError(cause);
-		}
-	}
-
-	/** Keep the exact detail returned by an acknowledged mutation on screen. */
-	showAuthoritative(detail: ResourceDetail): void {
-		this.#generation += 1;
-		this.queues = this.queues.map((queue) =>
-			queue.resource.id === detail.resource.id ? resourceQueue(detail) : queue
-		);
+	/**
+	 * Send one operation under a fresh operation ID. A request that never reached the daemon is
+	 * retried with the same ID, so the daemon applies it at most once.
+	 */
+	async run(key: string, send: (operationId: string) => Promise<unknown>): Promise<boolean> {
+		if (this.pending !== null) return false;
+		this.pending = key;
 		this.error = null;
-	}
-}
-
-/** One resource detail, including actions assigned to its exact supervisor. */
-export class ResourceDetailStore {
-	/** Last validated detail from the fixed resource authority. */
-	detail = $state<ResourceDetail | null>(null);
-	/** Pending actions for the assigned supervisor, or null until first success. */
-	pendingActions = $state<PendingAction[] | null>(null);
-	/** Authorities that could not answer the supervisor action query. */
-	pendingUnavailableAuthorities = $state<readonly Record<string, unknown>[] | null>(null);
-	/** Error from the resource detail request. */
-	error = $state<ApiError | null>(null);
-	/** Error from the pending-action query. */
-	pendingError = $state<ApiError | null>(null);
-	/** Epoch milliseconds of the last settled detail attempt. */
-	lastFetched = $state<number | null>(null);
-
-	#id: () => string;
-	#visible = new IsDocumentVisible();
-	#generation = 0;
-	#pendingGeneration = 0;
-	#loadedId = '';
-
-	constructor(id: () => string) {
-		this.#id = id;
-		startPolling({
-			key: id,
-			active: () => this.#visible.current,
-			run: () => void this.refresh()
-		});
-	}
-
-	/** Fetch detail, then refresh the supervisor's pending-action projection. */
-	async refresh(): Promise<void> {
-		const generation = ++this.#generation;
-		const id = this.#id();
-		if (this.#loadedId !== id) {
-			this.detail = null;
-			this.pendingActions = null;
-			this.pendingUnavailableAuthorities = null;
+		const operationId = newOperationId();
+		let succeeded = false;
+		for (let attempt = 1; attempt <= OPERATION_ATTEMPTS; attempt += 1) {
+			try {
+				await send(operationId);
+				succeeded = true;
+				break;
+			} catch (cause) {
+				const error = asApiError(cause);
+				this.error = error;
+				if (error.reachable) break;
+			}
 		}
-
-		try {
-			const detail = await fetchResourceDetail(id);
-			if (generation !== this.#generation) return;
-			this.detail = detail;
-			this.error = null;
-			this.#loadedId = id;
-		} catch (cause) {
-			if (generation !== this.#generation) return;
-			this.error = asApiError(cause);
-			this.lastFetched = Date.now();
-			return;
-		}
-
-		await this.refreshPendingActions(generation);
-		if (generation === this.#generation) this.lastFetched = Date.now();
+		if (succeeded) this.error = null;
+		this.pending = null;
+		await this.#refresh();
+		return succeeded;
 	}
 
-	/** Keep the exact detail returned by an acknowledged mutation on screen. */
-	showAuthoritative(detail: ResourceDetail): void {
-		if (detail.resource.id === this.#id()) {
-			this.#generation += 1;
-			this.#pendingGeneration += 1;
-			this.detail = detail;
-			this.pendingActions = null;
-			this.pendingUnavailableAuthorities = null;
-			this.pendingError = null;
-			this.error = null;
-			this.#loadedId = detail.resource.id;
-			this.lastFetched = Date.now();
-		}
-	}
-
-	/** Refresh the pending-action query without replacing resource detail. */
-	async refreshPending(): Promise<void> {
-		await this.refreshPendingActions(this.#generation);
-	}
-
-	async refreshPendingActions(generation = this.#generation): Promise<void> {
-		const detail = this.detail;
-		if (!detail) return;
-		const pendingGeneration = ++this.#pendingGeneration;
-		try {
-			const result: PendingActionResult = await fetchPendingActions(
-				detail.resource.supervisor.machine,
-				detail.resource.supervisor.thread
-			);
-			if (generation !== this.#generation || pendingGeneration !== this.#pendingGeneration) return;
-			this.pendingActions = result.actions.filter(
-				(action) => action.resource_id === detail.resource.id
-			);
-			this.pendingUnavailableAuthorities = result.unavailable_authorities ?? [];
-			this.pendingError = null;
-		} catch (cause) {
-			if (generation !== this.#generation || pendingGeneration !== this.#pendingGeneration) return;
-			this.pendingError = asApiError(cause);
-			this.pendingUnavailableAuthorities = null;
-		}
+	/** Clear the last error once the reader dismisses it. */
+	dismiss(): void {
+		this.error = null;
 	}
 }
 
