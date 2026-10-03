@@ -13,7 +13,7 @@ use crate::message::MessageId;
 /// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
 /// SQLite database file name under `$HOMEBASED_HOME`.
-pub const DB_NAME: &str = "homebased.sqlite";
+pub const DB_NAME: &str = "homebased_v1.sqlite";
 /// Daemon singleton lock file name under `$HOMEBASED_HOME`.
 pub const DAEMON_LOCK: &str = "daemon.lock";
 /// Log that records callbacks `codex queue` could not deliver.

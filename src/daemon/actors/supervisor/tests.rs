@@ -37,7 +37,7 @@ fn command_task_row(id: TaskId, spec: &NormalizedSpec, path: String, binary: &st
 
     new_queued_task(NewTask {
         id,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: spec.thread,
         workload: Workload::Task(TaskWorkload {
             command: workload.command.clone(),
@@ -263,7 +263,7 @@ fn direct_queued_tasks_keep_their_existing_startup_actions() {
         task: id,
         origin_machine,
         execution_machine,
-        spec: spec.into(),
+        spec,
         state: ProcessStatus::Queued,
     });
     assert_eq!(

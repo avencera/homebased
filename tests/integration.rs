@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use homebased::domain::{
     Agent, AgentKind, AgentWorkload, CallbackStatus, ExitReason, ProcessStatus, TaskEnv, TaskId,
-    TerminalCallbackProjection, Workload,
+    Workload,
 };
 use homebased::store::{NewTask, Store, new_queued_task};
 use serde_json::{Value, json};
@@ -234,7 +234,7 @@ impl Harness {
     }
 
     fn store(&self) -> Store {
-        Store::open(&self.home.join("homebased.sqlite")).unwrap()
+        Store::open(&self.home.join(homebased::home::DB_NAME)).unwrap()
     }
 
     fn stop_daemon(&mut self) {
@@ -310,7 +310,7 @@ impl Harness {
     fn backdate_created_at(&self, id: &str, hours_ago: i64) {
         let ts = (Utc::now() - ChronoDuration::hours(hours_ago))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
-        let conn = rusqlite::Connection::open(self.home.join("homebased.sqlite")).unwrap();
+        let conn = rusqlite::Connection::open(self.home.join(homebased::home::DB_NAME)).unwrap();
         let n = conn
             .execute(
                 "UPDATE tasks SET created_at = ?1 WHERE id = ?2",
@@ -325,7 +325,7 @@ impl Harness {
     }
 
     fn set_timeout_secs(&self, id: &str, secs: u64) {
-        let conn = rusqlite::Connection::open(self.home.join("homebased.sqlite")).unwrap();
+        let conn = rusqlite::Connection::open(self.home.join(homebased::home::DB_NAME)).unwrap();
         let n = conn
             .execute(
                 "UPDATE tasks SET timeout_secs = ?1 WHERE id = ?2",
@@ -668,7 +668,7 @@ fn codex_worker_thread_is_recorded_and_followup_resumes_the_worker() {
     );
     assert_eq!(h.agent_stdin(followup_id), "Review the new information");
 
-    let conn = rusqlite::Connection::open(h.home.join("homebased.sqlite")).unwrap();
+    let conn = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
     let workload_json: String = conn
         .query_row(
             "SELECT workload_json FROM tasks WHERE id=?1",
@@ -872,7 +872,7 @@ fn followup_dry_run_reads_message_file_without_spawning() {
     let message_path = h.home.join("followup-message.txt");
     fs::write(&message_path, "message from file").unwrap();
 
-    let before: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+    let before: i64 = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
         .unwrap();
@@ -898,7 +898,7 @@ fn followup_dry_run_reads_message_file_without_spawning() {
         argv.windows(3)
             .any(|args| { args == ["resume", worker_thread, "-"] })
     );
-    let after: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+    let after: i64 = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
         .unwrap();
@@ -967,7 +967,7 @@ fn local_submit_retry_with_the_same_request_returns_the_saved_task() {
     );
     let retry: Value = serde_json::from_slice(&retry.stdout).unwrap();
     assert_eq!(retry["id"], id);
-    let tasks: i64 = rusqlite::Connection::open(h.home.join("homebased.sqlite"))
+    let tasks: i64 = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
         .unwrap();
@@ -1536,7 +1536,7 @@ fn stop_refusal_and_yes() {
     let task = id.parse::<TaskId>().unwrap();
     assert_eq!(
         h.store().task_presentations(&[task]).unwrap()[&task].terminal_callback,
-        TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+        Some(CallbackStatus::Sent)
     );
 }
 
@@ -2976,7 +2976,7 @@ fn web_listener_serves_read_only_api() {
 }
 
 #[test]
-fn named_task_exposes_display_name_and_missing_name_is_rejected() {
+fn named_task_exposes_its_name_and_missing_name_is_rejected() {
     let h = Harness::new();
     let mut named = Harness::task_spec(&["true"]);
     named["name"] = json!("named job");
@@ -2991,7 +2991,6 @@ fn named_task_exposes_display_name_and_missing_name_is_rejected() {
     )
     .unwrap();
     assert_eq!(named_show["name"], "named job");
-    assert_eq!(named_show["display_name"], "named job");
 
     let mut nameless = Harness::task_spec(&["echo", "hi", "there", "x"]);
     nameless.as_object_mut().unwrap().remove("name");
@@ -3413,32 +3412,55 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
     let id = TaskId::new();
     let store = h.store();
     fs::create_dir_all(h.home.join("tasks").join(id.to_string())).unwrap();
+    let cwd = std::env::temp_dir();
+    let spec: homebased::spec::NormalizedSpec = serde_json::from_value(json!({
+        "api_version": 1,
+        "thread": THREAD,
+        "name": "reconcile test",
+        "cwd": cwd,
+        "timeout": "2h",
+        "workload": {
+            "type": "agent",
+            "agent": "claude",
+            "prompt": "reconcile",
+            "report_trailer": false
+        }
+    }))
+    .unwrap();
+    let row = new_queued_task(NewTask {
+        id,
+        name: spec.name.clone(),
+        thread: spec.thread,
+        workload: Workload::Agent(AgentWorkload {
+            agent: Agent::new(AgentKind::Claude, None),
+            extra_args: vec![],
+            report_trailer: false,
+            resume_thread: None,
+        }),
+        cwd: cwd.clone(),
+        timeout: spec.timeout,
+        env: TaskEnv {
+            path: h.path.clone(),
+            home: h.user_home.display().to_string(),
+        },
+        binary: fixture("fake-claude"),
+    });
+    let home = homebased::home::Home::resolve(Some(h.home.clone())).unwrap();
+    let machine = homebased::machine::load_or_create_machine_id(&home).unwrap();
     store
-        .insert_task(&new_queued_task(NewTask {
-            id,
-            name: None,
-            thread: THREAD.parse().unwrap(),
-            workload: Workload::Agent(AgentWorkload {
-                agent: Agent::new(AgentKind::Claude, None),
-                extra_args: vec![],
-                report_trailer: false,
-                resume_thread: None,
-            }),
-            cwd: std::env::temp_dir(),
-            timeout: Duration::from_secs(2 * 3600),
-            env: TaskEnv {
-                path: h.path.clone(),
-                home: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-            },
-            binary: fixture("fake-claude"),
-        }))
+        .insert_local_task(
+            &row,
+            &spec,
+            machine,
+            homebased::submission::RequestId::new(),
+            homebased::submission::CallbackExecutable::available(fixture("fake-codex")),
+        )
         .unwrap();
-    // the daemon died between the exit CAS and FinishCallback
-    let row = store
+    // the daemon died after the exit CAS committed its terminal event
+    store
         .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
         .unwrap()
         .expect("queued row cancels");
-    assert_eq!(row.callback_status, CallbackStatus::Pending);
     drop(store);
 
     let before = h.queue_messages().len();
@@ -3628,12 +3650,6 @@ fn task_dry_run_returns_exact_argv_and_creates_no_row() {
 /// 20s attempt deadline, and the terminal event must not leak
 #[test]
 fn terminal_event_waits_for_an_in_flight_check_due() {
-    use homebased::callback::{ATTENTION_SETTLE, QUEUE_ATTEMPT_TIMEOUT};
-    assert!(
-        ATTENTION_SETTLE > QUEUE_ATTEMPT_TIMEOUT * 3,
-        "settle must outlast three bounded queue attempts"
-    );
-
     let mut h = Harness::new();
     h.set_control("sleep", "40");
     let id = h.submit(&Harness::spec("claude", "race the terminal event"));

@@ -9,12 +9,12 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
-    AttentionId, CleanupFailure, JobId, OperationId, Placement, QueueError, ResourceId,
-    ResourceName, StopCause,
+    ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
+    ResourceId, ResourceName, StopCause,
 };
 use crate::store::Store;
 
-use super::NewJob;
+use super::{JobRecord, NewJob, ResourceRecord};
 
 /// One operation on the receiving machine's queue; selectors are resolved by the origin
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +77,41 @@ pub enum QueueRequest {
     },
 }
 
+/// One machine's resources, by name, with their active runs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceList {
+    /// Machine whose queue the resources serve
+    pub machine: MachineId,
+    /// Resources and their runs
+    pub resources: Vec<ResourceRecord>,
+}
+
+/// One machine's non-terminal jobs in serving order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobList {
+    /// Machine whose queue holds the jobs
+    pub machine: MachineId,
+    /// Jobs, highest level first, then by position
+    pub jobs: Vec<JobRecord>,
+}
+
+/// One job with its active run, every attempt, and its events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDetail {
+    /// The job
+    pub job: JobRecord,
+    /// Its run on a resource, while one holds it
+    pub active_run: Option<ActiveRun>,
+    /// Every attempt, oldest first
+    pub runs: Vec<JobRunView>,
+    /// Stop cause of the latest attempt that committed one
+    pub last_stop_cause: Option<StopCause>,
+    /// Job events in sequence order
+    pub events: Vec<JobEvent>,
+}
+
 /// One historical attempt, including cleanup and the last committed stop cause
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRunView {
     /// Ordinary task identity for logs
     pub task: TaskId,
@@ -107,31 +140,33 @@ impl Store {
         env: &TaskEnv,
     ) -> Result<Value, AppError> {
         let mut result = match request {
-            QueueRequest::Resources => {
-                json!({ "machine": machine, "resources": self.resources_on(machine)? })
-            }
-            QueueRequest::Jobs => {
-                json!({ "machine": machine, "jobs": self.machine_queue(machine)? })
-            }
+            QueueRequest::Resources => serde_json::to_value(ResourceList {
+                machine,
+                resources: self.resources_on(machine)?,
+            })?,
+            QueueRequest::Jobs => serde_json::to_value(JobList {
+                machine,
+                jobs: self.machine_queue(machine)?,
+            })?,
             QueueRequest::Show { job } => {
                 let record = self
                     .job(*job)?
                     .filter(|record| record.machine == machine)
                     .ok_or(QueueError::JobNotFound { job: *job })?;
-                let resources = self.resources_on(machine)?;
-                let active = resources
+                let active_run = self
+                    .resources_on(machine)?
                     .into_iter()
                     .filter_map(|resource| resource.run)
                     .find(|run| run.job == *job);
                 let runs = self.job_runs(*job)?;
                 let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
-                json!({
-                    "job": record,
-                    "active_run": active,
-                    "runs": runs,
-                    "last_stop_cause": last_stop_cause,
-                    "events": self.job_events(*job)?,
-                })
+                serde_json::to_value(JobDetail {
+                    job: record,
+                    active_run,
+                    runs,
+                    last_stop_cause,
+                    events: self.job_events(*job)?,
+                })?
             }
             QueueRequest::NoticeCurrent { job, seq } => {
                 self.require_machine_job(machine, *job)?;

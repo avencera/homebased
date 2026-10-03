@@ -121,10 +121,8 @@ export interface DaemonStatus {
 /** One row of `GET /v1/tasks`. */
 export interface TaskSummary {
 	id: string;
-	/** Submitted name. Omitted only for tasks stored before name was required. */
-	name?: string | null;
-	/** Non-empty server-derived label. */
-	display_name: string;
+	/** Submitted name. */
+	name: string;
 	status: ProcessStatus;
 	workload: WorkloadView;
 	/** Submitting Codex thread or Claude Code session. */
@@ -140,7 +138,8 @@ export interface TaskSummary {
 	execution_machine?: string;
 	/** Worker pid while running. */
 	pid: number | null;
-	callback: CallbackStatus;
+	/** Terminal callback delivery, or null when this machine delivers none for the task. */
+	callback: CallbackStatus | null;
 	/** Output-inactivity timeout in seconds. */
 	timeout_secs: number;
 	/** Whether the inactivity reminder is pending or sent. */
@@ -335,7 +334,8 @@ export type JobTarget = { type: 'any' } | { type: 'pinned'; resource: string };
 
 /** Where a job is in its life. */
 export type JobState =
-	| { state: 'queued'; next_step: number; resume: boolean }
+	/** `resume`: the next run resumes the step from a checkpoint. */
+	| { state: 'queued'; resume: boolean }
 	| { state: 'active'; resource: string }
 	| { state: 'succeeded' }
 	| { state: 'failed'; run: string }
@@ -370,6 +370,8 @@ export interface ActiveRun {
 	run_number: number;
 	/** 0-based step index. */
 	step: number;
+	/** Whether the run resumes its step from a checkpoint. */
+	resume: boolean;
 	phase: RunPhase;
 }
 
@@ -426,9 +428,8 @@ export interface JobRecord {
 	/** 1-based position within the level; null once terminal. */
 	position: number | null;
 	state: JobState;
-	/** 0-based step the next or current run executes. */
-	next_step: number;
-	resume: boolean;
+	/** 0-based step the job is at: the step its next or current run executes, or the step it ended on. */
+	step: number;
 	/** Runs started so far. */
 	runs: number;
 	created_at: string;
@@ -560,8 +561,7 @@ const ContainerDetailSchema = Schema.Struct({
 });
 const TaskSummarySchema = Schema.Struct({
 	id: Schema.String,
-	name: Schema.optional(Schema.NullOr(Schema.String)),
-	display_name: Schema.String,
+	name: Schema.String,
 	status: ProcessStatusSchema,
 	workload: WorkloadSchema,
 	thread: Schema.String,
@@ -571,7 +571,7 @@ const TaskSummarySchema = Schema.Struct({
 	origin_machine: Schema.optional(Schema.String),
 	execution_machine: Schema.optional(Schema.String),
 	pid: Schema.NullOr(Schema.Finite),
-	callback: CallbackStatusSchema,
+	callback: Schema.NullOr(CallbackStatusSchema),
 	timeout_secs: Schema.Finite,
 	check_timeout: CheckTimeoutStatusSchema,
 	exit_reason: Schema.NullOr(ExitReasonSchema),
@@ -594,8 +594,7 @@ const TaskEventSchema = Schema.Record({ key: Schema.String, value: Schema.Unknow
 const TaskDetailSchema = Schema.Struct({
 	api_version: Schema.Literal(API_VERSION),
 	id: Schema.String,
-	name: Schema.optional(Schema.NullOr(Schema.String)),
-	display_name: Schema.String,
+	name: Schema.String,
 	status: ProcessStatusSchema,
 	workload: WorkloadSchema,
 	thread: Schema.String,
@@ -604,7 +603,7 @@ const TaskDetailSchema = Schema.Struct({
 	origin_machine: Schema.optional(Schema.String),
 	execution_machine: Schema.optional(Schema.String),
 	pid: Schema.NullOr(Schema.Finite),
-	callback: CallbackStatusSchema,
+	callback: Schema.NullOr(CallbackStatusSchema),
 	timeout_secs: Schema.Finite,
 	check_timeout: CheckTimeoutStatusSchema,
 	exit_reason: Schema.NullOr(ExitReasonSchema),
@@ -734,6 +733,7 @@ const ActiveRunSchema = Schema.Struct({
 	task: Schema.String,
 	run_number: Schema.Finite,
 	step: Schema.Finite,
+	resume: Schema.Boolean,
 	phase: RunPhaseSchema
 });
 const ResourceListSchema = Schema.Struct({
@@ -754,7 +754,6 @@ const ResourceListSchema = Schema.Struct({
 const JobStateSchema = Schema.Union(
 	Schema.Struct({
 		state: Schema.Literal('queued'),
-		next_step: Schema.Finite,
 		resume: Schema.Boolean
 	}),
 	Schema.Struct({ state: Schema.Literal('active'), resource: Schema.String }),
@@ -789,8 +788,7 @@ const JobRecordSchema = Schema.Struct({
 	priority: PrioritySchema,
 	position: Schema.NullOr(Schema.Finite),
 	state: JobStateSchema,
-	next_step: Schema.Finite,
-	resume: Schema.Boolean,
+	step: Schema.Finite,
 	runs: Schema.Finite,
 	created_at: Schema.String,
 	updated_at: Schema.String

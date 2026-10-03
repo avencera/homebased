@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn outbound_route_stays_fixed_after_restart_and_name_rebinding() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let request = request();
         let recipient = requested_recipient(&request);
         let original_machine = MachineId::new();
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn changed_request_conflicts_before_destination_binding() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let mut store = Store::open(&path).unwrap();
         let request = request();
         store.begin_outbound_message(&request).unwrap();
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn protocol_retry_updates_attempt_and_returns_the_current_receipt_version() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let mut store = Store::open(&path).unwrap();
         let request = receiver_request(1);
         let attempt = MessageAttempt {
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn concurrent_first_sends_with_one_uuid_converge_on_one_route() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         drop(Store::open(&path).unwrap());
         let request = request();
         let recipient = requested_recipient(&request);

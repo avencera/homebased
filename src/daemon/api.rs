@@ -91,10 +91,7 @@ async fn followup_source(
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
-    let spec = route.spec.current().ok_or_else(|| AppError::Internal {
-        message: format!("task {id} has no saved workload for followup"),
-    })?;
-    match &spec.workload {
+    match &route.spec.workload {
         NormalizedWorkload::Agent(agent) if agent.agent == AgentKind::Codex => {
             Ok(Json(TaskFollowupSource {
                 api_version: API_VERSION,

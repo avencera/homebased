@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn cancellation_acknowledgement_uses_the_selected_protocol_version() {
         let request = request();
-        let selected = ClusterProtocolVersion(2);
+        let selected = crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 
         assert_eq!(
             decode_acknowledgement(acknowledgement(&request, selected), &request, selected)
@@ -338,7 +338,7 @@ mod tests {
         );
         assert!(matches!(
             decode_acknowledgement(
-                acknowledgement(&request, ClusterProtocolVersion(1)),
+                acknowledgement(&request, ClusterProtocolVersion(selected.0 - 1)),
                 &request,
                 selected
             ),

@@ -21,7 +21,7 @@ impl fmt::Display for ClusterProtocolVersion {
 }
 
 /// Version this build speaks by default
-pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(2);
+pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(3);
 
 /// Range this build accepts
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {

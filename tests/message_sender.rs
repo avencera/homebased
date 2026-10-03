@@ -23,7 +23,7 @@ use homebased::message::{MessageId, MessageSource};
 use homebased::spec;
 use homebased::store::{NewTask, Store, new_queued_task};
 use homebased::submission::{
-    CallbackContext, CallbackExecutable, OriginRoute, PersistedSpec, RequestId, SubmissionState,
+    CallbackContext, CallbackExecutable, OriginRoute, RequestId, SubmissionState,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -345,7 +345,7 @@ impl Daemon {
     }
 
     fn delivery(&self, id: MessageId) -> homebased::message::MessageDelivery {
-        Store::open(&self.state_home.join("homebased.sqlite"))
+        Store::open(&self.state_home.join(homebased::home::DB_NAME))
             .unwrap()
             .message_delivery(id)
             .unwrap()
@@ -634,7 +634,7 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
         "workload": { "type": "task", "command": ["echo", "route"] },
     }))
     .unwrap();
-    Store::open(&receiver.state_home.join("homebased.sqlite"))
+    Store::open(&receiver.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_origin_route(&OriginRoute {
             request: RequestId::new(),
@@ -650,10 +650,10 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
                 cwd: task_cwd,
                 codex: CallbackExecutable::available(receiver.codex.clone()),
             },
-            spec: PersistedSpec::Current(Box::new(spec)),
+            spec,
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         })
@@ -761,7 +761,7 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
         "workload": { "type": "task", "command": ["/bin/true"] },
     }))
     .unwrap();
-    Store::open(&sender.state_home.join("homebased.sqlite"))
+    Store::open(&sender.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_origin_route(&OriginRoute {
             request: RequestId::new(),
@@ -777,10 +777,10 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
                 cwd,
                 codex: CallbackExecutable::available(sender.codex.clone()),
             },
-            spec: PersistedSpec::Current(Box::new(spec)),
+            spec,
             submission: SubmissionState::Accepted,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         })
@@ -829,14 +829,15 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
     let repeated_self_error: Value = serde_json::from_slice(&repeated_self_message.stderr).unwrap();
     assert_eq!(repeated_self_error["error"]["code"], "message_to_self");
     assert!(sender.queue_calls().is_empty());
-    let binding_count: i64 = rusqlite::Connection::open(sender.state_home.join("homebased.sqlite"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM outbound_message_bindings WHERE message_id=?1",
-            [self_message.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let binding_count: i64 =
+        rusqlite::Connection::open(sender.state_home.join(homebased::home::DB_NAME))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_message_bindings WHERE message_id=?1",
+                [self_message.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
     assert_eq!(binding_count, 1);
 
     let task_source_id = MessageId::new();
@@ -970,11 +971,11 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
     // the daemon starts queued rows only at startup, so this one stays queued
     let queued = TaskId::new();
     fs::create_dir_all(receiver.state_home.join("tasks").join(queued.to_string())).unwrap();
-    Store::open(&receiver.state_home.join("homebased.sqlite"))
+    Store::open(&receiver.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_task(&new_queued_task(NewTask {
             id: queued,
-            name: None,
+            name: homebased::domain::TaskName::parse("test task").unwrap(),
             thread: origin,
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, None),

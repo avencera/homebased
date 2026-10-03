@@ -144,7 +144,9 @@
 						<Elapsed from={since} class="text-muted-foreground" />
 					{/if}
 				{:else if job.state.state === 'queued'}
-					<span class="text-muted-foreground">{job.resume ? 'waiting, resumes' : 'waiting'}</span>
+					<span class="text-muted-foreground"
+						>{job.state.resume ? 'waiting, resumes' : 'waiting'}</span
+					>
 				{:else}
 					{EM_DASH}
 				{/if}

@@ -454,6 +454,17 @@ pub enum AppError {
     /// The GPU priority queue refused a request
     #[error(transparent)]
     Queue(#[from] QueueError),
+    /// The database was written by a newer build that this binary cannot read
+    #[error(
+        "database schema version {found} is newer than this build supports ({supported}); \
+         update homebased"
+    )]
+    SchemaTooNew {
+        /// `user_version` found in the database file
+        found: i64,
+        /// Newest schema version this binary reads
+        supported: i64,
+    },
     /// Unexpected internal failure
     #[error("{message}")]
     Internal {
@@ -559,6 +570,7 @@ impl AppError {
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::DaemonBusy => "daemon_busy",
             Self::Queue(error) => error.code(),
+            Self::SchemaTooNew { .. } => "schema_too_new",
             Self::Internal { .. } => "internal",
         }
     }
@@ -577,6 +589,7 @@ impl AppError {
             | Self::TaskUnavailable { .. }
             | Self::NotifyFailed { .. }
             | Self::DaemonBusy
+            | Self::SchemaTooNew { .. }
             | Self::Internal { .. } => 1,
             Self::InvalidSpec { .. }
             | Self::InvalidCwd { .. }
@@ -688,6 +701,7 @@ impl AppError {
             | Self::UnitInvalid { .. }
             | Self::LockHeld { .. }
             | Self::NotifyFailed { .. }
+            | Self::SchemaTooNew { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::Queue(error) => error.http_status(),
         }
@@ -812,6 +826,9 @@ impl AppError {
             Self::NotifyNotConfigured => json!({}),
             Self::NotifyFailed { message } => json!({ "message": message }),
             Self::DaemonBusy => json!({}),
+            Self::SchemaTooNew { found, supported } => {
+                json!({ "found": found, "supported": supported })
+            }
             Self::Internal { message } => json!({ "message": message }),
             Self::ConfigInvalid { path, .. } => json!({ "path": path }),
             Self::MachineNotFound { machine } => json!({ "machine": machine }),

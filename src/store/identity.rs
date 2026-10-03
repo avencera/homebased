@@ -44,16 +44,6 @@ fn decode_route(value: &str) -> Result<OriginRoute, IdentityError> {
     Ok(route)
 }
 
-fn decode_identity(value: &str) -> Result<ExecutorIdentity, IdentityError> {
-    let identity: ExecutorIdentity = decode(value)?;
-    if let ExecutorIdentity::Accepted(record) = &identity
-        && !record.has_valid_spec_owners()
-    {
-        return Err(IdentityError::Conflict);
-    }
-    Ok(identity)
-}
-
 pub(super) fn executor_identity_on(
     conn: &rusqlite::Connection,
     task: TaskId,
@@ -66,7 +56,7 @@ pub(super) fn executor_identity_on(
         )
         .optional()
         .map_err(storage)?;
-    data.as_deref().map(decode_identity).transpose()
+    data.as_deref().map(decode).transpose()
 }
 
 fn validate_route(route: &OriginRoute) -> Result<(), IdentityError> {
@@ -159,9 +149,16 @@ impl Store {
         }
         let after_json = after.map(encode).transpose()?;
         tx.execute(
-            "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json,after_json) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![route.request.0.to_string(), route.task.to_string(), route.execution_machine.as_uuid().to_string(), encode(&route.spec)?, encode(route)?, after_json],
-        ).map_err(storage)?;
+            "INSERT INTO origin_routes (request_id,task_id,route_json,after_json)
+             VALUES (?1,?2,?3,?4)",
+            params![
+                route.request.0.to_string(),
+                route.task.to_string(),
+                encode(route)?,
+                after_json
+            ],
+        )
+        .map_err(storage)?;
         tx.commit().map_err(storage)?;
         Ok(route.clone())
     }
@@ -267,7 +264,7 @@ impl Store {
         match &route.submission {
             SubmissionState::AcceptanceUnknown => {
                 route.submission = outcome;
-                route.last_updated_at = Some(chrono::Utc::now());
+                route.last_updated_at = chrono::Utc::now();
                 tx.execute(
                     "UPDATE origin_routes SET route_json=?1 WHERE task_id=?2",
                     params![encode(&route)?, task.to_string()],
@@ -286,7 +283,7 @@ impl Store {
                     _ => None,
                 };
                 route.submission = outcome;
-                route.last_updated_at = Some(chrono::Utc::now());
+                route.last_updated_at = chrono::Utc::now();
                 match refused {
                     Some(ending) => super::dependency::append_unlaunched_event_on(
                         &tx,
@@ -317,9 +314,6 @@ impl Store {
         &mut self,
         record: &ExecutionRecord,
     ) -> Result<ExecutorIdentity, IdentityError> {
-        if record.current_spec().is_none() || !record.has_valid_spec_owners() {
-            return Err(IdentityError::Conflict);
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -464,7 +458,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{IdentityError, encode};
+    use super::IdentityError;
     use crate::domain::{ProcessStatus, TaskEnv, TaskId};
     use crate::machine::MachineId;
     use crate::store::Store;
@@ -501,10 +495,10 @@ mod tests {
                 cwd: Path::new("/tmp").to_path_buf(),
                 codex: Path::new("/bin/echo").to_path_buf().into(),
             },
-            spec: spec.into(),
+            spec,
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         }
@@ -515,7 +509,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let mut first = route();
-        first.spec.current_mut().unwrap().machine = Some("remote-executor".parse().unwrap());
+        first.spec.machine = Some("remote-executor".parse().unwrap());
         store.insert_origin_route(&first).unwrap();
         let saved = store.insert_origin_route(&first).unwrap();
         assert_eq!(saved.task, first.task);
@@ -546,7 +540,7 @@ mod tests {
             Err(IdentityError::Conflict)
         ));
         let mut changed_content = first.clone();
-        changed_content.spec.current_mut().unwrap().cwd = Path::new("/different").to_path_buf();
+        changed_content.spec.cwd = Path::new("/different").to_path_buf();
         assert!(matches!(
             store.insert_origin_route(&changed_content),
             Err(IdentityError::Conflict)
@@ -591,13 +585,10 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json)
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO origin_routes (request_id,task_id,route_json) VALUES (?1,?2,?3)",
                 params![
                     route.request.0.to_string(),
                     route.task.to_string(),
-                    route.execution_machine.as_uuid().to_string(),
-                    encode(route.spec.current().unwrap()).unwrap(),
                     serde_json::to_string(&json).unwrap(),
                 ],
             )
@@ -635,7 +626,7 @@ mod tests {
                     task,
                     origin_machine: origin,
                     execution_machine: execution,
-                    spec: spec().into(),
+                    spec: spec(),
                     state: ProcessStatus::Queued,
                 })
                 .unwrap()
@@ -666,7 +657,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
         let mut first = route();
-        first.spec.current_mut().unwrap().machine = Some("remote-executor".parse().unwrap());
+        first.spec.machine = Some("remote-executor".parse().unwrap());
         let mut contender = first.clone();
         contender.task = TaskId::new();
         contender.execution_machine = MachineId::new();
@@ -718,7 +709,7 @@ mod tests {
                 task,
                 origin_machine: origin,
                 execution_machine: execution,
-                spec: spec().into(),
+                spec: spec(),
                 state: ProcessStatus::Queued,
             })
             .unwrap();
@@ -735,7 +726,7 @@ mod tests {
             task: TaskId::new(),
             origin_machine: MachineId::new(),
             execution_machine: MachineId::new(),
-            spec: spec().into(),
+            spec: spec(),
             state: ProcessStatus::Queued,
         };
         store.accept_execution(&record).unwrap();
@@ -745,7 +736,7 @@ mod tests {
         assert!(
             matches!(store.accept_execution(&record).unwrap(), ExecutorIdentity::Accepted(saved) if saved.state == ProcessStatus::Running)
         );
-        record.spec.current_mut().unwrap().cwd = Path::new("/different").to_path_buf();
+        record.spec.cwd = Path::new("/different").to_path_buf();
         assert!(matches!(
             store.accept_execution(&record),
             Err(IdentityError::Conflict)

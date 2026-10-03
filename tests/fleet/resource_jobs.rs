@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use homebased::domain::{TaskEnv, ThreadId};
 use homebased::fleet::http::ClusterClient;
+use homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 use homebased::queue::delivery::RoutedJobEvent;
 use homebased::queue::{JobId, OperationId};
 use homebased::store::Store;
@@ -24,7 +25,7 @@ impl Drop for Jobs<'_> {
                 .output();
         }
         let _ = wait_until(Duration::from_secs(12), || {
-            let Ok(store) = Store::open(&self.executor.home.join("homebased.sqlite")) else {
+            let Ok(store) = Store::open(&self.executor.home.join(homebased::home::DB_NAME)) else {
                 return false;
             };
             self.ids.iter().all(|job| {
@@ -99,7 +100,7 @@ fn submit_ok(origin: &Daemon, job: JobId, spec: &Value) -> Value {
 }
 
 fn store(daemon: &Daemon) -> Store {
-    Store::open(&daemon.home.join("homebased.sqlite")).unwrap()
+    Store::open(&daemon.home.join(homebased::home::DB_NAME)).unwrap()
 }
 
 fn events(origin: &Daemon, job: JobId) -> Vec<Value> {
@@ -118,9 +119,9 @@ fn events(origin: &Daemon, job: JobId) -> Vec<Value> {
 fn wait_event(origin: &Daemon, job: JobId, count: u64) -> Vec<Value> {
     assert!(
         wait_until(Duration::from_secs(20), || store(origin)
-            .job_route(job)
+            .job_route_cursors(job)
             .unwrap()
-            .is_some_and(|route| route.last_settled_seq == count)),
+            .is_some_and(|cursors| cursors.settled == count)),
         "job callback missing: {:?}",
         events(origin, job)
     );
@@ -147,7 +148,8 @@ async fn fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
     assert!(!executor.user_home.join("callbacks").exists());
     let route = store(&origin).job_route(job).unwrap().unwrap();
     assert_eq!(route.authority, executor.machine_id());
-    assert_eq!(route.last_accepted_seq, 1);
+    let cursors = store(&origin).job_route_cursors(job).unwrap().unwrap();
+    assert_eq!(cursors.accepted, 1);
     let run = store(&executor).job_runs(job).unwrap().remove(0);
     assert!(
         store(&executor)
@@ -163,7 +165,7 @@ async fn fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
     };
     let body = json!({
         "api_version": 1,
-        "protocol_version": 2,
+        "protocol_version": CLUSTER_PROTOCOL_VERSION,
         "destination_machine": origin.machine_id(),
         "event": envelope,
     });

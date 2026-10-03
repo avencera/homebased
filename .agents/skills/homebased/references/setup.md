@@ -56,7 +56,7 @@ HOMEBASED_OPENCODE="$HOME/.opencode/bin/opencode" just smoke-cli
 - Linux: user unit `~/.config/systemd/user/homebased.service`, `KillMode=process`, `Restart=on-failure`. If install warns that lingering is off, run `loginctl enable-linger $USER` so the daemon survives logout.
 - macOS: `~/Library/LaunchAgents/dev.praveen.homebased.plist` with `KeepAlive` and `AbandonProcessGroup`.
 
-State directory: `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebased`, else `~/.local/state/homebased`. It holds `homebased.sqlite`, `homebased.sock`, `daemon.lock`, `tasks/<id>/`, and `callback-fallback.log`.
+State directory: `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebased`, else `~/.local/state/homebased`. It holds `homebased_v1.sqlite`, `homebased.sock`, `daemon.lock`, `tasks/<id>/`, and `callback-fallback.log`.
 
 ## Dashboard listener
 
@@ -93,6 +93,8 @@ just web-build
 cargo install --path /home/praveen/code/homebased
 homebased --json daemon restart
 ```
+
+The database file name carries its format: this build keeps tasks in `homebased_v1.sqlite`. An installation updated from a build that used `homebased.sqlite` starts with an empty task list and leaves the old file in place; that build's tasks, routes, and queue jobs are not carried over. Update across that change only when nothing is queued or running: a worker started by the older build keeps running, but the new daemon does not know it and sends no event for it. Opening a database from a newer build fails with `schema_too_new`.
 
 `update` and `daemon restart` restart only `serve`. Running workers are separate processes that hold their own lock; they keep running, and the restarted daemon reconciles them and delivers their events. Do not use raw `systemctl restart`; the CLI path uses the host supervisor only when the installed unit's `--home` matches the selected state directory, and otherwise respawns the standalone daemon for that home.
 

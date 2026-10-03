@@ -401,24 +401,19 @@ impl Store {
         task: TaskId,
         seq: NonZeroU64,
     ) -> Result<Option<OutboxEvent>, EventError> {
-        let row: Option<(String, bool, String)> = self
+        let row: Option<(String, String)> = self
             .conn
             .query_row(
-                "SELECT event_json,notification_required,state FROM executor_outbox
+                "SELECT event_json,state FROM executor_outbox
              WHERE task_id=?1 AND seq>=?2 ORDER BY seq LIMIT 1",
                 params![task.to_string(), sql_seq(seq.get())?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(storage)?;
-        row.map(|(json, notification_required, state)| {
+        row.map(|(json, state)| {
             let event: TaskEvent = decode(&json)?;
             validate(&event)?;
-            if event.payload.notification_required() != notification_required {
-                return Err(EventError::Storage(AppError::Internal {
-                    message: "outbox notification flag disagrees with payload".into(),
-                }));
-            }
             let state = match state.as_str() {
                 "pending" => OutboxState::Pending,
                 "acknowledged" => OutboxState::Acknowledged,
@@ -428,11 +423,7 @@ impl Store {
                     });
                 }
             };
-            Ok(OutboxEvent {
-                event,
-                state,
-                notification_required,
-            })
+            Ok(OutboxEvent { event, state })
         })
         .transpose()
     }
@@ -478,20 +469,19 @@ impl Store {
             .map_err(storage)?
             .ok_or(EventError::RouteNotFound { task })?;
         let route = decode_route(&route_json)?;
-        let row: Option<(String, bool, String)> = tx
+        let row: Option<(String, String)> = tx
             .query_row(
-                "SELECT event_json,notification_required,delivery_json FROM origin_inbox
+                "SELECT event_json,delivery_json FROM origin_inbox
              WHERE task_id=?1 AND seq>?2 ORDER BY seq LIMIT 1",
                 params![task.to_string(), sql_seq(route.last_settled_seq)?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(storage)?;
         tx.commit().map_err(storage)?;
-        row.map(|(event, notification_required, delivery)| {
+        row.map(|(event, delivery)| {
             Ok(InboxEvent {
                 event: decode(&event)?,
-                notification_required,
                 delivery: decode(&delivery)?,
             })
         })
@@ -518,16 +508,16 @@ impl Store {
             .map_err(storage)?
             .ok_or(EventError::RouteNotFound { task })?;
         let route = decode_route(&route_json)?;
-        let row: Option<(i64, String, bool, String)> = tx
+        let row: Option<(i64, String, String)> = tx
             .query_row(
-                "SELECT seq,event_json,notification_required,delivery_json FROM origin_inbox
+                "SELECT seq,event_json,delivery_json FROM origin_inbox
              WHERE task_id=?1 AND seq>?2 ORDER BY seq LIMIT 1",
                 params![task.to_string(), sql_seq(route.last_settled_seq)?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(storage)?;
-        let Some((first_seq, event_json, notification_required, delivery_json)) = row else {
+        let Some((first_seq, event_json, delivery_json)) = row else {
             return Ok(None);
         };
         if first_seq != sql_seq(seq.get())? {
@@ -561,7 +551,6 @@ impl Store {
         tx.commit().map_err(storage)?;
         Ok(Some(InboxEvent {
             event: decode(&event_json)?,
-            notification_required,
             delivery,
         }))
     }
@@ -587,12 +576,14 @@ impl Store {
             .map_err(storage)?
             .ok_or(EventError::RouteNotFound { task })?;
         let mut route = decode_route(&route_json)?;
-        let row: (String, bool, String) = tx.query_row(
-            "SELECT event_json,notification_required,delivery_json FROM origin_inbox WHERE task_id=?1 AND seq=?2",
-            params![task.to_string(), sql_seq(seq.get())?],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).map_err(storage)?;
-        let current_delivery: DeliveryState = decode(&row.2)?;
+        let (event_json, delivery_json): (String, String) = tx
+            .query_row(
+                "SELECT event_json,delivery_json FROM origin_inbox WHERE task_id=?1 AND seq=?2",
+                params![task.to_string(), sql_seq(seq.get())?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(storage)?;
+        let current_delivery: DeliveryState = decode(&delivery_json)?;
         let (attempts, last_error, waiting_since) = match current_delivery {
             DeliveryState::PendingDelivery {
                 attempts,
@@ -672,7 +663,7 @@ impl Store {
         )
         .map_err(storage)?;
         if matches!(delivery, DeliveryState::Delivered { .. }) {
-            let event: TaskEvent = decode(&row.0)?;
+            let event: TaskEvent = decode(&event_json)?;
             if let EventPayload::Callback {
                 event: callback, ..
             } = event.payload
@@ -715,8 +706,7 @@ impl Store {
         }
         tx.commit().map_err(storage)?;
         Ok(InboxEvent {
-            event: decode(&row.0)?,
-            notification_required: row.1,
+            event: decode(&event_json)?,
             delivery,
         })
     }
@@ -860,23 +850,14 @@ fn append_outbound_event_on(
     };
     validate(&event)?;
     let row = OutboxEvent {
-        notification_required: event.payload.notification_required(),
         event,
         state: OutboxState::Pending,
     };
     conn.execute(
-            "INSERT INTO executor_outbox (task_id,seq,origin_machine,execution_machine,event_json,notification_required,state)
-             VALUES (?1,?2,?3,?4,?5,?6,'pending')",
-            params![
-                task.to_string(),
-                next,
-                origin_machine.to_string(),
-                execution_machine.to_string(),
-                encode(&row.event)?,
-                row.notification_required,
-            ],
-        )
-        .map_err(storage)?;
+        "INSERT INTO executor_outbox (task_id,seq,event_json,state) VALUES (?1,?2,?3,'pending')",
+        params![task.to_string(), next, encode(&row.event)?],
+    )
+    .map_err(storage)?;
     conn.execute(
         "INSERT INTO executor_event_cursors (task_id,last_seq) VALUES (?1,?2)
              ON CONFLICT(task_id) DO UPDATE SET last_seq=excluded.last_seq",
@@ -892,30 +873,22 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT event_json,notification_required FROM executor_outbox
+                "SELECT event_json FROM executor_outbox
                  WHERE task_id=?1 AND state='pending' ORDER BY seq",
             )
             .map_err(storage)?;
         let rows = stmt
-            .query_map([task.to_string()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-            })
+            .query_map([task.to_string()], |row| row.get::<_, String>(0))
             .map_err(storage)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
         rows.into_iter()
-            .map(|(json, notification_required)| {
+            .map(|json| {
                 let event: TaskEvent = decode(&json)?;
                 validate(&event)?;
-                if event.payload.notification_required() != notification_required {
-                    return Err(EventError::Storage(AppError::Internal {
-                        message: "outbox notification flag disagrees with payload".into(),
-                    }));
-                }
                 Ok(OutboxEvent {
                     event,
                     state: OutboxState::Pending,
-                    notification_required,
                 })
             })
             .collect()
@@ -1070,23 +1043,19 @@ impl Store {
         let accepted_at = super::fmt_time(Utc::now());
         let settled_at = (!event.payload.notification_required()).then(|| accepted_at.clone());
         tx.execute(
-            "INSERT INTO origin_inbox
-             (task_id,seq,origin_machine,execution_machine,event_json,notification_required,delivery_json,settled_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO origin_inbox (task_id,seq,event_json,delivery_json,settled_at)
+             VALUES (?1,?2,?3,?4,?5)",
             params![
                 event.task.to_string(),
                 sql_seq(event.seq.get())?,
-                event.origin_machine.to_string(),
-                event.execution_machine.to_string(),
                 encode(event)?,
-                event.payload.notification_required(),
                 encode(&delivery)?,
                 settled_at,
             ],
         )
         .map_err(storage)?;
         route.last_accepted_seq = event.seq.get();
-        route.last_updated_at = Some(Utc::now());
+        route.last_updated_at = Utc::now();
         if let Some(state) = event.payload.process_state() {
             route.last_execution_state = Some(state);
         }
@@ -1122,38 +1091,30 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT event_json,notification_required,delivery_json FROM origin_inbox
+                "SELECT event_json,delivery_json FROM origin_inbox
                  WHERE task_id=?1 ORDER BY seq",
             )
             .map_err(storage)?;
         let rows = stmt
             .query_map([task.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(storage)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
         rows.into_iter()
-            .map(|(event, notification_required, delivery)| {
+            .map(|(event, delivery)| {
                 let event: TaskEvent = decode(&event)?;
                 let delivery: DeliveryState = decode(&delivery)?;
                 validate(&event)?;
-                if event.payload.notification_required() != notification_required
-                    || matches!(delivery, DeliveryState::NotRequired) == notification_required
+                if matches!(delivery, DeliveryState::NotRequired)
+                    == event.payload.notification_required()
                 {
                     return Err(EventError::Storage(AppError::Internal {
-                        message: "inbox delivery state disagrees with notification flag".into(),
+                        message: "inbox delivery state disagrees with its event".into(),
                     }));
                 }
-                Ok(InboxEvent {
-                    event,
-                    notification_required,
-                    delivery,
-                })
+                Ok(InboxEvent { event, delivery })
             })
             .collect()
     }
@@ -1207,10 +1168,10 @@ mod tests {
                 cwd: Path::new("/tmp").to_path_buf(),
                 codex: Path::new("/bin/echo").to_path_buf().into(),
             },
-            spec: spec.into(),
+            spec,
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         }
@@ -1231,7 +1192,7 @@ mod tests {
             "api_version": 1,
             "event": if state.is_some() { "TASK_SUCCEEDED" } else { "TASK_REPORTED" },
             "task": route.task,
-            "display_name": "event task",
+            "name": "event task",
             "workload": { "type": "task", "command": ["echo", "hello"] },
             "thread": route.thread,
             "cwd": "/tmp",
@@ -1335,7 +1296,7 @@ mod tests {
         assert_eq!(saved.last_execution_state, Some(ProcessStatus::Running));
         let inbox = store.inbound_events(route.task).unwrap();
         assert_eq!(inbox.len(), 1);
-        assert!(!inbox[0].notification_required);
+        assert!(!inbox[0].event.payload.notification_required());
         assert_eq!(inbox[0].delivery, DeliveryState::NotRequired);
     }
 
@@ -1700,17 +1661,10 @@ mod tests {
                 .conn
                 .execute(
                     &format!(
-                        "INSERT INTO executor_outbox
-                         (task_id,seq,origin_machine,execution_machine,event_json,
-                          notification_required,state,acknowledged_at)
-                         VALUES (?1,1,?2,?3,?4,0,'acknowledged',{age})"
+                        "INSERT INTO executor_outbox (task_id,seq,event_json,state,acknowledged_at)
+                         VALUES (?1,1,?2,'acknowledged',{age})"
                     ),
-                    params![
-                        task.to_string(),
-                        event.origin_machine.to_string(),
-                        event.execution_machine.to_string(),
-                        serde_json::to_string(&event).unwrap(),
-                    ],
+                    params![task.to_string(), serde_json::to_string(&event).unwrap()],
                 )
                 .unwrap();
         }
@@ -1770,7 +1724,7 @@ mod tests {
             "api_version": 1,
             "event": "TASK_REPORTED",
             "task": route.task,
-            "display_name": "event task",
+            "name": "event task",
             "workload": { "type": "task", "command": ["echo", "hello"] },
             "thread": route.thread,
             "cwd": "/tmp",
@@ -1809,7 +1763,7 @@ mod tests {
         };
         store.accept_inbound_event(&report).unwrap();
         let inbox = store.inbound_events(route.task).unwrap();
-        assert!(inbox[0].notification_required);
+        assert!(inbox[0].event.payload.notification_required());
         assert_eq!(
             inbox[0].delivery,
             DeliveryState::PendingDelivery {
@@ -1817,9 +1771,9 @@ mod tests {
                 last_error: None
             }
         );
-        assert!(!inbox[1].notification_required);
+        assert!(!inbox[1].event.payload.notification_required());
         assert_eq!(inbox[1].delivery, DeliveryState::NotRequired);
-        assert!(!inbox[2].notification_required);
+        assert!(!inbox[2].event.payload.notification_required());
         assert_eq!(inbox[2].delivery, DeliveryState::NotRequired);
         let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
         assert_eq!(saved.last_accepted_seq, 3);

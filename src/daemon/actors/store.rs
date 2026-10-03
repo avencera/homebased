@@ -11,7 +11,7 @@ use crate::cancellation::{
 use crate::daemon::actors::send_reply;
 use crate::dependency::{DependencyLookup, HeldCancellation, TaskDependencies};
 use crate::domain::{
-    ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
+    ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
 use crate::error::AppError;
 use std::num::NonZeroU64;
@@ -165,6 +165,11 @@ pub(crate) enum StoreMsg {
         reply: RpcReplyPort<Result<Option<crate::store::queue::JobRecord>, AppError>>,
     },
     /// Typed queue store operation
+    QueueJobEnv {
+        id: crate::queue::JobId,
+        reply: RpcReplyPort<Result<TaskEnv, AppError>>,
+    },
+    /// Typed queue store operation
     QueueCheckpoint {
         task: TaskId,
         reply: RpcReplyPort<Result<Option<crate::queue::checkpoint::Checkpoint>, AppError>>,
@@ -177,7 +182,7 @@ pub(crate) enum StoreMsg {
         task: TaskId,
         binary: PathBuf,
         now: chrono::DateTime<chrono::Utc>,
-        reply: RpcReplyPort<Result<crate::store::queue::ReservedRun, AppError>>,
+        reply: RpcReplyPort<Result<crate::queue::ActiveRun, AppError>>,
     },
     /// Typed queue store operation
     QueueStop {
@@ -234,11 +239,6 @@ pub(crate) enum StoreMsg {
         reply: RpcReplyPort<Result<bool, AppError>>,
     },
 
-    /// Migrate historical local rows before supervisor recovery begins
-    MigrateLegacyLocal {
-        machine: MachineId,
-        reply: RpcReplyPort<Result<(), AppError>>,
-    },
     /// Save or reuse a caller-owned cancellation before network delivery
     InsertCancellationRequest {
         request: CancellationRequest,
@@ -573,11 +573,6 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<bool, AppError>>,
     },
-    /// Release a legacy direct-send claim after its owner bound passes
-    ReleaseAttention {
-        id: TaskId,
-        reply: RpcReplyPort<Result<(), AppError>>,
-    },
     /// Reports in seq order
     Reports {
         id: TaskId,
@@ -699,6 +694,7 @@ impl Actor for StoreActor {
                 send_reply(reply, state.resources_on(machine))
             }
             StoreMsg::QueueJob { id, reply } => send_reply(reply, state.job(id)),
+            StoreMsg::QueueJobEnv { id, reply } => send_reply(reply, state.job_env(id)),
             StoreMsg::QueueCheckpoint { task, reply } => {
                 send_reply(reply, state.run_checkpoint(task))
             }
@@ -758,9 +754,6 @@ impl Actor for StoreActor {
                 send_reply(reply, state.produce_job_check_due(task))
             }
 
-            StoreMsg::MigrateLegacyLocal { machine, reply } => {
-                send_reply(reply, state.migrate_legacy_local(machine));
-            }
             StoreMsg::InsertCancellationRequest { request, reply } => {
                 send_reply(reply, state.insert_cancellation_request(request));
             }
@@ -1042,9 +1035,6 @@ impl Actor for StoreActor {
             }
             StoreMsg::ProduceAttentionEvent { id, reply } => {
                 send_reply(reply, state.produce_attention_event(id));
-            }
-            StoreMsg::ReleaseAttention { id, reply } => {
-                send_reply(reply, state.release_attention(id));
             }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
         }

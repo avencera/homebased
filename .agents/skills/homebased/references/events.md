@@ -10,8 +10,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `seq` | Per-task event sequence. Present on new events. Use with `task` as the event identity. It is separate from the `seq` on each worker report. |
 | `origin_machine` | Stable UUID of the machine that owns the Codex thread and sends the callback. Present on new events. |
 | `execution_machine` | Stable UUID of the machine that ran the child. Present on new events. |
-| `name` | Submitted task name. Omitted only for tasks stored before name was required. |
-| `display_name` | Non-empty server-derived label: the submitted name, or a workload fallback for unnamed stored rows. |
+| `name` | Submitted task name. |
 | `workload` | Discriminated union: `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. |
 | `thread` | The thread the event was addressed to. |
 | `cwd` | The child's working directory. |

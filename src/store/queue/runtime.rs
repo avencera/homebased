@@ -37,7 +37,6 @@ impl Store {
         Ok(Some(Checkpoint {
             run,
             resource,
-            resume: job.resume,
             step,
         }))
     }
@@ -186,9 +185,8 @@ impl Store {
                 return Ok(false);
             }
             let changed = self.conn.execute(
-                "UPDATE tasks SET attention_state = 'delivered', timeout_notified_at = ?1,
-                    updated_at = ?1
-                 WHERE id = ?2 AND status = 'running' AND attention_state = 'pending'",
+                "UPDATE tasks SET check_due_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND status = 'running' AND check_due_at IS NULL",
                 params![fmt_time(Utc::now()), task.to_string()],
             )?;
             if changed == 0 {

@@ -127,7 +127,7 @@ impl Daemon {
     }
 
     fn delivery(&self, id: MessageId) -> homebased::message::MessageDelivery {
-        Store::open(&self.state_home.join("homebased.sqlite"))
+        Store::open(&self.state_home.join(homebased::home::DB_NAME))
             .unwrap()
             .message_delivery(id)
             .unwrap()

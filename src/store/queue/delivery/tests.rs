@@ -2,13 +2,12 @@ use chrono::Utc;
 use tempfile::tempdir;
 
 use super::Store;
-use crate::domain::{TaskEnv, TaskId};
+use crate::domain::TaskEnv;
 use crate::events::EventAcceptance;
 use crate::machine::MachineId;
 use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::JobSpec;
-use crate::queue::{JobEvent, JobEventKind, JobId, QueueError, ResourceName};
-use crate::store::queue::NewJob;
+use crate::queue::{JobEvent, JobEventKind, JobId, QueueError};
 use crate::submission::{CallbackContext, CallbackExecutable};
 
 fn route() -> JobRoute {
@@ -35,8 +34,6 @@ fn route() -> JobRoute {
         },
         target: None,
         submission: JobSubmission::Unknown,
-        last_accepted_seq: 0,
-        last_settled_seq: 0,
     }
 }
 
@@ -105,11 +102,7 @@ fn job_inbox_checks_owners_content_gaps_and_settlement_after_restart() {
     store.settle_job_event(route.job, 2).unwrap();
     assert!(store.pending_job_inbox().unwrap().is_empty());
     assert_eq!(
-        store
-            .job_route(route.job)
-            .unwrap()
-            .unwrap()
-            .last_settled_seq,
+        store.job_route_cursors(route.job).unwrap().unwrap().settled,
         2
     );
     second.event.seq = u64::MAX;
@@ -131,59 +124,6 @@ fn job_route_retries_keep_context_and_refuse_spec_or_authority_changes() {
     retry.spec.priority = crate::queue::Priority::High;
     retry.digest = retry.spec.digest().unwrap();
     assert!(store.insert_job_route(&retry).is_err());
-}
-
-#[test]
-fn schema35_upgrade_preserves_jobs_and_active_runs() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("db");
-    let store = Store::open(&path).unwrap();
-    let route = route();
-    let resource = store
-        .register_resource(route.authority, ResourceName::gpu(0), None)
-        .unwrap()
-        .resource
-        .id;
-    store
-        .submit_job(&NewJob {
-            id: route.job,
-            machine: route.authority,
-            origin: route.origin,
-            spec: route.spec,
-            env: route.callback.env,
-        })
-        .unwrap();
-    let task = TaskId::new();
-    store
-        .reserve_run(
-            route.authority,
-            route.job,
-            resource,
-            task,
-            "/bin/true".into(),
-            Utc::now(),
-        )
-        .unwrap();
-    store
-        .conn
-        .execute_batch(
-            "ALTER TABLE resources DROP COLUMN origin;
-        ALTER TABLE resource_job_events DROP COLUMN suppressed_at;
-        DROP TABLE resource_run_history; DROP TABLE resource_job_delivery;
-        DROP TABLE resource_job_inbox; DROP TABLE resource_job_routes; PRAGMA user_version=35;",
-        )
-        .unwrap();
-    drop(store);
-    let store = Store::open(&path).unwrap();
-    assert_eq!(store.job(route.job).unwrap().unwrap().runs, 1);
-    assert_eq!(
-        store.resource(resource).unwrap().unwrap().run.unwrap().task,
-        task
-    );
-    let history = store.job_runs(route.job).unwrap();
-    assert_eq!(history[0].resource, Some(resource));
-    assert_eq!(history[0].task, task);
-    assert!(store.pending_job_inbox().unwrap().is_empty());
 }
 
 #[test]
@@ -216,34 +156,4 @@ fn suppressed_inbox_notice_retains_content_and_settles_in_order() {
     assert!(suppressed);
     store.settle_job_event(route.job, 2).unwrap();
     assert!(store.pending_job_inbox().unwrap().is_empty());
-}
-
-#[test]
-fn schema36_upgrade_retains_manual_registration_and_inbox_content() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("db");
-    let store = Store::open(&path).unwrap();
-    let route = route();
-    let resource = store
-        .register_resource(route.authority, ResourceName::gpu(0), None)
-        .unwrap();
-    store.insert_job_route(&route).unwrap();
-    let envelope = event(&route, 1);
-    store.accept_job_event(&envelope).unwrap();
-    store
-        .conn
-        .execute_batch(
-            "ALTER TABLE resources DROP COLUMN origin;
-        ALTER TABLE resource_job_events DROP COLUMN suppressed_at;
-        ALTER TABLE resource_job_inbox DROP COLUMN suppressed_at;
-        PRAGMA user_version=36;",
-        )
-        .unwrap();
-    drop(store);
-    let store = Store::open(&path).unwrap();
-    assert_eq!(
-        store.resource(resource.resource.id).unwrap().unwrap(),
-        resource
-    );
-    assert_eq!(store.pending_job_inbox().unwrap()[0].1, envelope);
 }

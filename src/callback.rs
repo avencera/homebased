@@ -39,44 +39,11 @@ pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
 /// [`QUEUE_ATTEMPT_TIMEOUT_SECS`] as a [`Duration`].
 pub const QUEUE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(QUEUE_ATTEMPT_TIMEOUT_SECS);
 
-const QUEUE_ATTEMPTS: u32 = 3;
-
 /// Extra time to reap a child after its process group receives SIGKILL.
 const QUEUE_REAP_TIMEOUT_SECS: u64 = 2;
 
 /// Maximum drain wait for each of stdout and stderr after direct-child exit.
 const QUEUE_PIPE_DRAIN_TIMEOUT_SECS: u64 = 2;
-
-/// Worst-case backoff across retries: attempt 2 waits 200ms, attempt 3 waits 400ms.
-const QUEUE_RETRY_BACKOFF_TOTAL_MS: u64 = 200 + 400;
-
-/// Slack after the last attempt returns for draining pipes, writing the
-/// callback log, and store settlement before the attention claim can release.
-const QUEUE_SETTLEMENT_SLACK_SECS: u64 = 5;
-
-/// A sender inherited from a dead daemon self-terminates within one attempt.
-const QUEUE_STALE_OWNER_MAX_SECS: u64 = QUEUE_ATTEMPT_TIMEOUT_SECS;
-
-/// Worst-case wall time for three bounded attempts, their backoff, and
-/// post-attempt settlement. The attention release valve must stay above this
-/// so a live send cannot outlive the claim.
-const QUEUE_ATTEMPT_WORST_CASE_SECS: u64 =
-    QUEUE_ATTEMPT_TIMEOUT_SECS + QUEUE_REAP_TIMEOUT_SECS + QUEUE_PIPE_DRAIN_TIMEOUT_SECS * 2;
-const QUEUE_SEND_WORST_CASE_SECS: u64 = QUEUE_ATTEMPT_WORST_CASE_SECS * QUEUE_ATTEMPTS as u64
-    + QUEUE_RETRY_BACKOFF_TOTAL_MS.div_ceil(1000)
-    + QUEUE_STALE_OWNER_MAX_SECS
-    + QUEUE_SETTLEMENT_SLACK_SECS;
-
-/// How long recovery waits for a legacy attention sender before releasing its
-/// persisted claim. Must exceed the worst-case live `codex queue` send.
-pub const ATTENTION_SETTLE_SECS: u64 = 120;
-/// [`ATTENTION_SETTLE_SECS`] as a [`Duration`].
-pub const ATTENTION_SETTLE: Duration = Duration::from_secs(ATTENTION_SETTLE_SECS);
-
-const _: () = assert!(
-    ATTENTION_SETTLE_SECS > QUEUE_SEND_WORST_CASE_SECS,
-    "attention settlement must outlast the worst-case queue send"
-);
 
 /// Public workload view. Omits private prompt and extra-arg fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,11 +298,8 @@ pub struct HomebasedEvent {
     pub event: EventKind,
     /// Task id.
     pub task: TaskId,
-    /// Submitted name. Omitted only for rows stored before name was required.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<TaskName>,
-    /// Non-empty server-derived label.
-    pub display_name: String,
+    /// Submitted name.
+    pub name: TaskName,
     /// Workload view.
     pub workload: WorkloadView,
     /// Codex thread.
@@ -356,14 +320,6 @@ pub struct HomebasedEvent {
     /// Why the origin cancelled a held task before it launched. Present only on that `TASK_CANCELLED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<HeldCancellation>,
-}
-
-impl HomebasedEvent {
-    /// Prefix plus JSON object, one line.
-    pub fn to_message_line(&self) -> Result<String, AppError> {
-        let json = serde_json::to_string(self)?;
-        Ok(format!("HOMEBASED_EVENT {json}"))
-    }
 }
 
 /// Build an exit event from the row's stored reason.
@@ -411,7 +367,6 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         event: EventKind::TaskCheckDue,
         task: row.id,
         name: row.name.clone(),
-        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -437,7 +392,6 @@ fn build_event(
         event,
         task: row.id,
         name: row.name.clone(),
-        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -487,8 +441,7 @@ pub fn unlaunched_event(
         api_version: crate::domain::API_VERSION,
         event,
         task,
-        name: Some(spec.name.clone()),
-        display_name: spec.name.to_string(),
+        name: spec.name.clone(),
         workload: WorkloadView::from(&crate::invocation::persist_workload(&spec.workload)),
         thread: spec.thread,
         cwd: spec.cwd.clone(),
@@ -509,7 +462,6 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         event: EventKind::TaskReported,
         task: row.id,
         name: row.name.clone(),
-        display_name: row.display_name(),
         workload: WorkloadView::from(&row.workload),
         thread: row.thread,
         cwd: row.cwd.clone(),
@@ -1323,11 +1275,11 @@ pub fn last_event_for_row(
                 .iter()
                 .rev()
                 .find(|report| report.notified_at.is_some());
-            match (row.attention.delivered_at(), report) {
-                (Some(attention_at), Some(report))
+            match (row.check_due_at, report) {
+                (Some(check_due_at), Some(report))
                     if report
                         .notified_at
-                        .is_some_and(|reported_at| reported_at > attention_at) =>
+                        .is_some_and(|notified_at| notified_at > check_due_at) =>
                 {
                     Some(notify_event(row, report, evidence))
                 }
@@ -1361,16 +1313,13 @@ mod tests {
     }
 
     use super::{
-        ATTENTION_SETTLE, CallbackContext, EventKind, NextAction, OriginSession, PendingT3Send,
-        ProcessPayload, QUEUE_ATTEMPT_TIMEOUT, QUEUE_ATTEMPT_WORST_CASE_SECS,
-        QUEUE_SEND_WORST_CASE_SECS, SendGate, WorkloadView, check_due_event, exit_event,
-        find_saved_origin, last_event_for_row, lost_event, notify_event,
-        run_command_deadline_checked, send_saved_queue_attempt,
+        CallbackContext, EventKind, NextAction, OriginSession, PendingT3Send, ProcessPayload,
+        SendGate, WorkloadView, check_due_event, exit_event, find_saved_origin, last_event_for_row,
+        lost_event, notify_event, run_command_deadline_checked, send_saved_queue_attempt,
     };
     use crate::domain::{
-        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ExitReason,
-        ProcessGroupExitEvidence, ReportOutcome, TaskEnv, TaskId, TaskReport, TaskRow, TaskState,
-        Workload,
+        Agent, AgentKind, AgentWorkload, ExitReason, ProcessGroupExitEvidence, ReportOutcome,
+        TaskEnv, TaskId, TaskReport, TaskRow, TaskState, Workload,
     };
     use chrono::Utc;
     use nix::sys::signal::kill;
@@ -1380,10 +1329,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn message_line(event: &super::HomebasedEvent) -> String {
+        format!("HOMEBASED_EVENT {}", serde_json::to_string(event).unwrap())
+    }
+
     fn row(state: TaskState) -> TaskRow {
         TaskRow {
             id: TaskId::new(),
-            name: None,
+            name: crate::domain::TaskName::parse("test task").unwrap(),
             thread: "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),
@@ -1402,8 +1355,7 @@ mod tests {
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
             container_exit_evidence: crate::domain::ContainerExitEvidence::Unconfirmed,
             child: None,
-            callback_status: CallbackStatus::Pending,
-            attention: AttentionState::Pending,
+            check_due_at: None,
             cancel_requested_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1600,7 +1552,7 @@ mod tests {
         assert!(event.process.is_none());
         assert_eq!(event.next_action, NextAction::InspectTask);
         assert_eq!(event.timeout_secs, Some(4 * 3600));
-        let line = event.to_message_line().unwrap();
+        let line = message_line(&event);
         assert!(line.contains("\"process\":null"));
         assert!(line.contains("TASK_CHECK_DUE"));
     }
@@ -1612,7 +1564,7 @@ mod tests {
         let event = notify_event(&r, &report, PathBuf::from("/e"));
         assert_eq!(event.event, EventKind::TaskReported);
         assert!(event.process.is_none());
-        let line = event.to_message_line().unwrap();
+        let line = message_line(&event);
         assert!(line.starts_with("HOMEBASED_EVENT {"));
         assert!(line.contains("\"process\":null"));
         assert!(line.contains("\"api_version\":1"));
@@ -1622,7 +1574,7 @@ mod tests {
     fn last_event_uses_the_latest_delivery_timestamp() {
         let now = Utc::now();
         let mut r = row(TaskState::Running { pid: Some(1) });
-        r.attention = AttentionState::Delivered { at: now };
+        r.check_due_at = Some(now);
         let mut later_report = report(1, ReportOutcome::Blocked);
         later_report.notified_at = Some(now + chrono::TimeDelta::seconds(1));
         let event = last_event_for_row(&r, &[later_report], PathBuf::from("/e")).unwrap();
@@ -1643,23 +1595,10 @@ mod tests {
             &[],
             PathBuf::from("/e"),
         );
-        let line = event.to_message_line().unwrap();
+        let line = message_line(&event);
         let json = line.strip_prefix("HOMEBASED_EVENT ").unwrap();
         let start = &json[..80];
         assert!(start.starts_with("{\"api_version\":1,\"event\":\"TASK_SUCCEEDED\",\"task\":"));
-    }
-
-    #[test]
-    fn attention_settle_outlasts_worst_case_queue_send() {
-        // relationship is enforced by the compile-time assert above; lock the
-        // public durations so a silent edit cannot shrink them independently
-        assert_eq!(QUEUE_ATTEMPT_TIMEOUT, Duration::from_secs(20));
-        assert_eq!(ATTENTION_SETTLE, Duration::from_secs(120));
-        assert_eq!(QUEUE_ATTEMPT_WORST_CASE_SECS, 20 + 2 + 2 * 2);
-        assert_eq!(
-            QUEUE_SEND_WORST_CASE_SECS,
-            (20 + 2 + 2 * 2) * 3 + 1 + 20 + 5
-        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! end and moves its job in the same transaction
 
 mod delivery;
+pub use delivery::JobCursors;
 pub mod interface;
 mod runtime;
 
@@ -15,8 +16,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
@@ -46,20 +47,20 @@ const RENUMBER_OFFSET: i64 = 1 << 40;
 
 const RESOURCE_SELECT: &str = "SELECT id, machine, name, device, run_job, run_task, run_number,
     run_step, run_phase, run_reserved_at, run_started_at, run_stop_cause,
-    run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin
+    run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin,
+    run_resume
  FROM resources";
 
-const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest, env_path,
-    env_home, target_resource, priority, position, state, active_resource, failed_run,
-    next_step, resume, last_run_number, created_at, updated_at
+const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest,
+    target_resource, priority, position, state, active_resource, failed_run, step, resume,
+    last_run_number, created_at, updated_at
  FROM resource_jobs";
 
 /// Serving order of a machine queue: level descending, then position
-const SERVING_ORDER: &str = "ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 \
-     ELSE 2 END, position";
+const SERVING_ORDER: &str = "ORDER BY priority DESC, position";
 
 /// How a resource entered the queue; only detected fallbacks are reconciled
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceOrigin {
     /// The platform had no indexed GPU
@@ -91,7 +92,7 @@ impl ResourceOrigin {
 }
 
 /// A resource with its machine and single active run
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRecord {
     /// Machine whose queue the resource serves
     pub machine: MachineId,
@@ -104,7 +105,7 @@ pub struct ResourceRecord {
 }
 
 /// A stored job
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     /// Job identity
     pub id: JobId,
@@ -116,9 +117,6 @@ pub struct JobRecord {
     pub spec: JobSpec,
     /// Digest of the accepted spec
     pub digest: String,
-    /// Execution environment, captured locally or on the remote authority
-    #[serde(skip)]
-    pub env: TaskEnv,
     /// Resources the job may use
     pub target: Target,
     /// Current level, which a move may change
@@ -127,10 +125,9 @@ pub struct JobRecord {
     pub position: Option<u32>,
     /// Where the job is in its life
     pub state: JobState,
-    /// The step the next or current run executes
-    pub next_step: StepIndex,
-    /// Whether that run resumes from a checkpoint
-    pub resume: bool,
+    /// Step the job is at: the step its next or current run executes, or the
+    /// step it ended on
+    pub step: StepIndex,
     /// Runs started so far
     pub runs: u32,
     /// Acceptance time
@@ -211,15 +208,6 @@ pub struct ReleaseResult {
     pub attention: AttentionId,
 }
 
-/// A run reserved on a resource; its worker may start
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReservedRun {
-    /// The resource's new active run
-    pub run: ActiveRun,
-    /// Whether the run resumes from a checkpoint (`HOMEBASED_RESUME=1`)
-    pub resume: bool,
-}
-
 /// Which code path ends a run task
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunEndSource {
@@ -242,6 +230,8 @@ enum Slot {
 /// Where a run's end leaves its job, and the event that records it
 struct JobAfterRun {
     state: JobState,
+    /// The step a queued job runs next, or the step a terminal job ended on
+    step: StepIndex,
     event: Option<JobEventKind>,
 }
 
@@ -401,14 +391,15 @@ impl Store {
             }
             let id = ResourceId::new();
             self.conn.execute(
-                "INSERT INTO resources (id, machine, name, device, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO resources (id, machine, name, device, created_at, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     id.to_string(),
                     machine.to_string(),
                     name.as_str(),
                     device.map(i64::from),
                     fmt_time(Utc::now()),
+                    ResourceOrigin::Manual.as_str(),
                 ],
             )?;
             self.require_resource(id)
@@ -502,7 +493,7 @@ impl Store {
             self.conn.execute(
                 "INSERT INTO resource_jobs (id, machine, origin_machine, thread_id, spec_json,
                     spec_digest, env_path, env_home, target_resource, priority, position, state,
-                    next_step, resume, last_run_number, event_seq, created_at, updated_at)
+                    step, resume, last_run_number, event_seq, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', 0, 0, 0, 0,
                     ?12, ?12)",
                 params![
@@ -515,7 +506,7 @@ impl Store {
                     new.env.path,
                     new.env.home,
                     pinned,
-                    priority.as_str(),
+                    priority.rank(),
                     sql_position(position)?,
                     now,
                 ],
@@ -535,6 +526,23 @@ impl Store {
             .optional()?
             .map(RawJob::parse)
             .transpose()
+    }
+
+    /// Execution environment of a job, captured locally or on the remote authority
+    pub fn job_env(&self, id: JobId) -> Result<TaskEnv, AppError> {
+        self.conn
+            .query_row(
+                "SELECT env_path, env_home FROM resource_jobs WHERE id = ?1",
+                [id.to_string()],
+                |row| {
+                    Ok(TaskEnv {
+                        path: row.get(0)?,
+                        home: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::JobNotFound { job: id }.into())
     }
 
     fn require_job(&self, id: JobId) -> Result<JobRecord, AppError> {
@@ -568,7 +576,7 @@ impl Store {
              ORDER BY position",
         )?;
         let ids = statement
-            .query_map(params![machine.to_string(), priority.as_str()], |row| {
+            .query_map(params![machine.to_string(), priority.rank()], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -592,7 +600,7 @@ impl Store {
                 "UPDATE resource_jobs SET priority = ?1, position = ?2
                  WHERE id = ?3 AND machine = ?4 AND position IS NOT NULL",
                 params![
-                    priority.as_str(),
+                    priority.rank(),
                     sql_position(index + 1)?,
                     job.to_string(),
                     machine.to_string(),
@@ -608,7 +616,7 @@ impl Store {
             self.conn.execute(
                 "UPDATE resource_jobs SET position = position + ?1
                  WHERE machine = ?2 AND priority = ?3 AND position IS NOT NULL",
-                params![RENUMBER_OFFSET, machine.to_string(), level.as_str()],
+                params![RENUMBER_OFFSET, machine.to_string(), level.rank()],
             )?;
         }
         Ok(())
@@ -879,7 +887,7 @@ impl Store {
         task: TaskId,
         binary: PathBuf,
         now: DateTime<Utc>,
-    ) -> Result<ReservedRun, AppError> {
+    ) -> Result<ActiveRun, AppError> {
         self.immediate(|| self.reserve_run_inner(machine, job, resource, task, binary, now))
     }
 
@@ -891,9 +899,9 @@ impl Store {
         task: TaskId,
         binary: PathBuf,
         now: DateTime<Utc>,
-    ) -> Result<ReservedRun, AppError> {
+    ) -> Result<ActiveRun, AppError> {
         let record = self.require_machine_job(machine, job)?;
-        let JobState::Queued { next_step, resume } = record.state else {
+        let JobState::Queued { resume } = record.state else {
             return Err(QueueError::Invariant {
                 message: format!("job {job} is {}, not queued", record.state.as_str()),
             }
@@ -933,6 +941,7 @@ impl Store {
             }
             .into());
         }
+        let next_step = record.step;
         let step = record
             .spec
             .steps
@@ -944,12 +953,12 @@ impl Store {
 
         let row = new_queued_task(NewTask {
             id: task,
-            name: Some(record.spec.name.clone()),
+            name: record.spec.name.clone(),
             thread: record.spec.thread,
             workload: step.to_workload(),
             cwd: record.spec.cwd.clone(),
             timeout: record.spec.timeout,
-            env: record.env.clone(),
+            env: self.job_env(job)?,
             binary,
         });
         let project_root = find_project_root(&row.cwd);
@@ -965,7 +974,7 @@ impl Store {
             ],
         )?;
         self.conn.execute(
-            "UPDATE resource_jobs SET state = ?1, active_resource = ?2,
+            "UPDATE resource_jobs SET state = ?1, active_resource = ?2, resume = NULL,
                     last_run_number = ?3, updated_at = ?4
                  WHERE id = ?5",
             params![
@@ -982,14 +991,14 @@ impl Store {
             task,
             run_number,
             step: next_step,
+            resume,
             phase: RunPhase::Launching { reserved_at: now },
         };
         self.conn.execute(
             "INSERT INTO resource_run_history(task_id,resource_id) VALUES (?1,?2)",
             params![task.to_string(), resource.to_string()],
         )?;
-        let run = self.write_run(&run)?;
-        Ok(ReservedRun { run, resume })
+        self.write_run(&run)
     }
 
     /// Fail a scheduled step whose executable disappeared after acceptance
@@ -1010,7 +1019,7 @@ impl Store {
             let step = record
                 .spec
                 .steps
-                .get(record.next_step)
+                .get(record.step)
                 .ok_or_else(|| corrupt("job next step missing"))?;
             let program = match step {
                 StepWorkload::Task(workload) => workload.command.program().to_owned(),
@@ -1419,35 +1428,36 @@ impl Store {
         process: Option<ExitReason>,
     ) -> Result<(), AppError> {
         let after = match transition {
-            None => JobAfterRun::queued(run.step, job.resume, None),
+            None => JobAfterRun::queued(run.step, run.resume, None),
             Some(JobTransition::NextStep) => JobAfterRun::queued(run.step.next(), false, None),
             Some(JobTransition::Requeue { resume }) => {
                 JobAfterRun::queued(run.step, resume, Some(JobEventKind::JobPreempted))
             }
             Some(JobTransition::Succeeded) => {
-                JobAfterRun::ended(JobState::Succeeded, JobEventKind::JobSucceeded)
+                JobAfterRun::ended(JobState::Succeeded, run.step, JobEventKind::JobSucceeded)
             }
-            Some(JobTransition::Failed) => {
-                JobAfterRun::ended(JobState::Failed { run: run.task }, JobEventKind::JobFailed)
-            }
+            Some(JobTransition::Failed) => JobAfterRun::ended(
+                JobState::Failed { run: run.task },
+                run.step,
+                JobEventKind::JobFailed,
+            ),
             Some(JobTransition::Cancelled) => {
-                JobAfterRun::ended(JobState::Cancelled, JobEventKind::JobCancelled)
+                JobAfterRun::ended(JobState::Cancelled, run.step, JobEventKind::JobCancelled)
             }
         };
-        // a terminal job keeps the step it ended on, for `resource job show`
-        let (next_step, resume) = match after.state {
-            JobState::Queued { next_step, resume } => (next_step, resume),
-            _ => (run.step, false),
+        let resume = match after.state {
+            JobState::Queued { resume } => Some(resume),
+            _ => None,
         };
         let terminal = after.state.is_terminal();
         self.conn.execute(
-            "UPDATE resource_jobs SET state = ?1, active_resource = NULL, next_step = ?2,
+            "UPDATE resource_jobs SET state = ?1, active_resource = NULL, step = ?2,
                 resume = ?3, failed_run = ?4, position = CASE WHEN ?5 THEN NULL ELSE position END,
                 updated_at = ?6
              WHERE id = ?7",
             params![
                 after.state.as_str(),
-                next_step.get(),
+                after.step.get(),
                 resume,
                 failed_run(after.state),
                 terminal,
@@ -1479,7 +1489,7 @@ impl Store {
         }
         self.conn.execute(
             "UPDATE resource_jobs SET state = ?1, position = NULL, active_resource = NULL,
-                failed_run = ?2, updated_at = ?3
+                resume = NULL, failed_run = ?2, updated_at = ?3
              WHERE id = ?4",
             params![
                 state.as_str(),
@@ -1619,7 +1629,7 @@ impl Store {
             "UPDATE resources SET run_job = ?1, run_task = ?2, run_number = ?3, run_step = ?4,
                 run_phase = ?5, run_reserved_at = ?6, run_started_at = ?7, run_stop_cause = ?8,
                 run_stop_requested_at = ?9, run_cleanup_attempt = ?10, run_attention_id = ?11,
-                run_attention_failure = ?12
+                run_attention_failure = ?12, run_resume = ?14
              WHERE id = ?13",
             params![
                 run.job.to_string(),
@@ -1635,6 +1645,7 @@ impl Store {
                 columns.attention.as_ref().map(|(id, _)| id.to_string()),
                 columns.attention.map(|(_, failure)| failure),
                 run.resource.to_string(),
+                run.resume,
             ],
         )?;
         self.require_run(run.resource, run.task)
@@ -1645,7 +1656,7 @@ impl Store {
             "UPDATE resources SET run_job = NULL, run_task = NULL, run_number = NULL,
                 run_step = NULL, run_phase = NULL, run_reserved_at = NULL, run_started_at = NULL,
                 run_stop_cause = NULL, run_stop_requested_at = NULL, run_cleanup_attempt = NULL,
-                run_attention_id = NULL, run_attention_failure = NULL
+                run_attention_id = NULL, run_attention_failure = NULL, run_resume = NULL
              WHERE id = ?1",
             [resource.to_string()],
         )?;
@@ -1753,16 +1764,18 @@ impl Store {
 }
 
 impl JobAfterRun {
-    fn queued(next_step: StepIndex, resume: bool, event: Option<JobEventKind>) -> Self {
+    fn queued(step: StepIndex, resume: bool, event: Option<JobEventKind>) -> Self {
         Self {
-            state: JobState::Queued { next_step, resume },
+            state: JobState::Queued { resume },
+            step,
             event,
         }
     }
 
-    fn ended(state: JobState, event: JobEventKind) -> Self {
+    fn ended(state: JobState, step: StepIndex, event: JobEventKind) -> Self {
         Self {
             state,
+            step,
             event: Some(event),
         }
     }
@@ -1870,6 +1883,7 @@ struct RawResource {
     attention_id: Option<String>,
     attention_failure: Option<String>,
     origin: String,
+    run_resume: Option<bool>,
 }
 
 impl RawResource {
@@ -1892,6 +1906,7 @@ impl RawResource {
             attention_id: row.get(14)?,
             attention_failure: row.get(15)?,
             origin: row.get(16)?,
+            run_resume: row.get(17)?,
         })
     }
 
@@ -1951,18 +1966,22 @@ impl RawResource {
             &self.run_task,
             self.run_number,
             self.run_step,
+            self.run_resume,
         ) {
-            (false, None, None, None, None) => None,
-            (true, Some(job), Some(task), Some(number), Some(step)) => Some(ActiveRun {
-                resource: id,
-                job: JobId::from_uuid(parse_uuid(job)?),
-                task: TaskId(parse_uuid(task)?),
-                run_number: RunNumber::new(
-                    u32::try_from(number).map_err(|_| corrupt("bad run number"))?,
-                )?,
-                step: StepIndex::new(u32::try_from(step).map_err(|_| corrupt("bad run step"))?),
-                phase: self.phase()?,
-            }),
+            (false, None, None, None, None, None) => None,
+            (true, Some(job), Some(task), Some(number), Some(step), Some(resume)) => {
+                Some(ActiveRun {
+                    resource: id,
+                    job: JobId::from_uuid(parse_uuid(job)?),
+                    task: TaskId(parse_uuid(task)?),
+                    run_number: RunNumber::new(
+                        u32::try_from(number).map_err(|_| corrupt("bad run number"))?,
+                    )?,
+                    step: StepIndex::new(u32::try_from(step).map_err(|_| corrupt("bad run step"))?),
+                    resume,
+                    phase: self.phase()?,
+                })
+            }
             _ => return Err(corrupt(format!("resource {id} has a partial active run")).into()),
         };
         Ok(ResourceRecord {
@@ -1985,16 +2004,14 @@ struct RawJob {
     origin: String,
     spec: String,
     digest: String,
-    env_path: String,
-    env_home: String,
     target: Option<String>,
-    priority: String,
+    priority: i64,
     position: Option<i64>,
     state: String,
     active_resource: Option<String>,
     failed_run: Option<String>,
-    next_step: i64,
-    resume: bool,
+    step: i64,
+    resume: Option<bool>,
     runs: i64,
     created_at: String,
     updated_at: String,
@@ -2003,45 +2020,44 @@ struct RawJob {
 impl RawJob {
     fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            id: row.get(0)?,
-            machine: row.get(1)?,
-            origin: row.get(2)?,
-            spec: row.get(3)?,
-            digest: row.get(4)?,
-            env_path: row.get(5)?,
-            env_home: row.get(6)?,
-            target: row.get(7)?,
-            priority: row.get(8)?,
-            position: row.get(9)?,
-            state: row.get(10)?,
-            active_resource: row.get(11)?,
-            failed_run: row.get(12)?,
-            next_step: row.get(13)?,
-            resume: row.get(14)?,
-            runs: row.get(15)?,
-            created_at: row.get(16)?,
-            updated_at: row.get(17)?,
+            id: row.get("id")?,
+            machine: row.get("machine")?,
+            origin: row.get("origin_machine")?,
+            spec: row.get("spec_json")?,
+            digest: row.get("spec_digest")?,
+            target: row.get("target_resource")?,
+            priority: row.get("priority")?,
+            position: row.get("position")?,
+            state: row.get("state")?,
+            active_resource: row.get("active_resource")?,
+            failed_run: row.get("failed_run")?,
+            step: row.get("step")?,
+            resume: row.get("resume")?,
+            runs: row.get("last_run_number")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
         })
     }
 
     fn parse(self) -> Result<JobRecord, AppError> {
         let id = JobId::from_uuid(parse_uuid(&self.id)?);
         let spec = JobSpec::parse_value(&serde_json::from_str(&self.spec)?)?;
-        let next_step =
-            StepIndex::new(u32::try_from(self.next_step).map_err(|_| corrupt("bad next step"))?);
-        let state = match (self.state.as_str(), self.active_resource, self.failed_run) {
-            ("queued", None, None) => JobState::Queued {
-                next_step,
-                resume: self.resume,
-            },
-            ("active", Some(resource), None) => JobState::Active {
+        let step = StepIndex::new(u32::try_from(self.step).map_err(|_| corrupt("bad step"))?);
+        let state = match (
+            self.state.as_str(),
+            self.active_resource,
+            self.failed_run,
+            self.resume,
+        ) {
+            ("queued", None, None, Some(resume)) => JobState::Queued { resume },
+            ("active", Some(resource), None, None) => JobState::Active {
                 resource: ResourceId::from_uuid(parse_uuid(&resource)?),
             },
-            ("succeeded", None, None) => JobState::Succeeded,
-            ("failed", None, Some(run)) => JobState::Failed {
+            ("succeeded", None, None, None) => JobState::Succeeded,
+            ("failed", None, Some(run), None) => JobState::Failed {
                 run: TaskId(parse_uuid(&run)?),
             },
-            ("cancelled", None, None) => JobState::Cancelled,
+            ("cancelled", None, None, None) => JobState::Cancelled,
             (state, ..) => return Err(corrupt(format!("job {id} has bad state {state:?}")).into()),
         };
         let target = match self.target {
@@ -2054,16 +2070,12 @@ impl RawJob {
             origin: self.origin.parse()?,
             spec,
             digest: self.digest,
-            env: TaskEnv {
-                path: self.env_path,
-                home: self.env_home,
-            },
             target,
-            priority: self.priority.parse()?,
+            priority: Priority::from_rank(self.priority)
+                .ok_or_else(|| corrupt(format!("job {id} has bad priority {}", self.priority)))?,
             position: opt_u32(self.position, "position")?,
             state,
-            next_step,
-            resume: self.resume,
+            step,
             runs: u32::try_from(self.runs).map_err(|_| corrupt("bad run count"))?,
             created_at: parse_time(&self.created_at)?,
             updated_at: parse_time(&self.updated_at)?,

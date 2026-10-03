@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::{Ctx, OutputMode};
@@ -15,7 +16,10 @@ use crate::error::AppError;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, ResourceName,
+    RunPhase, StopCause, Target,
 };
+use crate::store::queue::ResourceRecord;
+use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
 
 /// Resource and machine queue commands
 #[derive(Debug, Subcommand)]
@@ -139,11 +143,12 @@ pub async fn run(ctx: &Ctx, command: ResourceCommand) -> Result<ExitCode, AppErr
             let value = client
                 .post("/v1/resources", &json!({ "name": name, "device": device }))
                 .await?;
+            let registered: ResourceRecord = decode(value.clone())?;
             print_result(
                 ctx,
                 &value,
                 "registered",
-                value["resource"]["id"].as_str().unwrap_or_default(),
+                &registered.resource.id.to_string(),
             )?;
         }
         ResourceCommand::List(machine) => {
@@ -285,65 +290,75 @@ fn print_result(ctx: &Ctx, value: &Value, action: &str, id: &str) -> Result<(), 
     ctx.print_id(id, &format!("{action} {id}"), value.clone())
 }
 
-fn text<'a>(value: &'a Value, key: &str) -> &'a str {
-    value[key].as_str().unwrap_or("-")
+/// Decode a daemon response into the typed shape the daemon serialized
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
+    serde_json::from_value(value).map_err(|error| AppError::Internal {
+        message: format!("unexpected queue response: {error}"),
+    })
 }
 
 fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
     }
+    let list: ResourceList = decode(value)?;
     if ctx.output == OutputMode::Human {
         println!(
             "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE"
         );
     }
-    for record in value["resources"].as_array().into_iter().flatten() {
-        let resource = &record["resource"];
-        let id = text(resource, "id");
+    for record in &list.resources {
+        let resource = &record.resource;
+        let id = resource.id;
         if ctx.output == OutputMode::Quiet {
             println!("{id}");
             continue;
         }
-        let name = text(resource, "name");
-        let device = resource["device"]
-            .as_u64()
+        let name = resource.name.as_str();
+        let device = resource
+            .device
             .map_or_else(|| "-".into(), |device| device.to_string());
-        let run = &record["run"];
-        let state = run["phase"]["phase"].as_str().unwrap_or("idle");
-        let task = text(run, "task");
-        let age = run["phase"]["requested_at"]
-            .as_str()
-            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-            .map_or_else(String::new, |at| {
-                format!(
-                    " / {}s",
-                    (chrono::Utc::now() - at.to_utc()).num_seconds().max(0)
-                )
-            });
+        let run = record.run.as_ref();
+        let state = run.map_or("idle", |run| run.phase.as_str());
+        let task = run.map_or_else(|| "-".into(), |run| run.task.to_string());
+        let age = match run.map(|run| &run.phase) {
+            Some(RunPhase::Stopping { requested_at, .. }) => format!(
+                " / {}s",
+                (chrono::Utc::now() - *requested_at).num_seconds().max(0)
+            ),
+            _ => String::new(),
+        };
         println!("{id} {name:<16} {device:<6} {state:<12} {task}{age}");
     }
     Ok(())
+}
+
+fn target_label(target: Target) -> String {
+    match target {
+        Target::Any => "any".into(),
+        Target::Pinned(resource) => resource.to_string(),
+    }
 }
 
 fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
     }
+    let list: JobList = decode(value)?;
     if ctx.output == OutputMode::Human {
         println!("JOB                                  PRIORITY POSITION STATE     TARGET / NAME");
     }
-    for job in value["jobs"].as_array().into_iter().flatten() {
-        let id = text(job, "id");
+    for job in &list.jobs {
+        let id = job.id;
         if ctx.output == OutputMode::Quiet {
             println!("{id}");
             continue;
         }
-        let priority = text(job, "priority");
-        let position = job["position"].as_u64().unwrap_or(0);
-        let state = text(&job["state"], "state");
-        let target = job["target"]["resource"].as_str().unwrap_or("any");
-        let name = text(&job["spec"], "name");
+        let priority = job.priority.as_str();
+        let position = job.position.unwrap_or(0);
+        let state = job.state.as_str();
+        let target = target_label(job.target);
+        let name = &job.spec.name;
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
     }
     Ok(())
@@ -353,27 +368,29 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
     }
-    let job = &value["job"];
-    let id = text(job, "id");
+    let detail: JobDetail = decode(value)?;
+    let job = &detail.job;
+    let id = job.id;
     if ctx.output == OutputMode::Quiet {
         println!("{id}");
         return Ok(());
     }
-    let name = text(&job["spec"], "name");
-    let state = text(&job["state"], "state");
-    let priority = text(job, "priority");
-    let target = job["target"]["resource"].as_str().unwrap_or("any");
+    let name = &job.spec.name;
+    let state = job.state.as_str();
+    let priority = job.priority.as_str();
+    let target = target_label(job.target);
     println!("{id}  {name}\nstate: {state}\npriority: {priority}\ntarget: {target}");
-    println!(
-        "step: {}\nlast stop: {}",
-        job["next_step"], value["last_stop_cause"]
-    );
-    for run in value["runs"].as_array().into_iter().flatten() {
-        let task = text(run, "task");
-        let status = text(run, "status");
+    let last_stop = detail.last_stop_cause.map_or("-", StopCause::as_str);
+    println!("step: {}\nlast stop: {last_stop}", job.step);
+    for run in &detail.runs {
+        let cleanup = match &run.cleanup {
+            None => "pending".to_owned(),
+            Some(Ok(())) => "clean".to_owned(),
+            Some(Err(failure)) => format!("failed: {failure}"),
+        };
         println!(
-            "run {} step {}: {task} {status}; cleanup: {}",
-            run["run_number"], run["step"], run["cleanup"]
+            "run {} step {}: {} {}; cleanup: {cleanup}",
+            run.run_number, run.step, run.task, run.status
         );
     }
     Ok(())

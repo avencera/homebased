@@ -47,10 +47,6 @@ pub struct JobRoute {
     pub target: Option<Target>,
     /// Submission result separate from job state
     pub submission: JobSubmission,
-    /// Last event stored in the origin inbox
-    pub last_accepted_seq: u64,
-    /// Last event delivered to the thread
-    pub last_settled_seq: u64,
 }
 
 /// Identity-bound event sent by the authority, with origin-side deduplication

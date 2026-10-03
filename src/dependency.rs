@@ -170,9 +170,9 @@ impl fmt::Display for TaskOutcome {
 /// How a finished dependency ended, as far as its origin can prove
 ///
 /// Process status is not an outcome: a worker can exit 0 after reporting
-/// `blocked`. A task whose terminal event is gone, such as one that finished
-/// before outcomes were saved and whose event was pruned, is
-/// [`Self::Unknown`], and an unknown ending never releases a held task
+/// `blocked`. A task that ended with no saved outcome, or whose route is
+/// missing, is [`Self::Unknown`], and an unknown ending never releases a held
+/// task
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyOutcome {
     /// The terminal event, or the route's closure before launch, named this outcome

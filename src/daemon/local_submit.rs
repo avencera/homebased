@@ -83,10 +83,7 @@ pub(super) async fn release(state: &AppState, route: OriginRoute) -> Result<(), 
     ) {
         return Ok(());
     }
-    let spec = route
-        .current_spec()
-        .cloned()
-        .ok_or_else(|| conflict(&route, "held task has no saved spec"))?;
+    let spec = route.spec.clone();
     let admission = LocalAdmission::Released {
         request: route.request,
     };
@@ -144,7 +141,7 @@ async fn launch_row(
     let binary = resolve_workload_binary(&spec.workload, &env.path, &spec.cwd)?;
     let row = store::new_queued_task(NewTask {
         id,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: spec.thread,
         workload: persist_workload(&spec.workload),
         cwd: spec.cwd.clone(),
@@ -186,7 +183,7 @@ async fn resume(
             "request UUID belongs to a remote submission",
         ));
     }
-    if route.spec.current() != Some(spec) {
+    if route.spec != *spec {
         return Err(conflict(
             &route,
             "request UUID has different normalized content",

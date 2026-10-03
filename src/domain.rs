@@ -15,12 +15,6 @@ use crate::error::AppError;
 /// Public JSON schema version
 pub const API_VERSION: u32 = 1;
 
-/// SQLite `user_version`
-///
-/// Released versions 1, 2, and 27 through 34 migrate in place to this version
-/// Unreleased development versions 3 through 26 are refused
-pub const SCHEMA_VERSION: i64 = 37;
-
 /// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;
 
@@ -564,14 +558,15 @@ impl ProcessGroupExitEvidence {
         }
     }
 
-    /// Parse a storage tag. Unknown values remain conservative
-    #[must_use]
-    pub fn from_storage(value: Option<&str>) -> Self {
+    /// Parse a storage tag
+    pub fn from_storage(value: &str) -> Result<Self, AppError> {
         match value {
-            Some("confirmed_exited") => Self::ConfirmedExited,
-            Some("no_child_spawned") => Self::NoChildSpawned,
-            Some("unconfirmed") | None => Self::Unconfirmed,
-            Some(_) => Self::Unconfirmed,
+            "unconfirmed" => Ok(Self::Unconfirmed),
+            "confirmed_exited" => Ok(Self::ConfirmedExited),
+            "no_child_spawned" => Ok(Self::NoChildSpawned),
+            other => Err(AppError::Internal {
+                message: format!("unknown process-group exit evidence: {other}"),
+            }),
         }
     }
 }
@@ -646,7 +641,7 @@ pub enum ContainerExitEvidence {
 }
 
 impl ContainerExitEvidence {
-    /// SQLite storage form. `None` stores the conservative default
+    /// SQLite storage form. `None` stores [`Self::Unconfirmed`]
     pub fn to_storage(&self) -> Result<Option<String>, serde_json::Error> {
         match self {
             Self::Unconfirmed => Ok(None),
@@ -654,12 +649,9 @@ impl ContainerExitEvidence {
         }
     }
 
-    /// Parse the storage form. Unknown values remain conservative
-    #[must_use]
-    pub fn from_storage(value: Option<&str>) -> Self {
-        value
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or_default()
+    /// Parse the storage form, where `None` is [`Self::Unconfirmed`]
+    pub fn from_storage(value: Option<&str>) -> Result<Self, AppError> {
+        value.map_or(Ok(Self::Unconfirmed), |raw| Ok(serde_json::from_str(raw)?))
     }
 }
 
@@ -704,7 +696,7 @@ pub enum WorkExitEvidence {
     },
 }
 
-/// Compatibility projection of the terminal event's origin-inbox result
+/// Delivery of a task's terminal event to its origin thread, as the origin inbox records it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallbackStatus {
@@ -732,98 +724,9 @@ impl CallbackStatus {
             Self::Failed => "failed",
         }
     }
-
-    /// Parse a storage tag
-    pub fn from_storage(value: &str) -> Result<Self, AppError> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "sending" => Ok(Self::Sending),
-            "waiting" => Ok(Self::Waiting),
-            "sent" => Ok(Self::Sent),
-            "failed" => Ok(Self::Failed),
-            other => Err(AppError::Internal {
-                message: format!("unknown callback status: {other}"),
-            }),
-        }
-    }
 }
 
 impl fmt::Display for CallbackStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Origin-inbox status exposed beside a task row
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalCallbackProjection {
-    /// Status retained by a row that predates typed event ownership
-    Legacy(CallbackStatus),
-    /// Status read from this machine's origin inbox
-    OriginInbox(CallbackStatus),
-    /// The origin machine owns delivery, so this executor cannot report it
-    NotOwned,
-}
-
-/// Attention-reminder delivery state. A third axis, independent of the process
-/// status and of the terminal callback: a reminder never changes either one
-/// `Delivered` carries its timestamp, so "delivered with no time" cannot exist
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttentionState {
-    /// No reminder claimed yet
-    Pending,
-    /// A sender holds the claim and the queue send is in flight
-    Sending,
-    /// `TASK_CHECK_DUE` was delivered
-    Delivered {
-        /// When the queue send succeeded
-        at: DateTime<Utc>,
-    },
-}
-
-impl AttentionState {
-    /// SQLite storage tag for the `attention_state` column
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Sending => "sending",
-            Self::Delivered { .. } => "delivered",
-        }
-    }
-
-    /// Rebuild from the `attention_state` and `timeout_notified_at` columns
-    pub fn from_storage(tag: &str, at: Option<DateTime<Utc>>) -> Result<Self, AppError> {
-        match (tag, at) {
-            ("pending", None) => Ok(Self::Pending),
-            ("sending", None) => Ok(Self::Sending),
-            ("delivered", Some(at)) => Ok(Self::Delivered { at }),
-            (state, timestamp) => Err(AppError::Internal {
-                message: format!(
-                    "invalid attention state: state={state} notified={}",
-                    timestamp.is_some()
-                ),
-            }),
-        }
-    }
-
-    /// When the reminder was delivered, if it was
-    #[must_use]
-    pub fn delivered_at(&self) -> Option<DateTime<Utc>> {
-        match self {
-            Self::Delivered { at } => Some(*at),
-            Self::Pending | Self::Sending => None,
-        }
-    }
-
-    /// Whether `TASK_CHECK_DUE` has already been delivered
-    #[must_use]
-    pub fn is_delivered(&self) -> bool {
-        matches!(self, Self::Delivered { .. })
-    }
-}
-
-impl fmt::Display for AttentionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -907,7 +810,7 @@ pub struct TaskReport {
     pub summary: String,
     /// When the row was appended
     pub reported_at: DateTime<Utc>,
-    /// When an interim `--notify` send succeeded
+    /// When the origin delivered this report's interim `--notify` event
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notified_at: Option<DateTime<Utc>>,
 }
@@ -1046,8 +949,8 @@ impl TaskState {
 pub struct TaskRow {
     /// Task id
     pub id: TaskId,
-    /// Submitted name. `None` only for rows stored before name was required
-    pub name: Option<TaskName>,
+    /// Submitted name
+    pub name: TaskName,
     /// Submitting Codex thread
     pub thread: ThreadId,
     /// Workload configuration
@@ -1070,10 +973,9 @@ pub struct TaskRow {
     /// worker can tell its process group from a later one that reused the PID.
     /// `None` before spawn and for container tasks, whose container is the witness
     pub child: Option<ProcessIdentity>,
-    /// Terminal callback delivery. A second axis: it outlives the process state
-    pub callback_status: CallbackStatus,
-    /// Attention-reminder delivery state
-    pub attention: AttentionState,
+    /// When the task's one inactivity reminder (`TASK_CHECK_DUE`) was produced.
+    /// Independent of the process status: a reminder never changes it
+    pub check_due_at: Option<DateTime<Utc>>,
     /// When cancel was requested
     pub cancel_requested_at: Option<DateTime<Utc>>,
     /// Insert time
@@ -1148,44 +1050,6 @@ impl TaskRow {
     #[must_use]
     pub fn pid(&self) -> Option<i32> {
         self.state.pid()
-    }
-
-    /// Non-empty label for UI and events: submitted name, else workload fallback
-    #[must_use]
-    pub fn display_name(&self) -> String {
-        display_name(self.name.as_ref(), &self.workload)
-    }
-}
-
-/// Non-empty display label from an optional name and workload
-#[must_use]
-pub fn display_name(name: Option<&TaskName>, workload: &Workload) -> String {
-    if let Some(name) = name {
-        return name.as_str().to_string();
-    }
-    workload_display_name(workload)
-}
-
-/// Workload-only fallback used when no submitted name is present
-#[must_use]
-pub fn workload_display_name(workload: &Workload) -> String {
-    match workload {
-        Workload::Agent(agent) => match &agent.agent.model {
-            Some(model) => format!("{}/{model}", agent.agent.kind),
-            None => agent.agent.kind.to_string(),
-        },
-        Workload::Task(task) => {
-            let argv = task.command.to_vec();
-            let parts: Vec<&str> = argv.iter().take(3).map(String::as_str).collect();
-            if argv.len() > 3 {
-                format!("{}…", parts.join(" "))
-            } else if parts.is_empty() {
-                "task".into()
-            } else {
-                parts.join(" ")
-            }
-        }
-        Workload::Container(container) => format!("container {}", container.image.short_name()),
     }
 }
 
@@ -1275,11 +1139,10 @@ impl From<&ExitReason> for ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ContainerExitEvidence,
-        ContainerId, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity,
-        TaskName, TaskNameError, TaskRow, TaskState, TaskWorkload, ThreadId, TransitionError,
-        WorkExitEvidence, Workload, check_report_allowed, check_status_transition, display_name,
-        workload_display_name,
+        Agent, AgentKind, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason,
+        ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskIdentity, TaskName, TaskNameError,
+        TaskRow, TaskState, TaskWorkload, ThreadId, TransitionError, WorkExitEvidence, Workload,
+        check_report_allowed, check_status_transition,
     };
     use crate::error::AppError;
     use chrono::Utc;
@@ -1303,12 +1166,8 @@ mod tests {
     }
 
     #[test]
-    fn callback_status_waiting_has_a_stable_storage_and_json_tag() {
+    fn callback_status_waiting_has_a_stable_json_tag() {
         assert_eq!(CallbackStatus::Waiting.as_str(), "waiting");
-        assert_eq!(
-            CallbackStatus::from_storage("waiting").unwrap(),
-            CallbackStatus::Waiting
-        );
         assert_eq!(
             serde_json::to_value(CallbackStatus::Waiting).unwrap(),
             serde_json::json!("waiting")
@@ -1372,27 +1231,6 @@ mod tests {
     #[test]
     fn succeeded_to_running_rejected() {
         assert!(check_status_transition(ProcessStatus::Succeeded, ProcessStatus::Running).is_err());
-    }
-
-    #[test]
-    fn attention_state_rejects_impossible_storage_pairs() {
-        let at = Utc::now();
-        assert_eq!(
-            AttentionState::from_storage("pending", None).unwrap(),
-            AttentionState::Pending
-        );
-        assert_eq!(
-            AttentionState::from_storage("sending", None).unwrap(),
-            AttentionState::Sending
-        );
-        assert_eq!(
-            AttentionState::from_storage("delivered", Some(at)).unwrap(),
-            AttentionState::Delivered { at }
-        );
-        assert!(AttentionState::from_storage("pending", Some(at)).is_err());
-        assert!(AttentionState::from_storage("sending", Some(at)).is_err());
-        assert!(AttentionState::from_storage("delivered", None).is_err());
-        assert!(AttentionState::from_storage("unknown", None).is_err());
     }
 
     #[test]
@@ -1503,7 +1341,7 @@ mod tests {
         for (workload, state, process_group, container_evidence, expected) in cases {
             let row = TaskRow {
                 id: TaskId::new(),
-                name: None,
+                name: TaskName::parse("witness").unwrap(),
                 thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
                 workload: workload.clone(),
                 cwd: "/tmp".into(),
@@ -1517,18 +1355,13 @@ mod tests {
                 process_group_exit_evidence: process_group,
                 container_exit_evidence: container_evidence,
                 child: None,
-                callback_status: crate::domain::CallbackStatus::Pending,
-                attention: AttentionState::Pending,
+                check_due_at: None,
                 cancel_requested_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             };
             assert_eq!(row.work_exit_evidence(), expected);
         }
-        assert_eq!(
-            workload_display_name(&container),
-            format!("container sha256:{}", "0".repeat(12))
-        );
     }
 
     #[test]
@@ -1588,35 +1421,5 @@ mod tests {
         let back: TaskName = serde_json::from_str(&json).unwrap();
         assert_eq!(back, name);
         assert!(serde_json::from_str::<TaskName>("\"  \"").is_err());
-    }
-
-    #[test]
-    fn display_name_prefers_submitted_then_workload() {
-        let name = TaskName::parse("my job").unwrap();
-        let agent = Workload::Agent(AgentWorkload {
-            agent: Agent::new(AgentKind::Claude, Some("fable".into())),
-            extra_args: vec![],
-            report_trailer: true,
-            resume_thread: None,
-        });
-        assert_eq!(display_name(Some(&name), &agent), "my job");
-        assert_eq!(workload_display_name(&agent), "claude/fable");
-        let agent_bare = Workload::Agent(AgentWorkload {
-            agent: Agent::new(AgentKind::Grok, None),
-            extra_args: vec![],
-            report_trailer: true,
-            resume_thread: None,
-        });
-        assert_eq!(workload_display_name(&agent_bare), "grok");
-        let task = Workload::Task(TaskWorkload {
-            command: crate::invocation::CommandLine::try_from_argv(vec![
-                "cargo".into(),
-                "build".into(),
-                "--release".into(),
-                "--locked".into(),
-            ])
-            .unwrap(),
-        });
-        assert_eq!(workload_display_name(&task), "cargo build --release…");
     }
 }

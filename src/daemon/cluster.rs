@@ -222,8 +222,8 @@ pub struct OriginSummary {
     pub submission: SubmissionState,
     /// Last process state received from the executor
     pub last_execution_state: Option<ProcessStatus>,
-    /// Time of the last origin route state update, when known
-    pub last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Time of the last origin route state update
+    pub last_updated_at: chrono::DateTime<chrono::Utc>,
     /// Last accepted event sequence
     pub last_accepted_seq: u64,
     /// Last settled callback sequence
@@ -553,9 +553,7 @@ async fn submit_execution(
                     && record.execution_machine == body.destination_machine
                     && record.origin_machine != record.execution_machine
                     && body.unknown.is_empty()
-                    && record.spec.current().is_some_and(|stored| {
-                        normalized.as_ref().is_ok_and(|spec| stored == spec)
-                    }) => {}
+                    && normalized.as_ref().is_ok_and(|spec| &record.spec == spec) => {}
             ExecutorIdentity::Rejected(record)
                 if record.origin_machine == body.origin_machine
                     && record.execution_machine == body.destination_machine => {}

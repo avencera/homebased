@@ -155,13 +155,34 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// Stable lowercase name, also the storage tag
+    /// Stable lowercase name
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+        }
+    }
+
+    /// Serving rank, also the storage value: a higher rank is served first
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
+
+    /// Level of a stored rank
+    #[must_use]
+    pub const fn from_rank(rank: i64) -> Option<Self> {
+        match rank {
+            0 => Some(Self::Low),
+            1 => Some(Self::Medium),
+            2 => Some(Self::High),
+            _ => None,
         }
     }
 }
@@ -591,14 +612,13 @@ impl TryFrom<Vec<StepWorkload>> for Steps {
 }
 
 /// Where a job is in its life
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
-    /// Waiting in the queue; `next_step` is the step the next run executes
+    /// Waiting in the queue for a run of its current step
     Queued {
-        /// Step the next run executes
-        next_step: StepIndex,
-        /// Whether the previous attempt of `next_step` yielded at a checkpoint
+        /// Whether the previous attempt of the step yielded at a checkpoint,
+        /// so the next run resumes it
         resume: bool,
     },
     /// One resource's active run belongs to this job
@@ -725,7 +745,7 @@ impl fmt::Display for RunNumber {
 }
 
 /// One resource's single active run and where it is in its lifecycle
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveRun {
     /// Resource the run holds
     pub resource: ResourceId,
@@ -737,12 +757,14 @@ pub struct ActiveRun {
     pub run_number: RunNumber,
     /// Step the run executes
     pub step: StepIndex,
+    /// Whether the run resumes its step from a checkpoint (`HOMEBASED_RESUME=1`)
+    pub resume: bool,
     /// Where the run is in its lifecycle
     pub phase: RunPhase,
 }
 
 /// Lifecycle of a resource's active run
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum RunPhase {
     /// Task row inserted and reserved; worker not yet confirmed running

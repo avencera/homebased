@@ -901,7 +901,7 @@ mod tests {
         let store = Store::open(&home.db_path()).unwrap();
         let mut row = store::new_queued_task(crate::store::NewTask {
             id,
-            name: Some(crate::domain::TaskName::parse("self-cancel test").unwrap()),
+            name: crate::domain::TaskName::parse("self-cancel test").unwrap(),
             thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
             workload: crate::domain::Workload::Task(crate::domain::TaskWorkload {
                 command: crate::invocation::CommandLine::try_from_argv(vec![

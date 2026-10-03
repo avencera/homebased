@@ -1,23 +1,21 @@
 //! SQLite source of truth: task state, sequenced events, and callback results
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use nix::unistd::Pid;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
-use serde_json::Value;
 
 use crate::callback::{EventKind, ReportView, check_due_event, notify_event, terminal_event};
 use crate::cleanup::{ProcessIdentity, ProcessStartTime};
 use crate::dependency::TaskDependencies;
 use crate::domain::{
-    AttentionState, CallbackStatus, ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence,
-    ProcessStatus, REPORTS_MAX, ReportOutcome, SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv,
-    TaskExitEvidence, TaskId, TaskName, TaskReport, TaskRow, TaskState, TerminalCallbackProjection,
-    ThreadId, Workload, check_report_allowed, check_status_transition,
+    CallbackStatus, ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence, ProcessStatus,
+    REPORTS_MAX, ReportOutcome, SUMMARY_MAX_BYTES, TaskEnv, TaskExitEvidence, TaskId, TaskName,
+    TaskReport, TaskRow, TaskState, ThreadId, Workload, check_report_allowed,
+    check_status_transition,
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
@@ -25,8 +23,8 @@ use crate::events::{DeliveryState, TaskEvent};
 use crate::machine::MachineId;
 use crate::spec::NormalizedSpec;
 use crate::submission::{
-    CallbackContext, CallbackExecutable, ExecutionRecord, ExecutorIdentity, OriginRoute,
-    PersistedSpec, RequestId, SubmissionState,
+    CallbackContext, CallbackExecutable, ExecutionRecord, ExecutorIdentity, OriginRoute, RequestId,
+    SubmissionState,
 };
 
 mod cancellation;
@@ -36,596 +34,17 @@ mod events;
 mod identity;
 mod message;
 pub mod queue;
+mod schema;
 pub use container::TaskContainerRecord;
 pub use dependency::{HeldCancel, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
 pub use identity::IdentityError;
 
-/// Released version 2 schema
-///
-/// Fresh databases apply this schema and then the version 2 migration, so new
-/// and upgraded databases share one path to the current schema
-///
-/// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
-/// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
-/// in SQLite's signed INTEGER without a lossy cast
-const BASE_SCHEMA: &str = r"
-CREATE TABLE tasks (
-    id TEXT PRIMARY KEY,
-    thread_id TEXT NOT NULL,
-    name TEXT,
-    workload_json TEXT NOT NULL,
-    cwd TEXT NOT NULL,
-    timeout_secs TEXT NOT NULL,
-    env_path TEXT NOT NULL,
-    env_home TEXT NOT NULL,
-    binary TEXT NOT NULL,
-    status TEXT NOT NULL,
-    exit_reason TEXT,
-    callback_status TEXT NOT NULL,
-    attention_state TEXT NOT NULL,
-    timeout_notified_at TEXT,
-    pid INTEGER,
-    cancel_requested_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE INDEX tasks_status ON tasks(status);
-CREATE INDEX tasks_thread ON tasks(thread_id);
-
-CREATE TABLE reports (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    outcome TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    reported_at TEXT NOT NULL,
-    notified_at TEXT,
-    PRIMARY KEY (task_id, seq),
-    FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
-";
-
-/// Schema version 1 had no `name` column
-const MIGRATE_1_TO_2: &str = r"
-ALTER TABLE tasks ADD COLUMN name TEXT;
-";
-
-/// Schema version of the v0.4.0 release
-const RELEASED_V0_4_SCHEMA_VERSION: i64 = 27;
-
-/// Everything the v0.4.0 schema added to the released version 2 schema, apart
-/// from its GPU loan tables, which a later version drops
-///
-/// Versions 3 through 26 were never released, so a version 2 database moves to
-/// the current schema in one step
-const MIGRATE_2_TO_CURRENT: &str = r"
-ALTER TABLE tasks ADD COLUMN project_root TEXT;
-ALTER TABLE tasks ADD COLUMN process_group_exit_evidence TEXT;
-
-CREATE TABLE report_notification_intents (
-    task_id TEXT NOT NULL,
-    report_seq INTEGER NOT NULL,
-    requested_at TEXT NOT NULL,
-    PRIMARY KEY (task_id, report_seq),
-    FOREIGN KEY (task_id, report_seq) REFERENCES reports(task_id, seq)
-);
-
-CREATE TABLE origin_routes (
-    request_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL UNIQUE,
-    execution_machine TEXT NOT NULL,
-    spec_json TEXT NOT NULL,
-    route_json TEXT NOT NULL
-);
-
-CREATE TABLE executor_identities (
-    task_id TEXT PRIMARY KEY,
-    origin_machine TEXT NOT NULL,
-    identity_json TEXT NOT NULL
-);
-
-CREATE TABLE executor_outbox (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    origin_machine TEXT NOT NULL,
-    execution_machine TEXT NOT NULL,
-    event_json TEXT NOT NULL,
-    notification_required INTEGER NOT NULL CHECK (notification_required IN (0, 1)),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'acknowledged')),
-    acknowledged_at TEXT,
-    PRIMARY KEY (task_id, seq)
-);
-
-CREATE TABLE executor_event_cursors (
-    task_id TEXT PRIMARY KEY,
-    last_seq INTEGER NOT NULL CHECK (last_seq >= 0)
-);
-
-CREATE TABLE executor_event_routes (
-    task_id TEXT PRIMARY KEY,
-    state TEXT NOT NULL CHECK (state = 'orphaned'),
-    reason TEXT NOT NULL
-);
-
-CREATE TABLE origin_inbox (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    origin_machine TEXT NOT NULL,
-    execution_machine TEXT NOT NULL,
-    event_json TEXT NOT NULL,
-    notification_required INTEGER NOT NULL CHECK (notification_required IN (0, 1)),
-    delivery_json TEXT NOT NULL,
-    settled_at TEXT,
-    PRIMARY KEY (task_id, seq)
-);
-
-CREATE INDEX executor_outbox_pending ON executor_outbox(state, task_id, seq);
-CREATE INDEX executor_outbox_retention ON executor_outbox(acknowledged_at, task_id, seq);
-CREATE INDEX origin_inbox_order ON origin_inbox(task_id, seq);
-CREATE INDEX origin_inbox_retention ON origin_inbox(settled_at, task_id, seq);
-
-CREATE TABLE executor_event_receipts (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_digest TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
-    PRIMARY KEY (task_id, seq)
-);
-
-CREATE TABLE origin_event_receipts (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_digest TEXT NOT NULL,
-    delivery_json TEXT NOT NULL,
-    terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
-    PRIMARY KEY (task_id, seq)
-);
-
-CREATE TABLE cancellation_requests (
-    task_id TEXT PRIMARY KEY,
-    request_json TEXT NOT NULL
-);
-
-CREATE TABLE executor_cancellations (
-    cancellation_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
-    receipt_json TEXT NOT NULL
-);
-CREATE INDEX executor_cancellations_task ON executor_cancellations(task_id);
-
-CREATE TABLE message_attempts (
-    message_id TEXT PRIMARY KEY,
-    attempt_json TEXT NOT NULL
-);
-
-CREATE TABLE message_receipts (
-    message_id TEXT PRIMARY KEY REFERENCES message_attempts(message_id),
-    receipt_json TEXT NOT NULL
-);
-
-CREATE TABLE outbound_message_bindings (
-    message_id TEXT PRIMARY KEY,
-    binding_json TEXT NOT NULL
-);
-";
-
 const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
-    env_path, env_home, binary, status, exit_reason, callback_status,
-    attention_state, timeout_notified_at, pid, cancel_requested_at, created_at, updated_at,
-    process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time
+    env_path, env_home, binary, status, exit_reason, check_due_at, pid, cancel_requested_at,
+    created_at, updated_at, process_group_exit_evidence, container_exit_evidence, child_pid,
+    child_start_time
  FROM tasks";
-
-/// Schema version of the v0.5.0 release
-const RELEASED_V0_5_SCHEMA_VERSION: i64 = 28;
-
-/// Container tasks gained their witness after v0.5.0
-///
-/// `container_exit_evidence` sits beside `process_group_exit_evidence` so the
-/// terminal transition writes both in one update. `task_containers` keeps the
-/// saved container ID, its start, and the adoption streak of later workers
-const MIGRATE_28_TO_29_TASKS: &str = r"
-ALTER TABLE tasks ADD COLUMN container_exit_evidence TEXT;
-
-CREATE TABLE task_containers (
-    task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id),
-    container_id TEXT CHECK (
-        container_id IS NULL
-        OR (length(container_id) = 64 AND container_id NOT GLOB '*[^0-9a-f]*')
-    ),
-    started_at TEXT,
-    adoptions INTEGER NOT NULL DEFAULT 0 CHECK (adoptions >= 0)
-);
-";
-
-/// Move a released version 2 database to the current schema
-fn migrate_2_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_2_TO_CURRENT)?;
-    migrate_28_to_current(conn)
-}
-
-/// Move a v0.4.0 or v0.5.0 database to the current schema
-///
-/// Apart from the container witness, every change before version 32 touched
-/// only the GPU loan tables, which the version 35 step drops
-fn migrate_28_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
-    migrate_32_to_current(conn)
-}
-
-/// Schema version of the v0.5.1 release
-const RELEASED_V0_5_1_SCHEMA_VERSION: i64 = 29;
-
-/// Released v0.7.0 and v0.6.0 databases use schema version 30
-const RELEASED_V0_7_SCHEMA_VERSION: i64 = 30;
-
-/// Released v0.8 databases use schema version 31
-const RELEASED_V0_8_SCHEMA_VERSION: i64 = 31;
-
-/// Released v0.8.7 databases use schema version 32
-const RELEASED_V0_8_7_SCHEMA_VERSION: i64 = 32;
-
-/// Add the Codex worker thread captured from its task log
-fn migrate_32_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch("ALTER TABLE tasks ADD COLUMN worker_thread TEXT;")?;
-    migrate_33_to_current(conn)
-}
-
-/// Released v0.11 and v0.12 databases use schema version 33
-const RELEASED_V0_11_SCHEMA_VERSION: i64 = 33;
-
-/// Add task dependencies and the terminal outcome that releases or cancels a held task
-///
-/// `after_json` is the origin-only dependency list, saved beside the route
-/// like `spec_json`. `outcome` is how the task ended, taken from its terminal
-/// event, so it survives inbox payload compaction
-const MIGRATE_33_TO_34: &str = r"
-ALTER TABLE origin_routes ADD COLUMN after_json TEXT;
-ALTER TABLE origin_routes ADD COLUMN outcome TEXT
-    CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost'));
-";
-
-/// Outcomes of tasks that finished before the `outcome` column existed
-///
-/// Only definitive evidence sets an outcome. The retained terminal event names
-/// it. Older events may be pruned, so a local task's row and last report decide
-/// it next, by the same rules that built its terminal event. A remote route
-/// keeps only its last process state, which is not an outcome: a worker can
-/// exit 0 after reporting `blocked`, and its reports are on the executor. Such
-/// a route stays without an outcome, and dependency checks read its ending as
-/// unknown, which never counts as success
-const BACKFILL_33_TO_34: &str = r"
-UPDATE origin_routes SET outcome = (
-    SELECT CASE json_extract(i.event_json, '$.payload.event.event')
-        WHEN 'TASK_SUCCEEDED' THEN 'succeeded'
-        WHEN 'TASK_FAILED' THEN 'failed'
-        WHEN 'TASK_BLOCKED' THEN 'blocked'
-        WHEN 'TASK_CANCELLED' THEN 'cancelled'
-        WHEN 'TASK_LOST' THEN 'lost'
-    END
-    FROM origin_inbox i
-    WHERE i.task_id = origin_routes.task_id
-      AND json_extract(i.event_json, '$.payload.type') = 'callback'
-      AND json_extract(i.event_json, '$.payload.state') IN ('succeeded', 'failed', 'cancelled', 'lost')
-    ORDER BY i.seq DESC LIMIT 1
-)
-WHERE outcome IS NULL;
-
-UPDATE origin_routes SET outcome = (
-    SELECT CASE
-        WHEN t.status IN ('cancelled', 'lost') THEN t.status
-        WHEN last.outcome = 'blocked' THEN 'blocked'
-        WHEN t.status = 'failed' OR last.outcome = 'failed' THEN 'failed'
-        ELSE 'succeeded'
-    END
-    FROM tasks t
-    LEFT JOIN (
-        SELECT r.task_id, r.outcome FROM reports r
-        WHERE r.seq = (SELECT MAX(seq) FROM reports WHERE task_id = r.task_id)
-    ) last ON last.task_id = t.id
-    WHERE t.id = origin_routes.task_id
-      AND t.status IN ('succeeded', 'failed', 'cancelled', 'lost')
-)
-WHERE outcome IS NULL
-  AND json_extract(route_json, '$.origin_machine') = json_extract(route_json, '$.execution_machine');
-";
-
-/// Move a v0.11 database to the current schema
-fn migrate_33_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_33_TO_34)?;
-    conn.execute_batch(BACKFILL_33_TO_34)?;
-    migrate_34_to_current(conn)
-}
-
-/// Released v0.13 and v0.14 databases use schema version 34
-const RELEASED_V0_13_SCHEMA_VERSION: i64 = 34;
-
-/// Remove the GPU loan subsystem, which never ran live work
-///
-/// Origin routes, their callback rows, cancellation intents, and notice
-/// messages of the loan flows go first, since no current type can read them.
-/// Ordinary tasks, including any a loan launched, keep their rows. The loan
-/// tables then go children first, so no foreign key sees a missing parent, and
-/// `IF EXISTS` covers older databases that never had some of them
-const MIGRATE_34_TO_35: &str = r"
-DELETE FROM origin_inbox WHERE task_id IN (
-    SELECT task_id FROM origin_routes
-    WHERE json_extract(route_json, '$.submission.type')
-        IN ('resource', 'resource_action', 'resource_background')
-);
-DELETE FROM origin_event_receipts WHERE task_id IN (
-    SELECT task_id FROM origin_routes
-    WHERE json_extract(route_json, '$.submission.type')
-        IN ('resource', 'resource_action', 'resource_background')
-);
-DELETE FROM cancellation_requests
-    WHERE json_extract(request_json, '$.target.type') = 'resource'
-       OR json_extract(request_json, '$.delivery.state') = 'resource_delivered'
-       OR task_id IN (
-           SELECT task_id FROM origin_routes
-           WHERE json_extract(route_json, '$.submission.type')
-               IN ('resource', 'resource_action', 'resource_background')
-       );
-DELETE FROM origin_routes
-    WHERE json_extract(route_json, '$.submission.type')
-        IN ('resource', 'resource_action', 'resource_background');
-
-DELETE FROM message_receipts WHERE message_id IN (
-    SELECT message_id FROM message_attempts
-    WHERE json_extract(attempt_json, '$.request.source.kind') = 'resource_notice'
-);
-DELETE FROM message_attempts
-    WHERE json_extract(attempt_json, '$.request.source.kind') = 'resource_notice';
-
-DROP TABLE IF EXISTS resource_return_deadline_servings;
-DROP TABLE IF EXISTS resource_return_windows;
-DROP TABLE IF EXISTS resource_restore_closures;
-DROP TABLE IF EXISTS resource_return_decisions;
-DROP TABLE IF EXISTS resource_supervisor_notices;
-DROP TABLE IF EXISTS resource_idle_openings;
-DROP TABLE IF EXISTS resource_release_checkpoint_states;
-DROP TABLE IF EXISTS resource_release_completions;
-DROP TABLE IF EXISTS resource_task_completions;
-DROP TABLE IF EXISTS resource_action_task_receipts;
-DROP TABLE IF EXISTS resource_background_launches;
-DROP TABLE IF EXISTS resource_control_operations;
-DROP TABLE IF EXISTS resource_operator_attestations;
-DROP TABLE IF EXISTS resource_initial_idle_attestations;
-DROP TABLE IF EXISTS resource_registration_receipts;
-DROP TABLE IF EXISTS resource_cancellation_receipts;
-DROP TABLE IF EXISTS resource_request_preventions;
-DROP TABLE IF EXISTS resource_requests;
-DROP TABLE IF EXISTS trainer_attempt_associations;
-DROP TABLE IF EXISTS loans;
-DROP TABLE IF EXISTS resources;
-";
-
-/// Record each task's child and accept the `preempted` outcome
-///
-/// `child_pid` and `child_start_time` identify the worker's child, so cleanup
-/// after a lost worker can tell its process group from a later process that
-/// reused the PID. They are set together, once, at spawn.
-///
-/// SQLite cannot change a CHECK constraint in place, so `origin_routes` is
-/// rebuilt with the wider outcome list. No foreign key or index names it
-const MIGRATE_34_TO_35_TASKS: &str = r"
-ALTER TABLE tasks ADD COLUMN child_pid INTEGER CHECK (child_pid > 0);
-ALTER TABLE tasks ADD COLUMN child_start_time INTEGER CHECK (
-    (child_start_time IS NULL) = (child_pid IS NULL)
-    AND (child_start_time IS NULL OR child_start_time >= 0)
-);
-
-ALTER TABLE origin_routes RENAME TO origin_routes_before_preempted;
-CREATE TABLE origin_routes (
-    request_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL UNIQUE,
-    execution_machine TEXT NOT NULL,
-    spec_json TEXT NOT NULL,
-    route_json TEXT NOT NULL,
-    after_json TEXT,
-    outcome TEXT
-        CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted'))
-);
-INSERT INTO origin_routes
-    (request_id, task_id, execution_machine, spec_json, route_json, after_json, outcome)
-SELECT request_id, task_id, execution_machine, spec_json, route_json, after_json, outcome
-    FROM origin_routes_before_preempted;
-DROP TABLE origin_routes_before_preempted;
-";
-
-/// Create the GPU priority queue
-///
-/// `resources` holds each resource's single active run in its `run_*`
-/// columns, so one active run per resource is structural, and a unique index
-/// on `run_job` keeps one active run per job. The CHECKs tie each run column
-/// to the phases that use it. Jobs reference resources, and resources their
-/// active job, through `(id, machine)` keys, so a run, its job, and a pinned
-/// target always share one machine queue.
-///
-/// Every non-terminal job holds a slot `(priority, position)` that is unique
-/// in its machine queue; terminal jobs hold none. The store keeps positions
-/// dense by renumbering the affected levels in each transaction. A run is an
-/// ordinary task row with `resource_job_id`, `run_number`, and `step_index`,
-/// set together, and `(resource_job_id, run_number)` is unique. Only run
-/// reservation writes them, in the transaction that checks the job, so
-/// `resource_job_id` has no foreign key and the column stays droppable
-const MIGRATE_34_TO_35_QUEUE: &str = r"
-CREATE TABLE resources (
-    id TEXT PRIMARY KEY,
-    machine TEXT NOT NULL,
-    name TEXT NOT NULL,
-    device INTEGER CHECK (device IS NULL OR device >= 0),
-    created_at TEXT NOT NULL,
-    run_job TEXT,
-    run_task TEXT UNIQUE REFERENCES tasks(id),
-    run_number INTEGER CHECK (run_number IS NULL OR run_number >= 1),
-    run_step INTEGER CHECK (run_step IS NULL OR run_step >= 0),
-    run_phase TEXT
-        CHECK (run_phase IN ('launching', 'executing', 'stopping', 'cleaning', 'attention')),
-    run_reserved_at TEXT,
-    run_started_at TEXT,
-    run_stop_cause TEXT CHECK (run_stop_cause IN ('yield', 'restart', 'user_cancel')),
-    run_stop_requested_at TEXT,
-    run_cleanup_attempt INTEGER CHECK (run_cleanup_attempt IS NULL OR run_cleanup_attempt >= 1),
-    run_attention_id TEXT UNIQUE,
-    run_attention_failure TEXT,
-    UNIQUE (machine, name),
-    UNIQUE (id, machine),
-    FOREIGN KEY (run_job, machine) REFERENCES resource_jobs(id, machine),
-    CHECK ((run_phase IS NULL) = (run_job IS NULL)),
-    CHECK ((run_phase IS NULL) = (run_task IS NULL)),
-    CHECK ((run_phase IS NULL) = (run_number IS NULL)),
-    CHECK ((run_phase IS NULL) = (run_step IS NULL)),
-    CHECK ((COALESCE(run_phase, '') = 'launching') = (run_reserved_at IS NOT NULL)),
-    CHECK (CASE COALESCE(run_phase, '')
-        WHEN 'executing' THEN run_started_at IS NOT NULL
-        WHEN 'stopping' THEN 1
-        ELSE run_started_at IS NULL
-    END),
-    CHECK ((COALESCE(run_phase, '') = 'stopping') = (run_stop_cause IS NOT NULL)),
-    CHECK ((COALESCE(run_phase, '') = 'stopping') = (run_stop_requested_at IS NOT NULL)),
-    CHECK ((COALESCE(run_phase, '') = 'cleaning') = (run_cleanup_attempt IS NOT NULL)),
-    CHECK ((COALESCE(run_phase, '') = 'attention') = (run_attention_id IS NOT NULL)),
-    CHECK ((COALESCE(run_phase, '') = 'attention') = (run_attention_failure IS NOT NULL))
-);
-CREATE UNIQUE INDEX resources_device ON resources(machine, device) WHERE device IS NOT NULL;
-CREATE UNIQUE INDEX resources_run_job ON resources(run_job) WHERE run_job IS NOT NULL;
-
-CREATE TABLE resource_jobs (
-    id TEXT PRIMARY KEY,
-    machine TEXT NOT NULL,
-    origin_machine TEXT NOT NULL,
-    thread_id TEXT NOT NULL,
-    spec_json TEXT NOT NULL,
-    spec_digest TEXT NOT NULL,
-    env_path TEXT NOT NULL,
-    env_home TEXT NOT NULL,
-    target_resource TEXT,
-    priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
-    position INTEGER CHECK (position IS NULL OR position >= 1),
-    state TEXT NOT NULL
-        CHECK (state IN ('queued', 'active', 'succeeded', 'failed', 'cancelled')),
-    active_resource TEXT,
-    failed_run TEXT REFERENCES tasks(id),
-    next_step INTEGER NOT NULL CHECK (next_step >= 0),
-    resume INTEGER NOT NULL CHECK (resume IN (0, 1)),
-    last_run_number INTEGER NOT NULL CHECK (last_run_number >= 0),
-    event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (id, machine),
-    FOREIGN KEY (target_resource, machine) REFERENCES resources(id, machine),
-    FOREIGN KEY (active_resource, machine) REFERENCES resources(id, machine),
-    CHECK ((state IN ('queued', 'active')) = (position IS NOT NULL)),
-    CHECK ((state = 'active') = (active_resource IS NOT NULL)),
-    CHECK ((state = 'failed') = (failed_run IS NOT NULL)),
-    CHECK (
-        target_resource IS NULL OR active_resource IS NULL OR active_resource = target_resource
-    )
-);
-CREATE UNIQUE INDEX resource_jobs_slot
-    ON resource_jobs(machine, priority, position) WHERE position IS NOT NULL;
-
-CREATE TABLE resource_job_events (
-    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (job_id, seq)
-);
-
-CREATE TABLE resource_operations (
-    id TEXT PRIMARY KEY,
-    machine TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('move', 'cancel', 'release')),
-    content_digest TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE resource_blocked_notices (
-    id INTEGER PRIMARY KEY,
-    machine TEXT NOT NULL,
-    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
-    blocked_since TEXT NOT NULL,
-    notified_at TEXT,
-    ended_at TEXT
-);
-CREATE UNIQUE INDEX resource_blocked_notices_open
-    ON resource_blocked_notices(machine) WHERE ended_at IS NULL;
-
-ALTER TABLE tasks ADD COLUMN resource_job_id TEXT;
-ALTER TABLE tasks ADD COLUMN run_number INTEGER CHECK (
-    (run_number IS NULL) = (resource_job_id IS NULL)
-    AND (run_number IS NULL OR run_number >= 1)
-);
-ALTER TABLE tasks ADD COLUMN step_index INTEGER CHECK (
-    (step_index IS NULL) = (resource_job_id IS NULL)
-    AND (step_index IS NULL OR step_index >= 0)
-);
-CREATE UNIQUE INDEX tasks_resource_run
-    ON tasks(resource_job_id, run_number) WHERE resource_job_id IS NOT NULL;
-";
-
-/// Move a v0.13 database to the current schema
-fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_34_TO_35)?;
-    conn.execute_batch(MIGRATE_34_TO_35_TASKS)?;
-    conn.execute_batch(MIGRATE_34_TO_35_QUEUE)?;
-    conn.execute_batch(MIGRATE_35_TO_36)?;
-    conn.execute_batch(MIGRATE_36_TO_37)
-}
-
-/// Save job routes, ordered inboxes, and authority acknowledgement cursors
-const MIGRATE_35_TO_36: &str = r"
-CREATE TABLE resource_run_history (
-    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    stop_cause TEXT,
-    cleanup_json TEXT
-);
-INSERT INTO resource_run_history(task_id, resource_id) SELECT run_task,id FROM resources WHERE run_task IS NOT NULL;
-CREATE TABLE resource_job_routes (
-    job_id TEXT PRIMARY KEY,
-    route_json TEXT NOT NULL,
-    accepted_seq INTEGER NOT NULL DEFAULT 0 CHECK (accepted_seq >= 0),
-    settled_seq INTEGER NOT NULL DEFAULT 0 CHECK (settled_seq >= 0 AND settled_seq <= accepted_seq)
-);
-CREATE TABLE resource_job_inbox (
-    job_id TEXT NOT NULL REFERENCES resource_job_routes(job_id),
-    seq INTEGER NOT NULL CHECK (seq > 0),
-    event_json TEXT NOT NULL,
-    PRIMARY KEY (job_id, seq)
-);
-CREATE TABLE resource_job_delivery (
-    job_id TEXT PRIMARY KEY REFERENCES resource_jobs(id),
-    acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
-);
-";
-
-/// Retain registration ownership and settlement evidence for obsolete notices
-const MIGRATE_36_TO_37: &str = r"
-ALTER TABLE resources ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'
-    CHECK (origin IN ('manual', 'detected_fallback', 'detected_device'))
-    CHECK ((origin != 'detected_fallback' OR device IS NULL)
-        AND (origin != 'detected_device' OR device IS NOT NULL));
-ALTER TABLE resource_job_events ADD COLUMN suppressed_at TEXT;
-ALTER TABLE resource_job_inbox ADD COLUMN suppressed_at TEXT;
-";
-
-/// Why `Store::open` refuses a database version
-fn unsupported_schema_version(version: i64) -> AppError {
-    let message = if (3..RELEASED_V0_4_SCHEMA_VERSION).contains(&version) {
-        format!(
-            "schema user_version={version} came from an unreleased development build and has no \
-             migration; move the database aside to start over"
-        )
-    } else {
-        format!("unsupported schema user_version={version}")
-    };
-    AppError::Internal { message }
-}
 
 /// Open or create the database
 pub struct Store {
@@ -643,15 +62,14 @@ fn insert_task_with_project_root_on(
     conn.execute(
         "INSERT INTO tasks (
             id, thread_id, name, workload_json, cwd, timeout_secs,
-            env_path, env_home, binary, status, exit_reason,
-            callback_status, attention_state, timeout_notified_at,
+            env_path, env_home, binary, status, exit_reason, check_due_at,
             pid, cancel_requested_at, created_at, updated_at, project_root,
             process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             row.id.to_string(),
             row.thread.to_string(),
-            row.name.as_ref().map(TaskName::as_str),
+            row.name.as_str(),
             serde_json::to_string(&row.workload)?,
             row.cwd.to_string_lossy(),
             fmt_timeout(row.timeout),
@@ -660,9 +78,7 @@ fn insert_task_with_project_root_on(
             row.binary.to_string_lossy(),
             row.status().as_str(),
             row.exit_reason().map(serde_json::to_string).transpose()?,
-            row.callback_status.as_str(),
-            row.attention.as_str(),
-            row.attention.delivered_at().map(fmt_time),
+            row.check_due_at.map(fmt_time),
             row.pid(),
             row.cancel_requested_at.map(fmt_time),
             fmt_time(row.created_at),
@@ -715,7 +131,7 @@ fn validate_local_task_acceptance(
 ) -> Result<(), AppError> {
     if spec.machine.is_some()
         || row.status() != ProcessStatus::Queued
-        || row.name.as_ref() != Some(&spec.name)
+        || row.name != spec.name
         || row.thread != spec.thread
         || row.cwd != spec.cwd
         || row.timeout != spec.timeout
@@ -752,10 +168,10 @@ fn insert_local_task_records_on(
         execution_machine: machine,
         thread: row.thread,
         callback: callback.clone(),
-        spec: spec.clone().into(),
+        spec: spec.clone(),
         submission: SubmissionState::Accepted,
         last_execution_state: Some(ProcessStatus::Queued),
-        last_updated_at: Some(chrono::Utc::now()),
+        last_updated_at: chrono::Utc::now(),
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
@@ -763,12 +179,16 @@ fn insert_local_task_records_on(
         task: row.id,
         origin_machine: machine,
         execution_machine: machine,
-        spec: spec.clone().into(),
+        spec: spec.clone(),
         state: ProcessStatus::Queued,
     });
     conn.execute(
-        "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json) VALUES (?1,?2,?3,?4,?5)",
-        params![request.0.to_string(), row.id.to_string(), machine.to_string(), serde_json::to_string(&route.spec)?, serde_json::to_string(&route)?],
+        "INSERT INTO origin_routes (request_id,task_id,route_json) VALUES (?1,?2,?3)",
+        params![
+            request.0.to_string(),
+            row.id.to_string(),
+            serde_json::to_string(&route)?
+        ],
     )?;
     conn.execute(
         "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
@@ -836,7 +256,7 @@ fn release_held_local_task_records_on(
         || route.task != row.id
         || route.origin_machine != machine
         || route.execution_machine != machine
-        || route.current_spec() != Some(spec)
+        || route.spec != *spec
     {
         return Err(AppError::ClusterTaskConflict { task: row.id });
     }
@@ -846,12 +266,12 @@ fn release_held_local_task_records_on(
     insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
     route.submission = SubmissionState::Accepted;
     route.last_execution_state = Some(ProcessStatus::Queued);
-    route.last_updated_at = Some(chrono::Utc::now());
+    route.last_updated_at = chrono::Utc::now();
     let identity = ExecutorIdentity::Accepted(ExecutionRecord {
         task: row.id,
         origin_machine: machine,
         execution_machine: machine,
-        spec: spec.clone().into(),
+        spec: spec.clone(),
         state: ProcessStatus::Queued,
     });
     conn.execute(
@@ -894,10 +314,12 @@ pub struct TaskPresentation {
     pub project_root: Option<PathBuf>,
     /// Codex thread created by this task's worker, when the log included one
     pub worker_thread: Option<ThreadId>,
-    /// Owners from an accepted executor identity. Rejected and legacy tasks have none
+    /// Owners from an accepted executor identity. Queue runs have none
     pub owners: Option<TaskOwners>,
-    /// Typed origin-inbox ownership or legacy status for this task row
-    pub terminal_callback: TerminalCallbackProjection,
+    /// Delivery of the terminal event, or `None` when this machine owns no
+    /// callback for the task: the origin of a remote task delivers it, and a
+    /// queue run reports through its job
+    pub terminal_callback: Option<CallbackStatus>,
     /// Whether this task's inactivity reminder reached the origin queue
     pub attention_delivered: bool,
 }
@@ -925,37 +347,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            match version {
-                0 => {
-                    transaction.execute_batch(BASE_SCHEMA)?;
-                    migrate_2_to_current(&transaction)?;
-                }
-                1 => {
-                    transaction.execute_batch(MIGRATE_1_TO_2)?;
-                    migrate_2_to_current(&transaction)?;
-                }
-                2 => migrate_2_to_current(&transaction)?,
-                RELEASED_V0_4_SCHEMA_VERSION | RELEASED_V0_5_SCHEMA_VERSION => {
-                    migrate_28_to_current(&transaction)?;
-                }
-                RELEASED_V0_5_1_SCHEMA_VERSION
-                | RELEASED_V0_7_SCHEMA_VERSION
-                | RELEASED_V0_8_SCHEMA_VERSION
-                | RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
-                RELEASED_V0_11_SCHEMA_VERSION => migrate_33_to_current(&transaction)?,
-                RELEASED_V0_13_SCHEMA_VERSION => migrate_34_to_current(&transaction)?,
-                35 => {
-                    transaction.execute_batch(MIGRATE_35_TO_36)?;
-                    transaction.execute_batch(MIGRATE_36_TO_37)?;
-                }
-                36 => transaction.execute_batch(MIGRATE_36_TO_37)?,
-                other => return Err(unsupported_schema_version(other)),
-            }
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        schema::migrate(&transaction)?;
         transaction.commit()?;
         let tasks_dir = path.parent().unwrap_or(Path::new(".")).join("tasks");
         Ok(Self { conn, tasks_dir })
@@ -1042,7 +434,7 @@ impl Store {
     ) -> Result<ExecutorIdentity, AppError> {
         if origin == execution
             || row.status() != ProcessStatus::Queued
-            || row.name.as_ref() != Some(&spec.name)
+            || row.name != spec.name
             || row.thread != spec.thread
             || row.timeout != spec.timeout
             || !row.cwd.is_absolute()
@@ -1060,10 +452,9 @@ impl Store {
                 let identity: ExecutorIdentity = serde_json::from_str(&saved)?;
                 let same = match &identity {
                     ExecutorIdentity::Accepted(record) => {
-                        record.has_valid_spec_owners()
-                            && record.origin_machine == origin
+                        record.origin_machine == origin
                             && record.execution_machine == execution
-                            && record.current_spec() == Some(spec)
+                            && record.spec == *spec
                     }
                     ExecutorIdentity::Rejected(record) => record.origin_machine == origin
                         && record.execution_machine == execution,
@@ -1083,7 +474,7 @@ impl Store {
                 task: row.id,
                 origin_machine: origin,
                 execution_machine: execution,
-                spec: spec.clone().into(),
+                spec: spec.clone(),
                 state: ProcessStatus::Queued,
             });
             self.conn.execute(
@@ -1093,241 +484,6 @@ impl Store {
             self.append_produced_event(row.id, EventPayload::State { status: ProcessStatus::Queued })?;
             Ok(identity)
         })
-    }
-
-    /// Migrate pre-Fleet task rows to local origin and executor identities
-    ///
-    /// The immediate transaction serializes with runner completion so either
-    /// completion emits the first typed event, or migration retains its terminal
-    /// callback as that first event
-    pub fn migrate_legacy_local(&mut self, machine: MachineId) -> Result<(), AppError> {
-        self.migrate_legacy_local_with(machine, |path, cwd| {
-            crate::invocation::resolve_agent_binary(crate::domain::AgentKind::Codex, path, cwd)
-        })
-    }
-
-    fn migrate_legacy_local_with(
-        &mut self,
-        machine: MachineId,
-        resolve_codex: impl Fn(&str, &Path) -> Result<PathBuf, AppError>,
-    ) -> Result<(), AppError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = {
-            let mut statement = tx.prepare(&format!(
-                "{TASK_SELECT} WHERE resource_job_id IS NULL ORDER BY id"
-            ))?;
-            statement
-                .query_map([], parse_task_row)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
-        for row in rows {
-            let identity: Option<String> = tx
-                .query_row(
-                    "SELECT identity_json FROM executor_identities WHERE task_id=?1",
-                    [row.id.to_string()],
-                    |entry| entry.get(0),
-                )
-                .optional()?;
-            if identity.is_some() {
-                continue;
-            }
-
-            let route_json: Option<String> = tx
-                .query_row(
-                    "SELECT route_json FROM origin_routes WHERE task_id=?1",
-                    [row.id.to_string()],
-                    |entry| entry.get(0),
-                )
-                .optional()?;
-            if let Some(route_json) = route_json {
-                let route: OriginRoute = serde_json::from_str(&route_json)?;
-                if route.origin_machine == machine && route.execution_machine == machine {
-                    return Err(AppError::Internal {
-                        message: format!(
-                            "local origin route for task {} has no executor identity",
-                            row.id
-                        ),
-                    });
-                }
-                continue;
-            }
-
-            let pending_terminal_callback = row.state.is_terminal()
-                && matches!(
-                    row.callback_status,
-                    CallbackStatus::Pending | CallbackStatus::Sending
-                );
-            let saved_notification_intents = {
-                let mut statement = tx.prepare(
-                    "SELECT report_seq FROM report_notification_intents
-                     WHERE task_id=?1 ORDER BY report_seq",
-                )?;
-                statement
-                    .query_map([row.id.to_string()], |entry| entry.get::<_, i64>(0))?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            if saved_notification_intents
-                .windows(2)
-                .any(|pair| pair[0] == pair[1])
-            {
-                return Err(AppError::Internal {
-                    message: format!("duplicate notification intent for task {}", row.id),
-                });
-            }
-            let reports = if saved_notification_intents.is_empty() && !pending_terminal_callback {
-                Vec::new()
-            } else {
-                reports_from(&tx, row.id)?
-            };
-            let mut pending_notifications = Vec::new();
-            for report_seq in saved_notification_intents {
-                let report = reports
-                    .iter()
-                    .find(|report| report.seq == report_seq)
-                    .ok_or_else(|| AppError::Internal {
-                        message: format!(
-                            "notification intent for missing report {report_seq} on task {}",
-                            row.id
-                        ),
-                    })?;
-                if report.notified_at.is_none() {
-                    pending_notifications.push(report);
-                }
-            }
-            let mut next_event_seq =
-                u64::try_from(pending_notifications.len()).map_err(|_| AppError::Internal {
-                    message: format!("too many retained notification intents for task {}", row.id),
-                })?;
-            if pending_terminal_callback {
-                next_event_seq =
-                    next_event_seq
-                        .checked_add(1)
-                        .ok_or_else(|| AppError::Internal {
-                            message: format!("event sequence exhausted for task {}", row.id),
-                        })?;
-            }
-            let callback = CallbackContext {
-                env: row.env.clone(),
-                cwd: row.cwd.clone(),
-                codex: match resolve_codex(&row.env.path, &row.cwd) {
-                    Ok(path) if path.is_absolute() => CallbackExecutable::available(path),
-                    Ok(_) => CallbackExecutable::Unavailable {
-                        reason: "resolved saved Codex executable path is not absolute".into(),
-                    },
-                    Err(error) => CallbackExecutable::Unavailable {
-                        reason: format!("saved Codex executable could not be resolved: {error}"),
-                    },
-                },
-            };
-            let route = OriginRoute {
-                request: RequestId::new(),
-                task: row.id,
-                origin_machine: machine,
-                execution_machine: machine,
-                thread: row.thread,
-                callback,
-                spec: PersistedSpec::MigratedLocal,
-                submission: SubmissionState::Accepted,
-                last_execution_state: Some(row.status()),
-                last_updated_at: Some(Utc::now()),
-                last_accepted_seq: next_event_seq,
-                last_settled_seq: 0,
-            };
-            route.validate().map_err(|error| AppError::Internal {
-                message: format!("invalid migrated local route for task {}: {error}", row.id),
-            })?;
-
-            let identity = ExecutorIdentity::Accepted(ExecutionRecord {
-                task: row.id,
-                origin_machine: machine,
-                execution_machine: machine,
-                spec: PersistedSpec::MigratedLocal,
-                state: row.status(),
-            });
-            tx.execute(
-                "INSERT INTO origin_routes (request_id,task_id,execution_machine,spec_json,route_json)
-                 VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    route.request.0.to_string(),
-                    row.id.to_string(),
-                    machine.to_string(),
-                    serde_json::to_string(&route.spec)?,
-                    serde_json::to_string(&route)?,
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO executor_identities (task_id,origin_machine,identity_json)
-                 VALUES (?1,?2,?3)",
-                params![
-                    row.id.to_string(),
-                    machine.to_string(),
-                    serde_json::to_string(&identity)?,
-                ],
-            )?;
-
-            let mut seq = 0_u64;
-            for report in pending_notifications {
-                seq = seq.checked_add(1).ok_or_else(|| AppError::Internal {
-                    message: format!("event sequence exhausted for task {}", row.id),
-                })?;
-                let event = TaskEvent {
-                    task: row.id,
-                    seq: NonZeroU64::new(seq).ok_or_else(|| AppError::Internal {
-                        message: "invalid migrated event sequence".into(),
-                    })?,
-                    origin_machine: machine,
-                    execution_machine: machine,
-                    payload: EventPayload::Callback {
-                        event: Box::new(notify_event(
-                            &row,
-                            report,
-                            self.tasks_dir.join(row.id.to_string()),
-                        )),
-                        state: None,
-                    },
-                };
-                insert_migrated_callback_event(&tx, &event)?;
-            }
-            if pending_terminal_callback {
-                let callback =
-                    terminal_event(&row, &reports, self.tasks_dir.join(row.id.to_string()));
-                seq = seq.checked_add(1).ok_or_else(|| AppError::Internal {
-                    message: format!("event sequence exhausted for task {}", row.id),
-                })?;
-                let event = TaskEvent {
-                    task: row.id,
-                    seq: NonZeroU64::new(seq).ok_or_else(|| AppError::Internal {
-                        message: "invalid migrated event sequence".into(),
-                    })?,
-                    origin_machine: machine,
-                    execution_machine: machine,
-                    payload: EventPayload::Callback {
-                        event: Box::new(callback),
-                        state: Some(row.status()),
-                    },
-                };
-                insert_migrated_callback_event(&tx, &event)?;
-            }
-            if seq > 0 {
-                let last_seq = i64::try_from(seq).map_err(|_| AppError::Internal {
-                    message: "migrated event sequence exceeds SQLite range".into(),
-                })?;
-                tx.execute(
-                    "INSERT INTO executor_event_cursors (task_id,last_seq) VALUES (?1,?2)",
-                    params![row.id.to_string(), last_seq],
-                )?;
-            }
-            tx.execute(
-                "DELETE FROM report_notification_intents WHERE task_id=?1",
-                [row.id.to_string()],
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(())
     }
 
     /// Whether this task has a typed executor identity and uses sequenced events
@@ -1365,15 +521,11 @@ impl Store {
                     && route.origin_machine == route.execution_machine
                     && record.origin_machine == route.origin_machine
                     && record.execution_machine == route.execution_machine
-                    && record.has_valid_spec_owners()
                     && record.spec == route.spec
                     && accepted_submission
             }
             (ExecutorIdentity::Accepted(record), None) => {
-                record.task == id
-                    && record.origin_machine != record.execution_machine
-                    && record.current_spec().is_some()
-                    && record.has_valid_spec_owners()
+                record.task == id && record.origin_machine != record.execution_machine
             }
             _ => false,
         };
@@ -1501,7 +653,7 @@ impl Store {
                     project_root: project_root.map(PathBuf::from),
                     worker_thread,
                     owners,
-                    terminal_callback: TerminalCallbackProjection::Legacy(CallbackStatus::Pending),
+                    terminal_callback: None,
                     attention_delivered: false,
                 })
             })?;
@@ -1510,7 +662,7 @@ impl Store {
 
             for mut presentation in rows {
                 let task = self.require_task(presentation.id)?;
-                presentation.terminal_callback = self.terminal_callback_projection(&task)?;
+                presentation.terminal_callback = self.terminal_callback(&task)?;
                 presentation.attention_delivered = self.attention_callback_delivered(&task)?;
                 presentations.insert(presentation.id, presentation);
             }
@@ -1533,25 +685,21 @@ impl Store {
             None,
         )?;
         for row in rows {
-            match self.terminal_callback_projection(&row)? {
-                TerminalCallbackProjection::Legacy(status)
-                | TerminalCallbackProjection::OriginInbox(status)
-                    if matches!(status, CallbackStatus::Pending | CallbackStatus::Sending) =>
-                {
-                    return Ok(true);
-                }
-                TerminalCallbackProjection::Legacy(_)
-                | TerminalCallbackProjection::OriginInbox(_)
-                | TerminalCallbackProjection::NotOwned => {}
+            if matches!(
+                self.terminal_callback(&row)?,
+                Some(CallbackStatus::Pending | CallbackStatus::Sending)
+            ) {
+                return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn terminal_callback_projection(
-        &self,
-        row: &TaskRow,
-    ) -> Result<TerminalCallbackProjection, AppError> {
+    /// Delivery of a task's terminal event from this machine's origin inbox
+    ///
+    /// `None` when this machine owns no callback for the task: an executor
+    /// whose origin is another machine, or a queue run, whose job reports
+    fn terminal_callback(&self, row: &TaskRow) -> Result<Option<CallbackStatus>, AppError> {
         let route_json: Option<String> = self
             .conn
             .query_row(
@@ -1574,10 +722,10 @@ impl Store {
                     if record.task == row.id
                         && record.origin_machine != record.execution_machine =>
                 {
-                    Ok(TerminalCallbackProjection::NotOwned)
+                    Ok(None)
                 }
                 Some(_) => Err(AppError::ClusterTaskConflict { task: row.id }),
-                None => Ok(TerminalCallbackProjection::Legacy(row.callback_status)),
+                None => Ok(None),
             };
         };
         if !self.is_event_task(row.id)? {
@@ -1590,50 +738,21 @@ impl Store {
             });
         }
         if route.origin_machine != route.execution_machine {
-            return Ok(TerminalCallbackProjection::NotOwned);
+            return Ok(None);
         }
         if !row.state.is_terminal() {
-            return Ok(TerminalCallbackProjection::OriginInbox(
-                CallbackStatus::Pending,
-            ));
+            return Ok(Some(CallbackStatus::Pending));
         }
-        if let Some(delivery) = self.terminal_callback_delivery(row.id)? {
-            return match delivery {
-                DeliveryState::PendingDelivery { attempts, .. } => {
-                    Ok(TerminalCallbackProjection::OriginInbox(if attempts == 0 {
-                        CallbackStatus::Pending
-                    } else {
-                        CallbackStatus::Sending
-                    }))
-                }
-                DeliveryState::AwaitingThread { .. } => Ok(
-                    TerminalCallbackProjection::OriginInbox(CallbackStatus::Waiting),
-                ),
-                DeliveryState::Delivered { .. } => Ok(TerminalCallbackProjection::OriginInbox(
-                    CallbackStatus::Sent,
-                )),
-                DeliveryState::DeliveryFailed { .. } => Ok(
-                    TerminalCallbackProjection::OriginInbox(CallbackStatus::Failed),
-                ),
-                DeliveryState::NotRequired => Err(AppError::Internal {
-                    message: format!("terminal callback event {} is marked not required", row.id),
-                }),
-            };
-        }
-        if self.has_terminal_callback_outbox(row.id)? {
-            return Ok(TerminalCallbackProjection::OriginInbox(
-                CallbackStatus::Pending,
-            ));
-        }
-        if matches!(
-            row.callback_status,
-            CallbackStatus::Sent | CallbackStatus::Failed
-        ) {
-            return Ok(TerminalCallbackProjection::Legacy(row.callback_status));
-        }
-        Ok(TerminalCallbackProjection::OriginInbox(
-            CallbackStatus::Pending,
-        ))
+        let Some(delivery) = self.terminal_callback_delivery(row.id)? else {
+            // the terminal event has not reached the origin inbox yet
+            return Ok(Some(CallbackStatus::Pending));
+        };
+        delivery
+            .callback_status()
+            .map(Some)
+            .ok_or_else(|| AppError::Internal {
+                message: format!("terminal callback event {} is marked not required", row.id),
+            })
     }
 
     fn terminal_callback_delivery(&self, id: TaskId) -> Result<Option<DeliveryState>, AppError> {
@@ -1708,7 +827,7 @@ impl Store {
                     Ok(false)
                 }
                 Some(_) => Err(AppError::ClusterTaskConflict { task: row.id }),
-                None => Ok(row.attention.is_delivered()),
+                None => Ok(row.check_due_at.is_some()),
             };
         };
         let route: OriginRoute = serde_json::from_str(&route_json)?;
@@ -1759,36 +878,8 @@ impl Store {
             }
         }
 
-        // legacy delivered rows keep their marker after event payload compaction
-        Ok(row.attention.is_delivered())
-    }
-
-    fn has_terminal_callback_outbox(&self, id: TaskId) -> Result<bool, AppError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT event_json FROM executor_outbox WHERE task_id=?1 ORDER BY seq")?;
-        let rows = statement
-            .query_map([id.to_string()], |entry| entry.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for event_json in rows {
-            let event: TaskEvent = serde_json::from_str(&event_json)?;
-            if event.task != id {
-                return Err(AppError::Internal {
-                    message: format!("outbox event task does not match task row {id}"),
-                });
-            }
-            if is_terminal_callback_event(&event) {
-                return Ok(true);
-            }
-        }
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(
-                     SELECT 1 FROM executor_event_receipts
-                     WHERE task_id=?1 AND terminal_callback=1
-                 )",
-            [id.to_string()],
-            |row| row.get(0),
-        )?)
+        // the reminder event may be compacted away; the row keeps when it was produced
+        Ok(row.check_due_at.is_some())
     }
 
     /// Non-terminal tasks
@@ -2092,8 +1183,8 @@ impl Store {
             }
             let now = fmt_time(Utc::now());
             let changed = self.conn.execute(
-                "UPDATE tasks SET attention_state='delivered', timeout_notified_at=?1, updated_at=?1
-                 WHERE id=?2 AND attention_state='pending' AND status='running'",
+                "UPDATE tasks SET check_due_at=?1, updated_at=?1
+                 WHERE id=?2 AND check_due_at IS NULL AND status='running'",
                 params![now, id.to_string()],
             )?;
             if changed == 0 {
@@ -2111,17 +1202,6 @@ impl Store {
             )?;
             Ok(true)
         })
-    }
-
-    /// Drop a claim that did not deliver, so a later attempt can take it
-    /// Also the release valve for a claim stranded by a dead daemon
-    pub fn release_attention(&self, id: TaskId) -> Result<(), AppError> {
-        self.conn.execute(
-            "UPDATE tasks SET attention_state = 'pending', updated_at = ?1
-             WHERE id = ?2 AND attention_state = 'sending'",
-            params![fmt_time(Utc::now()), id.to_string()],
-        )?;
-        Ok(())
     }
 
     /// Append a report. Enforces cap, summary length, and terminal rejection
@@ -2159,8 +1239,8 @@ impl Store {
             }
             let seq = existing.len() as i64 + 1;
             self.conn.execute(
-                "INSERT INTO reports (task_id, seq, outcome, summary, reported_at, notified_at)
-                 VALUES (?1,?2,?3,?4,?5,NULL)",
+                "INSERT INTO reports (task_id, seq, outcome, summary, reported_at)
+                 VALUES (?1,?2,?3,?4,?5)",
                 params![
                     id.to_string(),
                     seq,
@@ -2189,12 +1269,6 @@ impl Store {
                     }
                 };
                 self.append_produced_event(id, payload)?;
-            } else if notify {
-                self.conn.execute(
-                    "INSERT INTO report_notification_intents (task_id,report_seq,requested_at)
-                     VALUES (?1,?2,?3)",
-                    params![id.to_string(), seq, fmt_time(Utc::now())],
-                )?;
             }
             Ok(reports)
         })
@@ -2204,44 +1278,6 @@ impl Store {
     pub fn reports(&self, id: TaskId) -> Result<Vec<TaskReport>, AppError> {
         reports_from(&self.conn, id)
     }
-}
-
-fn insert_migrated_callback_event(conn: &Connection, event: &TaskEvent) -> Result<(), AppError> {
-    let seq = i64::try_from(event.seq.get()).map_err(|_| AppError::Internal {
-        message: "migrated event sequence exceeds SQLite range".into(),
-    })?;
-    let event_json = serde_json::to_string(event)?;
-    let delivery = DeliveryState::PendingDelivery {
-        attempts: 0,
-        last_error: None,
-    };
-    conn.execute(
-        "INSERT INTO executor_outbox
-         (task_id,seq,origin_machine,execution_machine,event_json,notification_required,state,acknowledged_at)
-         VALUES (?1,?2,?3,?4,?5,1,'acknowledged',?6)",
-        params![
-            event.task.to_string(),
-            seq,
-            event.origin_machine.to_string(),
-            event.execution_machine.to_string(),
-            event_json,
-            fmt_time(Utc::now()),
-        ],
-    )?;
-    conn.execute(
-        "INSERT INTO origin_inbox
-         (task_id,seq,origin_machine,execution_machine,event_json,notification_required,delivery_json)
-         VALUES (?1,?2,?3,?4,?5,1,?6)",
-        params![
-            event.task.to_string(),
-            seq,
-            event.origin_machine.to_string(),
-            event.execution_machine.to_string(),
-            event_json,
-            serde_json::to_string(&delivery)?,
-        ],
-    )?;
-    Ok(())
 }
 
 fn is_terminal_callback_event(event: &TaskEvent) -> bool {
@@ -2413,7 +1449,7 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
 fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let id: String = row.get(0)?;
     let thread: String = row.get(1)?;
-    let name: Option<String> = row.get(2)?;
+    let name: String = row.get(2)?;
     let workload_json: String = row.get(3)?;
     let cwd: String = row.get(4)?;
     let timeout_secs: String = row.get(5)?;
@@ -2422,30 +1458,25 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let binary: String = row.get(8)?;
     let status: String = row.get(9)?;
     let exit_reason: Option<String> = row.get(10)?;
-    let callback_status: String = row.get(11)?;
-    let attention_state: String = row.get(12)?;
-    let timeout_notified_at: Option<String> = row.get(13)?;
-    let pid: Option<i32> = row.get(14)?;
-    let cancel_requested_at: Option<String> = row.get(15)?;
-    let created_at: String = row.get(16)?;
-    let updated_at: String = row.get(17)?;
-    let process_group_exit_evidence: Option<String> = row.get(18)?;
-    let container_exit_evidence: Option<String> = row.get(19)?;
-    let child_pid: Option<i32> = row.get(20)?;
-    let child_start_time: Option<i64> = row.get(21)?;
+    let check_due_at: Option<String> = row.get(11)?;
+    let pid: Option<i32> = row.get(12)?;
+    let cancel_requested_at: Option<String> = row.get(13)?;
+    let created_at: String = row.get(14)?;
+    let updated_at: String = row.get(15)?;
+    let process_group_exit_evidence: String = row.get(16)?;
+    let container_exit_evidence: Option<String> = row.get(17)?;
+    let child_pid: Option<i32> = row.get(18)?;
+    let child_start_time: Option<i64> = row.get(19)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
 
     let id: TaskId = id.parse().map_err(parse_err)?;
     let thread: ThreadId = thread.parse().map_err(parse_err)?;
-    let name = match name {
-        Some(raw) => Some(TaskName::parse(&raw).map_err(|err| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
-                message: format!("stored task name: {err}"),
-            }))
-        })?),
-        None => None,
-    };
+    let name = TaskName::parse(&name).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
+            message: format!("stored task name: {err}"),
+        }))
+    })?;
     let workload: Workload = serde_json::from_str(&workload_json).map_err(|err| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(AppError::Internal {
             message: err.to_string(),
@@ -2465,21 +1496,20 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         | ProcessStatus::Failed
         | ProcessStatus::Cancelled
         | ProcessStatus::Preempted => (
-            ProcessGroupExitEvidence::from_storage(process_group_exit_evidence.as_deref()),
-            ContainerExitEvidence::from_storage(container_exit_evidence.as_deref()),
+            ProcessGroupExitEvidence::from_storage(&process_group_exit_evidence)
+                .map_err(parse_err)?,
+            ContainerExitEvidence::from_storage(container_exit_evidence.as_deref())
+                .map_err(parse_err)?,
         ),
         ProcessStatus::Queued | ProcessStatus::Running | ProcessStatus::Lost => (
             ProcessGroupExitEvidence::Unconfirmed,
             ContainerExitEvidence::Unconfirmed,
         ),
     };
-    let callback_status = CallbackStatus::from_storage(&callback_status).map_err(parse_err)?;
-    let timeout_notified_at = match timeout_notified_at {
+    let check_due_at = match check_due_at {
         Some(raw) => Some(parse_time(&raw).map_err(parse_err)?),
         None => None,
     };
-    let attention =
-        AttentionState::from_storage(&attention_state, timeout_notified_at).map_err(parse_err)?;
     let cancel_requested_at = match cancel_requested_at {
         Some(raw) => Some(parse_time(&raw).map_err(parse_err)?),
         None => None,
@@ -2500,8 +1530,7 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         process_group_exit_evidence,
         container_exit_evidence,
         child: child_from_storage(child_pid, child_start_time).map_err(parse_err)?,
-        callback_status,
-        attention,
+        check_due_at,
         cancel_requested_at,
         created_at: parse_time(&created_at).map_err(parse_err)?,
         updated_at: parse_time(&updated_at).map_err(parse_err)?,
@@ -2512,8 +1541,8 @@ fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
 pub struct NewTask {
     /// Task id
     pub id: TaskId,
-    /// Submitted name. `None` only for rows stored before name was required
-    pub name: Option<TaskName>,
+    /// Submitted name
+    pub name: TaskName,
     /// Submitting thread
     pub thread: ThreadId,
     /// Workload configuration
@@ -2545,8 +1574,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         container_exit_evidence: ContainerExitEvidence::Unconfirmed,
         child: None,
-        callback_status: CallbackStatus::Pending,
-        attention: AttentionState::Pending,
+        check_due_at: None,
         cancel_requested_at: None,
         created_at: now,
         updated_at: now,
@@ -2555,14 +1583,13 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
 
 /// JSON view of `exit.json`
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExitJson {
     /// Exit reason
     pub reason: ExitReason,
     /// Evidence for the task-run worker's child process group
-    #[serde(default)]
     pub process_group_exit_evidence: ProcessGroupExitEvidence,
     /// Evidence for a container task's container
-    #[serde(default, skip_serializing_if = "is_unconfirmed_container")]
     pub container_exit_evidence: ContainerExitEvidence,
 }
 
@@ -2577,18 +1604,10 @@ impl ExitJson {
     }
 }
 
-fn is_unconfirmed_container(evidence: &ContainerExitEvidence) -> bool {
-    *evidence == ContainerExitEvidence::Unconfirmed
-}
-
 /// Parse `exit.json` if present
 pub fn read_exit_json(path: &Path) -> Result<Option<ExitJson>, AppError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let value: Value = serde_json::from_str(&text)?;
-            let parsed: ExitJson = serde_json::from_value(value)?;
-            Ok(Some(parsed))
-        }
+        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
@@ -2619,31 +1638,24 @@ pub(crate) fn write_exit_json_with_evidence(
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
-        RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
-        RELEASED_V0_8_7_SCHEMA_VERSION, RELEASED_V0_8_SCHEMA_VERSION,
-        RELEASED_V0_11_SCHEMA_VERSION, RELEASED_V0_13_SCHEMA_VERSION, Store, new_queued_task,
-        read_exit_json, write_exit_json_with_evidence,
+        CancelResult, NewTask, Store, new_queued_task, read_exit_json,
+        write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
     use crate::domain::{
-        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ContainerExitEvidence,
-        ContainerId, ExitReason, ProcessGroupExitEvidence, ProcessStatus, ReportOutcome,
-        SCHEMA_VERSION, SUMMARY_MAX_BYTES, TaskEnv, TaskExitEvidence, TaskId, TaskName, TaskRow,
-        TaskState, TaskWorkload, TerminalCallbackProjection, ThreadId, TransitionError, Workload,
+        Agent, AgentKind, AgentWorkload, CallbackStatus, ContainerExitEvidence, ContainerId,
+        ExitReason, ProcessGroupExitEvidence, ProcessStatus, ReportOutcome, SUMMARY_MAX_BYTES,
+        TaskEnv, TaskExitEvidence, TaskId, TaskName, TaskRow, TaskState, TaskWorkload, ThreadId,
+        TransitionError, Workload,
     };
     use crate::error::AppError;
-    use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, OutboxState};
+    use crate::events::{DeliveryOutcome, EventPayload};
     use crate::invocation::CommandLine;
     use crate::machine::MachineId;
     use crate::spec::NormalizedSpec;
-    use crate::submission::{
-        CallbackContext, CallbackExecutable, ExecutorIdentity, OriginRoute, PersistedSpec,
-        RequestId, SubmissionState,
-    };
-    use chrono::Utc;
-    use rusqlite::{Connection, OptionalExtension, params};
+    use crate::submission::{CallbackExecutable, ExecutorIdentity};
+    use rusqlite::params;
     use serde_json::json;
     use std::num::NonZeroU64;
     use std::path::Path;
@@ -2654,7 +1666,7 @@ mod tests {
     fn agent_row(id: TaskId) -> TaskRow {
         new_queued_task(NewTask {
             id,
-            name: Some(TaskName::parse("agent job").unwrap()),
+            name: TaskName::parse("agent job").unwrap(),
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, Some("fable".into())),
@@ -2675,7 +1687,7 @@ mod tests {
     fn task_row(id: TaskId) -> TaskRow {
         new_queued_task(NewTask {
             id,
-            name: None,
+            name: TaskName::parse("command job").unwrap(),
             thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
             workload: Workload::Task(TaskWorkload {
                 command: CommandLine::try_from_argv(vec![
@@ -2709,7 +1721,7 @@ mod tests {
 
     fn insert_local(store: &Store, id: TaskId) {
         let mut row = task_row(id);
-        row.name = Some(TaskName::parse("local task").unwrap());
+        row.name = TaskName::parse("local task").unwrap();
         let spec = local_spec(&row);
         store
             .insert_local_task(
@@ -2841,70 +1853,6 @@ mod tests {
     }
 
     #[test]
-    fn released_exit_json_and_database_rows_remain_unconfirmed() {
-        let directory = tempdir().unwrap();
-        let exit_path = directory.path().join("exit.json");
-        std::fs::write(&exit_path, r#"{"reason":{"kind":"exit","code":0}}"#).unwrap();
-        let old_exit = read_exit_json(&exit_path).unwrap().unwrap();
-        assert_eq!(old_exit.reason, ExitReason::Exit { code: 0 });
-        assert_eq!(
-            old_exit.process_group_exit_evidence,
-            ProcessGroupExitEvidence::Unconfirmed
-        );
-
-        let path = directory.path().join("v2-db");
-        let id = TaskId::new();
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(BASE_SCHEMA).unwrap();
-            conn.pragma_update(None, "user_version", 2i64).unwrap();
-            conn.execute(
-                "INSERT INTO tasks (
-                    id, thread_id, name, workload_json, cwd, timeout_secs,
-                    env_path, env_home, binary, status, exit_reason,
-                    callback_status, attention_state, timeout_notified_at,
-                    pid, cancel_requested_at, created_at, updated_at
-                ) VALUES (?1,?2,NULL,?3,'/tmp','14400','/bin','/home/u','/bin/echo',
-                    'cancelled',?4,'pending','pending',NULL,NULL,NULL,?5,?5)",
-                params![
-                    id.to_string(),
-                    "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-                    serde_json::to_string(&Workload::Task(TaskWorkload {
-                        command: CommandLine::try_from_argv(vec!["echo".into(), "hi".into()])
-                            .unwrap(),
-                    }))
-                    .unwrap(),
-                    serde_json::to_string(&ExitReason::Cancelled).unwrap(),
-                    "2024-01-01T00:00:00Z",
-                ],
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_no_loan_tables(&store);
-        let row = store.require_task(id).unwrap();
-        assert_eq!(row.status(), ProcessStatus::Cancelled);
-        assert_eq!(row.exit_reason(), Some(&ExitReason::Cancelled));
-        assert_eq!(
-            row.process_group_exit_evidence(),
-            ProcessGroupExitEvidence::Unconfirmed
-        );
-        assert_eq!(
-            store
-                .get_task(id)
-                .unwrap()
-                .map(|row| row.process_group_exit_evidence()),
-            Some(ProcessGroupExitEvidence::Unconfirmed)
-        );
-    }
-
-    #[test]
     fn exit_json_round_trips_typed_process_group_evidence() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("exit.json");
@@ -2936,7 +1884,7 @@ mod tests {
         {
             assert_eq!(outbox.event.seq.get(), seq);
             store.accept_inbound_event(&outbox.event).unwrap();
-            if outbox.notification_required {
+            if outbox.event.payload.notification_required() {
                 store
                     .reserve_inbox_attempt(id, outbox.event.seq)
                     .unwrap()
@@ -2951,7 +1899,7 @@ mod tests {
 
     fn row_at(id: TaskId, cwd: &Path) -> (TaskRow, NormalizedSpec) {
         let mut row = task_row(id);
-        row.name = Some(TaskName::parse("local task").unwrap());
+        row.name = TaskName::parse("local task").unwrap();
         row.cwd = cwd.to_path_buf();
         let spec = local_spec(&row);
         (row, spec)
@@ -2968,501 +1916,6 @@ mod tests {
                 CallbackExecutable::available("/bin/true".into()),
             )
             .unwrap();
-    }
-
-    fn insert_legacy_terminal(store: &Store, id: TaskId, callback: CallbackStatus) {
-        let mut row = task_row(id);
-        row.state = TaskState::Finished {
-            reason: ExitReason::Exit { code: 0 },
-        };
-        row.callback_status = callback;
-        store.insert_task(&row).unwrap();
-    }
-
-    #[test]
-    fn legacy_pending_and_sending_callbacks_migrate_once_and_survive_restart() {
-        let directory = tempdir().unwrap();
-        let machine = MachineId::new();
-
-        for callback_status in [CallbackStatus::Pending, CallbackStatus::Sending] {
-            let id = TaskId::new();
-            let db = directory
-                .path()
-                .join(format!("{}.sqlite", callback_status.as_str()));
-            let mut store = Store::open(&db).unwrap();
-            store.insert_task(&task_row(id)).unwrap();
-            store
-                .append_report_with_notification(id, ReportOutcome::Succeeded, "old report", false)
-                .unwrap();
-            store
-                .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-                .unwrap();
-            store
-                .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "UPDATE tasks SET callback_status=?1 WHERE id=?2",
-                    params![callback_status.as_str(), id.to_string()],
-                )
-                .unwrap();
-            store.migrate_legacy_local(machine).unwrap();
-
-            let route = store.origin_route_by_task(id).unwrap().unwrap();
-            let request = route.request;
-            assert_eq!(route.origin_machine, machine);
-            assert_eq!(route.execution_machine, machine);
-            assert!(matches!(route.spec, PersistedSpec::MigratedLocal));
-            assert_eq!(route.submission, SubmissionState::Accepted);
-            assert_eq!(route.last_accepted_seq, 1);
-            assert_eq!(route.last_settled_seq, 0);
-            assert_eq!(
-                store.require_task(id).unwrap().callback_status,
-                callback_status
-            );
-            assert_eq!(
-                store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-                TerminalCallbackProjection::OriginInbox(CallbackStatus::Pending)
-            );
-            assert!(store.has_pending_terminal_callbacks().unwrap());
-
-            let identity = store.executor_identity(id).unwrap().unwrap();
-            assert!(matches!(
-                identity,
-                ExecutorIdentity::Accepted(record)
-                    if record.spec.current().is_none()
-                        && record.origin_machine == machine
-                        && record.execution_machine == machine
-            ));
-            let outbox = store
-                .outbound_event_at_or_after(id, NonZeroU64::MIN)
-                .unwrap()
-                .unwrap();
-            assert_eq!(outbox.state, OutboxState::Acknowledged);
-            assert!(outbox.notification_required);
-            assert_eq!(outbox.event.seq.get(), 1);
-            let EventPayload::Callback { event, state } = &outbox.event.payload else {
-                panic!("legacy terminal callback payload")
-            };
-            assert_eq!(*state, Some(ProcessStatus::Succeeded));
-            assert_eq!(event.reports.len(), 1);
-            assert_eq!(event.reports[0].summary, "old report");
-
-            let inbox = store.inbound_events(id).unwrap();
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].event, outbox.event);
-            assert_eq!(
-                inbox[0].delivery,
-                DeliveryState::PendingDelivery {
-                    attempts: 0,
-                    last_error: None,
-                }
-            );
-            assert_eq!(store.pending_inbox_tasks().unwrap(), vec![id]);
-            let cursor: i64 = store
-                .conn
-                .query_row(
-                    "SELECT last_seq FROM executor_event_cursors WHERE task_id=?1",
-                    [id.to_string()],
-                    |entry| entry.get(0),
-                )
-                .unwrap();
-            assert_eq!(cursor, 1);
-
-            drop(store);
-            let mut reopened = Store::open(&db).unwrap();
-            reopened.migrate_legacy_local(machine).unwrap();
-            let restarted = reopened.origin_route_by_task(id).unwrap().unwrap();
-            assert_eq!(restarted.request, request);
-            assert_eq!(restarted.last_accepted_seq, 1);
-            assert_eq!(reopened.inbound_events(id).unwrap().len(), 1);
-            assert_eq!(
-                reopened.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-                TerminalCallbackProjection::OriginInbox(CallbackStatus::Pending)
-            );
-            assert!(reopened.has_pending_terminal_callbacks().unwrap());
-            assert_eq!(
-                reopened
-                    .outbound_event_at_or_after(id, NonZeroU64::MIN)
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                OutboxState::Acknowledged
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_report_notifications_keep_order_and_skip_delivered_reports() {
-        let directory = tempdir().unwrap();
-        let db = directory.path().join("db");
-        let mut store = Store::open(&db).unwrap();
-        let id = TaskId::new();
-        let machine = MachineId::new();
-        store.insert_task(&task_row(id)).unwrap();
-
-        for summary in ["first", "delivered", "last"] {
-            store
-                .append_report_with_notification(id, ReportOutcome::Succeeded, summary, true)
-                .unwrap();
-        }
-
-        store
-            .conn
-            .execute(
-                "UPDATE reports SET notified_at=?1 WHERE task_id=?2 AND seq=2",
-                params![super::fmt_time(Utc::now()), id.to_string()],
-            )
-            .unwrap();
-        store.migrate_legacy_local(machine).unwrap();
-
-        let events = store.inbound_events(id).unwrap();
-        assert_eq!(events.len(), 2);
-
-        for (inbox, (seq, summary)) in events.iter().zip([(1, "first"), (2, "last")]) {
-            assert_eq!(inbox.event.seq.get(), seq);
-            let EventPayload::Callback { event, state } = &inbox.event.payload else {
-                panic!("legacy report notification payload")
-            };
-
-            assert_eq!(event.event, EventKind::TaskReported);
-            assert_eq!(*state, None);
-            assert_eq!(event.reports.len(), 1);
-            assert_eq!(event.reports[0].summary, summary);
-        }
-
-        assert_eq!(
-            store
-                .origin_route_by_task(id)
-                .unwrap()
-                .unwrap()
-                .last_accepted_seq,
-            2
-        );
-        drop(store);
-
-        let mut reopened = Store::open(&db).unwrap();
-        reopened.migrate_legacy_local(machine).unwrap();
-        assert_eq!(reopened.inbound_events(id).unwrap(), events);
-    }
-
-    #[test]
-    fn legacy_sent_and_failed_callbacks_do_not_create_events() {
-        let directory = tempdir().unwrap();
-        let machine = MachineId::new();
-
-        for status in [CallbackStatus::Sent, CallbackStatus::Failed] {
-            let mut store =
-                Store::open(&directory.path().join(format!("{}.sqlite", status.as_str()))).unwrap();
-            let id = TaskId::new();
-            insert_legacy_terminal(&store, id, status);
-            store.migrate_legacy_local(machine).unwrap();
-
-            let route = store.origin_route_by_task(id).unwrap().unwrap();
-            assert_eq!(route.last_accepted_seq, 0);
-            assert_eq!(route.last_settled_seq, 0);
-            assert!(store.inbound_events(id).unwrap().is_empty());
-            assert!(
-                store
-                    .outbound_event_at_or_after(id, NonZeroU64::MIN)
-                    .unwrap()
-                    .is_none()
-            );
-            let cursor: Option<i64> = store
-                .conn
-                .query_row(
-                    "SELECT last_seq FROM executor_event_cursors WHERE task_id=?1",
-                    [id.to_string()],
-                    |entry| entry.get(0),
-                )
-                .optional()
-                .unwrap();
-            assert_eq!(cursor, None);
-            assert_eq!(
-                store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-                TerminalCallbackProjection::Legacy(status)
-            );
-            let summary = TaskSummary::from_row(
-                &store.require_task(id).unwrap(),
-                Some(&store.task_presentations(&[id]).unwrap()[&id]),
-            );
-            assert_eq!(
-                serde_json::to_value(summary).unwrap()["callback"],
-                status.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_nonterminal_migration_leaves_sequence_for_first_real_transition() {
-        let directory = tempdir().unwrap();
-        let mut store = Store::open(&directory.path().join("db")).unwrap();
-        let machine = MachineId::new();
-        let id = TaskId::new();
-        store.insert_task(&task_row(id)).unwrap();
-
-        store.migrate_legacy_local(machine).unwrap();
-        let migrated = store.origin_route_by_task(id).unwrap().unwrap();
-        assert_eq!(migrated.last_accepted_seq, 0);
-        assert_eq!(migrated.last_settled_seq, 0);
-        assert!(store.inbound_events(id).unwrap().is_empty());
-        assert!(
-            store
-                .outbound_event_at_or_after(id, NonZeroU64::MIN)
-                .unwrap()
-                .is_none()
-        );
-
-        store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-            .unwrap();
-        let first = store
-            .outbound_event_at_or_after(id, NonZeroU64::MIN)
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.event.seq.get(), 1);
-        assert_eq!(
-            first.event.payload,
-            EventPayload::State {
-                status: ProcessStatus::Running
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_migration_skips_remote_executors_and_rejects_a_partial_local_route() {
-        let directory = tempdir().unwrap();
-        let mut store = Store::open(&directory.path().join("db")).unwrap();
-        let machine = MachineId::new();
-
-        let remote_id = TaskId::new();
-        let (remote_row, remote_spec) = row_at(remote_id, Path::new("/tmp"));
-        let origin = MachineId::new();
-        store
-            .insert_remote_task(&remote_row, &remote_spec, origin, machine)
-            .unwrap();
-        store.migrate_legacy_local(machine).unwrap();
-        assert!(store.origin_route_by_task(remote_id).unwrap().is_none());
-        assert!(matches!(
-            store.executor_identity(remote_id).unwrap(),
-            Some(ExecutorIdentity::Accepted(record))
-                if record.origin_machine == origin
-                    && record.execution_machine == machine
-                    && record.current_spec().is_some()
-        ));
-
-        let legacy_id = TaskId(uuid::Uuid::from_u128(1));
-        let partial_id = TaskId(uuid::Uuid::from_u128(2));
-        store.insert_task(&task_row(legacy_id)).unwrap();
-        let row = task_row(partial_id);
-        store.insert_task(&row).unwrap();
-        let partial_route = OriginRoute {
-            request: RequestId::new(),
-            task: partial_id,
-            origin_machine: machine,
-            execution_machine: machine,
-            thread: row.thread,
-            callback: CallbackContext {
-                env: row.env.clone(),
-                cwd: row.cwd.clone(),
-                codex: CallbackExecutable::available(Path::new("/bin/true").into()),
-            },
-            spec: local_spec(&row).into(),
-            submission: SubmissionState::Accepted,
-            last_execution_state: Some(ProcessStatus::Queued),
-            last_updated_at: Some(Utc::now()),
-            last_accepted_seq: 0,
-            last_settled_seq: 0,
-        };
-        store.insert_origin_route(&partial_route).unwrap();
-        assert!(store.migrate_legacy_local(machine).is_err());
-        assert!(store.executor_identity(legacy_id).unwrap().is_none());
-        assert!(store.origin_route_by_task(legacy_id).unwrap().is_none());
-        assert!(store.executor_identity(partial_id).unwrap().is_none());
-        assert_eq!(
-            store
-                .origin_route_by_task(partial_id)
-                .unwrap()
-                .unwrap()
-                .request,
-            partial_route.request
-        );
-        assert!(store.inbound_events(partial_id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn missing_legacy_callback_directory_does_not_abort_migration() {
-        let directory = tempdir().unwrap();
-        let mut store = Store::open(&directory.path().join("db")).unwrap();
-        let machine = MachineId::new();
-        let id = TaskId::new();
-        let missing_cwd = directory.path().join("removed-cwd");
-        let mut row = task_row(id);
-        row.cwd = missing_cwd.clone();
-        row.state = TaskState::Finished {
-            reason: ExitReason::Exit { code: 0 },
-        };
-        store.insert_task(&row).unwrap();
-
-        store.migrate_legacy_local(machine).unwrap();
-        let route = store.origin_route_by_task(id).unwrap().unwrap();
-        assert_eq!(route.callback.cwd, missing_cwd);
-        let error = crate::callback::check_saved_callback(&route.callback).unwrap_err();
-        assert!(error.contains("saved callback directory is unavailable"));
-
-        let reserved = store
-            .reserve_inbox_attempt(id, NonZeroU64::MIN)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            reserved.delivery,
-            DeliveryState::PendingDelivery { attempts: 1, .. }
-        ));
-        let failed = store
-            .settle_inbox_attempt(id, NonZeroU64::MIN, DeliveryOutcome::Permanent(error))
-            .unwrap();
-        assert!(matches!(
-            failed.delivery,
-            DeliveryState::DeliveryFailed { attempts: 1, .. }
-        ));
-        assert_eq!(
-            store
-                .origin_route_by_task(id)
-                .unwrap()
-                .unwrap()
-                .last_settled_seq,
-            1
-        );
-    }
-
-    #[test]
-    fn unavailable_legacy_codex_is_durable_and_fails_inbox_delivery() {
-        let directory = tempdir().unwrap();
-        let mut store = Store::open(&directory.path().join("db")).unwrap();
-        let machine = MachineId::new();
-        let id = TaskId::new();
-        let empty_path = directory.path().join("empty-bin");
-        std::fs::create_dir(&empty_path).unwrap();
-        let mut row = task_row(id);
-        row.cwd = directory.path().to_path_buf();
-        row.env.path = empty_path.to_string_lossy().into_owned();
-        row.state = TaskState::Finished {
-            reason: ExitReason::Exit { code: 0 },
-        };
-        store.insert_task(&row).unwrap();
-
-        store
-            .migrate_legacy_local_with(machine, |path, cwd| {
-                assert_eq!(path, empty_path.to_string_lossy());
-                assert!(cwd.is_dir());
-                Err(AppError::ExecutableMissing {
-                    program: "codex".into(),
-                })
-            })
-            .unwrap();
-
-        let route = store.origin_route_by_task(id).unwrap().unwrap();
-        let CallbackExecutable::Unavailable { reason } = &route.callback.codex else {
-            panic!("unresolved Codex binary must remain explicitly unavailable")
-        };
-        assert!(reason.contains("saved Codex executable could not be resolved"));
-        let error = crate::callback::check_saved_callback(&route.callback).unwrap_err();
-        assert!(error.contains("codex"));
-
-        let reserved = store
-            .reserve_inbox_attempt(id, NonZeroU64::MIN)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            reserved.delivery,
-            DeliveryState::PendingDelivery { attempts: 1, .. }
-        ));
-        let failed = store
-            .settle_inbox_attempt(id, NonZeroU64::MIN, DeliveryOutcome::Permanent(error))
-            .unwrap();
-        assert!(matches!(
-            failed.delivery,
-            DeliveryState::DeliveryFailed { attempts: 1, .. }
-        ));
-        assert_eq!(
-            store
-                .origin_route_by_task(id)
-                .unwrap()
-                .unwrap()
-                .last_settled_seq,
-            1
-        );
-    }
-
-    #[test]
-    fn legacy_migration_serializes_with_runner_completion_and_produces_one_first_event() {
-        use std::sync::{Arc, Barrier};
-
-        let directory = tempdir().unwrap();
-        let db = directory.path().join("db");
-        let id = TaskId::new();
-        let machine = MachineId::new();
-        let store = Store::open(&db).unwrap();
-        store.insert_task(&task_row(id)).unwrap();
-        store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-            .unwrap();
-        drop(store);
-
-        let barrier = Arc::new(Barrier::new(3));
-        let migration_db = db.clone();
-        let migration_barrier = barrier.clone();
-        let migration = std::thread::spawn(move || {
-            let mut store = Store::open(&migration_db).unwrap();
-            migration_barrier.wait();
-            store.migrate_legacy_local(machine).unwrap();
-        });
-        let completion_db = db.clone();
-        let completion_barrier = barrier.clone();
-        let completion = std::thread::spawn(move || {
-            let store = Store::open(&completion_db).unwrap();
-            completion_barrier.wait();
-            store
-                .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
-                .unwrap();
-        });
-        barrier.wait();
-        migration.join().unwrap();
-        completion.join().unwrap();
-
-        let store = Store::open(&db).unwrap();
-        let outbox: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM executor_outbox WHERE task_id=?1",
-                [id.to_string()],
-                |entry| entry.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox, 1);
-        let event = store
-            .outbound_event_at_or_after(id, NonZeroU64::MIN)
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.event.seq.get(), 1);
-        assert!(matches!(
-            event.event.payload,
-            EventPayload::Callback {
-                state: Some(ProcessStatus::Succeeded),
-                ..
-            }
-        ));
-        assert_eq!(
-            store.require_task(id).unwrap().status(),
-            ProcessStatus::Succeeded
-        );
-        assert!(matches!(
-            store.executor_identity(id).unwrap(),
-            Some(ExecutorIdentity::Accepted(record))
-                if record.state == ProcessStatus::Succeeded
-                    && record.has_valid_spec_owners()
-        ));
     }
 
     #[test]
@@ -3532,18 +1985,18 @@ mod tests {
         let remote_id = TaskId::new();
         let origin_machine = MachineId::new();
         let execution_machine = MachineId::new();
-        let (mut remote_row, remote_spec) = row_at(remote_id, &remote_cwd);
-        remote_row.callback_status = CallbackStatus::Sent;
+        let (remote_row, remote_spec) = row_at(remote_id, &remote_cwd);
         store
             .insert_remote_task(&remote_row, &remote_spec, origin_machine, execution_machine)
             .unwrap();
 
-        let legacy_id = TaskId::new();
-        let legacy_row = task_row(legacy_id);
-        store.insert_task(&legacy_row).unwrap();
+        // a row with neither identity nor route, the shape of a queue run
+        let run_id = TaskId::new();
+        let run_row = task_row(run_id);
+        store.insert_task(&run_row).unwrap();
 
         let presentations = store
-            .task_presentations(&[local_id, remote_id, legacy_id])
+            .task_presentations(&[local_id, remote_id, run_id])
             .unwrap();
         let local = presentations.get(&local_id).unwrap();
         assert_eq!(local.project_root, None);
@@ -3571,14 +2024,15 @@ mod tests {
         assert_eq!(remote_json["project_root"], json!(remote_cwd.parent()));
         assert_eq!(remote_json["origin_machine"], json!(origin_machine));
         assert_eq!(remote_json["execution_machine"], json!(execution_machine));
-        assert_eq!(remote_json["callback"], "pending");
+        // the origin, not this executor, delivers the callback
+        assert_eq!(remote_json["callback"], json!(null));
 
-        let legacy = presentations.get(&legacy_id).unwrap();
-        assert_eq!(legacy.owners, None);
-        let legacy_json =
-            serde_json::to_value(TaskSummary::from_row(&legacy_row, Some(legacy))).unwrap();
-        assert!(legacy_json.get("origin_machine").is_none());
-        assert!(legacy_json.get("execution_machine").is_none());
+        let run = presentations.get(&run_id).unwrap();
+        assert_eq!(run.owners, None);
+        let run_json = serde_json::to_value(TaskSummary::from_row(&run_row, Some(run))).unwrap();
+        assert!(run_json.get("origin_machine").is_none());
+        assert!(run_json.get("execution_machine").is_none());
+        assert_eq!(run_json["callback"], json!(null));
     }
 
     #[test]
@@ -3616,7 +2070,7 @@ mod tests {
         let origin = MachineId::new();
         let execution = MachineId::new();
         let mut row = task_row(id);
-        row.name = Some(TaskName::parse("local task").unwrap());
+        row.name = TaskName::parse("local task").unwrap();
         let spec = local_spec(&row);
         row.workload = crate::invocation::persist_workload(&spec.workload);
         row.binary = Path::new("/bin/true").into();
@@ -3693,7 +2147,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .map(|event| event.notification_required)
+                .map(|event| event.event.payload.notification_required())
                 .collect::<Vec<_>>(),
             vec![false, false, false, true, true]
         );
@@ -3863,144 +2317,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_task_keeps_its_callback_after_reopen() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("db");
-        let id = TaskId::new();
-        let store = Store::open(&db).unwrap();
-        store.insert_task(&agent_row(id)).unwrap();
-        drop(store);
-        let store = Store::open(&db).unwrap();
-        assert!(!store.is_event_task(id).unwrap());
-        store
-            .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
-            .unwrap();
-        let mut store = store;
-        store.migrate_legacy_local(MachineId::new()).unwrap();
-        assert!(store.has_pending_terminal_callbacks().unwrap());
-        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
-        assert!(store.pending_outbound_events(id).unwrap().is_empty());
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM executor_outbox WHERE task_id=?1",
-                    [id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-    }
-
-    /// Schema version 1 layout used only to prove the 1→2 migration
-    const SCHEMA_V1: &str = r"
-CREATE TABLE tasks (
-    id TEXT PRIMARY KEY,
-    thread_id TEXT NOT NULL,
-    workload_json TEXT NOT NULL,
-    cwd TEXT NOT NULL,
-    timeout_secs TEXT NOT NULL,
-    env_path TEXT NOT NULL,
-    env_home TEXT NOT NULL,
-    binary TEXT NOT NULL,
-    status TEXT NOT NULL,
-    exit_reason TEXT,
-    callback_status TEXT NOT NULL,
-    attention_state TEXT NOT NULL,
-    timeout_notified_at TEXT,
-    pid INTEGER,
-    cancel_requested_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX tasks_status ON tasks(status);
-CREATE INDEX tasks_thread ON tasks(thread_id);
-CREATE TABLE reports (
-    task_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    outcome TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    reported_at TEXT NOT NULL,
-    notified_at TEXT,
-    PRIMARY KEY (task_id, seq),
-    FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
-";
-
-    #[test]
-    fn unreleased_development_schema_is_refused() {
-        for version in [3, RELEASED_V0_4_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("db");
-            Connection::open(&path)
-                .unwrap()
-                .pragma_update(None, "user_version", version)
-                .unwrap();
-            let Err(AppError::Internal { message }) = Store::open(&path) else {
-                panic!("schema user_version={version} must be refused");
-            };
-            assert!(
-                message.contains(&format!("user_version={version}")),
-                "{message}"
-            );
-            let unreleased = version < RELEASED_V0_4_SCHEMA_VERSION;
-            assert_eq!(message.contains("unreleased"), unreleased, "{message}");
-        }
-    }
-
-    #[test]
-    fn migrate_from_empty() {
-        let dir = tempdir().unwrap();
-        let store = Store::open(&dir.path().join("db")).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_no_loan_tables(&store);
-        assert_foreign_keys_enabled(&store);
-    }
-
-    /// Run one local task to exit 0 after a last report with this outcome
-    fn finish_local(store: &Store, id: TaskId, last_report: ReportOutcome) {
-        insert_local(store, id);
-        store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-            .unwrap();
-        store
-            .append_report_with_notification(id, last_report, "done", false)
-            .unwrap();
-        store
-            .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
-            .unwrap();
-    }
-
-    /// Save a remote route whose task exited 0 but whose terminal event is gone
-    fn insert_pruned_remote_route(store: &mut Store, id: TaskId) {
-        let row = task_row(id);
-        let route = OriginRoute {
-            request: RequestId::new(),
-            task: id,
-            origin_machine: MachineId::new(),
-            execution_machine: MachineId::new(),
-            thread: row.thread,
-            callback: CallbackContext {
-                env: row.env.clone(),
-                cwd: row.cwd.clone(),
-                codex: CallbackExecutable::available(Path::new("/bin/true").into()),
-            },
-            spec: local_spec(&row).into(),
-            submission: SubmissionState::Accepted,
-            last_execution_state: Some(ProcessStatus::Succeeded),
-            last_updated_at: Some(Utc::now()),
-            last_accepted_seq: 4,
-            last_settled_seq: 4,
-        };
-        store.insert_origin_route(&route).unwrap();
-    }
-
-    #[test]
     fn child_identity_is_recorded_once_while_the_task_runs() {
         use crate::cleanup::{ProcessIdentity, ProcessStartTime};
         use nix::unistd::Pid;
@@ -4107,550 +2423,6 @@ CREATE TABLE reports (
     }
 
     #[test]
-    fn released_v0_11_schema_backfills_outcomes_only_from_definitive_evidence() {
-        use crate::dependency::{DependencyOutcome, DependencyState, TaskOutcome};
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let delivered = TaskId::new();
-        let undelivered = TaskId::new();
-        let pending = TaskId::new();
-        let pruned_remote = TaskId::new();
-        {
-            let mut store = Store::open(&path).unwrap();
-            finish_local(&store, delivered, ReportOutcome::Blocked);
-            deliver_outbound_events(&mut store, delivered, |_| DeliveryOutcome::Delivered);
-            // its terminal event never reached the inbox, so the task row decides
-            finish_local(&store, undelivered, ReportOutcome::Failed);
-            insert_local(&store, pending);
-            // exit 0 is not success: the last report on the executor may say blocked
-            insert_pruned_remote_route(&mut store, pruned_remote);
-            store
-                .conn
-                .execute_batch(&format!(
-                    "{DROP_QUEUE_SCHEMA}
-                     ALTER TABLE tasks DROP COLUMN child_start_time;
-                     ALTER TABLE tasks DROP COLUMN child_pid;
-                     ALTER TABLE origin_routes DROP COLUMN after_json;
-                     ALTER TABLE origin_routes DROP COLUMN outcome;
-                     PRAGMA user_version = {RELEASED_V0_11_SCHEMA_VERSION};"
-                ))
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(
-            store
-                .dependency_states(&[delivered, undelivered, pending, pruned_remote])
-                .unwrap(),
-            vec![
-                (
-                    delivered,
-                    Some(DependencyState::Ended(TaskOutcome::Blocked.into()))
-                ),
-                (
-                    undelivered,
-                    Some(DependencyState::Ended(TaskOutcome::Failed.into()))
-                ),
-                (pending, Some(DependencyState::Pending)),
-                (
-                    pruned_remote,
-                    Some(DependencyState::Ended(DependencyOutcome::Unknown))
-                ),
-            ]
-        );
-        let saved: Option<String> = store
-            .conn
-            .query_row(
-                "SELECT outcome FROM origin_routes WHERE task_id=?1",
-                [pruned_remote.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(saved, None);
-    }
-
-    #[test]
-    fn released_v0_8_7_schema_gains_worker_thread_and_keeps_task_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            insert_local(&store, id);
-            store
-                .conn
-                .execute_batch(&format!(
-                    "{DROP_QUEUE_SCHEMA}
-                     ALTER TABLE tasks DROP COLUMN child_start_time;
-                     ALTER TABLE tasks DROP COLUMN child_pid;
-                     ALTER TABLE tasks DROP COLUMN worker_thread;
-                     ALTER TABLE origin_routes DROP COLUMN after_json;
-                     ALTER TABLE origin_routes DROP COLUMN outcome;
-                     PRAGMA user_version = {RELEASED_V0_8_7_SCHEMA_VERSION};"
-                ))
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(store.require_task(id).unwrap().id, id);
-        let worker_thread: Option<String> = store
-            .conn
-            .query_row(
-                "SELECT worker_thread FROM tasks WHERE id=?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(worker_thread, None);
-    }
-
-    fn assert_foreign_keys_enabled(store: &Store) {
-        let enabled: bool = store
-            .conn
-            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
-            .unwrap();
-        assert!(enabled);
-    }
-
-    /// Tables of the GPU priority queue, which reuse the `resource` prefix
-    const QUEUE_TABLES: [&str; 9] = [
-        "resources",
-        "resource_jobs",
-        "resource_job_events",
-        "resource_operations",
-        "resource_blocked_notices",
-        "resource_job_routes",
-        "resource_job_inbox",
-        "resource_job_delivery",
-        "resource_run_history",
-    ];
-
-    fn assert_no_loan_tables(store: &Store) {
-        let loan_tables: Vec<String> = store
-            .conn
-            .prepare(&format!(
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table'
-                   AND (name IN ('loans', 'trainer_attempt_associations')
-                        OR name LIKE 'resource%')
-                   AND name NOT IN ({})",
-                QUEUE_TABLES.map(|table| format!("'{table}'")).join(", ")
-            ))
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            loan_tables.is_empty(),
-            "loan tables remain: {loan_tables:?}"
-        );
-        for table in QUEUE_TABLES {
-            let rows: i64 = store
-                .conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 0, "loan rows reached {table}");
-        }
-    }
-
-    /// GPU loan tables of the last release that had them
-    const RELEASED_LOAN_SCHEMA: &str = include_str!("store/fixtures/loan_schema_v34.sql");
-
-    /// Every table, index, and trigger by type and name, with normalized SQL
-    ///
-    /// SQLite's own tables are left out: `sqlite_sequence` stays once an
-    /// `AUTOINCREMENT` loan table has existed, and SQLite cannot drop it
-    fn schema_snapshot(store: &Store) -> Vec<(String, String, String)> {
-        let mut statement = store
-            .conn
-            .prepare(
-                "SELECT type, name, sql FROM sqlite_master
-                 WHERE name NOT LIKE 'sqlite!_%' ESCAPE '!'
-                 ORDER BY type, name",
-            )
-            .unwrap();
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    normalized_sql(&row.get::<_, String>(2)?),
-                ))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    }
-
-    /// Schema SQL with whitespace collapsed and the parts of a table body sorted
-    ///
-    /// `ALTER TABLE ADD COLUMN` appends, so an upgraded version 1 database keeps
-    /// `name` last while a fresh one declares it third. Every query names its
-    /// columns, so their order is not part of the schema
-    fn normalized_sql(sql: &str) -> String {
-        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !sql.starts_with("CREATE TABLE") {
-            return sql;
-        }
-        let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else {
-            return sql;
-        };
-
-        let body = &sql[open + 1..close];
-        let mut parts = Vec::new();
-        let (mut depth, mut quoted, mut start) = (0_u32, false, 0);
-        for (index, character) in body.char_indices() {
-            match character {
-                '\'' => quoted = !quoted,
-                '(' if !quoted => depth += 1,
-                ')' if !quoted => depth -= 1,
-                ',' if !quoted && depth == 0 => {
-                    parts.push(body[start..index].trim());
-                    start = index + 1;
-                }
-                _ => {}
-            }
-        }
-        parts.push(body[start..].trim());
-        parts.sort_unstable();
-        format!("{} ({})", sql[..open].trim_end(), parts.join(", "))
-    }
-
-    /// Rows that only the loan flows wrote into shared tables, keyed by `loan_task`
-    fn seed_loan_rows(store: &Store, ordinary_task: TaskId, loan_task: TaskId) {
-        let resource = uuid::Uuid::now_v7().to_string();
-        let loan = uuid::Uuid::now_v7().to_string();
-        let attempt = uuid::Uuid::now_v7().to_string();
-        let conn = &store.conn;
-        conn.execute_batch(RELEASED_LOAN_SCHEMA).unwrap();
-        // the loan JSON constraints are irrelevant to dropping the tables
-        conn.pragma_update(None, "ignore_check_constraints", true)
-            .unwrap();
-        conn.execute(
-            "INSERT INTO resources (id, display_name, authority_machine, supervisor_machine,
-                supervisor_thread, assignment_revision, state_revision)
-             VALUES (?1, 'gpu', 'machine', 'machine', 'thread', 0, 0)",
-            [&resource],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, '{}')",
-            [&loan, &resource],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO resource_supervisor_notices (id, loan_id, action_id, notice_json)
-             VALUES (?1, ?2, ?1, '{}')",
-            [&attempt, &loan],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO trainer_attempt_associations
-                (task_id, resource_id, authority_machine, association_json)
-             VALUES (?1, ?2, 'machine', '{}')",
-            [ordinary_task.to_string(), resource],
-        )
-        .unwrap();
-        conn.pragma_update(None, "ignore_check_constraints", false)
-            .unwrap();
-
-        let loan_task = loan_task.to_string();
-        conn.execute(
-            "INSERT INTO origin_routes (request_id, task_id, execution_machine, spec_json, route_json)
-             VALUES (?1, ?2, 'machine', '{}', '{\"submission\":{\"type\":\"resource\"}}')",
-            [uuid::Uuid::now_v7().to_string(), loan_task.clone()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO origin_inbox (task_id, seq, origin_machine, execution_machine,
-                event_json, notification_required, delivery_json)
-             VALUES (?1, 1, 'machine', 'machine', '{}', 0, '{}')",
-            [&loan_task],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cancellation_requests (task_id, request_json)
-             VALUES (?1, '{\"target\":{\"type\":\"resource\"}}')",
-            [&loan_task],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message_attempts (message_id, attempt_json)
-             VALUES (?1, '{\"request\":{\"source\":{\"kind\":\"resource_notice\"}}}')",
-            [&attempt],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message_receipts (message_id, receipt_json) VALUES (?1, '{}')",
-            [&attempt],
-        )
-        .unwrap();
-    }
-
-    /// Remove the GPU priority queue, which no released schema has
-    const DROP_QUEUE_SCHEMA: &str = "
-        DROP INDEX tasks_resource_run;
-        ALTER TABLE tasks DROP COLUMN step_index;
-        ALTER TABLE tasks DROP COLUMN run_number;
-        ALTER TABLE tasks DROP COLUMN resource_job_id;
-        DROP TABLE resource_blocked_notices;
-        DROP TABLE resource_operations;
-        DROP TABLE resource_run_history;
-        DROP TABLE resource_job_inbox;
-        DROP TABLE resource_job_routes;
-        DROP TABLE resource_job_delivery;
-        DROP TABLE resource_job_events;
-        DROP TABLE resources;
-        DROP TABLE resource_jobs;
-    ";
-
-    /// Restore the shape of released schema `version` on a current database
-    ///
-    /// The queue's schema must already be gone; see [`DROP_QUEUE_SCHEMA`]
-    fn downgrade_to_released(store: &Store, version: i64) {
-        let mut sql = String::new();
-        if version < SCHEMA_VERSION {
-            sql.push_str(
-                "ALTER TABLE tasks DROP COLUMN child_start_time;
-                 ALTER TABLE tasks DROP COLUMN child_pid;
-                 ALTER TABLE origin_routes DROP COLUMN outcome;
-                 ALTER TABLE origin_routes ADD COLUMN outcome TEXT
-                     CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost'));",
-            );
-        }
-        if version < RELEASED_V0_13_SCHEMA_VERSION {
-            sql.push_str(
-                "ALTER TABLE origin_routes DROP COLUMN after_json;
-                 ALTER TABLE origin_routes DROP COLUMN outcome;",
-            );
-        }
-        if version < RELEASED_V0_11_SCHEMA_VERSION {
-            sql.push_str("ALTER TABLE tasks DROP COLUMN worker_thread;");
-        }
-        if version < RELEASED_V0_8_7_SCHEMA_VERSION {
-            sql.push_str(
-                "DROP TABLE resource_return_deadline_servings;
-                 DROP TABLE resource_return_windows;",
-            );
-        }
-        if version < RELEASED_V0_7_SCHEMA_VERSION {
-            sql.push_str("DROP TABLE resource_initial_idle_attestations;");
-        }
-        if version < RELEASED_V0_5_1_SCHEMA_VERSION {
-            sql.push_str(
-                "ALTER TABLE tasks DROP COLUMN container_exit_evidence;
-                 DROP TABLE task_containers;",
-            );
-        }
-        sql.push_str(&format!("PRAGMA user_version = {version};"));
-        store.conn.execute_batch(&sql).unwrap();
-    }
-
-    fn row_count(store: &Store, sql: &str, task: TaskId) -> i64 {
-        store
-            .conn
-            .query_row(sql, [task.to_string()], |row| row.get(0))
-            .unwrap()
-    }
-
-    /// Databases written by each release that introduced a schema version, each
-    /// with one finished task and its routes and events; paths are replaced
-    /// with fixture values. v0.14 shares v0.13's schema 34
-    const RELEASED_DATABASES: [(i64, &str); 8] = [
-        (
-            RELEASED_V0_4_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_4_0_database.sql"),
-        ),
-        (
-            RELEASED_V0_5_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_5_0_database.sql"),
-        ),
-        (
-            RELEASED_V0_5_1_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_5_1_database.sql"),
-        ),
-        (
-            RELEASED_V0_7_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_7_0_database.sql"),
-        ),
-        (
-            RELEASED_V0_8_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_8_0_database.sql"),
-        ),
-        (
-            RELEASED_V0_8_7_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_8_7_database.sql"),
-        ),
-        (
-            RELEASED_V0_11_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_11_0_database.sql"),
-        ),
-        (
-            RELEASED_V0_13_SCHEMA_VERSION,
-            include_str!("store/fixtures/released_v0_13_0_database.sql"),
-        ),
-    ];
-
-    // the downgrade recipes below rebuild old schemas from the current one, so
-    // these check databases the real releases wrote
-    #[test]
-    fn databases_from_real_releases_upgrade_and_keep_their_task() {
-        let fresh_dir = tempdir().unwrap();
-        let fresh = schema_snapshot(&Store::open(&fresh_dir.path().join("db")).unwrap());
-
-        for (version, dump) in RELEASED_DATABASES {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("db");
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(dump).unwrap();
-            conn.pragma_update(None, "user_version", version).unwrap();
-            let task: String = conn
-                .query_row("SELECT id FROM tasks", [], |row| row.get(0))
-                .unwrap();
-            drop(conn);
-
-            let store = Store::open(&path).unwrap();
-
-            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
-            assert_no_loan_tables(&store);
-            let row = store.require_task(task.parse().unwrap()).unwrap();
-            assert_eq!(
-                row.status(),
-                ProcessStatus::Succeeded,
-                "released version {version}"
-            );
-        }
-    }
-
-    #[test]
-    fn every_released_schema_upgrades_to_the_fresh_schema_without_loan_data() {
-        let fresh_dir = tempdir().unwrap();
-        let fresh = schema_snapshot(&Store::open(&fresh_dir.path().join("db")).unwrap());
-
-        for (version, schema) in [(1, SCHEMA_V1), (2, BASE_SCHEMA)] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("db");
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(schema).unwrap();
-            conn.pragma_update(None, "user_version", version).unwrap();
-            drop(conn);
-
-            let store = Store::open(&path).unwrap();
-            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
-        }
-
-        for version in [
-            RELEASED_V0_4_SCHEMA_VERSION,
-            RELEASED_V0_5_SCHEMA_VERSION,
-            RELEASED_V0_5_1_SCHEMA_VERSION,
-            RELEASED_V0_7_SCHEMA_VERSION,
-            RELEASED_V0_8_SCHEMA_VERSION,
-            RELEASED_V0_8_7_SCHEMA_VERSION,
-            RELEASED_V0_11_SCHEMA_VERSION,
-            RELEASED_V0_13_SCHEMA_VERSION,
-        ] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("db");
-            let ordinary_task = TaskId::new();
-            let loan_task = TaskId::new();
-            {
-                let store = Store::open(&path).unwrap();
-                insert_local(&store, ordinary_task);
-                // the queue's tables go first, since the loan tables reuse `resources`
-                store.conn.execute_batch(DROP_QUEUE_SCHEMA).unwrap();
-                seed_loan_rows(&store, ordinary_task, loan_task);
-                downgrade_to_released(&store, version);
-            }
-
-            let store = Store::open(&path).unwrap();
-            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
-            assert_no_loan_tables(&store);
-            assert_eq!(store.require_task(ordinary_task).unwrap().id, ordinary_task);
-            assert_eq!(
-                row_count(
-                    &store,
-                    "SELECT COUNT(*) FROM origin_routes WHERE task_id = ?1",
-                    ordinary_task
-                ),
-                1,
-                "released version {version}"
-            );
-            for table in ["origin_routes", "origin_inbox", "cancellation_requests"] {
-                assert_eq!(
-                    row_count(
-                        &store,
-                        &format!("SELECT COUNT(*) FROM {table} WHERE task_id = ?1"),
-                        loan_task
-                    ),
-                    0,
-                    "released version {version}: {table}"
-                );
-            }
-            let messages: i64 = store
-                .conn
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM message_attempts)
-                          + (SELECT COUNT(*) FROM message_receipts)",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(messages, 0, "released version {version}");
-            assert_foreign_keys_enabled(&store);
-        }
-    }
-
-    #[test]
-    fn released_v0_5_database_gains_the_container_witness_and_keeps_its_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            insert_local(&store, id);
-            // restore the v0.5.0 shape: no container column or table
-            store
-                .conn
-                .execute_batch(&format!(
-                    "{DROP_QUEUE_SCHEMA}
-                     ALTER TABLE tasks DROP COLUMN child_start_time;
-                     ALTER TABLE tasks DROP COLUMN child_pid;
-                     ALTER TABLE tasks DROP COLUMN worker_thread;
-                     ALTER TABLE origin_routes DROP COLUMN after_json;
-                     ALTER TABLE origin_routes DROP COLUMN outcome;
-                     ALTER TABLE tasks DROP COLUMN container_exit_evidence;
-                     DROP TABLE task_containers;
-                     PRAGMA user_version = {RELEASED_V0_5_SCHEMA_VERSION};"
-                ))
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let row = store.require_task(id).unwrap();
-        assert_eq!(
-            row.container_exit_evidence,
-            ContainerExitEvidence::Unconfirmed
-        );
-        assert_eq!(store.task_container(id).unwrap(), None);
-        assert_no_loan_tables(&store);
-        assert_foreign_keys_enabled(&store);
-    }
-
-    #[test]
     fn container_evidence_is_refused_where_no_container_path_records_it() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
@@ -4711,74 +2483,6 @@ CREATE TABLE reports (
     }
 
     #[test]
-    fn migrate_version_1_preserves_tasks() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(SCHEMA_V1).unwrap();
-            conn.pragma_update(None, "user_version", 1i64).unwrap();
-            let id = TaskId::new();
-            conn.execute(
-                "INSERT INTO tasks (
-                    id, thread_id, workload_json, cwd, timeout_secs,
-                    env_path, env_home, binary, status, exit_reason,
-                    callback_status, attention_state, timeout_notified_at,
-                    pid, cancel_requested_at, created_at, updated_at
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',NULL,'pending','pending',NULL,NULL,NULL,?9,?9)",
-                params![
-                    id.to_string(),
-                    "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-                    serde_json::to_string(&Workload::Task(TaskWorkload {
-                        command: CommandLine::try_from_argv(vec!["echo".into(), "hi".into()])
-                            .unwrap(),
-                    }))
-                    .unwrap(),
-                    "/tmp",
-                    "14400",
-                    "/bin",
-                    "/home/u",
-                    "/bin/echo",
-                    "2024-01-01T00:00:00Z",
-                ],
-            )
-            .unwrap();
-        }
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let listed = store.list_tasks(&[], None).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, None);
-        assert_eq!(listed[0].display_name(), "echo hi");
-        let id = listed[0].id;
-        assert_no_loan_tables(&store);
-        assert!(!store.is_event_task(id).unwrap());
-        store
-            .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)
-            .unwrap();
-        let mut store = store;
-        store.migrate_legacy_local(MachineId::new()).unwrap();
-        assert!(store.has_pending_terminal_callbacks().unwrap());
-        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
-        assert!(store.pending_outbound_events(id).unwrap().is_empty());
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM executor_outbox WHERE task_id=?1",
-                    [id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
     fn insert_list_get_agent_and_task() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
@@ -4788,12 +2492,10 @@ CREATE TABLE reports (
         store.insert_task(&task_row(task_id)).unwrap();
         let got = store.require_task(agent_id).unwrap();
         assert!(matches!(got.workload, Workload::Agent(_)));
-        assert_eq!(got.name.as_ref().map(TaskName::as_str), Some("agent job"));
-        assert_eq!(got.display_name(), "agent job");
+        assert_eq!(got.name.as_str(), "agent job");
         let got = store.require_task(task_id).unwrap();
         assert!(matches!(got.workload, Workload::Task(_)));
-        assert_eq!(got.name, None);
-        assert_eq!(got.display_name(), "cargo build --release");
+        assert_eq!(got.name.as_str(), "command job");
         let listed = store.list_tasks(&[ProcessStatus::Queued], None).unwrap();
         assert_eq!(listed.len(), 2);
     }
@@ -4839,18 +2541,18 @@ CREATE TABLE reports (
 
         let outbox = store.pending_outbound_events(id).unwrap();
         assert_eq!(outbox.len(), 4);
-        assert!(outbox[2].notification_required);
-        assert!(outbox[3].notification_required);
+        assert!(outbox[2].event.payload.notification_required());
+        assert!(outbox[3].event.payload.notification_required());
         assert_eq!(
             store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Pending)
+            Some(CallbackStatus::Pending)
         );
 
         deliver_outbound_events(&mut store, id, |_| DeliveryOutcome::Delivered);
 
         assert_eq!(
             store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+            Some(CallbackStatus::Sent)
         );
         assert!(store.reports(id).unwrap()[0].notified_at.is_some());
         assert!(!store.has_pending_terminal_callbacks().unwrap());
@@ -4883,14 +2585,14 @@ CREATE TABLE reports (
         assert_eq!(route.last_settled_seq, 4);
         assert_eq!(
             store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+            Some(CallbackStatus::Sent)
         );
         drop(store);
 
         let reopened = Store::open(&path).unwrap();
         assert_eq!(
             reopened.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+            Some(CallbackStatus::Sent)
         );
         assert!(!reopened.has_pending_terminal_callbacks().unwrap());
     }
@@ -4934,7 +2636,7 @@ CREATE TABLE reports (
         assert_eq!(
             store.task_presentations(&[interim_failure_id]).unwrap()[&interim_failure_id]
                 .terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Sent)
+            Some(CallbackStatus::Sent)
         );
         let failed = store.failed_inbox_events(interim_failure_id).unwrap();
         assert_eq!(failed.len(), 1);
@@ -4956,7 +2658,7 @@ CREATE TABLE reports (
         assert_eq!(
             store.task_presentations(&[terminal_failure_id]).unwrap()[&terminal_failure_id]
                 .terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Failed)
+            Some(CallbackStatus::Failed)
         );
         assert_eq!(
             serde_json::to_value(TaskSummary::from_row(
@@ -4987,7 +2689,7 @@ CREATE TABLE reports (
 
         assert_eq!(
             store.task_presentations(&[id]).unwrap()[&id].terminal_callback,
-            TerminalCallbackProjection::OriginInbox(CallbackStatus::Waiting)
+            Some(CallbackStatus::Waiting)
         );
         assert_eq!(
             serde_json::to_value(TaskSummary::from_row(
@@ -5032,32 +2734,7 @@ CREATE TABLE reports (
         };
         assert_eq!(*state, Some(ProcessStatus::Succeeded));
         assert_eq!(terminal.event, EventKind::TaskSucceeded);
-        assert!(store.require_task(id).unwrap().attention.is_delivered());
-    }
-
-    #[test]
-    fn old_attention_claim_can_be_released_into_a_durable_event() {
-        let dir = tempdir().unwrap();
-        let store = Store::open(&dir.path().join("db")).unwrap();
-        let id = TaskId::new();
-        insert_local(&store, id);
-        store
-            .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "UPDATE tasks SET attention_state='sending' WHERE id=?1",
-                [id.to_string()],
-            )
-            .unwrap();
-        store.release_attention(id).unwrap();
-        assert_eq!(
-            store.require_task(id).unwrap().attention,
-            AttentionState::Pending
-        );
-        assert!(store.produce_attention_event(id).unwrap());
-        assert_eq!(store.pending_outbound_events(id).unwrap().len(), 3);
+        assert!(store.require_task(id).unwrap().check_due_at.is_some());
     }
 
     #[test]
@@ -5067,10 +2744,7 @@ CREATE TABLE reports (
         let queued_id = TaskId::new();
         insert_local(&store, queued_id);
         assert!(!store.produce_attention_event(queued_id).unwrap());
-        assert_eq!(
-            store.require_task(queued_id).unwrap().attention,
-            AttentionState::Pending
-        );
+        assert_eq!(store.require_task(queued_id).unwrap().check_due_at, None);
 
         let terminal_id = TaskId::new();
         insert_local(&store, terminal_id);
@@ -5078,10 +2752,7 @@ CREATE TABLE reports (
             .cas_exit(terminal_id, ProcessStatus::Queued, &ExitReason::Cancelled)
             .unwrap();
         assert!(!store.produce_attention_event(terminal_id).unwrap());
-        assert_eq!(
-            store.require_task(terminal_id).unwrap().attention,
-            AttentionState::Pending
-        );
+        assert_eq!(store.require_task(terminal_id).unwrap().check_due_at, None);
     }
 
     #[test]

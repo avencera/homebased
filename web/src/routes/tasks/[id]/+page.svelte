@@ -73,11 +73,8 @@
 			all workers
 		</a>
 		{#if task}
-			<h1
-				class="min-w-0 text-base font-semibold tracking-tight wrap-anywhere"
-				title={task.display_name}
-			>
-				{task.display_name}
+			<h1 class="min-w-0 text-base font-semibold tracking-tight wrap-anywhere" title={task.name}>
+				{task.name}
 			</h1>
 			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 			<StatusBadge status={task.status} />

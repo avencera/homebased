@@ -18,6 +18,7 @@ use homebased::fleet::directory::LocalMachine;
 use homebased::fleet::http::ClusterClient;
 use homebased::fleet::identity::IdentityStatus;
 use homebased::fleet::probe::{ProbeError, probe};
+use homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 use homebased::fleet::protocol::SUPPORTED_PROTOCOLS;
 use homebased::fleet::runtime::{FleetHandle, FleetRuntime, FleetStart, RuntimeTimings};
 use homebased::machine::{BootId, LocalIdentity, MachineId, MachineName};
@@ -195,7 +196,7 @@ fn event_spec() -> NormalizedSpec {
 fn seed_event(executor: &Daemon, origin: &Daemon, task: TaskId, route: bool, count: usize) {
     let spec = event_spec();
     if route {
-        let mut store = Store::open(&origin.home.join("homebased.sqlite")).unwrap();
+        let mut store = Store::open(&origin.home.join(homebased::home::DB_NAME)).unwrap();
         store
             .insert_origin_route(&OriginRoute {
                 request: RequestId::new(),
@@ -211,22 +212,22 @@ fn seed_event(executor: &Daemon, origin: &Daemon, task: TaskId, route: bool, cou
                     cwd: PathBuf::from("/tmp"),
                     codex: PathBuf::from("/bin/echo").into(),
                 },
-                spec: spec.clone().into(),
+                spec: spec.clone(),
                 submission: SubmissionState::AcceptanceUnknown,
                 last_execution_state: None,
-                last_updated_at: Some(chrono::Utc::now()),
+                last_updated_at: chrono::Utc::now(),
                 last_accepted_seq: 0,
                 last_settled_seq: 0,
             })
             .unwrap();
     }
-    let mut store = Store::open(&executor.home.join("homebased.sqlite")).unwrap();
+    let mut store = Store::open(&executor.home.join(homebased::home::DB_NAME)).unwrap();
     store
         .accept_execution(&ExecutionRecord {
             task,
             origin_machine: origin.machine_id(),
             execution_machine: executor.machine_id(),
-            spec: spec.into(),
+            spec,
             state: ProcessStatus::Queued,
         })
         .unwrap();
@@ -268,7 +269,7 @@ fn add_peer(executor: &Daemon, origin: &Daemon) {
 }
 
 fn route_state(executor: &Daemon, task: TaskId) -> homebased::events::EventRouteStatus {
-    Store::open(&executor.home.join("homebased.sqlite"))
+    Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .outbound_route_status(task)
         .unwrap()
@@ -299,7 +300,7 @@ async fn post_execution(
             "/v1/cluster/executions",
             &serde_json::json!({
                 "api_version": 1,
-                "protocol_version": 2,
+                "protocol_version": CLUSTER_PROTOCOL_VERSION,
                 "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(),
                 "task": task,
@@ -312,7 +313,7 @@ async fn post_execution(
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     if status == 200 {
         assert_eq!(body["api_version"], 1);
-        assert_eq!(body["protocol_version"], 2);
+        assert_eq!(body["protocol_version"], CLUSTER_PROTOCOL_VERSION.0);
     }
     (status, body)
 }
@@ -335,7 +336,7 @@ fn seed_origin_route(
     spec: &NormalizedSpec,
 ) -> RequestId {
     let request = RequestId::new();
-    Store::open(&origin.home.join("homebased.sqlite"))
+    Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_origin_route(&OriginRoute {
             request,
@@ -351,10 +352,10 @@ fn seed_origin_route(
                 cwd: origin.user_home.clone(),
                 codex: PathBuf::from("/bin/true").into(),
             },
-            spec: spec.clone().into(),
+            spec: spec.clone(),
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         })
@@ -442,7 +443,7 @@ fn origin_socket_submission_retries_and_keeps_callbacks_local() {
     );
     let retry: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(retry["id"], body["id"]);
-    let route = Store::open(&origin.home.join("homebased.sqlite"))
+    let route = Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .origin_route_by_request(request)
         .unwrap()
@@ -452,7 +453,7 @@ fn origin_socket_submission_retries_and_keeps_callbacks_local() {
     assert_eq!(route.callback.codex.path(), Some(codex.as_path()));
     assert!(matches!(route.submission, SubmissionState::Accepted));
     assert!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -523,7 +524,7 @@ fn concurrent_remote_submissions_with_one_request_uuid_share_the_first_task() {
     assert_eq!(second["request_id"], request.0.to_string());
 
     let task: TaskId = first["id"].as_str().unwrap().parse().unwrap();
-    let origin_store = Store::open(&origin.home.join("homebased.sqlite")).unwrap();
+    let origin_store = Store::open(&origin.home.join(homebased::home::DB_NAME)).unwrap();
     let route = origin_store
         .origin_route_by_request(request)
         .unwrap()
@@ -531,7 +532,7 @@ fn concurrent_remote_submissions_with_one_request_uuid_share_the_first_task() {
     assert_eq!(route.task, task);
     assert!(matches!(route.submission, SubmissionState::Accepted));
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(task)
             .unwrap()
@@ -557,7 +558,7 @@ fn explicit_local_machine_name_is_rejected_as_a_remote_selector() {
             .contains("omit machine")
     );
     assert!(
-        Store::open(&daemon.home.join("homebased.sqlite"))
+        Store::open(&daemon.home.join(homebased::home::DB_NAME))
             .unwrap()
             .list_tasks(&[], None)
             .unwrap()
@@ -605,7 +606,7 @@ fn unknown_origin_route_resolves_by_identity_or_abandon() {
     assert_eq!(error["error"]["code"], "submission_outcome_unknown");
     assert_eq!(error["error"]["input"]["task_id"], absent_task.to_string());
     assert!(matches!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .origin_route_by_task(absent_task)
             .unwrap()
@@ -643,7 +644,7 @@ fn unknown_origin_route_resolves_by_identity_or_abandon() {
     assert_eq!(error["error"]["code"], "machine_unavailable");
     assert_eq!(error["error"]["retryable"], true);
     assert!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .origin_route_by_request(before)
             .unwrap()
@@ -712,14 +713,14 @@ fn remote_dry_run_expands_executor_home_without_identity() {
     let error: Value = serde_json::from_slice(&missing_program.stderr).unwrap();
     assert_eq!(error["error"]["code"], "executable_missing");
     assert!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .list_tasks(&[], None)
             .unwrap()
             .is_empty()
     );
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .list_tasks(&[], None)
             .unwrap()
@@ -751,7 +752,7 @@ fn dropped_local_socket_response_reuses_the_allocated_task() {
     write!(socket, "POST /v1/tasks HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
     socket.write_all(&body).unwrap();
     let routed = wait_until(Duration::from_secs(5), || {
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .origin_route_by_request(request)
             .unwrap()
@@ -765,14 +766,14 @@ fn dropped_local_socket_response_reuses_the_allocated_task() {
         let _ = socket.read_to_string(&mut response);
         panic!("socket request made no route: {response}");
     }
-    let task = Store::open(&origin.home.join("homebased.sqlite"))
+    let task = Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .origin_route_by_request(request)
         .unwrap()
         .unwrap()
         .task;
     assert!(wait_until(Duration::from_secs(5), || Store::open(
-        &executor.home.join("homebased.sqlite")
+        &executor.home.join(homebased::home::DB_NAME)
     )
     .unwrap()
     .executor_identity(task)
@@ -787,14 +788,14 @@ fn dropped_local_socket_response_reuses_the_allocated_task() {
     );
     let body: Value = serde_json::from_slice(&retry.stdout).unwrap();
     let returned: TaskId = body["id"].as_str().unwrap().parse().unwrap();
-    let route = Store::open(&origin.home.join("homebased.sqlite"))
+    let route = Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .origin_route_by_request(request)
         .unwrap()
         .unwrap();
     assert_eq!(route.task, returned);
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(task)
             .unwrap()
@@ -813,7 +814,7 @@ fn restart_resolves_a_route_saved_before_send() {
     origin.restart();
     assert!(wait_until(Duration::from_secs(10), || {
         matches!(
-            Store::open(&origin.home.join("homebased.sqlite"))
+            Store::open(&origin.home.join(homebased::home::DB_NAME))
                 .unwrap()
                 .origin_route_by_request(request)
                 .unwrap()
@@ -822,7 +823,7 @@ fn restart_resolves_a_route_saved_before_send() {
             SubmissionState::Rejected { .. }
         )
     }));
-    let identity = Store::open(&executor.home.join("homebased.sqlite"))
+    let identity = Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .executor_identity(task)
         .unwrap()
@@ -832,7 +833,7 @@ fn restart_resolves_a_route_saved_before_send() {
         if tombstone.reason == "abandoned_before_acceptance")
     );
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -894,7 +895,7 @@ async fn remote_accept_retry_conflict_and_events_use_executor_only() {
     assert_eq!(status, 200, "{duplicate}");
     assert_eq!(duplicate["identity"]["type"], "accepted");
     assert!(wait_until(Duration::from_secs(10), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -924,7 +925,7 @@ async fn remote_accept_retry_conflict_and_events_use_executor_only() {
         .contains("remote-output")
     );
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .origin_route_by_task(task)
             .unwrap()
@@ -932,7 +933,7 @@ async fn remote_accept_retry_conflict_and_events_use_executor_only() {
     );
     assert!(!executor.user_home.join("local-callback").exists());
     assert_eq!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .inbound_events(task)
             .unwrap()
@@ -975,7 +976,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 2, "destination_machine": origin.machine_id(),
+                "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION, "destination_machine": origin.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task, "spec": spec
             }),
         )
@@ -983,7 +984,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
         .unwrap();
     assert_eq!(wrong.status.as_u16(), 409);
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(task)
             .unwrap()
@@ -1009,7 +1010,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     assert_eq!(error["error"]["input"]["remote"]["min"], 99);
     assert_eq!(error["error"]["input"]["remote"]["max"], 99);
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(incompatible)
             .unwrap()
@@ -1019,7 +1020,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     for api_version in [Some(99), None] {
         let task = TaskId::new();
         let mut request = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": CLUSTER_PROTOCOL_VERSION,
             "destination_machine": executor.machine_id(),
             "origin_machine": origin.machine_id(),
             "task": task,
@@ -1037,7 +1038,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
         assert_eq!(error["api_version"], 1);
         assert_eq!(error["error"]["code"], "usage");
         assert!(
-            Store::open(&executor.home.join("homebased.sqlite"))
+            Store::open(&executor.home.join(homebased::home::DB_NAME))
                 .unwrap()
                 .executor_identity(task)
                 .unwrap()
@@ -1055,7 +1056,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions/abandon",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task
             }),
         )
@@ -1064,13 +1065,13 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     assert_eq!(abandon.status.as_u16(), 200);
     let abandon_body: Value = serde_json::from_slice(&abandon.body).unwrap();
     assert_eq!(abandon_body["api_version"], 1);
-    assert_eq!(abandon_body["protocol_version"], 2);
+    assert_eq!(abandon_body["protocol_version"], CLUSTER_PROTOCOL_VERSION.0);
     let (status, body) = post_execution(&executor, &origin, task, &spec).await;
     assert_eq!(status, 200);
     assert_eq!(body["identity"]["type"], "rejected");
     assert_eq!(body["identity"]["reason"], "abandoned_before_acceptance");
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -1084,7 +1085,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     assert_eq!(status, 200);
     assert_eq!(body["identity"]["reason"], "invalid_spec");
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(invalid)
             .unwrap()
@@ -1097,7 +1098,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": leaked_context,
                 "spec": remote_spec(&executor, vec!["/bin/echo", "never"]),
                 "callback_context": { "cwd": "/origin-only" }
@@ -1117,7 +1118,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     let (status, body) = post_execution(&executor, &origin, missing_binary, &unavailable).await;
     assert_eq!(status, 503, "{body}");
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(missing_binary)
             .unwrap()
@@ -1132,7 +1133,7 @@ async fn remote_destination_abandon_and_invalid_requests_do_not_launch() {
     assert_eq!(status, 200, "{accepted}");
     assert_eq!(accepted["identity"]["spec"]["cwd"], "~/", "{accepted}");
     assert_eq!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .require_task(home_task)
             .unwrap()
@@ -1155,7 +1156,7 @@ async fn accepted_queued_remote_task_launches_after_restart() {
     fs::create_dir_all(executor.home.join("tasks").join(task.to_string())).unwrap();
     let row = new_queued_task(NewTask {
         id: task,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: spec.thread,
         workload: homebased::invocation::persist_workload(&spec.workload),
         cwd: spec.cwd.clone(),
@@ -1166,13 +1167,13 @@ async fn accepted_queued_remote_task_launches_after_restart() {
         },
         binary: PathBuf::from("/bin/sh"),
     });
-    Store::open(&executor.home.join("homebased.sqlite"))
+    Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_remote_task(&row, &spec, origin.machine_id(), executor.machine_id())
         .unwrap();
     executor.restart();
     assert!(wait_until(Duration::from_secs(10), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -1209,7 +1210,7 @@ async fn remote_acceptance_and_abandon_have_one_winner() {
     let client = ClusterClient::default();
     let address = executor.address();
     let abandon_body = serde_json::json!({
-        "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
+        "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION, "destination_machine": executor.machine_id(),
         "origin_machine": origin.machine_id(), "task": task
     });
     let abandon = client.post_json(&address, "/v1/cluster/executions/abandon", &abandon_body);
@@ -1219,7 +1220,7 @@ async fn remote_acceptance_and_abandon_have_one_winner() {
     let (status, submitted) = submit;
     assert_eq!(status, 200, "{submitted}");
     assert_eq!(abandoned["identity"]["type"], submitted["identity"]["type"]);
-    let saved = Store::open(&executor.home.join("homebased.sqlite")).unwrap();
+    let saved = Store::open(&executor.home.join(homebased::home::DB_NAME)).unwrap();
     if submitted["identity"]["type"] == "rejected" {
         assert!(saved.get_task(task).unwrap().is_none());
         assert!(!executor.user_home.join("race-count").exists());
@@ -1244,7 +1245,7 @@ async fn lost_remote_response_retries_without_second_child() {
             &executor.address(),
             "/v1/cluster/executions",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 2, "destination_machine": executor.machine_id(),
+                "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION, "destination_machine": executor.machine_id(),
                 "origin_machine": origin.machine_id(), "task": task, "spec": spec
             }),
         )
@@ -1274,7 +1275,7 @@ async fn sender_uses_real_receiver_and_recovers_a_sequence_gap() {
     wait_for_probe(&origin.address()).await;
     let task = TaskId::new();
     seed_event(&executor, &origin, task, true, 2);
-    let store = Store::open(&executor.home.join("homebased.sqlite")).unwrap();
+    let store = Store::open(&executor.home.join(homebased::home::DB_NAME)).unwrap();
     store
         .mark_outbound_acknowledged(task, std::num::NonZeroU64::new(1).unwrap())
         .unwrap();
@@ -1282,7 +1283,7 @@ async fn sender_uses_real_receiver_and_recovers_a_sequence_gap() {
     assert!(wait_until(Duration::from_secs(12), || {
         route_state(&executor, task).acknowledged == 2
     }));
-    let inbox = Store::open(&origin.home.join("homebased.sqlite"))
+    let inbox = Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .inbound_events(task)
         .unwrap();
@@ -1297,7 +1298,7 @@ async fn sender_uses_real_receiver_and_recovers_a_sequence_gap() {
         route_state(&executor, task).state,
         EventRouteState::Acknowledged
     );
-    let mut store = Store::open(&executor.home.join("homebased.sqlite")).unwrap();
+    let mut store = Store::open(&executor.home.join(homebased::home::DB_NAME)).unwrap();
     store
         .append_outbound_event(
             task,
@@ -1322,7 +1323,7 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
     wait_for_probe(&origin.address()).await;
     let task = TaskId::new();
     seed_event(&executor, &origin, task, true, 1);
-    let event = Store::open(&executor.home.join("homebased.sqlite"))
+    let event = Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .pending_outbound_events(task)
         .unwrap()
@@ -1334,7 +1335,7 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
             &origin.address(),
             "/v1/cluster/events",
             &serde_json::json!({
-                "api_version": 1, "protocol_version": 2,
+                "api_version": 1, "protocol_version": CLUSTER_PROTOCOL_VERSION,
                 "destination_machine": origin.machine_id(), "event": event
             }),
         )
@@ -1343,7 +1344,10 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
     assert_eq!(response.status.as_u16(), 200);
     let acknowledgement: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(acknowledgement["api_version"], 1);
-    assert_eq!(acknowledgement["protocol_version"], 2);
+    assert_eq!(
+        acknowledgement["protocol_version"],
+        CLUSTER_PROTOCOL_VERSION.0
+    );
     origin.stop();
     add_peer(&executor, &origin);
     std::thread::sleep(Duration::from_secs(2));
@@ -1356,7 +1360,7 @@ async fn sender_retries_after_lost_response_and_origin_restart() {
     .acknowledged
         == 1));
     assert_eq!(
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .inbound_events(task)
             .unwrap()
@@ -1378,7 +1382,7 @@ async fn verified_route_not_found_orphans_without_discarding_events() {
     )
     .state
         == EventRouteState::Orphaned));
-    let mut store = Store::open(&executor.home.join("homebased.sqlite")).unwrap();
+    let mut store = Store::open(&executor.home.join(homebased::home::DB_NAME)).unwrap();
     store
         .append_outbound_event(
             task,
@@ -1420,7 +1424,7 @@ async fn stale_origin_address_does_not_orphan_or_redirect_events() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(route_state(&executor, task).state, EventRouteState::Pending);
     assert_eq!(
-        Store::open(&replacement.home.join("homebased.sqlite"))
+        Store::open(&replacement.home.join(homebased::home::DB_NAME))
             .unwrap()
             .inbound_events(task)
             .unwrap()
@@ -1451,7 +1455,7 @@ async fn local_origin_uses_the_durable_inbox() {
     )
     .acknowledged
         == 1));
-    let store = Store::open(&daemon.home.join("homebased.sqlite")).unwrap();
+    let store = Store::open(&daemon.home.join(homebased::home::DB_NAME)).unwrap();
     assert_eq!(store.inbound_events(task).unwrap().len(), 1);
 }
 
@@ -1507,7 +1511,7 @@ async fn new_local_reports_and_exit_use_sequenced_callbacks_across_restart() {
     let task: TaskId = response["id"].as_str().unwrap().parse().unwrap();
     let callbacks = daemon.user_home.join("callbacks");
     assert!(wait_until(Duration::from_secs(5), || Store::open(
-        &daemon.home.join("homebased.sqlite")
+        &daemon.home.join(homebased::home::DB_NAME)
     )
     .is_ok_and(|store| store
         .get_task(task)
@@ -1542,7 +1546,7 @@ async fn new_local_reports_and_exit_use_sequenced_callbacks_across_restart() {
     .is_ok_and(|text| text.lines().count() == 1)));
     fs::write(daemon.user_home.join("go"), "").unwrap();
     let settled = wait_until(Duration::from_secs(10), || {
-        let Ok(store) = Store::open(&daemon.home.join("homebased.sqlite")) else {
+        let Ok(store) = Store::open(&daemon.home.join(homebased::home::DB_NAME)) else {
             return false;
         };
         store
@@ -1552,7 +1556,7 @@ async fn new_local_reports_and_exit_use_sequenced_callbacks_across_restart() {
             && fs::read_to_string(&callbacks).is_ok_and(|text| text.lines().count() == 2)
     });
     if !settled {
-        let store = Store::open(&daemon.home.join("homebased.sqlite")).unwrap();
+        let store = Store::open(&daemon.home.join(homebased::home::DB_NAME)).unwrap();
         panic!(
             "task={:?} route={:?} outbox={:?} inbox={:?} callbacks={:?}",
             store.get_task(task).unwrap(),
@@ -2063,7 +2067,7 @@ async fn cancellation_keeps_a_terminal_execution_state() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(wait_until(Duration::from_secs(8), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -2078,7 +2082,7 @@ async fn cancellation_keeps_a_terminal_execution_state() {
     assert_eq!(response["receipt"]["state"]["state"], "already_terminal");
     assert_eq!(response["receipt"]["state"]["status"], "succeeded");
     assert_eq!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -2108,7 +2112,7 @@ async fn third_machine_refuses_to_cancel_without_the_origin_route() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(wait_until(Duration::from_secs(5), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -2124,14 +2128,14 @@ async fn third_machine_refuses_to_cancel_without_the_origin_route() {
     assert!(!ok, "{body}");
     assert_eq!(body["error"]["code"], "cluster_lookup_incomplete");
     assert!(
-        Store::open(&viewer.home.join("homebased.sqlite"))
+        Store::open(&viewer.home.join(homebased::home::DB_NAME))
             .unwrap()
             .pending_cancellation_requests()
             .unwrap()
             .is_empty()
     );
     assert!(wait_until(Duration::from_secs(2), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -2150,7 +2154,7 @@ async fn cancellation_lookup_offline_gap_does_not_claim_acceptance() {
     assert!(!ok, "{body}");
     assert_eq!(body["error"]["code"], "cluster_lookup_incomplete");
     assert!(
-        Store::open(&viewer.home.join("homebased.sqlite"))
+        Store::open(&viewer.home.join(homebased::home::DB_NAME))
             .unwrap()
             .pending_cancellation_requests()
             .unwrap()
@@ -2165,7 +2169,7 @@ async fn post_cancel_wire(executor: &Daemon, request: CancellationRequestIdentit
             "/v1/cluster/executions/cancel",
             &serde_json::json!({
                 "api_version": 1,
-                "protocol_version": 2,
+                "protocol_version": CLUSTER_PROTOCOL_VERSION,
                 "request": request,
                 "target": {"type": "execution", "request_id": RequestId::new()},
             }),
@@ -2176,7 +2180,7 @@ async fn post_cancel_wire(executor: &Daemon, request: CancellationRequestIdentit
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     if status == 200 {
         assert_eq!(body["api_version"], 1);
-        assert_eq!(body["protocol_version"], 2);
+        assert_eq!(body["protocol_version"], CLUSTER_PROTOCOL_VERSION.0);
     }
     (status, body)
 }
@@ -2208,12 +2212,12 @@ async fn cancellation_requester_restart_and_lost_reply_reuse_one_receipt() {
     let first = cancel_socket(&origin, task).await;
     assert_eq!(first["delivery"]["state"], "pending");
     origin.stop();
-    let saved = Store::open(&origin.home.join("homebased.sqlite"))
+    let saved = Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .pending_cancellation_requests()
         .unwrap();
     assert_eq!(saved.len(), 1);
-    let receipt = Store::open(&executor.home.join("homebased.sqlite"))
+    let receipt = Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .receive_cancellation(saved[0].identity())
         .unwrap();
@@ -2230,7 +2234,7 @@ async fn cancellation_requester_restart_and_lost_reply_reuse_one_receipt() {
         "prevented_before_start"
     );
     assert_eq!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .pending_executor_cancellations()
             .unwrap()
@@ -2255,7 +2259,7 @@ async fn executor_restart_resumes_received_cancellation() {
     assert_eq!(status, 200, "{body}");
     executor.stop();
     let request = cancel_identity(&origin, &origin, &executor, task);
-    let receipt = Store::open(&executor.home.join("homebased.sqlite"))
+    let receipt = Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .receive_cancellation(request)
         .unwrap();
@@ -2265,7 +2269,7 @@ async fn executor_restart_resumes_received_cancellation() {
     ));
     executor.restart();
     assert!(wait_until(Duration::from_secs(10), || {
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .pending_executor_cancellations()
             .unwrap()
@@ -2285,13 +2289,13 @@ async fn duplicate_requesters_and_terminal_identity_keep_original_outcome() {
     let second = Daemon::start("cancel-second", true);
     let executor = Daemon::start("cancel-compact-owner", true);
     let task = TaskId::new();
-    Store::open(&executor.home.join("homebased.sqlite"))
+    Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .accept_execution(&ExecutionRecord {
             task,
             origin_machine: first.machine_id(),
             execution_machine: executor.machine_id(),
-            spec: remote_spec(&executor, vec!["/bin/true"]).into(),
+            spec: remote_spec(&executor, vec!["/bin/true"]),
             state: ProcessStatus::Succeeded,
         })
         .unwrap();
@@ -2308,7 +2312,7 @@ async fn duplicate_requesters_and_terminal_identity_keep_original_outcome() {
     assert_eq!(status, 200, "{second_reply}");
     assert_eq!(second_reply["receipt"]["state"]["status"], "succeeded");
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .get_task(task)
             .unwrap()
@@ -2359,7 +2363,7 @@ async fn cancellation_rejects_wrong_destination_and_version_without_tombstone() 
     assert_eq!(error["api_version"], 1);
     assert_eq!(error["error"]["code"], "cluster_protocol_incompatible");
     assert!(
-        Store::open(&executor.home.join("homebased.sqlite"))
+        Store::open(&executor.home.join(homebased::home::DB_NAME))
             .unwrap()
             .executor_identity(task)
             .unwrap()
@@ -2371,7 +2375,7 @@ fn seed_inspection_row(daemon: &Daemon, task: TaskId) {
     let spec = remote_spec(daemon, vec!["/bin/echo", "saved-output"]);
     let row = new_queued_task(NewTask {
         id: task,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: spec.thread,
         workload: homebased::invocation::persist_workload(&spec.workload),
         cwd: spec.cwd,
@@ -2382,7 +2386,7 @@ fn seed_inspection_row(daemon: &Daemon, task: TaskId) {
         },
         binary: PathBuf::from("/bin/echo"),
     });
-    Store::open(&daemon.home.join("homebased.sqlite"))
+    Store::open(&daemon.home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_task(&row)
         .unwrap();
@@ -2478,7 +2482,7 @@ async fn route_cache_survives_offline_executor_without_invented_unknown_status()
             status: ProcessStatus::Running,
         },
     };
-    Store::open(&origin.home.join("homebased.sqlite"))
+    Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .accept_inbound_event(&event)
         .unwrap();
@@ -2489,7 +2493,7 @@ async fn route_cache_survives_offline_executor_without_invented_unknown_status()
     assert_eq!(unknown["submission"]["type"], "acceptance_unknown");
     assert_eq!(unknown["availability"], "executor_unavailable");
     assert!(unknown["last_update"].as_str().is_some());
-    Store::open(&origin.home.join("homebased.sqlite"))
+    Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .resolve_origin_route(task, SubmissionState::Accepted)
         .unwrap();
@@ -2543,7 +2547,7 @@ async fn inspection_retains_rejection_and_compact_accepted_state() {
     wait_for_probe(&executor.address()).await;
     add_peer(&viewer, &executor);
     let rejected = TaskId::new();
-    Store::open(&executor.home.join("homebased.sqlite"))
+    Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .reject_execution(&homebased::submission::RejectionTombstone {
             task: rejected,
@@ -2560,13 +2564,13 @@ async fn inspection_retains_rejection_and_compact_accepted_state() {
     assert_eq!(log["error"]["code"], "task_not_started");
     let accepted = TaskId::new();
     let spec = remote_spec(&executor, vec!["/bin/echo", "done"]);
-    Store::open(&executor.home.join("homebased.sqlite"))
+    Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .accept_execution(&ExecutionRecord {
             task: accepted,
             origin_machine: viewer.machine_id(),
             execution_machine: executor.machine_id(),
-            spec: spec.into(),
+            spec,
             state: ProcessStatus::Succeeded,
         })
         .unwrap();
@@ -2708,7 +2712,7 @@ async fn direct_message_retry_reuses_receipt() {
     let message_id = MessageId::new();
     let request = serde_json::json!({
         "api_version": 1,
-        "protocol_version": 2,
+        "protocol_version": CLUSTER_PROTOCOL_VERSION,
         "message_id": message_id,
         "destination_machine": receiver.machine_id(),
         "source": {
@@ -2727,33 +2731,48 @@ async fn direct_message_retry_reuses_receipt() {
     let (status, failed) = post_message(&receiver, &request).await;
     assert_eq!(status, 503, "{failed}");
     assert_eq!(failed["error"]["code"], "message_delivery_failed");
-    let first_attempt = Store::open(&receiver.home.join("homebased.sqlite"))
+    let first_attempt = Store::open(&receiver.home.join(homebased::home::DB_NAME))
         .unwrap()
         .message_delivery(message_id)
         .unwrap();
-    assert_eq!(first_attempt.attempt.unwrap().request.protocol_version, 2);
+    assert_eq!(
+        first_attempt.attempt.unwrap().request.protocol_version,
+        CLUSTER_PROTOCOL_VERSION.0
+    );
     assert!(first_attempt.receipt.is_none());
 
     fs::remove_file(fail_marker).unwrap();
     let (status, delivered) = post_message(&receiver, &request).await;
     assert_eq!(status, 200, "{delivered}");
-    assert_eq!(delivered["protocol_version"], 2);
-    assert_eq!(delivered["receipt"]["protocol_version"], 2);
-    let delivery = Store::open(&receiver.home.join("homebased.sqlite"))
+    assert_eq!(delivered["protocol_version"], CLUSTER_PROTOCOL_VERSION.0);
+    assert_eq!(
+        delivered["receipt"]["protocol_version"],
+        CLUSTER_PROTOCOL_VERSION.0
+    );
+    let delivery = Store::open(&receiver.home.join(homebased::home::DB_NAME))
         .unwrap()
         .message_delivery(message_id)
         .unwrap();
-    assert_eq!(delivery.attempt.unwrap().request.protocol_version, 2);
-    assert_eq!(delivery.receipt.unwrap().protocol_version, 2);
+    assert_eq!(
+        delivery.attempt.unwrap().request.protocol_version,
+        CLUSTER_PROTOCOL_VERSION.0
+    );
+    assert_eq!(
+        delivery.receipt.unwrap().protocol_version,
+        CLUSTER_PROTOCOL_VERSION.0
+    );
 
     let (status, retried) = post_message(&receiver, &request).await;
     assert_eq!(status, 200, "{retried}");
     assert_eq!(retried["receipt"], delivered["receipt"]);
-    let saved = Store::open(&receiver.home.join("homebased.sqlite"))
+    let saved = Store::open(&receiver.home.join(homebased::home::DB_NAME))
         .unwrap()
         .message_delivery(message_id)
         .unwrap();
-    assert_eq!(saved.receipt.unwrap().protocol_version, 2);
+    assert_eq!(
+        saved.receipt.unwrap().protocol_version,
+        CLUSTER_PROTOCOL_VERSION.0
+    );
     assert_eq!(
         fs::read_to_string(receiver.home.join("message-queue.log"))
             .unwrap()
@@ -2774,7 +2793,7 @@ async fn direct_message_retry_reuses_receipt() {
         "cluster_protocol_incompatible"
     );
     assert!(
-        Store::open(&receiver.home.join("homebased.sqlite"))
+        Store::open(&receiver.home.join(homebased::home::DB_NAME))
             .unwrap()
             .message_delivery(unsupported_id)
             .unwrap()
@@ -2858,7 +2877,7 @@ fn remote_submit_with_a_missing_executor_cwd_is_a_typed_rejection() {
         assert_eq!(error["error"]["input"]["value"], "~/not-present");
         assert_eq!(error["error"]["input"]["problem"], "not_found");
     }
-    let rejected: String = rusqlite::Connection::open(executor.home.join("homebased.sqlite"))
+    let rejected: String = rusqlite::Connection::open(executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .query_row("SELECT identity_json FROM executor_identities", [], |row| {
             row.get(0)
@@ -2911,7 +2930,7 @@ fn gate_command(gate: &Path) -> String {
 }
 
 fn origin_route(origin: &Daemon, task: TaskId) -> OriginRoute {
-    Store::open(&origin.home.join("homebased.sqlite"))
+    Store::open(&origin.home.join(homebased::home::DB_NAME))
         .unwrap()
         .origin_route_by_task(task)
         .unwrap()
@@ -2919,7 +2938,7 @@ fn origin_route(origin: &Daemon, task: TaskId) -> OriginRoute {
 }
 
 fn accepted_on_executor(executor: &Daemon, task: TaskId) -> Option<ExecutionRecord> {
-    match Store::open(&executor.home.join("homebased.sqlite"))
+    match Store::open(&executor.home.join(homebased::home::DB_NAME))
         .unwrap()
         .executor_identity(task)
         .unwrap()
@@ -2963,7 +2982,7 @@ fn held_remote_task_launches_after_its_remote_dependency_succeeds() {
     let record = accepted_on_executor(&executor, held).unwrap();
     let route = origin_route(&origin, held);
     assert_eq!(record.spec, route.spec);
-    let wire = serde_json::to_value(record.current_spec().unwrap()).unwrap();
+    let wire = serde_json::to_value(&record.spec).unwrap();
     assert!(wire.get("after").is_none());
     assert!(wait_until(Duration::from_secs(10), || matches!(
         origin_route(&origin, held).submission,
@@ -3001,7 +3020,7 @@ fn held_remote_task_waits_for_an_unreachable_executor_then_launches() {
     executor.stop();
     fs::write(&gate, "").unwrap();
     assert!(wait_until(Duration::from_secs(10), || {
-        Store::open(&origin.home.join("homebased.sqlite"))
+        Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
             .dependency_states(&[dependency])
             .unwrap()

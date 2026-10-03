@@ -66,10 +66,10 @@ pub(super) async fn submit(
         execution_machine: machine,
         thread: body.spec.thread,
         callback,
-        spec: body.spec.into(),
+        spec: body.spec,
         submission: SubmissionState::AcceptanceUnknown,
         last_execution_state: None,
-        last_updated_at: Some(chrono::Utc::now()),
+        last_updated_at: chrono::Utc::now(),
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
@@ -133,14 +133,7 @@ async fn check_retry(
     route: &OriginRoute,
     body: &SubmitBody,
 ) -> Result<(), AppError> {
-    if !matches!(route.submission, SubmissionState::Held { .. }) {
-        ensure_direct_route(route)?;
-    }
-    let saved_spec = route
-        .spec
-        .current()
-        .ok_or_else(|| conflict(route, "migrated local task has no remote request"))?;
-    if *saved_spec != body.spec {
+    if route.spec != body.spec {
         return Err(conflict(
             route,
             "request UUID has different normalized content",
@@ -211,10 +204,7 @@ fn execution_wire(
     protocol: ClusterProtocolVersion,
     machine: MachineId,
 ) -> Result<SubmitExecution, AppError> {
-    let spec = route
-        .spec
-        .current()
-        .ok_or_else(|| conflict(route, "migrated local task has no remote request"))?;
+    let spec = &route.spec;
     Ok(SubmitExecution {
         api_version: API_VERSION,
         protocol_version: protocol.0,
@@ -282,12 +272,9 @@ fn is_definite_rejection(error: &AppError) -> bool {
 
 /// Error for an executor refusal, typed when the executor refused a host input
 fn rejected(route: &OriginRoute, reason: &str) -> AppError {
-    match (
-        spec::HostInputRejection::parse(reason),
-        route.current_spec(),
-    ) {
-        (Some(rejection), Some(spec)) => rejection.into_error(spec),
-        _ => AppError::SubmissionRejected {
+    match spec::HostInputRejection::parse(reason) {
+        Some(rejection) => rejection.into_error(&route.spec),
+        None => AppError::SubmissionRejected {
             request: route.request,
             task: route.task,
             reason: reason.to_owned(),
@@ -323,7 +310,6 @@ async fn finish_saved(
 }
 
 async fn reconcile(state: &AppState, route: OriginRoute) -> Result<(TaskId, TaskStatus), AppError> {
-    ensure_direct_route(&route)?;
     let fleet = state
         .fleet
         .handle()
@@ -394,14 +380,6 @@ async fn resolve_identity(
     route: OriginRoute,
     identity: Option<ExecutorIdentity>,
 ) -> Result<(TaskId, TaskStatus), AppError> {
-    if !matches!(
-        route.submission,
-        SubmissionState::Held {
-            phase: HeldPhase::Launching
-        }
-    ) {
-        ensure_direct_route(&route)?;
-    }
     let (outcome, status) = match identity {
         Some(ExecutorIdentity::Accepted(record)) => {
             if record.task != route.task
@@ -504,13 +482,6 @@ pub(super) fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppEr
     }
 }
 
-fn ensure_direct_route(route: &OriginRoute) -> Result<(), AppError> {
-    if route.spec.current().is_none() {
-        return Err(conflict(route, "migrated local task has no remote request"));
-    }
-    Ok(())
-}
-
 /// Ask the execution owner to validate and expand a remote invocation without identity storage
 pub(super) async fn dry_run(
     state: &AppState,
@@ -611,7 +582,7 @@ mod tests {
     use crate::domain::{API_VERSION, TaskEnv, TaskId};
     use crate::error::AppError;
     use crate::fleet::http::ClusterResponse;
-    use crate::fleet::protocol::ClusterProtocolVersion;
+    use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
     use crate::machine::MachineId;
     use crate::spec::NormalizedSpec;
     use crate::submission::{
@@ -644,10 +615,10 @@ mod tests {
                 cwd: Path::new("/tmp").to_path_buf(),
                 codex: CallbackExecutable::available(Path::new("/bin/echo").to_path_buf()),
             },
-            spec: spec.into(),
+            spec,
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: None,
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         }
@@ -670,20 +641,20 @@ mod tests {
     #[test]
     fn identity_decoder_accepts_the_selected_protocol_version() {
         let route = direct_route();
-        let selected = ClusterProtocolVersion(2);
+        let selected = CLUSTER_PROTOCOL_VERSION;
 
-        let identity = decode_identity(&route, identity_response(2), selected).unwrap();
+        let identity = decode_identity(&route, identity_response(selected.0), selected).unwrap();
 
         assert_eq!(identity.protocol_version, selected.0);
         assert!(matches!(
-            decode_identity(&route, identity_response(1), selected),
+            decode_identity(&route, identity_response(selected.0 - 1), selected),
             Err(AppError::SubmissionOutcomeUnknown { .. })
         ));
     }
 
     #[test]
     fn preview_decoder_accepts_the_selected_protocol_version() {
-        let selected = ClusterProtocolVersion(2);
+        let selected = CLUSTER_PROTOCOL_VERSION;
         let preview = PreviewBody {
             api_version: API_VERSION,
             protocol_version: selected.0,
@@ -693,7 +664,10 @@ mod tests {
         };
         let value = serde_json::to_value(preview).unwrap();
 
-        assert_eq!(decode_preview(value, selected).unwrap().protocol_version, 2);
+        assert_eq!(
+            decode_preview(value, selected).unwrap().protocol_version,
+            selected.0
+        );
         let mismatched = serde_json::json!({
             "api_version": API_VERSION,
             "protocol_version": 1,

@@ -120,7 +120,7 @@ export function resourceNames(resources: readonly ResourceRecord[]): Map<string,
 /** Step progress: the step running or next to run, of all steps. */
 export function stepLabel(job: JobRecord): string {
 	const total = job.spec.steps.length;
-	const current = job.state.state === 'succeeded' ? total : Math.min(job.next_step + 1, total);
+	const current = job.state.state === 'succeeded' ? total : Math.min(job.step + 1, total);
 	return `step ${current}/${total}`;
 }
 
@@ -143,11 +143,11 @@ export function stepProgress(
 			if (index === failedStep) return 'failed';
 			return failedStep !== null && index < failedStep ? 'done' : 'skipped';
 		case 'cancelled':
-			return index < job.next_step ? 'done' : 'skipped';
+			return index < job.step ? 'done' : 'skipped';
 		case 'queued':
 		case 'active':
-			if (index < job.next_step) return 'done';
-			return index === job.next_step ? 'current' : 'pending';
+			if (index < job.step) return 'done';
+			return index === job.step ? 'current' : 'pending';
 	}
 }
 

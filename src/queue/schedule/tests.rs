@@ -110,6 +110,7 @@ impl Machine {
             task,
             run_number: RunNumber::FIRST,
             step: StepIndex::FIRST,
+            resume: false,
             phase,
         });
     }

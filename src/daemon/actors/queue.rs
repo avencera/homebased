@@ -303,20 +303,23 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
         .ok_or_else(|| AppError::Internal {
             message: format!("scheduled job {job} is missing"),
         })?;
+    let env = call(&args.store, |reply| StoreMsg::QueueJobEnv {
+        id: job,
+        reply,
+    })
+    .await?;
     let step = record
         .spec
         .steps
-        .get(record.next_step)
+        .get(record.step)
         .ok_or_else(|| AppError::Internal {
             message: format!("scheduled job {job} has no next step"),
         })?;
     let binary = match step {
-        StepWorkload::Task(workload) => resolve_executable(
-            workload.command.program(),
-            &record.env.path,
-            &record.spec.cwd,
-        ),
-        StepWorkload::Container(_) => resolve_docker_binary(&record.env.path, &record.spec.cwd),
+        StepWorkload::Task(workload) => {
+            resolve_executable(workload.command.program(), &env.path, &record.spec.cwd)
+        }
+        StepWorkload::Container(_) => resolve_docker_binary(&env.path, &record.spec.cwd),
     };
     let task = TaskId::new();
     let binary = match binary {

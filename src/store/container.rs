@@ -134,7 +134,7 @@ mod tests {
         store
             .insert_task(&new_queued_task(NewTask {
                 id,
-                name: None,
+                name: crate::domain::TaskName::parse("test task").unwrap(),
                 thread: ThreadId(uuid::Uuid::now_v7()),
                 workload: Workload::Container(Box::new(workload)),
                 cwd: "/tmp".into(),

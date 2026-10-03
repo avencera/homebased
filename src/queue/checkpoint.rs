@@ -29,8 +29,6 @@ pub struct Checkpoint {
     pub run: ActiveRun,
     /// Assigned lane and optional device
     pub resource: Resource,
-    /// Whether this attempt resumes a yielded step
-    pub resume: bool,
     /// What this attempt's step runs
     pub step: StepKind,
 }
@@ -147,7 +145,10 @@ impl Checkpoint {
             (run_env::JOB_DIR, job_dir),
             (run_env::RUN_NUMBER, self.run.run_number.to_string()),
             (run_env::STEP_INDEX, self.run.step.to_string()),
-            (run_env::RESUME, if self.resume { "1" } else { "0" }.into()),
+            (
+                run_env::RESUME,
+                if self.run.resume { "1" } else { "0" }.into(),
+            ),
             (run_env::YIELD_FILE, yield_file),
             (run_env::RESOURCE, self.resource.name.to_string()),
         ];

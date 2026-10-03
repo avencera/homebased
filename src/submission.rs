@@ -20,7 +20,7 @@ pub enum CallbackExecutable {
         /// Absolute path to the Codex executable
         path: PathBuf,
     },
-    /// Resolution failed when the route was accepted or a legacy task was migrated
+    /// Resolution failed when the route was accepted
     Unavailable {
         /// Durable reason shown when callback delivery settles as failed
         reason: String,
@@ -56,104 +56,6 @@ impl CallbackExecutable {
 impl From<PathBuf> for CallbackExecutable {
     fn from(path: PathBuf) -> Self {
         Self::available(path)
-    }
-}
-
-/// Durable identity for a submitted or migrated task
-///
-/// Current requests keep the direct wire shape; migrated rows use an explicit
-/// discriminant so they cannot enter request retry checks
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PersistedSpec {
-    /// Caller-provided normalized request content
-    Current(Box<NormalizedSpec>),
-    /// Historical local row with no complete normalized request evidence
-    MigratedLocal,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    content = "spec",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-enum TaggedPersistedSpec {
-    Current(Box<NormalizedSpec>),
-    MigratedLocal,
-}
-
-impl Serialize for PersistedSpec {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Current(spec) => spec.serialize(serializer),
-            Self::MigratedLocal => TaggedPersistedSpec::MigratedLocal.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for PersistedSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Compatible {
-            Tagged(TaggedPersistedSpec),
-            LegacyCurrent(NormalizedSpec),
-        }
-
-        Ok(match Compatible::deserialize(deserializer)? {
-            Compatible::Tagged(TaggedPersistedSpec::Current(spec)) => Self::Current(spec),
-            Compatible::LegacyCurrent(spec) => Self::Current(Box::new(spec)),
-            Compatible::Tagged(TaggedPersistedSpec::MigratedLocal) => Self::MigratedLocal,
-        })
-    }
-}
-
-impl From<NormalizedSpec> for PersistedSpec {
-    fn from(spec: NormalizedSpec) -> Self {
-        Self::Current(Box::new(spec))
-    }
-}
-
-impl PersistedSpec {
-    /// Borrow normalized retry content when this identity came from a request
-    #[must_use]
-    pub fn current(&self) -> Option<&NormalizedSpec> {
-        match self {
-            Self::Current(spec) => Some(spec),
-            Self::MigratedLocal => None,
-        }
-    }
-
-    /// Mutably borrow normalized request content when it exists
-    #[must_use]
-    pub fn current_mut(&mut self) -> Option<&mut NormalizedSpec> {
-        match self {
-            Self::Current(spec) => Some(spec),
-            Self::MigratedLocal => None,
-        }
-    }
-
-    /// Consume normalized retry content when this identity came from a request
-    #[must_use]
-    pub fn into_current(self) -> Option<NormalizedSpec> {
-        match self {
-            Self::Current(spec) => Some(*spec),
-            Self::MigratedLocal => None,
-        }
-    }
-
-    fn valid_for_owners(&self, origin: MachineId, execution: MachineId) -> bool {
-        match self {
-            Self::Current(_) => true,
-            Self::MigratedLocal => origin == execution,
-        }
     }
 }
 
@@ -231,12 +133,6 @@ pub enum RouteError {
     /// A held route cannot have accepted executor events
     #[error("route phase does not agree with its event cursor")]
     InvalidEventCursor,
-    /// A migrated local identity names different origin and execution machines
-    #[error("migrated local identity must have the same origin and execution machine")]
-    InvalidMigratedIdentity,
-    /// A migrated local route is always an accepted execution
-    #[error("migrated local origin route must have accepted submission state")]
-    InvalidMigratedRouteState,
 }
 
 /// Definitive result or unresolved sent request
@@ -257,7 +153,7 @@ pub enum SubmissionState {
 }
 
 /// Origin-owned request mapping and callback route
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginRoute {
     /// Caller retry UUID
@@ -273,63 +169,17 @@ pub struct OriginRoute {
     /// Origin-only callback environment and directory
     pub callback: CallbackContext,
     /// Normalized request used for conflict checks
-    pub spec: PersistedSpec,
+    pub spec: NormalizedSpec,
     /// Submission result, independent of process state
     pub submission: SubmissionState,
     /// Last execution status learned from events
     pub last_execution_state: Option<ProcessStatus>,
-    /// Time of the last route state update, when retained by this version
-    #[serde(default)]
-    pub last_updated_at: Option<DateTime<Utc>>,
+    /// Time of the last route state update
+    pub last_updated_at: DateTime<Utc>,
     /// Last accepted event sequence
     pub last_accepted_seq: u64,
     /// Last settled callback sequence
     pub last_settled_seq: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OriginRouteFields {
-    request: RequestId,
-    task: TaskId,
-    origin_machine: MachineId,
-    execution_machine: MachineId,
-    thread: ThreadId,
-    callback: CallbackContext,
-    spec: PersistedSpec,
-    submission: SubmissionState,
-    last_execution_state: Option<ProcessStatus>,
-    #[serde(default)]
-    last_updated_at: Option<DateTime<Utc>>,
-    last_accepted_seq: u64,
-    last_settled_seq: u64,
-}
-
-impl<'de> Deserialize<'de> for OriginRoute {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        let fields = OriginRouteFields::deserialize(deserializer)?;
-        let route = Self {
-            request: fields.request,
-            task: fields.task,
-            origin_machine: fields.origin_machine,
-            execution_machine: fields.execution_machine,
-            thread: fields.thread,
-            callback: fields.callback,
-            spec: fields.spec,
-            submission: fields.submission,
-            last_execution_state: fields.last_execution_state,
-            last_updated_at: fields.last_updated_at,
-            last_accepted_seq: fields.last_accepted_seq,
-            last_settled_seq: fields.last_settled_seq,
-        };
-        route.validate().map_err(D::Error::custom)?;
-        Ok(route)
-    }
 }
 
 /// One origin route with the dependencies it was submitted with
@@ -362,12 +212,6 @@ pub struct NewHeldRoute {
 }
 
 impl OriginRoute {
-    /// Borrow normalized request content when this route came from a submit request
-    #[must_use]
-    pub fn current_spec(&self) -> Option<&NormalizedSpec> {
-        self.spec.current()
-    }
-
     /// Create a route held on its origin until its dependencies succeed
     ///
     /// The task UUID is assigned now, so the eventual launch, its retries, and
@@ -389,30 +233,19 @@ impl OriginRoute {
             execution_machine,
             thread: spec.thread,
             callback,
-            spec: spec.into(),
+            spec,
             submission: SubmissionState::Held {
                 phase: HeldPhase::Waiting,
             },
             last_execution_state: None,
-            last_updated_at: Some(Utc::now()),
+            last_updated_at: Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         }
     }
 
-    /// Validate migrated and held route invariants while leaving direct routes unchanged
+    /// Validate held route invariants; other submission states carry none
     pub fn validate(&self) -> Result<(), RouteError> {
-        if !self
-            .spec
-            .valid_for_owners(self.origin_machine, self.execution_machine)
-        {
-            return Err(RouteError::InvalidMigratedIdentity);
-        }
-        if matches!(&self.spec, PersistedSpec::MigratedLocal)
-            && !matches!(&self.submission, SubmissionState::Accepted)
-        {
-            return Err(RouteError::InvalidMigratedRouteState);
-        }
         match &self.submission {
             SubmissionState::Held { phase } => self.validate_held_route(phase),
             SubmissionState::AcceptanceUnknown
@@ -422,10 +255,7 @@ impl OriginRoute {
     }
 
     fn validate_held_route(&self, phase: &HeldPhase) -> Result<(), RouteError> {
-        let Some(spec) = self.spec.current() else {
-            return Err(RouteError::InvalidMigratedRouteState);
-        };
-        if self.thread != spec.thread {
+        if self.thread != self.spec.thread {
             return Err(RouteError::ThreadMismatch);
         }
         // no executor event can reach a route that never launched; a
@@ -445,7 +275,7 @@ impl OriginRoute {
 }
 
 /// Executor-owned accepted task identity, retained after detail cleanup
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRecord {
     /// Global task UUID
@@ -455,58 +285,9 @@ pub struct ExecutionRecord {
     /// Execution owner
     pub execution_machine: MachineId,
     /// Normalized request used for conflict checks
-    pub spec: PersistedSpec,
+    pub spec: NormalizedSpec,
     /// Retained process state
     pub state: ProcessStatus,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExecutionRecordFields {
-    task: TaskId,
-    origin_machine: MachineId,
-    execution_machine: MachineId,
-    spec: PersistedSpec,
-    state: ProcessStatus,
-}
-
-impl<'de> Deserialize<'de> for ExecutionRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        let fields = ExecutionRecordFields::deserialize(deserializer)?;
-        let record = Self {
-            task: fields.task,
-            origin_machine: fields.origin_machine,
-            execution_machine: fields.execution_machine,
-            spec: fields.spec,
-            state: fields.state,
-        };
-        if !record.has_valid_spec_owners() {
-            return Err(D::Error::custom(
-                "migrated local execution identity has different owners",
-            ));
-        }
-        Ok(record)
-    }
-}
-
-impl ExecutionRecord {
-    /// Borrow normalized retry content when this identity came from a request
-    #[must_use]
-    pub fn current_spec(&self) -> Option<&NormalizedSpec> {
-        self.spec.current()
-    }
-
-    /// Whether this identity's persisted spec is valid for the fixed owners
-    #[must_use]
-    pub fn has_valid_spec_owners(&self) -> bool {
-        self.spec
-            .valid_for_owners(self.origin_machine, self.execution_machine)
-    }
 }
 
 /// A definitive rejection that prevents delayed submission
@@ -555,58 +336,9 @@ impl PreAcceptanceRejection {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::TaskEnv;
     use std::path::PathBuf;
 
-    use super::{
-        CallbackContext, CallbackExecutable, ExecutionRecord, OriginRoute, PersistedSpec,
-        RequestId, RouteError, SubmissionState,
-    };
-    use crate::domain::{ProcessStatus, TaskId};
-    use crate::machine::MachineId;
-    use crate::spec::NormalizedSpec;
-
-    fn spec() -> NormalizedSpec {
-        serde_json::from_value(serde_json::json!({
-            "api_version": 1,
-            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "name": "legacy compatible",
-            "cwd": "/tmp",
-            "timeout": "4h",
-            "workload": { "type": "task", "command": ["echo", "hello"] }
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn persisted_spec_keeps_current_wire_shape_and_tags_migrated_rows() {
-        let normalized = spec();
-        let legacy_json = serde_json::to_value(&normalized).unwrap();
-        let legacy: PersistedSpec = serde_json::from_value(legacy_json.clone()).unwrap();
-        assert!(matches!(legacy, PersistedSpec::Current(_)));
-        assert_eq!(serde_json::to_value(&legacy).unwrap(), legacy_json);
-
-        let tagged: PersistedSpec = serde_json::from_value(serde_json::json!({
-            "type": "current",
-            "spec": legacy_json
-        }))
-        .unwrap();
-        assert!(tagged.current().is_some());
-
-        let migrated = PersistedSpec::MigratedLocal;
-        assert_eq!(
-            serde_json::to_value(&migrated).unwrap(),
-            serde_json::json!({ "type": "migrated_local" })
-        );
-        assert!(
-            serde_json::from_value::<PersistedSpec>(serde_json::json!({
-                "type": "migrated_local"
-            }))
-            .unwrap()
-            .current()
-            .is_none()
-        );
-    }
+    use super::CallbackExecutable;
 
     #[test]
     fn callback_executable_round_trips_both_typed_states() {
@@ -627,69 +359,5 @@ mod tests {
             .unwrap(),
             unavailable
         );
-    }
-
-    #[test]
-    fn old_execution_record_json_reads_normalized_spec() {
-        let normalized = spec();
-        let identity = ExecutionRecord {
-            task: TaskId::new(),
-            origin_machine: MachineId::new(),
-            execution_machine: MachineId::new(),
-            spec: normalized.clone().into(),
-            state: ProcessStatus::Queued,
-        };
-        let mut old_json = serde_json::to_value(identity).unwrap();
-        old_json["spec"] = serde_json::to_value(normalized).unwrap();
-        let old: ExecutionRecord = serde_json::from_value(old_json).unwrap();
-        assert!(matches!(old.spec, PersistedSpec::Current(_)));
-        assert!(old.has_valid_spec_owners());
-    }
-
-    #[test]
-    fn migrated_spec_requires_one_machine_owner() {
-        let spec = PersistedSpec::MigratedLocal;
-        let machine = MachineId::new();
-        assert!(spec.valid_for_owners(machine, machine));
-        assert!(!spec.valid_for_owners(machine, MachineId::new()));
-    }
-
-    #[test]
-    fn migrated_origin_route_requires_local_accepted_ownership() {
-        let machine = MachineId::new();
-        let mut route = OriginRoute {
-            request: RequestId::new(),
-            task: TaskId::new(),
-            origin_machine: machine,
-            execution_machine: machine,
-            thread: spec().thread,
-            callback: CallbackContext {
-                env: TaskEnv {
-                    path: "/bin".into(),
-                    home: "/tmp".into(),
-                },
-                cwd: PathBuf::from("/tmp"),
-                codex: CallbackExecutable::available(PathBuf::from("/bin/codex")),
-            },
-            spec: PersistedSpec::MigratedLocal,
-            submission: SubmissionState::Accepted,
-            last_execution_state: Some(ProcessStatus::Queued),
-            last_updated_at: None,
-            last_accepted_seq: 0,
-            last_settled_seq: 0,
-        };
-        assert!(route.validate().is_ok());
-
-        route.submission = SubmissionState::AcceptanceUnknown;
-        assert!(matches!(
-            route.validate(),
-            Err(RouteError::InvalidMigratedRouteState)
-        ));
-        route.submission = SubmissionState::Accepted;
-        route.execution_machine = MachineId::new();
-        assert!(matches!(
-            route.validate(),
-            Err(RouteError::InvalidMigratedIdentity)
-        ));
     }
 }

@@ -401,48 +401,62 @@ fn wait_socket_up(path: &std::path::Path, budget: Duration) -> Result<(), AppErr
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use std::time::Duration;
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::wait_terminal_and_callback;
-    use crate::domain::{
-        Agent, AgentKind, AgentWorkload, ExitReason, TaskEnv, TaskId, TaskRow, TaskState, ThreadId,
-        Workload,
-    };
+    use crate::domain::{TaskEnv, TaskId, TaskName, TaskWorkload, Workload};
+    use crate::invocation::CommandLine;
     use crate::machine::MachineId;
-    use crate::store::{NewTask, Store, new_queued_task};
+    use crate::spec::NormalizedSpec;
+    use crate::store::{CancelResult, NewTask, Store, new_queued_task};
+    use crate::submission::{CallbackExecutable, RequestId};
 
     #[test]
     fn stop_without_socket_waits_for_process_exit_but_not_callback_delivery() {
         let directory = tempdir().unwrap();
-        let db_path = directory.path().join("db");
+        let cwd = directory.path().to_path_buf();
+        let spec: NormalizedSpec = serde_json::from_value(json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "stop test",
+            "cwd": cwd,
+            "timeout": "4h",
+            "workload": { "type": "task", "command": ["/bin/true"] }
+        }))
+        .unwrap();
         let id = TaskId::new();
-        let mut row: TaskRow = new_queued_task(NewTask {
+        let row = new_queued_task(NewTask {
             id,
-            name: None,
-            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
-            workload: Workload::Agent(AgentWorkload {
-                agent: Agent::new(AgentKind::Claude, None),
-                extra_args: Vec::new(),
-                report_trailer: false,
-                resume_thread: None,
+            name: TaskName::parse("stop test").unwrap(),
+            thread: spec.thread,
+            workload: Workload::Task(TaskWorkload {
+                command: CommandLine::try_from_argv(vec!["/bin/true".into()]).unwrap(),
             }),
-            cwd: directory.path().to_path_buf(),
-            timeout: Duration::from_secs(4 * 3600),
+            cwd,
+            timeout: spec.timeout,
             env: TaskEnv {
                 path: String::new(),
                 home: directory.path().display().to_string(),
             },
             binary: std::path::PathBuf::from("/bin/true"),
         });
-        row.state = TaskState::Finished {
-            reason: ExitReason::Cancelled,
-        };
-        let mut store = Store::open(&db_path).unwrap();
-        store.insert_task(&row).unwrap();
-        store.migrate_legacy_local(MachineId::new()).unwrap();
+        let store = Store::open(&directory.path().join("db")).unwrap();
+        store
+            .insert_local_task(
+                &row,
+                &spec,
+                MachineId::new(),
+                RequestId::new(),
+                CallbackExecutable::available("/bin/true".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.request_cancel(id).unwrap(),
+            CancelResult::CancelledQueued(_)
+        ));
         assert!(store.has_pending_terminal_callbacks().unwrap());
 
         wait_terminal_and_callback(&store, Duration::ZERO, false).unwrap();

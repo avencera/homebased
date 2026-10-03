@@ -188,11 +188,6 @@ impl Actor for SupervisorActor {
         )
         .await?;
         let machine = load_or_create_machine_id(&home)?;
-        call(&store, |reply| StoreMsg::MigrateLegacyLocal {
-            machine,
-            reply,
-        })
-        .await?;
         let (callback, _callback_handle) = CallbackActor::spawn_linked(
             Some(CALLBACK_NAME.into()),
             CallbackActor,
@@ -393,7 +388,7 @@ async fn launch_remote(
     }
     let row = new_queued_task(NewTask {
         id: task,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: spec.thread,
         workload: persist_workload(&spec.workload),
         cwd,
@@ -441,7 +436,7 @@ fn matching_identity(
             *origin_machine == origin
                 && *execution_machine == execution
                 && origin != execution
-                && saved.current() == Some(spec)
+                && saved == spec
         }
         ExecutorIdentity::Rejected(record) => {
             record.origin_machine == origin && record.execution_machine == execution

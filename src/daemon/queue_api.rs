@@ -235,8 +235,6 @@ async fn submit(
                 },
                 target: None,
                 submission: JobSubmission::Unknown,
-                last_accepted_seq: 0,
-                last_settled_seq: 0,
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),

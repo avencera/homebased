@@ -31,9 +31,8 @@ function job(
 		target: { type: 'any' },
 		priority,
 		position,
-		state: { state: 'queued', next_step: 0, resume: false },
-		next_step: 0,
-		resume: false,
+		state: { state: 'queued', resume: false },
+		step: 0,
 		runs: 0,
 		created_at: '2026-10-03T00:00:00Z',
 		updated_at: '2026-10-03T00:00:00Z',
@@ -126,14 +125,14 @@ test('step progress follows the job and stops at a failed run', () => {
 		command: ['run', String(index)]
 	}));
 	const base = job('s', 'low', 1, { spec: { ...job('s', 'low', 1).spec, steps } });
-	const queued = { ...base, next_step: 1 };
+	const queued = { ...base, step: 1 };
 	assert.deepEqual(
 		[0, 1, 2].map((index) => stepProgress(queued, index, null)),
 		['done', 'current', 'pending']
 	);
 	const failed = {
 		...base,
-		next_step: 1,
+		step: 1,
 		position: null,
 		state: { state: 'failed' as const, run: 'r' }
 	};
@@ -143,7 +142,7 @@ test('step progress follows the job and stops at a failed run', () => {
 	);
 	const cancelled = {
 		...base,
-		next_step: 2,
+		step: 2,
 		position: null,
 		state: { state: 'cancelled' as const }
 	};

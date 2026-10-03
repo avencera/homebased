@@ -181,7 +181,7 @@ fn wake_failure_notice(
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{event_kind:?}"));
-    let display_name = &event.display_name;
+    let display_name = &event.name;
     let message = match failure {
         WakeFailure::Waiting { reason } => format!(
             "{display_name} ({event_name}) is waiting on {machine_name}: {reason}. Open the thread to receive it."

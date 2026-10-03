@@ -6,7 +6,7 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
-use super::{CancelResult, JobRecord, NewJob, ReservedRun};
+use super::{CancelResult, JobRecord, NewJob};
 use crate::cleanup::CleanupFailure as ProcessCleanupFailure;
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskState,
@@ -109,7 +109,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn reserve(&self, job: JobId, resource: &str) -> ReservedRun {
+    fn reserve(&self, job: JobId, resource: &str) -> ActiveRun {
         self.store
             .reserve_run(
                 self.machine,
@@ -125,13 +125,13 @@ impl Fixture {
     /// Reserve a run, start its worker, and confirm it executing
     fn start(&self, job: JobId, resource: &str, started_at: DateTime<Utc>) -> ActiveRun {
         let reserved = self.reserve(job, resource);
-        let task = reserved.run.task;
+        let task = reserved.task;
         self.store
             .cas_status(task, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap()
             .unwrap();
         self.store
-            .mark_run_executing(reserved.run.resource, task, started_at)
+            .mark_run_executing(reserved.resource, task, started_at)
             .unwrap()
     }
 
@@ -210,13 +210,13 @@ fn assert_invariants(store: &Store) {
              WHERE position IS NOT NULL ORDER BY machine, priority, position",
         )
         .unwrap();
-    let slots: Vec<(String, String, i64)> = statement
+    let slots: Vec<(String, i64, i64)> = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     let mut expected = 0;
-    let mut level: Option<(String, String)> = None;
+    let mut level: Option<(String, i64)> = None;
     for (machine, priority, position) in slots {
         let key = Some((machine, priority));
         if key != level {
@@ -559,13 +559,8 @@ fn a_preempted_job_keeps_its_slot_ahead_of_later_arrivals() {
         .unwrap();
     fixture.exit(&run, ExitReason::Exit { code: 75 });
 
-    assert_eq!(
-        fixture.job(first).state,
-        JobState::Queued {
-            next_step: StepIndex::FIRST,
-            resume: true
-        }
-    );
+    assert_eq!(fixture.job(first).state, JobState::Queued { resume: true });
+    assert_eq!(fixture.job(first).step, StepIndex::FIRST);
     assert_eq!(fixture.ids(), vec![first, later]);
     assert_eq!(fixture.events(first), vec![JobEventKind::JobPreempted]);
     assert_invariants(&fixture.store);
@@ -580,8 +575,8 @@ fn a_preempted_job_keeps_its_slot_ahead_of_later_arrivals() {
     assert_eq!(launches[0].job, first);
     let resumed = fixture.reserve(first, "gpu0");
     assert!(resumed.resume);
-    assert_eq!(resumed.run.run_number.get(), 2);
-    assert_ne!(resumed.run.task, run.task, "a resumed step gets a new task");
+    assert_eq!(resumed.run_number.get(), 2);
+    assert_ne!(resumed.task, run.task, "a resumed step gets a new task");
 }
 
 #[test]
@@ -655,10 +650,7 @@ fn every_classification_row_moves_the_stored_job() {
             cause: None,
             last_step: false,
             status: ProcessStatus::Succeeded,
-            job: |_| JobState::Queued {
-                next_step: StepIndex::new(1),
-                resume: false,
-            },
+            job: |_| JobState::Queued { resume: false },
             event: None,
         },
         Case {
@@ -666,10 +658,7 @@ fn every_classification_row_moves_the_stored_job() {
             cause: Some(Yield),
             last_step: false,
             status: ProcessStatus::Succeeded,
-            job: |_| JobState::Queued {
-                next_step: StepIndex::new(1),
-                resume: false,
-            },
+            job: |_| JobState::Queued { resume: false },
             event: None,
         },
         Case {
@@ -677,10 +666,7 @@ fn every_classification_row_moves_the_stored_job() {
             cause: Some(Restart),
             last_step: false,
             status: ProcessStatus::Succeeded,
-            job: |_| JobState::Queued {
-                next_step: StepIndex::new(1),
-                resume: false,
-            },
+            job: |_| JobState::Queued { resume: false },
             event: None,
         },
         Case {
@@ -696,10 +682,7 @@ fn every_classification_row_moves_the_stored_job() {
             cause: Some(Yield),
             last_step: true,
             status: ProcessStatus::Preempted,
-            job: |_| JobState::Queued {
-                next_step: StepIndex::FIRST,
-                resume: true,
-            },
+            job: |_| JobState::Queued { resume: true },
             event: Some(JobPreempted),
         },
         Case {
@@ -731,10 +714,7 @@ fn every_classification_row_moves_the_stored_job() {
             cause: Some(Restart),
             last_step: true,
             status: ProcessStatus::Preempted,
-            job: |_| JobState::Queued {
-                next_step: StepIndex::FIRST,
-                resume: false,
-            },
+            job: |_| JobState::Queued { resume: false },
             event: Some(JobPreempted),
         },
         Case {
@@ -864,6 +844,15 @@ fn every_classification_row_moves_the_stored_job() {
             (case.job)(run.task),
             "{label}: job transition"
         );
+        // only a step that succeeds before the last moves the job to its next step
+        let advanced = matches!(case.end, End::Exit(0))
+            && !case.last_step
+            && matches!(record.state, JobState::Queued { .. });
+        assert_eq!(
+            record.step,
+            StepIndex::new(u32::from(advanced)),
+            "{label}: job step"
+        );
         let expected_events: Vec<_> = case.event.into_iter().collect();
         assert_eq!(fixture.events(job), expected_events, "{label}: job events");
         if let Some(event) = fixture.store.job_events(job).unwrap().first() {
@@ -933,7 +922,7 @@ fn an_ordinary_exit_75_stays_a_failure() {
     let id = TaskId::new();
     let row = crate::store::new_queued_task(crate::store::NewTask {
         id,
-        name: None,
+        name: crate::domain::TaskName::parse("test task").unwrap(),
         thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
         workload: crate::domain::Workload::Task(crate::domain::TaskWorkload {
             command: crate::invocation::CommandLine::try_from_argv(vec!["true".into()]).unwrap(),
@@ -970,18 +959,13 @@ fn an_abandoned_launch_returns_the_job_to_its_slot_without_a_failure() {
     assert!(
         fixture
             .store
-            .abandon_launch(reserved.run.resource, reserved.run.task)
+            .abandon_launch(reserved.resource, reserved.task)
             .unwrap()
     );
-    let task = fixture.store.require_task(reserved.run.task).unwrap();
+    let task = fixture.store.require_task(reserved.task).unwrap();
     assert_eq!(task.status(), ProcessStatus::Failed);
-    assert_eq!(
-        fixture.job(job).state,
-        JobState::Queued {
-            next_step: StepIndex::FIRST,
-            resume: false
-        }
-    );
+    assert_eq!(fixture.job(job).state, JobState::Queued { resume: false });
+    assert_eq!(fixture.job(job).step, StepIndex::FIRST);
     assert!(fixture.events(job).is_empty());
     assert_eq!(
         fixture.run_on("gpu1").unwrap().phase,
@@ -1008,7 +992,7 @@ fn a_spawn_failure_fails_the_job() {
     fixture
         .store
         .cas_exit(
-            reserved.run.task,
+            reserved.task,
             ProcessStatus::Queued,
             &ExitReason::SpawnFailed {
                 message: "fork".into(),
@@ -1018,11 +1002,64 @@ fn a_spawn_failure_fails_the_job() {
         .unwrap();
     assert_eq!(
         fixture.job(job).state,
-        JobState::Failed {
-            run: reserved.run.task
-        }
+        JobState::Failed { run: reserved.task }
     );
     assert_eq!(fixture.events(job), vec![JobEventKind::JobFailed]);
+}
+
+/// A run reports through its job's events and owns no terminal callback, so
+/// a finished run never reads as an undelivered callback. It used to read as
+/// `pending` forever, which held `daemon stop --yes` until its time limit
+#[test]
+fn a_finished_run_owns_no_terminal_callback() {
+    let fixture = Fixture::new();
+    let job = fixture.submit(Priority::Medium);
+    let run = fixture.start(job, "gpu0", Utc::now());
+    fixture.exit(&run, ExitReason::Exit { code: 0 });
+    let row = fixture.store.require_task(run.task).unwrap();
+    assert!(row.state.is_terminal(), "{row:?}");
+
+    assert!(!fixture.store.has_pending_terminal_callbacks().unwrap());
+    let presentations = fixture.store.task_presentations(&[run.task]).unwrap();
+    assert_eq!(presentations[&run.task].terminal_callback, None);
+}
+
+/// The CLI decodes queue responses into the shapes the store serialized
+#[test]
+fn queue_responses_decode_into_their_typed_shapes() {
+    use super::interface::{JobDetail, JobList, QueueRequest, ResourceList};
+
+    let fixture = Fixture::new();
+    let job = fixture.submit_spec(spec(Priority::High, 2));
+    let waiting = fixture.submit(Priority::Low);
+    let run = fixture.start(job, "gpu0", Utc::now());
+    fixture
+        .store
+        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
+        .unwrap();
+    let env = TaskEnv {
+        path: "/bin".into(),
+        home: "/tmp".into(),
+    };
+    let request = |request: QueueRequest| {
+        fixture
+            .store
+            .queue_request(fixture.machine, &request, &env)
+            .unwrap()
+    };
+
+    let resources: ResourceList = serde_json::from_value(request(QueueRequest::Resources)).unwrap();
+    assert_eq!(
+        resources.resources,
+        fixture.store.resources_on(fixture.machine).unwrap()
+    );
+    let jobs: JobList = serde_json::from_value(request(QueueRequest::Jobs)).unwrap();
+    assert_eq!(jobs.jobs, vec![fixture.job(job), fixture.job(waiting)]);
+    let detail: JobDetail = serde_json::from_value(request(QueueRequest::Show { job })).unwrap();
+    assert_eq!(detail.job, fixture.job(job));
+    assert_eq!(detail.active_run, fixture.run_on("gpu0"));
+    assert_eq!(detail.runs.len(), 1);
+    assert_eq!(detail.runs[0].task, run.task);
 }
 
 #[test]
@@ -1092,7 +1129,7 @@ fn a_launching_run_can_be_cancelled_but_not_preempted() {
     let fixture = Fixture::new();
     let job = fixture.submit(Priority::Low);
     let reserved = fixture.reserve(job, "gpu0");
-    let run = reserved.run;
+    let run = reserved;
     assert!(matches!(
         fixture
             .store
@@ -1345,7 +1382,7 @@ fn a_job_cannot_start_again_while_its_previous_run_is_cleaned_up() {
     assert!(early.is_err());
     fixture.clean("gpu0");
     let next = fixture.reserve(job, "gpu1");
-    assert_eq!(next.run.step, StepIndex::new(1));
+    assert_eq!(next.step, StepIndex::new(1));
     assert!(!next.resume);
 }
 
@@ -1828,14 +1865,10 @@ fn queue_state_survives_reopening_the_database() {
             )
             .unwrap();
         store
-            .cas_status(
-                reserved.run.task,
-                ProcessStatus::Queued,
-                ProcessStatus::Running,
-            )
+            .cas_status(reserved.task, ProcessStatus::Queued, ProcessStatus::Running)
             .unwrap();
         let run = store
-            .mark_run_executing(resource, reserved.run.task, Utc::now())
+            .mark_run_executing(resource, reserved.task, Utc::now())
             .unwrap();
         store
             .commit_stop(resource, run.task, StopCause::Yield, Utc::now())
@@ -1893,8 +1926,7 @@ fn detection_defers_all_phases_of_an_active_fallback() {
         let run = f
             .store
             .reserve_run(machine, job, resource, task, "/bin/true".into(), Utc::now())
-            .unwrap()
-            .run;
+            .unwrap();
         if phase != "launching" {
             f.store
                 .cas_status(task, ProcessStatus::Queued, ProcessStatus::Running)
@@ -1978,7 +2010,7 @@ fn checkpoint_control_modes_ignore_umask() {
     let home = crate::home::Home::resolve(Some(f._dir.path().to_path_buf())).unwrap();
     home.ensure().unwrap();
     let job = f.submit(Priority::Low);
-    let run = f.reserve(job, "gpu0").run;
+    let run = f.reserve(job, "gpu0");
     let checkpoint = f.store.run_checkpoint(run.task).unwrap().unwrap();
     checkpoint.prepare(&home).unwrap();
     checkpoint.request_yield(&home).unwrap();
@@ -2063,13 +2095,8 @@ fn a_restart_marker_does_not_become_a_user_cancel() {
         .unwrap();
     f.store.signal_committed_run_stop(run.task).unwrap();
     f.exit(&run, ExitReason::Cancelled);
-    assert_eq!(
-        f.job(job).state,
-        JobState::Queued {
-            next_step: StepIndex::new(0),
-            resume: false
-        }
-    );
+    assert_eq!(f.job(job).state, JobState::Queued { resume: false });
+    assert_eq!(f.job(job).step, StepIndex::FIRST);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2151,8 +2178,6 @@ async fn notice_ends_during_callback_preparation() {
         spec: job.spec,
         target: None,
         submission: JobSubmission::Unknown,
-        last_accepted_seq: 0,
-        last_settled_seq: 0,
     };
     f.store.insert_job_route(&route).unwrap();
     let notice = RoutedJobEvent {
@@ -2266,10 +2291,7 @@ async fn notice_ends_during_callback_preparation() {
     assert!(!sent.contains("JOB_BLOCKED"));
     assert!(sent.contains("JOB_SUCCEEDED"));
     assert_eq!(sent.lines().count(), 1);
-    assert_eq!(
-        f.store.job_route(head).unwrap().unwrap().last_settled_seq,
-        2
-    );
+    assert_eq!(f.store.job_route_cursors(head).unwrap().unwrap().settled, 2);
     assert!(f.store.pending_job_inbox().unwrap().is_empty());
     assert_eq!(f.store.job_events(head).unwrap().len(), 2);
 }

@@ -287,7 +287,7 @@
 									</span>
 								{:else}
 									<QueueBadge state={job.state.state} />
-									{#if job.resume}
+									{#if job.state.state === 'queued' && job.state.resume}
 										<span class="text-[11px] text-muted-foreground">resumes</span>
 									{/if}
 								{/if}

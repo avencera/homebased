@@ -10,21 +10,29 @@ use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::{JobEventKind, JobId, QueueError, Target};
 use crate::store::Store;
 
+/// Sequence cursors of one job's origin inbox
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCursors {
+    /// Last event stored in the origin inbox
+    pub accepted: u64,
+    /// Last event delivered to the thread or suppressed
+    pub settled: u64,
+}
+
 impl Store {
-    /// Read the origin's job route, including its accepted and delivered cursors
+    /// Read the origin's job route
     pub fn job_route(&self, job: JobId) -> Result<Option<JobRoute>, AppError> {
-        let saved: Option<(String, i64, i64)> = self
+        let saved: Option<String> = self
             .conn
             .query_row(
-                "SELECT route_json, accepted_seq, settled_seq FROM resource_job_routes
-                 WHERE job_id = ?1",
+                "SELECT route_json FROM resource_job_routes WHERE job_id = ?1",
                 [job.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .optional()?;
         saved
-            .map(|(json, accepted, settled)| {
-                let mut route: JobRoute = serde_json::from_str(&json)?;
+            .map(|json| {
+                let route: JobRoute = serde_json::from_str(&json)?;
                 if route.job != job
                     || route.thread != route.spec.thread
                     || route.digest != route.spec.digest()?
@@ -34,9 +42,27 @@ impl Store {
                     }
                     .into());
                 }
-                route.last_accepted_seq = read_seq(accepted)?;
-                route.last_settled_seq = read_seq(settled)?;
                 Ok(route)
+            })
+            .transpose()
+    }
+
+    /// Last event stored in the job's origin inbox, and last one delivered
+    pub fn job_route_cursors(&self, job: JobId) -> Result<Option<JobCursors>, AppError> {
+        let saved: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT accepted_seq, settled_seq FROM resource_job_routes WHERE job_id = ?1",
+                [job.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        saved
+            .map(|(accepted, settled)| {
+                Ok(JobCursors {
+                    accepted: read_seq(accepted)?,
+                    settled: read_seq(settled)?,
+                })
             })
             .transpose()
     }
@@ -45,8 +71,6 @@ impl Store {
     pub fn insert_job_route(&self, route: &JobRoute) -> Result<JobRoute, AppError> {
         if route.thread != route.spec.thread
             || route.digest != route.spec.digest()?
-            || route.last_accepted_seq != 0
-            || route.last_settled_seq != 0
             || !matches!(route.submission, JobSubmission::Unknown)
             || route.target.is_some()
         {
@@ -183,6 +207,10 @@ impl Store {
             let mut route = self
                 .job_route(event.job)?
                 .ok_or(QueueError::JobNotFound { job: event.job })?;
+            let accepted = self
+                .job_route_cursors(event.job)?
+                .ok_or(QueueError::JobNotFound { job: event.job })?
+                .accepted;
             if route.origin != envelope.origin
                 || route.authority != envelope.authority
                 || route.digest != envelope.digest
@@ -195,7 +223,7 @@ impl Store {
                     message: "job sequence must be positive".into(),
                 });
             }
-            if event.seq <= route.last_accepted_seq {
+            if event.seq <= accepted {
                 let json: String = self.conn.query_row(
                     "SELECT event_json FROM resource_job_inbox WHERE job_id=?1 AND seq=?2",
                     params![event.job.to_string(), seq],
@@ -207,10 +235,8 @@ impl Store {
                 }
                 return Ok(EventAcceptance::Acknowledged { seq: event.seq });
             }
-            if event.seq != route.last_accepted_seq + 1 {
-                return Ok(EventAcceptance::Expected {
-                    seq: route.last_accepted_seq + 1,
-                });
+            if event.seq != accepted + 1 {
+                return Ok(EventAcceptance::Expected { seq: accepted + 1 });
             }
             route.submission = JobSubmission::Accepted;
             self.conn.execute(
@@ -286,8 +312,8 @@ impl Store {
         )?;
         if changed == 0
             && self
-                .job_route(job)?
-                .is_none_or(|r| r.last_settled_seq < seq)
+                .job_route_cursors(job)?
+                .is_none_or(|cursors| cursors.settled < seq)
         {
             return Err(QueueError::Invariant {
                 message: "job settlement has a sequence gap".into(),

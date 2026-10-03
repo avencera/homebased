@@ -989,7 +989,7 @@ mod tests {
             thread: ThreadId(Uuid::now_v7()),
             submission,
             last_execution_state: None,
-            last_updated_at: None,
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
             failed_events: Vec::new(),

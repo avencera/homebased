@@ -20,7 +20,7 @@ use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
 use crate::machine::MachineId;
 use crate::store::Store;
-use crate::submission::{CallbackContext, OriginRoute, PersistedSpec, RequestId, SubmissionState};
+use crate::submission::{CallbackContext, OriginRoute, RequestId, SubmissionState};
 use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
 
 const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
@@ -150,10 +150,10 @@ fn fixture(script: &str) -> (TempDir, Home, OriginRoute) {
             cwd: callback_cwd,
             codex: codex.into(),
         },
-        spec: spec.into(),
+        spec,
         submission: SubmissionState::AcceptanceUnknown,
         last_execution_state: None,
-        last_updated_at: Some(chrono::Utc::now()),
+        last_updated_at: chrono::Utc::now(),
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
@@ -165,7 +165,7 @@ fn event(route: &OriginRoute, seq: u64, callback: bool) -> TaskEvent {
         EventPayload::Callback {
             event: Box::new(serde_json::from_value(serde_json::json!({
                 "api_version": 1, "event": "TASK_REPORTED", "task": route.task,
-                "display_name": "origin inbox", "workload": { "type": "task", "command": ["echo", "remote"] },
+                "name": "origin inbox", "workload": { "type": "task", "command": ["echo", "remote"] },
                 "thread": route.thread, "cwd": "/tmp", "evidence": "/tmp/evidence",
                 "reports": [], "process": null, "next_action": "read_report"
             })).unwrap()),
@@ -614,14 +614,12 @@ async fn local_terminal_event_delivers_once_after_restart() {
 
     let (_dir, home, mut route) =
         fixture("#!/bin/sh\nprintf 'callback\\n' >> \"$HOME/commands\"\n");
-    let PersistedSpec::Current(spec) = &mut route.spec else {
-        panic!("test fixture must have normalized spec");
-    };
+    let spec = &mut route.spec;
     spec.cwd = route.callback.cwd.clone();
     let machine = MachineId::new();
     let row = new_queued_task(NewTask {
         id: route.task,
-        name: Some(spec.name.clone()),
+        name: spec.name.clone(),
         thread: route.thread,
         workload: Workload::Task(TaskWorkload {
             command: CommandLine::try_from_argv(vec!["echo".into(), "local".into()]).unwrap(),
@@ -679,7 +677,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
             .inbound_events(row.id)
             .unwrap()
             .iter()
-            .filter(|event| event.notification_required)
+            .filter(|event| event.event.payload.notification_required())
             .count(),
         1
     );

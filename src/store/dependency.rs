@@ -104,9 +104,7 @@ pub(super) fn append_unlaunched_event_on(
     route: &mut OriginRoute,
     ending: UnlaunchedEnding,
 ) -> Result<(), AppError> {
-    let spec = route.current_spec().ok_or_else(|| AppError::Internal {
-        message: format!("held task {} has no saved spec", route.task),
-    })?;
+    let spec = &route.spec;
     let (state, outcome) = match &ending {
         UnlaunchedEnding::Cancelled(_) => (ProcessStatus::Cancelled, TaskOutcome::Cancelled),
         UnlaunchedEnding::LaunchRefused(_) => (ProcessStatus::Failed, TaskOutcome::Failed),
@@ -135,22 +133,19 @@ pub(super) fn append_unlaunched_event_on(
         last_error: None,
     };
     conn.execute(
-        "INSERT INTO origin_inbox
-         (task_id,seq,origin_machine,execution_machine,event_json,notification_required,delivery_json,settled_at)
-         VALUES (?1,?2,?3,?4,?5,1,?6,NULL)",
+        "INSERT INTO origin_inbox (task_id,seq,event_json,delivery_json,settled_at)
+         VALUES (?1,?2,?3,?4,NULL)",
         params![
             route.task.to_string(),
             i64::try_from(seq.get()).map_err(|_| AppError::Internal {
                 message: "origin event sequence exceeds storage".into(),
             })?,
-            route.origin_machine.to_string(),
-            route.execution_machine.to_string(),
             serde_json::to_string(&event)?,
             serde_json::to_string(&delivery)?,
         ],
     )?;
     route.last_accepted_seq = seq.get();
-    route.last_updated_at = Some(Utc::now());
+    route.last_updated_at = Utc::now();
     save_route_on(conn, route)?;
     record_outcome_on(conn, route.task, outcome)?;
     Ok(())
@@ -184,9 +179,8 @@ fn closed_route_outcome(route: &OriginRoute) -> Option<TaskOutcome> {
 /// How a dependency with no saved outcome ended, or `None` while it runs
 ///
 /// Every terminal event saves its outcome with the route's terminal state, so
-/// a terminal state without one means the event that named it is gone. That
-/// happens only to a task that ended before outcomes were saved, and its
-/// process status cannot stand in for the outcome
+/// a terminal state without one breaks that rule. Its process status cannot
+/// stand in for the outcome, so it reads as unknown, which never releases
 fn unrecorded_outcome(route: &OriginRoute) -> Option<DependencyOutcome> {
     if let Some(outcome) = closed_route_outcome(route) {
         return Some(outcome.into());
@@ -292,15 +286,11 @@ impl Store {
     }
 
     fn unlaunched(&self, held: DependentRoute) -> Result<UnlaunchedTask, AppError> {
-        let callback = match self.terminal_callback_delivery(held.route.task)? {
-            None
-            | Some(DeliveryState::NotRequired)
-            | Some(DeliveryState::PendingDelivery { attempts: 0, .. }) => CallbackStatus::Pending,
-            Some(DeliveryState::PendingDelivery { .. }) => CallbackStatus::Sending,
-            Some(DeliveryState::AwaitingThread { .. }) => CallbackStatus::Waiting,
-            Some(DeliveryState::Delivered { .. }) => CallbackStatus::Sent,
-            Some(DeliveryState::DeliveryFailed { .. }) => CallbackStatus::Failed,
-        };
+        let callback = self
+            .terminal_callback_delivery(held.route.task)?
+            .as_ref()
+            .and_then(DeliveryState::callback_status)
+            .unwrap_or(CallbackStatus::Pending);
         Ok(UnlaunchedTask { held, callback })
     }
 
@@ -435,7 +425,7 @@ impl Store {
             route.submission = SubmissionState::Held {
                 phase: HeldPhase::Launching,
             };
-            route.last_updated_at = Some(Utc::now());
+            route.last_updated_at = Utc::now();
             save_route_on(&tx, &route)?;
         }
         tx.commit()?;

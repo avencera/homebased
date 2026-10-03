@@ -105,22 +105,22 @@
 							<a
 								href={resolve('/tasks/[id]', { id: task.id })}
 								class="truncate font-medium text-foreground after:absolute after:inset-0 after:content-[''] hover:text-primary"
-								title={task.display_name}
+								title={task.name}
 							>
-								{task.display_name}
+								{task.name}
 							</a>
 						{:else if peerHref}
 							<a
 								href={peerHref}
 								rel="external"
 								class="truncate font-medium text-foreground after:absolute after:inset-0 after:content-[''] hover:text-primary"
-								title={`${task.display_name} on ${machine}`}
+								title={`${task.name} on ${machine}`}
 							>
-								{task.display_name}
+								{task.name}
 							</a>
 						{:else}
-							<span class="truncate font-medium" title={task.display_name}>
-								{task.display_name}
+							<span class="truncate font-medium" title={task.name}>
+								{task.name}
 							</span>
 						{/if}
 						<span class="truncate font-mono text-[11px] text-muted-foreground">

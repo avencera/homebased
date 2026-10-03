@@ -65,7 +65,7 @@ impl Drop for Jobs<'_> {
                 .output();
         }
         let _ = wait_until(Duration::from_secs(12), || {
-            let Ok(store) = Store::open(&self.harness.home.join("homebased.sqlite")) else {
+            let Ok(store) = Store::open(&self.harness.home.join(homebased::home::DB_NAME)) else {
                 return false;
             };
             self.ids.iter().all(|job| {
@@ -137,11 +137,11 @@ fn callbacks(h: &Harness, job: JobId) -> Vec<Value> {
 fn wait_callbacks(h: &Harness, job: JobId, count: usize) -> Vec<Value> {
     assert!(
         wait_until(Duration::from_secs(15), || {
-            Store::open(&h.home.join("homebased.sqlite"))
+            Store::open(&h.home.join(homebased::home::DB_NAME))
                 .unwrap()
-                .job_route(job)
+                .job_route_cursors(job)
                 .unwrap()
-                .is_some_and(|route| route.last_settled_seq == count as u64)
+                .is_some_and(|cursors| cursors.settled == count as u64)
         }),
         "callbacks: {:?}",
         h.queue_messages()
@@ -198,7 +198,7 @@ fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     assert!(wait_until(
         Duration::from_secs(10),
         || show(&h, job)["runs"][1]["cleanup"]["Ok"].is_null()
-            && Store::open(&h.home.join("homebased.sqlite"))
+            && Store::open(&h.home.join(homebased::home::DB_NAME))
                 .unwrap()
                 .resources_on(machine(&h))
                 .unwrap()
@@ -343,7 +343,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
             .any(|r| r["resource"]["name"] == "gpu0")
     );
     h.stop_daemon();
-    let store = Store::open(&h.home.join("homebased.sqlite")).unwrap();
+    let store = Store::open(&h.home.join(homebased::home::DB_NAME)).unwrap();
     let machine = machine(&h);
     let resource = store.resources_on(machine).unwrap()[0].resource.id;
     let job = JobId::new();
@@ -419,8 +419,6 @@ fn attention_release_refuses_stale_identity_and_replays() {
         },
         target: None,
         submission: homebased::queue::delivery::JobSubmission::Unknown,
-        last_accepted_seq: 0,
-        last_settled_seq: 0,
     };
     store.insert_job_route(&route).unwrap();
     store
@@ -672,6 +670,9 @@ fn cli_transport_retry_keeps_generated_operation_identity() {
                 "CLI did not retry"
             );
             let mut incoming = incoming.unwrap();
+            // a stream accepted from a nonblocking listener inherits that mode
+            // on macOS, so reads would fail with WouldBlock before data arrives
+            incoming.set_nonblocking(false).unwrap();
             incoming
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -791,7 +792,7 @@ fn task_cancel_during_yield_commits_user_cancel_before_signalling() {
         .home
         .join("ready")
         .exists()));
-    let store = Store::open(&h.home.join("homebased.sqlite")).unwrap();
+    let store = Store::open(&h.home.join(homebased::home::DB_NAME)).unwrap();
     let checkpoint = store
         .resources_on(machine(&h))
         .unwrap()
