@@ -485,6 +485,7 @@ fn blocked_notice_timing_follows_the_stored_episode() {
 
     // the stored episode keeps its start across decisions and restarts
     machine.episode = Some(StoredEpisode {
+        id: 1,
         job: head,
         blocked_since: at(10),
         notified: false,
@@ -499,6 +500,7 @@ fn blocked_notice_timing_follows_the_stored_episode() {
 
     // one notice per episode
     machine.episode = Some(StoredEpisode {
+        id: 1,
         job: head,
         blocked_since: at(10),
         notified: true,
@@ -512,6 +514,7 @@ fn blocked_notice_timing_follows_the_stored_episode() {
 
     // a different stored head means a new episode for this one
     machine.episode = Some(StoredEpisode {
+        id: 1,
         job: JobId::new(),
         blocked_since: at(0),
         notified: true,

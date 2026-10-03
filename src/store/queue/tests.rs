@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use rusqlite::params;
@@ -1527,6 +1528,14 @@ fn register_refuses_a_taken_name_or_device() {
 #[test]
 fn blocked_episodes_start_end_and_send_one_notice() {
     let fixture = Fixture::new();
+    let running = fixture.submit(Priority::Low);
+    fixture.start(running, "gpu0", Utc::now());
+    let running = fixture.submit(Priority::Low);
+    fixture.start(running, "gpu1", Utc::now());
+    let thresholds = NoticeThresholds {
+        after_yield: Duration::from_secs(1),
+        after_wait: Duration::from_secs(1),
+    };
     let head = fixture.submit(Priority::High);
     let other = fixture.submit(Priority::High);
     let since = Utc::now();
@@ -1550,13 +1559,13 @@ fn blocked_episodes_start_end_and_send_one_notice() {
     assert!(
         fixture
             .store
-            .mark_blocked_notice_sent(fixture.machine, head, later)
+            .produce_job_blocked(fixture.machine, episode, thresholds, later)
             .unwrap()
     );
     assert!(
         !fixture
             .store
-            .mark_blocked_notice_sent(fixture.machine, head, later)
+            .produce_job_blocked(fixture.machine, episode, thresholds, later)
             .unwrap()
     );
     assert!(
@@ -1579,7 +1588,7 @@ fn blocked_episodes_start_end_and_send_one_notice() {
     assert!(
         !fixture
             .store
-            .mark_blocked_notice_sent(fixture.machine, head, later)
+            .produce_job_blocked(fixture.machine, episode, thresholds, later)
             .unwrap()
     );
 
@@ -1594,7 +1603,7 @@ fn blocked_episodes_start_end_and_send_one_notice() {
     assert!(
         !fixture
             .store
-            .mark_blocked_notice_sent(fixture.machine, other, later)
+            .produce_job_blocked(fixture.machine, fresh, thresholds, later)
             .unwrap()
     );
     assert_eq!(

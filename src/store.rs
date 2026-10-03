@@ -35,7 +35,7 @@ mod dependency;
 mod events;
 mod identity;
 mod message;
-mod queue;
+pub mod queue;
 pub use container::TaskContainerRecord;
 pub use dependency::{HeldCancel, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
@@ -1071,7 +1071,9 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
-            let mut statement = tx.prepare(&format!("{TASK_SELECT} ORDER BY id"))?;
+            let mut statement = tx.prepare(&format!(
+                "{TASK_SELECT} WHERE resource_job_id IS NULL ORDER BY id"
+            ))?;
             statement
                 .query_map([], parse_task_row)?
                 .collect::<Result<Vec<_>, _>>()?
@@ -1917,6 +1919,9 @@ impl Store {
     }
 
     fn produce_state_event(&self, row: &TaskRow) -> Result<(), AppError> {
+        if self.job_run_link(row.id)?.is_some() {
+            return Ok(());
+        }
         if !self.is_event_task(row.id)? {
             return Ok(());
         }
@@ -1988,7 +1993,7 @@ impl Store {
             self.require_task(id)?;
             self.conn.execute(
                 "UPDATE tasks SET cancel_requested_at = ?1, updated_at = ?1
-                 WHERE id = ?2
+                 WHERE id = ?2 AND cancel_requested_at IS NULL
                    AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost', 'preempted')",
                 params![fmt_time(Utc::now()), id.to_string()],
             )?;
@@ -2028,6 +2033,9 @@ impl Store {
 
     /// Produce one inactivity callback while the task is running
     pub fn produce_attention_event(&self, id: TaskId) -> Result<bool, AppError> {
+        if self.job_run_link(id)?.is_some() {
+            return self.produce_job_check_due(id);
+        }
         self.immediate(|| {
             if !self.is_event_task(id)? {
                 return Ok(false);

@@ -53,7 +53,7 @@ pub struct JobView {
 }
 
 /// Notice thresholds from `[resource.notify_blocked_after]`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct NoticeThresholds {
     /// Wait behind a run asked to yield
     pub after_yield: Duration,
@@ -73,6 +73,8 @@ impl Default for NoticeThresholds {
 /// The stored blocking episode of the machine queue
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredEpisode {
+    /// Durable database identity, never reused for a later episode
+    pub id: i64,
     /// Head that is blocked
     pub job: JobId,
     /// When the episode started
@@ -119,7 +121,8 @@ pub struct Preempt {
 }
 
 /// What keeps the blocked head from starting
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Blocker {
     /// A run holds one of the head's resources
     Run {

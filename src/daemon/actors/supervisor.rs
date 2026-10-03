@@ -7,6 +7,7 @@ use std::sync::Arc;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
+use crate::daemon::actors::queue::{QUEUE_NAME, QueueActor, QueueArgs, QueueMsg};
 use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
 use crate::daemon::actors::{StoreActor, StoreMsg, call, send_reply};
 use crate::domain::{
@@ -32,6 +33,17 @@ pub(crate) static SUPERVISOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 
 /// Messages sent to the daemon root supervisor
 pub(crate) enum SupervisorMsg {
+    /// Finish the queue actor's newly reserved launch through the normal worker path
+    LaunchQueueRun {
+        task: TaskId,
+        prepared: Result<(), AppError>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Observe a recovered queue worker without ever spawning queued work
+    ObserveQueueRun {
+        task: TaskId,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// Store ref for `AppState` reads
     GetStore {
         reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
@@ -96,6 +108,7 @@ pub(crate) struct SupervisorState {
     store: ActorRef<StoreMsg>,
     callback: ActorRef<CallbackMsg>,
     tasks: HashMap<TaskId, ActorRef<TaskMsg>>,
+    queue: Option<ActorRef<QueueMsg>>,
 }
 
 /// Root actor
@@ -107,6 +120,7 @@ pub(crate) struct SupervisorArgs {
     callback_codex_pin: Option<String>,
     notifier: Option<Arc<Notifier>>,
     machine_name: String,
+    thresholds: crate::queue::schedule::NoticeThresholds,
 }
 
 impl SupervisorArgs {
@@ -121,7 +135,17 @@ impl SupervisorArgs {
             callback_codex_pin,
             notifier: None,
             machine_name: "this machine".into(),
+            thresholds: crate::queue::schedule::NoticeThresholds::default(),
         }
+    }
+
+    /// Set the blocked notice thresholds from the daemon configuration
+    pub(crate) fn with_queue_thresholds(
+        mut self,
+        thresholds: crate::queue::schedule::NoticeThresholds,
+    ) -> Self {
+        self.thresholds = thresholds;
+        self
     }
 
     /// Supply daemon notification settings to the callback actor
@@ -149,6 +173,7 @@ impl Actor for SupervisorActor {
             callback_codex_pin,
             notifier,
             machine_name,
+            thresholds,
         }: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         let (store, _store_handle) = StoreActor::spawn_linked(
@@ -184,8 +209,30 @@ impl Actor for SupervisorActor {
             store,
             callback,
             tasks: HashMap::new(),
+            queue: None,
         };
+        let detected = tokio::task::spawn_blocking(crate::queue::gpu::detect).await?;
+        call(&state.store, |reply| StoreMsg::QueueDetect {
+            machine,
+            detected,
+            reply,
+        })
+        .await?;
         recovery::recover_tasks(&myself, &mut state).await?;
+        let (queue, _) = QueueActor::spawn_linked(
+            Some(QUEUE_NAME.into()),
+            QueueActor,
+            QueueArgs {
+                home: state.home.clone(),
+                machine,
+                store: state.store.clone(),
+                supervisor: myself.clone(),
+                thresholds,
+            },
+            myself.get_cell(),
+        )
+        .await?;
+        state.queue = Some(queue);
         // a slow store must not fail startup; the callback actor's retry scan
         // picks these tasks up later
         match call(&state.store, |reply| StoreMsg::PendingInboxTasks { reply }).await {
@@ -206,6 +253,25 @@ impl Actor for SupervisorActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
+            SupervisorMsg::LaunchQueueRun {
+                task,
+                prepared,
+                reply,
+            } => {
+                let result = match prepared {
+                    Ok(()) => launch_queue_run(&myself, state, task).await,
+                    Err(error) => finish_spawn_failed(state, task, &error).await,
+                };
+                send_reply(reply, result);
+            }
+            SupervisorMsg::ObserveQueueRun { task, reply } => {
+                let result = match task_status(state, task).await {
+                    Ok(ProcessStatus::Running) => spawn_task_actor(&myself, state, task).await,
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                send_reply(reply, result);
+            }
             SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
             SupervisorMsg::Launch {
                 row,
@@ -247,7 +313,10 @@ impl Actor for SupervisorActor {
                 // and every live task actor holds their refs; there is no
                 // correct in-process recovery, so fail and let the host unit
                 // restart `serve` (DEC-20)
-                if name.as_deref() == Some(STORE_NAME) || name.as_deref() == Some(CALLBACK_NAME) {
+                if matches!(
+                    name.as_deref(),
+                    Some(STORE_NAME | CALLBACK_NAME | QUEUE_NAME)
+                ) {
                     tracing::error!(actor = ?name, "daemon actor failed; stopping serve: {err}");
                     return Err(err);
                 }
@@ -266,6 +335,29 @@ impl Actor for SupervisorActor {
         }
         Ok(())
     }
+}
+
+async fn launch_queue_run(
+    supervisor: &ActorRef<SupervisorMsg>,
+    state: &mut SupervisorState,
+    task: TaskId,
+) -> Result<(), AppError> {
+    let checkpoint = call(&state.store, |reply| StoreMsg::QueueCheckpoint {
+        task,
+        reply,
+    })
+    .await?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    if !matches!(
+        checkpoint.run.phase,
+        crate::queue::RunPhase::Launching { .. }
+    ) || task_status(state, task).await? != ProcessStatus::Queued
+    {
+        return Ok(());
+    }
+    launch_accepted(supervisor, state, task).await
 }
 
 async fn launch_remote(
@@ -518,6 +610,15 @@ async fn resume_local(
     state: &mut SupervisorState,
     id: TaskId,
 ) -> Result<ProcessStatus, AppError> {
+    if call(&state.store, |reply| StoreMsg::QueueTaskJob {
+        task: id,
+        reply,
+    })
+    .await?
+    .is_some()
+    {
+        return task_status(state, id).await;
+    }
     if !state.tasks.contains_key(&id) {
         match task_status(state, id).await? {
             ProcessStatus::Queued => launch_accepted(supervisor, state, id).await?,

@@ -23,6 +23,18 @@ pub(super) async fn recover_tasks(
     .await?;
     let rows = call(&state.store, |reply| StoreMsg::NonTerminal { reply }).await?;
     for row in rows {
+        if row.status() == ProcessStatus::Queued
+            && call(&state.store, |reply| StoreMsg::QueueTaskJob {
+                task: row.id,
+                reply,
+            })
+            .await?
+            .is_some()
+        {
+            // only the queue actor can abandon or launch a reservation; observing
+            // its free lock here would incorrectly classify it as lost
+            continue;
+        }
         let identity = if row.status() == ProcessStatus::Queued {
             call(&state.store, |reply| StoreMsg::ExecutorIdentity {
                 id: row.id,

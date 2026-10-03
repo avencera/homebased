@@ -298,6 +298,9 @@ async fn start_attention_reminder(
         return Ok(AttentionStep::Done);
     };
 
+    if matches!(row.attention, AttentionState::Delivered { .. }) {
+        return Ok(AttentionStep::Done);
+    }
     match row.state {
         TaskState::Queued => {
             return Ok(AttentionStep::Deferred(schedule_attention_retry(&myself)));
@@ -322,6 +325,24 @@ async fn start_attention_reminder(
         )));
     }
 
+    if call(&actor.store, |reply| StoreMsg::QueueTaskJob {
+        task: id,
+        reply,
+    })
+    .await?
+    .is_some()
+    {
+        let produced = call(&actor.store, |reply| StoreMsg::QueueCheckDue {
+            task: id,
+            reply,
+        })
+        .await?;
+        return Ok(if produced {
+            AttentionStep::Done
+        } else {
+            AttentionStep::Deferred(schedule_attention_retry(&myself))
+        });
+    }
     if !call(&actor.store, |reply| StoreMsg::IsEventTask { id, reply }).await? {
         return Err(AppError::Internal {
             message: format!("task {id} has no durable event identity"),

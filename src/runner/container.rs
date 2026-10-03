@@ -122,7 +122,8 @@ impl ContainerLedger for StoreLedger<'_> {
     }
 
     fn record_started(&self) -> Result<(), AppError> {
-        self.store.record_task_container_started(self.task)
+        self.store.record_task_container_started(self.task)?;
+        self.store.confirm_job_run_started(self.task)
     }
 
     fn record_observed(&self) -> Result<(), AppError> {

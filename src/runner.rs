@@ -152,7 +152,7 @@ fn prepare_worker(fd: RawFd) -> io::Result<()> {
 
 /// Worker entry: hold the inherited lock until exit.json and event commit.
 pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
-    let _lock = unsafe { File::from_raw_fd(lock_fd) };
+    let lock = unsafe { File::from_raw_fd(lock_fd) };
     // install the SIGTERM handler before any other work. Everything below (the
     // Queued->Running CAS, set_pid, the feed read) is a window in which the
     // default disposition would kill this worker outright, leaving the task
@@ -161,6 +161,10 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     let mut sigterm = signal(SignalKind::terminate()).map_err(|err| AppError::Internal {
         message: format!("signal: {err}"),
     })?;
+    // the descriptor crosses exec only to enter this worker; workload children
+    // must not hold it or surviving children can hide a lost worker from flock
+    fcntl(&lock, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
+
     home.ensure()?;
     let store = Store::open_with_busy_timeout(&home.db_path(), WORKER_BUSY_TIMEOUT)?;
     let queued = store.require_task(id)?;
@@ -191,6 +195,11 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         } else {
             container::Entry::Launch
         };
+        let configured = store
+            .run_checkpoint(id)?
+            .map(|checkpoint| checkpoint.container_workload(&home, workload))
+            .transpose()?;
+        let workload = configured.as_ref().unwrap_or(workload);
         return container::run(&store, &row, workload, &paths, entry, &mut sigterm).await;
     }
     let exit = match invocation_from_workload_for_identity(
@@ -360,6 +369,11 @@ async fn run_child(
     for (key, value) in invocation.environment.iter() {
         cmd.env(key, value);
     }
+    if let Some(checkpoint) = store.run_checkpoint(id)? {
+        for (key, value) in checkpoint.environment(home, false) {
+            cmd.env(key, value);
+        }
+    }
     match invocation.stdin {
         StdinPolicy::PromptFeed => {
             cmd.stdin(Stdio::piped());
@@ -390,6 +404,15 @@ async fn run_child(
         });
     };
     record_child_identity(store, id, child_pgid);
+    if let Err(error) = store.confirm_job_run_started(id) {
+        let evidence = cancel_child_group(&mut child, child_pgid).await;
+        return Ok(TaskRunExit {
+            reason: ExitReason::SpawnFailed {
+                message: format!("confirm job child start: {error}"),
+            },
+            process_group_exit_evidence: evidence,
+        });
+    }
     if invocation.stdin == StdinPolicy::PromptFeed
         && let Some(feed) = feed
         && let Some(mut stdin) = child.stdin.take()

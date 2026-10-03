@@ -30,12 +30,26 @@ pub const RESUME: &str = "HOMEBASED_RESUME";
 /// Run-scoped path that appears when the run should stop at its next checkpoint
 pub const YIELD_FILE: &str = "HOMEBASED_YIELD_FILE";
 
+/// Resource lane assigned to the workload
+pub const RESOURCE: &str = "HOMEBASED_RESOURCE";
+
+/// Device selection owned by the assigned resource
+pub const CUDA_VISIBLE_DEVICES: &str = "CUDA_VISIBLE_DEVICES";
+
 /// Every variable that belongs to exactly one run
 ///
 /// Configuration such as `HOMEBASED_HOME` is not listed: it describes the
 /// installation, not a run, and children need it to reach the daemon
-pub const RUN_MARKER_VARS: [&str; 7] = [
-    TASK_ID, JOB_ID, JOB_DIR, RUN_NUMBER, STEP_INDEX, RESUME, YIELD_FILE,
+pub const RUN_MARKER_VARS: [&str; 9] = [
+    TASK_ID,
+    JOB_ID,
+    JOB_DIR,
+    RUN_NUMBER,
+    STEP_INDEX,
+    RESUME,
+    YIELD_FILE,
+    RESOURCE,
+    CUDA_VISIBLE_DEVICES,
 ];
 
 /// Remove every inherited run-marker variable from a command's environment

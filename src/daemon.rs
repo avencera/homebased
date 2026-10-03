@@ -125,7 +125,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         home.clone(),
         std::env::var(crate::domain::AgentKind::Codex.binary_env()).ok(),
     )
-    .with_notifications(notifier.clone(), machine.name.to_string());
+    .with_notifications(notifier.clone(), machine.name.to_string())
+    .with_queue_thresholds(config.resource.notify_blocked_after);
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await
         .map_err(|err| AppError::Internal {

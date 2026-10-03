@@ -59,6 +59,115 @@ fn event_error(error: EventError) -> AppError {
 
 /// Messages for daemon SQLite operations
 pub(crate) enum StoreMsg {
+    /// Wake the local queue after task mutations; worker commits also have a recovery scan
+    WatchQueue {
+        queue: ActorRef<super::queue::QueueMsg>,
+    },
+    /// Fail executable resolution without exposing a launchable reservation
+    QueueLaunchFailed {
+        machine: MachineId,
+        job: crate::queue::JobId,
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        message: String,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Typed queue store operation
+    QueueDetect {
+        machine: MachineId,
+        detected: Vec<crate::queue::gpu::DetectedResource>,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::ResourceRecord>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueSnapshot {
+        machine: MachineId,
+        now: chrono::DateTime<chrono::Utc>,
+        thresholds: crate::queue::schedule::NoticeThresholds,
+        reply: RpcReplyPort<Result<crate::queue::schedule::Snapshot, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueResources {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::ResourceRecord>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueJob {
+        id: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Option<crate::store::queue::JobRecord>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueCheckpoint {
+        task: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::queue::checkpoint::Checkpoint>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueReserve {
+        machine: MachineId,
+        job: crate::queue::JobId,
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        binary: PathBuf,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<crate::store::queue::ReservedRun, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueStop {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        cause: crate::queue::StopCause,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<crate::queue::ActiveRun, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueBeginCleanup {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        reply: RpcReplyPort<Result<u32, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueCleanupResult {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        attempt: u32,
+        result: Result<(), crate::queue::CleanupFailure>,
+        reply: RpcReplyPort<Result<Option<crate::queue::RunPhase>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueAbandon {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueRecordHead {
+        machine: MachineId,
+        head: Option<(crate::queue::JobId, chrono::DateTime<chrono::Utc>)>,
+        reply: RpcReplyPort<Result<Option<crate::queue::schedule::StoredEpisode>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueBlocked {
+        machine: MachineId,
+        episode: crate::queue::schedule::StoredEpisode,
+        thresholds: crate::queue::schedule::NoticeThresholds,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueProtected {
+        reply: RpcReplyPort<Result<Vec<i32>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueTaskJob {
+        task: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::queue::JobId>, AppError>>,
+    },
+    /// Typed queue store operation
+    QueueCheckDue {
+        task: TaskId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+
     /// Migrate historical local rows before supervisor recovery begins
     MigrateLegacyLocal {
         machine: MachineId,
@@ -408,9 +517,28 @@ pub(crate) enum StoreMsg {
 /// Owns `rusqlite::Connection` via `Store`
 pub(crate) struct StoreActor;
 
+/// Store connection and the local queue wakeup subscription
+pub(crate) struct StoreState {
+    store: Store,
+    queue: Option<ActorRef<super::queue::QueueMsg>>,
+}
+
+impl std::ops::Deref for StoreState {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for StoreState {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
 impl Actor for StoreActor {
     type Msg = StoreMsg;
-    type State = Store;
+    type State = StoreState;
     type Arguments = PathBuf;
 
     async fn pre_start(
@@ -418,7 +546,10 @@ impl Actor for StoreActor {
         _myself: ActorRef<Self::Msg>,
         db_path: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(Store::open(&db_path)?)
+        Ok(StoreState {
+            store: Store::open(&db_path)?,
+            queue: None,
+        })
     }
 
     async fn handle(
@@ -427,7 +558,107 @@ impl Actor for StoreActor {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        let wake_queue = matches!(
+            &message,
+            StoreMsg::CasStatus { .. }
+                | StoreMsg::CasExit { .. }
+                | StoreMsg::CasExitWithWorkerThread { .. }
+                | StoreMsg::RequestCancel { .. }
+        );
         match message {
+            StoreMsg::WatchQueue { queue } => state.queue = Some(queue),
+            StoreMsg::QueueLaunchFailed {
+                machine,
+                job,
+                resource,
+                task,
+                message,
+                now,
+                reply,
+            } => {
+                send_reply(
+                    reply,
+                    state.fail_job_launch(machine, job, resource, task, message, now),
+                );
+            }
+            StoreMsg::QueueDetect {
+                machine,
+                detected,
+                reply,
+            } => send_reply(reply, state.ensure_detected_resources(machine, &detected)),
+            StoreMsg::QueueSnapshot {
+                machine,
+                now,
+                thresholds,
+                reply,
+            } => send_reply(reply, state.queue_snapshot(machine, now, thresholds)),
+            StoreMsg::QueueResources { machine, reply } => {
+                send_reply(reply, state.resources_on(machine))
+            }
+            StoreMsg::QueueJob { id, reply } => send_reply(reply, state.job(id)),
+            StoreMsg::QueueCheckpoint { task, reply } => {
+                send_reply(reply, state.run_checkpoint(task))
+            }
+            StoreMsg::QueueReserve {
+                machine,
+                job,
+                resource,
+                task,
+                binary,
+                now,
+                reply,
+            } => send_reply(
+                reply,
+                state.reserve_run(machine, job, resource, task, binary, now),
+            ),
+            StoreMsg::QueueStop {
+                resource,
+                task,
+                cause,
+                now,
+                reply,
+            } => send_reply(reply, state.commit_stop(resource, task, cause, now)),
+            StoreMsg::QueueBeginCleanup {
+                resource,
+                task,
+                reply,
+            } => send_reply(reply, state.begin_cleanup_attempt(resource, task)),
+            StoreMsg::QueueCleanupResult {
+                resource,
+                task,
+                attempt,
+                result,
+                reply,
+            } => send_reply(
+                reply,
+                state.apply_cleanup_result(resource, task, attempt, result),
+            ),
+            StoreMsg::QueueAbandon {
+                resource,
+                task,
+                reply,
+            } => send_reply(reply, state.abandon_launch(resource, task)),
+            StoreMsg::QueueRecordHead {
+                machine,
+                head,
+                reply,
+            } => send_reply(reply, state.record_blocked_head(machine, head)),
+            StoreMsg::QueueBlocked {
+                machine,
+                episode,
+                thresholds,
+                now,
+                reply,
+            } => send_reply(
+                reply,
+                state.produce_job_blocked(machine, episode, thresholds, now),
+            ),
+            StoreMsg::QueueProtected { reply } => send_reply(reply, state.cleanup_protected_pids()),
+            StoreMsg::QueueTaskJob { task, reply } => send_reply(reply, state.job_run_link(task)),
+            StoreMsg::QueueCheckDue { task, reply } => {
+                send_reply(reply, state.produce_job_check_due(task))
+            }
+
             StoreMsg::MigrateLegacyLocal { machine, reply } => {
                 send_reply(reply, state.migrate_legacy_local(machine));
             }
@@ -714,6 +945,9 @@ impl Actor for StoreActor {
                 send_reply(reply, state.release_attention(id));
             }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
+        }
+        if wake_queue && let Some(queue) = &state.queue {
+            let _ = queue.cast(super::queue::QueueMsg::Reconcile);
         }
         Ok(())
     }

@@ -68,6 +68,9 @@ impl Home {
     /// Create the root directory if needed.
     pub fn ensure(&self) -> Result<(), AppError> {
         fs::create_dir_all(self.tasks_dir())?;
+        // job state directories are 0777 so container users can write, so the
+        // root must keep other host users out
+        fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 

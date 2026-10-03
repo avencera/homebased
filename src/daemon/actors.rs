@@ -1,6 +1,7 @@
 //! Daemon ractor topology: store, callback, per-task watch, supervisor
 
 pub mod callback;
+pub(crate) mod queue;
 pub mod store;
 pub mod supervisor;
 pub mod task;

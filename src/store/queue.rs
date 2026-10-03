@@ -7,6 +7,8 @@
 //! the machine queue. The terminal commit of a run task classifies the run's
 //! end and moves its job in the same transaction
 
+mod runtime;
+
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -736,100 +738,150 @@ impl Store {
         binary: PathBuf,
         now: DateTime<Utc>,
     ) -> Result<ReservedRun, AppError> {
+        self.immediate(|| self.reserve_run_inner(machine, job, resource, task, binary, now))
+    }
+
+    fn reserve_run_inner(
+        &self,
+        machine: MachineId,
+        job: JobId,
+        resource: ResourceId,
+        task: TaskId,
+        binary: PathBuf,
+        now: DateTime<Utc>,
+    ) -> Result<ReservedRun, AppError> {
+        let record = self.require_machine_job(machine, job)?;
+        let JobState::Queued { next_step, resume } = record.state else {
+            return Err(QueueError::Invariant {
+                message: format!("job {job} is {}, not queued", record.state.as_str()),
+            }
+            .into());
+        };
+        let holder = self.require_resource(resource)?;
+        if holder.machine != machine {
+            return Err(QueueError::ResourceNotFound {
+                resource: resource.to_string(),
+            }
+            .into());
+        }
+        if let Some(run) = &holder.run {
+            return Err(QueueError::Invariant {
+                message: format!(
+                    "resource {} already has an active run of job {} in {}",
+                    holder.resource.name,
+                    run.job,
+                    run.phase.as_str()
+                ),
+            }
+            .into());
+        }
+        if !record.target.allows(resource) {
+            return Err(QueueError::Invariant {
+                message: format!("job {job} is pinned to another resource"),
+            }
+            .into());
+        }
+        if let Some(other) = self.run_of_job(job)? {
+            return Err(QueueError::Invariant {
+                message: format!(
+                    "job {job} already has an active run on resource {} in {}",
+                    other.resource,
+                    other.phase.as_str()
+                ),
+            }
+            .into());
+        }
+        let step = record
+            .spec
+            .steps
+            .get(next_step)
+            .ok_or_else(|| QueueError::Corrupt {
+                message: format!("job {job} has no step {next_step}"),
+            })?;
+        let run_number = RunNumber::new(record.runs + 1)?;
+
+        let row = new_queued_task(NewTask {
+            id: task,
+            name: Some(record.spec.name.clone()),
+            thread: record.spec.thread,
+            workload: step.to_workload(),
+            cwd: record.spec.cwd.clone(),
+            timeout: record.spec.timeout,
+            env: record.env.clone(),
+            binary,
+        });
+        let project_root = find_project_root(&row.cwd);
+        super::insert_task_with_project_root_on(&self.conn, &row, project_root.as_deref())?;
+        self.conn.execute(
+            "UPDATE tasks SET resource_job_id = ?1, run_number = ?2, step_index = ?3
+                 WHERE id = ?4",
+            params![
+                job.to_string(),
+                run_number.get(),
+                next_step.get(),
+                task.to_string()
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE resource_jobs SET state = 'active', active_resource = ?1,
+                    last_run_number = ?2, updated_at = ?3
+                 WHERE id = ?4",
+            params![
+                resource.to_string(),
+                run_number.get(),
+                fmt_time(now),
+                job.to_string()
+            ],
+        )?;
+        let run = ActiveRun {
+            resource,
+            job,
+            task,
+            run_number,
+            step: next_step,
+            phase: RunPhase::Launching { reserved_at: now },
+        };
+        let run = self.write_run(&run)?;
+        Ok(ReservedRun { run, resume })
+    }
+
+    /// Fail a scheduled step whose executable disappeared after acceptance
+    ///
+    /// This creates an already-terminal attempt and applies its job result in
+    /// one transaction. Its diagnostic binary is never passed to a worker
+    pub fn fail_job_launch(
+        &self,
+        machine: MachineId,
+        job: JobId,
+        resource: ResourceId,
+        task: TaskId,
+        message: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
         self.immediate(|| {
             let record = self.require_machine_job(machine, job)?;
-            let JobState::Queued { next_step, resume } = record.state else {
-                return Err(QueueError::Invariant {
-                    message: format!("job {job} is {}, not queued", record.state.as_str()),
-                }
-                .into());
-            };
-            let holder = self.require_resource(resource)?;
-            if holder.machine != machine {
-                return Err(QueueError::ResourceNotFound {
-                    resource: resource.to_string(),
-                }
-                .into());
-            }
-            if let Some(run) = &holder.run {
-                return Err(QueueError::Invariant {
-                    message: format!(
-                        "resource {} already has an active run of job {} in {}",
-                        holder.resource.name,
-                        run.job,
-                        run.phase.as_str()
-                    ),
-                }
-                .into());
-            }
-            if !record.target.allows(resource) {
-                return Err(QueueError::Invariant {
-                    message: format!("job {job} is pinned to another resource"),
-                }
-                .into());
-            }
-            if let Some(other) = self.run_of_job(job)? {
-                return Err(QueueError::Invariant {
-                    message: format!(
-                        "job {job} already has an active run on resource {} in {}",
-                        other.resource,
-                        other.phase.as_str()
-                    ),
-                }
-                .into());
-            }
             let step = record
                 .spec
                 .steps
-                .get(next_step)
-                .ok_or_else(|| QueueError::Corrupt {
-                    message: format!("job {job} has no step {next_step}"),
-                })?;
-            let run_number = RunNumber::new(record.runs + 1)?;
-
-            let row = new_queued_task(NewTask {
-                id: task,
-                name: Some(record.spec.name.clone()),
-                thread: record.spec.thread,
-                workload: step.to_workload(),
-                cwd: record.spec.cwd.clone(),
-                timeout: record.spec.timeout,
-                env: record.env.clone(),
-                binary,
-            });
-            let project_root = find_project_root(&row.cwd);
-            super::insert_task_with_project_root_on(&self.conn, &row, project_root.as_deref())?;
-            self.conn.execute(
-                "UPDATE tasks SET resource_job_id = ?1, run_number = ?2, step_index = ?3
-                 WHERE id = ?4",
-                params![
-                    job.to_string(),
-                    run_number.get(),
-                    next_step.get(),
-                    task.to_string()
-                ],
-            )?;
-            self.conn.execute(
-                "UPDATE resource_jobs SET state = 'active', active_resource = ?1,
-                    last_run_number = ?2, updated_at = ?3
-                 WHERE id = ?4",
-                params![
-                    resource.to_string(),
-                    run_number.get(),
-                    fmt_time(now),
-                    job.to_string()
-                ],
-            )?;
-            let run = ActiveRun {
-                resource,
-                job,
-                task,
-                run_number,
-                step: next_step,
-                phase: RunPhase::Launching { reserved_at: now },
+                .get(record.next_step)
+                .ok_or_else(|| corrupt("job next step missing"))?;
+            let program = match step.to_workload() {
+                crate::domain::Workload::Task(workload) => workload.command.program().to_owned(),
+                crate::domain::Workload::Container(_) => "docker".into(),
+                crate::domain::Workload::Agent(_) => {
+                    return Err(corrupt("agent queue workload").into());
+                }
             };
-            let run = self.write_run(&run)?;
-            Ok(ReservedRun { run, resume })
+            self.reserve_run_inner(machine, job, resource, task, PathBuf::from(program), now)?;
+            self.commit_terminal(
+                task,
+                ProcessStatus::Queued,
+                &ExitReason::SpawnFailed { message },
+                &ProcessGroupExitEvidence::NoChildSpawned.into(),
+                None,
+                RunEndSource::Task,
+            )?;
+            Ok(())
         })
     }
 
@@ -1015,7 +1067,7 @@ impl Store {
     }
 
     /// The run task's job link, if it is a run
-    pub(super) fn job_run_link(&self, task: TaskId) -> Result<Option<JobId>, AppError> {
+    pub fn job_run_link(&self, task: TaskId) -> Result<Option<JobId>, AppError> {
         let job: Option<Option<String>> = self
             .conn
             .query_row(
@@ -1268,6 +1320,18 @@ impl Store {
         process: Option<ExitReason>,
         attention: Option<AttentionId>,
     ) -> Result<JobEvent, AppError> {
+        self.append_job_event_with_notice(job, event, run, process, attention, None)
+    }
+
+    fn append_job_event_with_notice(
+        &self,
+        job: JobId,
+        event: JobEventKind,
+        run: Option<EventRun>,
+        process: Option<ExitReason>,
+        attention: Option<AttentionId>,
+        blocked: Option<crate::queue::BlockedNotice>,
+    ) -> Result<JobEvent, AppError> {
         self.conn.execute(
             "UPDATE resource_jobs SET event_seq = event_seq + 1 WHERE id = ?1",
             [job.to_string()],
@@ -1285,6 +1349,7 @@ impl Store {
             process,
             attention,
             at: Utc::now(),
+            blocked,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)
@@ -1438,39 +1503,20 @@ impl Store {
         })
     }
 
-    /// Record that the open episode of `job` sent its one notice
-    ///
-    /// Returns `false` when that episode ended or already sent it
-    pub fn mark_blocked_notice_sent(
-        &self,
-        machine: MachineId,
-        job: JobId,
-        at: DateTime<Utc>,
-    ) -> Result<bool, AppError> {
-        self.immediate(|| {
-            let updated = self.conn.execute(
-                "UPDATE resource_blocked_notices SET notified_at = ?1
-                 WHERE machine = ?2 AND job_id = ?3 AND ended_at IS NULL
-                   AND notified_at IS NULL",
-                params![fmt_time(at), machine.to_string(), job.to_string()],
-            )?;
-            Ok(updated == 1)
-        })
-    }
-
     /// The open blocking episode of `machine`'s queue
     pub fn blocked_episode(&self, machine: MachineId) -> Result<Option<StoredEpisode>, AppError> {
-        let raw: Option<(String, String, Option<String>)> = self
+        let raw: Option<(i64, String, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT job_id, blocked_since, notified_at FROM resource_blocked_notices
+                "SELECT id, job_id, blocked_since, notified_at FROM resource_blocked_notices
                  WHERE machine = ?1 AND ended_at IS NULL",
                 [machine.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        raw.map(|(job, since, notified)| {
+        raw.map(|(id, job, since, notified)| {
             Ok(StoredEpisode {
+                id,
                 job: JobId::from_uuid(parse_uuid(&job)?),
                 blocked_since: parse_time(&since)?,
                 notified: notified.is_some(),

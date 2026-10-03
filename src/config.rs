@@ -110,6 +110,15 @@ pub struct Config {
     pub notify: Notify,
     /// Whether the daemon keeps the host awake, from `power.keep_awake`.
     pub sleep: SleepPolicy,
+    /// Notice thresholds for the local resource queue
+    pub resource: ResourceConfig,
+}
+
+/// Resource queue notice settings; these never stop a job
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ResourceConfig {
+    /// Time to wait before recording a notice for the blocked head
+    pub notify_blocked_after: crate::queue::schedule::NoticeThresholds,
 }
 
 /// Whether this machine joins a fleet.
@@ -200,6 +209,55 @@ struct RawConfig {
     notify: RawNotify,
     #[serde(default)]
     power: RawPower,
+    #[serde(default)]
+    resource: RawResource,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResource {
+    #[serde(default)]
+    notify_blocked_after: RawBlockedThresholds,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBlockedThresholds {
+    #[serde(rename = "yield")]
+    after_yield: Option<String>,
+    #[serde(rename = "wait")]
+    after_wait: Option<String>,
+}
+
+impl RawResource {
+    fn validate(self) -> Result<ResourceConfig, String> {
+        let mut thresholds = crate::queue::schedule::NoticeThresholds::default();
+        for (name, raw, target) in [
+            (
+                "yield",
+                self.notify_blocked_after.after_yield,
+                &mut thresholds.after_yield,
+            ),
+            (
+                "wait",
+                self.notify_blocked_after.after_wait,
+                &mut thresholds.after_wait,
+            ),
+        ] {
+            let Some(raw) = raw else { continue };
+            let duration = humantime::parse_duration(&raw)
+                .map_err(|error| format!("resource.notify_blocked_after.{name}: {error}"))?;
+            if duration.is_zero() || chrono::Duration::from_std(duration).is_err() {
+                return Err(format!(
+                    "resource.notify_blocked_after.{name}: duration must be positive and fit the clock"
+                ));
+            }
+            *target = duration;
+        }
+        Ok(ResourceConfig {
+            notify_blocked_after: thresholds,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -303,6 +361,7 @@ impl RawConfig {
         } = self.fleet;
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
+        let resource = self.resource.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -328,6 +387,7 @@ impl RawConfig {
             fleet,
             notify,
             sleep,
+            resource,
         })
     }
 }
@@ -353,6 +413,28 @@ impl RawDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_notice_settings_validate_durations_and_keys() {
+        let config =
+            Config::parse("[resource.notify_blocked_after]\nyield = \"200ms\"\nwait = \"2s\"\n")
+                .unwrap();
+        assert_eq!(
+            config.resource.notify_blocked_after.after_yield,
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            config.resource.notify_blocked_after.after_wait,
+            std::time::Duration::from_secs(2)
+        );
+        for text in [
+            "[resource.notify_blocked_after]\nyield = \"0s\"\n",
+            "[resource.notify_blocked_after]\nwait = \"bad\"\n",
+            "[resource.notify_blocked_after]\nyeld = \"1m\"\n",
+        ] {
+            assert!(Config::parse(text).is_err());
+        }
+    }
 
     #[test]
     fn empty_file_disables_fleet() {

@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::container::ContainerWorkload;
 use crate::domain::{TaskId, TaskWorkload, Workload};
 
+pub mod checkpoint;
 pub mod classify;
 mod error;
 pub mod gpu;
@@ -955,6 +956,21 @@ pub enum JobEventKind {
     JobPreempted,
     /// Cleanup after this job's run entered `Attention`
     JobAttention,
+    /// The open blocking episode reached its notice threshold
+    JobBlocked,
+    /// A running job's output reached its inactivity threshold
+    JobCheckDue,
+}
+
+/// One blocked notice, tied to the exact stored episode
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedNotice {
+    /// Durable identity of this blocking episode
+    pub episode: i64,
+    /// Start of this job's blocking episode
+    pub blocked_since: DateTime<Utc>,
+    /// Runs or attentions that prevent the job from starting
+    pub blockers: Vec<schedule::Blocker>,
 }
 
 /// The run an event is about
@@ -991,6 +1007,9 @@ pub struct JobEvent {
     pub attention: Option<AttentionId>,
     /// When the event was recorded
     pub at: DateTime<Utc>,
+    /// Present only on a blocked notice
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<BlockedNotice>,
 }
 
 #[cfg(test)]
