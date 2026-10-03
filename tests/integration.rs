@@ -706,10 +706,12 @@ fn task_followup_reports_each_blocker() {
     let running_error = followup_error(&h, &running);
     assert_eq!(running_error["error"]["code"], "followup_unavailable");
     assert_eq!(running_error["error"]["input"]["reason"], "not_terminal");
-    h.clear_controls();
     let cancel = h.cmd().args(["task", "cancel", &running]).output().unwrap();
     assert!(cancel.status.success());
     h.wait_status(&running, "cancelled");
+    // a slow fake agent reads its sleep control after it is marked running, so
+    // clearing the control before the cancel can let it exit 0 first
+    h.clear_controls();
 
     let claude = h.submit(&Harness::spec("claude", "not codex"));
     h.wait_status(&claude, "succeeded");
