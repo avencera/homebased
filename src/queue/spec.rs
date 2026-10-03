@@ -561,3 +561,10 @@ fn missing_field_name(err: &serde_json::Error) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+impl<'de> Deserialize<'de> for JobSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::parse_value(&value).map_err(serde::de::Error::custom)
+    }
+}

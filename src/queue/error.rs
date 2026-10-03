@@ -9,6 +9,16 @@ use super::{AttentionId, JobId, OperationId, Priority, ResourceId, ResourceName}
 /// Why a queue request was refused, or stored queue data could not be read
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueueError {
+    /// A typed refusal decoded from an authority's response, preserving its input and code
+    #[error("{message}")]
+    Remote {
+        /// Known queue response code
+        code: QueueCode,
+        /// Authority diagnostic
+        message: String,
+        /// Structured refused input
+        input: Value,
+    },
     /// A UUID argument did not parse
     #[error("invalid {what} (full UUID required): {value}")]
     InvalidId {
@@ -171,6 +181,7 @@ impl QueueError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::Remote { code, .. } => code.as_str(),
             Self::InvalidId { .. }
             | Self::InvalidPriority { .. }
             | Self::InvalidRestartWindow { .. }
@@ -194,6 +205,7 @@ impl QueueError {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self {
+            Self::Remote { code, .. } => code.exit_code(),
             Self::InvalidId { .. }
             | Self::InvalidPriority { .. }
             | Self::InvalidRestartWindow { .. }
@@ -228,6 +240,7 @@ impl QueueError {
     #[must_use]
     pub fn input(&self) -> Value {
         match self {
+            Self::Remote { input, .. } => input.clone(),
             Self::InvalidId { what, value } => json!({ "what": what, "value": value }),
             Self::InvalidPriority { value } => json!({ "value": value }),
             Self::InvalidRestartWindow { window } => {
@@ -251,6 +264,61 @@ impl QueueError {
             Self::Invariant { message } | Self::Corrupt { message } => {
                 json!({ "message": message })
             }
+        }
+    }
+}
+
+/// Known queue refusal codes carried by the public API
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCode {
+    /// Invalid queue argument
+    InvalidQueueInput,
+    /// Missing job
+    JobNotFound,
+    /// Job already ended
+    JobTerminal,
+    /// Job identity reused with different content
+    JobConflict,
+    /// Operation identity reused with different content
+    OperationConflict,
+    /// Invalid placement
+    MoveRefused,
+    /// Missing resource
+    ResourceNotFound,
+    /// Resource name or device already registered
+    ResourceConflict,
+    /// Stale or unknown Attention
+    AttentionNotFound,
+    /// Run or cleanup identity changed
+    StaleRun,
+}
+
+impl QueueCode {
+    /// Stable wire name
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidQueueInput => "invalid_queue_input",
+            Self::JobNotFound => "job_not_found",
+            Self::JobTerminal => "job_terminal",
+            Self::JobConflict => "job_conflict",
+            Self::OperationConflict => "operation_conflict",
+            Self::MoveRefused => "move_refused",
+            Self::ResourceNotFound => "resource_not_found",
+            Self::ResourceConflict => "resource_conflict",
+            Self::AttentionNotFound => "attention_not_found",
+            Self::StaleRun => "stale_run",
+        }
+    }
+
+    /// Exit-code grouping shared with authority-side queue errors
+    #[must_use]
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::InvalidQueueInput | Self::MoveRefused => 2,
+            Self::JobNotFound | Self::ResourceNotFound | Self::AttentionNotFound => 3,
+            _ => 5,
         }
     }
 }

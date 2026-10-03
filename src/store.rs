@@ -572,8 +572,36 @@ CREATE UNIQUE INDEX tasks_resource_run
 fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_34_TO_35)?;
     conn.execute_batch(MIGRATE_34_TO_35_TASKS)?;
-    conn.execute_batch(MIGRATE_34_TO_35_QUEUE)
+    conn.execute_batch(MIGRATE_34_TO_35_QUEUE)?;
+    conn.execute_batch(MIGRATE_35_TO_36)
 }
+
+/// Save job routes, ordered inboxes, and authority acknowledgement cursors
+const MIGRATE_35_TO_36: &str = r"
+CREATE TABLE resource_run_history (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    resource_id TEXT NOT NULL REFERENCES resources(id),
+    stop_cause TEXT,
+    cleanup_json TEXT
+);
+INSERT INTO resource_run_history(task_id, resource_id) SELECT run_task,id FROM resources WHERE run_task IS NOT NULL;
+CREATE TABLE resource_job_routes (
+    job_id TEXT PRIMARY KEY,
+    route_json TEXT NOT NULL,
+    accepted_seq INTEGER NOT NULL DEFAULT 0 CHECK (accepted_seq >= 0),
+    settled_seq INTEGER NOT NULL DEFAULT 0 CHECK (settled_seq >= 0 AND settled_seq <= accepted_seq)
+);
+CREATE TABLE resource_job_inbox (
+    job_id TEXT NOT NULL REFERENCES resource_job_routes(job_id),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    event_json TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+);
+CREATE TABLE resource_job_delivery (
+    job_id TEXT PRIMARY KEY REFERENCES resource_jobs(id),
+    acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
+);
+";
 
 /// Why `Store::open` refuses a database version
 fn unsupported_schema_version(version: i64) -> AppError {
@@ -908,6 +936,7 @@ impl Store {
                 | RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
                 RELEASED_V0_11_SCHEMA_VERSION => migrate_33_to_current(&transaction)?,
                 RELEASED_V0_13_SCHEMA_VERSION => migrate_34_to_current(&transaction)?,
+                35 => transaction.execute_batch(MIGRATE_35_TO_36)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -4115,12 +4144,16 @@ CREATE TABLE reports (
     }
 
     /// Tables of the GPU priority queue, which reuse the `resource` prefix
-    const QUEUE_TABLES: [&str; 5] = [
+    const QUEUE_TABLES: [&str; 9] = [
         "resources",
         "resource_jobs",
         "resource_job_events",
         "resource_operations",
         "resource_blocked_notices",
+        "resource_job_routes",
+        "resource_job_inbox",
+        "resource_job_delivery",
+        "resource_run_history",
     ];
 
     fn assert_no_loan_tables(store: &Store) {
@@ -4296,6 +4329,10 @@ CREATE TABLE reports (
         ALTER TABLE tasks DROP COLUMN resource_job_id;
         DROP TABLE resource_blocked_notices;
         DROP TABLE resource_operations;
+        DROP TABLE resource_run_history;
+        DROP TABLE resource_job_inbox;
+        DROP TABLE resource_job_routes;
+        DROP TABLE resource_job_delivery;
         DROP TABLE resource_job_events;
         DROP TABLE resources;
         DROP TABLE resource_jobs;

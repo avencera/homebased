@@ -48,6 +48,7 @@ impl IntoResponse for AppError {
 /// Routes that only read state. Safe to expose on the TCP listener
 pub fn read_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::daemon::queue_api::read_routes())
         .merge(crate::daemon::fleet_api::read_routes())
         .merge(crate::daemon::fleet_tasks::read_routes())
         .merge(crate::daemon::thread_titles::read_routes())
@@ -64,6 +65,7 @@ pub fn read_routes() -> Router<AppState> {
 /// loopback port is reachable from any page the user has open
 pub fn write_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::daemon::queue_api::write_routes())
         .route("/v1/tasks", post(submit))
         .route("/v1/tasks/dry-run", post(dry_run))
         .route("/v1/tasks/{id}/cancel", post(cancel))

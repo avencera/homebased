@@ -307,6 +307,7 @@ pub fn routes(fleet: FleetHandle) -> Router<AppState> {
         .route("/v1/cluster/executions/cancel", post(cancel_execution))
         .route("/v1/cluster/events", post(receive_event))
         .route("/v1/cluster/messages", post(receive_message))
+        .merge(super::queue_api::cluster_routes())
         .merge(super::fleet_tasks::cluster_routes())
         .merge(super::thread_titles::cluster_routes())
 }

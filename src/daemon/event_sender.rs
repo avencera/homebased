@@ -1,5 +1,7 @@
 //! Ordered executor outbox delivery and recovery
 
+pub(crate) mod jobs;
+
 use crate::fleet::probe::VerifiedDestination;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;

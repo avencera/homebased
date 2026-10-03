@@ -59,6 +59,68 @@ fn event_error(error: EventError) -> AppError {
 
 /// Messages for daemon SQLite operations
 pub(crate) enum StoreMsg {
+    /// Retained authority events for sequence gap recovery
+    QueueEvents {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobEvent>, AppError>>,
+    },
+    /// Public queue operation, dispatched only through the store API
+    QueueInterface {
+        machine: MachineId,
+        request: Box<crate::store::queue::interface::QueueRequest>,
+        env: crate::domain::TaskEnv,
+        reply: RpcReplyPort<Result<serde_json::Value, AppError>>,
+    },
+    /// Origin route lookup
+    JobRoute {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
+    },
+    /// Save origin routing before any submit reaches the authority
+    InsertJobRoute {
+        route: Box<crate::queue::delivery::JobRoute>,
+        reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
+    },
+    /// Retain the authority's submission result
+    ResolveJobRoute {
+        job: crate::queue::JobId,
+        submission: crate::queue::delivery::JobSubmission,
+        target: Option<crate::queue::Target>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// First unacknowledged event per authority job
+    PendingJobOutbox {
+        reply: RpcReplyPort<Result<Vec<crate::queue::delivery::RoutedJobEvent>, AppError>>,
+    },
+    /// Retain the origin's acknowledgement
+    AckJobEvent {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Deduplicate and accept an authority event
+    AcceptJobEvent {
+        event: Box<crate::queue::delivery::RoutedJobEvent>,
+        reply: RpcReplyPort<Result<EventAcceptance, AppError>>,
+    },
+    /// First undelivered event per origin job
+    PendingJobInbox {
+        reply: RpcReplyPort<
+            Result<
+                Vec<(
+                    crate::queue::delivery::JobRoute,
+                    crate::queue::delivery::RoutedJobEvent,
+                )>,
+                AppError,
+            >,
+        >,
+    },
+    /// Advance only after callback delivery succeeds
+    SettleJobEvent {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// Wake the local queue after task mutations; worker commits also have a recovery scan
     WatchQueue {
         queue: ActorRef<super::queue::QueueMsg>,
@@ -564,8 +626,37 @@ impl Actor for StoreActor {
                 | StoreMsg::CasExit { .. }
                 | StoreMsg::CasExitWithWorkerThread { .. }
                 | StoreMsg::RequestCancel { .. }
+                | StoreMsg::QueueInterface { .. }
         );
         match message {
+            StoreMsg::QueueEvents { job, reply } => send_reply(reply, state.job_events(job)),
+            StoreMsg::QueueInterface {
+                machine,
+                request,
+                env,
+                reply,
+            } => send_reply(reply, state.queue_request(machine, &request, &env)),
+            StoreMsg::JobRoute { job, reply } => send_reply(reply, state.job_route(job)),
+            StoreMsg::InsertJobRoute { route, reply } => {
+                send_reply(reply, state.insert_job_route(&route))
+            }
+            StoreMsg::ResolveJobRoute {
+                job,
+                submission,
+                target,
+                reply,
+            } => send_reply(reply, state.resolve_job_route(job, submission, target)),
+            StoreMsg::PendingJobOutbox { reply } => send_reply(reply, state.pending_job_outbox()),
+            StoreMsg::AckJobEvent { job, seq, reply } => {
+                send_reply(reply, state.acknowledge_job_event(job, seq))
+            }
+            StoreMsg::AcceptJobEvent { event, reply } => {
+                send_reply(reply, state.accept_job_event(&event))
+            }
+            StoreMsg::PendingJobInbox { reply } => send_reply(reply, state.pending_job_inbox()),
+            StoreMsg::SettleJobEvent { job, seq, reply } => {
+                send_reply(reply, state.settle_job_event(job, seq))
+            }
             StoreMsg::WatchQueue { queue } => state.queue = Some(queue),
             StoreMsg::QueueLaunchFailed {
                 machine,

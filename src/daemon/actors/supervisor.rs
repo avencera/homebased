@@ -33,6 +33,10 @@ pub(crate) static SUPERVISOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 
 /// Messages sent to the daemon root supervisor
 pub(crate) enum SupervisorMsg {
+    /// Callback actor for job events sharing the normal origin delivery path
+    GetCallback {
+        reply: RpcReplyPort<Result<ActorRef<CallbackMsg>, AppError>>,
+    },
     /// Finish the queue actor's newly reserved launch through the normal worker path
     LaunchQueueRun {
         task: TaskId,
@@ -272,6 +276,7 @@ impl Actor for SupervisorActor {
                 };
                 send_reply(reply, result);
             }
+            SupervisorMsg::GetCallback { reply } => send_reply(reply, Ok(state.callback.clone())),
             SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
             SupervisorMsg::Launch {
                 row,

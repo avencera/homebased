@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod fleet;
 pub mod message;
 pub mod notify;
+pub mod resource;
 pub mod t3;
 pub mod task;
 pub mod update;
@@ -98,6 +99,12 @@ pub enum Command {
         /// Task subcommand
         #[command(subcommand)]
         command: task::TaskCommand,
+    },
+    /// Manage exclusive resources and priority jobs
+    Resource {
+        /// Resource subcommand
+        #[command(subcommand)]
+        command: resource::ResourceCommand,
     },
     /// Check the T3 Code local API
     T3 {
@@ -264,6 +271,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Message { command } => message::run(&ctx, command).await,
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
+        Command::Resource { command } => resource::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {

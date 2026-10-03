@@ -22,12 +22,13 @@ use crate::domain::{TaskId, TaskWorkload, Workload};
 
 pub mod checkpoint;
 pub mod classify;
+pub mod delivery;
 mod error;
 pub mod gpu;
 pub mod schedule;
 pub mod spec;
 
-pub use error::{MoveRefusal, QueueError};
+pub use error::{MoveRefusal, QueueCode, QueueError};
 
 /// Declare a UUID identity with string, serde, and schema forms
 macro_rules! uuid_id {
@@ -600,7 +601,8 @@ impl TryFrom<Vec<StepWorkload>> for Steps {
 }
 
 /// Where a job is in its life
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting in the queue; `next_step` is the step the next run executes
     Queued {
@@ -733,7 +735,7 @@ impl fmt::Display for RunNumber {
 }
 
 /// One resource's single active run and where it is in its lifecycle
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActiveRun {
     /// Resource the run holds
     pub resource: ResourceId,
@@ -750,7 +752,8 @@ pub struct ActiveRun {
 }
 
 /// Lifecycle of a resource's active run
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum RunPhase {
     /// Task row inserted and reserved; worker not yet confirmed running
     Launching {
@@ -866,7 +869,7 @@ pub enum Side {
 
 /// Where `resource job move` puts a job
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Placement {
     /// An end of a level; `priority` is the job's current level when absent
     Edge {

@@ -98,7 +98,7 @@ impl Client {
             .into_body()
             .collect()
             .await
-            .map_err(|err| AppError::Internal {
+            .map_err(|err| AppError::DaemonUnavailable {
                 message: format!("read body: {err}"),
             })?
             .to_bytes();
@@ -140,7 +140,17 @@ pub(crate) fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
 }
 
 fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> AppError {
+    if let Ok(code) = serde_json::from_value::<crate::queue::QueueCode>(Value::String(code.into()))
+    {
+        return crate::queue::QueueError::Remote {
+            code,
+            message,
+            input: input.clone(),
+        }
+        .into();
+    }
     match code {
+        "usage" => AppError::Usage { message },
         "daemon_unavailable" => AppError::DaemonUnavailable { message },
         "cluster_lookup_incomplete" => {
             let task = input

@@ -3099,3 +3099,6 @@ fn worker_message_from_another_machine_explains_a_held_task() {
 
     fs::write(&gate, "").unwrap();
 }
+
+#[path = "fleet/phase5.rs"]
+mod phase5;

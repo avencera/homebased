@@ -3,7 +3,7 @@
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
 //! is reachable from any web page the user has open, so this router never
-//! exposes task submit or cancel
+//! exposes task submit or cancel; queue writes require same-origin JSON
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -85,7 +85,7 @@ pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read-only API and the embedded single-page app
+/// Read API, guarded queue writes, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -93,12 +93,44 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         None => api::read_routes(),
     };
     routes
+        .merge(super::queue_api::write_routes().layer(middleware::from_fn(browser_write_guard)))
         .fallback(asset)
         .layer(middleware::from_fn(move |request: Request, next: Next| {
             let policy = policy.clone();
             async move { host_guard(policy, request, next).await }
         }))
         .with_state(state)
+}
+
+/// Reject browser writes from another origin; non-browser JSON Fleet clients have no Origin
+pub(super) async fn browser_write_guard(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let origin = headers.get(header::ORIGIN);
+    let fetch_site = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    let allowed = !matches!(fetch_site, Some("cross-site" | "same-site"))
+        && origin.is_none_or(|origin| {
+            host.is_some_and(|host| origin.to_str().ok() == Some(format!("http://{host}").as_str()))
+        })
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media| media.trim() == "application/json")
+            });
+    if allowed {
+        return next.run(request).await;
+    }
+    (StatusCode::FORBIDDEN, Json(json!({ "api_version": API_VERSION, "error": {
+        "code": "permission", "message": "write requires same-origin JSON", "retryable": false, "input": {}
+    } }))).into_response()
 }
 
 /// Output of `npm run build` in `web/`. Empty until the dashboard is built;

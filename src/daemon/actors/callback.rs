@@ -18,7 +18,7 @@ use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
-use crate::home::{Home, TaskPaths};
+use crate::home::Home;
 use crate::notify::{Notice, NoticePriority, Notifier};
 use crate::submission::CallbackContext;
 use crate::thread_title::TitleSources;
@@ -464,7 +464,10 @@ pub(crate) async fn dispatch_inbox(
                 context: route.callback.clone(),
                 thread: route.thread,
                 line,
-                paths,
+                paths: CallbackPaths {
+                    callback_log: paths.callback_log,
+                    delivery_lock: paths.delivery_lock,
+                },
                 pending,
             };
             attempt.run(&callback).await?
@@ -529,12 +532,60 @@ pub(crate) async fn dispatch_inbox(
     }
 }
 
+/// Callback evidence independent of task or job identity
+struct CallbackPaths {
+    callback_log: PathBuf,
+    delivery_lock: PathBuf,
+}
+
+/// Deliver one job event through the same Claude, Codex, and T3 routing as task events
+pub(crate) async fn deliver_job_event(
+    home: &Home,
+    route: &crate::queue::delivery::JobRoute,
+    event: &crate::queue::JobEvent,
+    callback: &ActorRef<CallbackMsg>,
+) -> Result<DeliveryOutcome, AppError> {
+    let dir = home
+        .root()
+        .join("jobs")
+        .join(route.job.to_string())
+        .join("delivery");
+    std::fs::create_dir_all(&dir)?;
+    let mut payload = serde_json::to_value(event)?;
+    payload["api_version"] = serde_json::json!(crate::domain::API_VERSION);
+    payload["thread"] = serde_json::json!(route.thread);
+    payload["name"] = serde_json::json!(route.spec.name);
+    payload["machine"] = serde_json::json!(route.authority);
+    // blocked and never-started jobs have no run; explicit nulls keep the envelope stable
+    payload["resource"] = serde_json::json!(event.run.map(|run| run.resource));
+    payload["task"] = serde_json::json!(event.run.map(|run| run.task));
+    payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
+    payload["step"] = serde_json::json!(event.run.map(|run| run.step));
+    let attempt = OriginAttempt {
+        context: route.callback.clone(),
+        thread: route.thread,
+        line: format!("HOMEBASED_EVENT {}", serde_json::to_string(&payload)?),
+        paths: CallbackPaths {
+            callback_log: dir.join("callback.log"),
+            delivery_lock: dir.join("delivery.lock"),
+        },
+        pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
+    };
+    let (outcome, _) = attempt.run(callback).await?.into_settlement();
+    if matches!(outcome, DeliveryOutcome::Delivered) {
+        let _ = callback.cast(CallbackMsg::Delivered {
+            thread: route.thread,
+        });
+    }
+    Ok(outcome)
+}
+
 /// One reserved attempt on a saved origin route
 struct OriginAttempt {
     context: CallbackContext,
     thread: ThreadId,
     line: String,
-    paths: TaskPaths,
+    paths: CallbackPaths,
     pending: PendingT3Send,
 }
 

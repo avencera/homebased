@@ -16,6 +16,7 @@ pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
+pub mod queue_api;
 mod t3_watch;
 mod thread_titles;
 pub mod web;
@@ -83,6 +84,8 @@ pub struct AppState {
 #[derive(Clone, Default)]
 pub(crate) struct DaemonLocks {
     /// Origin-side remote task submissions, by caller request
+    /// Job submissions, by stable job identity
+    pub(crate) job_submissions: KeyedLocks<crate::queue::JobId>,
     pub(crate) origin_submissions: KeyedLocks<RequestId>,
     /// Origin-side cancellation intents, by task
     pub(crate) cancellation_intents: KeyedLocks<TaskId>,
@@ -158,6 +161,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         state.machine.identity.machine,
         state.fleet.clone(),
     ));
+    let job_events = tokio::spawn(event_sender::jobs::run(state.clone()));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
@@ -199,6 +203,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         runtime.shutdown().await;
     }
     sender.abort();
+    job_events.abort();
     recovery.abort();
     dependency_release.abort();
     cancellation.abort();

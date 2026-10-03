@@ -7,6 +7,8 @@
 //! the machine queue. The terminal commit of a run task classifies the run's
 //! end and moves its job in the same transaction
 
+mod delivery;
+pub mod interface;
 mod runtime;
 
 use std::path::PathBuf;
@@ -57,7 +59,7 @@ const SERVING_ORDER: &str = "ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med
      ELSE 2 END, position";
 
 /// A resource with its machine and single active run
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceRecord {
     /// Machine whose queue the resource serves
     pub machine: MachineId,
@@ -68,7 +70,7 @@ pub struct ResourceRecord {
 }
 
 /// A stored job
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobRecord {
     /// Job identity
     pub id: JobId,
@@ -80,7 +82,8 @@ pub struct JobRecord {
     pub spec: JobSpec,
     /// Digest of the accepted spec
     pub digest: String,
-    /// Captured environment of the submitter
+    /// Execution environment, captured locally or on the remote authority
+    #[serde(skip)]
     pub env: TaskEnv,
     /// Resources the job may use
     pub target: Target,
@@ -339,7 +342,10 @@ impl Store {
         let digest = new.spec.digest()?;
         self.immediate(|| {
             if let Some(existing) = self.job(new.id)? {
-                if existing.digest != digest || existing.machine != new.machine {
+                if existing.digest != digest
+                    || existing.machine != new.machine
+                    || existing.origin != new.origin
+                {
                     return Err(QueueError::JobConflict { job: new.id }.into());
                 }
                 return Ok(accepted(&existing));
@@ -841,6 +847,10 @@ impl Store {
             step: next_step,
             phase: RunPhase::Launching { reserved_at: now },
         };
+        self.conn.execute(
+            "INSERT INTO resource_run_history(task_id,resource_id) VALUES (?1,?2)",
+            params![task.to_string(), resource.to_string()],
+        )?;
         let run = self.write_run(&run)?;
         Ok(ReservedRun { run, resume })
     }
@@ -974,6 +984,13 @@ impl Store {
                 return Err(stale(resource, "the run already ended"));
             }
         };
+        self.conn.execute(
+            "UPDATE resource_run_history SET stop_cause=?2 WHERE task_id=?1",
+            params![
+                run.task.to_string(),
+                serde_json::to_string(&stop_cause(&run.phase))?
+            ],
+        )?;
         self.write_run(&run)
     }
 
@@ -1020,6 +1037,10 @@ impl Store {
                     ),
                 ));
             }
+            self.conn.execute(
+                "UPDATE resource_run_history SET cleanup_json=?2 WHERE task_id=?1",
+                params![task.to_string(), serde_json::to_string(&result)?],
+            )?;
             let Err(failure) = result else {
                 self.clear_run(resource)?;
                 return Ok(None);

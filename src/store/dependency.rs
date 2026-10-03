@@ -337,6 +337,9 @@ impl Store {
         tasks
             .iter()
             .map(|task| {
+                if self.job_run_link(*task)?.is_some() {
+                    return Err(AppError::Usage { message: format!("run task {task} cannot be used in after; job dependencies are not supported") });
+                }
                 let saved: Option<(String, Option<String>)> = self
                     .conn
                     .query_row(
