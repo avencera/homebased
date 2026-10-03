@@ -1,6 +1,5 @@
 //! Daemon-to-daemon identity and event routes under `/v1/cluster/*`
 
-use crate::daemon::actors::SupervisorMsg;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -10,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::cancellation::{CancellationReceipt, CancellationRequestIdentity, CancellationTarget};
 use crate::daemon::AppState;
-use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{LogTail, TaskDetail};
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId, TaskIdentity};
 use crate::error::AppError;
@@ -660,34 +659,37 @@ fn expand_executor_cwd(cwd: &StdPath) -> Result<PathBuf, AppError> {
         return Ok(cwd.to_path_buf());
     }
     let text = cwd.to_string_lossy();
-    if let Some(relative) = text.strip_prefix("~/") {
-        if StdPath::new(relative).is_absolute()
-            || StdPath::new(relative)
-                .components()
-                .any(|component| component == std::path::Component::ParentDir)
-        {
-            return Err(AppError::InvalidSpec {
-                pointer: "/spec/cwd".into(),
-                value: serde_json::to_value(cwd).unwrap_or(serde_json::Value::Null),
-                message: "remote cwd must remain under executor HOME".into(),
-            });
-        }
-        let home = std::env::var_os("HOME").ok_or(AppError::RemoteSubmissionUnavailable {
-            message: "executor HOME is unavailable".into(),
-        })?;
-        let home = PathBuf::from(home);
-        if !home.is_absolute() {
-            return Err(AppError::RemoteSubmissionUnavailable {
-                message: "executor HOME is not absolute".into(),
-            });
-        }
-        return Ok(home.join(relative));
+    let Some(relative) = text.strip_prefix("~/") else {
+        return Err(AppError::InvalidSpec {
+            pointer: "/spec/cwd".into(),
+            value: serde_json::to_value(cwd).unwrap_or(serde_json::Value::Null),
+            message: "remote cwd must be absolute or start with ~/".into(),
+        });
+    };
+
+    if StdPath::new(relative).is_absolute()
+        || StdPath::new(relative)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(AppError::InvalidSpec {
+            pointer: "/spec/cwd".into(),
+            value: serde_json::to_value(cwd).unwrap_or(serde_json::Value::Null),
+            message: "remote cwd must remain under executor HOME".into(),
+        });
     }
-    Err(AppError::InvalidSpec {
-        pointer: "/spec/cwd".into(),
-        value: serde_json::to_value(cwd).unwrap_or(serde_json::Value::Null),
-        message: "remote cwd must be absolute or start with ~/".into(),
-    })
+
+    let home = std::env::var_os("HOME").ok_or(AppError::RemoteSubmissionUnavailable {
+        message: "executor HOME is unavailable".into(),
+    })?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(AppError::RemoteSubmissionUnavailable {
+            message: "executor HOME is not absolute".into(),
+        });
+    }
+
+    Ok(home.join(relative))
 }
 
 async fn executor_identity(
@@ -778,12 +780,7 @@ fn check(state: &AppState, query: ReadQuery) -> Result<(), AppError> {
         .machine
         .identity
         .check_destination(query.destination_machine)?;
-    if query.api_version != API_VERSION {
-        return Err(AppError::Usage {
-            message: "unsupported API version".into(),
-        });
-    }
-    Ok(())
+    check_api_version(query.api_version)
 }
 
 async fn tasks(

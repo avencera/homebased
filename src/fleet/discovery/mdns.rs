@@ -281,9 +281,20 @@ fn claimed_identity(machine: Option<&str>, boot: Option<&str>) -> Option<Claimed
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use mdns_sd::ServiceEvent;
+
+    use super::{
+        MdnsAnnouncement, TXT_BOOT, TXT_MACHINE, TXT_PROTOCOL, claimed_identity, handle_event,
+    };
+    use crate::fleet::address::MachineAddress;
+    use crate::fleet::advertisement::MachineHeader;
+    use crate::fleet::directory::SightingProvider;
+    use crate::fleet::discovery::{DiscoveryEvent, SERVICE_TYPE};
     use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
-    use crate::machine::MachineName;
+    use crate::machine::{BootId, MACHINE_NAME_MAX_LEN, MachineId, MachineName};
 
     fn announcement() -> MdnsAnnouncement {
         MdnsAnnouncement {

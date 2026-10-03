@@ -831,10 +831,16 @@ fn rootless_runtime_directory(path: &Path) -> bool {
         3
     };
     // the directory itself or one user's runtime directory, not a path below it
-    components.len() <= depth + 1
-        || components
-            .get(depth + 1)
-            .is_some_and(|part| matches!(part, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with("docker") || name.starts_with("containerd"))))
+    if components.len() <= depth + 1 {
+        return true;
+    }
+
+    let Some(Component::Normal(name)) = components.get(depth + 1) else {
+        return false;
+    };
+
+    name.to_str()
+        .is_some_and(|name| name.starts_with("docker") || name.starts_with("containerd"))
 }
 
 /// Known daemon sockets with their symbolic links resolved on this machine

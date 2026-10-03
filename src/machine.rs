@@ -118,18 +118,22 @@ impl MachineName {
         if raw.is_empty() {
             return Err(MachineNameError::Empty);
         }
+
         if raw.len() > MACHINE_NAME_MAX_LEN {
             return Err(MachineNameError::TooLong { len: raw.len() });
         }
+
         if let Some(ch) = raw
             .chars()
             .find(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '-'))
         {
             return Err(MachineNameError::InvalidChar { ch });
         }
+
         if raw.starts_with('-') || raw.ends_with('-') {
             return Err(MachineNameError::EdgeHyphen);
         }
+
         Ok(Self(raw.to_string()))
     }
 
@@ -245,6 +249,7 @@ impl LocalIdentity {
         if destination == self.machine {
             return Ok(());
         }
+
         Err(AppError::MachineIdentityMismatch {
             expected: destination,
             found: Some(self.machine),
@@ -262,17 +267,20 @@ pub fn load_or_create_machine_id(home: &Home) -> Result<MachineId, AppError> {
     if let Some(id) = read_machine_id(&path)? {
         return Ok(id);
     }
+
     fs::create_dir_all(home.root())?;
     let candidate = MachineId::new();
     let tmp = home
         .root()
         .join(format!(".machine-id.{}.tmp", Uuid::now_v7()));
     write_synced(&tmp, format!("{candidate}\n").as_bytes())?;
+
     // a hard link fails when the target exists, which gives create-if-absent
     // without replacing an identity another process just wrote
     let linked = fs::hard_link(&tmp, &path);
     // the temporary name is garbage in every outcome
     let _ = fs::remove_file(&tmp);
+
     match linked {
         Ok(()) => Ok(candidate),
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -290,12 +298,14 @@ fn read_machine_id(path: &Path) -> Result<Option<MachineId>, AppError> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
+
     let uuid = Uuid::parse_str(text.trim()).map_err(|err| AppError::Internal {
         message: format!(
             "{} does not hold a machine UUID ({err}); restore it or remove it to create a new machine identity",
             path.display()
         ),
     })?;
+
     Ok(Some(MachineId(uuid)))
 }
 
@@ -316,7 +326,13 @@ pub fn host_machine_name() -> Option<MachineName> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+
+    use super::{
+        BootId, LocalIdentity, MachineId, MachineName, MachineNameError, load_or_create_machine_id,
+    };
+    use crate::error::AppError;
+    use crate::home::Home;
 
     fn home() -> (tempfile::TempDir, Home) {
         let dir = tempfile::tempdir().unwrap();

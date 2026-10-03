@@ -271,7 +271,10 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::{ClusterTaskList, merge_records};
+    use crate::daemon::api::views::TaskSummary;
+    use crate::domain::API_VERSION;
+    use crate::machine::MachineId;
 
     const MAIN: &str = "00000000-0000-4000-8000-000000000001";
     const CODE: &str = "00000000-0000-4000-8000-000000000002";

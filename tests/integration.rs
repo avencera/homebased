@@ -144,12 +144,7 @@ impl Harness {
     }
 
     fn restart_daemon_with_env(&mut self, env: &[(&str, &str)]) {
-        if let Some(mut child) = self.daemon.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let sock = self.home.join("homebased.sock");
-        let _ = fs::remove_file(&sock);
+        self.stop_daemon();
         self.start_daemon_with_env(env);
     }
 

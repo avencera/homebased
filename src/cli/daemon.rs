@@ -1,4 +1,4 @@
-//! `homebased daemon` commands.
+//! `homebased daemon` commands
 
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -52,12 +52,12 @@ pub enum DaemonCommand {
     Status,
 }
 
-/// How stop/restart reach the selected home's daemon.
+/// How stop/restart reach the selected home's daemon
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleRoute {
-    /// Installed unit matches this home; use systemctl/launchctl.
+    /// Installed unit matches this home; use systemctl/launchctl
     HostSupervisor,
-    /// No matching unit; signal or respawn through the selected socket.
+    /// No matching unit; signal or respawn through the selected socket
     Standalone,
 }
 
@@ -70,9 +70,19 @@ impl LifecycleRoute {
             | HostUnitState::Unrecognized => Self::Standalone,
         }
     }
+
+    fn recheck(self, ctx: &Ctx) -> Result<Self, AppError> {
+        match self {
+            Self::HostSupervisor => {
+                let current = install::inspect_host_unit(&ctx.home)?;
+                Ok(Self::from_unit_state(&current))
+            }
+            Self::Standalone => Ok(Self::Standalone),
+        }
+    }
 }
 
-/// Dispatch a daemon command.
+/// Dispatch a daemon command
 pub async fn run(ctx: &Ctx, command: DaemonCommand) -> Result<ExitCode, AppError> {
     match command {
         DaemonCommand::Install { dry_run } => install(ctx, dry_run),
@@ -102,8 +112,10 @@ fn install(ctx: &Ctx, dry_run: bool) -> Result<ExitCode, AppError> {
             }
             _ => print!("{text}"),
         }
+
         return Ok(ExitCode::SUCCESS);
     }
+
     install::install_with_config(&ctx.home, config.as_deref())?;
     ctx.print_id(
         "installed",
@@ -133,6 +145,7 @@ async fn uninstall(ctx: &Ctx, yes: bool) -> Result<ExitCode, AppError> {
         }
         HostUnitState::Absent | HostUnitState::SelectedHome => {}
     }
+
     stop_with_route(ctx, yes, &state).await?;
     install::uninstall(&ctx.home)?;
     ctx.print_id(
@@ -198,33 +211,34 @@ async fn stop_with_route(ctx: &Ctx, yes: bool, state: &HostUnitState) -> Result<
     let client = Client::new(ctx.home.sock_path());
     let socket_up = client.get("/v1/status").await.ok();
     ensure_idle_or_cancel(ctx, yes, socket_up.is_some()).await?;
-    let route = match LifecycleRoute::from_unit_state(state) {
-        LifecycleRoute::HostSupervisor => {
-            let current = install::inspect_host_unit(&ctx.home)?;
-            LifecycleRoute::from_unit_state(&current)
-        }
-        LifecycleRoute::Standalone => LifecycleRoute::Standalone,
-    };
+    let route = LifecycleRoute::from_unit_state(state).recheck(ctx)?;
     match route {
         LifecycleRoute::HostSupervisor => {
             install::host_stop()?;
         }
         LifecycleRoute::Standalone => {
-            if let Some(body) = socket_up
-                && let Some(pid) = body.get("pid").and_then(Value::as_u64)
-            {
-                // the daemon may already have exited between the status call and here
-                if let Err(err) = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGTERM,
-                ) {
-                    eprintln!("warning: SIGTERM daemon {pid}: {err}");
-                }
+            if let Some(body) = socket_up {
+                signal_daemon(&body);
             }
         }
     }
+
     wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
     Ok(())
+}
+
+fn signal_daemon(body: &Value) {
+    let Some(pid) = body.get("pid").and_then(Value::as_u64) else {
+        return;
+    };
+
+    // the daemon may already have exited between the status call and here
+    if let Err(err) = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    ) {
+        eprintln!("warning: SIGTERM daemon {pid}: {err}");
+    }
 }
 
 async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
@@ -237,16 +251,10 @@ async fn restart(ctx: &Ctx) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Restart serve for the selected home. Workers keep running.
+/// Restart serve for the selected home; workers keep running
 pub(crate) async fn restart_daemon(ctx: &Ctx) -> Result<(), AppError> {
     let state = install::inspect_host_unit(&ctx.home)?;
-    let route = match LifecycleRoute::from_unit_state(&state) {
-        LifecycleRoute::HostSupervisor => {
-            let current = install::inspect_host_unit(&ctx.home)?;
-            LifecycleRoute::from_unit_state(&current)
-        }
-        LifecycleRoute::Standalone => LifecycleRoute::Standalone,
-    };
+    let route = LifecycleRoute::from_unit_state(&state).recheck(ctx)?;
     match route {
         LifecycleRoute::HostSupervisor => {
             install::host_restart()?;
@@ -254,15 +262,7 @@ pub(crate) async fn restart_daemon(ctx: &Ctx) -> Result<(), AppError> {
         LifecycleRoute::Standalone => {
             let client = Client::new(ctx.home.sock_path());
             if let Ok(body) = client.get("/v1/status").await {
-                if let Some(pid) = body.get("pid").and_then(Value::as_u64) {
-                    // the daemon may already have exited between the status call and here
-                    if let Err(err) = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGTERM,
-                    ) {
-                        eprintln!("warning: SIGTERM daemon {pid}: {err}");
-                    }
-                }
+                signal_daemon(&body);
                 wait_socket_gone(&ctx.home.sock_path(), Duration::from_secs(15))?;
             }
             let exe = std::env::current_exe().map_err(|err| AppError::Internal {
@@ -292,6 +292,7 @@ pub(crate) async fn restart_daemon(ctx: &Ctx) -> Result<(), AppError> {
             cmd.spawn()?;
         }
     }
+
     wait_socket_up(&ctx.home.sock_path(), Duration::from_secs(15))?;
     Ok(())
 }
@@ -302,9 +303,11 @@ async fn ensure_idle_or_cancel(ctx: &Ctx, yes: bool, socket_up: bool) -> Result<
     if in_flight == 0 {
         return Ok(());
     }
+
     if !yes {
         return Err(AppError::TasksInFlight { count: in_flight });
     }
+
     cancel_in_flight(ctx, &store, socket_up).await?;
     wait_terminal_and_callback(&store, Duration::from_secs(60), socket_up)?;
     Ok(())
@@ -315,16 +318,19 @@ async fn cancel_in_flight(ctx: &Ctx, store: &Store, socket_up: bool) -> Result<(
     if socket_up {
         let client = Client::new(ctx.home.sock_path());
         for row in tasks {
+            let id = row.id;
             // cancel is idempotent and the daemon may be shutting down already
             if let Err(err) = client
-                .post(&format!("/v1/tasks/{}/cancel", row.id), &json!({}))
+                .post(&format!("/v1/tasks/{id}/cancel"), &json!({}))
                 .await
             {
-                eprintln!("warning: cancel {}: {err}", row.id);
+                eprintln!("warning: cancel {id}: {err}");
             }
         }
+
         return Ok(());
     }
+
     for row in tasks {
         match store.request_cancel(row.id)? {
             CancelResult::AlreadyTerminal(_) => {}
@@ -356,11 +362,13 @@ fn wait_terminal_and_callback(
         if !busy {
             return Ok(());
         }
+
         if start.elapsed() > budget {
             return Err(AppError::Internal {
                 message: "timed out waiting for in-flight tasks to finish".into(),
             });
         }
+
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -371,6 +379,7 @@ fn wait_socket_gone(path: &std::path::Path, budget: Duration) -> Result<(), AppE
         if start.elapsed() > budget {
             break;
         }
+
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
@@ -384,6 +393,7 @@ fn wait_socket_up(path: &std::path::Path, budget: Duration) -> Result<(), AppErr
                 message: "socket did not appear after restart".into(),
             });
         }
+
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())

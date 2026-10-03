@@ -110,19 +110,20 @@ pub(super) async fn insert_route(
             .await
         }
     };
-    match inserted {
-        Ok(saved) => Ok(saved),
-        Err(error) => {
-            let found = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
-                request,
-                reply,
-            })
-            .await?;
-            match found {
-                Some(found) => Err(conflict(&found, error.to_string())),
-                None => Err(error),
-            }
-        }
+    let error = match inserted {
+        Ok(saved) => return Ok(saved),
+        Err(error) => error,
+    };
+
+    let found = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
+        request,
+        reply,
+    })
+    .await?;
+
+    match found {
+        Some(found) => Err(conflict(&found, error.to_string())),
+        None => Err(error),
     }
 }
 

@@ -1039,21 +1039,24 @@ impl Store {
         let accept_held_launch = match &route.submission {
             // the executor's first queued event proves that a released launch
             // was accepted, even when its reply was lost
-            SubmissionState::Held { phase } => match phase {
-                HeldPhase::Launching => {
-                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
-                        return Err(EventError::Invalid {
-                            message: "first released task event must report queued state".into(),
-                        });
-                    }
-                    true
-                }
-                HeldPhase::Waiting | HeldPhase::Cancelled { .. } => {
+            SubmissionState::Held {
+                phase: HeldPhase::Launching,
+            } => {
+                if event.payload.process_state() != Some(ProcessStatus::Queued) {
                     return Err(EventError::Invalid {
-                        message: "held route has not launched a task".into(),
+                        message: "first released task event must report queued state".into(),
                     });
                 }
-            },
+
+                true
+            }
+            SubmissionState::Held {
+                phase: HeldPhase::Waiting | HeldPhase::Cancelled { .. },
+            } => {
+                return Err(EventError::Invalid {
+                    message: "held route has not launched a task".into(),
+                });
+            }
             _ => false,
         };
         let delivery = if event.payload.notification_required() {

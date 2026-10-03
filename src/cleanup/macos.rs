@@ -88,7 +88,7 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
 }
 
 // libc has no kinfo_proc binding; this is the leading extern_proc layout
-// from sys/proc.h, through p_pid. No trailing fields are interpreted
+// from sys/proc.h, through p_pid; no trailing fields are interpreted
 #[repr(C)]
 struct ProcStatusPrefix {
     start: libc::timeval,
@@ -110,7 +110,7 @@ fn exited_identity(pid: Pid) -> Option<ProcessIdentity> {
     ];
     let mut buffer = [0_u8; 1024];
     let mut size = buffer.len();
-    // safety: the kernel writes at most size bytes into the initialized buffer
+    // SAFETY: the kernel writes at most size bytes into the initialized buffer
     let result = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -124,7 +124,7 @@ fn exited_identity(pid: Pid) -> Option<ProcessIdentity> {
     if result != 0 || size < mem::size_of::<ProcStatusPrefix>() || size > buffer.len() {
         return None;
     }
-    // safety: this initialized prefix consists only of integers and raw pointers;
+    // SAFETY: this initialized prefix consists only of integers and raw pointers;
     // read_unaligned does not require the byte buffer to have struct alignment
     let info = unsafe { buffer.as_ptr().cast::<ProcStatusPrefix>().read_unaligned() };
     if info.pid != pid.as_raw() || u32::from(info.status) != libc::SZOMB {
@@ -149,6 +149,7 @@ pub(crate) struct EnvironmentReader {
 }
 
 impl EnvironmentReader {
+    /// Allocates a reusable buffer bounded by the kernel argument limit
     pub(super) fn new() -> io::Result<Self> {
         Ok(Self {
             buffer: vec![0; argmax()?],
@@ -242,10 +243,12 @@ fn environment_block(buffer: &[u8]) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
+/// Uses the PID as the signal handle because macOS has no pidfd
 pub(super) fn pin(pid: Pid) -> Read<SignalHandle> {
     Read::Found(pid)
 }
 
+/// Sends a signal to the PID after the caller checks its identity
 pub(super) fn send(pid: &SignalHandle, signal: Signal) -> Result<(), Errno> {
     kill(*pid, signal)
 }

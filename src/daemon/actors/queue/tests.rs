@@ -265,6 +265,58 @@ impl Harness {
         });
         identity
     }
+
+    fn cancel_jobs(&self, store: &Store) {
+        let Ok(jobs) = store.machine_queue(self.machine) else {
+            return;
+        };
+
+        for job in jobs {
+            let _ = store.cancel_job(self.machine, OperationId::new(), job.id, Utc::now());
+            let Ok(resources) = store.resources_on(self.machine) else {
+                continue;
+            };
+
+            for run in resources
+                .iter()
+                .filter_map(|resource| resource.run.as_ref())
+                .filter(|run| run.job == job.id)
+            {
+                let _ = store.request_cancel(run.task);
+            }
+        }
+    }
+
+    fn cleanup_tasks(store: &Store) {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while store
+            .non_terminal()
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let Ok(rows) = store.non_terminal() else {
+            return;
+        };
+
+        for row in rows {
+            if let Some(pid) = row.pid() {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+
+            if let Some(child) = row.child {
+                let _ = cleanup::cleanup_lost_group(
+                    child,
+                    row.id,
+                    &Default::default(),
+                    CleanupTiming::STANDARD,
+                );
+            }
+        }
+    }
 }
 
 impl Drop for Harness {
@@ -281,51 +333,18 @@ impl Drop for Harness {
                 );
             }
         }
+
         if let Ok(store) = Store::open(&self.home.db_path()) {
-            if let Ok(jobs) = store.machine_queue(self.machine) {
-                for job in jobs {
-                    let _ = store.cancel_job(self.machine, OperationId::new(), job.id, Utc::now());
-                    if let Ok(resources) = store.resources_on(self.machine) {
-                        for run in resources
-                            .iter()
-                            .filter_map(|resource| resource.run.as_ref())
-                            .filter(|run| run.job == job.id)
-                        {
-                            let _ = store.request_cancel(run.task);
-                        }
-                    }
-                }
-            }
-            let deadline = Instant::now() + Duration::from_secs(12);
-            while store
-                .non_terminal()
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false)
-                && Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            if let Ok(rows) = store.non_terminal() {
-                for row in rows {
-                    if let Some(pid) = row.pid() {
-                        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-                    }
-                    if let Some(child) = row.child {
-                        let _ = cleanup::cleanup_lost_group(
-                            child,
-                            row.id,
-                            &Default::default(),
-                            CleanupTiming::STANDARD,
-                        );
-                    }
-                }
-            }
+            self.cancel_jobs(&store);
+            Self::cleanup_tasks(&store);
         }
+
         for identity in &self.helpers {
             if cleanup::process_identity(identity.pid).ok() == Some(*identity) {
                 let _ = kill(identity.pid, Signal::SIGKILL);
             }
         }
+
         if let Some(mut child) = self.daemon.take() {
             let _ = child.kill();
             let _ = child.wait();

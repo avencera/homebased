@@ -850,11 +850,24 @@ impl PeerDirectory {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fleet::advertisement::MachineAdvertisement;
-    use crate::fleet::protocol::{
-        CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, SUPPORTED_PROTOCOLS,
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use chrono::{DateTime, Duration, Utc};
+
+    use super::{
+        AddressBinding, LocalMachine, NameError, NameTarget, PeerDirectory, Reachability,
+        RouteError, Sighting, SightingProvider,
     };
+    use crate::fleet::address::{AddressSource, MachineAddress};
+    use crate::fleet::advertisement::{
+        Capabilities, MachineAdvertisement, MachineHeader, ProbedMachine,
+    };
+    use crate::fleet::identity::{IdentityStatus, IdentityVerdict};
+    use crate::fleet::protocol::{
+        CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+    };
+    use crate::machine::{BootId, LocalIdentity, MachineId, MachineName};
 
     fn local() -> LocalMachine {
         LocalMachine {

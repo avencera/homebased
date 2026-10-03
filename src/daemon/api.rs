@@ -400,13 +400,13 @@ impl TaskFilter {
         Ok(Self { statuses, thread })
     }
 
-    /// Query pairs that parse back into this filter, `&`-terminated when non-empty
     /// Whether a task with this status and thread passes the filter
     fn matches(&self, status: TaskStatus, thread: ThreadId) -> bool {
         (self.statuses.is_empty() || self.statuses.contains(&status))
             && self.thread.is_none_or(|wanted| wanted == thread)
     }
 
+    /// Query pairs that parse back into this filter, `&`-terminated when non-empty
     pub(super) fn query_prefix(&self) -> String {
         let mut prefix = String::new();
         if !self.statuses.is_empty() {

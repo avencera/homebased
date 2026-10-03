@@ -336,33 +336,41 @@ impl Store {
     pub fn dependency_states(&self, tasks: &[TaskId]) -> Result<DependencyLookup, AppError> {
         tasks
             .iter()
-            .map(|task| {
-                if self.job_run_link(*task)?.is_some() {
-                    return Err(AppError::Usage { message: format!("run task {task} cannot be used in after; job dependencies are not supported") });
-                }
-                let saved: Option<(String, Option<String>)> = self
-                    .conn
-                    .query_row(
-                        "SELECT route_json,outcome FROM origin_routes WHERE task_id=?1",
-                        [task.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                let Some((route_json, outcome)) = saved else {
-                    return Ok((*task, None));
-                };
-                let outcome = match outcome {
-                    Some(outcome) => Some(DependencyOutcome::Known(
-                        TaskOutcome::from_storage(&outcome).ok_or_else(|| AppError::Internal {
-                            message: format!("unknown task outcome {outcome} for {task}"),
-                        })?,
-                    )),
-                    None => unrecorded_outcome(&decode_route(&route_json)?),
-                };
-                let state = outcome.map_or(DependencyState::Pending, DependencyState::Ended);
-                Ok((*task, Some(state)))
-            })
+            .map(|&task| self.dependency_state(task).map(|state| (task, state)))
             .collect()
+    }
+
+    fn dependency_state(&self, task: TaskId) -> Result<Option<DependencyState>, AppError> {
+        if self.job_run_link(task)?.is_some() {
+            return Err(AppError::Usage {
+                message: format!(
+                    "run task {task} cannot be used in after; job dependencies are not supported"
+                ),
+            });
+        }
+
+        let saved: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT route_json,outcome FROM origin_routes WHERE task_id=?1",
+                [task.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((route_json, outcome)) = saved else {
+            return Ok(None);
+        };
+
+        let outcome = match outcome {
+            Some(outcome) => Some(DependencyOutcome::Known(
+                TaskOutcome::from_storage(&outcome).ok_or_else(|| AppError::Internal {
+                    message: format!("unknown task outcome {outcome} for {task}"),
+                })?,
+            )),
+            None => unrecorded_outcome(&decode_route(&route_json)?),
+        };
+        let state = outcome.map_or(DependencyState::Pending, DependencyState::Ended);
+        Ok(Some(state))
     }
 
     /// Cancel a held route before launch and queue its `TASK_CANCELLED` event

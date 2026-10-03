@@ -18,6 +18,7 @@ use crate::domain::{
     ThreadId,
 };
 use crate::error::AppError;
+use crate::machine::MachineId;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -283,8 +284,11 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
             crate::error::FollowupBlocker::NotTerminal,
         ));
     }
-    let (local_machine, execution_machine, machine) =
-        followup_machines(&client, task, &detail).await?;
+    let FollowupMachines {
+        local_machine,
+        execution_machine,
+        submit_target,
+    } = followup_machines(&client, task, &detail).await?;
     if detail.get("availability").and_then(Value::as_str) != Some("available") {
         return Err(AppError::TaskUnavailable {
             task,
@@ -331,7 +335,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         "thread": thread,
         "name": name,
         "cwd": cwd,
-        "machine": machine,
+        "machine": submit_target,
         "timeout": format!("{timeout_secs}s"),
         "workload": {
             "type": "agent",
@@ -407,32 +411,31 @@ fn read_followup_message(
     }
 }
 
+struct FollowupMachines {
+    local_machine: MachineId,
+    execution_machine: MachineId,
+    submit_target: Option<String>,
+}
+
 async fn followup_machines(
     client: &Client,
     task: TaskId,
     detail: &Value,
-) -> Result<
-    (
-        crate::machine::MachineId,
-        crate::machine::MachineId,
-        Option<String>,
-    ),
-    AppError,
-> {
+) -> Result<FollowupMachines, AppError> {
     let origin_machine = detail
         .get("origin_machine")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Usage {
             message: "task detail does not identify its origin machine".into(),
         })?
-        .parse::<crate::machine::MachineId>()?;
+        .parse::<MachineId>()?;
     let execution_machine = detail
         .get("execution_machine")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Usage {
             message: "task detail does not identify its execution machine".into(),
         })?
-        .parse::<crate::machine::MachineId>()?;
+        .parse::<MachineId>()?;
     let inventory: MachinesBody = serde_json::from_value(client.get("/v1/fleet/machines").await?)
         .map_err(|error| AppError::Internal {
         message: format!("invalid Fleet machine list: {error}"),
@@ -444,7 +447,7 @@ async fn followup_machines(
             execution_machine,
         });
     }
-    let machine = if inventory.local.machine == execution_machine {
+    let submit_target = if inventory.local.machine == execution_machine {
         None
     } else {
         let peer = inventory
@@ -456,7 +459,11 @@ async fn followup_machines(
             })?;
         Some(peer.name.to_string())
     };
-    Ok((inventory.local.machine, execution_machine, machine))
+    Ok(FollowupMachines {
+        local_machine: inventory.local.machine,
+        execution_machine,
+        submit_target,
+    })
 }
 
 /// Waits between local submit attempts. The daemon has stalled for over a

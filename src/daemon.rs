@@ -83,9 +83,9 @@ pub struct AppState {
 /// key observes the result instead of racing it
 #[derive(Clone, Default)]
 pub(crate) struct DaemonLocks {
-    /// Origin-side remote task submissions, by caller request
     /// Job submissions, by stable job identity
     pub(crate) job_submissions: KeyedLocks<crate::queue::JobId>,
+    /// Origin-side remote task submissions, by caller request
     pub(crate) origin_submissions: KeyedLocks<RequestId>,
     /// Origin-side cancellation intents, by task
     pub(crate) cancellation_intents: KeyedLocks<TaskId>,

@@ -30,6 +30,28 @@ fn echo_command() -> NormalizedSpec {
     .unwrap()
 }
 
+fn command_task_row(id: TaskId, spec: &NormalizedSpec, path: String, binary: &str) -> TaskRow {
+    let NormalizedWorkload::Task(workload) = &spec.workload else {
+        panic!("supervisor test must use a command workload");
+    };
+
+    new_queued_task(NewTask {
+        id,
+        name: Some(spec.name.clone()),
+        thread: spec.thread,
+        workload: Workload::Task(TaskWorkload {
+            command: workload.command.clone(),
+        }),
+        cwd: spec.cwd.clone(),
+        timeout: spec.timeout,
+        env: TaskEnv {
+            path,
+            home: "/tmp".into(),
+        },
+        binary: binary.into(),
+    })
+}
+
 fn configure_task_runner() {
     crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
 }
@@ -58,25 +80,8 @@ async fn direct_launch_still_starts_its_command() {
     let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
     home.ensure().unwrap();
     let spec = echo_command();
-    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
-        panic!("direct launch test must use a command workload");
-    };
     let id = TaskId::new();
-    let row = new_queued_task(NewTask {
-        id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: Workload::Task(TaskWorkload {
-            command: workload.command,
-        }),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: TaskEnv {
-            path: "/bin".into(),
-            home: "/tmp".into(),
-        },
-        binary: "/bin/echo".into(),
-    });
+    let row = command_task_row(id, &spec, "/bin".into(), "/bin/echo");
     home.prepare_task(id).unwrap();
 
     let (supervisor, handle) = SupervisorActor::spawn(
@@ -123,25 +128,8 @@ async fn resume_local_starts_a_committed_row_whose_launch_stopped() {
     let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
     home.ensure().unwrap();
     let spec = echo_command();
-    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
-        panic!("resume test must use a command workload");
-    };
     let id = TaskId::new();
-    let row = new_queued_task(NewTask {
-        id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: Workload::Task(TaskWorkload {
-            command: workload.command,
-        }),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: TaskEnv {
-            path: "/bin".into(),
-            home: "/tmp".into(),
-        },
-        binary: "/bin/echo".into(),
-    });
+    let row = command_task_row(id, &spec, "/bin".into(), "/bin/echo");
     home.prepare_task(id).unwrap();
     let (supervisor, handle) = SupervisorActor::spawn(
         None,
@@ -212,25 +200,14 @@ async fn direct_launch_keeps_an_unresolved_callback_codex_unavailable() {
     let empty_path = directory.path().join("empty-bin");
     std::fs::create_dir(&empty_path).unwrap();
     let spec = echo_command();
-    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
-        panic!("direct launch test must use a command workload");
-    };
     let id = TaskId::new();
-    let row = new_queued_task(NewTask {
+    let row = command_task_row(
         id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: Workload::Task(TaskWorkload {
-            command: workload.command,
-        }),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: TaskEnv {
-            path: empty_path.to_string_lossy().into_owned(),
-            home: "/tmp".into(),
-        },
-        binary: "/bin/echo".into(),
-    });
+        &spec,
+        empty_path.to_string_lossy().into_owned(),
+        "/bin/echo",
+    );
+
     home.prepare_task(id).unwrap();
 
     let (supervisor, handle) = SupervisorActor::spawn(
@@ -271,24 +248,7 @@ async fn direct_launch_keeps_an_unresolved_callback_codex_unavailable() {
 fn direct_queued_tasks_keep_their_existing_startup_actions() {
     let spec = echo_command();
     let id = TaskId::new();
-    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
-        panic!("startup test must use a command workload");
-    };
-    let row = new_queued_task(NewTask {
-        id,
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: Workload::Task(TaskWorkload {
-            command: workload.command,
-        }),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: TaskEnv {
-            path: "/bin".into(),
-            home: "/tmp".into(),
-        },
-        binary: "/bin/echo".into(),
-    });
+    let row = command_task_row(id, &spec, "/bin".into(), "/bin/echo");
     assert_eq!(
         startup_recovery_action(&row, None, false),
         StartupRecoveryAction::Observe
@@ -346,24 +306,8 @@ fn shell_task(script: &str) -> (TaskRow, NormalizedSpec) {
         "workload": { "type": "task", "command": ["/bin/sh", "-c", script] }
     }))
     .unwrap();
-    let NormalizedWorkload::Task(workload) = spec.workload.clone() else {
-        panic!("released task test must use a command workload");
-    };
-    let row = new_queued_task(NewTask {
-        id: TaskId::new(),
-        name: Some(spec.name.clone()),
-        thread: spec.thread,
-        workload: Workload::Task(TaskWorkload {
-            command: workload.command,
-        }),
-        cwd: spec.cwd.clone(),
-        timeout: spec.timeout,
-        env: TaskEnv {
-            path: "/bin".into(),
-            home: "/tmp".into(),
-        },
-        binary: "/bin/sh".into(),
-    });
+
+    let row = command_task_row(TaskId::new(), &spec, "/bin".into(), "/bin/sh");
     (row, spec)
 }
 

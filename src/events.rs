@@ -73,10 +73,12 @@ impl TaskEvent {
         let EventPayload::Callback { event, .. } = &self.payload else {
             return Ok(None);
         };
+
         let mut value = serde_json::to_value(event)?;
         let object = value.as_object_mut().ok_or_else(|| AppError::Internal {
             message: "callback payload is not an object".into(),
         })?;
+
         object.insert("seq".into(), serde_json::json!(self.seq.get()));
         object.insert(
             "origin_machine".into(),
@@ -86,6 +88,7 @@ impl TaskEvent {
             "execution_machine".into(),
             serde_json::json!(self.execution_machine),
         );
+
         Ok(Some(format!("HOMEBASED_EVENT {value}")))
     }
 }
@@ -305,11 +308,14 @@ pub enum EventError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{num::NonZeroU64, path::PathBuf};
 
-    use super::*;
-    use crate::callback::{EventKind, NextAction, WorkloadView};
-    use crate::domain::ThreadId;
+    use chrono::Utc;
+
+    use super::{DeliveryState, EventPayload, TaskEvent};
+    use crate::callback::{EventKind, HomebasedEvent, NextAction, WorkloadView};
+    use crate::domain::{TaskId, ThreadId};
+    use crate::machine::MachineId;
 
     #[test]
     fn awaiting_thread_delivery_state_uses_its_durable_tag() {

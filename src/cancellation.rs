@@ -94,6 +94,7 @@ impl CancellationOwner {
         if route.task != task || route.origin_machine != route_machine {
             return Err(CancellationRefusal::RouteMismatch);
         }
+
         match route.submission {
             SubmissionState::Rejected { .. }
             | SubmissionState::Held {
@@ -133,6 +134,7 @@ impl CancellationOwner {
         if self.task != task {
             return Err(CancellationRefusal::RouteMismatch);
         }
+
         Ok(CancellationRequest {
             requester_machine,
             cancellation,
@@ -147,7 +149,6 @@ impl CancellationOwner {
     }
 }
 
-/// Durable requester-side target for one cancellation intent
 /// Durable requester-side target for one cancellation intent
 ///
 /// The tagged form is the stored and wire shape of saved intents, so it stays
@@ -337,6 +338,7 @@ mod tests {
         let request = owner
             .request(MachineId::new(), task, cancellation)
             .expect("ordinary execution must use its generic cancellation intent");
+
         assert_eq!(request.task, task);
         assert_eq!(request.origin_machine, origin_machine);
         assert_eq!(request.execution_machine, execution_machine);

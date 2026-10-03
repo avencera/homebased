@@ -1,4 +1,4 @@
-//! Hyper HTTP/1 client over a Unix socket.
+//! Hyper HTTP/1 client over a Unix socket
 
 use std::path::PathBuf;
 
@@ -14,30 +14,30 @@ use tokio::net::UnixStream;
 
 use crate::error::AppError;
 
-/// Client for the daemon Unix socket.
+/// Client for the daemon Unix socket
 #[derive(Debug, Clone)]
 pub struct Client {
     sock: PathBuf,
 }
 
 impl Client {
-    /// Connect to `home.sock_path()`.
+    /// Connect to `home.sock_path()`
     #[must_use]
     pub fn new(sock: PathBuf) -> Self {
         Self { sock }
     }
 
-    /// GET.
+    /// GET
     pub async fn get(&self, path: &str) -> Result<Value, AppError> {
         self.request("GET", path, None).await
     }
 
-    /// POST JSON.
+    /// POST JSON
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, AppError> {
         self.request("POST", path, Some(body)).await
     }
 
-    /// POST a typed JSON request and decode a typed response.
+    /// POST a typed JSON request and decode a typed response
     pub async fn post_json<T, R>(&self, path: &str, body: &T) -> Result<R, AppError>
     where
         T: Serialize,
@@ -73,10 +73,12 @@ impl Client {
             // connection errors surface on `send_request` and the body read below
             let _ = conn.await;
         });
+
         let payload = match body {
             Some(value) => serde_json::to_vec(value)?,
             None => Vec::new(),
         };
+
         let req = Request::builder()
             .method(method)
             .uri(path)
@@ -110,6 +112,7 @@ impl Client {
                 message: format!("decode: {err}"),
             });
         }
+
         Err(map_error(status, &bytes))
     }
 }
@@ -130,6 +133,7 @@ pub(crate) fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
         let input = error.get("input").unwrap_or(&Value::Null);
         return from_code(code, message, input, status);
     }
+
     AppError::Internal {
         message: format!(
             "http {} {}",
@@ -137,6 +141,13 @@ pub(crate) fn map_error(status: StatusCode, bytes: &[u8]) -> AppError {
             String::from_utf8_lossy(bytes)
         ),
     }
+}
+
+fn decode_field<T: DeserializeOwned>(input: &Value, key: &str) -> Option<T> {
+    input
+        .get(key)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> AppError {
@@ -149,18 +160,13 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         }
         .into();
     }
+
     match code {
         "usage" => AppError::Usage { message },
         "daemon_unavailable" => AppError::DaemonUnavailable { message },
         "cluster_lookup_incomplete" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok());
-            let unchecked = input
-                .get("unchecked")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok());
+            let task = decode_field(input, "task");
+            let unchecked = decode_field(input, "unchecked");
             match (task, unchecked) {
                 (Some(task), Some(unchecked)) => {
                     AppError::ClusterLookupIncomplete { task, unchecked }
@@ -169,102 +175,57 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "task_unavailable" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok());
-            let machine = input
-                .get("machine")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok());
+            let task = decode_field(input, "task");
+            let machine = decode_field(input, "machine");
             match (task, machine) {
                 (Some(task), Some(machine)) => AppError::TaskUnavailable { task, machine },
                 _ => AppError::Internal { message },
             }
         }
-        "unknown_dependency" => input
-            .get("task")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
+        "unknown_dependency" => decode_field(input, "task")
             .map_or(AppError::Internal { message }, |task| {
                 AppError::UnknownDependency { task }
             }),
         "dependency_failed" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let outcome = input
-                .get("outcome")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let task = decode_field(input, "task");
+            let outcome = decode_field(input, "outcome");
             match (task, outcome) {
                 (Some(task), Some(outcome)) => AppError::DependencyFailed { task, outcome },
                 _ => AppError::Internal { message },
             }
         }
-        "task_not_started" => input
-            .get("task")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
+        "task_not_started" => decode_field(input, "task")
             .map_or(AppError::Internal { message }, |task| {
                 AppError::TaskNotStarted { task }
             }),
         "followup_unavailable" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let reason = input
-                .get("reason")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let task = decode_field(input, "task");
+            let reason = decode_field(input, "reason");
             match (task, reason) {
                 (Some(task), Some(reason)) => AppError::FollowupUnavailable { task, reason },
                 _ => AppError::Internal { message },
             }
         }
         "worker_message_unavailable" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let reason = input
-                .get("reason")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let task = decode_field(input, "task");
+            let reason = decode_field(input, "reason");
             match (task, reason) {
                 (Some(task), Some(reason)) => AppError::WorkerMessageUnavailable { task, reason },
                 _ => AppError::Internal { message },
             }
         }
         "resume_thread_busy" => {
-            let thread = input
-                .get("thread")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let thread = decode_field(input, "thread");
+            let task = decode_field(input, "task");
             match (thread, task) {
                 (Some(thread), Some(task)) => AppError::ResumeThreadBusy { thread, task },
                 _ => AppError::Internal { message },
             }
         }
         "followup_wrong_machine" => {
-            let task = input
-                .get("task")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let origin_machine = input
-                .get("origin_machine")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let execution_machine = input
-                .get("execution_machine")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let task = decode_field(input, "task");
+            let origin_machine = decode_field(input, "origin_machine");
+            let execution_machine = decode_field(input, "execution_machine");
             match (task, origin_machine, execution_machine) {
                 (Some(task), Some(origin_machine), Some(execution_machine)) => {
                     AppError::FollowupWrongMachine {
@@ -276,18 +237,12 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
-        "cluster_task_conflict" => input
-            .get("task")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
+        "cluster_task_conflict" => decode_field(input, "task")
             .map_or(AppError::Internal { message }, |task| {
                 AppError::ClusterTaskConflict { task }
             }),
         "machine_unavailable" => {
-            let machine = input
-                .get("machine")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let machine = decode_field(input, "machine");
             match machine {
                 Some(machine) => AppError::MachineUnavailable { machine, message },
                 None => AppError::Internal { message },
@@ -302,46 +257,25 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 .to_string(),
         },
         "machine_identity_mismatch" => {
-            let expected = input
-                .get("expected")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let found = input
-                .get("found")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let expected = decode_field(input, "expected");
+            let found = decode_field(input, "found");
             match expected {
                 Some(expected) => AppError::MachineIdentityMismatch { expected, found },
                 None => AppError::Internal { message },
             }
         }
         "duplicate_machine_name" => {
-            let name = input
-                .get("name")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let machines = input
-                .get("machines")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let name = decode_field(input, "name");
+            let machines = decode_field(input, "machines");
             match (name, machines) {
                 (Some(name), Some(machines)) => AppError::DuplicateMachineName { name, machines },
                 _ => AppError::Internal { message },
             }
         }
         "cluster_protocol_incompatible" => {
-            let machine = input
-                .get("machine")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let local = input
-                .get("local")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let remote = input
-                .get("remote")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let machine = decode_field(input, "machine");
+            let local = decode_field(input, "local");
+            let remote = decode_field(input, "remote");
             match (machine, local, remote) {
                 (Some(machine), Some(local), Some(remote)) => {
                     AppError::ClusterProtocolIncompatible {
@@ -354,10 +288,7 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "submission_outcome_unknown" | "submission_rejected" | "submission_conflict" => {
-            let request = input
-                .get("request_id")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let request = decode_field(input, "request_id");
             let task = input
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -399,10 +330,7 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 None => AppError::Internal { message },
             }
         }
-        "route_not_found" => input
-            .get("task")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
+        "route_not_found" => decode_field(input, "task")
             .map_or(AppError::Internal { message }, |task| {
                 AppError::RouteNotFound { task }
             }),
@@ -413,10 +341,7 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 .unwrap_or(&message)
                 .to_string(),
         },
-        "message_to_self" => input
-            .get("thread")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
+        "message_to_self" => decode_field(input, "thread")
             .map_or(AppError::Internal { message }, |thread| {
                 AppError::MessageToSelf { thread }
             }),
@@ -427,40 +352,27 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 .unwrap_or("unknown")
                 .to_string(),
         },
-        "message_conflict" => input
-            .get("message_id")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
+        "message_conflict" => decode_field(input, "message_id")
             .map_or(AppError::Internal { message }, |id| {
                 AppError::MessageConflict { id }
             }),
-        "message_delivery_failed" => input
-            .get("message_id")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .map_or(
-                AppError::Internal {
-                    message: message.clone(),
-                },
-                |id| AppError::MessageDeliveryFailed {
-                    id,
-                    // the top-level message is the display form, which already names the id
-                    message: input
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or(&message)
-                        .to_string(),
-                },
-            ),
+        "message_delivery_failed" => decode_field(input, "message_id").map_or(
+            AppError::Internal {
+                message: message.clone(),
+            },
+            |id| AppError::MessageDeliveryFailed {
+                id,
+                // the top-level message is the display form, which already names the id
+                message: input
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&message)
+                    .to_string(),
+            },
+        ),
         "message_outcome_unknown" => {
-            let id = input
-                .get("message_id")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
-            let machine = input
-                .get("machine")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let id = decode_field(input, "message_id");
+            let machine = decode_field(input, "machine");
             match (id, machine) {
                 (Some(id), Some(machine)) => AppError::MessageOutcomeUnknown {
                     id,
@@ -472,16 +384,8 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         }
         "message_receiver_unavailable" => AppError::MessageUnavailable { message },
         "invalid_cwd" => {
-            let path_at = |key: &str| {
-                input
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .map(std::path::PathBuf::from)
-            };
-            let problem = input
-                .get("problem")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let path_at = |key: &str| input.get(key).and_then(Value::as_str).map(PathBuf::from);
+            let problem = decode_field(input, "problem");
             match (path_at("value"), problem) {
                 (Some(path), Some(problem)) => AppError::InvalidCwd {
                     path,
@@ -508,10 +412,7 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             message,
         },
         "agent_configuration" => {
-            let agent = input
-                .get("agent")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok());
+            let agent = decode_field(input, "agent");
             match agent {
                 Some(agent) => AppError::AgentConfiguration { agent, message },
                 None => AppError::Internal { message },
@@ -551,10 +452,29 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
 
 #[cfg(test)]
 mod tests {
+    use hyper::StatusCode;
     use serde_json::json;
 
-    use super::*;
+    use super::{from_code, map_error};
     use crate::domain::AgentKind;
+    use crate::error::AppError;
+
+    #[test]
+    fn invalid_error_fields_keep_the_internal_error_fallback() {
+        for input in [json!({}), json!({"task": null}), json!({"task": 42})] {
+            let error = from_code(
+                "unknown_dependency",
+                "invalid dependency".into(),
+                &input,
+                StatusCode::BAD_REQUEST,
+            );
+
+            assert!(matches!(
+                error,
+                AppError::Internal { message } if message == "invalid dependency"
+            ));
+        }
+    }
 
     #[test]
     fn message_delivery_failure_keeps_its_reason_across_hops() {
@@ -624,6 +544,7 @@ mod tests {
                 execution_machine: crate::machine::MachineId::new(),
             },
         ];
+
         for original in errors {
             let body = serde_json::to_vec(&original.to_json()).unwrap();
             let mapped = map_error(original.http_status(), &body);

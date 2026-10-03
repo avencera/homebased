@@ -180,15 +180,12 @@ impl Store {
             )
             .optional()
             .map_err(storage)?;
-        data.as_deref()
-            .map(decode_route)
-            .transpose()
-            .and_then(|route| {
-                if route.as_ref().is_some_and(|route| route.request != request) {
-                    return Err(IdentityError::Conflict);
-                }
-                Ok(route)
-            })
+        let route = data.as_deref().map(decode_route).transpose()?;
+        if route.as_ref().is_some_and(|route| route.request != request) {
+            return Err(IdentityError::Conflict);
+        }
+
+        Ok(route)
     }
 
     /// Read a saved origin route by global task UUID
@@ -202,15 +199,12 @@ impl Store {
             )
             .optional()
             .map_err(storage)?;
-        data.as_deref()
-            .map(decode_route)
-            .transpose()
-            .and_then(|route| {
-                if route.as_ref().is_some_and(|route| route.task != task) {
-                    return Err(IdentityError::Conflict);
-                }
-                Ok(route)
-            })
+        let route = data.as_deref().map(decode_route).transpose()?;
+        if route.as_ref().is_some_and(|route| route.task != task) {
+            return Err(IdentityError::Conflict);
+        }
+
+        Ok(route)
     }
 
     /// Find unresolved origin routes for one startup recovery pass

@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1135,7 +1135,7 @@ fn queue_command_once_checked(
 
 /// Drive one child to completion or deadline. Drains stdout/stderr on helper
 /// threads so a chatty child cannot deadlock a filled pipe, and kills the
-/// process group when the deadline elapses.
+/// process group when the deadline elapses
 fn run_command_deadline_checked(
     cmd: &mut Command,
     timeout: Duration,
@@ -1199,33 +1199,9 @@ fn run_command_deadline_checked(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                // kill the whole group, then reap; never leave an unbounded wait
-                let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
-                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-                let reap_deadline = Instant::now() + Duration::from_secs(QUEUE_REAP_TIMEOUT_SECS);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            let _ = rx_out.recv_timeout(Duration::from_millis(100));
-                            let _ = rx_err.recv_timeout(Duration::from_millis(100));
-                            return Err(format!(
-                                "codex queue timed out after {}s (exit={})",
-                                timeout.as_secs(),
-                                status
-                                    .code()
-                                    .unwrap_or_else(|| status.signal().unwrap_or(-1))
-                            ));
-                        }
-                        Ok(None) if Instant::now() >= reap_deadline => {
-                            return Err(format!(
-                                "codex queue timed out after {}s and child did not reap",
-                                timeout.as_secs()
-                            ));
-                        }
-                        Ok(None) => thread::sleep(Duration::from_millis(20)),
-                        Err(err) => return Err(err.to_string()),
-                    }
-                }
+                return Err(terminate_timed_out_child(
+                    &mut child, pid, timeout, &rx_out, &rx_err,
+                ));
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(err) => return Err(err.to_string()),
@@ -1240,6 +1216,42 @@ fn run_command_deadline_checked(
         stdout,
         stderr,
     }))
+}
+
+fn terminate_timed_out_child(
+    child: &mut Child,
+    pid: i32,
+    timeout: Duration,
+    stdout: &mpsc::Receiver<Vec<u8>>,
+    stderr: &mpsc::Receiver<Vec<u8>>,
+) -> String {
+    // kill the whole group, then reap; never leave an unbounded wait
+    let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    let reap_deadline = Instant::now() + Duration::from_secs(QUEUE_REAP_TIMEOUT_SECS);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = stdout.recv_timeout(Duration::from_millis(100));
+                let _ = stderr.recv_timeout(Duration::from_millis(100));
+                let timeout_secs = timeout.as_secs();
+                let exit = status
+                    .code()
+                    .unwrap_or_else(|| status.signal().unwrap_or(-1));
+
+                return format!("codex queue timed out after {timeout_secs}s (exit={exit})");
+            }
+            Ok(None) if Instant::now() >= reap_deadline => {
+                let timeout_secs = timeout.as_secs();
+                return format!(
+                    "codex queue timed out after {timeout_secs}s and child did not reap"
+                );
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(err) => return err.to_string(),
+        }
+    }
 }
 
 fn clear_close_on_exec(fd: i32) -> io::Result<()> {
@@ -1348,13 +1360,25 @@ mod tests {
         .ok_or_else(|| "unconditional callback was suppressed".into())
     }
 
-    use super::*;
+    use super::{
+        ATTENTION_SETTLE, CallbackContext, EventKind, NextAction, OriginSession, PendingT3Send,
+        ProcessPayload, QUEUE_ATTEMPT_TIMEOUT, QUEUE_ATTEMPT_WORST_CASE_SECS,
+        QUEUE_SEND_WORST_CASE_SECS, SendGate, WorkloadView, check_due_event, exit_event,
+        find_saved_origin, last_event_for_row, lost_event, notify_event,
+        run_command_deadline_checked, send_saved_queue_attempt,
+    };
     use crate::domain::{
-        Agent, AgentWorkload, AttentionState, CallbackStatus, ProcessGroupExitEvidence, TaskEnv,
+        Agent, AgentKind, AgentWorkload, AttentionState, CallbackStatus, ExitReason,
+        ProcessGroupExitEvidence, ReportOutcome, TaskEnv, TaskId, TaskReport, TaskRow, TaskState,
         Workload,
     };
     use chrono::Utc;
-    use std::time::Duration;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn row(state: TaskState) -> TaskRow {
         TaskRow {

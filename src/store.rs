@@ -1182,7 +1182,7 @@ impl Store {
             } else {
                 reports_from(&tx, row.id)?
             };
-            let mut notification_intents = Vec::new();
+            let mut pending_notifications = Vec::new();
             for report_seq in saved_notification_intents {
                 let report = reports
                     .iter()
@@ -1194,11 +1194,11 @@ impl Store {
                         ),
                     })?;
                 if report.notified_at.is_none() {
-                    notification_intents.push(report_seq);
+                    pending_notifications.push(report);
                 }
             }
             let mut next_event_seq =
-                u64::try_from(notification_intents.len()).map_err(|_| AppError::Internal {
+                u64::try_from(pending_notifications.len()).map_err(|_| AppError::Internal {
                     message: format!("too many retained notification intents for task {}", row.id),
                 })?;
             if pending_terminal_callback {
@@ -1269,16 +1269,7 @@ impl Store {
             )?;
 
             let mut seq = 0_u64;
-            for report_seq in &notification_intents {
-                let report = reports
-                    .iter()
-                    .find(|report| report.seq == *report_seq)
-                    .ok_or_else(|| AppError::Internal {
-                        message: format!(
-                            "notification intent for missing report {report_seq} on task {}",
-                            row.id
-                        ),
-                    })?;
+            for report in pending_notifications {
                 seq = seq.checked_add(1).ok_or_else(|| AppError::Internal {
                     message: format!("event sequence exhausted for task {}", row.id),
                 })?;
@@ -3100,6 +3091,60 @@ mod tests {
                 OutboxState::Acknowledged
             );
         }
+    }
+
+    #[test]
+    fn legacy_report_notifications_keep_order_and_skip_delivered_reports() {
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("db");
+        let mut store = Store::open(&db).unwrap();
+        let id = TaskId::new();
+        let machine = MachineId::new();
+        store.insert_task(&task_row(id)).unwrap();
+
+        for summary in ["first", "delivered", "last"] {
+            store
+                .append_report_with_notification(id, ReportOutcome::Succeeded, summary, true)
+                .unwrap();
+        }
+
+        store
+            .conn
+            .execute(
+                "UPDATE reports SET notified_at=?1 WHERE task_id=?2 AND seq=2",
+                params![super::fmt_time(Utc::now()), id.to_string()],
+            )
+            .unwrap();
+        store.migrate_legacy_local(machine).unwrap();
+
+        let events = store.inbound_events(id).unwrap();
+        assert_eq!(events.len(), 2);
+
+        for (inbox, (seq, summary)) in events.iter().zip([(1, "first"), (2, "last")]) {
+            assert_eq!(inbox.event.seq.get(), seq);
+            let EventPayload::Callback { event, state } = &inbox.event.payload else {
+                panic!("legacy report notification payload")
+            };
+
+            assert_eq!(event.event, EventKind::TaskReported);
+            assert_eq!(*state, None);
+            assert_eq!(event.reports.len(), 1);
+            assert_eq!(event.reports[0].summary, summary);
+        }
+
+        assert_eq!(
+            store
+                .origin_route_by_task(id)
+                .unwrap()
+                .unwrap()
+                .last_accepted_seq,
+            2
+        );
+        drop(store);
+
+        let mut reopened = Store::open(&db).unwrap();
+        reopened.migrate_legacy_local(machine).unwrap();
+        assert_eq!(reopened.inbound_events(id).unwrap(), events);
     }
 
     #[test]

@@ -936,8 +936,10 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
@@ -946,7 +948,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
-    use super::*;
+    use super::{
+        ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, WakeOutcome, deterministic_id,
+        load_runtime, owner, probe, wake_thread,
+    };
+    use crate::domain::ThreadId;
 
     const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
     const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";

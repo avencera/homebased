@@ -396,25 +396,14 @@ impl FleetHandle {
         let mut saw_mismatch = false;
         for ranked in plan.addresses {
             let address = ranked.address;
-            let result = probe(&self.shared.client, &address, self.shared.local.protocol).await;
-            let now = Utc::now();
-            let probed = match result {
+            let probed = match self.probe_address(&address).await {
                 Ok(probed) => probed,
                 Err(err) => {
                     last_failure = err.to_string();
-                    self.shared.directory.write().await.record_probe_failure(
-                        &address,
-                        last_failure.clone(),
-                        now,
-                    );
                     continue;
                 }
             };
-            self.shared
-                .directory
-                .write()
-                .await
-                .record_probe(&address, &probed, now);
+
             match check_probed(&address, machine, probed) {
                 Ok(verified) => return Ok(verified),
                 Err(DestinationError::IdentityMismatch { found, .. }) => {

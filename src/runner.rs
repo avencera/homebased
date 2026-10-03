@@ -1,4 +1,4 @@
-//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event.
+//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -54,6 +54,15 @@ struct TaskRunExit {
     process_group_exit_evidence: ProcessGroupExitEvidence,
 }
 
+impl TaskRunExit {
+    fn spawn_failed(message: String) -> Self {
+        Self {
+            reason: ExitReason::SpawnFailed { message },
+            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CleanupTiming {
     term_grace: Duration,
@@ -76,7 +85,7 @@ pub(crate) fn set_task_run_executable_for_tests(executable: std::path::PathBuf) 
     *TASK_RUN_EXECUTABLE_FOR_TESTS.lock().unwrap() = Some(executable);
 }
 
-/// Spawn `homebased task-run` with an inherited exclusive flock.
+/// Spawn `homebased task-run` with an inherited exclusive flock
 pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppError> {
     let exe = task_run_executable()?;
     let fd = lock.as_raw_fd();
@@ -150,14 +159,14 @@ fn prepare_worker(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Worker entry: hold the inherited lock until exit.json and event commit.
+/// Worker entry: hold the inherited lock until exit.json and event commit
 pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
     let lock = unsafe { File::from_raw_fd(lock_fd) };
-    // install the SIGTERM handler before any other work. Everything below (the
+    // install the SIGTERM handler before any other work: everything below (the
     // Queued->Running CAS, set_pid, the feed read) is a window in which the
     // default disposition would kill this worker outright, leaving the task
-    // Lost instead of Cancelled. Tokio latches a signal that arrives before the
-    // first `recv()`, so a cancel in this window is still seen.
+    // Lost instead of Cancelled; Tokio latches a signal that arrives before the
+    // first `recv()`, so a cancel in this window is still seen
     let mut sigterm = signal(SignalKind::terminate()).map_err(|err| AppError::Internal {
         message: format!("signal: {err}"),
     })?;
@@ -202,55 +211,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         let workload = configured.as_ref().unwrap_or(workload);
         return container::run(&store, &row, workload, &paths, entry, &mut sigterm).await;
     }
-    let exit = match invocation_from_workload_for_identity(
-        &row.workload,
-        &row.binary,
-        &row.cwd,
-        &paths.feed,
-        TaskIdentity::Actual(id),
-    ) {
-        Ok(invocation) => {
-            // only stdin-fed agents need the bytes; Grok reads the feed path from argv
-            let feed = match invocation.stdin {
-                StdinPolicy::PromptFeed => match std::fs::read(&paths.feed) {
-                    Ok(feed) => Ok(Some(feed)),
-                    Err(err) => {
-                        let message = format!("read prompt feed: {err}");
-                        std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
-                        Err(TaskRunExit {
-                            reason: ExitReason::SpawnFailed { message },
-                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-                        })
-                    }
-                },
-                StdinPolicy::Null => Ok(None),
-            };
-            match feed {
-                Ok(feed) => {
-                    match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm)
-                        .await
-                    {
-                        Ok(exit) => exit,
-                        Err(err) => TaskRunExit {
-                            reason: ExitReason::SpawnFailed {
-                                message: err.to_string(),
-                            },
-                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-                        },
-                    }
-                }
-                Err(exit) => exit,
-            }
-        }
-        Err(err) => {
-            let message = err.to_string();
-            std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
-            TaskRunExit {
-                reason: ExitReason::SpawnFailed { message },
-                process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-            }
-        }
-    };
+    let exit = run_host_workload(&row, &home, &paths, &store, &mut sigterm).await?;
 
     record_exit(
         &store,
@@ -259,6 +220,48 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         &exit.reason,
         exit.process_group_exit_evidence.into(),
         &row,
+    )
+}
+
+async fn run_host_workload(
+    row: &TaskRow,
+    home: &Home,
+    paths: &TaskPaths,
+    store: &Store,
+    sigterm: &mut SignalStream,
+) -> Result<TaskRunExit, AppError> {
+    let invocation = match invocation_from_workload_for_identity(
+        &row.workload,
+        &row.binary,
+        &row.cwd,
+        &paths.feed,
+        TaskIdentity::Actual(row.id),
+    ) {
+        Ok(invocation) => invocation,
+        Err(err) => {
+            let message = err.to_string();
+            std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+            return Ok(TaskRunExit::spawn_failed(message));
+        }
+    };
+
+    // only stdin-fed agents need the bytes; Grok reads the feed path from argv
+    let feed = match invocation.stdin {
+        StdinPolicy::PromptFeed => match std::fs::read(&paths.feed) {
+            Ok(feed) => Some(feed),
+            Err(err) => {
+                let message = format!("read prompt feed: {err}");
+                std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+                return Ok(TaskRunExit::spawn_failed(message));
+            }
+        },
+        StdinPolicy::Null => None,
+    };
+
+    Ok(
+        run_child(&invocation, row, home, paths, feed, store, sigterm)
+            .await
+            .unwrap_or_else(|err| TaskRunExit::spawn_failed(err.to_string())),
     )
 }
 
@@ -496,7 +499,7 @@ fn record_child_identity(store: &Store, id: TaskId, pid: i32) {
     }
 }
 
-/// A Unix wait status is either an exit code or a terminating signal.
+/// A Unix wait status is either an exit code or a terminating signal
 fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<ExitReason, AppError> {
     let status = match status {
         Ok(status) => status,
@@ -524,7 +527,7 @@ enum ProcessGroupProbe {
     Unknown,
 }
 
-/// Probe one process group without treating unexpected errors as evidence of exit.
+/// Probe one process group without treating unexpected errors as evidence of exit
 fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
     match kill(Pid::from_raw(-pgid), None) {
         Ok(()) => ProcessGroupProbe::Alive,
@@ -536,7 +539,7 @@ fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
     }
 }
 
-/// Reap the direct child while giving the full group one shared TERM grace.
+/// Reap the direct child while giving the full group one shared TERM grace
 async fn stop_child(
     child: &mut tokio::process::Child,
     pgid: i32,
@@ -630,7 +633,7 @@ async fn cancel_child_group(
     (evidence, state.natural)
 }
 
-/// Terminate remaining members of the child process group and confirm the result.
+/// Terminate remaining members of the child process group and confirm the result
 async fn cleanup_process_group(child_pgid: i32) -> ProcessGroupExitEvidence {
     cleanup_process_group_with(
         child_pgid,
@@ -710,7 +713,7 @@ async fn cleanup_process_group_with(
     }
 }
 
-/// Write prompt evidence for an agent workload.
+/// Write prompt evidence for an agent workload
 pub fn write_task_files(
     paths: &TaskPaths,
     prompt: &str,
@@ -724,15 +727,23 @@ pub fn write_task_files(
     paths.write_prompt(prompt, trailer)
 }
 
-/// Open `runner.lock` and take the exclusive flock before spawn.
+/// Open `runner.lock` and take the exclusive flock before spawn
 pub fn lock_before_spawn(paths: &TaskPaths) -> Result<File, AppError> {
     home::flock_exclusive(&paths.runner_lock, LockMode::Blocking)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AppError, ChildInvocation, CleanupTiming, Duration, ExitReason, File, Home, LockMode,
+        ProcessGroupExitEvidence, ProcessGroupProbe, Signal, SignalKind, StdinPolicy, Store,
+        TaskId, TaskPaths, ThreadId, TokioCommand, WORKER_THREAD_LOG_PREFIX_BYTES,
+        cancel_child_group, cleanup_process_group_with, home, parse_codex_worker_thread,
+        prepare_worker, run_child, signal, stop_child, store, time, write_task_files,
+    };
     use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     #[test]

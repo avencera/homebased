@@ -472,12 +472,7 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
             Ok(NormalizedWorkload::Agent(agent))
         }
         "task" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct TaskWire {
-                command: Vec<String>,
-            }
-            let task: TaskWire = deserialize_under(&content, "/workload")?;
+            let task: SubmitTaskWorkload = deserialize_under(&content, "/workload")?;
             let command = CommandLine::try_from_argv(task.command.clone())
                 .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
             Ok(NormalizedWorkload::Task(NormalizedTaskWorkload { command }))
@@ -975,44 +970,10 @@ impl From<HostInputError> for AppError {
 }
 
 #[cfg(test)]
-fn example_agent_json() -> Value {
-    json!({
-        "api_version": 1,
-        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-        "name": "implement file browser",
-        "cwd": "/tmp",
-        "timeout": "4h",
-        "workload": {
-            "type": "agent",
-            "agent": "claude",
-            "model": "fable",
-            "prompt": "do the work",
-            "extra_args": ["--verbose"]
-        }
-    })
-}
-
-#[cfg(test)]
-fn example_task_json() -> Value {
-    json!({
-        "api_version": 1,
-        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-        "name": "cargo release build",
-        "cwd": "/tmp",
-        "timeout": "4h",
-        "workload": {
-            "type": "task",
-            "command": ["cargo", "build", "--release"]
-        }
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
         NormalizedWorkload, PromptSource, SubmitAgent, SubmitSpec, SubmitWorkloadValidated,
-        default_timeout, example_agent_json, example_task_json, normalize, parse_normalized_value,
-        parse_spec_value, schema_json,
+        default_timeout, normalize, parse_normalized_value, parse_spec_value, schema_json,
     };
     use crate::domain::{AgentKind, TaskName, ThreadId};
     use crate::error::AppError;
@@ -1020,6 +981,37 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    fn example_agent_json() -> Value {
+        json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "implement file browser",
+            "cwd": "/tmp",
+            "timeout": "4h",
+            "workload": {
+                "type": "agent",
+                "agent": "claude",
+                "model": "fable",
+                "prompt": "do the work",
+                "extra_args": ["--verbose"]
+            }
+        })
+    }
+
+    fn example_task_json() -> Value {
+        json!({
+            "api_version": 1,
+            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+            "name": "cargo release build",
+            "cwd": "/tmp",
+            "timeout": "4h",
+            "workload": {
+                "type": "task",
+                "command": ["cargo", "build", "--release"]
+            }
+        })
+    }
 
     #[test]
     fn absent_machine_keeps_local_spec_valid() {
