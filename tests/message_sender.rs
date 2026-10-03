@@ -237,16 +237,28 @@ impl Daemon {
     }
 
     fn spawn(&mut self) {
+        let log = self.state_home.join("daemon-stderr.log");
         let child = self
             .command()
             .args(["daemon", "serve", "--web-listen"])
             .arg(&self.address)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
             .spawn()
             .unwrap();
         self.child = Some(child);
-        assert!(wait_until(Duration::from_secs(10), || self.http_ready()));
+        if wait_until(Duration::from_secs(10), || self.http_ready()) {
+            return;
+        }
+
+        // say whether the daemon exited, for example on a port another test took,
+        // or is still starting, so an intermittent failure carries its cause
+        let exited = self.child.as_mut().map(Child::try_wait);
+        let stderr = fs::read_to_string(&log).unwrap_or_default();
+        panic!(
+            "daemon on {} was not ready after 10s; exit status: {exited:?}\n{stderr}",
+            self.address
+        );
     }
 
     fn http_ready(&self) -> bool {
