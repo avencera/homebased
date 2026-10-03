@@ -509,9 +509,7 @@ struct Sweeper<'a, S> {
     protected_hits: BTreeSet<Pid>,
     /// Same-user refusals already logged, so rescans do not repeat the warning
     warned: BTreeSet<Pid>,
-    observation_unstable: bool,
     empty_since: Option<Instant>,
-    exited: BTreeSet<ProcessIdentity>,
 }
 
 impl<'a, S: ProcessSource> Sweeper<'a, S> {
@@ -534,9 +532,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             signalled: BTreeSet::new(),
             protected_hits: BTreeSet::new(),
             warned: BTreeSet::new(),
-            observation_unstable: false,
             empty_since: None,
-            exited: BTreeSet::new(),
         }
     }
 
@@ -641,7 +637,6 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             .map_err(|error| CleanupFailure::EnumerationFailed {
                 message: error.to_string(),
             })?;
-        self.observation_unstable = false;
         let mut scan = Scan::default();
         for pid in pids {
             let Some(identity) = self.observe(pid) else {
@@ -655,9 +650,14 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             }
             scan.targets.insert(pid, identity);
         }
-        // a vanished parent can leave a child outside the enumerated PID list
-        // only two stable empty scans separated by a full poll can finish cleanup
-        if !scan.targets.is_empty() || self.observation_unstable {
+        // a marked parent that forks and exits during a scan leaves its child
+        // outside that scan's PID list, but the child is listed by the next
+        // scan, so cleanup finishes only after two empty scans a full poll
+        // apart. Processes that vanish mid-scan do not reset this: on a busy
+        // machine short-lived processes exit during every scan. A chain of
+        // marked processes that each fork and exit within every poll can
+        // still escape
+        if !scan.targets.is_empty() {
             self.empty_since = None;
         } else {
             let now = Instant::now();
@@ -673,40 +673,18 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     fn observe(&mut self, pid: Pid) -> Option<ProcessIdentity> {
         let info = match self.source.info(pid) {
             Read::Found(info) if !info.zombie => info,
-            Read::Gone => {
-                self.observation_unstable = true;
-                return None;
-            }
-            Read::Found(info) => {
-                self.note_exited(ProcessIdentity {
-                    pid,
-                    start: info.start,
-                });
-                return None;
-            }
-            Read::Exited(identity) => {
-                self.note_exited(identity);
-                return None;
-            }
-            Read::Refused(_) => return None,
+            Read::Found(_) | Read::Exited(_) | Read::Gone | Read::Refused(_) => return None,
         };
         let environment = match self.source.environment(pid) {
             Read::Found(environment) => environment,
-            Read::Gone => {
-                self.observation_unstable = true;
-                return None;
-            }
-            Read::Exited(_) => {
-                self.observation_unstable = true;
-                return None;
-            }
+            Read::Exited(_) | Read::Gone => return None,
             Read::Refused(errno) => {
                 self.note_refusal(pid, info, errno);
                 return None;
             }
         };
-        // the identity must still hold after the environment read, even for an
-        // unmarked process, or this process table scan was not stable
+        // the identity must still hold after the environment read, or the
+        // environment may belong to a process that reused the PID
         if !self.still_same(pid, info) || !environment.carries(&self.marker_value) {
             return None;
         }
@@ -716,25 +694,10 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         })
     }
 
-    fn note_exited(&mut self, identity: ProcessIdentity) {
-        // a newly observed zombie may have forked after enumeration; only an
-        // already observed exited identity cannot introduce another descendant
-        if self.exited.insert(identity) {
-            self.observation_unstable = true;
-        }
-    }
-
     fn still_same(&mut self, pid: Pid, info: ProcessInfo) -> bool {
         match self.source.info(pid) {
             Read::Found(after) if !after.zombie && after.start == info.start => true,
-            Read::Found(_) | Read::Exited(_) | Read::Gone => {
-                self.observation_unstable = true;
-                false
-            }
-            Read::Refused(_) => {
-                self.observation_unstable = true;
-                false
-            }
+            Read::Found(_) | Read::Exited(_) | Read::Gone | Read::Refused(_) => false,
         }
     }
 
