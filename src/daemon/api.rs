@@ -13,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::callback::last_event_for_row;
-use crate::cancellation::{
-    CancellationOwner, CancellationPlan, CancellationRoute, CancellationTarget,
-};
+use crate::cancellation::{CancellationOwner, CancellationRoute};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
     ContainerDetail, DependencyView, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList,
@@ -51,7 +49,6 @@ impl IntoResponse for AppError {
 pub fn read_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::daemon::fleet_api::read_routes())
-        .merge(crate::daemon::resource_api::read_routes())
         .merge(crate::daemon::fleet_tasks::read_routes())
         .merge(crate::daemon::thread_titles::read_routes())
         .route("/v1/status", get(status))
@@ -78,9 +75,6 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(write_routes())
         .route("/v1/tasks/{id}/followup-source", get(followup_source))
         .merge(crate::daemon::fleet_api::socket_routes())
-        .merge(crate::daemon::release_watcher_api::socket_routes())
-        .merge(crate::daemon::resource_action::socket_routes())
-        .merge(crate::daemon::resource_api::socket_routes())
         .with_state(state)
 }
 
@@ -588,34 +582,19 @@ async fn cancel(
     }
 
     let local = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await?;
-    if local.is_some() && local_task_already_cancelled(&state, id).await? {
-        return Ok(Json(CancelResponse::status(id, ProcessStatus::Cancelled)));
-    }
-
     if local.is_none() {
         let owner = crate::daemon::inspection::cancellation_owner(&state, id).await?;
-        let plan = owner
-            .plan(state.machine.identity.machine, id, uuid::Uuid::now_v7())
+        let request = owner
+            .request(state.machine.identity.machine, id, uuid::Uuid::now_v7())
             .map_err(|refusal| refusal.into_error(id))?;
-        let response = match plan {
-            CancellationPlan::AlreadyCancelled => {
-                CancelResponse::status(id, ProcessStatus::Cancelled)
-            }
-            CancellationPlan::Deliver(request) => {
-                let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
-                    request: *request,
-                    reply,
-                })
-                .await?;
-                CancelResponse::intent(&saved)
-            }
-            CancellationPlan::ForwardToOrigin(target) => {
-                crate::daemon::cluster::forward_resource_cancellation_intent(&state, &target)
-                    .await?
-            }
-        };
-        return Ok(Json(response));
+        let (saved, _) = call(&state.store, |reply| StoreMsg::InsertCancellationRequest {
+            request,
+            reply,
+        })
+        .await?;
+        return Ok(Json(CancelResponse::intent(&saved)));
     }
+    check_local_cancellation_owner(&state, id).await?;
     let result = call(&state.supervisor, |reply| SupervisorMsg::Cancel {
         id,
         reply,
@@ -629,7 +608,8 @@ async fn cancel(
     Ok(Json(response))
 }
 
-async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bool, AppError> {
+/// Refuse to cancel a local row through the supervisor unless this machine executes it
+async fn check_local_cancellation_owner(state: &AppState, id: TaskId) -> Result<(), AppError> {
     let machine = state.machine.identity.machine;
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply }).await?;
     let owner = if let Some(route) = route {
@@ -642,27 +622,15 @@ async fn local_task_already_cancelled(state: &AppState, id: TaskId) -> Result<bo
         })
         .await?;
         if identity.is_none() {
-            return Ok(false);
+            return Ok(());
         }
         crate::daemon::inspection::cancellation_owner(state, id).await?
     };
 
-    let plan = owner
-        .plan(machine, id, uuid::Uuid::now_v7())
-        .map_err(|refusal| refusal.into_error(id))?;
-    match plan {
-        CancellationPlan::AlreadyCancelled => Ok(true),
-        // only an ordinary execution intent aimed at this machine may use the local row
-        CancellationPlan::Deliver(request)
-            if request.execution_machine == machine
-                && matches!(request.target, CancellationTarget::Execution { .. }) =>
-        {
-            Ok(false)
-        }
-        CancellationPlan::Deliver(_) | CancellationPlan::ForwardToOrigin(_) => {
-            Err(AppError::ClusterTaskConflict { task: id })
-        }
+    if owner.execution_machine != machine {
+        return Err(AppError::ClusterTaskConflict { task: id });
     }
+    Ok(())
 }
 
 #[cfg(test)]

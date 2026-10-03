@@ -318,11 +318,6 @@ async fn finish_saved(
         SubmissionState::AcceptanceUnknown => reconcile(state, route).await,
         // the dependency release owns a held route, including its launch
         SubmissionState::Held { phase } => Ok((route.task, phase.status())),
-        SubmissionState::Resource { .. }
-        | SubmissionState::ResourceAction { .. }
-        | SubmissionState::ResourceBackground { .. } => {
-            Err(conflict(&route, "request UUID belongs to a resource route"))
-        }
     }
 }
 
@@ -449,11 +444,6 @@ async fn resolve_identity(
         SubmissionState::AcceptanceUnknown | SubmissionState::Held { .. } => {
             Err(unknown(&route, "origin route is unresolved"))
         }
-        SubmissionState::Resource { .. }
-        | SubmissionState::ResourceAction { .. }
-        | SubmissionState::ResourceBackground { .. } => {
-            Err(conflict(&saved, "request UUID belongs to a resource route"))
-        }
     }
 }
 
@@ -514,15 +504,6 @@ pub(super) fn conflict(route: &OriginRoute, message: impl Into<String>) -> AppEr
 }
 
 fn ensure_direct_route(route: &OriginRoute) -> Result<(), AppError> {
-    // resource and action-bound routes never use the generic abandon path
-    if matches!(
-        route.submission,
-        SubmissionState::Resource { .. }
-            | SubmissionState::ResourceAction { .. }
-            | SubmissionState::ResourceBackground { .. }
-    ) {
-        return Err(conflict(route, "request UUID belongs to a resource route"));
-    }
     if route.spec.current().is_none() {
         return Err(conflict(route, "migrated local task has no remote request"));
     }
@@ -624,18 +605,16 @@ fn local_dry_run(
 mod tests {
     use std::path::Path;
 
-    use super::{decode_identity, decode_preview, ensure_direct_route};
+    use super::{decode_identity, decode_preview};
     use crate::daemon::cluster::PreviewBody;
     use crate::domain::{API_VERSION, TaskEnv, TaskId};
     use crate::error::AppError;
     use crate::fleet::http::ClusterResponse;
     use crate::fleet::protocol::ClusterProtocolVersion;
     use crate::machine::MachineId;
-    use crate::resource::ResourceId;
     use crate::spec::NormalizedSpec;
     use crate::submission::{
-        CallbackContext, CallbackExecutable, NewResourceRoute, OriginRoute, RequestId,
-        ResourceRoutePhase, SubmissionState,
+        CallbackContext, CallbackExecutable, OriginRoute, RequestId, SubmissionState,
     };
     use axum::http::StatusCode;
     use bytes::Bytes;
@@ -724,49 +703,6 @@ mod tests {
         assert!(matches!(
             decode_preview(mismatched, selected),
             Err(AppError::RemoteSubmissionUnavailable { .. })
-        ));
-    }
-
-    #[test]
-    fn direct_retry_rejects_a_saved_resource_request_before_reconciliation() {
-        let spec: NormalizedSpec = serde_json::from_value(serde_json::json!({
-            "api_version": 1,
-            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "name": "resource task",
-            "cwd": "/tmp",
-            "timeout": "4h",
-            "workload": { "type": "task", "command": ["echo", "hello"] }
-        }))
-        .unwrap();
-        let route = OriginRoute::new_resource_waiting(NewResourceRoute {
-            request: RequestId::new(),
-            task: TaskId::new(),
-            origin_machine: MachineId::new(),
-            authority_machine: MachineId::new(),
-            thread: spec.thread,
-            callback: CallbackContext {
-                env: TaskEnv {
-                    path: "/bin".into(),
-                    home: "/tmp".into(),
-                },
-                cwd: Path::new("/tmp").to_path_buf(),
-                codex: Path::new("/bin/echo").to_path_buf().into(),
-            },
-            spec,
-            resource: ResourceId::new(),
-        })
-        .unwrap();
-
-        assert!(matches!(
-            ensure_direct_route(&route),
-            Err(AppError::SubmissionConflict { .. })
-        ));
-        assert!(matches!(
-            route.submission,
-            SubmissionState::Resource {
-                phase: ResourceRoutePhase::AcceptanceUnknown,
-                ..
-            }
         ));
     }
 }

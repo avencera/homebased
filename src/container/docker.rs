@@ -20,13 +20,9 @@ use super::lifecycle::{
 };
 use super::spec::{ContainerUser, ContainerWorkload};
 use crate::domain::{ContainerId, TaskEnv, TaskId};
-use crate::resource::ResourceId;
 
 /// Label that names the Homebased task of a container
 pub const TASK_LABEL: &str = "homebased.task";
-
-/// Label that names the resource whose loan runs a container
-pub const RESOURCE_LABEL: &str = "homebased.resource";
 
 /// Longest wait for one Docker CLI call that does not block on the container
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -45,8 +41,6 @@ pub fn container_name(task: TaskId) -> String {
 pub struct CreateContext<'a> {
     /// Task that owns the container
     pub task: TaskId,
-    /// Resource whose loan runs the container, for resource work
-    pub resource: Option<ResourceId>,
     /// File where Docker writes the new container ID
     pub cidfile: &'a Path,
     /// User when the workload names none: the daemon's user
@@ -70,10 +64,6 @@ pub fn create_args(workload: &ContainerWorkload, context: &CreateContext<'_>) ->
         "--label".into(),
         format!("{TASK_LABEL}={}", context.task),
     ];
-    if let Some(resource) = context.resource {
-        args.push("--label".into());
-        args.push(format!("{RESOURCE_LABEL}={}", resource.as_uuid()));
-    }
     args.extend([
         "--init".into(),
         "--cidfile".into(),
@@ -462,14 +452,12 @@ mod tests {
     use crate::container::lifecycle::ContainerStatus;
     use crate::container::spec::{ContainerUser, ContainerWorkload};
     use crate::domain::TaskId;
-    use crate::resource::ResourceId;
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn create_argv_comes_only_from_the_typed_spec() {
         let task: TaskId = "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap();
-        let resource = ResourceId::new();
         let workload = ContainerWorkload::from_value(&json!({
             "image": format!("eval@{DIGEST}"),
             "entrypoint": ["/usr/bin/python3", "-m", "eval"],
@@ -488,7 +476,6 @@ mod tests {
             &workload,
             &CreateContext {
                 task,
-                resource: Some(resource),
                 cidfile: Path::new("/home/me/.homebased/tasks/t/container.cid"),
                 default_user: ContainerUser { uid: 501, gid: 20 },
             },
@@ -500,8 +487,6 @@ mod tests {
             "homebased-01a0ab97-a7aa-7463-a5b0-8d500e40e431",
             "--label",
             "homebased.task=01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "--label",
-            &format!("homebased.resource={}", resource.as_uuid()),
             "--init",
             "--cidfile",
             "/home/me/.homebased/tasks/t/container.cid",
@@ -552,7 +537,6 @@ mod tests {
             &minimal,
             &CreateContext {
                 task,
-                resource: None,
                 cidfile: Path::new("/t/container.cid"),
                 default_user: ContainerUser { uid: 501, gid: 20 },
             },
@@ -561,11 +545,6 @@ mod tests {
             !args
                 .iter()
                 .any(|arg| arg == "--gpus" || arg == "--entrypoint")
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("homebased.resource="))
         );
         assert_eq!(args.last().map(String::as_str), Some(DIGEST));
         let user = args.iter().position(|arg| arg == "--user").unwrap();

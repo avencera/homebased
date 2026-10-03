@@ -50,14 +50,6 @@ impl Client {
         })
     }
 
-    /// Typed GET.
-    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, AppError> {
-        let value = self.get(path).await?;
-        serde_json::from_value(value).map_err(|err| AppError::Internal {
-            message: err.to_string(),
-        })
-    }
-
     async fn request(
         &self,
         method: &str,

@@ -210,19 +210,19 @@ async fn resume(
                 reason: reason.clone(),
             });
         }
-        _ => return Err(conflict(&route, "request UUID belongs to a resource route")),
+        // only a remote submission waits on an unknown acceptance
+        SubmissionState::AcceptanceUnknown => {
+            return Err(conflict(
+                &route,
+                "request UUID belongs to a remote submission",
+            ));
+        }
     }
     let id = route.task;
-    match call(&state.supervisor, |reply| SupervisorMsg::ResumeLocal {
+    let status = call(&state.supervisor, |reply| SupervisorMsg::ResumeLocal {
         id,
         reply,
     })
-    .await?
-    {
-        Some(status) => Ok((id, status.into())),
-        None => Err(conflict(
-            &route,
-            "request UUID belongs to a resource launch",
-        )),
-    }
+    .await?;
+    Ok((id, status.into()))
 }

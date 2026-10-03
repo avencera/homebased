@@ -16,13 +16,6 @@ pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
-mod release_watcher_api;
-mod resource_action;
-mod resource_api;
-mod resource_background;
-mod resource_notice_delivery;
-pub(crate) mod resource_notice_sender;
-mod resource_submit;
 mod t3_watch;
 mod thread_titles;
 pub mod web;
@@ -51,7 +44,6 @@ use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 use crate::machine::LocalIdentity;
 use crate::notify::Notifier;
-use crate::resource::ActionId;
 use crate::submission::RequestId;
 use crate::thread_title::TitleSources;
 
@@ -92,12 +84,6 @@ pub struct AppState {
 pub(crate) struct DaemonLocks {
     /// Origin-side remote task submissions, by caller request
     pub(crate) origin_submissions: KeyedLocks<RequestId>,
-    /// Origin-side resource queue submissions, by caller request
-    pub(crate) resource_submissions: KeyedLocks<RequestId>,
-    /// Supervisor-side resource action launches, by action
-    pub(crate) resource_actions: KeyedLocks<ActionId>,
-    /// Supervisor-side background launches, by launch request
-    pub(crate) background_launches: KeyedLocks<RequestId>,
     /// Origin-side cancellation intents, by task
     pub(crate) cancellation_intents: KeyedLocks<TaskId>,
 }
@@ -173,11 +159,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     ));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
-    let resource_recovery = tokio::spawn(resource_submit::recover(state.clone()));
-    let action_recovery = tokio::spawn(resource_action::recover(state.clone()));
-    let background_recovery = tokio::spawn(resource_background::recover(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
-    let notice_delivery = tokio::spawn(resource_notice_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -218,11 +200,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     sender.abort();
     recovery.abort();
     dependency_release.abort();
-    resource_recovery.abort();
-    action_recovery.abort();
-    background_recovery.abort();
     cancellation.abort();
-    notice_delivery.abort();
     t3_watcher.abort();
     if !supervisor_died {
         supervisor.stop(None);

@@ -16,7 +16,6 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
 - Event delivery is at-least-once. For new events, deduplicate by `(task, seq)`; for a legacy event without `seq`, use `(task, event)`.
-- For GPU resource work, read [resource-loans.md](references/resource-loans.md). Check the exact pending actions at start, after compaction, and before an independent background launch. A delivered notice is not completion, and a notice whose action is absent from a complete pending result is stale. An unavailable authority is not an empty action list.
 - Use `homebased message send` for a direct message to a Claude Code session or Codex thread. Address a session by its id or by a task whose origin it is, never by its display name, which changes each time the session restarts. Read [messages.md](references/messages.md) for destination, source, and retry rules.
 - `message send --task` targets the task's origin thread, not its worker. Use `message send --worker <task>` to give a running Claude worker new instructions; it reads them at its next turn boundary. Use `homebased task followup` to resume a terminal Codex worker with new information. Run follow-up on the task's origin or execution machine. Only one follow-up can resume a thread at a time; wait for the active task's event after `resume_thread_busy`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
@@ -42,7 +41,6 @@ Pick the first row that matches, then read only that file.
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |
 | A command exited non-zero, `daemon_unavailable`, or the socket is down | [errors.md](references/errors.md) |
-| Supervising shared GPU work or a resource loan | [resource-loans.md](references/resource-loans.md) |
 | `homebased` is missing, the daemon is not installed, or the binary was rebuilt | [setup.md](references/setup.md) |
 
 ## Minimal flow

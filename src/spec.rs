@@ -141,7 +141,7 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
     let agent_kind = subschema::<AgentKind>(generator);
     let resume_thread = subschema::<Option<ThreadId>>(generator);
     let command = subschema::<CommandLine>(generator);
-    let container = container_workload_schema(false);
+    let container = container_workload_schema();
     schemars::json_schema!({
         "description": "Workload variant. Exactly one of agent, task, or container.",
         "oneOf": [

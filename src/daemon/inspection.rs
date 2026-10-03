@@ -25,10 +25,7 @@ use crate::fleet::probe::{VerifiedDestination, check_probed, probe};
 use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
-use crate::submission::{
-    ExecutorIdentity, HeldPhase, ResourceActionRoutePhase, ResourceBackgroundRoutePhase,
-    SubmissionState,
-};
+use crate::submission::{ExecutorIdentity, HeldPhase, SubmissionState};
 
 /// Strict read query for a peer log, with an optional line limit
 #[derive(Debug, Deserialize)]
@@ -657,7 +654,7 @@ pub(super) async fn cancellation_owner(
         return absent(id, &records);
     };
 
-    let (origin, execution) = target.machines();
+    let (origin, execution) = (target.origin_machine, target.execution_machine);
     let unchecked: Vec<_> = records
         .unchecked
         .iter()
@@ -909,18 +906,7 @@ fn cached_route(records: &Records, id: TaskId) -> Result<Value, AppError> {
         "failed_events": route.failed_events,
         "last_update": route.last_updated_at,
     });
-    let availability = if matches!(
-        route.submission,
-        SubmissionState::Rejected { .. }
-            | SubmissionState::ResourceAction {
-                phase: ResourceActionRoutePhase::Rejected { .. },
-                ..
-            }
-            | SubmissionState::ResourceBackground {
-                phase: ResourceBackgroundRoutePhase::Rejected { .. },
-                ..
-            }
-    ) {
+    let availability = if matches!(route.submission, SubmissionState::Rejected { .. }) {
         "rejected"
     } else if records.unchecked.contains(&route.execution_machine) {
         "executor_unavailable"
@@ -944,17 +930,6 @@ fn cached_process_status(route: &OriginSummary) -> Option<ProcessStatus> {
         | SubmissionState::Rejected { .. }
         | SubmissionState::Held { .. } => None,
         SubmissionState::Accepted => route.last_execution_state,
-        SubmissionState::Resource { .. } => route.last_execution_state,
-        SubmissionState::ResourceAction {
-            phase: ResourceActionRoutePhase::Accepted,
-            ..
-        } => route.last_execution_state,
-        SubmissionState::ResourceAction { .. } => None,
-        SubmissionState::ResourceBackground {
-            phase: ResourceBackgroundRoutePhase::Accepted,
-            ..
-        } => route.last_execution_state,
-        SubmissionState::ResourceBackground { .. } => None,
     }
 }
 
@@ -997,8 +972,7 @@ mod tests {
     use crate::domain::TaskId;
     use crate::error::AppError;
     use crate::machine::MachineId;
-    use crate::resource::ResourceId;
-    use crate::submission::{RequestId, ResourceRoutePhase, SubmissionState};
+    use crate::submission::{RequestId, SubmissionState};
 
     fn origin_summary(
         task: TaskId,
@@ -1023,38 +997,32 @@ mod tests {
     }
 
     #[test]
-    fn resource_cancellation_target_keeps_its_full_identity() {
+    fn execution_cancellation_target_keeps_its_full_identity() {
         let task = TaskId::new();
         let request_id = RequestId::new();
-        let resource_id = ResourceId::new();
         let origin_machine = MachineId::new();
-        let authority_machine = MachineId::new();
+        let execution_machine = MachineId::new();
         let route = origin_summary(
             task,
             request_id,
             origin_machine,
-            authority_machine,
-            SubmissionState::Resource {
-                resource: resource_id,
-                phase: ResourceRoutePhase::Waiting,
-            },
+            execution_machine,
+            SubmissionState::Accepted,
         );
 
-        let CancellationOwner::Resource(target) =
-            cancellation_target(task, origin_machine, &route).unwrap()
-        else {
-            panic!("resource routes must keep their authority-owned target type");
-        };
-        assert_eq!(target.request_id, request_id);
-        assert_eq!(target.task_id, task);
-        assert_eq!(target.resource_id, resource_id);
-        assert_eq!(target.origin_machine, origin_machine);
-        assert_eq!(target.authority_machine, authority_machine);
-        assert_eq!(target.phase, ResourceRoutePhase::Waiting);
+        assert_eq!(
+            cancellation_target(task, origin_machine, &route).unwrap(),
+            CancellationOwner {
+                request_id,
+                task,
+                origin_machine,
+                execution_machine,
+            }
+        );
     }
 
     #[test]
-    fn resource_cancellation_target_rejects_wrong_task_or_origin_identity() {
+    fn cancellation_target_rejects_wrong_task_or_origin_identity() {
         let task = TaskId::new();
         let origin_machine = MachineId::new();
         let route = origin_summary(
@@ -1062,10 +1030,7 @@ mod tests {
             RequestId::new(),
             origin_machine,
             MachineId::new(),
-            SubmissionState::Resource {
-                resource: ResourceId::new(),
-                phase: ResourceRoutePhase::AcceptanceUnknown,
-            },
+            SubmissionState::AcceptanceUnknown,
         );
 
         assert!(matches!(
@@ -1099,60 +1064,11 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_background_launch_cannot_become_a_cancellation_target() {
-        use crate::resource::background_launch::{
-            BackgroundLaunchBinding, BackgroundSupervisorAssignment, ResourceBackgroundRejection,
-        };
-        use crate::resource::{AssignmentRevision, ResourceRevision, SupervisorAddress};
-        use crate::submission::ResourceBackgroundRoutePhase;
-
+    fn duplicate_routes_with_different_request_ids_conflict() {
         let task = TaskId::new();
         let origin_machine = MachineId::new();
         let authority_machine = MachineId::new();
-        let binding = BackgroundLaunchBinding {
-            assignment: BackgroundSupervisorAssignment {
-                authority_machine,
-                resource_id: ResourceId::new(),
-                supervisor: SupervisorAddress {
-                    machine: origin_machine,
-                    thread: ThreadId(Uuid::now_v7()),
-                },
-                assignment_revision: AssignmentRevision::new(1),
-            },
-            expected_state_revision: ResourceRevision::new(1),
-        };
-        // a cancellation must never fence the fixed launch identity before acceptance
-        for phase in [
-            ResourceBackgroundRoutePhase::AcceptanceUnknown,
-            ResourceBackgroundRoutePhase::Rejected {
-                reason: ResourceBackgroundRejection::ResourceNotFound,
-            },
-        ] {
-            let route = origin_summary(
-                task,
-                RequestId::new(),
-                origin_machine,
-                authority_machine,
-                SubmissionState::ResourceBackground { binding, phase },
-            );
-
-            assert!(matches!(
-                cancellation_target(task, origin_machine, &route),
-                Err(AppError::ClusterTaskConflict { task: found }) if found == task
-            ));
-        }
-    }
-
-    #[test]
-    fn duplicate_routes_with_different_resource_request_ids_conflict() {
-        let task = TaskId::new();
-        let origin_machine = MachineId::new();
-        let authority_machine = MachineId::new();
-        let resource_id = ResourceId::new();
-        let submission = SubmissionState::Resource {
-            resource: resource_id,
-            phase: ResourceRoutePhase::Waiting,
-        };
+        let submission = SubmissionState::Accepted;
         let mut records = Records::default();
         records.routes.insert(
             MachineId::new(),

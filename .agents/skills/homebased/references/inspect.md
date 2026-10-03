@@ -68,7 +68,7 @@ The local daemon reads `output.log` on the execution machine. For a remote task,
 
 ## Dashboard
 
-The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn. When a GPU runs or queues work, the task list shows its current task and queue at the side.
+The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn.
 
 ```bash
 homebased --json daemon status       # "web" holds the URL, or null when the dashboard is off or the socket is down

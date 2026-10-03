@@ -1,7 +1,5 @@
-//! SQLite schema for authority-local resource state
-
-/// Resource tables installed by the Store migration hook
-pub(crate) const RESOURCE_SCHEMA: &str = r"
+-- GPU loan tables as the v0.14.0 release (schema version 34) created them
+-- Upgrade tests seed these to prove that the version 35 step drops them
 CREATE TABLE IF NOT EXISTS resources (
     id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
@@ -362,4 +360,3 @@ CREATE TABLE IF NOT EXISTS resource_registration_receipts (
         AND COALESCE(json_type(receipt_json, '$.initial_supervisor') = 'object', 0)
     )
 );
-";

@@ -410,7 +410,6 @@ pub fn invocation_from_normalized_for_identity(
                 container,
                 &CreateContext {
                     task,
-                    resource: None,
                     cidfile: &cidfile,
                     default_user: ContainerUser::current(),
                 },

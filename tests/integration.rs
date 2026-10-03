@@ -2617,7 +2617,8 @@ fn cancel_on_terminal_task_is_idempotent() {
     let h = Harness::new();
     let id = h.submit(&Harness::spec("claude", "quick"));
     h.wait_status(&id, "succeeded");
-    let before = h.queue_messages().len();
+    // the success callback can land after the status flips, so count from it
+    let before = h.wait_for_event(&id, "TASK_SUCCEEDED").len();
     let out = h
         .cmd()
         .args(["--json", "task", "cancel", &id])
@@ -3777,29 +3778,8 @@ fn mistyped_thread_is_rejected_before_any_work_starts() {
     let mistyped = "01a0ab97-a7aa-7463-a5b0-8d500e40e4ff";
     let mut spec = Harness::task_spec(&["/bin/echo", "hello"]);
     spec["thread"] = json!(mistyped);
-    let resource = uuid::Uuid::now_v7().to_string();
-    let request = uuid::Uuid::now_v7().to_string();
 
-    for args in [
-        vec!["task", "submit"],
-        vec!["task", "submit", "--dry-run"],
-        vec![
-            "resource",
-            "request",
-            "submit",
-            &resource,
-            "--request-id",
-            &request,
-        ],
-        vec![
-            "resource",
-            "background",
-            "submit",
-            &resource,
-            "--request-id",
-            &request,
-        ],
-    ] {
+    for args in [vec!["task", "submit"], vec!["task", "submit", "--dry-run"]] {
         let (code, error) = submit_error(&h, &spec, &args, None);
         assert_eq!(code, 2, "{args:?} {error}");
         assert_eq!(error["api_version"], 1);

@@ -20,8 +20,7 @@ use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::submission::{
-    DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, ResourceActionRoutePhase,
-    ResourceRoutePhase, SubmissionState,
+    DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
 
 fn decode_route(json: &str) -> Result<OriginRoute, AppError> {
@@ -172,28 +171,12 @@ pub(super) fn refused_launch_ending(reason: &str) -> UnlaunchedEnding {
 /// so its closure is its ending
 fn closed_route_outcome(route: &OriginRoute) -> Option<TaskOutcome> {
     match &route.submission {
-        SubmissionState::Rejected { .. }
-        | SubmissionState::Resource {
-            phase: ResourceRoutePhase::Rejected { .. },
-            ..
-        }
-        | SubmissionState::ResourceAction {
-            phase: ResourceActionRoutePhase::Rejected { .. },
-            ..
-        } => Some(TaskOutcome::Failed),
-        SubmissionState::Resource {
-            phase: ResourceRoutePhase::CancelledBeforeLaunch,
-            ..
-        }
-        | SubmissionState::Held {
+        SubmissionState::Rejected { .. } => Some(TaskOutcome::Failed),
+        SubmissionState::Held {
             phase: HeldPhase::Cancelled { .. },
         } => Some(TaskOutcome::Cancelled),
-        // a refused background launch can still be proven accepted by its first event
         SubmissionState::AcceptanceUnknown
         | SubmissionState::Accepted
-        | SubmissionState::Resource { .. }
-        | SubmissionState::ResourceAction { .. }
-        | SubmissionState::ResourceBackground { .. }
         | SubmissionState::Held { .. } => None,
     }
 }

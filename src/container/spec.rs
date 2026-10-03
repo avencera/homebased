@@ -460,7 +460,7 @@ pub struct ContainerWorkload {
     /// Arguments passed unchanged; not a shell string
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// GPUs the container may use. Required for resource work
+    /// GPUs the container may use
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<GpuRequest>,
     /// Memory limit, also used as the memory-plus-swap limit
@@ -900,16 +900,10 @@ pub fn check_container_host(workload: &ContainerWorkload) -> Result<(), AppError
 }
 
 /// JSON Schema of the container workload body, including its `type` key
-///
-/// `gpus_required` is set for resource work, which must name its GPUs
 #[must_use]
-pub fn container_workload_schema(gpus_required: bool) -> Value {
+pub fn container_workload_schema() -> Value {
     let hex = "[0-9a-f]{64}";
     let component = "[a-z0-9]+([._-]+[a-z0-9]+)*";
-    let mut required = vec!["type", "image", "memory"];
-    if gpus_required {
-        required.push("gpus");
-    }
     json!({
         "title": "container",
         "description": "Docker container that Homebased starts, watches, stops, and removes. No shell and no Docker options beyond these fields.",
@@ -943,11 +937,7 @@ pub fn container_workload_schema(gpus_required: bool) -> Value {
                         "items": { "type": "integer", "minimum": 0, "maximum": u32::MAX }
                     }
                 ],
-                "description": if gpus_required {
-                    "\"all\" or device indices. Required for resource work."
-                } else {
-                    "\"all\" or device indices."
-                }
+                "description": "\"all\" or device indices."
             },
             "memory": {
                 "oneOf": [
@@ -986,7 +976,7 @@ pub fn container_workload_schema(gpus_required: bool) -> Value {
                 "description": "Explicit environment values. Nothing passes through from the host."
             }
         },
-        "required": required,
+        "required": ["type", "image", "memory"],
         "additionalProperties": false
     })
 }

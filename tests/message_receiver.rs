@@ -1,4 +1,4 @@
-//! Message and supervisor-notice receiver behavior through a Fleet-enabled daemon
+//! Message receiver behavior through a Fleet-enabled daemon
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -16,10 +16,6 @@ use homebased::domain::{API_VERSION, ThreadId};
 use homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 use homebased::machine::MachineId;
 use homebased::message::{MessageId, MessageRequest};
-use homebased::resource::{
-    ActionId, AssignmentRevision, DeliveryAttemptId, LoanId, NoticeId, ResourceRevision,
-    SupervisorAddress, SupervisorNoticePayload, SupervisorNoticeRequest,
-};
 use homebased::store::Store;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -122,10 +118,6 @@ impl Daemon {
         post_json(&self.address, "/v1/cluster/messages", body)
     }
 
-    fn send_notice(&self, body: &Value) -> HttpResponse {
-        post_json(&self.address, "/v1/cluster/resource-notices", body)
-    }
-
     fn queue_calls(&self) -> Vec<String> {
         fs::read_to_string(&self.queue_log)
             .unwrap_or_default()
@@ -139,13 +131,6 @@ impl Daemon {
             .unwrap()
             .message_delivery(id)
             .unwrap()
-    }
-
-    fn notice_delivery(
-        &self,
-        attempt_id: DeliveryAttemptId,
-    ) -> homebased::message::MessageDelivery {
-        self.delivery(MessageId::from_uuid(attempt_id.as_uuid()).unwrap())
     }
 
     fn restart(&mut self) {
@@ -249,32 +234,6 @@ fn request(id: MessageId, destination: MachineId, recipient: Value, body: &str) 
         "reply_to": Uuid::now_v7(),
         "conversation_id": Uuid::now_v7(),
     })
-}
-
-fn notice_request(
-    destination_machine: MachineId,
-    destination_thread: ThreadId,
-    attempt_id: DeliveryAttemptId,
-) -> Value {
-    serde_json::to_value(SupervisorNoticeRequest {
-        api_version: API_VERSION,
-        protocol_version: CLUSTER_PROTOCOL_VERSION.0,
-        source_machine: MachineId::new(),
-        destination: SupervisorAddress {
-            machine: destination_machine,
-            thread: destination_thread,
-        },
-        notice_id: NoticeId::new(),
-        loan_id: LoanId::new(),
-        action_id: ActionId::new(),
-        state_revision: ResourceRevision::new(9),
-        assignment_revision: AssignmentRevision::new(3),
-        attempt_id,
-        payload: SupervisorNoticePayload::ReleaseRequired {
-            task_id: homebased::domain::TaskId::new(),
-        },
-    })
-    .unwrap()
 }
 
 fn post_json(address: &str, path: &str, body: &Value) -> HttpResponse {
@@ -525,206 +484,4 @@ fn receiver_delivers_to_claude_sessions_without_codex_queue() {
     let message = stopped.body["error"]["input"]["message"].as_str().unwrap();
     assert!(message.contains("no T3 thread owns it"), "{message}");
     assert!(daemon.queue_calls().is_empty());
-}
-
-#[test]
-fn receiver_queues_resource_notice_by_attempt_on_the_exact_thread() {
-    let daemon = Daemon::start();
-    let exact_cwd = daemon.user_home.join("exact-project");
-    let newer_cwd = daemon.user_home.join("newer-project");
-    fs::create_dir_all(&exact_cwd).unwrap();
-    fs::create_dir_all(&newer_cwd).unwrap();
-
-    let exact_thread = ThreadId(Uuid::now_v7());
-    let newer_thread = ThreadId(Uuid::now_v7());
-    write_session(&daemon.user_home, "notice-exact", exact_thread, &exact_cwd);
-    write_session(&daemon.user_home, "notice-newer", newer_thread, &newer_cwd);
-
-    let wrong_machine_attempt = DeliveryAttemptId::new();
-    let wrong_machine = notice_request(MachineId::new(), exact_thread, wrong_machine_attempt);
-    let mismatch = daemon.send_notice(&wrong_machine);
-    assert_eq!(mismatch.status, 409, "{:?}", mismatch.body);
-    assert_eq!(mismatch.body["error"]["code"], "machine_identity_mismatch");
-    assert!(
-        daemon
-            .notice_delivery(wrong_machine_attempt)
-            .attempt
-            .is_none()
-    );
-
-    let missing_thread_attempt = DeliveryAttemptId::new();
-    let missing_thread = notice_request(
-        daemon.machine_id(),
-        ThreadId(Uuid::now_v7()),
-        missing_thread_attempt,
-    );
-    let missing = daemon.send_notice(&missing_thread);
-    assert_eq!(missing.status, 404, "{:?}", missing.body);
-    assert_eq!(missing.body["error"]["code"], "agent_thread_not_found");
-    assert!(
-        daemon
-            .notice_delivery(missing_thread_attempt)
-            .attempt
-            .is_none()
-    );
-    assert!(daemon.queue_calls().is_empty());
-
-    let attempt_id = DeliveryAttemptId::new();
-    let notice = notice_request(daemon.machine_id(), exact_thread, attempt_id);
-    let response = daemon.send_notice(&notice);
-    assert_eq!(response.status, 200, "{:?}", response.body);
-    assert_eq!(response.body["receipt"]["attempt_id"], json!(attempt_id));
-    assert_eq!(
-        response.body["receipt"]["destination_thread"],
-        exact_thread.to_string()
-    );
-    let first_queue_line = daemon.queue_calls().remove(0);
-    assert!(first_queue_line.contains(&format!(
-        "--thread {exact_thread} --message HOMEBASED_RESOURCE_NOTICE "
-    )));
-    assert!(!first_queue_line.contains("HOMEBASED_MESSAGE "));
-    assert!(!first_queue_line.contains("HOMEBASED_EVENT "));
-    let queued: Value = serde_json::from_str(
-        first_queue_line
-            .split_once("--message HOMEBASED_RESOURCE_NOTICE ")
-            .unwrap()
-            .1,
-    )
-    .unwrap();
-    assert_eq!(queued["attempt_id"], json!(attempt_id));
-    assert!(queued.get("notice_id").is_some());
-    assert!(queued.get("loan_id").is_some());
-    assert!(queued.get("action_id").is_some());
-    assert!(queued.get("state_revision").is_some());
-    assert!(queued.get("assignment_revision").is_some());
-    assert_eq!(queued["destination"]["thread"], json!(exact_thread));
-    assert!(queued.get("delivery").is_none());
-
-    let saved_receipt = response.body["receipt"].clone();
-    let duplicate = daemon.send_notice(&notice);
-    assert_eq!(duplicate.status, 200, "{:?}", duplicate.body);
-    assert_eq!(duplicate.body["receipt"], saved_receipt);
-    assert_eq!(daemon.queue_calls().len(), 1);
-
-    let mut conflicting = notice.clone();
-    conflicting["payload"] = json!({
-        "type": "attention_required",
-        "reason": "different content for the same attempt",
-    });
-    let conflict = daemon.send_notice(&conflicting);
-    assert_eq!(conflict.status, 409, "{:?}", conflict.body);
-    assert_eq!(conflict.body["error"]["code"], "message_conflict");
-    assert_eq!(daemon.queue_calls().len(), 1);
-
-    let retargeted_attempt = DeliveryAttemptId::new();
-    let mut retargeted = notice.clone();
-    retargeted["attempt_id"] = json!(retargeted_attempt);
-    retargeted["assignment_revision"] = json!(4);
-    retargeted["destination"]["thread"] = json!(newer_thread);
-    let retargeted_response = daemon.send_notice(&retargeted);
-    assert_eq!(
-        retargeted_response.status, 200,
-        "{:?}",
-        retargeted_response.body
-    );
-    assert_eq!(
-        retargeted_response.body["receipt"]["notice_id"],
-        notice["notice_id"]
-    );
-    assert_eq!(
-        retargeted_response.body["receipt"]["attempt_id"],
-        json!(retargeted_attempt)
-    );
-    assert_eq!(
-        retargeted_response.body["receipt"]["destination_thread"],
-        newer_thread.to_string()
-    );
-    assert!(daemon.queue_calls()[1].contains(&format!(
-        "--thread {newer_thread} --message HOMEBASED_RESOURCE_NOTICE "
-    )));
-
-    let direct = request(
-        MessageId::new(),
-        daemon.machine_id(),
-        json!({"kind": "thread", "thread": exact_thread}),
-        "Keep direct message delivery unchanged",
-    );
-    let direct_response = daemon.send(&direct);
-    assert_eq!(direct_response.status, 200, "{:?}", direct_response.body);
-    let queue_calls = daemon.queue_calls();
-    assert!(queue_calls[2].contains("HOMEBASED_MESSAGE "));
-    assert!(!queue_calls[2].contains("HOMEBASED_RESOURCE_NOTICE "));
-
-    let mut notice_source = request(
-        MessageId::new(),
-        daemon.machine_id(),
-        json!({"kind": "thread", "thread": exact_thread}),
-        "A notice source cannot use the direct-message route",
-    );
-    notice_source["source"] = json!({
-        "kind": "resource_notice",
-        "machine": daemon.machine_id(),
-        "notice_id": NoticeId::new(),
-    });
-    let rejected_source = daemon.send(&notice_source);
-    assert_eq!(rejected_source.status, 400, "{:?}", rejected_source.body);
-    assert_eq!(rejected_source.body["error"]["code"], "message_invalid");
-    assert_eq!(daemon.queue_calls().len(), 3);
-
-    let mut unknown = notice_request(daemon.machine_id(), exact_thread, DeliveryAttemptId::new());
-    unknown["unknown"] = json!(true);
-    assert!((400..500).contains(&daemon.send_notice(&unknown).status));
-
-    let mut invalid = notice_request(daemon.machine_id(), exact_thread, DeliveryAttemptId::new());
-    invalid["attempt_id"] = json!(Uuid::nil());
-    // a nil identity cannot decode, so the body is refused before validation
-    assert_eq!(daemon.send_notice(&invalid).status, 422);
-    assert_eq!(daemon.queue_calls().len(), 3);
-}
-
-#[test]
-fn failed_notice_attempt_is_retained_and_same_attempt_can_retry() {
-    let daemon = Daemon::start();
-    let exact_cwd = daemon.user_home.join("exact-project");
-    let other_cwd = daemon.user_home.join("other-project");
-    fs::create_dir_all(&exact_cwd).unwrap();
-    fs::create_dir_all(&other_cwd).unwrap();
-    let exact_thread = ThreadId(Uuid::now_v7());
-    let other_thread = ThreadId(Uuid::now_v7());
-    write_session(
-        &daemon.user_home,
-        "failed-notice-exact",
-        exact_thread,
-        &exact_cwd,
-    );
-    write_session(
-        &daemon.user_home,
-        "failed-notice-other",
-        other_thread,
-        &other_cwd,
-    );
-
-    let attempt_id = DeliveryAttemptId::new();
-    let request = notice_request(daemon.machine_id(), exact_thread, attempt_id);
-    fs::write(&daemon.queue_fail_marker, "fail").unwrap();
-    let failed = daemon.send_notice(&request);
-    assert_eq!(failed.status, 503, "{:?}", failed.body);
-    assert_eq!(failed.body["error"]["code"], "message_delivery_failed");
-    let delivery = daemon.notice_delivery(attempt_id);
-    assert!(delivery.attempt.is_some());
-    assert!(delivery.receipt.is_none());
-    assert_eq!(daemon.queue_calls().len(), 1);
-
-    fs::remove_file(&daemon.queue_fail_marker).unwrap();
-    let retried = daemon.send_notice(&request);
-    assert_eq!(retried.status, 200, "{:?}", retried.body);
-    assert_eq!(
-        retried.body["receipt"]["destination_thread"],
-        exact_thread.to_string()
-    );
-    assert_eq!(daemon.queue_calls().len(), 2);
-    assert!(daemon.queue_calls()[1].contains(&format!(
-        "--thread {exact_thread} --message HOMEBASED_RESOURCE_NOTICE "
-    )));
-    assert!(daemon.notice_delivery(attempt_id).receipt.is_some());
 }

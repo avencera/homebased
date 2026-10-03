@@ -370,7 +370,7 @@ async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<AfterLock, Ap
 /// The container runs under dockerd, so the task stays running while it runs.
 /// The new worker finds the container by its saved ID, ID file, or name, and
 /// finishes the witness. A streak of workers that never reach the container
-/// ends with the task lost, which keeps any resource loan reserved
+/// ends with the task lost
 async fn adopt_container(actor: &TaskActor, row: TaskRow) -> Result<AfterLock, AppError> {
     let id = row.id;
     let claimed = call(&actor.store, |reply| StoreMsg::ClaimContainerAdoption {

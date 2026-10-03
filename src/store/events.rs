@@ -17,10 +17,7 @@ use crate::events::{
     TaskEvent, WaitingInboxEvent,
 };
 use crate::machine::MachineId;
-use crate::submission::{
-    ExecutorIdentity, HeldPhase, OriginRoute, ResourceActionRoutePhase,
-    ResourceBackgroundRoutePhase, ResourceRoutePhase, SubmissionState,
-};
+use crate::submission::{ExecutorIdentity, HeldPhase, OriginRoute, SubmissionState};
 
 const EVENT_RETENTION_DAYS: i64 = 30;
 const EVENT_RETENTION_BATCH_SIZE: i64 = 64;
@@ -62,7 +59,7 @@ fn decode_route(value: &str) -> Result<OriginRoute, EventError> {
     let route: OriginRoute = decode(value)?;
     route.validate().map_err(|error| {
         EventError::Storage(AppError::Internal {
-            message: format!("invalid saved resource origin route: {error}"),
+            message: format!("invalid saved origin route: {error}"),
         })
     })?;
     Ok(route)
@@ -812,53 +809,6 @@ pub(super) fn append_produced_event_on(
     Ok(())
 }
 
-pub(super) fn initial_queued_event_matches_on(
-    conn: &Connection,
-    task: TaskId,
-    origin_machine: MachineId,
-    execution_machine: MachineId,
-) -> Result<bool, EventError> {
-    let expected = TaskEvent {
-        task,
-        seq: NonZeroU64::MIN,
-        origin_machine,
-        execution_machine,
-        payload: EventPayload::State {
-            status: ProcessStatus::Queued,
-        },
-    };
-
-    let outbox: Option<(String, bool)> = conn
-        .query_row(
-            "SELECT event_json, notification_required FROM executor_outbox
-             WHERE task_id=?1 AND seq=1",
-            [task.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(storage)?;
-    if let Some((event_json, notification_required)) = outbox {
-        let event: TaskEvent = decode(&event_json)?;
-        validate(&event)?;
-        return Ok(event == expected && !notification_required);
-    }
-
-    let receipt: Option<(String, String)> = conn
-        .query_row(
-            "SELECT event_digest, result_json FROM executor_event_receipts
-             WHERE task_id=?1 AND seq=1",
-            [task.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(storage)?;
-    let Some((saved_digest, result_json)) = receipt else {
-        return Ok(false);
-    };
-    Ok(saved_digest == event_digest(&expected)?
-        && result_json == encode(&OutboxState::Acknowledged)?)
-}
-
 fn append_outbound_event_on(
     conn: &Connection,
     task: TaskId,
@@ -1073,58 +1023,7 @@ impl Store {
                 seq: event.seq.get(),
             });
         }
-        let activate_resource = match &route.submission {
-            // the first queued event proves that the authority accepted the fixed
-            // identity, even when its launch reply was lost
-            SubmissionState::ResourceAction { phase, .. } => match phase {
-                ResourceActionRoutePhase::AcceptanceUnknown => {
-                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
-                        return Err(EventError::Invalid {
-                            message: "first resource action task event must report queued state"
-                                .into(),
-                        });
-                    }
-                    true
-                }
-                ResourceActionRoutePhase::Accepted => false,
-                ResourceActionRoutePhase::Rejected { .. } => {
-                    return Err(EventError::Invalid {
-                        message: "resource action route was rejected before task acceptance".into(),
-                    });
-                }
-            },
-            // the authority's durable first queued event proves acceptance even
-            // after a refusal was saved, since a delayed send may have won; the
-            // callback owner must keep the running trainer's results
-            SubmissionState::ResourceBackground { phase, .. } => match phase {
-                ResourceBackgroundRoutePhase::AcceptanceUnknown
-                | ResourceBackgroundRoutePhase::Rejected { .. } => {
-                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
-                        return Err(EventError::Invalid {
-                            message: "first background launch event must report queued state"
-                                .into(),
-                        });
-                    }
-                    true
-                }
-                ResourceBackgroundRoutePhase::Accepted => false,
-            },
-            SubmissionState::Resource { phase, .. } => match phase {
-                ResourceRoutePhase::AcceptanceUnknown | ResourceRoutePhase::Waiting => {
-                    if event.payload.process_state() != Some(ProcessStatus::Queued) {
-                        return Err(EventError::Invalid {
-                            message: "first resource task event must report queued state".into(),
-                        });
-                    }
-                    true
-                }
-                ResourceRoutePhase::Activated => false,
-                ResourceRoutePhase::CancelledBeforeLaunch | ResourceRoutePhase::Rejected { .. } => {
-                    return Err(EventError::Invalid {
-                        message: "resource route was closed before task activation".into(),
-                    });
-                }
-            },
+        let accept_held_launch = match &route.submission {
             // the executor's first queued event proves that a released launch
             // was accepted, even when its reply was lost
             SubmissionState::Held { phase } => match phase {
@@ -1175,24 +1074,12 @@ impl Store {
         if let Some(state) = event.payload.process_state() {
             route.last_execution_state = Some(state);
         }
-        if activate_resource {
-            match &mut route.submission {
-                SubmissionState::Resource { phase, .. } => *phase = ResourceRoutePhase::Activated,
-                SubmissionState::ResourceAction { phase, .. } => {
-                    *phase = ResourceActionRoutePhase::Accepted;
-                }
-                SubmissionState::ResourceBackground { phase, .. } => {
-                    *phase = ResourceBackgroundRoutePhase::Accepted;
-                }
-                SubmissionState::Held { .. } => route.submission = SubmissionState::Accepted,
-                SubmissionState::AcceptanceUnknown
-                | SubmissionState::Accepted
-                | SubmissionState::Rejected { .. } => {}
-            }
+        if accept_held_launch {
+            route.submission = SubmissionState::Accepted;
         }
         route.validate().map_err(|error| {
             EventError::Storage(AppError::Internal {
-                message: format!("invalid resource origin route transition: {error}"),
+                message: format!("invalid origin route transition: {error}"),
             })
         })?;
         if matches!(delivery, DeliveryState::NotRequired)
@@ -1259,7 +1146,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::domain::ProcessStatus;
-    use crate::resource::{AssignmentRevision, ResourceId, ResourceRevision, SupervisorAddress};
     use std::path::Path;
 
     use tempfile::tempdir;
@@ -1273,11 +1159,9 @@ mod tests {
         THREAD_WAIT_LIMIT, TaskEvent,
     };
     use crate::machine::MachineId;
-    use crate::store::{IdentityError, Store};
+    use crate::store::Store;
     use crate::submission::{
-        CallbackContext, ExecutionRecord, OriginRoute, RequestId, ResourceActionRoutePhase,
-        ResourceBackgroundRoutePhase, ResourceQueueOutcome, ResourceQueueReceipt,
-        ResourceRoutePhase, SubmissionState,
+        CallbackContext, ExecutionRecord, OriginRoute, RequestId, SubmissionState,
     };
     use chrono::Utc;
     use rusqlite::params;
@@ -1363,112 +1247,6 @@ mod tests {
                  SET settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-31 days');",
             )
             .unwrap();
-    }
-
-    fn resource_route() -> OriginRoute {
-        let mut route = route();
-        route.submission = SubmissionState::Resource {
-            resource: ResourceId::new(),
-            phase: ResourceRoutePhase::AcceptanceUnknown,
-        };
-        route
-    }
-
-    #[test]
-    fn first_queued_resource_event_activates_in_the_cursor_transaction() {
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = resource_route();
-        store.insert_origin_route(&route).unwrap();
-
-        let queued = event(&route, 1, ProcessStatus::Queued);
-        assert_eq!(
-            store.accept_inbound_event(&queued).unwrap(),
-            EventAcceptance::Acknowledged { seq: 1 }
-        );
-        let activated = store.origin_route_by_task(route.task).unwrap().unwrap();
-        assert!(matches!(
-            activated.submission,
-            SubmissionState::Resource {
-                phase: ResourceRoutePhase::Activated,
-                ..
-            }
-        ));
-        assert_eq!(activated.last_accepted_seq, 1);
-        assert_eq!(activated.last_execution_state, Some(ProcessStatus::Queued));
-
-        store
-            .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
-            .unwrap();
-        let advanced = store.origin_route_by_task(route.task).unwrap().unwrap();
-        assert!(matches!(
-            advanced.submission,
-            SubmissionState::Resource {
-                phase: ResourceRoutePhase::Activated,
-                ..
-            }
-        ));
-        assert_eq!(advanced.last_accepted_seq, 2);
-        assert_eq!(advanced.last_execution_state, Some(ProcessStatus::Running));
-    }
-
-    #[test]
-    fn resource_route_rejects_a_nonqueued_first_task_event() {
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = resource_route();
-        store.insert_origin_route(&route).unwrap();
-
-        assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running,)),
-            Err(EventError::Invalid { .. })
-        ));
-        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
-        assert!(matches!(
-            saved.submission,
-            SubmissionState::Resource {
-                phase: ResourceRoutePhase::AcceptanceUnknown,
-                ..
-            }
-        ));
-        assert_eq!(saved.last_accepted_seq, 0);
-        assert!(store.inbound_events(route.task).unwrap().is_empty());
-    }
-
-    #[test]
-    fn rejected_resource_route_does_not_accept_a_task_event() {
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = resource_route();
-        store.insert_origin_route(&route).unwrap();
-        let SubmissionState::Resource { resource, .. } = &route.submission else {
-            unreachable!();
-        };
-        store
-            .resolve_resource_route(&ResourceQueueReceipt {
-                request: route.request,
-                task: route.task,
-                origin_machine: route.origin_machine,
-                authority_machine: route.execution_machine,
-                resource: *resource,
-                outcome: ResourceQueueOutcome::Rejected {
-                    reason: "queue rejected".into(),
-                },
-            })
-            .unwrap();
-
-        assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Queued,)),
-            Err(EventError::Invalid { .. })
-        ));
-        assert_eq!(
-            store
-                .origin_route_by_task(route.task)
-                .unwrap()
-                .unwrap()
-                .last_accepted_seq,
-            0
-        );
     }
 
     #[test]
@@ -2408,220 +2186,5 @@ mod tests {
             EventRouteState::Orphaned
         );
         assert!(reopened.pending_outbound_tasks().unwrap().is_empty());
-    }
-
-    fn action_route() -> OriginRoute {
-        let base = route();
-        OriginRoute::new_resource_action(crate::submission::NewResourceActionRoute {
-            request: base.request,
-            task: base.task,
-            callback: base.callback.clone(),
-            spec: base.current_spec().unwrap().clone(),
-            binding: crate::submission::ResourceActionRouteBinding {
-                kind: crate::resource::bound_action::ResourceActionKind::ReleaseWatcher,
-                authority: crate::resource::SupervisorActionAuthority {
-                    authority_machine: base.execution_machine,
-                    resource_id: ResourceId::new(),
-                    loan_id: crate::resource::LoanId::new(),
-                    action_id: crate::resource::ActionId::new(),
-                    expected_state_revision: ResourceRevision::new(1),
-                    supervisor: SupervisorAddress {
-                        machine: base.origin_machine,
-                        thread: base.thread,
-                    },
-                    assignment_revision: AssignmentRevision::new(0),
-                },
-            },
-            launch: crate::resource::bound_action::ResourceActionLaunch::ReleaseWatcher {
-                observed_background_task: TaskId::new(),
-            },
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn first_queued_event_accepts_an_action_route_and_duplicates_settle_once() {
-        use crate::domain::ProcessStatus;
-
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = action_route();
-        store.insert_origin_route(&route).unwrap();
-
-        assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running)),
-            Err(EventError::Invalid { .. })
-        ));
-        assert_eq!(
-            store
-                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
-                .unwrap(),
-            EventAcceptance::Acknowledged { seq: 1 }
-        );
-        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
-        assert!(matches!(
-            saved.submission,
-            SubmissionState::ResourceAction {
-                phase: ResourceActionRoutePhase::Accepted,
-                ..
-            }
-        ));
-        // a duplicate is acknowledged from the saved inbox, a later event is ordered
-        assert_eq!(
-            store
-                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
-                .unwrap(),
-            EventAcceptance::Acknowledged { seq: 1 }
-        );
-        assert_eq!(
-            store
-                .accept_inbound_event(&event(&route, 3, ProcessStatus::Running))
-                .unwrap(),
-            EventAcceptance::Expected { seq: 2 }
-        );
-        assert_eq!(
-            store
-                .accept_inbound_event(&event(&route, 2, ProcessStatus::Running))
-                .unwrap(),
-            EventAcceptance::Acknowledged { seq: 2 }
-        );
-        assert_eq!(store.inbound_events(route.task).unwrap().len(), 2);
-        // an event from another execution owner is refused
-        let mut foreign = event(&route, 3, ProcessStatus::Running);
-        foreign.execution_machine = MachineId::new();
-        assert!(matches!(
-            store.accept_inbound_event(&foreign),
-            Err(EventError::OwnerConflict { .. })
-        ));
-    }
-
-    #[test]
-    fn rejected_action_route_refuses_task_events() {
-        use crate::domain::ProcessStatus;
-
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = action_route();
-        store.insert_origin_route(&route).unwrap();
-        store
-            .resolve_resource_action_route(
-                route.task,
-                &crate::store::ResourceActionRouteResult::Rejected(
-                    crate::resource::bound_action::ResourceActionRejection::ActionNotPending,
-                ),
-            )
-            .unwrap();
-        assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Queued)),
-            Err(EventError::Invalid { .. })
-        ));
-        assert!(store.inbound_events(route.task).unwrap().is_empty());
-    }
-
-    fn background_route() -> OriginRoute {
-        let base = route();
-        OriginRoute::new_resource_background(crate::submission::NewResourceBackgroundRoute {
-            request: base.request,
-            task: base.task,
-            callback: base.callback.clone(),
-            spec: base.current_spec().unwrap().clone(),
-            binding: crate::resource::background_launch::BackgroundLaunchBinding {
-                assignment: crate::resource::background_launch::BackgroundSupervisorAssignment {
-                    authority_machine: base.execution_machine,
-                    resource_id: ResourceId::new(),
-                    supervisor: SupervisorAddress {
-                        machine: base.origin_machine,
-                        thread: base.thread,
-                    },
-                    assignment_revision: AssignmentRevision::new(0),
-                },
-                expected_state_revision: ResourceRevision::new(2),
-            },
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn background_route_keeps_a_trainer_that_the_authority_accepted_after_a_saved_refusal() {
-        use crate::domain::ProcessStatus;
-        use crate::resource::background_launch::{
-            RemoteBackgroundLaunchReceipt, ResourceBackgroundRejection,
-        };
-        use crate::store::ResourceBackgroundRouteResult;
-
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let route = background_route();
-        store.insert_origin_route(&route).unwrap();
-        let SubmissionState::ResourceBackground { binding, .. } = &route.submission else {
-            unreachable!();
-        };
-        let receipt = RemoteBackgroundLaunchReceipt {
-            binding: *binding,
-            request_id: route.request,
-            task_id: route.task,
-            normalized_spec_sha256: crate::submission::normalized_spec_sha256(
-                route.current_spec().unwrap(),
-            )
-            .unwrap(),
-        };
-        // a receipt for another assignment cannot accept this route
-        let mut other = receipt;
-        other.binding.assignment.assignment_revision = AssignmentRevision::new(1);
-        assert!(matches!(
-            store.resolve_resource_background_route(
-                route.task,
-                &ResourceBackgroundRouteResult::Accepted(other)
-            ),
-            Err(IdentityError::Conflict)
-        ));
-
-        // a delayed send may win after a refusal was saved; its first queued
-        // event is durable acceptance, so the trainer keeps its callback owner
-        store
-            .resolve_resource_background_route(
-                route.task,
-                &ResourceBackgroundRouteResult::Rejected(
-                    ResourceBackgroundRejection::LaunchPending {
-                        task_id: TaskId::new(),
-                    },
-                ),
-            )
-            .unwrap();
-        assert!(matches!(
-            store.accept_inbound_event(&event(&route, 1, ProcessStatus::Running)),
-            Err(EventError::Invalid { .. })
-        ));
-        assert_eq!(
-            store
-                .accept_inbound_event(&event(&route, 1, ProcessStatus::Queued))
-                .unwrap(),
-            EventAcceptance::Acknowledged { seq: 1 }
-        );
-        let saved = store.origin_route_by_task(route.task).unwrap().unwrap();
-        assert!(matches!(
-            saved.submission,
-            SubmissionState::ResourceBackground {
-                phase: ResourceBackgroundRoutePhase::Accepted,
-                ..
-            }
-        ));
-
-        // an accepted route never moves back to a refusal; the exact receipt is idempotent
-        assert!(matches!(
-            store.resolve_resource_background_route(
-                route.task,
-                &ResourceBackgroundRouteResult::Rejected(
-                    ResourceBackgroundRejection::NotCurrentSupervisor
-                )
-            ),
-            Err(IdentityError::Conflict)
-        ));
-        store
-            .resolve_resource_background_route(
-                route.task,
-                &ResourceBackgroundRouteResult::Accepted(receipt),
-            )
-            .unwrap();
     }
 }

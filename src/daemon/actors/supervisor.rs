@@ -1,4 +1,4 @@
-//! Root supervisor: store, callback, and per-task and per-resource actors
+//! Root supervisor: store, callback, and per-task actors
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -7,10 +7,6 @@ use std::sync::Arc;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
-use crate::daemon::actors::resource::{
-    ResourceActor, ResourceActorInspection, ResourceMsg, resource_actor_name,
-    resource_id_from_actor_name,
-};
 use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
 use crate::daemon::actors::{StoreActor, StoreMsg, call, send_reply};
 use crate::domain::{
@@ -21,34 +17,12 @@ use crate::home::{Home, LockMode, TaskPaths};
 use crate::invocation::{persist_workload, resolve_agent_binary_with};
 use crate::machine::{MachineId, load_or_create_machine_id};
 use crate::notify::Notifier;
-use crate::resource::background_launch::RemoteBackgroundLaunchReceipt;
-use crate::resource::bound_action::{ResourceActionOutcome, ResourceActionRequest};
-use crate::resource::store::{
-    PreLaunchFailure, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError, ResourceSnapshot,
-    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput,
-};
-use crate::resource::{
-    ReleaseWatcherIntent, Resource, ResourceId, ReturnDecision, SupervisorActionAuthority,
-    SupervisorAddress,
-};
 use crate::runner;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
-use crate::store::{
-    BackgroundLaunchAcceptance, BackgroundLaunchError, CancelResult, EndedRestoreResolution,
-    LocalAdmission, NewTask, ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance,
-    new_queued_task,
-};
-use crate::submission::{CallbackExecutable, ExecutionRecord, ExecutorIdentity, RequestId};
+use crate::store::{CancelResult, LocalAdmission, NewTask, new_queued_task};
+use crate::submission::{CallbackExecutable, ExecutionRecord, ExecutorIdentity};
 
 mod recovery;
-use recovery::ResourceOwnedTasks;
-mod resource_launch;
-
-pub(crate) use resource_launch::return_decision_rejection;
-use resource_launch::{
-    decide_return, fail_assigned_resource_task_before_launch, launch_assigned_resource_task,
-    launch_background, launch_bound_release_watcher, launch_remote_background, resource_action,
-};
 
 const STORE_NAME: &str = "homebased.store";
 const CALLBACK_NAME: &str = "homebased.callback";
@@ -61,95 +35,6 @@ pub(crate) enum SupervisorMsg {
     /// Store ref for `AppState` reads
     GetStore {
         reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
-    },
-    /// Register or reuse one resource on this machine and ensure its actor exists
-    RegisterResource {
-        resource: Box<Resource>,
-        reply: RpcReplyPort<Result<Resource, AppError>>,
-    },
-    /// Inspect the restored snapshot and identity of one resource actor
-    InspectResource {
-        id: ResourceId,
-        reply: RpcReplyPort<Result<Option<ResourceActorInspection>, AppError>>,
-    },
-    /// Wake one resource actor after queue acceptance or an authority-side retry
-    ReconcileResource {
-        /// Resource whose authority-owned queue must be reconciled
-        id: ResourceId,
-        /// Reply after the resource actor has reconciled and refreshed its snapshot
-        reply: RpcReplyPort<Result<(), AppError>>,
-    },
-    /// Accept one assigned request and launch only when this call inserts its task
-    LaunchAssignedResourceTask {
-        /// Exact Serving assignment and fixed task identity selected by the resource owner
-        input: Box<ResourceTaskAcceptanceInput>,
-        /// Typed task acceptance, nested inside actor and storage errors
-        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
-    },
-    /// Accept one assigned request whose launch must fail, and fail its task if it has not started
-    FailAssignedResourceTaskBeforeLaunch {
-        /// Exact Serving assignment and fixed task identity selected by the resource owner
-        input: Box<ResourceTaskAcceptanceInput>,
-        /// Why the task ends before launch
-        failure: PreLaunchFailure,
-        /// Typed task acceptance, nested inside actor and storage errors
-        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
-    },
-    /// Accept one authority-bound release watcher and spawn only when this call inserts it
-    LaunchBoundReleaseWatcher {
-        /// Saved watcher intent and the executable for its canonical command
-        launch: Box<ReleaseWatcherLaunch>,
-        /// Typed watcher acceptance, nested inside actor and storage errors
-        reply: RpcReplyPort<
-            Result<Result<ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError>, AppError>,
-        >,
-    },
-    /// Apply one supervisor return decision and spawn only a newly inserted return task
-    DecideReturn {
-        /// Exact supervisor authority for the pending return action
-        authority: SupervisorActionAuthority,
-        /// Typed no-resume or launch decision
-        decision: Box<ReturnDecision>,
-        /// Typed decision result, nested inside actor and storage errors
-        reply: RpcReplyPort<Result<Result<ReturnDecisionOutcome, ReturnDecisionError>, AppError>>,
-    },
-    /// Apply one validated operation from a remote supervisor's machine
-    ///
-    /// The cluster route has already checked the destination, source machine, and
-    /// saved callback-route evidence. Only an insertion by this call spawns a task
-    ResourceAction {
-        /// Validated request from the supervisor machine
-        request: Box<ResourceActionRequest>,
-        /// Typed authority outcome inside actor and storage errors
-        reply: RpcReplyPort<Result<ResourceActionOutcome, AppError>>,
-    },
-    /// Close a Restoring loan after the supervisor resolves a return task that ended early
-    ResolveEndedRestore {
-        /// Exact authority, bound task, and supervisor reason
-        resolution: Box<EndedRestoreResolution>,
-        /// Typed closure result, nested inside actor and storage errors
-        reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
-    },
-    /// Bind one first background launch and spawn only a newly inserted task
-    LaunchBackground {
-        /// Stable request, full spec, and co-located executor context
-        launch: Box<BackgroundLaunch>,
-        /// Typed launch result, nested inside actor and storage errors
-        reply: RpcReplyPort<
-            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
-        >,
-    },
-    /// Bind one remote supervisor's first background launch and spawn only a new insertion
-    ///
-    /// The cluster route has already checked the destination, source machine, and
-    /// saved callback-route evidence
-    LaunchRemoteBackground {
-        /// Exact receipt that the supervisor machine saved, and the saved spec
-        launch: Box<RemoteBackgroundLaunch>,
-        /// Typed launch result, nested inside actor and storage errors
-        reply: RpcReplyPort<
-            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
-        >,
     },
     /// Persist a queued row under its admission, spawn its worker, and watch it
     Launch {
@@ -166,10 +51,10 @@ pub(crate) enum SupervisorMsg {
         cwd: PathBuf,
         reply: RpcReplyPort<Result<CallbackExecutable, AppError>>,
     },
-    /// Finish the launch of a saved local task; `None` when a resource flow owns it
+    /// Finish the launch of a saved local task
     ResumeLocal {
         id: TaskId,
-        reply: RpcReplyPort<Result<Option<ProcessStatus>, AppError>>,
+        reply: RpcReplyPort<Result<ProcessStatus, AppError>>,
     },
     /// Accept a remote task and launch only if this request won acceptance
     LaunchRemote {
@@ -183,65 +68,6 @@ pub(crate) enum SupervisorMsg {
     },
     /// Wake the ordered origin inbox worker after a receive commits
     DispatchInbox { id: TaskId },
-    /// Wake resource owners after an executor event for a remote origin is ready to send
-    ///
-    /// The origin inbox is on another machine, so this is the authority-side hint
-    /// that an action-bound task may have reached its running boundary
-    RemoteOriginEvent { id: TaskId },
-}
-
-/// Authority-owned inputs for one release-watcher launch with a local callback route
-///
-/// The supervisor builds the canonical command from these identities; the store
-/// rejects any row or spec that differs from the saved intent's digest
-pub(crate) struct ReleaseWatcherLaunch {
-    /// Machine that owns the resource and executes the watcher
-    pub(crate) authority_machine: MachineId,
-    /// Resource whose release action owns the watcher
-    pub(crate) resource_id: ResourceId,
-    /// Supervisor address saved on the resource
-    pub(crate) supervisor: SupervisorAddress,
-    /// Saved watcher task, request, action, and digest identities
-    pub(crate) intent: ReleaseWatcherIntent,
-    /// Executable placed in the canonical watcher command
-    pub(crate) executable: PathBuf,
-}
-
-/// Caller inputs for one first background launch on this authority
-///
-/// The supervisor preallocates the task identity; the store keeps the identity
-/// saved by an earlier exact launch with the same request
-pub(crate) struct BackgroundLaunch {
-    /// Resource whose background slot receives the task
-    pub(crate) resource_id: ResourceId,
-    /// Stable caller retry identity
-    pub(crate) request_id: RequestId,
-    /// Full normalized command spec
-    pub(crate) spec: NormalizedSpec,
-    /// Executor environment captured by the co-located supervisor
-    pub(crate) env: TaskEnv,
-    /// Directory used to find the callback Codex executable
-    pub(crate) callback_cwd: PathBuf,
-}
-
-/// Remote supervisor inputs for one first background launch on this authority
-///
-/// The supervisor machine fixed every identity before it sent the launch; the
-/// authority supplies only its own executor environment
-pub(crate) struct RemoteBackgroundLaunch {
-    /// Fixed identities, digest, supervisor assignment, and observed revision
-    pub(crate) receipt: RemoteBackgroundLaunchReceipt,
-    /// Full normalized spec saved in the supervisor's route
-    pub(crate) spec: NormalizedSpec,
-}
-
-/// Durable result of one supervisor return decision
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReturnDecisionOutcome {
-    /// The no-resume decision closed the loan
-    Closed(Box<ReturnClosure>),
-    /// The launch decision bound a task, or found the exact earlier binding
-    Launch(ReturnTaskAcceptance),
 }
 
 /// Validated executor-local inputs with the original normalized retry content
@@ -270,7 +96,6 @@ pub(crate) struct SupervisorState {
     store: ActorRef<StoreMsg>,
     callback: ActorRef<CallbackMsg>,
     tasks: HashMap<TaskId, ActorRef<TaskMsg>>,
-    resources: HashMap<ResourceId, ActorRef<ResourceMsg>>,
 }
 
 /// Root actor
@@ -359,9 +184,7 @@ impl Actor for SupervisorActor {
             store,
             callback,
             tasks: HashMap::new(),
-            resources: HashMap::new(),
         };
-        restore_resource_actors(&myself, &mut state).await?;
         recovery::recover_tasks(&myself, &mut state).await?;
         // a slow store must not fail startup; the callback actor's retry scan
         // picks these tasks up later
@@ -384,79 +207,6 @@ impl Actor for SupervisorActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
-            SupervisorMsg::RegisterResource { resource, reply } => {
-                send_reply(
-                    reply,
-                    register_resource_actor(&myself, state, *resource).await,
-                );
-            }
-            SupervisorMsg::InspectResource { id, reply } => {
-                let inspection = match state.resources.get(&id) {
-                    Some(actor) => call(actor, |reply| ResourceMsg::Inspect { reply })
-                        .await
-                        .map(Some),
-                    None => Ok(None),
-                };
-                send_reply(reply, inspection);
-            }
-            SupervisorMsg::ReconcileResource { id, reply } => {
-                let result = reconcile_resource_actor(&myself, state, id).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::LaunchAssignedResourceTask { input, reply } => {
-                let result = launch_assigned_resource_task(&myself, state, *input).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::FailAssignedResourceTaskBeforeLaunch {
-                input,
-                failure,
-                reply,
-            } => {
-                let result =
-                    fail_assigned_resource_task_before_launch(&myself, state, *input, failure)
-                        .await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::LaunchBoundReleaseWatcher { launch, reply } => {
-                let result = launch_bound_release_watcher(&myself, state, *launch).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::DecideReturn {
-                authority,
-                decision,
-                reply,
-            } => {
-                let result = decide_return(&myself, state, authority, *decision).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::ResourceAction { request, reply } => {
-                let result = resource_action(&myself, state, *request).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::RemoteOriginEvent { id } => {
-                for resource in state.resources.values() {
-                    resource.cast(ResourceMsg::TaskProgress { task_id: id })?;
-                }
-            }
-            SupervisorMsg::ResolveEndedRestore { resolution, reply } => {
-                let resource_id = resolution.authority.resource_id;
-                let result = call(&state.store, |reply| {
-                    StoreMsg::ResolveEndedRestoreForAuthority { resolution, reply }
-                })
-                .await;
-                if matches!(result, Ok(Ok(_))) {
-                    wake_resource(state, resource_id);
-                }
-                send_reply(reply, result);
-            }
-            SupervisorMsg::LaunchBackground { launch, reply } => {
-                let result = launch_background(&myself, state, *launch).await;
-                send_reply(reply, result);
-            }
-            SupervisorMsg::LaunchRemoteBackground { launch, reply } => {
-                let result = launch_remote_background(&myself, state, *launch).await;
-                send_reply(reply, result);
-            }
             SupervisorMsg::Launch {
                 row,
                 spec,
@@ -479,10 +229,6 @@ impl Actor for SupervisorActor {
             }
             SupervisorMsg::DispatchInbox { id } => {
                 state.callback.cast(CallbackMsg::DispatchInbox { id })?;
-                // a delivered state event may confirm the start of a bound return task
-                for resource in state.resources.values() {
-                    resource.cast(ResourceMsg::TaskProgress { task_id: id })?;
-                }
             }
         }
         Ok(())
@@ -505,213 +251,21 @@ impl Actor for SupervisorActor {
                     tracing::error!(actor = ?name, "daemon actor failed; stopping serve: {err}");
                     return Err(err);
                 }
-                if let Some(id) = resource_id_from_actor_name(name.clone()) {
-                    tracing::error!(actor = ?name, resource = ?id, "resource actor failed; stopping serve: {err}");
-                    return Err(err);
-                }
                 tracing::error!(actor = ?name, "actor failed: {err}");
                 if let Some(id) = task_id_from_name(name) {
                     state.tasks.remove(&id);
                     spawn_task_actor(&myself, state, id).await?;
                 }
             }
-            SupervisionEvent::ActorTerminated(who, _, reason) => {
-                let name = who.get_name();
-                if let Some(id) = resource_id_from_actor_name(name.clone()) {
-                    let reason = reason.unwrap_or_else(|| "without an exit reason".into());
-                    tracing::error!(actor = ?name, resource = ?id, %reason, "resource actor terminated; stopping serve");
-                    return Err(Box::new(AppError::Internal {
-                        message: format!(
-                            "resource actor {} terminated unexpectedly: {reason}",
-                            id.as_uuid()
-                        ),
-                    }));
-                }
+            SupervisionEvent::ActorTerminated(who, _, _) => {
                 if let Some(id) = task_id_from_name(who.get_name()) {
                     state.tasks.remove(&id);
-                    reconcile_terminal_task(&myself, state, id).await?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
-}
-
-async fn reconcile_terminal_task(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    task_id: TaskId,
-) -> Result<(), AppError> {
-    let Some(task) = call(&state.store, |reply| StoreMsg::GetTask {
-        id: task_id,
-        reply,
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    if !task.state.is_terminal() {
-        return Ok(());
-    }
-
-    for resource in state.resources.values() {
-        resource.cast(ResourceMsg::TaskTerminal { task_id })?;
-    }
-
-    let snapshots = call(&state.store, |reply| {
-        StoreMsg::ResourceSnapshotsForAuthority {
-            authority_machine: state.machine,
-            reply,
-        }
-    })
-    .await?;
-    for snapshot in snapshots {
-        let Some(loan) = snapshot.loan else {
-            continue;
-        };
-        let is_exact_release = snapshot.resource.registered_background_task == Some(task_id)
-            && matches!(
-                loan.state,
-                crate::resource::LoanState::Active {
-                    phase: crate::resource::LoanPhase::AwaitingRelease {
-                        observed_background_task,
-                        ..
-                    }
-                } if observed_background_task == task_id
-            );
-        if is_exact_release {
-            reconcile_resource_actor(supervisor, state, snapshot.resource.id).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn restore_resource_actors(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-) -> Result<(), AppError> {
-    let snapshots = call(&state.store, |reply| {
-        StoreMsg::ResourceSnapshotsForAuthority {
-            authority_machine: state.machine,
-            reply,
-        }
-    })
-    .await?;
-    for snapshot in snapshots {
-        spawn_resource_actor(
-            supervisor,
-            &mut state.resources,
-            state.store.clone(),
-            state.machine,
-            snapshot,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn register_resource_actor(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    resource: Resource,
-) -> Result<Resource, AppError> {
-    let resource = call(&state.store, |reply| StoreMsg::RegisterResource {
-        authority_machine: state.machine,
-        resource: Box::new(resource),
-        reply,
-    })
-    .await?;
-    ensure_resource_actor(supervisor, state, resource.id).await?;
-
-    Ok(resource)
-}
-
-async fn ensure_resource_actor(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    id: ResourceId,
-) -> Result<(), AppError> {
-    if state.resources.contains_key(&id) {
-        return Ok(());
-    }
-
-    let snapshots = call(&state.store, |reply| {
-        StoreMsg::ResourceSnapshotsForAuthority {
-            authority_machine: state.machine,
-            reply,
-        }
-    })
-    .await?;
-    let snapshot = snapshots
-        .into_iter()
-        .find(|snapshot| snapshot.resource.id == id)
-        .ok_or_else(|| AppError::Internal {
-            message: format!(
-                "registered resource {} is missing from the authority store",
-                id.as_uuid()
-            ),
-        })?;
-    spawn_resource_actor(
-        supervisor,
-        &mut state.resources,
-        state.store.clone(),
-        state.machine,
-        snapshot,
-    )
-    .await
-}
-
-async fn reconcile_resource_actor(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    id: ResourceId,
-) -> Result<(), AppError> {
-    ensure_resource_actor(supervisor, state, id).await?;
-    let actor = state.resources.get(&id).ok_or_else(|| AppError::Internal {
-        message: format!(
-            "resource actor {} disappeared during reconciliation",
-            id.as_uuid()
-        ),
-    })?;
-    call(actor, |reply| ResourceMsg::Reconcile { reply })
-        .await
-        .map(|_| ())
-}
-
-async fn spawn_resource_actor(
-    supervisor: &ActorRef<SupervisorMsg>,
-    resources: &mut HashMap<ResourceId, ActorRef<ResourceMsg>>,
-    store: ActorRef<StoreMsg>,
-    authority_machine: MachineId,
-    snapshot: ResourceSnapshot,
-) -> Result<(), AppError> {
-    let id = snapshot.resource.id;
-    if resources.contains_key(&id) {
-        return Ok(());
-    }
-
-    let (actor, _handle) = ResourceActor::spawn_linked(
-        Some(resource_actor_name(id)),
-        ResourceActor,
-        (
-            store,
-            supervisor.clone(),
-            authority_machine,
-            snapshot.resource,
-            snapshot.loan,
-        ),
-        supervisor.get_cell(),
-    )
-    .await
-    .map_err(|err| AppError::Internal {
-        message: format!("spawn resource actor {}: {err}", id.as_uuid()),
-    })?;
-    resources.insert(id, actor);
-
-    Ok(())
 }
 
 async fn launch_remote(
@@ -856,14 +410,6 @@ fn callback_executable(resolved: Result<PathBuf, AppError>) -> CallbackExecutabl
     }
 }
 
-fn wake_resource(state: &SupervisorState, id: ResourceId) {
-    if let Some(resource) = state.resources.get(&id)
-        && let Err(error) = resource.cast(ResourceMsg::Wake)
-    {
-        tracing::debug!(resource = %id.as_uuid(), "resource wake cast: {error}");
-    }
-}
-
 fn task_name(id: TaskId) -> String {
     format!("homebased.task.{id}")
 }
@@ -966,16 +512,12 @@ async fn task_exists(state: &SupervisorState, id: TaskId) -> Result<bool, AppErr
 /// Give a saved local task the worker and watch that its launch may have missed
 ///
 /// A submit whose caller timed out can leave its row committed without a
-/// worker, or with a worker that nothing watches. A task whose launch a
-/// resource flow owns is left to that resource and reported as `None`
+/// worker, or with a worker that nothing watches
 async fn resume_local(
     supervisor: &ActorRef<SupervisorMsg>,
     state: &mut SupervisorState,
     id: TaskId,
-) -> Result<Option<ProcessStatus>, AppError> {
-    if ResourceOwnedTasks::load(state).await?.owns(id) {
-        return Ok(None);
-    }
+) -> Result<ProcessStatus, AppError> {
     if !state.tasks.contains_key(&id) {
         match task_status(state, id).await? {
             ProcessStatus::Queued => launch_accepted(supervisor, state, id).await?,
@@ -984,7 +526,7 @@ async fn resume_local(
         }
     }
     // a failed spawn finishes the row, so report the status after the launch
-    task_status(state, id).await.map(Some)
+    task_status(state, id).await
 }
 
 async fn task_status(state: &SupervisorState, id: TaskId) -> Result<ProcessStatus, AppError> {
@@ -1000,21 +542,6 @@ async fn record_pid(state: &SupervisorState, id: TaskId, pid: u32) -> Result<(),
         message: format!("runner pid {pid} for task {id} does not fit a signed process id"),
     })?;
     call(&state.store, |reply| StoreMsg::SetPid { id, pid, reply }).await
-}
-
-/// Prepare the files of a task that this call inserted, then spawn its worker
-///
-/// A preparation failure finishes the committed row as `SpawnFailed`, so the
-/// row never waits for a worker that cannot start
-async fn spawn_inserted(
-    supervisor: &ActorRef<SupervisorMsg>,
-    state: &mut SupervisorState,
-    id: TaskId,
-) -> Result<(), AppError> {
-    match state.home.prepare_task(id) {
-        Ok(_) => launch_accepted(supervisor, state, id).await,
-        Err(error) => finish_spawn_failed(state, id, &error).await,
-    }
 }
 
 async fn finish_spawn_failed(

@@ -14,12 +14,9 @@
 		type ProcessStatus
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
-	import ExpandToggle from '$lib/components/ExpandToggle.svelte';
-	import ResourceQueuePanel from '$lib/components/ResourceQueuePanel.svelte';
 	import Capsule from '$lib/components/Capsule.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
-	import { DaemonStore, ResourceQueueStore } from '$lib/daemon.svelte';
-	import { isBusy, queueThreads } from '$lib/resource-state';
+	import { DaemonStore } from '$lib/daemon.svelte';
 	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
 	import { EM_DASH, projectName, shortId } from '$lib/format';
 	import { cn } from '$lib/utils';
@@ -32,7 +29,6 @@
 	const inFlightOnly = $derived(!showFinished && statuses.length === IN_FLIGHT_STATUSES.length);
 
 	const store = new DaemonStore(() => ({ statuses, thread }));
-	const resourceStore = new ResourceQueueStore();
 
 	const visibleTasks = $derived(
 		project ? store.tasks.filter((entry) => projectName(entry.task) === project) : store.tasks
@@ -56,33 +52,12 @@
 			.map(([name, count]) => `${count} on ${name}`)
 			.join(', ');
 	});
-	const busyQueues = $derived(resourceStore.queues.filter(isBusy));
-	const threadTitles = new ThreadTitleStore(() => [
-		...visibleTasks.map(taskThread),
-		...busyQueues.flatMap(queueThreads)
-	]);
+	const threadTitles = new ThreadTitleStore(() => visibleTasks.map(taskThread));
 	// the filter holds only a thread id, so its title comes from a listed task
 	const threadFilterTitle = $derived.by(() => {
 		const entry = thread ? store.tasks.find((candidate) => candidate.task.thread === thread) : null;
 		return entry ? threadTitles.title(taskThread(entry)) : null;
 	});
-	// while a resource runs or waits on work, tasks and its queue share the screen
-	const split = $derived(busyQueues.length > 0);
-
-	/** Box that fills the whole content area, hiding the other one. */
-	type ExpandedBox = 'tasks' | 'gpu';
-	let expandedChoice = $state<ExpandedBox | null>(null);
-	// only a split can expand; when the GPU work ends, the tasks fill the screen anyway
-	const expanded = $derived(split ? expandedChoice : null);
-
-	function toggleExpanded(box: ExpandedBox) {
-		expandedChoice = expanded === box ? null : box;
-	}
-
-	function onKeydown(event: KeyboardEvent) {
-		if (event.key === 'Escape' && expanded) expandedChoice = null;
-	}
-
 	interface Filters {
 		status: string | null;
 		thread: string | null;
@@ -137,32 +112,13 @@
 	function machineList(names: readonly string[]): string {
 		return names.join(', ');
 	}
-
-	async function refreshDashboard(): Promise<void> {
-		await Promise.all([store.refresh(), resourceStore.refresh()]);
-	}
 </script>
-
-<svelte:window onkeydown={onKeydown} />
-
-{#snippet tasksExpand()}
-	<ExpandToggle
-		expanded={expanded === 'tasks'}
-		label="tasks"
-		onToggle={() => toggleExpanded('tasks')}
-	/>
-{/snippet}
 
 <!-- pinned to the viewport so the document never scrolls; only the boxes do. The padding keeps
      at least the safe-area insets the browser reports, so the boxes end above the home indicator
      and any browser bar that claims the edge -->
-<!-- the GPU column on wide screens takes width from the task table, so the page widens on very
-     wide screens to give the table back its usual width -->
 <div
-	class={cn(
-		'fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4',
-		split && '2xl:max-w-[104rem]'
-	)}
+	class="fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4"
 >
 	<header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 sm:gap-x-4">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>
@@ -216,7 +172,6 @@
 				{/each}
 			</span>
 		{/if}
-		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
@@ -259,12 +214,6 @@
 				</ul>
 			</div>
 		</div>
-	{/if}
-
-	{#if resourceStore.error}
-		<p class="mt-3 text-muted-foreground">
-			GPU queue unavailable: {resourceStore.error.message}
-		</p>
 	{/if}
 
 	<!-- one swipeable row on phones, wrapped on wider screens -->
@@ -317,62 +266,30 @@
 		{/if}
 	</div>
 
-	<!-- the page fits the screen and each box scrolls on its own. Each box is as tall as its
-	     content; when both overflow, grid sizing shares the height evenly, and a short box keeps
-	     its content height while the other takes the rest. When the GPU queue shows, wide screens put
-	     the boxes side by side, each as tall as its content up to the full height; the task column
-	     keeps the width its table layout needs. An expanded box takes the whole area -->
-	<div
-		class={cn(
-			'mt-3 grid min-h-0 flex-1 content-start gap-3',
-			expanded ? 'grid-rows-[minmax(0,1fr)]' : 'grid-rows-[minmax(0,auto)_minmax(0,auto)]',
-			split &&
-				!expanded &&
-				'xl:grid-cols-[minmax(57rem,1fr)_minmax(18rem,22rem)] xl:grid-rows-[minmax(0,auto)] xl:items-start xl:[&>*]:max-h-full'
-		)}
-	>
-		{#if expanded !== 'gpu'}
-			<TaskList
-				tasks={visibleTasks}
-				machines={store.machines}
-				activeThread={thread}
-				activeProject={project}
-				onThread={(next) => navigate({ ...currentFilters, thread: next })}
-				onProject={(next) => navigate({ ...currentFilters, project: next })}
-				threadTitle={threadTitles.title}
-				class="min-h-0"
-				actions={split ? tasksExpand : undefined}
-			>
-				{#snippet empty()}
-					<p class="px-3 py-6 text-center text-muted-foreground">
-						{#if store.lastFetched === null}
-							{EM_DASH}
-						{:else if inFlightOnly && !project}
-							No workers in flight
-						{:else}
-							No tasks match this filter
-						{/if}
-					</p>
-				{/snippet}
-			</TaskList>
-		{/if}
-		{#if split && expanded !== 'tasks'}
-			<ResourceQueuePanel
-				queues={busyQueues}
-				machines={store.machines}
-				{resourceStore}
-				{refreshDashboard}
-				threadTitle={threadTitles.title}
-				class="scrollbar-none min-h-0 overflow-y-auto"
-			>
-				{#snippet actions()}
-					<ExpandToggle
-						expanded={expanded === 'gpu'}
-						label="GPU queue"
-						onToggle={() => toggleExpanded('gpu')}
-					/>
-				{/snippet}
-			</ResourceQueuePanel>
-		{/if}
+	<!-- the page fits the screen and the task box scrolls on its own, as tall as its content up to
+	     the full height -->
+	<div class="mt-3 grid min-h-0 flex-1 grid-rows-[minmax(0,auto)] content-start">
+		<TaskList
+			tasks={visibleTasks}
+			machines={store.machines}
+			activeThread={thread}
+			activeProject={project}
+			onThread={(next) => navigate({ ...currentFilters, thread: next })}
+			onProject={(next) => navigate({ ...currentFilters, project: next })}
+			threadTitle={threadTitles.title}
+			class="min-h-0"
+		>
+			{#snippet empty()}
+				<p class="px-3 py-6 text-center text-muted-foreground">
+					{#if store.lastFetched === null}
+						{EM_DASH}
+					{:else if inFlightOnly && !project}
+						No workers in flight
+					{:else}
+						No tasks match this filter
+					{/if}
+				</p>
+			{/snippet}
+		</TaskList>
 	</div>
 </div>

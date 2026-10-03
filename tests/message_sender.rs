@@ -954,5 +954,12 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
             .unwrap()
             .contains("homebased task followup")
     );
-    assert_eq!(receiver.queue_calls().len(), 1);
+    // the finished task's own callback also goes through `codex queue`, at a time
+    // the test does not control, so count only the worker message
+    let messages = receiver
+        .queue_calls()
+        .into_iter()
+        .filter(|call| call.contains("HOMEBASED_MESSAGE"))
+        .count();
+    assert_eq!(messages, 1);
 }

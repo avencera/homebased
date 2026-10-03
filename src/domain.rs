@@ -16,9 +16,9 @@ pub const API_VERSION: u32 = 1;
 
 /// SQLite `user_version`
 ///
-/// Released versions 1, 2, and 27 through 33 migrate in place to this version
+/// Released versions 1, 2, and 27 through 34 migrate in place to this version
 /// Unreleased development versions 3 through 26 are refused
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// Maximum Unicode scalar values in a submitted task name
 pub const TASK_NAME_MAX_CHARS: usize = 120;

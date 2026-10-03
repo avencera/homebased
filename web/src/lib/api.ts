@@ -594,23 +594,6 @@ export function fetchContentOrigin(): Promise<ContentOrigin> {
 }
 
 /**
- * Return an unknown JSON value for a feature client to validate with Effect Schema.
- * The path stays relative so browser calls use the exact same origin as the dashboard.
- */
-export function getJsonBody(path: string): Promise<unknown> {
-	return requestJson(path, { method: 'GET' });
-}
-
-/** Return an unknown JSON value for a feature client to validate with Effect Schema. */
-export function postJsonBody(path: string, body: unknown): Promise<unknown> {
-	return requestJson(path, {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-}
-
-/**
  * Absolute URL on the content origin for a UTF-8 filesystem path. Uses the
  * current browser hostname so loopback, LAN, and Tailscale clients match.
  */

@@ -21,13 +21,12 @@ use crate::domain::{
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
-use crate::events::{DeliveryState, EventError, TaskEvent};
+use crate::events::{DeliveryState, TaskEvent};
 use crate::machine::MachineId;
-use crate::resource::store::{RESOURCE_SCHEMA, open_missing_return_windows_on};
 use crate::spec::NormalizedSpec;
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutionRecord, ExecutorIdentity, OriginRoute,
-    PersistedSpec, RequestId, ResourceRoutePhase, SubmissionState,
+    PersistedSpec, RequestId, SubmissionState,
 };
 
 mod cancellation;
@@ -36,35 +35,10 @@ mod dependency;
 mod events;
 mod identity;
 mod message;
-mod resource;
 pub use container::TaskContainerRecord;
 pub use dependency::{HeldCancel, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
-pub use identity::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
-pub(crate) use resource::VerifiedReleaseProof;
-#[cfg(test)]
-pub(crate) use resource::test_support::{
-    mark_request_assigned_for_race, unreceipted_release_provenance,
-};
-pub(crate) use resource::{
-    AcceptedActionTask, EndedRestoreResolution, PreparedReturnTask,
-    RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
-    ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput,
-    ReturnTaskOrigin,
-};
-pub(crate) use resource::{
-    BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
-    BackgroundLaunchPhase, BackgroundLaunchView, RemoteBackgroundLaunchInput,
-    idle_boundary_decision_on, idle_opening_matches_on, open_idle_serving_loan_on,
-    pending_background_launch_on, promote_started_background_launch_on,
-};
-pub(crate) use resource::{
-    InitialIdleError, OperatorGpuFreeError, operator_serving_release_matches_on,
-};
-pub(crate) use resource::{
-    ResourceControlEffect, ResourceControlError, ResourceControlRequest, ResourceControlStart,
-    ResourceReadModel, SupervisorReplacement, open_action_id,
-};
+pub use identity::IdentityError;
 
 /// Released version 2 schema
 ///
@@ -119,8 +93,8 @@ ALTER TABLE tasks ADD COLUMN name TEXT;
 /// Schema version of the v0.4.0 release
 const RELEASED_V0_4_SCHEMA_VERSION: i64 = 27;
 
-/// Everything added after the released version 2 schema, except the resource
-/// tables that `RESOURCE_SCHEMA` owns
+/// Everything the v0.4.0 schema added to the released version 2 schema, apart
+/// from its GPU loan tables, which a later version drops
 ///
 /// Versions 3 through 26 were never released, so a version 2 database moves to
 /// the current schema in one step
@@ -242,45 +216,6 @@ const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeo
     process_group_exit_evidence, container_exit_evidence
  FROM tasks";
 
-/// Operator attestation receipts gained the Restoring return outcomes after v0.4.0
-///
-/// SQLite cannot change a CHECK constraint in place, so the table is rebuilt
-/// Existing receipts keep their bytes, and `RESOURCE_SCHEMA` recreates the
-/// resource index that the dropped table owned
-const MIGRATE_27_TO_28: &str = r"
-CREATE TABLE resource_operator_attestations_v28 (
-    operation_id TEXT PRIMARY KEY NOT NULL,
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    task_id TEXT NOT NULL UNIQUE,
-    preceding_loan TEXT,
-    preceding_launch TEXT,
-    receipt_json TEXT NOT NULL CHECK (
-        json_valid(receipt_json)
-        AND COALESCE(json_type(receipt_json) = 'object', 0)
-        AND COALESCE(json_extract(receipt_json, '$.attestation.operation_id') = operation_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.attestation.resource_id') = resource_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.attestation.task_id') = task_id, 0)
-        AND COALESCE(
-            json_extract(receipt_json, '$.attestation.confirmation') = 'operator_confirmed_gpu_free',
-            0
-        )
-        AND COALESCE(length(trim(json_extract(receipt_json, '$.attestation.observation'))) > 0, 0)
-        AND COALESCE(json_type(receipt_json, '$.evidence') = 'object', 0)
-        AND COALESCE(json_extract(receipt_json, '$.outcome.type') IN (
-            'release_resolved_serving', 'release_resolved_return_required',
-            'idle_serving', 'idle_boundary',
-            'restore_closed_serving', 'restore_closed_idle_boundary'
-        ), 0)
-    )
-);
-INSERT INTO resource_operator_attestations_v28
-    (operation_id, resource_id, task_id, preceding_loan, preceding_launch, receipt_json)
-SELECT operation_id, resource_id, task_id, preceding_loan, preceding_launch, receipt_json
-FROM resource_operator_attestations ORDER BY rowid;
-DROP TABLE resource_operator_attestations;
-ALTER TABLE resource_operator_attestations_v28 RENAME TO resource_operator_attestations;
-";
-
 /// Schema version of the v0.5.0 release
 const RELEASED_V0_5_SCHEMA_VERSION: i64 = 28;
 
@@ -303,176 +238,29 @@ CREATE TABLE task_containers (
 );
 ";
 
-/// Resource requests and restore closures gained container work after v0.5.0
-///
-/// SQLite cannot change a CHECK constraint in place, so both tables are
-/// rebuilt with the constraints that `RESOURCE_SCHEMA` now declares. Existing
-/// rows keep their bytes, and `RESOURCE_SCHEMA` recreates the dropped indexes
-const MIGRATE_28_TO_29_RESOURCES: &str = r"
-CREATE TABLE resource_requests_v29 (
-    acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (acceptance_sequence > 0),
-    request_id TEXT NOT NULL UNIQUE,
-    task_id TEXT NOT NULL UNIQUE,
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    origin_machine TEXT NOT NULL,
-    spec_json TEXT NOT NULL CHECK (
-        json_valid(spec_json)
-        AND COALESCE(json_type(spec_json) = 'object', 0)
-        AND COALESCE(json_type(spec_json, '$.api_version') = 'integer', 0)
-        AND COALESCE(json_type(spec_json, '$.thread') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.name') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.cwd') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.timeout') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.workload') = 'object', 0)
-        AND COALESCE(
-            (
-                json_extract(spec_json, '$.workload.type') = 'task'
-                AND json_type(spec_json, '$.workload.command') = 'array'
-            ) OR (
-                json_extract(spec_json, '$.workload.type') = 'container'
-                AND json_type(spec_json, '$.workload.image') = 'text'
-                AND json_type(spec_json, '$.workload.gpus') IS NOT NULL
-            ),
-            0
-        )
-    ),
-    state_json TEXT NOT NULL CHECK (
-        json_valid(state_json)
-        AND COALESCE(json_type(state_json) = 'object', 0)
-        AND COALESCE(json_type(state_json, '$.type') = 'text', 0)
-        AND COALESCE(json_extract(state_json, '$.type') IN (
-            'queued', 'assigned', 'finished', 'cancelled_before_launch', 'rejected'
-        ), 0)
-    )
-);
-INSERT INTO resource_requests_v29
-    (acceptance_sequence, request_id, task_id, resource_id, origin_machine, spec_json, state_json)
-SELECT acceptance_sequence, request_id, task_id, resource_id, origin_machine, spec_json, state_json
-FROM resource_requests ORDER BY acceptance_sequence;
-DROP TABLE resource_requests;
-ALTER TABLE resource_requests_v29 RENAME TO resource_requests;
-
-CREATE TABLE resource_restore_closures_v29 (
-    action_id TEXT PRIMARY KEY REFERENCES resource_return_decisions(action_id),
-    task_id TEXT NOT NULL UNIQUE,
-    receipt_json TEXT NOT NULL CHECK (
-        json_valid(receipt_json)
-        AND COALESCE(json_type(receipt_json) = 'object', 0)
-        AND COALESCE(json_extract(receipt_json, '$.action_id') = action_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.task_id') = task_id, 0)
-        AND COALESCE(json_extract(receipt_json, '$.basis.type') IN (
-            'confirmed_running', 'foreground_ended', 'container_ended', 'supervisor_resolved_end'
-        ), 0)
-    )
-);
-INSERT INTO resource_restore_closures_v29 (action_id, task_id, receipt_json)
-SELECT action_id, task_id, receipt_json FROM resource_restore_closures ORDER BY rowid;
-DROP TABLE resource_restore_closures;
-ALTER TABLE resource_restore_closures_v29 RENAME TO resource_restore_closures;
-";
-
 /// Move a released version 2 database to the current schema
-///
-/// The version 2 schema has no resource tables, so `RESOURCE_SCHEMA` creates
-/// them with the current constraints
 fn migrate_2_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_2_TO_CURRENT)?;
-    conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
-    conn.execute_batch(RESOURCE_SCHEMA)?;
-    migrate_32_to_current(conn)
-}
-
-/// Move a v0.4.0 database to the current schema
-fn migrate_27_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_27_TO_28)?;
     migrate_28_to_current(conn)
 }
 
-/// Move a v0.5.0 database to the current schema
+/// Move a v0.4.0 or v0.5.0 database to the current schema
+///
+/// Apart from the container witness, every change before version 32 touched
+/// only the GPU loan tables, which the version 35 step drops
 fn migrate_28_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_28_TO_29_TASKS)?;
-    conn.execute_batch(MIGRATE_28_TO_29_RESOURCES)?;
-    migrate_30_to_current(conn)
+    migrate_32_to_current(conn)
 }
 
 /// Schema version of the v0.5.1 release
 const RELEASED_V0_5_1_SCHEMA_VERSION: i64 = 29;
 
-/// Move a v0.5.1 database to the current schema
-fn migrate_29_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    migrate_30_to_current(conn)
-}
-
 /// Released v0.7.0 and v0.6.0 databases use schema version 30
 const RELEASED_V0_7_SCHEMA_VERSION: i64 = 30;
 
-/// Add serving ranks before `RESOURCE_SCHEMA` creates serving-order indexes
-///
-/// Rebuilding the table keeps the upgraded column constraints identical to a
-/// fresh database. Existing requests retain their acceptance order.
-const MIGRATE_30_TO_CURRENT: &str = r"
-CREATE TABLE resource_requests_v31 (
-    acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (acceptance_sequence > 0),
-    queue_rank INTEGER NOT NULL CHECK (queue_rank > 0),
-    request_id TEXT NOT NULL UNIQUE,
-    task_id TEXT NOT NULL UNIQUE,
-    resource_id TEXT NOT NULL REFERENCES resources(id),
-    origin_machine TEXT NOT NULL,
-    spec_json TEXT NOT NULL CHECK (
-        json_valid(spec_json)
-        AND COALESCE(json_type(spec_json) = 'object', 0)
-        AND COALESCE(json_type(spec_json, '$.api_version') = 'integer', 0)
-        AND COALESCE(json_type(spec_json, '$.thread') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.name') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.cwd') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.timeout') = 'text', 0)
-        AND COALESCE(json_type(spec_json, '$.workload') = 'object', 0)
-        AND COALESCE(
-            (
-                json_extract(spec_json, '$.workload.type') = 'task'
-                AND json_type(spec_json, '$.workload.command') = 'array'
-            ) OR (
-                json_extract(spec_json, '$.workload.type') = 'container'
-                AND json_type(spec_json, '$.workload.image') = 'text'
-                AND json_type(spec_json, '$.workload.gpus') IS NOT NULL
-            ),
-            0
-        )
-    ),
-    state_json TEXT NOT NULL CHECK (
-        json_valid(state_json)
-        AND COALESCE(json_type(state_json) = 'object', 0)
-        AND COALESCE(json_type(state_json, '$.type') = 'text', 0)
-        AND COALESCE(json_extract(state_json, '$.type') IN (
-            'queued', 'assigned', 'finished', 'cancelled_before_launch', 'rejected'
-        ), 0)
-    )
-);
-INSERT INTO resource_requests_v31
-    (acceptance_sequence, queue_rank, request_id, task_id, resource_id,
-     origin_machine, spec_json, state_json)
-SELECT acceptance_sequence, acceptance_sequence, request_id, task_id, resource_id,
-       origin_machine, spec_json, state_json
-FROM resource_requests ORDER BY acceptance_sequence;
-DROP TABLE resource_requests;
-ALTER TABLE resource_requests_v31 RENAME TO resource_requests;
-";
-
-/// Move a released schema version 30 database to the current schema
-fn migrate_30_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(MIGRATE_30_TO_CURRENT)?;
-    migrate_31_to_current(conn)
-}
-
 /// Released v0.8 databases use schema version 31
 const RELEASED_V0_8_SCHEMA_VERSION: i64 = 31;
-
-/// Add return decision windows, and open one for each loan that already awaits a return
-fn migrate_31_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(RESOURCE_SCHEMA)?;
-    open_missing_return_windows_on(conn, Utc::now())?;
-    migrate_32_to_current(conn)
-}
 
 /// Released v0.8.7 databases use schema version 32
 const RELEASED_V0_8_7_SCHEMA_VERSION: i64 = 32;
@@ -545,7 +333,76 @@ WHERE outcome IS NULL
 /// Move a v0.11 database to the current schema
 fn migrate_33_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(MIGRATE_33_TO_34)?;
-    conn.execute_batch(BACKFILL_33_TO_34)
+    conn.execute_batch(BACKFILL_33_TO_34)?;
+    migrate_34_to_current(conn)
+}
+
+/// Released v0.13 and v0.14 databases use schema version 34
+const RELEASED_V0_13_SCHEMA_VERSION: i64 = 34;
+
+/// Remove the GPU loan subsystem, which never ran live work
+///
+/// Origin routes, their callback rows, cancellation intents, and notice
+/// messages of the loan flows go first, since no current type can read them.
+/// Ordinary tasks, including any a loan launched, keep their rows. The loan
+/// tables then go children first, so no foreign key sees a missing parent, and
+/// `IF EXISTS` covers older databases that never had some of them
+const MIGRATE_34_TO_35: &str = r"
+DELETE FROM origin_inbox WHERE task_id IN (
+    SELECT task_id FROM origin_routes
+    WHERE json_extract(route_json, '$.submission.type')
+        IN ('resource', 'resource_action', 'resource_background')
+);
+DELETE FROM origin_event_receipts WHERE task_id IN (
+    SELECT task_id FROM origin_routes
+    WHERE json_extract(route_json, '$.submission.type')
+        IN ('resource', 'resource_action', 'resource_background')
+);
+DELETE FROM cancellation_requests
+    WHERE json_extract(request_json, '$.target.type') = 'resource'
+       OR json_extract(request_json, '$.delivery.state') = 'resource_delivered'
+       OR task_id IN (
+           SELECT task_id FROM origin_routes
+           WHERE json_extract(route_json, '$.submission.type')
+               IN ('resource', 'resource_action', 'resource_background')
+       );
+DELETE FROM origin_routes
+    WHERE json_extract(route_json, '$.submission.type')
+        IN ('resource', 'resource_action', 'resource_background');
+
+DELETE FROM message_receipts WHERE message_id IN (
+    SELECT message_id FROM message_attempts
+    WHERE json_extract(attempt_json, '$.request.source.kind') = 'resource_notice'
+);
+DELETE FROM message_attempts
+    WHERE json_extract(attempt_json, '$.request.source.kind') = 'resource_notice';
+
+DROP TABLE IF EXISTS resource_return_deadline_servings;
+DROP TABLE IF EXISTS resource_return_windows;
+DROP TABLE IF EXISTS resource_restore_closures;
+DROP TABLE IF EXISTS resource_return_decisions;
+DROP TABLE IF EXISTS resource_supervisor_notices;
+DROP TABLE IF EXISTS resource_idle_openings;
+DROP TABLE IF EXISTS resource_release_checkpoint_states;
+DROP TABLE IF EXISTS resource_release_completions;
+DROP TABLE IF EXISTS resource_task_completions;
+DROP TABLE IF EXISTS resource_action_task_receipts;
+DROP TABLE IF EXISTS resource_background_launches;
+DROP TABLE IF EXISTS resource_control_operations;
+DROP TABLE IF EXISTS resource_operator_attestations;
+DROP TABLE IF EXISTS resource_initial_idle_attestations;
+DROP TABLE IF EXISTS resource_registration_receipts;
+DROP TABLE IF EXISTS resource_cancellation_receipts;
+DROP TABLE IF EXISTS resource_request_preventions;
+DROP TABLE IF EXISTS resource_requests;
+DROP TABLE IF EXISTS trainer_attempt_associations;
+DROP TABLE IF EXISTS loans;
+DROP TABLE IF EXISTS resources;
+";
+
+/// Move a v0.13 database to the current schema
+fn migrate_34_to_current(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(MIGRATE_34_TO_35)
 }
 
 /// Why `Store::open` refuses a database version
@@ -565,43 +422,6 @@ fn unsupported_schema_version(version: i64) -> AppError {
 pub struct Store {
     conn: Connection,
     tasks_dir: std::path::PathBuf,
-}
-
-fn resource_task_id_is_reserved(conn: &Connection, task: TaskId) -> Result<bool, rusqlite::Error> {
-    if resource_request_task_id_is_reserved(conn, task)? {
-        return Ok(true);
-    }
-    release_watcher_task_id_is_reserved(conn, task)
-}
-
-fn resource_request_task_id_is_reserved(
-    conn: &Connection,
-    task: TaskId,
-) -> Result<bool, rusqlite::Error> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM resource_requests WHERE task_id = ?1
-            UNION ALL
-            SELECT 1 FROM resource_request_preventions WHERE task_id = ?1
-        )",
-        [task.to_string()],
-        |row| row.get(0),
-    )
-}
-
-fn release_watcher_task_id_is_reserved(
-    conn: &Connection,
-    task: TaskId,
-) -> Result<bool, rusqlite::Error> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM loans
-            WHERE json_extract(state_json, '$.phase.watcher_intent.watcher_task_id') = ?1
-               OR json_extract(state_json, '$.last_safe_phase.watcher_intent.watcher_task_id') = ?1
-        )",
-        [task.to_string()],
-        |row| row.get(0),
-    )
 }
 
 fn insert_task_with_project_root_on(
@@ -676,30 +496,7 @@ fn reject_busy_resume_thread_on(conn: &Connection, row: &TaskRow) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn task_by_id_on(conn: &Connection, id: TaskId) -> Result<Option<TaskRow>, AppError> {
-    let mut statement = conn.prepare(&format!("{TASK_SELECT} WHERE id = ?1"))?;
-    Ok(statement
-        .query_row(params![id.to_string()], parse_task_row)
-        .optional()?)
-}
-
-pub(crate) fn executor_identity_for_resource_task_on(
-    conn: &Connection,
-    task: TaskId,
-) -> Result<Option<ExecutorIdentity>, IdentityError> {
-    identity::executor_identity_on(conn, task)
-}
-
-pub(crate) fn initial_queued_event_matches_on(
-    conn: &Connection,
-    task: TaskId,
-    origin_machine: MachineId,
-    execution_machine: MachineId,
-) -> Result<bool, EventError> {
-    events::initial_queued_event_matches_on(conn, task, origin_machine, execution_machine)
-}
-
-pub(super) fn validate_local_task_acceptance(
+fn validate_local_task_acceptance(
     row: &TaskRow,
     spec: &NormalizedSpec,
     callback: &CallbackContext,
@@ -732,16 +529,8 @@ fn insert_local_task_records_on(
     machine: MachineId,
     request: RequestId,
     callback: &CallbackContext,
-    allowed_watcher_task: Option<TaskId>,
 ) -> Result<(), AppError> {
     validate_local_task_acceptance(row, spec, callback)?;
-    if resource_request_task_id_is_reserved(conn, row.id)?
-        || (allowed_watcher_task != Some(row.id)
-            && release_watcher_task_id_is_reserved(conn, row.id)?)
-    {
-        return Err(AppError::ClusterTaskConflict { task: row.id });
-    }
-
     let project_root = find_project_root(&row.cwd);
     insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
     let route = OriginRoute {
@@ -840,11 +629,6 @@ fn release_held_local_task_records_on(
         return Err(AppError::ClusterTaskConflict { task: row.id });
     }
     validate_local_task_acceptance(row, spec, &route.callback)?;
-    if resource_request_task_id_is_reserved(conn, row.id)?
-        || release_watcher_task_id_is_reserved(conn, row.id)?
-    {
-        return Err(AppError::ClusterTaskConflict { task: row.id });
-    }
 
     let project_root = find_project_root(&row.cwd);
     insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
@@ -873,126 +657,6 @@ fn release_held_local_task_records_on(
     events::append_produced_event_on(
         conn,
         row.id,
-        EventPayload::State {
-            status: ProcessStatus::Queued,
-        },
-    )?;
-    Ok(())
-}
-
-/// Fixed owners of one authority task whose callback route lives on another machine
-pub(crate) struct RemoteOriginTask {
-    /// Stable retry identity saved in the remote route
-    pub(crate) request_id: RequestId,
-    /// Supervisor machine that owns the callback route
-    pub(crate) origin_machine: MachineId,
-    /// Authority machine that executes the task
-    pub(crate) execution_machine: MachineId,
-    /// Supervisor thread named by the spec
-    pub(crate) thread: ThreadId,
-    /// Whether the task is the release watcher that its own action reserved
-    pub(crate) reserved_watcher: bool,
-}
-
-/// Insert one action-bound task whose callback route lives on the supervisor machine
-///
-/// The task row, accepted remote executor identity, first queued event, and exact
-/// action receipt commit in the caller's transaction. No origin route is written
-/// here because the supervisor machine saved it before sending the launch
-pub(crate) fn insert_remote_action_task_records_on(
-    conn: &Connection,
-    row: &TaskRow,
-    spec: &NormalizedSpec,
-    receipt: &crate::resource::bound_action::ActionTaskReceipt,
-) -> Result<(), AppError> {
-    if row.id != receipt.task_id {
-        return Err(AppError::ClusterTaskConflict { task: row.id });
-    }
-    insert_remote_origin_task_records_on(
-        conn,
-        row,
-        spec,
-        &RemoteOriginTask {
-            request_id: receipt.request_id,
-            origin_machine: receipt.origin_machine(),
-            execution_machine: receipt.execution_machine(),
-            thread: receipt.authority.supervisor.thread,
-            // only the watcher bound by this exact action may use its reserved identity
-            reserved_watcher: receipt.kind
-                == crate::resource::bound_action::ResourceActionKind::ReleaseWatcher,
-        },
-    )
-}
-
-/// Insert one authority task whose callback route lives on a remote supervisor machine
-///
-/// The task row, accepted remote executor identity, and first queued event commit
-/// in the caller's transaction. The caller saves its own receipt in the same one
-pub(crate) fn insert_remote_origin_task_records_on(
-    conn: &Connection,
-    row: &TaskRow,
-    spec: &NormalizedSpec,
-    owners: &RemoteOriginTask,
-) -> Result<(), AppError> {
-    let task = row.id;
-    let origin = owners.origin_machine;
-    let execution = owners.execution_machine;
-    if origin == execution
-        || spec.machine.is_some()
-        || spec.thread != owners.thread
-        || matches!(&spec.workload, crate::spec::NormalizedWorkload::Agent(_))
-        || row.status() != ProcessStatus::Queued
-        || row.name.as_ref() != Some(&spec.name)
-        || row.thread != spec.thread
-        || row.workload != crate::invocation::persist_workload(&spec.workload)
-        || row.cwd != spec.cwd
-        || row.timeout != spec.timeout
-        || !row.cwd.is_absolute()
-        || !row.binary.is_absolute()
-    {
-        return Err(AppError::ClusterTaskConflict { task });
-    }
-    let watcher_reserved = release_watcher_task_id_is_reserved(conn, task)?;
-    if resource_request_task_id_is_reserved(conn, task)?
-        || (watcher_reserved && !owners.reserved_watcher)
-    {
-        return Err(AppError::ClusterTaskConflict { task });
-    }
-    let occupied: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM tasks WHERE id=?1
-            UNION ALL SELECT 1 FROM executor_identities WHERE task_id=?1
-            UNION ALL SELECT 1 FROM origin_routes WHERE task_id=?1 OR request_id=?2
-            UNION ALL SELECT 1 FROM executor_outbox WHERE task_id=?1
-            UNION ALL SELECT 1 FROM executor_event_receipts WHERE task_id=?1
-        )",
-        params![task.to_string(), owners.request_id.0.to_string()],
-        |entry| entry.get(0),
-    )?;
-    if occupied {
-        return Err(AppError::ClusterTaskConflict { task });
-    }
-
-    let project_root = find_project_root(&row.cwd);
-    insert_task_with_project_root_on(conn, row, project_root.as_deref())?;
-    let identity = ExecutorIdentity::Accepted(ExecutionRecord {
-        task,
-        origin_machine: origin,
-        execution_machine: execution,
-        spec: spec.clone().into(),
-        state: ProcessStatus::Queued,
-    });
-    conn.execute(
-        "INSERT INTO executor_identities (task_id,origin_machine,identity_json) VALUES (?1,?2,?3)",
-        params![
-            task.to_string(),
-            origin.to_string(),
-            serde_json::to_string(&identity)?
-        ],
-    )?;
-    events::append_produced_event_on(
-        conn,
-        task,
         EventPayload::State {
             status: ProcessStatus::Queued,
         },
@@ -1062,13 +726,15 @@ impl Store {
                     migrate_2_to_current(&transaction)?;
                 }
                 2 => migrate_2_to_current(&transaction)?,
-                RELEASED_V0_4_SCHEMA_VERSION => migrate_27_to_current(&transaction)?,
-                RELEASED_V0_5_SCHEMA_VERSION => migrate_28_to_current(&transaction)?,
-                RELEASED_V0_5_1_SCHEMA_VERSION => migrate_29_to_current(&transaction)?,
-                RELEASED_V0_7_SCHEMA_VERSION => migrate_30_to_current(&transaction)?,
-                RELEASED_V0_8_SCHEMA_VERSION => migrate_31_to_current(&transaction)?,
-                RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
+                RELEASED_V0_4_SCHEMA_VERSION | RELEASED_V0_5_SCHEMA_VERSION => {
+                    migrate_28_to_current(&transaction)?;
+                }
+                RELEASED_V0_5_1_SCHEMA_VERSION
+                | RELEASED_V0_7_SCHEMA_VERSION
+                | RELEASED_V0_8_SCHEMA_VERSION
+                | RELEASED_V0_8_7_SCHEMA_VERSION => migrate_32_to_current(&transaction)?,
                 RELEASED_V0_11_SCHEMA_VERSION => migrate_33_to_current(&transaction)?,
+                RELEASED_V0_13_SCHEMA_VERSION => migrate_34_to_current(&transaction)?,
                 other => return Err(unsupported_schema_version(other)),
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1106,7 +772,7 @@ impl Store {
             codex,
         };
         self.immediate(|| {
-            insert_local_task_records_on(&self.conn, row, spec, machine, request, &callback, None)
+            insert_local_task_records_on(&self.conn, row, spec, machine, request, &callback)
         })
     }
 
@@ -1132,7 +798,7 @@ impl Store {
                 };
                 self.immediate(|| {
                     insert_local_task_records_on(
-                        &self.conn, row, spec, machine, *request, &callback, None,
+                        &self.conn, row, spec, machine, *request, &callback,
                     )?;
                     if let Some(after) = after {
                         self.conn.execute(
@@ -1185,17 +851,11 @@ impl Store {
                     ExecutorIdentity::Rejected(record) => record.origin_machine == origin
                         && record.execution_machine == execution,
                 };
-                return if !same
-                    || (matches!(&identity, ExecutorIdentity::Accepted(_))
-                        && resource_task_id_is_reserved(&self.conn, row.id)?)
-                {
-                    Err(AppError::ClusterTaskConflict { task: row.id })
-                } else {
+                return if same {
                     Ok(identity)
+                } else {
+                    Err(AppError::ClusterTaskConflict { task: row.id })
                 };
-            }
-            if resource_task_id_is_reserved(&self.conn, row.id)? {
-                return Err(AppError::ClusterTaskConflict { task: row.id });
             }
             if self.get_task(row.id)?.is_some() {
                 return Err(AppError::ClusterTaskConflict { task: row.id });
@@ -1489,16 +1149,7 @@ impl Store {
                 route.validate().map_err(|error| AppError::Internal {
                     message: format!("invalid saved origin route: {error}"),
                 })?;
-                let accepted_submission = match &route.submission {
-                    SubmissionState::Accepted => true,
-                    SubmissionState::Resource { phase, .. } => matches!(
-                        phase,
-                        ResourceRoutePhase::AcceptanceUnknown
-                            | ResourceRoutePhase::Waiting
-                            | ResourceRoutePhase::Activated
-                    ),
-                    _ => false,
-                };
+                let accepted_submission = matches!(route.submission, SubmissionState::Accepted);
                 record.task == id
                     && route.task == id
                     && route.origin_machine == route.execution_machine
@@ -2678,8 +2329,8 @@ mod tests {
         BASE_SCHEMA, CancelResult, NewTask, RELEASED_V0_4_SCHEMA_VERSION,
         RELEASED_V0_5_1_SCHEMA_VERSION, RELEASED_V0_5_SCHEMA_VERSION, RELEASED_V0_7_SCHEMA_VERSION,
         RELEASED_V0_8_7_SCHEMA_VERSION, RELEASED_V0_8_SCHEMA_VERSION,
-        RELEASED_V0_11_SCHEMA_VERSION, Store, new_queued_task, read_exit_json,
-        write_exit_json_with_evidence,
+        RELEASED_V0_11_SCHEMA_VERSION, RELEASED_V0_13_SCHEMA_VERSION, Store, new_queued_task,
+        read_exit_json, write_exit_json_with_evidence,
     };
     use crate::callback::EventKind;
     use crate::daemon::api::views::TaskSummary;
@@ -2693,9 +2344,6 @@ mod tests {
     use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, OutboxState};
     use crate::invocation::CommandLine;
     use crate::machine::MachineId;
-    use crate::resource::{
-        AssignmentRevision, Resource, ResourceId, ResourceRevision, SupervisorAddress,
-    };
     use crate::spec::NormalizedSpec;
     use crate::submission::{
         CallbackContext, CallbackExecutable, ExecutorIdentity, OriginRoute, PersistedSpec,
@@ -2810,7 +2458,10 @@ mod tests {
             ProcessGroupExitEvidence::ConfirmedExited
         );
         assert_eq!(
-            store.process_group_exit_evidence(id).unwrap(),
+            store
+                .get_task(id)
+                .unwrap()
+                .map(|row| row.process_group_exit_evidence()),
             Some(ProcessGroupExitEvidence::ConfirmedExited)
         );
         let terminal_events = store
@@ -2888,7 +2539,10 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert_eq!(
-            store.process_group_exit_evidence(id).unwrap(),
+            store
+                .get_task(id)
+                .unwrap()
+                .map(|row| row.process_group_exit_evidence()),
             Some(ProcessGroupExitEvidence::NoChildSpawned)
         );
     }
@@ -2940,7 +2594,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
+        assert_no_loan_tables(&store);
         let row = store.require_task(id).unwrap();
         assert_eq!(row.status(), ProcessStatus::Cancelled);
         assert_eq!(row.exit_reason(), Some(&ExitReason::Cancelled));
@@ -2949,7 +2603,10 @@ mod tests {
             ProcessGroupExitEvidence::Unconfirmed
         );
         assert_eq!(
-            store.process_group_exit_evidence(id).unwrap(),
+            store
+                .get_task(id)
+                .unwrap()
+                .map(|row| row.process_group_exit_evidence()),
             Some(ProcessGroupExitEvidence::Unconfirmed)
         );
     }
@@ -3018,75 +2675,6 @@ mod tests {
                 CallbackExecutable::available("/bin/true".into()),
             )
             .unwrap();
-    }
-
-    #[test]
-    fn queued_resource_task_cannot_be_accepted_as_local_or_remote_work() {
-        let dir = tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("db")).unwrap();
-        let task = TaskId::new();
-        let authority = MachineId::new();
-        let origin = MachineId::new();
-        let (row, spec) = row_at(task, Path::new("/tmp"));
-        let resource = crate::resource::Resource::new(
-            crate::resource::ResourceId::new(),
-            "gpu-0".into(),
-            authority,
-            crate::resource::SupervisorAddress {
-                machine: authority,
-                thread: row.thread,
-            },
-            crate::resource::AssignmentRevision::new(0),
-            crate::resource::ResourceRevision::new(0),
-            None,
-        );
-        store.register_resource(authority, &resource).unwrap();
-        store
-            .accept_resource_request(
-                authority,
-                RequestId::new(),
-                task,
-                resource.id,
-                origin,
-                spec.clone(),
-            )
-            .unwrap();
-
-        assert!(matches!(
-            store.insert_local_task(
-                &row,
-                &spec,
-                MachineId::new(),
-                crate::submission::RequestId::new(),
-                CallbackExecutable::available("/bin/true".into()),
-            ),
-            Err(AppError::ClusterTaskConflict { task: conflict }) if conflict == task
-        ));
-        assert!(matches!(
-            store.insert_remote_task(&row, &spec, origin, authority),
-            Err(AppError::ClusterTaskConflict { task: conflict }) if conflict == task
-        ));
-        assert!(store.get_task(task).unwrap().is_none());
-        assert!(store.executor_identity(task).unwrap().is_none());
-        assert_eq!(
-            store
-                .next_queued_resource_request(authority, resource.id)
-                .unwrap()
-                .unwrap()
-                .task_id,
-            task
-        );
-
-        let ordinary_task = TaskId::new();
-        let (ordinary_row, ordinary_spec) = row_at(ordinary_task, Path::new("/tmp"));
-        assert!(matches!(
-            store.insert_remote_task(&ordinary_row, &ordinary_spec, origin, authority),
-            Ok(ExecutorIdentity::Accepted(_))
-        ));
-        assert!(matches!(
-            store.insert_remote_task(&ordinary_row, &ordinary_spec, origin, authority),
-            Ok(ExecutorIdentity::Accepted(_))
-        ));
     }
 
     fn insert_legacy_terminal(store: &Store, id: TaskId, callback: CallbackStatus) {
@@ -4023,8 +3611,7 @@ CREATE TABLE reports (
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_resource_tables_installed(&store);
-        assert_resource_request_serving_schema(&store, "fresh");
+        assert_no_loan_tables(&store);
         assert_foreign_keys_enabled(&store);
     }
 
@@ -4164,57 +3751,6 @@ CREATE TABLE reports (
         assert_eq!(worker_thread, None);
     }
 
-    fn assert_resource_tables_installed(store: &Store) {
-        for table in [
-            "resources",
-            "trainer_attempt_associations",
-            "resource_requests",
-            "resource_request_preventions",
-            "resource_cancellation_receipts",
-            "loans",
-            "resource_supervisor_notices",
-            "resource_release_completions",
-            "resource_release_checkpoint_states",
-            "resource_return_decisions",
-            "resource_restore_closures",
-            "resource_action_task_receipts",
-            "resource_background_launches",
-            "resource_idle_openings",
-            "resource_registration_receipts",
-        ] {
-            let exists: bool = store
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "resource table {table} was not installed");
-        }
-
-        let resource_primary_key: i64 = store
-            .conn
-            .query_row(
-                "SELECT pk FROM pragma_table_info('trainer_attempt_associations')
-                 WHERE name='resource_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let task_primary_key: i64 = store
-            .conn
-            .query_row(
-                "SELECT pk FROM pragma_table_info('trainer_attempt_associations')
-                 WHERE name='task_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(resource_primary_key, 0);
-        assert_eq!(task_primary_key, 1);
-    }
-
     fn assert_foreign_keys_enabled(store: &Store) {
         let enabled: bool = store
             .conn
@@ -4223,186 +3759,272 @@ CREATE TABLE reports (
         assert!(enabled);
     }
 
-    /// Schema text of one table or index
-    fn schema_sql(store: &Store, name: &str) -> String {
-        store
+    fn assert_no_loan_tables(store: &Store) {
+        let loan_tables: Vec<String> = store
             .conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name = ?1",
-                [name],
-                |row| row.get(0),
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table'
+                   AND (name IN ('resources', 'loans', 'trainer_attempt_associations')
+                        OR name LIKE 'resource!_%' ESCAPE '!')",
             )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            loan_tables.is_empty(),
+            "loan tables remain: {loan_tables:?}"
+        );
+    }
+
+    /// GPU loan tables of the last release that had them
+    const RELEASED_LOAN_SCHEMA: &str = include_str!("store/fixtures/loan_schema_v34.sql");
+
+    /// Every table, index, and trigger by type and name, with normalized SQL
+    ///
+    /// SQLite's own tables are left out: `sqlite_sequence` stays once an
+    /// `AUTOINCREMENT` loan table has existed, and SQLite cannot drop it
+    fn schema_snapshot(store: &Store) -> Vec<(String, String, String)> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite!_%' ESCAPE '!'
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    normalized_sql(&row.get::<_, String>(2)?),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap()
     }
 
-    fn prepare_released_resource_queue(
-        path: &Path,
-        version: i64,
-    ) -> (MachineId, ResourceId, Vec<RequestId>) {
-        let mut store = Store::open(path).unwrap();
-        let authority = MachineId::new();
-        let resource_id = ResourceId::new();
-        let resource = Resource::new(
-            resource_id,
-            "migration GPU".into(),
-            authority,
-            SupervisorAddress {
-                machine: authority,
-                thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
-            },
-            AssignmentRevision::new(0),
-            ResourceRevision::new(0),
-            None,
-        );
-        store.register_resource(authority, &resource).unwrap();
-        store
-            .conn
-            .execute_batch(
-                "DROP TABLE resource_requests;
-                 CREATE TABLE resource_requests (
-                     acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                     request_id TEXT NOT NULL UNIQUE,
-                     task_id TEXT NOT NULL UNIQUE,
-                     resource_id TEXT NOT NULL REFERENCES resources(id),
-                     origin_machine TEXT NOT NULL,
-                     spec_json TEXT NOT NULL,
-                     state_json TEXT NOT NULL
-                 );",
-            )
+    /// Schema SQL with whitespace collapsed and the parts of a table body sorted
+    ///
+    /// `ALTER TABLE ADD COLUMN` appends, so an upgraded version 1 database keeps
+    /// `name` last while a fresh one declares it third. Every query names its
+    /// columns, so their order is not part of the schema
+    fn normalized_sql(sql: &str) -> String {
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !sql.starts_with("CREATE TABLE") {
+            return sql;
+        }
+        let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else {
+            return sql;
+        };
+
+        let body = &sql[open + 1..close];
+        let mut parts = Vec::new();
+        let (mut depth, mut quoted, mut start) = (0_u32, false, 0);
+        for (index, character) in body.char_indices() {
+            match character {
+                '\'' => quoted = !quoted,
+                '(' if !quoted => depth += 1,
+                ')' if !quoted => depth -= 1,
+                ',' if !quoted && depth == 0 => {
+                    parts.push(body[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(body[start..].trim());
+        parts.sort_unstable();
+        format!("{} ({})", sql[..open].trim_end(), parts.join(", "))
+    }
+
+    /// Rows that only the loan flows wrote into shared tables, keyed by `loan_task`
+    fn seed_loan_rows(store: &Store, ordinary_task: TaskId, loan_task: TaskId) {
+        let resource = uuid::Uuid::now_v7().to_string();
+        let loan = uuid::Uuid::now_v7().to_string();
+        let attempt = uuid::Uuid::now_v7().to_string();
+        let conn = &store.conn;
+        conn.execute_batch(RELEASED_LOAN_SCHEMA).unwrap();
+        // the loan JSON constraints are irrelevant to dropping the tables
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO resources (id, display_name, authority_machine, supervisor_machine,
+                supervisor_thread, assignment_revision, state_revision)
+             VALUES (?1, 'gpu', 'machine', 'machine', 'thread', 0, 0)",
+            [&resource],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loans (id, resource_id, state_json) VALUES (?1, ?2, '{}')",
+            [&loan, &resource],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resource_supervisor_notices (id, loan_id, action_id, notice_json)
+             VALUES (?1, ?2, ?1, '{}')",
+            [&attempt, &loan],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trainer_attempt_associations
+                (task_id, resource_id, authority_machine, association_json)
+             VALUES (?1, ?2, 'machine', '{}')",
+            [ordinary_task.to_string(), resource],
+        )
+        .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
 
-        let request_ids = vec![RequestId::new(), RequestId::new()];
-        let spec_json = json!({
-            "api_version": 1,
-            "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "name": "migration request",
-            "cwd": "/tmp",
-            "timeout": "4h",
-            "workload": { "type": "task", "command": ["/bin/echo", "migration"] }
-        })
-        .to_string();
-        for (sequence, request_id) in [7_i64, 13_i64].into_iter().zip(&request_ids) {
-            store
-                .conn
-                .execute(
-                    "INSERT INTO resource_requests
-                        (acceptance_sequence, request_id, task_id, resource_id,
-                         origin_machine, spec_json, state_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        sequence,
-                        request_id.0.to_string(),
-                        TaskId::new().to_string(),
-                        resource_id.as_uuid().to_string(),
-                        authority.as_uuid().to_string(),
-                        spec_json,
-                        json!({ "type": "queued" }).to_string(),
-                    ],
-                )
-                .unwrap();
-        }
+        let loan_task = loan_task.to_string();
+        conn.execute(
+            "INSERT INTO origin_routes (request_id, task_id, execution_machine, spec_json, route_json)
+             VALUES (?1, ?2, 'machine', '{}', '{\"submission\":{\"type\":\"resource\"}}')",
+            [uuid::Uuid::now_v7().to_string(), loan_task.clone()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO origin_inbox (task_id, seq, origin_machine, execution_machine,
+                event_json, notification_required, delivery_json)
+             VALUES (?1, 1, 'machine', 'machine', '{}', 0, '{}')",
+            [&loan_task],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cancellation_requests (task_id, request_json)
+             VALUES (?1, '{\"target\":{\"type\":\"resource\"}}')",
+            [&loan_task],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_attempts (message_id, attempt_json)
+             VALUES (?1, '{\"request\":{\"source\":{\"kind\":\"resource_notice\"}}}')",
+            [&attempt],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_receipts (message_id, receipt_json) VALUES (?1, '{}')",
+            [&attempt],
+        )
+        .unwrap();
+    }
 
-        if version == RELEASED_V0_4_SCHEMA_VERSION || version == RELEASED_V0_5_SCHEMA_VERSION {
-            store
-                .conn
-                .execute_batch(
-                    "DROP TABLE task_containers;
-                     ALTER TABLE tasks DROP COLUMN container_exit_evidence;",
-                )
-                .unwrap();
-        }
-        store
-            .conn
-            .execute_batch(
-                "ALTER TABLE tasks DROP COLUMN worker_thread;
-                 ALTER TABLE origin_routes DROP COLUMN after_json;
+    /// Restore the shape of released schema `version` on a current database
+    fn downgrade_to_released(store: &Store, version: i64) {
+        let mut sql = String::new();
+        if version < RELEASED_V0_13_SCHEMA_VERSION {
+            sql.push_str(
+                "ALTER TABLE origin_routes DROP COLUMN after_json;
                  ALTER TABLE origin_routes DROP COLUMN outcome;",
-            )
-            .unwrap();
-        if version < RELEASED_V0_7_SCHEMA_VERSION {
-            store
-                .conn
-                .execute("DROP TABLE resource_initial_idle_attestations", [])
-                .unwrap();
+            );
         }
-        drop_return_window_tables(&store);
+        if version < RELEASED_V0_11_SCHEMA_VERSION {
+            sql.push_str("ALTER TABLE tasks DROP COLUMN worker_thread;");
+        }
+        if version < RELEASED_V0_8_7_SCHEMA_VERSION {
+            sql.push_str(
+                "DROP TABLE resource_return_deadline_servings;
+                 DROP TABLE resource_return_windows;",
+            );
+        }
+        if version < RELEASED_V0_7_SCHEMA_VERSION {
+            sql.push_str("DROP TABLE resource_initial_idle_attestations;");
+        }
+        if version < RELEASED_V0_5_1_SCHEMA_VERSION {
+            sql.push_str(
+                "ALTER TABLE tasks DROP COLUMN container_exit_evidence;
+                 DROP TABLE task_containers;",
+            );
+        }
+        sql.push_str(&format!("PRAGMA user_version = {version};"));
+        store.conn.execute_batch(&sql).unwrap();
+    }
+
+    fn row_count(store: &Store, sql: &str, task: TaskId) -> i64 {
         store
             .conn
-            .pragma_update(None, "user_version", version)
-            .unwrap();
-        drop(store);
-        (authority, resource_id, request_ids)
+            .query_row(sql, [task.to_string()], |row| row.get(0))
+            .unwrap()
     }
 
     #[test]
-    fn released_resource_schemas_backfill_queue_ranks_and_keep_the_request_order() {
+    fn every_released_schema_upgrades_to_the_fresh_schema_without_loan_data() {
+        let fresh_dir = tempdir().unwrap();
+        let fresh = schema_snapshot(&Store::open(&fresh_dir.path().join("db")).unwrap());
+
+        for (version, schema) in [(1, SCHEMA_V1), (2, BASE_SCHEMA)] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(schema).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+
+            let store = Store::open(&path).unwrap();
+            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
+        }
+
         for version in [
             RELEASED_V0_4_SCHEMA_VERSION,
             RELEASED_V0_5_SCHEMA_VERSION,
             RELEASED_V0_5_1_SCHEMA_VERSION,
             RELEASED_V0_7_SCHEMA_VERSION,
+            RELEASED_V0_8_SCHEMA_VERSION,
+            RELEASED_V0_8_7_SCHEMA_VERSION,
+            RELEASED_V0_11_SCHEMA_VERSION,
+            RELEASED_V0_13_SCHEMA_VERSION,
         ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("db");
-            let (authority, resource_id, request_ids) =
-                prepare_released_resource_queue(&path, version);
+            let ordinary_task = TaskId::new();
+            let loan_task = TaskId::new();
+            {
+                let store = Store::open(&path).unwrap();
+                insert_local(&store, ordinary_task);
+                seed_loan_rows(&store, ordinary_task, loan_task);
+                downgrade_to_released(&store, version);
+            }
+
             let store = Store::open(&path).unwrap();
-            let current_version: i64 = store
-                .conn
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .unwrap();
+            assert_eq!(schema_snapshot(&store), fresh, "released version {version}");
+            assert_no_loan_tables(&store);
+            assert_eq!(store.require_task(ordinary_task).unwrap().id, ordinary_task);
             assert_eq!(
-                current_version, SCHEMA_VERSION,
+                row_count(
+                    &store,
+                    "SELECT COUNT(*) FROM origin_routes WHERE task_id = ?1",
+                    ordinary_task
+                ),
+                1,
                 "released version {version}"
             );
-
-            let requests = store.resource_requests(authority, resource_id).unwrap();
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request.request_id)
-                    .collect::<Vec<_>>(),
-                request_ids,
-                "released version {version}"
-            );
-            let ranks = store
+            for table in ["origin_routes", "origin_inbox", "cancellation_requests"] {
+                assert_eq!(
+                    row_count(
+                        &store,
+                        &format!("SELECT COUNT(*) FROM {table} WHERE task_id = ?1"),
+                        loan_task
+                    ),
+                    0,
+                    "released version {version}: {table}"
+                );
+            }
+            let messages: i64 = store
                 .conn
-                .prepare(
-                    "SELECT queue_rank FROM resource_requests
-                     WHERE resource_id = ?1 ORDER BY acceptance_sequence",
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM message_attempts)
+                          + (SELECT COUNT(*) FROM message_receipts)",
+                    [],
+                    |row| row.get(0),
                 )
-                .unwrap()
-                .query_map([resource_id.as_uuid().to_string()], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            assert_eq!(ranks, [7, 13], "released version {version}");
-            assert_resource_request_serving_schema(&store, &format!("released version {version}"));
+            assert_eq!(messages, 0, "released version {version}");
+            assert_foreign_keys_enabled(&store);
         }
-    }
-
-    fn assert_resource_request_serving_schema(store: &Store, label: &str) {
-        let request_schema = schema_sql(store, "resource_requests");
-        assert!(
-            request_schema.contains("queue_rank INTEGER NOT NULL CHECK (queue_rank > 0)"),
-            "{label}: {request_schema}"
-        );
-        assert!(
-            !request_schema.contains("queue_rank INTEGER NOT NULL DEFAULT"),
-            "{label}: {request_schema}"
-        );
-        assert!(
-            schema_sql(store, "resource_requests_serving_order")
-                .contains("resource_id, queue_rank, acceptance_sequence"),
-            "{label}"
-        );
-        assert!(
-            schema_sql(store, "resource_requests_queued_serving_order")
-                .contains("resource_id, queue_rank, acceptance_sequence"),
-            "{label}"
-        );
     }
 
     #[test]
@@ -4413,8 +4035,7 @@ CREATE TABLE reports (
         {
             let store = Store::open(&path).unwrap();
             insert_local(&store, id);
-            // restore the v0.5.0 shape: no container column or table, and a
-            // request CHECK that accepted only command work
+            // restore the v0.5.0 shape: no container column or table
             store
                 .conn
                 .execute_batch(&format!(
@@ -4423,18 +4044,6 @@ CREATE TABLE reports (
                      ALTER TABLE origin_routes DROP COLUMN outcome;
                      ALTER TABLE tasks DROP COLUMN container_exit_evidence;
                      DROP TABLE task_containers;
-                     DROP TABLE resource_requests;
-                     CREATE TABLE resource_requests (
-                         acceptance_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                         request_id TEXT NOT NULL UNIQUE,
-                         task_id TEXT NOT NULL UNIQUE,
-                         resource_id TEXT NOT NULL REFERENCES resources(id),
-                         origin_machine TEXT NOT NULL,
-                         spec_json TEXT NOT NULL CHECK (
-                             COALESCE(json_extract(spec_json, '$.workload.type') = 'task', 0)
-                         ),
-                         state_json TEXT NOT NULL
-                     );
                      PRAGMA user_version = {RELEASED_V0_5_SCHEMA_VERSION};"
                 ))
                 .unwrap();
@@ -4452,88 +4061,8 @@ CREATE TABLE reports (
             ContainerExitEvidence::Unconfirmed
         );
         assert_eq!(store.task_container(id).unwrap(), None);
-        assert!(schema_sql(&store, "resource_requests").contains("'container'"));
-        assert!(!schema_sql(&store, "resource_requests").contains("'task', 0) AND"));
-        assert!(schema_sql(&store, "resource_restore_closures").contains("'container_ended'"));
-        schema_sql(&store, "resource_requests_serving_order");
-        schema_sql(&store, "resource_requests_queued_serving_order");
-        assert_resource_tables_installed(&store);
+        assert_no_loan_tables(&store);
         assert_foreign_keys_enabled(&store);
-    }
-
-    /// Remove the tables that schema version 32 added, as a released database lacks them
-    fn drop_return_window_tables(store: &Store) {
-        store
-            .conn
-            .execute_batch(
-                "DROP TABLE resource_return_deadline_servings;
-                 DROP TABLE resource_return_windows;",
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn released_v0_8_database_gains_return_windows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            insert_local(&store, id);
-            drop_return_window_tables(&store);
-            store
-                .conn
-                .execute_batch(
-                    "ALTER TABLE tasks DROP COLUMN worker_thread;
-                 ALTER TABLE origin_routes DROP COLUMN after_json;
-                 ALTER TABLE origin_routes DROP COLUMN outcome;",
-                )
-                .unwrap();
-            store
-                .conn
-                .pragma_update(None, "user_version", RELEASED_V0_8_SCHEMA_VERSION)
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert!(schema_sql(&store, "resource_return_windows").contains("deadline_at"));
-        assert!(schema_sql(&store, "resource_return_deadline_servings").contains("receipt_json"));
-        store.require_task(id).unwrap();
-    }
-
-    #[test]
-    fn released_v0_5_1_database_gains_the_initial_idle_table() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db");
-        let id = TaskId::new();
-        {
-            let store = Store::open(&path).unwrap();
-            insert_local(&store, id);
-            store
-                .conn
-                .execute_batch(&format!(
-                    "DROP TABLE resource_initial_idle_attestations;
-                     ALTER TABLE tasks DROP COLUMN worker_thread;
-                     ALTER TABLE origin_routes DROP COLUMN after_json;
-                     ALTER TABLE origin_routes DROP COLUMN outcome;
-                     PRAGMA user_version = {RELEASED_V0_5_1_SCHEMA_VERSION};"
-                ))
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let version: i64 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert!(schema_sql(&store, "resource_initial_idle_attestations").contains("resource_id"));
-        store.require_task(id).unwrap();
     }
 
     #[test]
@@ -4641,7 +4170,7 @@ CREATE TABLE reports (
         assert_eq!(listed[0].name, None);
         assert_eq!(listed[0].display_name(), "echo hi");
         let id = listed[0].id;
-        assert_resource_tables_installed(&store);
+        assert_no_loan_tables(&store);
         assert!(!store.is_event_task(id).unwrap());
         store
             .cas_exit(id, ProcessStatus::Queued, &ExitReason::Cancelled)

@@ -72,7 +72,6 @@
 			<ArrowLeft class="size-3.5" />
 			all workers
 		</a>
-		<a href={resolve('/resources')} class="text-primary hover:underline">resources</a>
 		{#if task}
 			<h1
 				class="min-w-0 text-base font-semibold tracking-tight wrap-anywhere"

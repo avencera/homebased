@@ -6,7 +6,6 @@ use rusqlite::{OptionalExtension, params};
 use super::{Store, fmt_time, parse_time};
 use crate::domain::{ContainerId, TaskId};
 use crate::error::AppError;
-use crate::resource::ResourceId;
 
 /// Container lifecycle saved for one container task
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,30 +89,6 @@ impl Store {
             [task.to_string()],
         )?;
         Ok(())
-    }
-
-    /// Resource whose request or return loan owns one task, if any
-    pub(crate) fn resource_for_task(&self, task: TaskId) -> Result<Option<ResourceId>, AppError> {
-        let resource: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT resource_id FROM resource_requests WHERE task_id = ?1
-                 UNION ALL
-                 SELECT resource_id FROM loans
-                 WHERE json_extract(state_json, '$.phase.resume_task_id') = ?1
-                    OR json_extract(state_json, '$.last_safe_phase.resume_task_id') = ?1
-                 LIMIT 1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        resource
-            .map(|raw| {
-                raw.parse().map_err(|_| AppError::Internal {
-                    message: format!("stored resource id {raw} is invalid"),
-                })
-            })
-            .transpose()
     }
 
     /// Count one more adopting worker, unless `limit` workers in a row already
