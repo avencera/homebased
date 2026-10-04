@@ -750,5 +750,4 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
 }
 
 #[cfg(test)]
-#[path = "delivery_tests.rs"]
 mod tests;
