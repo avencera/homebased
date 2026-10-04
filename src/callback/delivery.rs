@@ -159,22 +159,37 @@ impl PendingT3Send {
         Self(path)
     }
 
-    fn get(&self, thread: ThreadId) -> Option<ProviderThread> {
-        match fs::read_to_string(&self.0).ok()?.trim() {
-            "claude" => Some(ProviderThread::Claude(thread)),
-            "codex" => Some(ProviderThread::Codex(thread)),
-            _ => None,
+    fn get(&self, thread: ThreadId) -> Result<Option<ProviderThread>, SendFailure> {
+        let content = match fs::read_to_string(&self.0) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read pending T3 send: {error}").into()),
+        };
+        match content.trim() {
+            "claude" => Ok(Some(ProviderThread::Claude(thread))),
+            "codex" => Ok(Some(ProviderThread::Codex(thread))),
+            _ => Err("invalid pending T3 send record; fallback is blocked"
+                .to_string()
+                .into()),
         }
     }
 
-    fn record(&self, provider_thread: ProviderThread) {
+    fn record(&self, provider_thread: ProviderThread) -> Result<(), SendFailure> {
         let provider = match provider_thread {
             ProviderThread::Claude(_) => "claude",
             ProviderThread::Codex(_) => "codex",
         };
-        if let Err(error) = fs::write(&self.0, provider) {
-            warn!("record pending T3 send {}: {error}", self.0.display());
-        }
+        let save = || -> io::Result<()> {
+            let mut file = fs::File::create(&self.0)?;
+            file.write_all(provider.as_bytes())?;
+            file.sync_all()?;
+            if let Some(parent) = self.0.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        };
+        save()
+            .map_err(|error| format!("record pending T3 send {}: {error}", self.0.display()).into())
     }
 
     fn clear(&self) {
@@ -203,7 +218,7 @@ pub(crate) fn retry_pending_t3(
     pending: &PendingT3Send,
     gate: SendGate<'_>,
 ) -> Result<Option<PendingRetry>, SendFailure> {
-    let Some(provider_thread) = pending.get(thread) else {
+    let Some(provider_thread) = pending.get(thread)? else {
         return Ok(None);
     };
     let retry = match wake_provider_thread(context, provider_thread, line, log_path, pending, gate)?
@@ -440,31 +455,43 @@ fn wake_provider_thread(
     gate: SendGate<'_>,
 ) -> Result<WakeOutcome, SendFailure> {
     let _lock = gate.lock()?;
+    let thread = match provider_thread {
+        ProviderThread::Claude(thread) | ProviderThread::Codex(thread) => thread,
+    };
+    let was_pending = pending.get(thread)?.is_some();
+    // persist before the request: a lost reply must never enable another route
+    if !was_pending {
+        pending.record(provider_thread)?;
+    }
     let outcome = match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check) {
         Ok(outcome) => outcome,
         // with no notice to recheck, a failed dispatch only leaves T3 unavailable
         Err(failure) if gate.check.is_none() => WakeOutcome::Unavailable(failure.to_string()),
-        Err(failure) => return Err(failure),
+        Err(failure) => {
+            if !was_pending {
+                pending.clear();
+            }
+            return Err(failure);
+        }
     };
-    record_wake(&outcome, provider_thread, log_path, pending);
+    if !was_pending
+        && !matches!(
+            outcome,
+            WakeOutcome::Woken { .. } | WakeOutcome::Uncertain(_)
+        )
+    {
+        pending.clear();
+    }
+    record_wake(&outcome, log_path, pending);
     Ok(outcome)
 }
 
-fn record_wake(
-    outcome: &WakeOutcome,
-    provider_thread: ProviderThread,
-    log_path: &Path,
-    pending: &PendingT3Send,
-) {
-    match outcome {
-        WakeOutcome::Woken { t3_thread } => {
-            pending.clear();
-            if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
-                let _ = writeln!(log, "t3 wake thread={t3_thread}");
-            }
+fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send) {
+    if let WakeOutcome::Woken { t3_thread } = outcome {
+        pending.clear();
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
+            let _ = writeln!(log, "t3 wake thread={t3_thread}");
         }
-        WakeOutcome::Uncertain(_) => pending.record(provider_thread),
-        _ => {}
     }
 }
 
@@ -660,4 +687,39 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
     writeln!(file, "{line}")?;
     writeln!(file, "{stderr}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bugfix_t3_send_requires_a_saved_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = crate::submission::CallbackContext {
+            env: crate::domain::TaskEnv {
+                path: String::new(),
+                home: directory.path().display().to_string(),
+            },
+            cwd: directory.path().to_path_buf(),
+            codex: crate::submission::CallbackExecutable::Unavailable {
+                reason: "unused".into(),
+            },
+        };
+        let pending = super::PendingT3Send::new(directory.path().to_path_buf());
+        let thread = "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap();
+        let lock = directory.path().join("delivery.lock");
+        let log = directory.path().join("callback.log");
+        let result = super::wake_provider_thread(
+            &context,
+            crate::t3::ProviderThread::Codex(thread),
+            "message",
+            &log,
+            &pending,
+            super::SendGate {
+                path: &lock,
+                check: None,
+            },
+        );
+        assert!(result.is_err());
+        assert!(!log.exists());
+    }
 }

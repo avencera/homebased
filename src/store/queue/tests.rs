@@ -2297,3 +2297,60 @@ async fn notice_ends_during_callback_preparation() {
     assert!(f.store.pending_job_inbox().unwrap().is_empty());
     assert_eq!(f.store.job_events(head).unwrap().len(), 2);
 }
+
+#[test]
+fn bugfix_run_count_overflow_leaves_the_job_queued() {
+    let fixture = Fixture::new();
+    let job = fixture.submit(Priority::Medium);
+    fixture
+        .store
+        .conn
+        .execute(
+            "UPDATE resource_jobs SET last_run_number = ?1 WHERE id = ?2",
+            params![u32::MAX, job.to_string()],
+        )
+        .unwrap();
+    let task = TaskId::new();
+    assert!(
+        fixture
+            .store
+            .reserve_run(
+                fixture.machine,
+                job,
+                fixture.resource("gpu0"),
+                task,
+                PathBuf::from("/bin/true"),
+                Utc::now()
+            )
+            .is_err()
+    );
+    assert!(fixture.store.get_task(task).unwrap().is_none());
+    assert!(fixture.run_on("gpu0").is_none());
+    assert_eq!(fixture.job(job).runs, u32::MAX);
+}
+
+#[test]
+fn bugfix_cleanup_count_overflow_preserves_the_attempt() {
+    let fixture = Fixture::new();
+    let job = fixture.submit(Priority::Medium);
+    let run = fixture.start(job, "gpu0", Utc::now());
+    fixture.exit(&run, ExitReason::Exit { code: 0 });
+    fixture
+        .store
+        .conn
+        .execute(
+            "UPDATE resources SET run_cleanup_attempt = ?1 WHERE id = ?2",
+            params![u32::MAX, run.resource.to_string()],
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .begin_cleanup_attempt(run.resource, run.task)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.run_on("gpu0").unwrap().phase,
+        RunPhase::Cleaning { attempt: u32::MAX }
+    );
+}

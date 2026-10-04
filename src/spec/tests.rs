@@ -769,3 +769,17 @@ fn container_cwd_names_the_host_path_under_the_deepest_mount_target() {
         Some(host.path().join("cache/runs").as_path())
     );
 }
+
+#[test]
+fn bugfix_missing_task_command_has_its_own_pointer() {
+    let mut value = example_task_json();
+    value["workload"].as_object_mut().unwrap().remove("command");
+    for result in [
+        parse_spec_value(&value).map(|_| ()),
+        parse_normalized_value(&value).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(AppError::InvalidSpec { pointer, value, .. }) if pointer == "/workload/command" && value.is_null())
+        );
+    }
+}

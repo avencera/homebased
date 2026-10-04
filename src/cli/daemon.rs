@@ -377,7 +377,9 @@ fn wait_socket_gone(path: &std::path::Path, budget: Duration) -> Result<(), AppE
     let start = std::time::Instant::now();
     while path.exists() {
         if start.elapsed() > budget {
-            break;
+            return Err(AppError::DaemonUnavailable {
+                message: "socket still exists after stop timeout".into(),
+            });
         }
 
         std::thread::sleep(Duration::from_millis(50));
@@ -401,6 +403,16 @@ fn wait_socket_up(path: &std::path::Path, budget: Duration) -> Result<(), AppErr
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_stop_timeout_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(super::wait_socket_gone(&path, Duration::ZERO).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::wait_socket_gone(&path, Duration::ZERO).is_ok());
+    }
     use std::time::Duration;
 
     use serde_json::json;

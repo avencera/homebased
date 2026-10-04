@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use ractor::ActorRef;
 use serde_json::Value;
 use tokio::task::JoinSet;
@@ -97,13 +98,12 @@ async fn schedule(
         }
         active.insert(key);
         let state = state.clone();
-        workers.spawn(async move {
-            let result = match route {
+        workers.spawn(delivery_worker(key, async move {
+            match route {
                 Some(route) => deliver_origin(&state, route, event).await,
                 None => deliver_authority(&state, event).await,
-            };
-            (key, result)
-        });
+            }
+        }));
     }
     Ok(())
 }
@@ -287,4 +287,34 @@ async fn notice_current(state: &AppState, route: &JobRoute, seq: u64) -> Result<
         .ok_or_else(|| AppError::Internal {
             message: "notice eligibility response has no boolean current field".into(),
         })
+}
+
+async fn delivery_worker(
+    key: Key,
+    delivery: impl std::future::Future<Output = Result<(), AppError>>,
+) -> (Key, Result<(), AppError>) {
+    let result = std::panic::AssertUnwindSafe(delivery)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppError::Internal {
+                message: "job delivery worker panicked".into(),
+            })
+        });
+    (key, result)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn panicked_job_worker_returns_its_key_for_retry() {
+        let key = (super::Stage::Origin, crate::queue::JobId::new());
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(super::delivery_worker(key, async {
+            panic!("delivery panic")
+        }));
+        let (returned, result) = workers.join_next().await.unwrap().unwrap();
+        assert_eq!(returned, key);
+        assert!(result.is_err());
+    }
 }

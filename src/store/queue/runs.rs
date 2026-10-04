@@ -116,7 +116,15 @@ impl Store {
             .ok_or_else(|| QueueError::Corrupt {
                 message: format!("job {job} has no step {next_step}"),
             })?;
-        let run_number = RunNumber::new(record.runs + 1)?;
+        let run_number =
+            RunNumber::new(
+                record
+                    .runs
+                    .checked_add(1)
+                    .ok_or_else(|| QueueError::Invariant {
+                        message: format!("job {job} reached the run count limit"),
+                    })?,
+            )?;
 
         let row = new_queued_task(NewTask {
             id: task,
@@ -343,7 +351,11 @@ impl Store {
             let RunPhase::Cleaning { attempt } = run.phase else {
                 return Err(stale(resource, "the run is not cleaning"));
             };
-            let next = attempt + 1;
+            let next = attempt
+                .checked_add(1)
+                .ok_or_else(|| QueueError::Invariant {
+                    message: format!("task {task} reached the cleanup attempt limit"),
+                })?;
             run.phase = RunPhase::Cleaning { attempt: next };
             self.write_run(&run)?;
             Ok(next)

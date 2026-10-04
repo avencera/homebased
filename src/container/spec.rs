@@ -900,7 +900,9 @@ pub fn check_container_host(workload: &ContainerWorkload) -> Result<(), AppError
 #[must_use]
 pub fn container_workload_schema() -> Value {
     let hex = "[0-9a-f]{64}";
-    let component = "[a-z0-9]+([._-]+[a-z0-9]+)*";
+    let component = "[a-z0-9]+((\\.|__?|-+)[a-z0-9]+)*";
+    let label = "[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?";
+    let registry = format!("(({label}\\.)+{label}(:[0-9]+)?|{label}:[0-9]+|localhost)");
     json!({
         "title": "container",
         "description": "Docker container that Homebased starts, watches, stops, and removes. No shell and no Docker options beyond these fields.",
@@ -909,7 +911,7 @@ pub fn container_workload_schema() -> Value {
             "type": { "const": "container" },
             "image": {
                 "type": "string",
-                "pattern": format!("^(sha256:{hex}|([a-zA-Z0-9.-]+(:[0-9]+)?/)?{component}(/{component})*@sha256:{hex})$"),
+                "pattern": format!("^(sha256:{hex}|({registry}/)?{component}(/{component})*@sha256:{hex})$"),
                 "description": "Image pinned by digest: sha256:<64 hex> image ID or name@sha256:<64 hex>. A tag is refused. The image must already be present on the machine."
             },
             "entrypoint": {
@@ -980,6 +982,31 @@ pub fn container_workload_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_image_schema_matches_repository_separators() {
+        let schema = super::container_workload_schema()["properties"]["image"].clone();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for name in [
+            "a..b",
+            "a._b",
+            "a___b",
+            "a.-b",
+            "a__b",
+            "a-b",
+            "a---b",
+            "a.b",
+            "ghcr.io/org/a__b",
+            "a..b/org/img",
+        ] {
+            let image = format!("{name}@{DIGEST}");
+            assert_eq!(
+                validator.is_valid(&json!(image)),
+                super::ImageReference::parse(&image).is_ok(),
+                "{image}"
+            );
+        }
+    }
     use serde_json::{Value, json};
 
     use super::{

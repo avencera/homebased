@@ -96,11 +96,11 @@ pub(super) fn start_turn(
     before_send: Option<&crate::callback::send_check::SendCheck>,
 ) -> Result<(), ApiFailure> {
     let snapshot = fetch_snapshot(origin, thread_id, token)?;
-    if snapshot.archived {
-        unarchive(origin, thread_id, text, token)?;
-    }
     if snapshot.deleted {
         return Err(ApiFailure::Refused("T3 thread is deleted".into()));
+    }
+    if snapshot.archived {
+        unarchive(origin, thread_id, text, token)?;
     }
 
     dispatch_turn(

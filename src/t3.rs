@@ -1264,6 +1264,29 @@ mod tests {
     }
 
     #[test]
+    fn bugfix_deleted_archived_thread_is_not_unarchived() {
+        if !curl_available() {
+            return;
+        }
+        let mut deleted = snapshot(T3_THREAD_ID);
+        deleted["thread"]["archivedAt"] = json!("2026-09-26T17:00:00Z");
+        deleted["thread"]["deletedAt"] = json!("2026-09-26T17:00:00Z");
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &deleted),
+                FakeResponse::http(200, &json!({ "sequence": 11 })),
+            ],
+        );
+        let fixture = Fixture::new(Some(&server), true, live_pid());
+        assert!(matches!(
+            wake_thread(&fixture.env, claude_thread(), "message"),
+            WakeOutcome::Refused(_)
+        ));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
     fn wake_unarchives_an_archived_thread_before_its_turn() {
         if !curl_available() {
             return;

@@ -115,7 +115,7 @@ The receiver delivers the line in one of three ways:
   thread, so T3 shows it. If T3 cannot take it, or no T3 thread owns the Codex
   thread, it goes through `codex queue`.
 
-An archived T3 thread is unarchived before the turn. If T3 may have taken the
+A deleted T3 thread is refused without a change. An archived T3 thread is unarchived before the turn. Before a T3 send, Homebased saves the retry route. If it cannot save that route, the send fails without sending the message. If T3 may have taken the
 message but its reply was lost, the send fails with `message_delivery_failed`,
 and a retry with the same `--message-id` goes only through T3, which drops the
 repeat. With T3 unreachable, that retry keeps failing instead of sending a

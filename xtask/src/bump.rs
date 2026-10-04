@@ -74,17 +74,49 @@ impl Version {
 
 pub(crate) fn run(part: Part) -> Result<()> {
     let root = crate::workspace_root()?;
+    let (current, next) = bump_at(&root, part, refresh_lockfile)?;
+    println!("Bumped homebased {current} -> {next}");
+    Ok(())
+}
+
+fn bump_at(
+    root: &Path,
+    part: Part,
+    refresh: impl FnOnce(&Path) -> Result<()>,
+) -> Result<(Version, Version)> {
     let cargo_toml = root.join("Cargo.toml");
     let contents = fs::read_to_string(&cargo_toml)
         .wrap_err_with(|| format!("failed to read {}", cargo_toml.display()))?;
     let current = package_version_from_toml(&contents)?;
     let next = current.bump(part)?;
     let updated = set_package_version(&contents, next)?;
+    let lock_path = root.join("Cargo.lock");
+    let saved_lock = match fs::read(&lock_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).wrap_err("failed to read Cargo.lock before bump"),
+    };
     fs::write(&cargo_toml, updated)
         .wrap_err_with(|| format!("failed to write {}", cargo_toml.display()))?;
-    refresh_lockfile(&root)?;
-    println!("Bumped homebased {current} -> {next}");
-    Ok(())
+    if let Err(error) = refresh(root) {
+        fs::write(&cargo_toml, contents)
+            .wrap_err_with(|| format!("bump failed ({error}); failed to restore Cargo.toml"))?;
+        match saved_lock {
+            Some(bytes) => fs::write(&lock_path, bytes)
+                .wrap_err_with(|| format!("bump failed ({error}); failed to restore Cargo.lock"))?,
+            None => match fs::remove_file(&lock_path) {
+                Ok(()) => {}
+                Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove_error) => {
+                    return Err(remove_error).wrap_err_with(|| {
+                        format!("bump failed ({error}); failed to remove new Cargo.lock")
+                    });
+                }
+            },
+        }
+        return Err(error);
+    }
+    Ok((current, next))
 }
 
 pub(crate) fn package_version(root: &Path) -> Result<Version> {
@@ -154,6 +186,25 @@ fn checked_inc(value: u64, name: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bugfix_failed_lock_refresh_restores_both_files() {
+        let root = std::env::temp_dir().join(format!("homebased-bump-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = "[package]\nname = \"homebased\"\nversion = \"1.2.3\"\n";
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "original lock").unwrap();
+        let result = super::bump_at(&root, super::Part::Patch, |root| {
+            std::fs::write(root.join("Cargo.lock"), "partial lock")?;
+            Err(color_eyre::eyre::eyre!("simulated cargo failure"))
+        });
+        let actual_manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let actual_lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err());
+        assert_eq!(actual_manifest, manifest);
+        assert_eq!(actual_lock, "original lock");
+    }
+
     use super::{Part, Version, set_package_version};
 
     fn v(s: &str) -> Version {

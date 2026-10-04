@@ -21,7 +21,10 @@ impl HostPolicy {
     /// Whether the `Host` header value is accepted for this bind
     #[must_use]
     pub fn allows(&self, host_header: &str) -> bool {
-        let host = strip_port(host_header.trim()).trim_end_matches('.');
+        let Some(host) = strip_port(host_header.trim()) else {
+            return false;
+        };
+        let host = host.trim_end_matches('.');
         if host.is_empty() {
             return false;
         }
@@ -57,13 +60,19 @@ pub async fn host_guard(policy: HostPolicy, request: Request, next: Next) -> Res
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
 }
 
-fn strip_port(host: &str) -> &str {
+fn strip_port(host: &str) -> Option<&str> {
     if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+        let (address, suffix) = rest.split_once(']')?;
+        address.parse::<std::net::Ipv6Addr>().ok()?;
+        if !suffix.is_empty() {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        return Some(address);
     }
-    host.rsplit_once(':')
-        .and_then(|(name, port)| port.parse::<u16>().ok().map(|_| name))
-        .unwrap_or(host)
+    match host.rsplit_once(':') {
+        Some((name, port)) => port.parse::<u16>().ok().map(|_| name),
+        None => Some(host),
+    }
 }
 
 fn is_local_ip(ip: IpAddr) -> bool {
@@ -124,6 +133,23 @@ fn is_dns_labels(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_bracketed_hosts_require_a_valid_suffix() {
+        let p = policy("127.0.0.1:7677");
+        for raw in [
+            "[::1]garbage",
+            "[::1",
+            "[::1]:",
+            "[::1]:65536",
+            "[::1]:80:90",
+            "[localhost]",
+        ] {
+            assert!(!p.allows(raw), "{raw}");
+        }
+        assert!(p.allows("[::1]"));
+        assert!(p.allows("[::1]:65535"));
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{HostPolicy, is_tailscale_ip};

@@ -306,19 +306,7 @@ impl Daemon {
     }
 
     fn http_ready(&self) -> bool {
-        let Ok(mut stream) = TcpStream::connect(&self.address) else {
-            return false;
-        };
-        use std::io::{Read, Write};
-        let request = format!(
-            "GET /v1/status HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.address
-        );
-        if stream.write_all(request.as_bytes()).is_err() {
-            return false;
-        }
-        let mut response = String::new();
-        stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+        http_ready_at(&self.address)
     }
 
     fn cli(&self, args: &[&str]) -> Output {
@@ -1019,4 +1007,87 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
         .filter(|call| call.contains("HOMEBASED_MESSAGE"))
         .count();
     assert_eq!(messages, 1);
+}
+
+fn http_ready_at(address: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(address) = address.parse() else {
+        return false;
+    };
+    let timeout = Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + timeout;
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() || stream.set_write_timeout(Some(remaining)).is_err() {
+        return false;
+    }
+    let request =
+        format!("GET /v1/status HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status = Vec::new();
+    while status.len() < 1024 && !status.contains(&b'\n') {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return false;
+        }
+        let mut chunk = [0; 128];
+        let Ok(count) = stream.read(&mut chunk) else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        status.extend_from_slice(&chunk[..count]);
+    }
+    status.starts_with(b"HTTP/1.1 200 ")
+}
+
+#[test]
+fn bugfix_readiness_does_not_wait_for_connection_close() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(connection.read(&mut request).unwrap() > 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    let start = std::time::Instant::now();
+    let ready = http_ready_at(&address);
+    let elapsed = start.elapsed();
+    server.join().unwrap();
+    assert!(ready);
+    assert!(elapsed < Duration::from_millis(400));
+}
+
+#[test]
+fn bugfix_readiness_deadline_bounds_a_slow_status_line() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(connection.read(&mut request).unwrap() > 0);
+        for _ in 0..20 {
+            if connection.write_all(b"H").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+    let started = std::time::Instant::now();
+    let ready = http_ready_at(&address);
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    assert!(!ready);
+    assert!(elapsed < Duration::from_millis(400));
 }

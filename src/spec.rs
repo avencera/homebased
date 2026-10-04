@@ -713,16 +713,11 @@ fn deserialize_under<T: for<'de> Deserialize<'de>>(
     prefix: &str,
 ) -> Result<T, AppError> {
     serde_path_to_error::deserialize(value).map_err(|err| {
-        let pointer = format!("{prefix}{}", json_pointer(err.path()));
-        let field_value = value
-            .pointer(&json_pointer(err.path()))
-            .cloned()
-            .unwrap_or(Value::Null);
-        AppError::InvalidSpec {
-            pointer,
-            value: field_value,
-            message: err.to_string(),
+        let mut error = invalid_spec_from_de(value, &err);
+        if let AppError::InvalidSpec { pointer, .. } = &mut error {
+            *pointer = format!("{prefix}{pointer}");
         }
+        error
     })
 }
 

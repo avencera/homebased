@@ -318,3 +318,18 @@ fn move_flags_name_one_placement() {
         assert_eq!(Placement::from_flags(given), Err(expected), "{given:?}");
     }
 }
+
+#[test]
+fn bugfix_run_number_deserialization_rejects_zero() {
+    assert!(super::RunNumber::new(u32::MAX).unwrap().next().is_err());
+    assert_eq!(super::RunNumber::FIRST.next().unwrap().get(), 2);
+    assert!(serde_json::from_str::<super::RunNumber>("0").is_err());
+    assert_eq!(
+        serde_json::from_str::<super::RunNumber>("1").unwrap(),
+        super::RunNumber::FIRST
+    );
+    assert_eq!(
+        serde_json::to_string(&super::RunNumber::FIRST).unwrap(),
+        "1"
+    );
+}

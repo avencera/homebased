@@ -47,7 +47,11 @@ impl CfString {
         let raw = unsafe {
             CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), K_CF_STRING_ENCODING_UTF8)
         };
-        (!raw.is_null()).then_some(Self(raw))
+        Self::from_created(raw)
+    }
+
+    fn from_created(raw: CfStringRef) -> Option<Self> {
+        (!raw.is_null()).then(|| Self(raw))
     }
 }
 
@@ -92,5 +96,13 @@ impl Drop for SystemSleepAssertion {
         // a failed release leaves nothing to clean up, and process exit
         // releases it anyway
         unsafe { IOPMAssertionRelease(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bugfix_null_cfstring_is_not_released() {
+        assert!(super::CfString::from_created(std::ptr::null()).is_none());
     }
 }

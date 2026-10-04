@@ -707,9 +707,15 @@ impl StopCause {
 }
 
 /// Attempt count across a whole job, starting at 1
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RunNumber(u32);
+
+impl<'de> Deserialize<'de> for RunNumber {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl RunNumber {
     /// A job's first run
@@ -731,10 +737,14 @@ impl RunNumber {
         self.0
     }
 
-    /// The run after this one
-    #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// The run after this one, or an invariant error at the count limit
+    pub fn next(self) -> Result<Self, QueueError> {
+        self.0
+            .checked_add(1)
+            .ok_or_else(|| QueueError::Invariant {
+                message: "run number limit reached".into(),
+            })
+            .and_then(Self::new)
     }
 }
 

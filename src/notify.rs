@@ -233,7 +233,7 @@ fn read_token(path: &Path) -> Result<String, String> {
         return Err(token_file_too_large(&path));
     }
 
-    let file = fs::File::open(&path)
+    let file = open_token_file(&path)
         .map_err(|error| format!("could not read ntfy token file {}: {error}", path.display()))?;
     let mut token = String::new();
     file.take((TOKEN_FILE_LIMIT + 1) as u64)
@@ -255,6 +255,22 @@ fn read_token(path: &Path) -> Result<String, String> {
     }
 
     Ok(token)
+}
+
+fn open_token_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // the path can change after inspection; validate the opened descriptor too
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "token must be a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn token_file_too_large(path: &Path) -> String {
@@ -286,7 +302,37 @@ fn response_excerpt(body: &str, token: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_open_rejects_a_replacement_fifo_without_waiting() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("token");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let path = fifo.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _writer = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let started = std::time::Instant::now();
+        let result = super::open_token_file(&fifo);
+        let elapsed = started.elapsed();
+        release.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(150));
+    }
     use std::fs;
+    use std::time::Duration;
 
     use super::{
         Notice, NoticePriority, Notifier, NtfyConfig, NtfyTopic, TOKEN_FILE_LIMIT, read_token,

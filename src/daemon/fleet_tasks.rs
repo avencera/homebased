@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -210,8 +211,8 @@ async fn read_peers(
             "{CLUSTER_TASK_LIST_PATH}?{}api_version={API_VERSION}&destination_machine={machine}",
             filter.query_prefix()
         );
-        jobs.spawn(async move {
-            let result = read_peer::<ClusterTaskList>(&fleet, machine, &path)
+        jobs.spawn(peer_worker(index, async move {
+            read_peer::<ClusterTaskList>(&fleet, machine, &path)
                 .await
                 .and_then(|body| {
                     if body.machine == machine {
@@ -219,9 +220,8 @@ async fn read_peers(
                     } else {
                         Err("peer answered for another machine".to_owned())
                     }
-                });
-            (index, result)
-        });
+                })
+        }));
     }
 
     let mut results: Vec<Result<Vec<TaskSummary>, String>> = peers
@@ -235,6 +235,17 @@ async fn read_peers(
         }
     }
     peers.into_iter().zip(results).collect()
+}
+
+async fn peer_worker(
+    index: usize,
+    read: impl std::future::Future<Output = Result<Vec<TaskSummary>, String>>,
+) -> (usize, Result<Vec<TaskSummary>, String>) {
+    let result = std::panic::AssertUnwindSafe(read)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err("peer task read worker panicked".into()));
+    (index, result)
 }
 
 /// Merge per-machine records into one entry per task, newest first
@@ -269,6 +280,15 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn bugfix_peer_panic_names_the_worker_failure() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(super::peer_worker(7, async { panic!("peer read panic") }));
+        let (index, result) = workers.join_next().await.unwrap().unwrap();
+        assert_eq!(index, 7);
+        assert!(result.unwrap_err().contains("worker panicked"));
+    }
+
     use serde_json::json;
 
     use super::{ClusterTaskList, merge_records};

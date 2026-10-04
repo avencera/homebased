@@ -215,19 +215,26 @@ fn argmax() -> io::Result<usize> {
 ///
 /// The layout is `argc` as a native i32, the executable path, NUL padding,
 /// `argc` NUL-terminated arguments, then NUL-terminated environment entries
-/// up to an empty entry. An empty first argument is indistinguishable from the
-/// padding, which can shift one argument into the environment; a process
-/// would need an argument that is exactly a run marker entry for that to
-/// matter
+/// up to an empty entry. XNU aligns the path plus the stripped
+/// `executable_path=` prefix to the target process pointer size (8 bytes on
+/// supported macOS hosts), so padding must not consume an empty argument
 fn environment_block(buffer: &[u8]) -> Option<&[u8]> {
     let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
     let argc = usize::try_from(argc).ok()?;
     let mut rest = buffer.get(4..)?;
 
     let path_end = rest.iter().position(|byte| *byte == 0)?;
-    rest = &rest[path_end..];
-    let padding = rest.iter().take_while(|byte| **byte == 0).count();
-    rest = &rest[padding..];
+    // xnu strips this 16-byte prefix after aligning the saved path
+    let argument_start =
+        (path_end + 1 + "executable_path=".len()).next_multiple_of(8) - "executable_path=".len();
+    if rest
+        .get(path_end..argument_start)?
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return None;
+    }
+    rest = rest.get(argument_start..)?;
     for _ in 0..argc {
         let end = rest.iter().position(|byte| *byte == 0)?;
         rest = &rest[end + 1..];
@@ -264,22 +271,36 @@ mod tests {
     }
 
     #[test]
-    fn environment_follows_the_path_padding_and_arguments() {
-        let buffer = procargs(
-            2,
-            b"/usr/bin/tool\0\0\0\0tool\0--flag\0A=1\0B=2\0\0\0garbage",
+    fn empty_first_argument_does_not_hide_the_run_marker() {
+        // xnu aligns the path plus its stripped executable_path= prefix to 8 bytes
+        let path = b"/usr/bin/tool\0";
+        let mut body = path.to_vec();
+        body.resize(
+            (path.len() + "executable_path=".len()).next_multiple_of(8) - "executable_path=".len(),
+            0,
         );
+        body.extend_from_slice(b"\0--flag\0HOMEBASED_TASK_ID=run\0B=2\0\0");
+        let buffer = procargs(2, &body);
+        assert_eq!(
+            environment_block(&buffer),
+            Some(&b"HOMEBASED_TASK_ID=run\0B=2\0"[..])
+        );
+    }
+
+    #[test]
+    fn environment_follows_the_path_padding_and_arguments() {
+        let buffer = procargs(2, b"/usr/bin/tool\0\0\0tool\0--flag\0A=1\0B=2\0\0\0garbage");
         assert_eq!(environment_block(&buffer), Some(&b"A=1\0B=2\0"[..]));
     }
 
     #[test]
     fn missing_environment_is_empty_and_truncated_buffers_are_refused() {
         assert_eq!(
-            environment_block(&procargs(1, b"/bin/sleep\0\0sleep\0\0\0")),
+            environment_block(&procargs(1, b"/bin/sleep\0\0\0\0\0\0sleep\0\0\0")),
             Some(&b""[..])
         );
         assert_eq!(
-            environment_block(&procargs(1, b"/bin/sleep\0\0sleep\0")),
+            environment_block(&procargs(1, b"/bin/sleep\0\0\0\0\0\0sleep\0")),
             Some(&b""[..])
         );
         assert_eq!(environment_block(&procargs(3, b"/bin/x\0x\0y")), None);

@@ -2,7 +2,7 @@
 
 pub mod launchd;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub mod systemd;
 
 use std::path::{Path, PathBuf};

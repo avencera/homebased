@@ -92,7 +92,7 @@ mod tests {
         let path = PathBuf::from(raw);
         let token = encode_path(&path);
         assert_eq!(decode_path(&token).unwrap(), path);
-        assert!(!path_display(&path).contains('\u{FFFD}') || path_display(&path).contains('�'));
+        assert_eq!(path_display(&path), "/tmp/bad\u{FFFD}name");
     }
 
     #[test]
