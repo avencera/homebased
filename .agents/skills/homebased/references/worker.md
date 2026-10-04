@@ -2,6 +2,8 @@
 
 `HOMEBASED_TASK_ID` is set, so this session was started by `homebased` on behalf of an orchestrator in another Codex thread. `HOMEBASED_HOME` points at the state directory. Nobody is watching this session live, and nobody can answer a question mid-task.
 
+For a GPU queue run, `HOMEBASED_TASK_ID` identifies one attempt. Use [resource-queue.md](resource-queue.md) for run variables, checkpoints, and exit 75. Run tasks cannot be used in `after`.
+
 ## Do the work
 
 - Follow the prompt. Verify the work the way the prompt asks, or with the repository's normal checks if it says nothing.

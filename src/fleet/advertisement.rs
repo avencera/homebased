@@ -218,7 +218,7 @@ pub fn decode_advertisement(
 mod tests {
     use super::{AdvertisementError, ProbedMachine, decode_advertisement};
     use crate::domain::AgentKind;
-    use crate::fleet::protocol::{ClusterProtocolVersion, SUPPORTED_PROTOCOLS};
+    use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, SUPPORTED_PROTOCOLS};
     use serde_json::json;
 
     fn body(protocol: serde_json::Value, extra: serde_json::Value) -> Vec<u8> {
@@ -241,7 +241,10 @@ mod tests {
     #[test]
     fn compatible_probe_decodes_fully_and_drops_unknown_agents() {
         let probed = decode_advertisement(
-            &body(json!({"min":2,"max":2}), json!({})),
+            &body(
+                json!({"min": CLUSTER_PROTOCOL_VERSION, "max": CLUSTER_PROTOCOL_VERSION}),
+                json!({}),
+            ),
             SUPPORTED_PROTOCOLS,
         )
         .unwrap();
@@ -252,7 +255,7 @@ mod tests {
         else {
             panic!("expected compatible");
         };
-        assert_eq!(version, ClusterProtocolVersion(2));
+        assert_eq!(version, CLUSTER_PROTOCOL_VERSION);
         assert_eq!(advertisement.capabilities.agents, vec![AgentKind::Codex]);
         assert_eq!(advertisement.name.as_str(), "code");
     }
@@ -276,7 +279,10 @@ mod tests {
     #[test]
     fn rejects_other_api_version_and_garbage() {
         let err = decode_advertisement(
-            &body(json!({"min":2,"max":2}), json!({"api_version": 2})),
+            &body(
+                json!({"min": CLUSTER_PROTOCOL_VERSION, "max": CLUSTER_PROTOCOL_VERSION}),
+                json!({"api_version": 2}),
+            ),
             SUPPORTED_PROTOCOLS,
         )
         .unwrap_err();

@@ -1,4 +1,4 @@
-//! Durable direct-message attempts and success receipts.
+//! Durable direct-message attempts and success receipts
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -102,7 +102,7 @@ impl Store {
         Ok(binding)
     }
 
-    /// Read the saved request binding and committed receipt for one message UUID.
+    /// Read the saved request binding and committed receipt for one message UUID
     pub fn message_delivery(&self, id: MessageId) -> Result<MessageDelivery, AppError> {
         let attempt_json: Option<String> = self
             .conn
@@ -130,11 +130,7 @@ impl Store {
             }
             (Some(attempt), Some(receipt))
                 if attempt.request.message_id != id
-                    || receipt.message_id != id
-                    || receipt.api_version != crate::domain::API_VERSION
-                    || receipt.protocol_version != attempt.request.protocol_version
-                    || receipt.destination_thread != attempt.destination_thread
-                    || receipt.destination_cwd != attempt.destination_cwd =>
+                    || !receipt_matches_attempt(receipt, attempt) =>
             {
                 return Err(AppError::Internal {
                     message: "message receipt does not match its saved attempt".into(),
@@ -145,7 +141,7 @@ impl Store {
         Ok(MessageDelivery { attempt, receipt })
     }
 
-    /// Bind one message UUID to immutable request content and its resolved local destination.
+    /// Bind one message UUID to immutable request content and its resolved local destination
     pub fn bind_message_attempt(
         &mut self,
         attempt: &MessageAttempt,
@@ -194,7 +190,7 @@ impl Store {
         Ok(attempt.clone())
     }
 
-    /// Commit a success receipt after the saved attempt's queue command succeeds.
+    /// Commit a success receipt after the saved attempt's queue command succeeds
     pub fn commit_message_receipt(
         &mut self,
         receipt: &MessageReceipt,
@@ -215,12 +211,7 @@ impl Store {
             });
         };
         let attempt: MessageAttempt = decode(&attempt_json)?;
-        if receipt.message_id != attempt.request.message_id
-            || receipt.api_version != crate::domain::API_VERSION
-            || receipt.protocol_version != attempt.request.protocol_version
-            || receipt.destination_thread != attempt.destination_thread
-            || receipt.destination_cwd != attempt.destination_cwd
-        {
+        if !receipt_matches_attempt(receipt, &attempt) {
             return Err(AppError::Internal {
                 message: "message receipt does not match its saved attempt".into(),
             });
@@ -244,6 +235,14 @@ impl Store {
     }
 }
 
+fn receipt_matches_attempt(receipt: &MessageReceipt, attempt: &MessageAttempt) -> bool {
+    receipt.message_id == attempt.request.message_id
+        && receipt.api_version == crate::domain::API_VERSION
+        && receipt.protocol_version == attempt.request.protocol_version
+        && receipt.destination_thread == attempt.destination_thread
+        && receipt.destination_cwd == attempt.destination_cwd
+}
+
 fn validate_saved_binding(binding: &OutboundMessageBinding, id: MessageId) -> Result<(), AppError> {
     if binding.request().message_id != id || binding.validate().is_err() {
         return Err(AppError::Internal {
@@ -262,10 +261,14 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::*;
+    use super::Store;
     use crate::domain::{API_VERSION, ThreadId};
+    use crate::error::AppError;
     use crate::machine::MachineId;
-    use crate::message::{MessageRequest, MessageSource, MessageSourceSelector, MessageTarget};
+    use crate::message::{
+        MessageAttempt, MessageId, MessageReceipt, MessageRequest, MessageSendRequest,
+        MessageSource, MessageSourceSelector, MessageTarget, OutboundMessageBinding, Recipient,
+    };
 
     fn request() -> MessageSendRequest {
         let message_id = MessageId::new();
@@ -317,7 +320,7 @@ mod tests {
     #[test]
     fn outbound_route_stays_fixed_after_restart_and_name_rebinding() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let request = request();
         let recipient = requested_recipient(&request);
         let original_machine = MachineId::new();
@@ -349,7 +352,7 @@ mod tests {
     #[test]
     fn changed_request_conflicts_before_destination_binding() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let mut store = Store::open(&path).unwrap();
         let request = request();
         store.begin_outbound_message(&request).unwrap();
@@ -365,7 +368,7 @@ mod tests {
     #[test]
     fn protocol_retry_updates_attempt_and_returns_the_current_receipt_version() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         let mut store = Store::open(&path).unwrap();
         let request = receiver_request(1);
         let attempt = MessageAttempt {
@@ -421,7 +424,7 @@ mod tests {
     #[test]
     fn concurrent_first_sends_with_one_uuid_converge_on_one_route() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("homebased.sqlite");
+        let path = directory.path().join(crate::home::DB_NAME);
         drop(Store::open(&path).unwrap());
         let request = request();
         let recipient = requested_recipient(&request);

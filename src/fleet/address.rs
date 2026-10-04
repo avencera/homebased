@@ -155,10 +155,22 @@ impl FromStr for MachineAddress {
             });
         }
         let host = parse_host(authority.host()).ok_or_else(|| malformed("invalid host".into()))?;
-        Ok(Self {
-            host,
-            port: authority.port_u16().unwrap_or(DEFAULT_PORT),
-        })
+        let suffix = authority
+            .as_str()
+            .strip_prefix(authority.host())
+            .ok_or_else(|| malformed("invalid authority".into()))?;
+        let port = if suffix.is_empty() {
+            DEFAULT_PORT
+        } else {
+            let raw_port = suffix
+                .strip_prefix(':')
+                .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or_else(|| malformed("invalid port".into()))?;
+            raw_port
+                .parse::<u16>()
+                .map_err(|_| malformed("invalid port".into()))?
+        };
+        Ok(Self { host, port })
     }
 }
 
@@ -244,6 +256,20 @@ impl From<AddressSource> for AddressPreference {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_explicit_invalid_ports_are_not_defaulted() {
+        for raw in [
+            "http://main:65536",
+            "http://[::1]:65536",
+            "http://main:999999",
+            "http://main:",
+        ] {
+            assert!(raw.parse::<MachineAddress>().is_err(), "{raw}");
+        }
+        assert_eq!(addr("http://main:65535").port(), 65535);
+        assert_eq!(addr("http://main").port(), 7677);
+    }
     use super::*;
 
     fn addr(raw: &str) -> MachineAddress {

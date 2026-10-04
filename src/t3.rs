@@ -55,6 +55,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Builder;
 
+use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::curl::{CurlMethod, CurlRequest, CurlResponse};
 use crate::domain::ThreadId;
 
@@ -257,42 +258,56 @@ pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<Option<Prot
 }
 
 /// Start a T3 turn for the thread that owns this provider session
-#[must_use]
-pub fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
+///
+/// `before_send` rechecks an unsent notice at the final dispatch boundary
+pub(crate) fn wake_thread_checked(
+    env: &T3Env,
+    provider_thread: ProviderThread,
+    text: &str,
+    before_send: Option<&SendCheck>,
+) -> Result<WakeOutcome, SendFailure> {
     let userdata = env.userdata();
     if !userdata.is_dir() {
-        return WakeOutcome::NotT3Thread;
+        return Ok(WakeOutcome::NotT3Thread);
     }
 
     let lookups = Store::lookups(&userdata, provider_thread);
     if lookups.iter().all(|(_, found)| matches!(found, Ok(None))) {
-        return WakeOutcome::NotT3Thread;
+        return Ok(WakeOutcome::NotT3Thread);
     }
     let server = match connect(&userdata) {
         Ok(server) => server,
-        Err(failure) => return failure.into_wake_outcome(),
+        Err(failure) => return Ok(failure.into_wake_outcome()),
     };
     let (store, t3_thread) = match Store::active(lookups, server.protocol) {
         Some((store, Ok(Some(t3_thread)))) => (store, t3_thread),
-        Some((_, Err(detail))) => return WakeOutcome::Unavailable(detail),
-        Some((_, Ok(None))) | None => return WakeOutcome::NotT3Thread,
+        Some((_, Err(detail))) => return Ok(WakeOutcome::Unavailable(detail)),
+        Some((_, Ok(None))) | None => return Ok(WakeOutcome::NotT3Thread),
     };
     let cli = match T3Cli::resolve(env, server.pid) {
         Ok(cli) => cli,
-        Err(detail) => return WakeOutcome::Unavailable(detail),
+        Err(detail) => return Ok(WakeOutcome::Unavailable(detail)),
     };
     let token = match cli.issue_token() {
         Ok(token) => token,
-        Err(IssueError::Unavailable(detail)) => return WakeOutcome::Unavailable(detail),
-        Err(IssueError::Changed(detail)) => return WakeOutcome::ApiChanged(detail),
+        Err(IssueError::Unavailable(detail)) => return Ok(WakeOutcome::Unavailable(detail)),
+        Err(IssueError::Changed(detail)) => return Ok(WakeOutcome::ApiChanged(detail)),
     };
     let started = match store {
-        Store::V1(_) => v1::start_turn(&server.origin, &t3_thread, text, &token.value),
-        Store::V2(path) => v2::start_turn(&server.origin, &path, &t3_thread, text, &token.value),
+        Store::V1(_) => v1::start_turn(&server.origin, &t3_thread, text, &token.value, before_send),
+        Store::V2(path) => v2::start_turn(
+            &server.origin,
+            &path,
+            &t3_thread,
+            text,
+            &token.value,
+            before_send,
+        ),
     };
     match started {
-        Ok(()) => WakeOutcome::Woken { t3_thread },
-        Err(failure) => failure.into_wake_outcome(),
+        Ok(()) => Ok(WakeOutcome::Woken { t3_thread }),
+        Err(ApiFailure::Delivery(failure)) => Err(failure),
+        Err(failure) => Ok(failure.into_wake_outcome()),
     }
 }
 
@@ -799,6 +814,7 @@ impl Drop for TokenRevoker {
 
 #[derive(Debug)]
 enum ApiFailure {
+    Delivery(SendFailure),
     Unavailable(String),
     Refused(String),
     /// Sent, but the reply was lost; see [`WakeOutcome::Uncertain`]
@@ -809,6 +825,7 @@ enum ApiFailure {
 impl ApiFailure {
     fn detail(&self) -> String {
         match self {
+            Self::Delivery(failure) => failure.to_string(),
             Self::Unavailable(detail)
             | Self::Refused(detail)
             | Self::Uncertain(detail)
@@ -818,6 +835,7 @@ impl ApiFailure {
 
     fn into_wake_outcome(self) -> WakeOutcome {
         match self {
+            Self::Delivery(failure) => WakeOutcome::Unavailable(failure.to_string()),
             Self::Unavailable(detail) => WakeOutcome::Unavailable(detail),
             Self::Refused(detail) => WakeOutcome::Refused(detail),
             Self::Uncertain(detail) => WakeOutcome::Uncertain(detail),
@@ -827,6 +845,7 @@ impl ApiFailure {
 
     fn probe_status(&self) -> ProbeStatus {
         match self {
+            Self::Delivery(_) => ProbeStatus::Unavailable,
             Self::Unavailable(_) | Self::Refused(_) | Self::Uncertain(_) => {
                 ProbeStatus::Unavailable
             }
@@ -912,8 +931,10 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
@@ -922,7 +943,17 @@ mod tests {
     use uuid::Uuid;
 
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
-    use super::*;
+    use super::{
+        ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, WakeOutcome, deterministic_id,
+        load_runtime, owner, probe, wake_thread_checked,
+    };
+    use crate::domain::ThreadId;
+
+    /// Start a T3 turn with no notice to recheck
+    fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
+        wake_thread_checked(env, provider_thread, text, None)
+            .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+    }
 
     const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
     const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
@@ -1230,6 +1261,29 @@ mod tests {
             WakeOutcome::Unavailable(_)
         ));
         assert!(fixture.revocations().is_empty());
+    }
+
+    #[test]
+    fn bugfix_deleted_archived_thread_is_not_unarchived() {
+        if !curl_available() {
+            return;
+        }
+        let mut deleted = snapshot(T3_THREAD_ID);
+        deleted["thread"]["archivedAt"] = json!("2026-09-26T17:00:00Z");
+        deleted["thread"]["deletedAt"] = json!("2026-09-26T17:00:00Z");
+        let server = FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &deleted),
+                FakeResponse::http(200, &json!({ "sequence": 11 })),
+            ],
+        );
+        let fixture = Fixture::new(Some(&server), true, live_pid());
+        assert!(matches!(
+            wake_thread(&fixture.env, claude_thread(), "message"),
+            WakeOutcome::Refused(_)
+        ));
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
@@ -1628,5 +1682,40 @@ mod tests {
         let first = deterministic_id("command", T3_THREAD_ID, "text");
         assert_eq!(first, deterministic_id("command", T3_THREAD_ID, "text"));
         assert_ne!(first, deterministic_id("message", T3_THREAD_ID, "text"));
+    }
+    #[test]
+    fn t3_notice_rechecks_eligibility_after_preparation() {
+        use crate::callback::send_check::{SendCheck, SendFailure};
+        if !curl_available() {
+            return;
+        }
+        let server = std::sync::Arc::new(FakeT3Server::start(
+            Some(1),
+            vec![
+                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
+                dispatch_ok(),
+            ],
+        ));
+        let fixture = Fixture::new(Some(&server), true, live_pid());
+        let prepared = server.clone();
+        let check: SendCheck = std::sync::Arc::new(move || {
+            let requests = prepared.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "eligibility must follow the T3 snapshot lookup"
+            );
+            assert_eq!(requests[0].method, "GET");
+            Err(SendFailure::Suppressed)
+        });
+        let outcome =
+            super::wake_thread_checked(&fixture.env, claude_thread(), "JOB_BLOCKED", Some(&check));
+        assert!(matches!(outcome, Err(SendFailure::Suppressed)));
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "the ended notice must not be dispatched"
+        );
+        assert_eq!(fixture.revocations(), ["fake-session"]);
     }
 }

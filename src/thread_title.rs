@@ -86,6 +86,7 @@ impl TitleSources {
                 .filter(|value| !value.is_empty())
                 .map_or_else(|| home.join(fallback), PathBuf::from)
         };
+
         Some(Self {
             t3_userdata: home.join(".t3/userdata"),
             codex_home: env_dir("CODEX_HOME", ".codex"),
@@ -112,6 +113,7 @@ impl TitleSources {
         let codex = latest_codex_state(&self.codex_home)
             .as_deref()
             .and_then(open_read_only);
+
         threads
             .iter()
             .map(|thread| {
@@ -142,10 +144,12 @@ fn open_read_only(path: &Path) -> Option<Connection> {
     if !path.is_file() {
         return None;
     }
+
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(path, flags)
         .inspect_err(|error| debug!("open {}: {error}", path.display()))
         .ok()?;
+
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT).ok()?;
     Some(connection)
 }
@@ -156,6 +160,7 @@ fn query_title(db: &Connection, sql: &str, id: &str) -> Option<String> {
         .optional()
         .inspect_err(|error| debug!("thread title query failed: {error}"))
         .ok()?;
+
     non_empty(title.flatten()?)
 }
 
@@ -172,6 +177,7 @@ fn latest_codex_state(codex_home: &Path) -> Option<PathBuf> {
                 .strip_suffix(".sqlite")?
                 .parse::<u32>()
                 .ok()?;
+
             Some((version, entry.path()))
         })
         .max_by_key(|(version, _)| *version)
@@ -205,12 +211,14 @@ fn claude_title(claude_home: &Path, session: &str) -> Option<String> {
         if !line.contains("-title\"") {
             continue;
         }
+
         match serde_json::from_str(&line) {
             Ok(ClaudeTitleLine::CustomTitle { custom_title }) => custom = Some(custom_title),
             Ok(ClaudeTitleLine::AiTitle { ai_title }) => generated = Some(ai_title),
             Err(_) => {}
         }
     }
+
     custom
         .and_then(non_empty)
         .or_else(|| generated.and_then(non_empty))
@@ -239,7 +247,8 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use super::*;
+    use super::TitleSources;
+    use crate::domain::ThreadId;
     use crate::t3::test_support::V2State;
 
     const CODEX_THREAD: &str = "01a0d118-ad25-7f62-9f45-e3548a3fd998";
@@ -273,6 +282,7 @@ mod tests {
                  CREATE TABLE provider_session_runtime (thread_id TEXT PRIMARY KEY, resume_cursor_json TEXT, last_seen_at TEXT NOT NULL);",
             )
             .unwrap();
+
             for (t3_thread, cursor, title) in rows {
                 db.execute(
                     "INSERT INTO projection_threads (thread_id, title) VALUES (?1, ?2)",

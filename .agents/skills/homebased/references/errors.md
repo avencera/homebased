@@ -26,13 +26,13 @@ Errors go to stderr. With `--json` they are one object:
 | `daemon_unavailable` | 1, retryable | Socket missing or refused. | `homebased --json daemon status`. If `socket` is `down`, read setup.md and start or restart the daemon. Tasks already running keep running and still report. |
 | `config_invalid` | 2 | An explicitly selected config file is missing, unreadable, or invalid TOML. | Fix the reported path or setting. Run `homebased --json config validate`. |
 | `invalid_spec` | 2 | Bad JSON, unknown field, wrong `api_version`, bad UUID, both or neither of `prompt`/`prompt_file`, timeout below 30m, empty command, cross-variant fields, unreadable `prompt_file`, blank prompt text, or a container mount `source` that is missing or exposes a container daemon socket on the machine that runs the task (`input.pointer` is `/workload/mounts/<n>/source`, or `/workload/mounts` when a remote machine refused it). | Fix the field at `input.pointer`. `homebased task schema` prints the schema. |
-| `unknown_thread` | 2 | The spec `thread` names no Claude Code session (registry file or transcript) and no Codex thread (session file) on the submitting machine. Checked by `task submit` (also with `--dry-run`), `resource request submit`, and `resource background submit` before any work starts. | Use the exact id from submit.md step 1. `input.suggestions` lists known ids that differ by a likely typo, best first; the message names the best one. A Homebased task id is not a thread. A worker on a remote executor cannot send events to its parent's thread. |
+| `unknown_thread` | 2 | The spec `thread` names no Claude Code session (registry file or transcript) and no Codex thread (session file) on the submitting machine. Checked by `task submit`, also with `--dry-run`, before any work starts. | Use the exact id from submit.md step 1. `input.suggestions` lists known ids that differ by a likely typo, best first; the message names the best one. A Homebased task id is not a thread. A worker on a remote executor cannot send events to its parent's thread. |
 | `thread_mismatch` | 2 | `HOMEBASED_TASK_ID` is set and the spec `thread` differs from the parent task's thread. `input.parent_task` and `input.parent_thread` name the parent. | Use `input.parent_thread`. Pass `--allow-other-thread` on submit or followup only when the events must go to another session; that thread must still exist. |
 | `agent_configuration` | 1 | OpenCode inherited inline configuration is malformed, has the wrong shape, or already defines the generated task agent. | Fix `OPENCODE_CONFIG_CONTENT` without putting credentials in the task spec or logs, then submit again. |
-| `invalid_cwd` | 2 | `cwd` is not an existing, accessible host directory on the machine that runs the task. `input.problem` is `not_found`, `not_directory`, or `inaccessible`; `input.value` is the `cwd`. Checked at submit, including `--dry-run`, `resource request submit`, and `resource background submit`; a remote executor or resource authority checks its own file system and refuses at acceptance. | `cwd` is a host path, never a path inside a container. When it names a container mount target, `input.suggested_cwd` is the matching host path under that mount's `source`; use it, and set `workload.workdir` for the directory inside the container. |
+| `invalid_cwd` | 2 | `cwd` is not an existing, accessible host directory on the machine that runs the task. `input.problem` is `not_found`, `not_directory`, or `inaccessible`; `input.value` is the `cwd`. Checked at submit, including `--dry-run`; a remote executor checks its own file system and refuses at acceptance. | `cwd` is a host path, never a path inside a container. When it names a container mount target, `input.suggested_cwd` is the matching host path under that mount's `source`; use it, and set `workload.workdir` for the directory inside the container. |
 | `executable_missing` | 3 | Requested program missing, not a file, or not executable. Agents also check `HOMEBASED_<AGENT>` overrides. | Submit from a shell where the program is on `PATH`, use an absolute path, or export `HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, or `HOMEBASED_GROK`. |
 | `unknown_dependency` | 3 | An `after` entry names no task submitted through this daemon. `input.task` names it. Checked by `task submit`, also with `--dry-run`. | Use the id of a task submitted from this machine. A task submitted through another machine cannot be a dependency here. |
-| `dependency_failed` | 5 | An `after` entry already ended without success, so the task could never start. `input.task` and `input.outcome` name it. `input.outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown`; `unknown` means the task ended but no record says how, as for a task that finished before an update and whose terminal event was pruned. | Handle that task's result first, then submit without it or after its replacement. |
+| `dependency_failed` | 5 | An `after` entry already ended without success, so the task could never start. `input.task` and `input.outcome` name it. `input.outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown`; `unknown` means the task ended but no record here says how. | Handle that task's result first, then submit without it or after its replacement. |
 | `task_not_found` | 3 | No task with that full UUID exists in the checked scope. | Check the UUID and known Fleet inventory. `task list` shows local tasks only. |
 | `cluster_lookup_incomplete` | 1, retryable | A known Fleet machine could not give a definitive task lookup result. | Retry `task show`, `task log`, or `task cancel` after that peer is reachable. `input.unchecked` lists UUIDs that were not checked. This is not proof that the task is absent. |
 | `task_unavailable` | 1, retryable | Homebased knows the execution machine, but cannot return its task detail or log. | Restore the executor connection and retry. `task show` can return cached origin state when it has a route. |
@@ -55,6 +55,7 @@ Errors go to stderr. With `--json` they are one object:
 | `duplicate_machine_name` | 5 | More than one live machine has the selected name. | Give each machine a unique `fleet.machine_name`; validate config and rediscover. |
 | `cluster_protocol_incompatible` | 5 | The peer and local daemon do not share a supported Fleet protocol version. | Update the incompatible Homebased installation. |
 | `submission_outcome_unknown` | 1, retryable | The executor may have accepted the request, but the origin has no definitive reply. | Retry the same spec with the same `--request-id`. Do not create a new request UUID for the same intended task. The error input includes `request_id` and `task_id`. |
+| `schema_too_new` | 1 | The database was written by a newer Homebased build. `input.found` and `input.supported` name both schema versions. | Update this installation to the newer build. Do not edit or delete the database. |
 | `daemon_busy` | 1 | A daemon call timed out, usually because the disk is slow. The operation may still complete. | Check the current state, for example with `task show` or `task list`, before you repeat a change. A local submit retries this by itself. If it keeps happening, tell the user that the daemon or its disk needs attention. |
 | `submission_rejected` | 5 | The executor retained a definitive rejection for this task identity. | Fix the cause and submit again with a new request UUID. |
 | `submission_conflict` | 5 | The request UUID was already used with different task content or a different `after` list. | Retry with the original content, or use a new UUID for new work. |
@@ -68,7 +69,7 @@ This happens after a raw `systemctl stop`, a crash, or an upgrade in progress. W
 
 ## Callback failed
 
-For a legacy task row, `callback: "failed"` means its terminal `codex queue` delivery failed; the message text is appended to `<home>/callback-fallback.log`. New sequenced events keep a result for each callback. `task show` lists failed event sequences in `failed_events`; callback delivery failure does not change process status. The origin machine uses the saved callback directory, environment, and resolved Codex path. See [events.md](events.md) for retry limits and origin/executor roles.
+`callback: "failed"` means delivery of the terminal event failed; the message text is appended to `<home>/callback-fallback.log`. Every sequenced event keeps its own delivery result. `task show` lists failed event sequences in `failed_events`; callback delivery failure does not change process status. The origin machine uses the saved callback directory, environment, and resolved Codex path. See [events.md](events.md) for retry limits and origin/executor roles.
 
 ### Claude Code session events missing
 
@@ -85,3 +86,21 @@ Claude Code delivery uses an internal Claude Code socket protocol, not a public 
 | `message_receiver_unavailable` | 1, retryable | The receiver could not inspect local Codex session metadata. | Check the receiver's session files and retry. |
 | `message_invalid` | 2 | A message, UUID, or receiver-side `cwd` failed validation. | Fix the reported value. |
 | `message_to_self` | 2 | The selected destination is the source thread, or a `--worker` destination is the source task's own worker. A `--task` destination resolves to its origin thread, not its worker. | Choose a different source or destination. Use `--worker` for a running Claude worker, or `homebased task followup` to resume a finished Codex worker. |
+
+## Queue errors
+
+| Code | Exit | Do this |
+| --- | --- | --- |
+| `invalid_queue_input` | 2 | Fix the full UUID, level, resource name, step count, or restart window. |
+| `move_refused` | 2 | Give one valid placement. Check target existence, state, and level. |
+| `job_not_found` | 3 | Check the full job UUID and authority machine. |
+| `resource_not_found` | 3 | Read resource list on the target machine. |
+| `attention_not_found` | 3 | Refresh resource list. Do not release a different Attention without another machine check. |
+| `job_terminal` | 5 | Read the result. Submit a new job only for new work. |
+| `job_conflict` | 5 | Restore the original spec for this job UUID. Use a new UUID for a different job. |
+| `operation_conflict` | 5 | Restore the original operation content. Use a new UUID for a new action. |
+| `resource_conflict` | 5 | Use the existing resource. Names and device indices must be unique. |
+| `stale_run` | 5 | Refresh job and resource state. Do not act on an old run. |
+| `internal` | 1 | Keep the error and state evidence. Ask the operator to check it. Do not edit the database. |
+
+See [resource-queue.md](resource-queue.md) for job and operation retry identities. A run task in `after` returns `usage` (exit 2). Wait for the job result and submit once its inputs are ready.

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tracing::warn;
 
+use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
 use crate::callback::{
     CodexWakeError, HomebasedEvent, OriginSession, PendingRetry, PendingT3Send, ReachableOrigin,
     append_fallback, check_saved_callback, find_saved_inbox_origin, retry_pending_t3,
@@ -18,7 +19,7 @@ use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
-use crate::home::{Home, TaskPaths};
+use crate::home::Home;
 use crate::notify::{Notice, NoticePriority, Notifier};
 use crate::submission::CallbackContext;
 use crate::thread_title::TitleSources;
@@ -180,7 +181,7 @@ fn wake_failure_notice(
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{event_kind:?}"));
-    let display_name = &event.display_name;
+    let display_name = &event.name;
     let message = match failure {
         WakeFailure::Waiting { reason } => format!(
             "{display_name} ({event_name}) is waiting on {machine_name}: {reason}. Open the thread to receive it."
@@ -382,6 +383,8 @@ async fn start_inbox_worker(myself: &ActorRef<CallbackMsg>, state: &mut Callback
 enum AttemptOutcome {
     /// Settle the event with this outcome
     Settle(DeliveryOutcome),
+    /// The blocked episode ended before any callback bytes were written
+    Suppressed,
     /// A claimed T3 wake failed, so the event waits and the thread may need a push
     WakeFailed(String),
     /// The T3 wake failed, but `codex queue` accepted the event
@@ -389,8 +392,9 @@ enum AttemptOutcome {
 }
 
 impl AttemptOutcome {
-    fn into_settlement(self) -> (DeliveryOutcome, Option<WakeFailure>) {
-        match self {
+    fn into_settlement(self) -> Option<(DeliveryOutcome, Option<WakeFailure>)> {
+        Some(match self {
+            Self::Suppressed => return None,
             Self::Settle(outcome) => (outcome, None),
             Self::WakeFailed(reason) => (
                 DeliveryOutcome::Deferred(reason.clone()),
@@ -400,6 +404,14 @@ impl AttemptOutcome {
                 DeliveryOutcome::Delivered,
                 Some(WakeFailure::CodexQueued { reason }),
             ),
+        })
+    }
+
+    fn from_send(sent: Result<(), SendFailure>) -> Self {
+        match sent {
+            Ok(()) => Self::Settle(DeliveryOutcome::Delivered),
+            Err(SendFailure::Suppressed) => Self::Suppressed,
+            Err(SendFailure::Failed(message)) => Self::Settle(DeliveryOutcome::Retryable(message)),
         }
     }
 }
@@ -464,12 +476,21 @@ pub(crate) async fn dispatch_inbox(
                 context: route.callback.clone(),
                 thread: route.thread,
                 line,
-                paths,
+                paths: CallbackPaths {
+                    callback_log: paths.callback_log,
+                    delivery_lock: paths.delivery_lock,
+                },
                 pending,
+                before_send: None,
             };
             attempt.run(&callback).await?
         };
-        let (outcome, failed_wake) = outcome.into_settlement();
+        let (outcome, failed_wake) =
+            outcome
+                .into_settlement()
+                .ok_or_else(|| AppError::Internal {
+                    message: "an ordinary task callback cannot be suppressed".into(),
+                })?;
         let settled = call(&store, |reply| StoreMsg::SettleInboxAttempt {
             id,
             seq,
@@ -529,16 +550,78 @@ pub(crate) async fn dispatch_inbox(
     }
 }
 
+/// Callback evidence independent of task or job identity
+struct CallbackPaths {
+    callback_log: PathBuf,
+    delivery_lock: PathBuf,
+}
+
+/// Deliver one job event through the same Claude, Codex, and T3 routing as task events
+///
+/// Returns `None` only when a blocked notice ended before the callback write
+pub(crate) async fn deliver_job_event(
+    home: &Home,
+    route: &crate::queue::delivery::JobRoute,
+    event: &crate::queue::JobEvent,
+    callback: &ActorRef<CallbackMsg>,
+    before_send: Option<SendCheck>,
+) -> Result<Option<DeliveryOutcome>, AppError> {
+    let dir = home
+        .root()
+        .join("jobs")
+        .join(route.job.to_string())
+        .join("delivery");
+    std::fs::create_dir_all(&dir)?;
+    let mut payload = serde_json::to_value(event)?;
+    payload["api_version"] = serde_json::json!(crate::domain::API_VERSION);
+    payload["thread"] = serde_json::json!(route.thread);
+    payload["name"] = serde_json::json!(route.spec.name);
+    payload["machine"] = serde_json::json!(route.authority);
+    // blocked and never-started jobs have no run; explicit nulls keep the envelope stable
+    payload["resource"] = serde_json::json!(event.run.map(|run| run.resource));
+    payload["task"] = serde_json::json!(event.run.map(|run| run.task));
+    payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
+    payload["step"] = serde_json::json!(event.run.map(|run| run.step));
+    let attempt = OriginAttempt {
+        context: route.callback.clone(),
+        thread: route.thread,
+        line: format!("HOMEBASED_EVENT {}", serde_json::to_string(&payload)?),
+        paths: CallbackPaths {
+            callback_log: dir.join("callback.log"),
+            delivery_lock: dir.join("delivery.lock"),
+        },
+        pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
+        before_send: before_send.filter(|_| event.event == crate::queue::JobEventKind::JobBlocked),
+    };
+    let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
+        return Ok(None);
+    };
+    if matches!(outcome, DeliveryOutcome::Delivered) {
+        let _ = callback.cast(CallbackMsg::Delivered {
+            thread: route.thread,
+        });
+    }
+    Ok(Some(outcome))
+}
+
 /// One reserved attempt on a saved origin route
 struct OriginAttempt {
     context: CallbackContext,
     thread: ThreadId,
     line: String,
-    paths: TaskPaths,
+    paths: CallbackPaths,
     pending: PendingT3Send,
+    before_send: Option<SendCheck>,
 }
 
 impl OriginAttempt {
+    fn gate(&self) -> SendGate<'_> {
+        SendGate {
+            path: &self.paths.delivery_lock,
+            check: self.before_send.as_ref(),
+        }
+    }
+
     async fn run(self, callback: &ActorRef<CallbackMsg>) -> Result<AttemptOutcome, AppError> {
         let (attempt, retry) = run_blocking("pending T3 retry", move || {
             let retry = retry_pending_t3(
@@ -547,10 +630,15 @@ impl OriginAttempt {
                 &self.line,
                 &self.paths.callback_log,
                 &self.pending,
+                self.gate(),
             );
             (self, retry)
         })
         .await?;
+        let retry = match retry {
+            Ok(retry) => retry,
+            Err(error) => return Ok(AttemptOutcome::from_send(Err(error))),
+        };
         match retry {
             Some(PendingRetry::Delivered) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
             Some(PendingRetry::Uncertain(reason)) => {
@@ -584,14 +672,11 @@ impl OriginAttempt {
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
-                &self.paths.delivery_lock,
+                self.gate(),
             )
         })
         .await?;
-        Ok(AttemptOutcome::Settle(match sent {
-            Ok(()) => DeliveryOutcome::Delivered,
-            Err(error) => DeliveryOutcome::Retryable(error),
-        }))
+        Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_t3_claude(self, origin: ReachableOrigin) -> Result<AttemptOutcome, AppError> {
@@ -602,15 +687,12 @@ impl OriginAttempt {
                 origin,
                 &self.line,
                 &self.paths.callback_log,
-                &self.paths.delivery_lock,
+                self.gate(),
                 &self.pending,
             )
         })
         .await?;
-        Ok(AttemptOutcome::Settle(match sent {
-            Ok(()) => DeliveryOutcome::Delivered,
-            Err(error) => DeliveryOutcome::Retryable(error),
-        }))
+        Ok(AttemptOutcome::from_send(sent))
     }
 
     async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
@@ -620,7 +702,7 @@ impl OriginAttempt {
                 self.thread,
                 &self.line,
                 &self.paths.callback_log,
-                &self.paths.delivery_lock,
+                self.gate(),
             )
         })
         .await?;
@@ -629,7 +711,7 @@ impl OriginAttempt {
                 Some(reason) => AttemptOutcome::DeliveredWakeFailed(reason),
                 None => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
             },
-            Err(error) => AttemptOutcome::Settle(DeliveryOutcome::Retryable(error)),
+            Err(error) => AttemptOutcome::from_send(Err(error)),
         })
     }
 
@@ -641,10 +723,15 @@ impl OriginAttempt {
                 &self.line,
                 &self.paths.callback_log,
                 &self.pending,
+                self.gate(),
             );
             (self, woken)
         })
         .await?;
+        let woken = match woken {
+            Ok(woken) => woken,
+            Err(error) => return Ok(AttemptOutcome::from_send(Err(error))),
+        };
         match woken {
             Ok(()) => Ok(AttemptOutcome::Settle(DeliveryOutcome::Delivered)),
             // `codex queue` could deliver a second copy of a turn T3 already started
@@ -670,12 +757,14 @@ impl OriginAttempt {
                 &self.line,
                 &self.paths.callback_log,
                 &self.pending,
+                self.gate(),
             )
         })
         .await?;
         Ok(match woken {
             Ok(()) => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
-            Err(reason) => AttemptOutcome::WakeFailed(reason),
+            Err(SendFailure::Suppressed) => AttemptOutcome::Suppressed,
+            Err(SendFailure::Failed(reason)) => AttemptOutcome::WakeFailed(reason),
         })
     }
 }
@@ -698,8 +787,9 @@ mod tests {
 
     #[test]
     fn codex_queue_fallback_settles_as_delivered_with_a_wake_failure() {
-        let result =
-            AttemptOutcome::DeliveredWakeFailed("T3 is unavailable".into()).into_settlement();
+        let result = AttemptOutcome::DeliveredWakeFailed("T3 is unavailable".into())
+            .into_settlement()
+            .unwrap();
 
         assert!(matches!(result.0, DeliveryOutcome::Delivered));
         assert!(matches!(

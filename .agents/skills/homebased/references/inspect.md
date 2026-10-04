@@ -10,9 +10,9 @@ homebased --json task list --status running,queued         # in flight
 homebased --quiet task list --status running               # bare ids, one per line
 ```
 
-Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
+Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
 
-Each entry: `id`, `name`, `display_name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `display_name`. `name` is omitted only for tasks stored before it was required.
+Each entry: `id`, `name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `name`.
 
 `task list` reads tasks stored on this machine. It does not query every Fleet peer. It includes tasks held here, also those that will run on another machine, and held tasks that ended before they started. Those entries also have `after`: one `{"task", "state"}` per dependency, where `state` is `pending`, or `ended` with an `outcome` of `succeeded`, `failed`, `blocked`, `cancelled`, `lost`, or `unknown`. `unknown` means the task ended but no record says how; it never counts as success.
 
@@ -24,14 +24,13 @@ homebased --json task show <id>
 
 | Field | Meaning |
 | --- | --- |
-| `name` | Submitted goal label. Omitted only for tasks stored before name was required. |
-| `display_name` | Non-empty label: the submitted name, or a workload fallback for unnamed stored rows. |
+| `name` | Submitted goal label. |
 | `status` | Process status, or `held`, see above. |
 | `after` | Present for a task submitted with `after`: each dependency and its `state`, as in the list. A held task waits for every `pending` entry. |
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
 | `worker_thread` | Worker thread UUID. A Claude worker's session id, recorded when it starts running; send it new instructions with `message send --worker`. A Codex worker's thread, recorded when the task ends, including lost tasks, if Homebased found a valid session id in the first 64 KiB of `output.log`. Omitted when unknown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
-| `callback` | Retained task-row callback state. For tasks with sequenced events, use `failed_events` for per-event callback failures. |
+| `callback` | Delivery of the terminal event to the submitting thread: `pending`, `sending`, `waiting`, `sent`, or `failed`. `null` when this machine delivers no callback for the task: on the executor of a task submitted from another machine (ask the origin), and on a queue run, which reports through its job. Use `failed_events` for per-event callback failures. |
 | `cancel_requested_at` | Set once `task cancel` ran. |
 | `reports` | Worker reports with `seq`, `outcome`, `summary`, `reported_at`, and `notified_at` when `--notify` succeeded. |
 | `evidence` | Task directory. |
@@ -64,11 +63,11 @@ homebased task log <id> --tail 100
 homebased --json task log <id>       # {"id", "log", "truncated"}
 ```
 
-The local daemon reads `output.log` on the execution machine. For a remote task, it gets the log from the executor over Fleet. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines; `truncated` is true when earlier lines were dropped. If the executor is offline or the log has been removed, the CLI returns `task_unavailable`. A task prevented before it started has no log and returns `task_not_started`.
+The local daemon reads `output.log` on the execution machine. For a remote task, it gets the log from the executor over Fleet. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines and reads at most 1 MiB of log bytes. A longer line can return only its end. `truncated` is true when earlier lines or bytes were dropped. If the executor is offline or the log has been removed, the CLI returns `task_unavailable`. A task prevented before it started has no log and returns `task_not_started`.
 
 ## Dashboard
 
-The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn. When a GPU runs or queues work, the task list shows its current task and queue at the side.
+The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn.
 
 ```bash
 homebased --json daemon status       # "web" holds the URL, or null when the dashboard is off or the socket is down
@@ -77,7 +76,9 @@ curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Submit and cancel are refused there with 405; they belong to the Unix socket. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit and cancel are refused there with 405; they belong to the Unix socket. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
+
+A queue run can be `preempted` while its job waits to resume. Use [resource-queue.md](resource-queue.md) to inspect the job and its run history. Run task IDs cannot be used in `after`.
 
 ## Task directory
 
@@ -95,7 +96,7 @@ The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `
 | `runner.lock` | Liveness lock. Held while the worker parent is alive. |
 | `worker.log` | Stderr of the worker parent. Explains a worker that stopped before `exit.json`, such as a `lost` task that never started its child. |
 
-`<home>` is `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebased`, else `~/.local/state/homebased`. The SQLite database is `<home>/homebased.sqlite` and is the source of truth; do not edit it.
+`<home>` is `--home`, else `HOMEBASED_HOME`, else `$XDG_STATE_HOME/homebased`, else `~/.local/state/homebased`. The SQLite database is `<home>/homebased_v1.sqlite` and is the source of truth; do not edit it.
 
 ## Cancel
 

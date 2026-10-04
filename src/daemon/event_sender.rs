@@ -1,11 +1,14 @@
 //! Ordered executor outbox delivery and recovery
 
+pub(crate) mod jobs;
+
 use crate::fleet::probe::VerifiedDestination;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use futures_util::FutureExt;
 use ractor::ActorRef;
 use serde::Deserialize;
 use tokio::task::JoinSet;
@@ -202,8 +205,22 @@ async fn schedule(
         }
         active.insert(task);
         let sender = sender.clone();
-        jobs.spawn(async move { (task, sender.deliver(task).await) });
+        jobs.spawn(delivery_worker(
+            task,
+            async move { sender.deliver(task).await },
+        ));
     }
+}
+
+async fn delivery_worker(
+    task: TaskId,
+    delivery: impl std::future::Future<Output = DeliveryResult>,
+) -> (TaskId, DeliveryResult) {
+    let outcome = std::panic::AssertUnwindSafe(delivery)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| DeliveryResult::Retry("delivery worker panicked".into()));
+    (task, outcome)
 }
 
 impl Sender {
@@ -227,10 +244,6 @@ impl Sender {
         let destination = if origin == self.local {
             None
         } else {
-            // the authority observes its own task row, so a remote callback outage
-            // cannot hide a confirmed start from the resource owner
-            self.supervisor
-                .cast(SupervisorMsg::RemoteOriginEvent { id: task })?;
             let FleetState::Enabled(fleet) = &self.fleet else {
                 return Ok(DeliveryResult::Retry(
                     "fleet is disabled for remote origin".into(),
@@ -244,13 +257,7 @@ impl Sender {
                     "local machine identity is duplicated".into(),
                 ));
             }
-            let verified = match fleet.connect(origin).await {
-                Ok(verified) => verified,
-                Err(_) => {
-                    fleet.discover_now().await;
-                    fleet.connect(origin).await?
-                }
-            };
+            let verified = fleet.connect_rediscovering(origin).await?;
             Some((fleet.clone(), verified))
         };
         let client = ClusterClient::default();
@@ -440,6 +447,18 @@ async fn classify_error(
 mod tests {
     use super::{MAX_BACKOFF, Retry, backoff};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn panicked_task_worker_returns_its_key_for_retry() {
+        let task = crate::domain::TaskId::new();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(super::delivery_worker(task, async {
+            panic!("delivery panic")
+        }));
+        let (returned, outcome) = workers.join_next().await.unwrap().unwrap();
+        assert_eq!(returned, task);
+        assert!(matches!(outcome, super::DeliveryResult::Retry(_)));
+    }
 
     #[test]
     fn retry_delay_is_bounded() {

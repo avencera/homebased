@@ -12,7 +12,6 @@ use uuid::Uuid;
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::resource::NoticeId;
 
 /// Maximum message body size in UTF-8 bytes
 pub const MESSAGE_BODY_MAX_BYTES: usize = 16 * 1024;
@@ -82,7 +81,7 @@ impl<'de> Deserialize<'de> for MessageId {
     }
 }
 
-/// Source identity for a message from a thread, task, or resource notice
+/// Source identity for a message from a thread or task
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageSource {
@@ -100,13 +99,6 @@ pub enum MessageSource {
         /// Source task UUID
         task: TaskId,
     },
-    /// Reply route for a durable resource notice
-    ResourceNotice {
-        /// Machine that owns the resource authority
-        machine: MachineId,
-        /// Stable identity of the notice
-        notice_id: NoticeId,
-    },
 }
 
 impl MessageSource {
@@ -114,9 +106,7 @@ impl MessageSource {
     #[must_use]
     pub const fn machine(&self) -> MachineId {
         match self {
-            Self::Thread { machine, .. }
-            | Self::Task { machine, .. }
-            | Self::ResourceNotice { machine, .. } => *machine,
+            Self::Thread { machine, .. } | Self::Task { machine, .. } => *machine,
         }
     }
 }
@@ -415,7 +405,7 @@ impl MessageRequest {
             destination_machine: self.destination_machine,
             source: self.source.clone(),
             recipient: self.recipient.clone(),
-            body: semantic_body(&self.source, &self.body),
+            body: self.body.clone(),
             reply_to: self.reply_to,
             conversation_id: self.conversation_id,
         }
@@ -464,21 +454,6 @@ impl MessageRequest {
     }
 }
 
-fn semantic_body(source: &MessageSource, body: &str) -> String {
-    if !matches!(source, MessageSource::ResourceNotice { .. }) {
-        return body.to_string();
-    }
-
-    // supervisor notices embed the wire version in their serialized backing body
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return body.to_string();
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.remove("protocol_version");
-    }
-    serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
-}
-
 fn validate_body(body: &str) -> Result<(), AppError> {
     if body.trim().is_empty() {
         return Err(AppError::MessageInvalid {
@@ -520,69 +495,6 @@ fn validate_cwd_selector(cwd: &std::path::Path) -> Result<(), AppError> {
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{MessageId, MessageRequest, MessageSource, Recipient};
-    use crate::domain::{API_VERSION, ThreadId};
-    use crate::machine::MachineId;
-    use crate::resource::NoticeId;
-    use uuid::Uuid;
-
-    #[test]
-    fn resource_notice_source_requires_a_non_nil_notice_identity() {
-        let notice_id = NoticeId::new();
-        let request = MessageRequest {
-            api_version: API_VERSION,
-            protocol_version: 1,
-            message_id: MessageId::new(),
-            destination_machine: MachineId::new(),
-            source: MessageSource::ResourceNotice {
-                machine: MachineId::new(),
-                notice_id,
-            },
-            recipient: Recipient::Thread {
-                thread: ThreadId(Uuid::now_v7()),
-            },
-            body: "Resource notice source validation".into(),
-            reply_to: None,
-            conversation_id: Uuid::now_v7(),
-        };
-        let mut wire = serde_json::to_value(&request).unwrap();
-        assert!(serde_json::from_value::<MessageRequest>(wire.clone()).is_ok());
-
-        wire["source"]["notice_id"] = serde_json::json!(Uuid::nil());
-        assert!(serde_json::from_value::<MessageRequest>(wire).is_err());
-    }
-
-    #[test]
-    fn semantic_identity_ignores_the_notice_wire_version_only() {
-        let mut request = MessageRequest {
-            api_version: API_VERSION,
-            protocol_version: 1,
-            message_id: MessageId::new(),
-            destination_machine: MachineId::new(),
-            source: MessageSource::ResourceNotice {
-                machine: MachineId::new(),
-                notice_id: NoticeId::new(),
-            },
-            recipient: Recipient::Thread {
-                thread: ThreadId(Uuid::now_v7()),
-            },
-            body: serde_json::json!({"protocol_version": 1, "reason": "review"}).to_string(),
-            reply_to: None,
-            conversation_id: Uuid::now_v7(),
-        };
-        let identity = request.identity();
-
-        request.protocol_version = 2;
-        request.body = serde_json::json!({"protocol_version": 2, "reason": "review"}).to_string();
-        assert_eq!(request.identity(), identity);
-
-        request.body = serde_json::json!({"protocol_version": 2, "reason": "changed"}).to_string();
-        assert_ne!(request.identity(), identity);
-    }
 }
 
 /// Durable binding between a message request and its resolved local destination

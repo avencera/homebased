@@ -12,11 +12,11 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Never run `codex queue` yourself, never write to a Claude Code messaging socket yourself, and never tell a worker to do either. Delivery belongs to `homebased`.
 - A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`. When a T3 Code thread owns the session or Codex thread, the daemon starts the turn through T3 instead, so the thread shows it; [messages.md](references/messages.md) has the exact rules.
 - Submit through the daemon on the machine that owns the Codex thread. To run the child elsewhere, enable Fleet and set `machine` in the JSON spec. The submitting machine remains the origin and sends callbacks to the original thread; the selected Fleet machine executes the child.
+- Send all GPU work through the resource queue. Read [resource-queue.md](references/resource-queue.md) for priority, checkpoints, job events, and cleanup.
 - Put task fields in the JSON spec and submit with `homebased task submit --spec <file|->`. Use `--request-id <uuid>` when a caller needs a stable retry identity.
 - Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
-- Event delivery is at-least-once. For new events, deduplicate by `(task, seq)`; for a legacy event without `seq`, use `(task, event)`.
-- For GPU resource work, read [resource-loans.md](references/resource-loans.md). Check the exact pending actions at start, after compaction, and before an independent background launch. A delivered notice is not completion, and a notice whose action is absent from a complete pending result is stale. An unavailable authority is not an empty action list.
+- Event delivery is at-least-once. Deduplicate by `(task, seq)`.
 - Use `homebased message send` for a direct message to a Claude Code session or Codex thread. Address a session by its id or by a task whose origin it is, never by its display name, which changes each time the session restarts. Read [messages.md](references/messages.md) for destination, source, and retry rules.
 - `message send --task` targets the task's origin thread, not its worker. Use `message send --worker <task>` to give a running Claude worker new instructions; it reads them at its next turn boundary. Use `homebased task followup` to resume a terminal Codex worker with new information. Run follow-up on the task's origin or execution machine. Only one follow-up can resume a thread at a time; wait for the active task's event after `resume_thread_busy`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
@@ -37,12 +37,12 @@ Pick the first row that matches, then read only that file.
 | --- | --- |
 | `HOMEBASED_TASK_ID` is set in this session's environment | [worker.md](references/worker.md). You are the worker, not the orchestrator. |
 | A message starting with `HOMEBASED_EVENT ` arrived | [events.md](references/events.md) |
+| GPU work, resource queues, job specs, priority, preemption, or Attention | [resource-queue.md](references/resource-queue.md) |
 | Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks | [inspect.md](references/inspect.md) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |
 | A command exited non-zero, `daemon_unavailable`, or the socket is down | [errors.md](references/errors.md) |
-| Supervising shared GPU work or a resource loan | [resource-loans.md](references/resource-loans.md) |
 | `homebased` is missing, the daemon is not installed, or the binary was rebuilt | [setup.md](references/setup.md) |
 
 ## Minimal flow

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, ReportView};
-use crate::domain::{ProcessStatus, TaskId};
+use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 
@@ -73,10 +73,12 @@ impl TaskEvent {
         let EventPayload::Callback { event, .. } = &self.payload else {
             return Ok(None);
         };
+
         let mut value = serde_json::to_value(event)?;
         let object = value.as_object_mut().ok_or_else(|| AppError::Internal {
             message: "callback payload is not an object".into(),
         })?;
+
         object.insert("seq".into(), serde_json::json!(self.seq.get()));
         object.insert(
             "origin_machine".into(),
@@ -86,6 +88,7 @@ impl TaskEvent {
             "execution_machine".into(),
             serde_json::json!(self.execution_machine),
         );
+
         Ok(Some(format!("HOMEBASED_EVENT {value}")))
     }
 }
@@ -140,8 +143,6 @@ pub struct OutboxEvent {
     pub event: TaskEvent,
     /// Transport acknowledgement state
     pub state: OutboxState,
-    /// Derived notification requirement, stored with the row
-    pub notification_required: bool,
 }
 
 /// How long an event may wait for its origin thread before delivery gives up
@@ -181,7 +182,6 @@ pub enum DeliveryState {
         /// Reserved command attempts
         attempts: u8,
         /// Last failed attempt before success, if any
-        #[serde(default)]
         last_error: Option<String>,
     },
     /// Queue delivery ended without success; the result remains visible
@@ -194,6 +194,20 @@ pub enum DeliveryState {
 }
 
 impl DeliveryState {
+    /// Callback status of a notifying event in this state, or `None` for a
+    /// state-only event, which has no callback
+    #[must_use]
+    pub fn callback_status(&self) -> Option<CallbackStatus> {
+        match self {
+            Self::NotRequired => None,
+            Self::PendingDelivery { attempts: 0, .. } => Some(CallbackStatus::Pending),
+            Self::PendingDelivery { .. } => Some(CallbackStatus::Sending),
+            Self::AwaitingThread { .. } => Some(CallbackStatus::Waiting),
+            Self::Delivered { .. } => Some(CallbackStatus::Sent),
+            Self::DeliveryFailed { .. } => Some(CallbackStatus::Failed),
+        }
+    }
+
     /// Whether the dispatcher still owns this event
     #[must_use]
     pub fn is_unsettled(&self) -> bool {
@@ -249,8 +263,6 @@ pub struct InboxEvent {
     pub event: TaskEvent,
     /// Per-event callback delivery result
     pub delivery: DeliveryState,
-    /// Derived notification requirement, stored with the row
-    pub notification_required: bool,
 }
 
 /// Result of origin sequence validation after the transaction commits
@@ -305,11 +317,14 @@ pub enum EventError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{num::NonZeroU64, path::PathBuf};
 
-    use super::*;
-    use crate::callback::{EventKind, NextAction, WorkloadView};
-    use crate::domain::ThreadId;
+    use chrono::Utc;
+
+    use super::{DeliveryState, EventPayload, TaskEvent};
+    use crate::callback::{EventKind, HomebasedEvent, NextAction, WorkloadView};
+    use crate::domain::{TaskId, ThreadId};
+    use crate::machine::MachineId;
 
     #[test]
     fn awaiting_thread_delivery_state_uses_its_durable_tag() {
@@ -334,8 +349,7 @@ mod tests {
             api_version: 1,
             event: EventKind::TaskReported,
             task,
-            name: None,
-            display_name: "event task".into(),
+            name: crate::domain::TaskName::parse("test task").unwrap(),
             workload: WorkloadView::Task {
                 command: vec!["echo".into(), "hello".into()],
             },

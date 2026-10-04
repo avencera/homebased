@@ -1,5 +1,6 @@
 //! Replace the installed binary from a GitHub release
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -198,28 +199,16 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), AppError> {
 }
 
 fn find_executable(dir: &Path) -> Result<PathBuf, AppError> {
-    let mut found = None;
-    let entries = std::fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = entry.metadata()?.permissions().mode();
-            if mode & 0o111 == 0 {
-                continue;
-            }
-        }
-        found = Some(path);
-        break;
+    let path = dir.join(CRATE_NAME);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Internal {
+        message: format!("archive did not contain an executable homebased binary: {error}"),
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::Internal {
+            message: "archive did not contain an executable homebased binary".into(),
+        });
     }
-    found.ok_or_else(|| AppError::Internal {
-        message: "archive did not contain an executable homebased binary".into(),
-    })
+    Ok(path)
 }
 
 /// Stage beside the destination, then atomically replace a running binary
@@ -328,6 +317,25 @@ pub const STATUS_WAIT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_archive_requires_the_named_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other-tool");
+        fs::write(&other, "wrong executable").unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(find_executable(dir.path()).is_err());
+        let binary = dir.path().join("homebased");
+        fs::write(&binary, "right executable").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_executable(dir.path()).unwrap(), binary);
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(find_executable(dir.path()).is_err());
+        fs::remove_file(&binary).unwrap();
+        std::os::unix::fs::symlink(&other, &binary).unwrap();
+        assert!(find_executable(dir.path()).is_err());
+    }
     use super::{
         DEFAULT_GIT, TempDir, UpdatePlan, UpdateRequest, asset_url, expand_dest, extract_archive,
         find_executable, home_dir, is_cargo_build_path, plan, replace_binary, tag_from_latest_url,

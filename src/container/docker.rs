@@ -20,13 +20,9 @@ use super::lifecycle::{
 };
 use super::spec::{ContainerUser, ContainerWorkload};
 use crate::domain::{ContainerId, TaskEnv, TaskId};
-use crate::resource::ResourceId;
 
 /// Label that names the Homebased task of a container
 pub const TASK_LABEL: &str = "homebased.task";
-
-/// Label that names the resource whose loan runs a container
-pub const RESOURCE_LABEL: &str = "homebased.resource";
 
 /// Longest wait for one Docker CLI call that does not block on the container
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -45,8 +41,6 @@ pub fn container_name(task: TaskId) -> String {
 pub struct CreateContext<'a> {
     /// Task that owns the container
     pub task: TaskId,
-    /// Resource whose loan runs the container, for resource work
-    pub resource: Option<ResourceId>,
     /// File where Docker writes the new container ID
     pub cidfile: &'a Path,
     /// User when the workload names none: the daemon's user
@@ -70,10 +64,6 @@ pub fn create_args(workload: &ContainerWorkload, context: &CreateContext<'_>) ->
         "--label".into(),
         format!("{TASK_LABEL}={}", context.task),
     ];
-    if let Some(resource) = context.resource {
-        args.push("--label".into());
-        args.push(format!("{RESOURCE_LABEL}={}", resource.as_uuid()));
-    }
     args.extend([
         "--init".into(),
         "--cidfile".into(),
@@ -147,6 +137,7 @@ impl DockerCli {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        crate::run_env::scrub(command.as_std_mut());
         command
             .env("PATH", &self.env.path)
             .env("HOME", &self.env.home)
@@ -398,6 +389,8 @@ struct InspectedState {
     status: String,
     #[serde(default)]
     exit_code: i32,
+    #[serde(default)]
+    finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +426,11 @@ impl InspectedContainer {
         Ok(ContainerObservation {
             id,
             status,
+            // Docker uses year 1 as its not-yet-finished sentinel
+            finished_at: self
+                .state
+                .finished_at
+                .filter(|time| time.timestamp() != -62_135_596_800),
             task_label,
         })
     }
@@ -462,14 +460,12 @@ mod tests {
     use crate::container::lifecycle::ContainerStatus;
     use crate::container::spec::{ContainerUser, ContainerWorkload};
     use crate::domain::TaskId;
-    use crate::resource::ResourceId;
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn create_argv_comes_only_from_the_typed_spec() {
         let task: TaskId = "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap();
-        let resource = ResourceId::new();
         let workload = ContainerWorkload::from_value(&json!({
             "image": format!("eval@{DIGEST}"),
             "entrypoint": ["/usr/bin/python3", "-m", "eval"],
@@ -488,7 +484,6 @@ mod tests {
             &workload,
             &CreateContext {
                 task,
-                resource: Some(resource),
                 cidfile: Path::new("/home/me/.homebased/tasks/t/container.cid"),
                 default_user: ContainerUser { uid: 501, gid: 20 },
             },
@@ -500,8 +495,6 @@ mod tests {
             "homebased-01a0ab97-a7aa-7463-a5b0-8d500e40e431",
             "--label",
             "homebased.task=01a0ab97-a7aa-7463-a5b0-8d500e40e431",
-            "--label",
-            &format!("homebased.resource={}", resource.as_uuid()),
             "--init",
             "--cidfile",
             "/home/me/.homebased/tasks/t/container.cid",
@@ -552,7 +545,6 @@ mod tests {
             &minimal,
             &CreateContext {
                 task,
-                resource: None,
                 cidfile: Path::new("/t/container.cid"),
                 default_user: ContainerUser { uid: 501, gid: 20 },
             },
@@ -561,11 +553,6 @@ mod tests {
             !args
                 .iter()
                 .any(|arg| arg == "--gpus" || arg == "--entrypoint")
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("homebased.resource="))
         );
         assert_eq!(args.last().map(String::as_str), Some(DIGEST));
         let user = args.iter().position(|arg| arg == "--user").unwrap();
@@ -613,5 +600,34 @@ mod tests {
             Some("t")
         );
         assert!(decode("unknown", 0).is_err());
+    }
+    #[test]
+    fn inspect_preserves_exact_finished_at() {
+        let decode = |finished_at: serde_json::Value| {
+            serde_json::from_value::<InspectedContainer>(json!({
+                "Id": "a".repeat(64),
+                "State": { "Status": "exited", "ExitCode": 0, "FinishedAt": finished_at }
+            }))
+            .map(|container| container.observation().unwrap())
+        };
+        let timestamp = "2026-10-03T12:34:56.123456789Z";
+        assert_eq!(
+            decode(json!(timestamp)).unwrap().finished_at,
+            Some(timestamp.parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+        );
+        assert_eq!(
+            decode(json!("0001-01-01T00:00:00Z")).unwrap().finished_at,
+            None
+        );
+        assert_eq!(decode(serde_json::Value::Null).unwrap().finished_at, None);
+        assert_eq!(
+            decode(json!("1970-01-01T00:00:00Z")).unwrap().finished_at,
+            Some(
+                "1970-01-01T00:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            )
+        );
+        assert!(decode(json!("not a timestamp")).is_err());
     }
 }

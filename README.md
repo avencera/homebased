@@ -13,6 +13,10 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 [Ask your agent to install it](#for-agents), or follow the [manual install steps](#install). Homebased runs on Linux and macOS.
 
+## GPU priority queue
+
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
+
 ## For agents
 
 Tell an agent to install this:
@@ -284,7 +288,7 @@ OpenCode agent workloads use `opencode run --standalone` with JSON events and th
 
 ### Spec
 
-Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. Tasks stored before this field was required keep a server-derived `display_name` from the workload. `thread` is the Codex thread UUID that should receive events. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
+Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread UUID that should receive events. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
 
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
@@ -427,14 +431,6 @@ the same `--request-id` to resolve or retry. `cluster_lookup_incomplete` means
 one or more known peers could not be checked. Retry the lookup; the daemon only
 returns `task_not_found` after every machine in the current known Fleet gives a
 definitive negative result.
-
-### GPU resource loans
-
-Use a registered resource for shared GPU work. The resource authority owns the
-queue, active loan, and release proof. Read the
-[GPU resource loan runbook](docs/resource-loans.md) for the real CLI commands,
-JSON inputs, retry rules, and supervisor steps. Do not use the current live
-training job to test this workflow.
 
 ### Events
 

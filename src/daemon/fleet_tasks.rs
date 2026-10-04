@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -210,8 +211,8 @@ async fn read_peers(
             "{CLUSTER_TASK_LIST_PATH}?{}api_version={API_VERSION}&destination_machine={machine}",
             filter.query_prefix()
         );
-        jobs.spawn(async move {
-            let result = read_peer::<ClusterTaskList>(&fleet, machine, &path)
+        jobs.spawn(peer_worker(index, async move {
+            read_peer::<ClusterTaskList>(&fleet, machine, &path)
                 .await
                 .and_then(|body| {
                     if body.machine == machine {
@@ -219,9 +220,8 @@ async fn read_peers(
                     } else {
                         Err("peer answered for another machine".to_owned())
                     }
-                });
-            (index, result)
-        });
+                })
+        }));
     }
 
     let mut results: Vec<Result<Vec<TaskSummary>, String>> = peers
@@ -235,6 +235,17 @@ async fn read_peers(
         }
     }
     peers.into_iter().zip(results).collect()
+}
+
+async fn peer_worker(
+    index: usize,
+    read: impl std::future::Future<Output = Result<Vec<TaskSummary>, String>>,
+) -> (usize, Result<Vec<TaskSummary>, String>) {
+    let result = std::panic::AssertUnwindSafe(read)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err("peer task read worker panicked".into()));
+    (index, result)
 }
 
 /// Merge per-machine records into one entry per task, newest first
@@ -269,9 +280,21 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn bugfix_peer_panic_names_the_worker_failure() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(super::peer_worker(7, async { panic!("peer read panic") }));
+        let (index, result) = workers.join_next().await.unwrap().unwrap();
+        assert_eq!(index, 7);
+        assert!(result.unwrap_err().contains("worker panicked"));
+    }
+
     use serde_json::json;
 
-    use super::*;
+    use super::{ClusterTaskList, merge_records};
+    use crate::daemon::api::views::TaskSummary;
+    use crate::domain::API_VERSION;
+    use crate::machine::MachineId;
 
     const MAIN: &str = "00000000-0000-4000-8000-000000000001";
     const CODE: &str = "00000000-0000-4000-8000-000000000002";
@@ -288,7 +311,7 @@ mod tests {
     ) -> TaskSummary {
         let mut value = json!({
             "id": id,
-            "display_name": "train",
+            "name": "train",
             "status": status,
             "workload": { "type": "task", "command": ["true"] },
             "thread": "01a0b19f-f048-7832-8e98-01618ccf44d7",
@@ -368,7 +391,7 @@ mod tests {
             "machine": CODE,
             "tasks": [{
                 "id": "01a0d100-0000-7000-8000-000000000003",
-                "display_name": "train",
+                "name": "train",
                 "status": "running",
                 "workload": { "type": "container", "image": "img@sha256:00", "args": [], "gpus": "all" },
                 "thread": "01a0b19f-f048-7832-8e98-01618ccf44d7",

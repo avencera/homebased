@@ -107,6 +107,9 @@ pub enum TaskOutcome {
     Cancelled,
     /// `TASK_LOST`
     Lost,
+    /// `TASK_PREEMPTED`: the run stopped for higher-priority work and its job
+    /// runs again in a new task, so this run did not succeed
+    Preempted,
 }
 
 impl TaskOutcome {
@@ -119,6 +122,7 @@ impl TaskOutcome {
             EventKind::TaskBlocked => Some(Self::Blocked),
             EventKind::TaskCancelled => Some(Self::Cancelled),
             EventKind::TaskLost => Some(Self::Lost),
+            EventKind::TaskPreempted => Some(Self::Preempted),
             EventKind::TaskReported | EventKind::TaskCheckDue => None,
         }
     }
@@ -138,6 +142,7 @@ impl TaskOutcome {
             Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
             Self::Lost => "lost",
+            Self::Preempted => "preempted",
         }
     }
 
@@ -150,6 +155,7 @@ impl TaskOutcome {
             "blocked" => Some(Self::Blocked),
             "cancelled" => Some(Self::Cancelled),
             "lost" => Some(Self::Lost),
+            "preempted" => Some(Self::Preempted),
             _ => None,
         }
     }
@@ -164,9 +170,9 @@ impl fmt::Display for TaskOutcome {
 /// How a finished dependency ended, as far as its origin can prove
 ///
 /// Process status is not an outcome: a worker can exit 0 after reporting
-/// `blocked`. A task whose terminal event is gone, such as one that finished
-/// before outcomes were saved and whose event was pruned, is
-/// [`Self::Unknown`], and an unknown ending never releases a held task
+/// `blocked`. A task that ended with no saved outcome, or whose route is
+/// missing, is [`Self::Unknown`], and an unknown ending never releases a held
+/// task
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyOutcome {
     /// The terminal event, or the route's closure before launch, named this outcome
@@ -371,6 +377,7 @@ mod tests {
             (EventKind::TaskBlocked, false),
             (EventKind::TaskCancelled, false),
             (EventKind::TaskLost, false),
+            (EventKind::TaskPreempted, false),
         ] {
             let outcome = TaskOutcome::from_event(kind).unwrap();
             assert_eq!(DependencyOutcome::from(outcome).is_success(), success);

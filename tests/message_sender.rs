@@ -23,7 +23,7 @@ use homebased::message::{MessageId, MessageSource};
 use homebased::spec;
 use homebased::store::{NewTask, Store, new_queued_task};
 use homebased::submission::{
-    CallbackContext, CallbackExecutable, OriginRoute, PersistedSpec, RequestId, SubmissionState,
+    CallbackContext, CallbackExecutable, OriginRoute, RequestId, SubmissionState,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -166,6 +166,14 @@ fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, String, usize)> {
     Some((request, path, header_end))
 }
 
+/// Why a daemon start did not become ready
+enum Launch {
+    /// Another process bound the chosen port first
+    PortTaken,
+    /// The daemon exited for another reason or never answered
+    NotReady(String),
+}
+
 impl Daemon {
     fn start(name: &str) -> Self {
         let dir = TempDir::new().unwrap();
@@ -213,7 +221,7 @@ impl Daemon {
             address,
             child: None,
         };
-        daemon.spawn();
+        daemon.start_on_free_port();
         daemon
     }
 
@@ -236,33 +244,69 @@ impl Daemon {
         command
     }
 
+    /// First start of a daemon on a port from `free_port`
+    ///
+    /// Another test's process can bind that port between `free_port` releasing
+    /// it and this daemon binding it, so a start that fails with the address in
+    /// use retries on a fresh port. Restarts go through `spawn` and keep their
+    /// address, because peers already point at it
+    fn start_on_free_port(&mut self) {
+        for _ in 0..3 {
+            match self.launch() {
+                Ok(()) => return,
+                Err(Launch::PortTaken) => {
+                    self.address = format!("127.0.0.1:{}", free_port());
+                }
+                Err(Launch::NotReady(message)) => panic!("{message}"),
+            }
+        }
+        panic!("daemon found no free port after 3 attempts");
+    }
+
     fn spawn(&mut self) {
+        match self.launch() {
+            Ok(()) => {}
+            Err(Launch::PortTaken) => panic!("daemon port {} is taken", self.address),
+            Err(Launch::NotReady(message)) => panic!("{message}"),
+        }
+    }
+
+    fn launch(&mut self) -> Result<(), Launch> {
+        let log = self.state_home.join("daemon-stderr.log");
         let child = self
             .command()
             .args(["daemon", "serve", "--web-listen"])
             .arg(&self.address)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
             .spawn()
             .unwrap();
         self.child = Some(child);
-        assert!(wait_until(Duration::from_secs(10), || self.http_ready()));
+        let mut exited = None;
+        let ready = wait_until(Duration::from_secs(10), || {
+            exited = self
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten());
+            exited.is_none() && self.http_ready()
+        });
+        if ready {
+            return Ok(());
+        }
+
+        let stderr = fs::read_to_string(&log).unwrap_or_default();
+        if exited.is_some() && stderr.contains("Address already in use") {
+            self.child = None;
+            return Err(Launch::PortTaken);
+        }
+        Err(Launch::NotReady(format!(
+            "daemon on {} was not ready after 10s; exit status: {exited:?}\n{stderr}",
+            self.address
+        )))
     }
 
     fn http_ready(&self) -> bool {
-        let Ok(mut stream) = TcpStream::connect(&self.address) else {
-            return false;
-        };
-        use std::io::{Read, Write};
-        let request = format!(
-            "GET /v1/status HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.address
-        );
-        if stream.write_all(request.as_bytes()).is_err() {
-            return false;
-        }
-        let mut response = String::new();
-        stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+        http_ready_at(&self.address)
     }
 
     fn cli(&self, args: &[&str]) -> Output {
@@ -289,7 +333,7 @@ impl Daemon {
     }
 
     fn delivery(&self, id: MessageId) -> homebased::message::MessageDelivery {
-        Store::open(&self.state_home.join("homebased.sqlite"))
+        Store::open(&self.state_home.join(homebased::home::DB_NAME))
             .unwrap()
             .message_delivery(id)
             .unwrap()
@@ -578,7 +622,7 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
         "workload": { "type": "task", "command": ["echo", "route"] },
     }))
     .unwrap();
-    Store::open(&receiver.state_home.join("homebased.sqlite"))
+    Store::open(&receiver.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_origin_route(&OriginRoute {
             request: RequestId::new(),
@@ -594,10 +638,10 @@ fn sender_resolves_remote_local_and_task_routes_and_retries_same_binding() {
                 cwd: task_cwd,
                 codex: CallbackExecutable::available(receiver.codex.clone()),
             },
-            spec: PersistedSpec::Current(Box::new(spec)),
+            spec,
             submission: SubmissionState::AcceptanceUnknown,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         })
@@ -705,7 +749,7 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
         "workload": { "type": "task", "command": ["/bin/true"] },
     }))
     .unwrap();
-    Store::open(&sender.state_home.join("homebased.sqlite"))
+    Store::open(&sender.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_origin_route(&OriginRoute {
             request: RequestId::new(),
@@ -721,10 +765,10 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
                 cwd,
                 codex: CallbackExecutable::available(sender.codex.clone()),
             },
-            spec: PersistedSpec::Current(Box::new(spec)),
+            spec,
             submission: SubmissionState::Accepted,
             last_execution_state: None,
-            last_updated_at: Some(chrono::Utc::now()),
+            last_updated_at: chrono::Utc::now(),
             last_accepted_seq: 0,
             last_settled_seq: 0,
         })
@@ -773,14 +817,15 @@ fn task_message_from_its_origin_thread_is_rejected_but_task_source_is_allowed() 
     let repeated_self_error: Value = serde_json::from_slice(&repeated_self_message.stderr).unwrap();
     assert_eq!(repeated_self_error["error"]["code"], "message_to_self");
     assert!(sender.queue_calls().is_empty());
-    let binding_count: i64 = rusqlite::Connection::open(sender.state_home.join("homebased.sqlite"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM outbound_message_bindings WHERE message_id=?1",
-            [self_message.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let binding_count: i64 =
+        rusqlite::Connection::open(sender.state_home.join(homebased::home::DB_NAME))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_message_bindings WHERE message_id=?1",
+                [self_message.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
     assert_eq!(binding_count, 1);
 
     let task_source_id = MessageId::new();
@@ -914,11 +959,11 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
     // the daemon starts queued rows only at startup, so this one stays queued
     let queued = TaskId::new();
     fs::create_dir_all(receiver.state_home.join("tasks").join(queued.to_string())).unwrap();
-    Store::open(&receiver.state_home.join("homebased.sqlite"))
+    Store::open(&receiver.state_home.join(homebased::home::DB_NAME))
         .unwrap()
         .insert_task(&new_queued_task(NewTask {
             id: queued,
-            name: None,
+            name: homebased::domain::TaskName::parse("test task").unwrap(),
             thread: origin,
             workload: Workload::Agent(AgentWorkload {
                 agent: Agent::new(AgentKind::Claude, None),
@@ -954,5 +999,95 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
             .unwrap()
             .contains("homebased task followup")
     );
-    assert_eq!(receiver.queue_calls().len(), 1);
+    // the finished task's own callback also goes through `codex queue`, at a time
+    // the test does not control, so count only the worker message
+    let messages = receiver
+        .queue_calls()
+        .into_iter()
+        .filter(|call| call.contains("HOMEBASED_MESSAGE"))
+        .count();
+    assert_eq!(messages, 1);
+}
+
+fn http_ready_at(address: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(address) = address.parse() else {
+        return false;
+    };
+    let timeout = Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + timeout;
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() || stream.set_write_timeout(Some(remaining)).is_err() {
+        return false;
+    }
+    let request =
+        format!("GET /v1/status HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status = Vec::new();
+    while status.len() < 1024 && !status.contains(&b'\n') {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return false;
+        }
+        let mut chunk = [0; 128];
+        let Ok(count) = stream.read(&mut chunk) else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        status.extend_from_slice(&chunk[..count]);
+    }
+    status.starts_with(b"HTTP/1.1 200 ")
+}
+
+#[test]
+fn bugfix_readiness_does_not_wait_for_connection_close() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(connection.read(&mut request).unwrap() > 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    let start = std::time::Instant::now();
+    let ready = http_ready_at(&address);
+    let elapsed = start.elapsed();
+    server.join().unwrap();
+    assert!(ready);
+    assert!(elapsed < Duration::from_millis(400));
+}
+
+#[test]
+fn bugfix_readiness_deadline_bounds_a_slow_status_line() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(connection.read(&mut request).unwrap() > 0);
+        for _ in 0..20 {
+            if connection.write_all(b"H").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+    let started = std::time::Instant::now();
+    let ready = http_ready_at(&address);
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    assert!(!ready);
+    assert!(elapsed < Duration::from_millis(400));
 }

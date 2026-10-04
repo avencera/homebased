@@ -1,4 +1,4 @@
-//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event.
+//! `task-run`: lock, setsid, spawn, process-group cleanup, `exit.json`, event
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -20,14 +20,16 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
+use crate::cleanup;
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
     TaskRow, TaskState, ThreadId, Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
-use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload_for_identity};
+use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
 use crate::report::REPORT_TRAILER;
+use crate::run_env;
 use crate::store::{self, Store};
 
 mod container;
@@ -52,6 +54,15 @@ struct TaskRunExit {
     process_group_exit_evidence: ProcessGroupExitEvidence,
 }
 
+impl TaskRunExit {
+    fn spawn_failed(message: String) -> Self {
+        Self {
+            reason: ExitReason::SpawnFailed { message },
+            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CleanupTiming {
     term_grace: Duration,
@@ -74,7 +85,7 @@ pub(crate) fn set_task_run_executable_for_tests(executable: std::path::PathBuf) 
     *TASK_RUN_EXECUTABLE_FOR_TESTS.lock().unwrap() = Some(executable);
 }
 
-/// Spawn `homebased task-run` with an inherited exclusive flock.
+/// Spawn `homebased task-run` with an inherited exclusive flock
 pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppError> {
     let exe = task_run_executable()?;
     let fd = lock.as_raw_fd();
@@ -91,7 +102,8 @@ pub fn spawn_task_run(home: &Home, id: TaskId, lock: File) -> Result<u32, AppErr
         }
     };
     let mut cmd = StdCommand::new(&exe);
-    cmd.arg("task-run")
+    run_env::scrub(&mut cmd)
+        .arg("task-run")
         .arg("--home")
         .arg(home.root())
         .arg("--id")
@@ -147,17 +159,21 @@ fn prepare_worker(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Worker entry: hold the inherited lock until exit.json and event commit.
+/// Worker entry: hold the inherited lock until exit.json and event commit
 pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
-    let _lock = unsafe { File::from_raw_fd(lock_fd) };
-    // install the SIGTERM handler before any other work. Everything below (the
+    let lock = unsafe { File::from_raw_fd(lock_fd) };
+    // install the SIGTERM handler before any other work: everything below (the
     // Queued->Running CAS, set_pid, the feed read) is a window in which the
     // default disposition would kill this worker outright, leaving the task
-    // Lost instead of Cancelled. Tokio latches a signal that arrives before the
-    // first `recv()`, so a cancel in this window is still seen.
+    // Lost instead of Cancelled; Tokio latches a signal that arrives before the
+    // first `recv()`, so a cancel in this window is still seen
     let mut sigterm = signal(SignalKind::terminate()).map_err(|err| AppError::Internal {
         message: format!("signal: {err}"),
     })?;
+    // the descriptor crosses exec only to enter this worker; workload children
+    // must not hold it or surviving children can hide a lost worker from flock
+    fcntl(&lock, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
+
     home.ensure()?;
     let store = Store::open_with_busy_timeout(&home.db_path(), WORKER_BUSY_TIMEOUT)?;
     let queued = store.require_task(id)?;
@@ -188,57 +204,14 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         } else {
             container::Entry::Launch
         };
+        let configured = store
+            .run_checkpoint(id)?
+            .map(|checkpoint| checkpoint.container_workload(&home, workload))
+            .transpose()?;
+        let workload = configured.as_ref().unwrap_or(workload);
         return container::run(&store, &row, workload, &paths, entry, &mut sigterm).await;
     }
-    let exit = match invocation_from_workload_for_identity(
-        &row.workload,
-        &row.binary,
-        &row.cwd,
-        &paths.feed,
-        TaskIdentity::Actual(id),
-    ) {
-        Ok(invocation) => {
-            // only stdin-fed agents need the bytes; Grok reads the feed path from argv
-            let feed = match invocation.stdin {
-                StdinPolicy::PromptFeed => match std::fs::read(&paths.feed) {
-                    Ok(feed) => Ok(Some(feed)),
-                    Err(err) => {
-                        let message = format!("read prompt feed: {err}");
-                        std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
-                        Err(TaskRunExit {
-                            reason: ExitReason::SpawnFailed { message },
-                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-                        })
-                    }
-                },
-                StdinPolicy::Null => Ok(None),
-            };
-            match feed {
-                Ok(feed) => {
-                    match run_child(&invocation, &row, &home, &paths, feed, &store, &mut sigterm)
-                        .await
-                    {
-                        Ok(exit) => exit,
-                        Err(err) => TaskRunExit {
-                            reason: ExitReason::SpawnFailed {
-                                message: err.to_string(),
-                            },
-                            process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-                        },
-                    }
-                }
-                Err(exit) => exit,
-            }
-        }
-        Err(err) => {
-            let message = err.to_string();
-            std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
-            TaskRunExit {
-                reason: ExitReason::SpawnFailed { message },
-                process_group_exit_evidence: ProcessGroupExitEvidence::NoChildSpawned,
-            }
-        }
-    };
+    let exit = run_host_workload(&row, &home, &paths, &store, &mut sigterm).await?;
 
     record_exit(
         &store,
@@ -247,6 +220,48 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         &exit.reason,
         exit.process_group_exit_evidence.into(),
         &row,
+    )
+}
+
+async fn run_host_workload(
+    row: &TaskRow,
+    home: &Home,
+    paths: &TaskPaths,
+    store: &Store,
+    sigterm: &mut SignalStream,
+) -> Result<TaskRunExit, AppError> {
+    let invocation = match invocation_from_workload(
+        &row.workload,
+        &row.binary,
+        &row.cwd,
+        &paths.feed,
+        TaskIdentity::Actual(row.id),
+    ) {
+        Ok(invocation) => invocation,
+        Err(err) => {
+            let message = err.to_string();
+            std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+            return Ok(TaskRunExit::spawn_failed(message));
+        }
+    };
+
+    // only stdin-fed agents need the bytes; Grok reads the feed path from argv
+    let feed = match invocation.stdin {
+        StdinPolicy::PromptFeed => match std::fs::read(&paths.feed) {
+            Ok(feed) => Some(feed),
+            Err(err) => {
+                let message = format!("read prompt feed: {err}");
+                std::fs::write(&paths.output, format!("homebased: {message}\n"))?;
+                return Ok(TaskRunExit::spawn_failed(message));
+            }
+        },
+        StdinPolicy::Null => None,
+    };
+
+    Ok(
+        run_child(&invocation, row, home, paths, feed, store, sigterm)
+            .await
+            .unwrap_or_else(|err| TaskRunExit::spawn_failed(err.to_string())),
     )
 }
 
@@ -261,16 +276,10 @@ fn record_exit(
     evidence: TaskExitEvidence,
     row: &TaskRow,
 ) -> Result<(), AppError> {
-    store::write_exit_json_with_evidence(&paths.exit_json, reason, evidence.clone())?;
+    store::write_exit_json(&paths.exit_json, reason, evidence.clone())?;
     let worker_thread = worker_thread(row, paths);
     if store
-        .cas_exit_with_evidence_and_worker_thread(
-            id,
-            ProcessStatus::Running,
-            reason,
-            evidence,
-            worker_thread,
-        )?
+        .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence, worker_thread)?
         .is_none()
     {
         let current = store.require_task(id)?;
@@ -343,11 +352,12 @@ async fn run_child(
     let stderr = log;
 
     let mut cmd = TokioCommand::new(&invocation.program);
+    run_env::scrub(cmd.as_std_mut());
     cmd.args(&invocation.args)
         .current_dir(&row.cwd)
         .env("PATH", &row.env.path)
         .env("HOME", &row.env.home)
-        .env("HOMEBASED_TASK_ID", id.to_string())
+        .env(run_env::TASK_ID, id.to_string())
         .env("HOMEBASED_HOME", home.root())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -355,6 +365,11 @@ async fn run_child(
         .process_group(0);
     for (key, value) in invocation.environment.iter() {
         cmd.env(key, value);
+    }
+    if let Some(checkpoint) = store.run_checkpoint(id)? {
+        for (key, value) in checkpoint.host_environment(home) {
+            cmd.env(key, value);
+        }
     }
     match invocation.stdin {
         StdinPolicy::PromptFeed => {
@@ -385,6 +400,16 @@ async fn run_child(
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         });
     };
+    record_child_identity(store, id, child_pgid);
+    if let Err(error) = store.confirm_job_run_started(id) {
+        let (evidence, _) = cancel_child_group(&mut child, child_pgid).await;
+        return Ok(TaskRunExit {
+            reason: ExitReason::SpawnFailed {
+                message: format!("confirm job child start: {error}"),
+            },
+            process_group_exit_evidence: evidence,
+        });
+    }
     if invocation.stdin == StdinPolicy::PromptFeed
         && let Some(feed) = feed
         && let Some(mut stdin) = child.stdin.take()
@@ -441,19 +466,34 @@ async fn run_child(
             warn!(%id, cancelled, "SIGTERM: forwarding to child group")
         }
     }
-    let process_group_exit_evidence = cancel_child_group(&mut child, child_pgid).await;
     let reason = if cancelled {
         ExitReason::Cancelled
     } else {
         ExitReason::Signal { signal: 15 }
     };
-    Ok(TaskRunExit {
-        reason,
-        process_group_exit_evidence,
-    })
+    Ok(stop_child(&mut child, child_pgid, reason).await)
 }
 
-/// A Unix wait status is either an exit code or a terminating signal.
+/// Save the child's identity for cleanup after a lost worker
+///
+/// The child is not reaped yet, so its PID cannot be reused before the read. A
+/// failure only weakens later lost-worker cleanup, so the task keeps running
+fn record_child_identity(store: &Store, id: TaskId, pid: i32) {
+    let identity = match cleanup::process_identity(Pid::from_raw(pid)) {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(%id, pid, "read child identity: {err}");
+            return;
+        }
+    };
+    match store.set_child_identity(id, identity) {
+        Ok(true) => {}
+        Ok(false) => warn!(%id, %identity, "child identity not recorded: task row changed"),
+        Err(err) => warn!(%id, %identity, "record child identity: {err}"),
+    }
+}
+
+/// A Unix wait status is either an exit code or a terminating signal
 fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<ExitReason, AppError> {
     let status = match status {
         Ok(status) => status,
@@ -481,7 +521,7 @@ enum ProcessGroupProbe {
     Unknown,
 }
 
-/// Probe one process group without treating unexpected errors as evidence of exit.
+/// Probe one process group without treating unexpected errors as evidence of exit
 fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
     match kill(Pid::from_raw(-pgid), None) {
         Ok(()) => ProcessGroupProbe::Alive,
@@ -493,39 +533,101 @@ fn process_group_probe(pgid: i32) -> ProcessGroupProbe {
     }
 }
 
-/// Reap the direct child while giving the full group one shared TERM grace.
+/// Reap the direct child while giving the full group one shared TERM grace
+async fn stop_child(
+    child: &mut tokio::process::Child,
+    pgid: i32,
+    reason: ExitReason,
+) -> TaskRunExit {
+    let (process_group_exit_evidence, natural) = cancel_child_group(child, pgid).await;
+    TaskRunExit {
+        reason: natural.unwrap_or(reason),
+        process_group_exit_evidence,
+    }
+}
+
+struct ChildStop<'a> {
+    child: &'a mut tokio::process::Child,
+    reaped: bool,
+    signalled: bool,
+    natural: Option<ExitReason>,
+}
+
+impl ChildStop<'_> {
+    fn reap(&mut self, pgid: i32) {
+        if self.reaped {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.reaped = true;
+                if !self.signalled {
+                    self.natural = status_to_reason(Ok(status)).ok();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(pgid, "reap cancelled child: {error}");
+            }
+        }
+    }
+
+    fn signal(&mut self, pgid: i32, signal: Signal) -> Result<(), Errno> {
+        // selection of the cancellation branch is not evidence that the child is live
+        self.reap(pgid);
+        // a natural exit inside the next call is recorded as cancellation: after
+        // the group signal, it is indistinguishable from a TERM handler's exit 0
+        let result = kill(Pid::from_raw(-pgid), signal);
+        if result.is_ok() {
+            self.signalled = true;
+        }
+        result
+    }
+}
+
 async fn cancel_child_group(
     child: &mut tokio::process::Child,
     child_pgid: i32,
-) -> ProcessGroupExitEvidence {
-    let mut child_reaped = false;
+) -> (ProcessGroupExitEvidence, Option<ExitReason>) {
+    let state = std::sync::Mutex::new(ChildStop {
+        child,
+        reaped: false,
+        signalled: false,
+        natural: None,
+    });
     let evidence = cleanup_process_group_with(
         child_pgid,
         || process_group_probe(child_pgid),
-        |signal| kill(Pid::from_raw(-child_pgid), signal),
+        |signal| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .signal(child_pgid, signal)
+        },
         || {
-            if child_reaped {
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => child_reaped = true,
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(child_pgid, "reap cancelled child: {err}");
-                    child_reaped = true;
-                }
-            }
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reap(child_pgid)
         },
         CLEANUP_TIMING,
     )
     .await;
-    if !child_reaped && let Err(err) = time::timeout(KILL_REAP_GRACE, child.wait()).await {
-        warn!(child_pgid, "reap cancelled child timed out: {err}");
+    let mut state = state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.reaped {
+        match time::timeout(KILL_REAP_GRACE, state.child.wait()).await {
+            Ok(Ok(status)) if !state.signalled => state.natural = status_to_reason(Ok(status)).ok(),
+            Ok(Err(error)) => warn!(child_pgid, "reap cancelled child: {error}"),
+            Err(error) => warn!(child_pgid, "reap cancelled child timed out: {error}"),
+            Ok(Ok(_)) => {}
+        }
     }
-    evidence
+    (evidence, state.natural)
 }
 
-/// Terminate remaining members of the child process group and confirm the result.
+/// Terminate remaining members of the child process group and confirm the result
 async fn cleanup_process_group(child_pgid: i32) -> ProcessGroupExitEvidence {
     cleanup_process_group_with(
         child_pgid,
@@ -605,7 +707,7 @@ async fn cleanup_process_group_with(
     }
 }
 
-/// Write prompt evidence for an agent workload.
+/// Write prompt evidence for an agent workload
 pub fn write_task_files(
     paths: &TaskPaths,
     prompt: &str,
@@ -619,15 +721,23 @@ pub fn write_task_files(
     paths.write_prompt(prompt, trailer)
 }
 
-/// Open `runner.lock` and take the exclusive flock before spawn.
+/// Open `runner.lock` and take the exclusive flock before spawn
 pub fn lock_before_spawn(paths: &TaskPaths) -> Result<File, AppError> {
     home::flock_exclusive(&paths.runner_lock, LockMode::Blocking)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AppError, ChildInvocation, CleanupTiming, Duration, ExitReason, File, Home, LockMode,
+        ProcessGroupExitEvidence, ProcessGroupProbe, Signal, SignalKind, StdinPolicy, Store,
+        TaskId, TaskPaths, ThreadId, TokioCommand, WORKER_THREAD_LOG_PREFIX_BYTES,
+        cancel_child_group, cleanup_process_group_with, home, parse_codex_worker_thread,
+        prepare_worker, run_child, signal, stop_child, store, time, write_task_files,
+    };
     use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     #[test]
@@ -769,7 +879,7 @@ mod tests {
         let child_pgid = child.id().unwrap() as i32;
 
         assert_eq!(
-            cancel_child_group(&mut child, child_pgid).await,
+            cancel_child_group(&mut child, child_pgid).await.0,
             ProcessGroupExitEvidence::ConfirmedExited
         );
         assert!(child.try_wait().unwrap().is_some());
@@ -785,7 +895,7 @@ mod tests {
         let store = Store::open(&home.db_path()).unwrap();
         let mut row = store::new_queued_task(crate::store::NewTask {
             id,
-            name: Some(crate::domain::TaskName::parse("self-cancel test").unwrap()),
+            name: crate::domain::TaskName::parse("self-cancel test").unwrap(),
             thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
             workload: crate::domain::Workload::Task(crate::domain::TaskWorkload {
                 command: crate::invocation::CommandLine::try_from_argv(vec![
@@ -884,5 +994,47 @@ mod tests {
             ProcessGroupExitEvidence::Unconfirmed,
             "an exit probe after the kill grace must not hide the grace timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_preserves_an_already_exited_child() {
+        for code in [0, 7] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", &format!("exit {code}")])
+                .process_group(0)
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let pgid = i32::try_from(child.id().unwrap()).unwrap();
+            child.wait().await.unwrap();
+            let exit = stop_child(&mut child, pgid, ExitReason::Cancelled).await;
+            assert_eq!(exit.reason, ExitReason::Exit { code });
+        }
+    }
+
+    #[tokio::test]
+    async fn child_exit_after_homebased_signal_stays_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap 'exit 0' TERM; echo ready > \"$1\"; while :; do :; done",
+                "sh",
+            ])
+            .arg(&ready)
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let pgid = i32::try_from(child.id().unwrap()).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let exit = stop_child(&mut child, pgid, ExitReason::Cancelled).await;
+        assert_eq!(exit.reason, ExitReason::Cancelled);
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(0));
     }
 }

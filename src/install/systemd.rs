@@ -59,24 +59,25 @@ pub(crate) fn parse_unit_home(text: &str) -> Option<PathBuf> {
         return None;
     }
     match exec_starts.as_slice() {
-        [one] => home_from_daemon_argv(&split_exec_args(one)),
+        [one] => home_from_daemon_argv(&split_exec_args(one)?),
         _ => None,
     }
 }
 
-/// Render the unit text.
-pub fn render(home: &Home) -> Result<String, AppError> {
-    render_with_config(home, None)
-}
-
 /// Render the unit with an optional explicit config file.
-pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
+pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env_lines = String::new();
-    env_lines.push_str(&format!("Environment=PATH={}\n", installer_path()));
+    env_lines.push_str(&format!(
+        "Environment={}\n",
+        quote_systemd_environment("PATH", &installer_path())?
+    ));
     for (key, path) in agent_paths() {
-        env_lines.push_str(&format!("Environment={key}={}\n", path.display()));
+        env_lines.push_str(&format!(
+            "Environment={}\n",
+            quote_systemd_environment(key, &path.display().to_string())?
+        ));
     }
     if let Some((key, value)) = web_listen_env()? {
         env_lines.push_str(&format!("Environment={key}={value}\n"));
@@ -101,19 +102,14 @@ pub fn render_with_config(home: &Home, config: Option<&Path>) -> Result<String, 
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        bin.display(),
-        home.display(),
+        quote_systemd_argument(&bin.display().to_string(), false)?,
+        quote_systemd_argument(&home.display().to_string(), true)?,
     ))
 }
 
-/// Write, verify, enable, and start the unit.
-pub fn install(home: &Home) -> Result<(), AppError> {
-    install_with_config(home, None)
-}
-
 /// Write, verify, enable, and start with an optional explicit config file.
-pub fn install_with_config(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
-    let text = render_with_config(home, config)?;
+pub fn install(home: &Home, config: Option<&Path>) -> Result<(), AppError> {
+    let text = render(home, config)?;
     let path = unit_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -219,29 +215,132 @@ fn quote_systemd_environment(key: &str, value: &str) -> Result<String, AppError>
     Ok(quoted)
 }
 
-/// Split an `ExecStart=` value on whitespace. Generated units do not quote
-/// paths; quoting support is deferred.
-fn split_exec_args(rest: &str) -> Vec<&str> {
-    rest.split_whitespace().collect()
+/// Quote one literal `ExecStart` argument without variable or specifier expansion
+fn quote_systemd_argument(value: &str, expand_environment: bool) -> Result<String, AppError> {
+    if value.chars().any(char::is_control) {
+        return Err(AppError::UnitInvalid {
+            message: "systemd paths cannot contain control characters".into(),
+        });
+    }
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '%' => quoted.push_str("%%"),
+            // systemd expands variables in argv, but not in the executable path
+            '$' if expand_environment => quoted.push_str("$$"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
 }
 
-fn home_from_daemon_argv(args: &[&str]) -> Option<PathBuf> {
+/// Read literal arguments in generated units and older unquoted units
+///
+/// Other expansions or escapes are refused so an unknown invocation cannot
+/// claim ownership of the selected home
+fn split_exec_args(rest: &str) -> Option<Vec<String>> {
+    let mut characters = rest.chars().peekable();
+    let mut args = Vec::new();
+    while characters.peek().is_some() {
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            characters.next();
+        }
+        let Some(&first) = characters.peek() else {
+            break;
+        };
+        let quote = matches!(first, '"' | '\'').then_some(first);
+        if quote.is_some() {
+            characters.next();
+        }
+        let mut argument = String::new();
+        let mut closed = quote.is_none();
+        while let Some(character) = characters.next() {
+            if quote == Some(character) {
+                closed = true;
+                if characters
+                    .peek()
+                    .is_some_and(|character| !character.is_whitespace())
+                {
+                    return None;
+                }
+                break;
+            }
+            if quote.is_none() && character.is_whitespace() {
+                break;
+            }
+            match character {
+                '\\' => {
+                    let escaped = characters.next()?;
+                    if !matches!(escaped, '\\' | '"' | '\'') {
+                        return None;
+                    }
+                    argument.push(escaped);
+                }
+                '$' if args.is_empty() => argument.push(character),
+                '%' | '$' => {
+                    if characters.next()? != character {
+                        return None;
+                    }
+                    argument.push(character);
+                }
+                character if character.is_control() || matches!(character, '"' | '\'') => {
+                    return None;
+                }
+                character => argument.push(character),
+            }
+        }
+        if !closed {
+            return None;
+        }
+        args.push(argument);
+    }
+    Some(args)
+}
+
+fn home_from_daemon_argv(args: &[String]) -> Option<PathBuf> {
     // require the exact shape generated by render so unrelated commands cannot claim ownership
-    if args.len() != 5
-        || args[1] != "daemon"
-        || args[2] != "serve"
-        || args[3] != "--home"
-        || args[4].is_empty()
-    {
+    let [_, daemon, serve, flag, home] = args else {
+        return None;
+    };
+    if daemon != "daemon" || serve != "serve" || flag != "--home" || home.is_empty() {
         return None;
     }
-    Some(PathBuf::from(args[4]))
+    Some(PathBuf::from(home))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[test]
+    fn bugfix_unit_round_trips_quoted_home_and_binary_paths() {
+        assert_eq!(
+            super::quote_systemd_argument("/opt/my $tools/homebased", false).unwrap(),
+            r#""/opt/my $tools/homebased""#
+        );
+        let path = PathBuf::from("/tmp/state with space");
+        let home = Home::resolve(Some(path.clone())).unwrap();
+        let text = render(&home, None).unwrap();
+        assert_eq!(parse_unit_home(&text), Some(path));
+        assert_eq!(
+            parse_unit_home(&sample_unit(
+                r#""/opt/my $tools/homebased""#,
+                r#""/tmp/a \"b\" \\ c $$value %%i""#
+            )),
+            Some(PathBuf::from(r#"/tmp/a "b" \ c $value %i"#))
+        );
+    }
+
+    use std::path::{Path, PathBuf};
+
+    use super::{inspect_host_unit_at, parse_unit_home, quote_systemd_environment, render};
+    use crate::config::CONFIG_ENV;
     use crate::home::Home;
+    use crate::install::{HostUnitState, classify_configured_home};
 
     fn sample_unit(bin: &str, home: &str) -> String {
         format!(
@@ -265,14 +364,17 @@ mod tests {
     #[test]
     fn unit_contains_required_fields() {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(text.contains("KillMode=process"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("ExecStop=")),
             "{text}"
         );
         assert!(text.contains("ExecStart="), "{text}");
-        assert!(text.contains("daemon serve --home /tmp/hb-state"), "{text}");
+        assert!(
+            text.contains("daemon serve --home \"/tmp/hb-state\""),
+            "{text}"
+        );
         assert!(text.contains("Environment=PATH="), "{text}");
         assert!(
             !text.contains(&format!("Environment={CONFIG_ENV}=")),
@@ -290,7 +392,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let config = Path::new("/tmp/config with \"quotes\" \\ and $value %specifier.toml");
 
-        let text = render_with_config(&home, Some(config)).unwrap();
+        let text = render(&home, Some(config)).unwrap();
 
         assert!(
             text.lines().any(|line| line
@@ -312,9 +414,9 @@ mod tests {
     fn unit_makes_a_relative_home_absolute() {
         let home = Home::resolve(Some(PathBuf::from("relative-state"))).unwrap();
         let expected = std::path::absolute(home.root()).unwrap();
-        let text = render(&home).unwrap();
+        let text = render(&home, None).unwrap();
         assert!(
-            text.contains(&format!("daemon serve --home {}", expected.display())),
+            text.contains(&format!("daemon serve --home \"{}\"", expected.display())),
             "{text}"
         );
     }

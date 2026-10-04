@@ -1,4 +1,4 @@
-//! Host header checks that limit DNS rebinding without adding a user login step.
+//! Host header checks that limit DNS rebinding without adding a user login step
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -10,18 +10,21 @@ use serde_json::json;
 
 use crate::domain::API_VERSION;
 
-/// Addresses and names accepted on the dashboard and content listeners.
+/// Addresses and names accepted on the dashboard and content listeners
 #[derive(Debug, Clone)]
 pub struct HostPolicy {
-    /// Literal bind address of this listener.
+    /// Literal bind address of this listener
     pub bind: SocketAddr,
 }
 
 impl HostPolicy {
-    /// Whether the `Host` header value is accepted for this bind.
+    /// Whether the `Host` header value is accepted for this bind
     #[must_use]
     pub fn allows(&self, host_header: &str) -> bool {
-        let host = strip_port(host_header.trim()).trim_end_matches('.');
+        let Some(host) = strip_port(host_header.trim()) else {
+            return false;
+        };
+        let host = host.trim_end_matches('.');
         if host.is_empty() {
             return false;
         }
@@ -35,7 +38,7 @@ impl HostPolicy {
     }
 }
 
-/// Axum middleware that rejects unexpected `Host` values.
+/// Axum middleware that rejects unexpected `Host` values
 pub async fn host_guard(policy: HostPolicy, request: Request, next: Next) -> Response {
     let allowed = request
         .headers()
@@ -57,13 +60,19 @@ pub async fn host_guard(policy: HostPolicy, request: Request, next: Next) -> Res
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
 }
 
-fn strip_port(host: &str) -> &str {
+fn strip_port(host: &str) -> Option<&str> {
     if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+        let (address, suffix) = rest.split_once(']')?;
+        address.parse::<std::net::Ipv6Addr>().ok()?;
+        if !suffix.is_empty() {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        return Some(address);
     }
-    host.rsplit_once(':')
-        .and_then(|(name, port)| port.parse::<u16>().ok().map(|_| name))
-        .unwrap_or(host)
+    match host.rsplit_once(':') {
+        Some((name, port)) => port.parse::<u16>().ok().map(|_| name),
+        None => Some(host),
+    }
 }
 
 fn is_local_ip(ip: IpAddr) -> bool {
@@ -80,7 +89,7 @@ fn is_local_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Tailscale userspace addresses live in 100.64.0.0/10.
+/// Tailscale userspace addresses live in 100.64.0.0/10
 fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -124,8 +133,26 @@ fn is_dns_labels(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
+
+    #[test]
+    fn bugfix_bracketed_hosts_require_a_valid_suffix() {
+        let p = policy("127.0.0.1:7677");
+        for raw in [
+            "[::1]garbage",
+            "[::1",
+            "[::1]:",
+            "[::1]:65536",
+            "[::1]:80:90",
+            "[localhost]",
+        ] {
+            assert!(!p.allows(raw), "{raw}");
+        }
+        assert!(p.allows("[::1]"));
+        assert!(p.allows("[::1]:65535"));
+    }
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{HostPolicy, is_tailscale_ip};
 
     fn policy(bind: &str) -> HostPolicy {
         HostPolicy {

@@ -18,6 +18,7 @@ use crate::domain::{
     ThreadId,
 };
 use crate::error::AppError;
+use crate::machine::MachineId;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -283,8 +284,11 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
             crate::error::FollowupBlocker::NotTerminal,
         ));
     }
-    let (local_machine, execution_machine, machine) =
-        followup_machines(&client, task, &detail).await?;
+    let FollowupMachines {
+        local_machine,
+        execution_machine,
+        submit_target,
+    } = followup_machines(&client, task, &detail).await?;
     if detail.get("availability").and_then(Value::as_str) != Some("available") {
         return Err(AppError::TaskUnavailable {
             task,
@@ -312,7 +316,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         .ok_or_else(|| followup_unavailable(task, crate::error::FollowupBlocker::NoWorkerThread))?;
 
     let thread = select_followup_thread(thread)?;
-    let name = name.unwrap_or_else(|| followup_name(detail.get("display_name")));
+    let name = name.unwrap_or_else(|| followup_name(detail.get("name")));
     let prompt = read_followup_message(message, message_file)?;
     let cwd = detail
         .get("cwd")
@@ -331,7 +335,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         "thread": thread,
         "name": name,
         "cwd": cwd,
-        "machine": machine,
+        "machine": submit_target,
         "timeout": format!("{timeout_secs}s"),
         "workload": {
             "type": "agent",
@@ -382,9 +386,9 @@ fn select_followup_thread(explicit: Option<ThreadId>) -> Result<ThreadId, AppErr
     })
 }
 
-fn followup_name(display_name: Option<&Value>) -> String {
-    let display_name = display_name.and_then(Value::as_str).unwrap_or("task");
-    format!("follow up: {display_name}")
+fn followup_name(name: Option<&Value>) -> String {
+    let name = name.and_then(Value::as_str).unwrap_or("task");
+    format!("follow up: {name}")
         .chars()
         .take(TASK_NAME_MAX_CHARS)
         .collect()
@@ -407,32 +411,31 @@ fn read_followup_message(
     }
 }
 
+struct FollowupMachines {
+    local_machine: MachineId,
+    execution_machine: MachineId,
+    submit_target: Option<String>,
+}
+
 async fn followup_machines(
     client: &Client,
     task: TaskId,
     detail: &Value,
-) -> Result<
-    (
-        crate::machine::MachineId,
-        crate::machine::MachineId,
-        Option<String>,
-    ),
-    AppError,
-> {
+) -> Result<FollowupMachines, AppError> {
     let origin_machine = detail
         .get("origin_machine")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Usage {
             message: "task detail does not identify its origin machine".into(),
         })?
-        .parse::<crate::machine::MachineId>()?;
+        .parse::<MachineId>()?;
     let execution_machine = detail
         .get("execution_machine")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Usage {
             message: "task detail does not identify its execution machine".into(),
         })?
-        .parse::<crate::machine::MachineId>()?;
+        .parse::<MachineId>()?;
     let inventory: MachinesBody = serde_json::from_value(client.get("/v1/fleet/machines").await?)
         .map_err(|error| AppError::Internal {
         message: format!("invalid Fleet machine list: {error}"),
@@ -444,7 +447,7 @@ async fn followup_machines(
             execution_machine,
         });
     }
-    let machine = if inventory.local.machine == execution_machine {
+    let submit_target = if inventory.local.machine == execution_machine {
         None
     } else {
         let peer = inventory
@@ -456,7 +459,11 @@ async fn followup_machines(
             })?;
         Some(peer.name.to_string())
     };
-    Ok((inventory.local.machine, execution_machine, machine))
+    Ok(FollowupMachines {
+        local_machine: inventory.local.machine,
+        execution_machine,
+        submit_target,
+    })
 }
 
 /// Waits between local submit attempts. The daemon has stalled for over a
@@ -686,7 +693,7 @@ fn report(
 ) -> Result<ExitCode, AppError> {
     let id = match id {
         Some(id) => id,
-        None => std::env::var("HOMEBASED_TASK_ID")
+        None => std::env::var(crate::run_env::TASK_ID)
             .map_err(|_| AppError::Usage {
                 message: "missing --id and HOMEBASED_TASK_ID".into(),
             })?
@@ -702,7 +709,7 @@ fn report(
         }
     };
     let store = Store::open(&ctx.home.db_path())?;
-    let reports = store.append_report_with_notification(id, outcome, &summary, notify)?;
+    let reports = store.append_report(id, outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
     let row = store.require_task(id)?;
     let last_event = match (notify, reports.last()) {
@@ -736,7 +743,7 @@ fn read_summary(path: &str) -> Result<String, AppError> {
 }
 
 fn workload_label(value: &Value) -> String {
-    if let Some(name) = value.get("display_name").and_then(Value::as_str)
+    if let Some(name) = value.get("name").and_then(Value::as_str)
         && !name.is_empty()
     {
         return name.to_string();
@@ -773,20 +780,9 @@ fn workload_label(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-    use std::time::Duration;
-
-    use tempfile::tempdir;
-
-    use super::{report, retries_local_submit};
-    use crate::cli::{Ctx, OutputMode};
-    use crate::domain::{
-        Agent, AgentKind, AgentWorkload, ReportOutcome, TaskEnv, TaskId, ThreadId, Workload,
-    };
+    use super::retries_local_submit;
+    use crate::domain::TaskId;
     use crate::error::AppError;
-    use crate::home::Home;
-    use crate::machine::MachineId;
-    use crate::store::{NewTask, Store, new_queued_task};
 
     #[test]
     fn local_submit_retries_only_unknown_outcomes() {
@@ -800,84 +796,5 @@ mod tests {
         assert!(!retries_local_submit(&AppError::Internal {
             message: "boom".into()
         }));
-    }
-
-    #[test]
-    fn notify_report_while_daemon_is_down_is_migrated_once() {
-        let directory = tempdir().unwrap();
-        let home = Home::resolve(Some(directory.path().to_path_buf())).unwrap();
-        home.ensure().unwrap();
-        let id = TaskId::new();
-        let row = new_queued_task(NewTask {
-            id,
-            name: None,
-            thread: ThreadId::from_str("01a0ab97-a7aa-7463-a5b0-8d500e40e431").unwrap(),
-            workload: Workload::Agent(AgentWorkload {
-                agent: Agent::new(AgentKind::Claude, None),
-                extra_args: Vec::new(),
-                report_trailer: false,
-                resume_thread: None,
-            }),
-            cwd: directory.path().to_path_buf(),
-            timeout: Duration::from_secs(4 * 3600),
-            env: TaskEnv {
-                path: "/bin".into(),
-                home: directory.path().display().to_string(),
-            },
-            binary: std::path::PathBuf::from("/bin/true"),
-        });
-        {
-            let store = Store::open(&home.db_path()).unwrap();
-            store.insert_task(&row).unwrap();
-            store
-                .cas_status(
-                    id,
-                    crate::domain::ProcessStatus::Queued,
-                    crate::domain::ProcessStatus::Running,
-                )
-                .unwrap();
-        }
-
-        let context = Ctx {
-            output: OutputMode::Quiet,
-            home,
-            config: None,
-        };
-        report(
-            &context,
-            Some(id),
-            ReportOutcome::Blocked,
-            Some("notification requested offline".into()),
-            None,
-            true,
-        )
-        .unwrap();
-
-        let conn = rusqlite::Connection::open(context.home.db_path()).unwrap();
-        let intent_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM report_notification_intents WHERE task_id=?1",
-                [id.to_string()],
-                |entry| entry.get(0),
-            )
-            .unwrap();
-        assert_eq!(intent_count, 1);
-
-        let mut store = Store::open(&context.home.db_path()).unwrap();
-        assert!(!store.is_event_task(id).unwrap());
-
-        store.migrate_legacy_local(MachineId::new()).unwrap();
-        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
-        assert_eq!(
-            store
-                .origin_route_by_task(id)
-                .unwrap()
-                .unwrap()
-                .last_accepted_seq,
-            1
-        );
-        store.migrate_legacy_local(MachineId::new()).unwrap();
-        assert_eq!(store.inbound_events(id).unwrap().len(), 1);
-        assert!(store.pending_outbound_events(id).unwrap().is_empty());
     }
 }

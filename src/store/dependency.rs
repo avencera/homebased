@@ -20,8 +20,7 @@ use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::submission::{
-    DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, ResourceActionRoutePhase,
-    ResourceRoutePhase, SubmissionState,
+    DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
 
 fn decode_route(json: &str) -> Result<OriginRoute, AppError> {
@@ -105,9 +104,7 @@ pub(super) fn append_unlaunched_event_on(
     route: &mut OriginRoute,
     ending: UnlaunchedEnding,
 ) -> Result<(), AppError> {
-    let spec = route.current_spec().ok_or_else(|| AppError::Internal {
-        message: format!("held task {} has no saved spec", route.task),
-    })?;
+    let spec = &route.spec;
     let (state, outcome) = match &ending {
         UnlaunchedEnding::Cancelled(_) => (ProcessStatus::Cancelled, TaskOutcome::Cancelled),
         UnlaunchedEnding::LaunchRefused(_) => (ProcessStatus::Failed, TaskOutcome::Failed),
@@ -136,22 +133,19 @@ pub(super) fn append_unlaunched_event_on(
         last_error: None,
     };
     conn.execute(
-        "INSERT INTO origin_inbox
-         (task_id,seq,origin_machine,execution_machine,event_json,notification_required,delivery_json,settled_at)
-         VALUES (?1,?2,?3,?4,?5,1,?6,NULL)",
+        "INSERT INTO origin_inbox (task_id,seq,event_json,delivery_json,settled_at)
+         VALUES (?1,?2,?3,?4,NULL)",
         params![
             route.task.to_string(),
             i64::try_from(seq.get()).map_err(|_| AppError::Internal {
                 message: "origin event sequence exceeds storage".into(),
             })?,
-            route.origin_machine.to_string(),
-            route.execution_machine.to_string(),
             serde_json::to_string(&event)?,
             serde_json::to_string(&delivery)?,
         ],
     )?;
     route.last_accepted_seq = seq.get();
-    route.last_updated_at = Some(Utc::now());
+    route.last_updated_at = Utc::now();
     save_route_on(conn, route)?;
     record_outcome_on(conn, route.task, outcome)?;
     Ok(())
@@ -172,28 +166,12 @@ pub(super) fn refused_launch_ending(reason: &str) -> UnlaunchedEnding {
 /// so its closure is its ending
 fn closed_route_outcome(route: &OriginRoute) -> Option<TaskOutcome> {
     match &route.submission {
-        SubmissionState::Rejected { .. }
-        | SubmissionState::Resource {
-            phase: ResourceRoutePhase::Rejected { .. },
-            ..
-        }
-        | SubmissionState::ResourceAction {
-            phase: ResourceActionRoutePhase::Rejected { .. },
-            ..
-        } => Some(TaskOutcome::Failed),
-        SubmissionState::Resource {
-            phase: ResourceRoutePhase::CancelledBeforeLaunch,
-            ..
-        }
-        | SubmissionState::Held {
+        SubmissionState::Rejected { .. } => Some(TaskOutcome::Failed),
+        SubmissionState::Held {
             phase: HeldPhase::Cancelled { .. },
         } => Some(TaskOutcome::Cancelled),
-        // a refused background launch can still be proven accepted by its first event
         SubmissionState::AcceptanceUnknown
         | SubmissionState::Accepted
-        | SubmissionState::Resource { .. }
-        | SubmissionState::ResourceAction { .. }
-        | SubmissionState::ResourceBackground { .. }
         | SubmissionState::Held { .. } => None,
     }
 }
@@ -201,9 +179,8 @@ fn closed_route_outcome(route: &OriginRoute) -> Option<TaskOutcome> {
 /// How a dependency with no saved outcome ended, or `None` while it runs
 ///
 /// Every terminal event saves its outcome with the route's terminal state, so
-/// a terminal state without one means the event that named it is gone. That
-/// happens only to a task that ended before outcomes were saved, and its
-/// process status cannot stand in for the outcome
+/// a terminal state without one breaks that rule. Its process status cannot
+/// stand in for the outcome, so it reads as unknown, which never releases
 fn unrecorded_outcome(route: &OriginRoute) -> Option<DependencyOutcome> {
     if let Some(outcome) = closed_route_outcome(route) {
         return Some(outcome.into());
@@ -309,15 +286,11 @@ impl Store {
     }
 
     fn unlaunched(&self, held: DependentRoute) -> Result<UnlaunchedTask, AppError> {
-        let callback = match self.terminal_callback_delivery(held.route.task)? {
-            None
-            | Some(DeliveryState::NotRequired)
-            | Some(DeliveryState::PendingDelivery { attempts: 0, .. }) => CallbackStatus::Pending,
-            Some(DeliveryState::PendingDelivery { .. }) => CallbackStatus::Sending,
-            Some(DeliveryState::AwaitingThread { .. }) => CallbackStatus::Waiting,
-            Some(DeliveryState::Delivered { .. }) => CallbackStatus::Sent,
-            Some(DeliveryState::DeliveryFailed { .. }) => CallbackStatus::Failed,
-        };
+        let callback = self
+            .terminal_callback_delivery(held.route.task)?
+            .as_ref()
+            .and_then(DeliveryState::callback_status)
+            .unwrap_or(CallbackStatus::Pending);
         Ok(UnlaunchedTask { held, callback })
     }
 
@@ -353,30 +326,41 @@ impl Store {
     pub fn dependency_states(&self, tasks: &[TaskId]) -> Result<DependencyLookup, AppError> {
         tasks
             .iter()
-            .map(|task| {
-                let saved: Option<(String, Option<String>)> = self
-                    .conn
-                    .query_row(
-                        "SELECT route_json,outcome FROM origin_routes WHERE task_id=?1",
-                        [task.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                let Some((route_json, outcome)) = saved else {
-                    return Ok((*task, None));
-                };
-                let outcome = match outcome {
-                    Some(outcome) => Some(DependencyOutcome::Known(
-                        TaskOutcome::from_storage(&outcome).ok_or_else(|| AppError::Internal {
-                            message: format!("unknown task outcome {outcome} for {task}"),
-                        })?,
-                    )),
-                    None => unrecorded_outcome(&decode_route(&route_json)?),
-                };
-                let state = outcome.map_or(DependencyState::Pending, DependencyState::Ended);
-                Ok((*task, Some(state)))
-            })
+            .map(|&task| self.dependency_state(task).map(|state| (task, state)))
             .collect()
+    }
+
+    fn dependency_state(&self, task: TaskId) -> Result<Option<DependencyState>, AppError> {
+        if self.job_run_link(task)?.is_some() {
+            return Err(AppError::Usage {
+                message: format!(
+                    "run task {task} cannot be used in after; job dependencies are not supported"
+                ),
+            });
+        }
+
+        let saved: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT route_json,outcome FROM origin_routes WHERE task_id=?1",
+                [task.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((route_json, outcome)) = saved else {
+            return Ok(None);
+        };
+
+        let outcome = match outcome {
+            Some(outcome) => Some(DependencyOutcome::Known(
+                TaskOutcome::from_storage(&outcome).ok_or_else(|| AppError::Internal {
+                    message: format!("unknown task outcome {outcome} for {task}"),
+                })?,
+            )),
+            None => unrecorded_outcome(&decode_route(&route_json)?),
+        };
+        let state = outcome.map_or(DependencyState::Pending, DependencyState::Ended);
+        Ok(Some(state))
     }
 
     /// Cancel a held route before launch and queue its `TASK_CANCELLED` event
@@ -441,7 +425,7 @@ impl Store {
             route.submission = SubmissionState::Held {
                 phase: HeldPhase::Launching,
             };
-            route.last_updated_at = Some(Utc::now());
+            route.last_updated_at = Utc::now();
             save_route_on(&tx, &route)?;
         }
         tx.commit()?;

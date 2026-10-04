@@ -1,7 +1,7 @@
 //! State directory resolution and task directory layout.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use crate::message::MessageId;
 /// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
 /// SQLite database file name under `$HOMEBASED_HOME`.
-pub const DB_NAME: &str = "homebased.sqlite";
+pub const DB_NAME: &str = "homebased_v1.sqlite";
 /// Daemon singleton lock file name under `$HOMEBASED_HOME`.
 pub const DAEMON_LOCK: &str = "daemon.lock";
 /// Log that records callbacks `codex queue` could not deliver.
@@ -68,6 +68,9 @@ impl Home {
     /// Create the root directory if needed.
     pub fn ensure(&self) -> Result<(), AppError> {
         fs::create_dir_all(self.tasks_dir())?;
+        // job state directories are 0777 so container users can write, so the
+        // root must keep other host users out
+        fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
@@ -156,7 +159,7 @@ pub struct OutputTail {
     /// Log text. Tailed text is the kept lines joined with `\n` and carries no
     /// trailing newline.
     pub text: String,
-    /// Whether earlier lines were dropped.
+    /// Whether earlier lines or bytes were dropped
     pub truncated: bool,
 }
 
@@ -249,32 +252,62 @@ impl TaskPaths {
     }
 
     /// Read `output.log`, keeping only the last `tail` lines when asked.
-    /// `tail` is capped at [`MAX_TAIL_LINES`]. `Ok(None)` means the file does
+    /// `tail` is capped at [`MAX_TAIL_LINES`] and reads at most [`MAX_TAIL_BYTES`]. `Ok(None)` means the file does
     /// not exist: either the child has written nothing yet, or the task id has
     /// no directory.
     ///
     /// Child output is arbitrary bytes, so invalid UTF-8 is replaced rather
     /// than rejected.
     pub fn read_output(&self, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
-        let bytes = match fs::read(&self.output) {
-            Ok(bytes) => bytes,
+        let mut file = match File::open(&self.output) {
+            Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
         let Some(tail) = tail else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
             return Ok(Some(OutputTail {
-                text,
+                text: String::from_utf8_lossy(&bytes).into_owned(),
                 truncated: false,
             }));
         };
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(tail.min(MAX_TAIL_LINES));
-        Ok(Some(OutputTail {
-            text: lines[start..].join("\n"),
-            truncated: start > 0,
-        }))
+        Ok(Some(read_tail(&mut file, tail.min(MAX_TAIL_LINES))?))
     }
+}
+
+/// Maximum bytes read for a tail, including a log with no line breaks
+pub const MAX_TAIL_BYTES: usize = 1024 * 1024;
+
+fn read_tail(file: &mut File, tail: usize) -> std::io::Result<OutputTail> {
+    let mut position = file.metadata()?.len();
+    if tail == 0 {
+        return Ok(OutputTail {
+            text: String::new(),
+            truncated: position > 0,
+        });
+    }
+    let mut chunks = Vec::new();
+    let mut bytes_read = 0;
+    let mut newlines = 0;
+    while position > 0 && bytes_read < MAX_TAIL_BYTES && newlines <= tail {
+        let length = position.min(8192).min((MAX_TAIL_BYTES - bytes_read) as u64) as usize;
+        position -= length as u64;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; length];
+        file.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        bytes_read += length;
+        chunks.push(chunk);
+    }
+    let bytes: Vec<u8> = chunks.into_iter().rev().flatten().collect();
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    Ok(OutputTail {
+        text: lines[start..].join("\n"),
+        truncated: position > 0 || start > 0,
+    })
 }
 
 /// Whether `flock_exclusive` waits for a held lock.
@@ -331,6 +364,51 @@ pub fn chmod_600(path: &Path) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bugfix_tail_bounds_a_log_with_a_very_long_line() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let home = super::Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        let paths = home.task_paths(crate::domain::TaskId::new());
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let mut file = std::fs::File::create(&paths.output).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(-4)).unwrap();
+        file.write_all(b"end\n").unwrap();
+        let output = paths.read_output(Some(1)).unwrap().unwrap();
+        assert!(output.text.len() <= 1024 * 1024);
+        assert!(output.text.ends_with("end"));
+        assert!(output.truncated);
+        let empty = paths.read_output(Some(0)).unwrap().unwrap();
+        assert!(empty.text.is_empty());
+        assert!(empty.truncated);
+    }
+
+    #[test]
+    fn bugfix_tail_preserves_line_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = super::Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        let paths = home.task_paths(crate::domain::TaskId::new());
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        for body in [
+            "",
+            "one",
+            "one\n",
+            "one\r\ntwo\r\n",
+            "\n\n",
+            "one\ntwo\nthree",
+        ] {
+            std::fs::write(&paths.output, body).unwrap();
+            for tail in 0..4 {
+                let lines: Vec<_> = body.lines().collect();
+                let start = lines.len().saturating_sub(tail);
+                let output = paths.read_output(Some(tail)).unwrap().unwrap();
+                assert_eq!(output.text, lines[start..].join("\n"), "{body:?}, {tail}");
+                assert_eq!(output.truncated, start > 0, "{body:?}, {tail}");
+            }
+        }
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::sync::Mutex;

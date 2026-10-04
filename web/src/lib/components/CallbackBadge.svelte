@@ -21,13 +21,23 @@
 	import { cn } from '$lib/utils';
 
 	interface Props {
-		callback: CallbackStatus;
+		/** Null when this machine delivers no callback for the task */
+		callback: CallbackStatus | null;
 		class?: string;
 	}
 
 	let { callback, class: className }: Props = $props();
 </script>
 
-<span class={cn(callbackBadge({ callback }), className)} title="callback delivery">
-	{callback}
-</span>
+{#if callback}
+	<span class={cn(callbackBadge({ callback }), className)} title="callback delivery">
+		{callback}
+	</span>
+{:else}
+	<span
+		class={cn('font-mono text-[11px] text-muted-foreground', className)}
+		title="this machine delivers no callback for this task"
+	>
+		—
+	</span>
+{/if}

@@ -2,13 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
 use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
-    ResourceCancellationRequestIdentity,
 };
 use crate::daemon::actors::send_reply;
 use crate::dependency::{DependencyLookup, HeldCancellation, TaskDependencies};
@@ -27,86 +25,15 @@ use crate::message::{
     MessageAttempt, MessageDelivery, MessageId, MessageReceipt, MessageSendRequest,
     OutboundMessageBinding, Recipient,
 };
-use crate::resource::operator_release::{OperatorGpuFreeAttestation, OperatorGpuFreeResolution};
-use crate::resource::ownership_lock::VerifiedTrainerAttempt;
-use crate::resource::release_watcher::{ReleaseWatcherPollOutcome, ReleaseWatcherPollRequest};
-use crate::resource::store::{
-    AcceptedResourceTask, AssignedResourceTaskReconcileInput, AssignedResourceTaskReconcileOutcome,
-    CompleteReleaseError, OpenReleaseLoanError, PreLaunchFailure, ReleaseCheckpointError,
-    ReleaseCompletionResult, ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError,
-    ReleaseWatcherAcceptanceInput, ResourceQueueReconcileError, ResourceSnapshot,
-    ResourceStoreError, ResourceTaskAcceptance, ResourceTaskAcceptanceInput, ReturnDeadlineOutcome,
-    SupervisorNoticeStoreError, TrainerAttemptAssociationStoreError,
-};
-use crate::resource::{
-    ActionId, DeliveryAttemptId, NoticeId, ReleaseCheckpointBaseline, ReleaseWatcherIntent,
-    Resource, ResourceId, ResourceQueueReconcileOutcome, ResourceRequest, ResourceRevision,
-    SupervisorActionAuthority, SupervisorAddress, SupervisorNotice, TrainerAttemptAssociation,
-};
-use crate::resource::{ReturnDecisionWindow, ReturnLaunch};
 use crate::spec::NormalizedSpec;
 use crate::store::{
-    AcceptedActionTask, BackgroundLaunchAcceptance, BackgroundLaunchError, BackgroundLaunchInput,
-    BackgroundLaunchView, EndedRestoreResolution, PreparedReturnTask, RemoteBackgroundLaunchInput,
-    RemoteReleaseWatcherAcceptanceInput, ResourceActionError, RestoreReconcileOutcome,
-    ReturnClosure, ReturnDecisionError, ReturnTaskAcceptance, ReturnTaskAcceptanceInput,
-};
-use crate::store::{
-    CancelResult, HeldCancel, LocalAdmission, OperatorGpuFreeError, Store, TaskPresentation,
+    CancelResult, HeldCancel, IdentityError, LocalAdmission, Store, TaskPresentation,
     UnlaunchedTask,
-};
-use crate::store::{IdentityError, ResourceActionRouteResult, ResourceBackgroundRouteResult};
-use crate::store::{
-    ResourceControlError, ResourceControlRequest, ResourceControlStart, ResourceReadModel,
-    SupervisorReplacement,
 };
 use crate::submission::{
     CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute, RejectionTombstone,
-    RequestId, ResourceCancellationReceipt, ResourceQueueReceipt, SubmissionState,
+    RequestId, SubmissionState,
 };
-
-fn control_error(
-    error: ResourceControlError,
-    resource: ResourceId,
-    operation: Option<uuid::Uuid>,
-    expected: ResourceRevision,
-) -> AppError {
-    match error {
-        ResourceControlError::NotFound => AppError::ResourceNotFound { resource },
-        ResourceControlError::WrongAuthority { expected, found } => {
-            AppError::MachineIdentityMismatch {
-                expected,
-                found: Some(found),
-            }
-        }
-        ResourceControlError::StaleRevision { current } => AppError::ResourceStaleRevision {
-            resource,
-            expected: expected.get(),
-            current: current.get(),
-        },
-        ResourceControlError::Conflict => AppError::ResourceOperationConflict {
-            resource,
-            operation,
-            message: "operation identity already names different content".into(),
-        },
-        ResourceControlError::NotAllowed(message) => {
-            AppError::ResourceActionNotAllowed { resource, message }
-        }
-        ResourceControlError::Notice(SupervisorNoticeStoreError::Storage(error))
-        | ResourceControlError::Storage(error) => error.into(),
-        ResourceControlError::Notice(error @ SupervisorNoticeStoreError::CorruptRecord { .. }) => {
-            AppError::Internal {
-                message: error.to_string(),
-            }
-        }
-        ResourceControlError::Notice(error) => AppError::ResourceActionNotAllowed {
-            resource,
-            message: error.to_string(),
-        },
-        ResourceControlError::Json(error) => error.into(),
-        ResourceControlError::Resource(error) => resource_error(error, None, None),
-    }
-}
 
 fn identity_error(error: IdentityError) -> AppError {
     match error {
@@ -117,97 +44,6 @@ fn identity_error(error: IdentityError) -> AppError {
             message: "executor identity disappeared".into(),
         },
         IdentityError::Storage(error) => error,
-    }
-}
-
-fn resource_error(
-    error: ResourceStoreError,
-    task: Option<TaskId>,
-    request: Option<RequestId>,
-) -> AppError {
-    match error {
-        ResourceStoreError::Conflict(reason) => task.map_or_else(
-            || AppError::Usage {
-                message: format!("resource identity conflict: {reason}"),
-            },
-            |task| AppError::ClusterTaskConflict { task },
-        ),
-        ResourceStoreError::RegistrationConflict { resource } => {
-            AppError::ResourceOperationConflict {
-                resource,
-                operation: None,
-                message: "resource identity is already registered with different content".into(),
-            }
-        }
-        ResourceStoreError::Prevented => match (request, task) {
-            (Some(request), Some(task)) => AppError::SubmissionRejected {
-                request,
-                task,
-                reason: "cancelled_before_acceptance".into(),
-            },
-            _ => AppError::Usage {
-                message: "resource request was prevented before acceptance".into(),
-            },
-        },
-        ResourceStoreError::ResourceNotFound => AppError::Usage {
-            message: "resource not found".into(),
-        },
-        ResourceStoreError::WrongAuthority { expected, found } => {
-            AppError::MachineIdentityMismatch {
-                expected,
-                found: Some(found),
-            }
-        }
-        ResourceStoreError::OriginRouteNotFound { task } => AppError::RouteNotFound { task },
-        ResourceStoreError::ExecutorAlreadyAccepted { task } => {
-            AppError::ClusterTaskConflict { task }
-        }
-        ResourceStoreError::Identity(IdentityError::Conflict) => task.map_or_else(
-            || AppError::Usage {
-                message: "resource executor identity conflict".into(),
-            },
-            |task| AppError::ClusterTaskConflict { task },
-        ),
-        ResourceStoreError::Identity(IdentityError::RouteNotFound) => AppError::Internal {
-            message: "executor identity disappeared during resource cancellation".into(),
-        },
-        ResourceStoreError::Identity(IdentityError::Storage(error)) => error,
-        ResourceStoreError::InvalidCommandSpec(error) => AppError::Usage {
-            message: error.to_string(),
-        },
-        error @ ResourceStoreError::UnsupportedCommandOwnership { .. } => AppError::Usage {
-            message: error.to_string(),
-        },
-        // a definitive refusal, so the origin saves it instead of retrying an unknown outcome
-        ResourceStoreError::HostInputRejected(error) => match (request, task) {
-            (Some(request), Some(task)) => AppError::SubmissionRejected {
-                request,
-                task,
-                reason: error.rejection.as_str().into(),
-            },
-            _ => error.error,
-        },
-        ResourceStoreError::TaskPreparation(error) => error,
-        ResourceStoreError::TaskRow(error) => error,
-        ResourceStoreError::Event(error) => event_error(error),
-        ResourceStoreError::ReturnDecisionRead(message) => AppError::Internal { message },
-        error @ ResourceStoreError::CorruptRecord { .. } => AppError::Internal {
-            message: error.to_string(),
-        },
-        ResourceStoreError::Storage(error) => error.into(),
-    }
-}
-
-fn resource_queue_reconcile_error(error: ResourceQueueReconcileError) -> AppError {
-    match error {
-        ResourceQueueReconcileError::Resource(error)
-        | ResourceQueueReconcileError::Release(OpenReleaseLoanError::Resource(error)) => {
-            resource_error(error, None, None)
-        }
-        ResourceQueueReconcileError::Storage(error) => error.into(),
-        ResourceQueueReconcileError::Release(error) => AppError::Internal {
-            message: format!("resource queue reconciliation failed: {error}"),
-        },
     }
 }
 
@@ -223,411 +59,186 @@ fn event_error(error: EventError) -> AppError {
 
 /// Messages for daemon SQLite operations
 pub(crate) enum StoreMsg {
-    /// Migrate historical local rows before supervisor recovery begins
-    MigrateLegacyLocal {
+    /// Retained authority events for sequence gap recovery
+    QueueEvents {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobEvent>, AppError>>,
+    },
+    /// Public queue operation, dispatched only through the store API
+    QueueInterface {
         machine: MachineId,
+        request: Box<crate::store::queue::interface::QueueRequest>,
+        env: crate::domain::TaskEnv,
+        reply: RpcReplyPort<Result<serde_json::Value, AppError>>,
+    },
+    /// Origin route lookup
+    JobRoute {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
+    },
+    /// Save origin routing before any submit reaches the authority
+    InsertJobRoute {
+        route: Box<crate::queue::delivery::JobRoute>,
+        reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
+    },
+    /// Retain the authority's submission result
+    ResolveJobRoute {
+        job: crate::queue::JobId,
+        submission: crate::queue::delivery::JobSubmission,
+        target: Option<crate::queue::Target>,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Register or reuse one resource on its fixed authority
-    RegisterResource {
-        authority_machine: MachineId,
-        resource: Box<Resource>,
-        reply: RpcReplyPort<Result<Resource, AppError>>,
+    /// First unacknowledged event per authority job
+    PendingJobOutbox {
+        reply: RpcReplyPort<Result<Vec<crate::queue::delivery::RoutedJobEvent>, AppError>>,
     },
-    /// Read durable resource state owned by this authority
-    ResourceReadModels {
-        /// Local authority identity
-        authority_machine: MachineId,
-        /// One resource, or every resource owned by the authority
-        resource_id: Option<ResourceId>,
-        /// Resource, loan, request, and notice state
-        reply: RpcReplyPort<Result<Vec<ResourceReadModel>, AppError>>,
+    /// Retain the origin's acknowledgement
+    AckJobEvent {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Commit one idempotent resource control before its external effect
-    BeginResourceControl {
-        /// Local authority identity
-        authority_machine: MachineId,
-        /// Stable caller retry identity
-        operation_id: uuid::Uuid,
-        /// Immutable operation content
-        request: Box<ResourceControlRequest>,
-        /// Attempt identity to reserve when the control is a first renotify
-        attempt_id: DeliveryAttemptId,
-        /// Committed effect or typed refusal
-        reply: RpcReplyPort<Result<ResourceControlStart, AppError>>,
+    /// Deduplicate and accept an authority event
+    AcceptJobEvent {
+        event: Box<crate::queue::delivery::RoutedJobEvent>,
+        reply: RpcReplyPort<Result<EventAcceptance, AppError>>,
     },
-    /// Replace one resource supervisor and retarget undelivered notices
-    ReplaceResourceSupervisor {
-        /// Local authority identity
-        authority_machine: MachineId,
-        /// Resource whose supervisor changes
-        resource_id: ResourceId,
-        /// Resource revision the caller observed
-        expected_revision: ResourceRevision,
-        /// Exact new supervisor thread
-        supervisor: SupervisorAddress,
-        /// New assignment and retargeted notices
-        reply: RpcReplyPort<Result<SupervisorReplacement, AppError>>,
-    },
-    /// Load the local authority's resources and non-closed loans for startup
-    ResourceSnapshotsForAuthority {
-        authority_machine: MachineId,
-        reply: RpcReplyPort<Result<Vec<ResourceSnapshot>, AppError>>,
-    },
-    /// Bind verified trainer attempt evidence to an authority-owned registered task
-    BindTrainerAttemptAssociationForAuthority {
-        /// Fixed authority recorded on the resource
-        authority_machine: MachineId,
-        /// Resource that registered the trainer task
-        resource_id: ResourceId,
-        /// Exact registered Homebased background task
-        task_id: TaskId,
-        /// Point-in-time trainer request and held-lock evidence
-        verified_attempt: Box<VerifiedTrainerAttempt>,
-        /// Typed durable association result
+    /// First undelivered event per origin job
+    PendingJobInbox {
         reply: RpcReplyPort<
             Result<
-                Result<TrainerAttemptAssociation, TrainerAttemptAssociationStoreError>,
+                Vec<(
+                    crate::queue::delivery::JobRoute,
+                    crate::queue::delivery::RoutedJobEvent,
+                )>,
                 AppError,
             >,
         >,
     },
-    /// Read a historical trainer association by its exact task identity
-    TrainerAttemptAssociationForTaskForAuthority {
-        /// Fixed authority recorded on the associated resource
-        authority_machine: MachineId,
-        /// Exact historical task identity
-        task_id: TaskId,
-        /// Typed durable association result, if one exists
-        reply: RpcReplyPort<
-            Result<
-                Result<Option<TrainerAttemptAssociation>, TrainerAttemptAssociationStoreError>,
-                AppError,
-            >,
-        >,
+    /// Settle an obsolete blocked notice without callback delivery
+    SuppressJobNotice {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Read exact accepted task identities from authority-owned resource assignments
-    AcceptedResourceTasksForAuthority {
-        authority_machine: MachineId,
-        reply: RpcReplyPort<Result<Vec<AcceptedResourceTask>, AppError>>,
+    /// Advance only after callback delivery succeeds
+    SettleJobEvent {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Accept a command request and allocate its immutable acceptance identity
-    AcceptResourceRequest {
-        authority_machine: MachineId,
-        request_id: RequestId,
-        task_id: TaskId,
-        resource_id: ResourceId,
-        origin_machine: MachineId,
-        normalized_spec: Box<NormalizedSpec>,
-        reply: RpcReplyPort<Result<ResourceRequest, AppError>>,
+    /// Wake the local queue after task mutations; worker commits also have a recovery scan
+    WatchQueue {
+        queue: ActorRef<super::queue::QueueMsg>,
     },
-    /// Atomically accept the exact request selected by a Serving loan as a queued task
-    AcceptAssignedResourceTask {
-        /// Selection identity, immutable spec, and executor runtime environment
-        input: Box<ResourceTaskAcceptanceInput>,
-        /// Typed task-layer result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
+    /// Fail executable resolution without exposing a launchable reservation
+    QueueLaunchFailed {
+        machine: MachineId,
+        job: crate::queue::JobId,
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        message: String,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Accept the exact request selected by a Serving loan as a task that must fail before launch
-    AcceptUnlaunchableResourceTask {
-        /// Selection identity, immutable spec, and executor runtime environment
-        input: Box<ResourceTaskAcceptanceInput>,
-        /// Why the task ends before launch
-        failure: PreLaunchFailure,
-        /// Typed task-layer result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ResourceTaskAcceptance, ResourceStoreError>, AppError>>,
+    /// Typed queue store operation
+    QueueDetect {
+        machine: MachineId,
+        detected: Vec<crate::queue::gpu::DetectedResource>,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::ResourceRecord>, AppError>>,
     },
-    /// Reconcile one exact assigned task and atomically advance only after its exit proof
-    AssignedResourceTaskReconcile {
-        /// Exact resource, loan, request, task, and expected revision to reconcile
-        input: AssignedResourceTaskReconcileInput,
-        /// Typed evidence result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<AssignedResourceTaskReconcileOutcome, ResourceStoreError>, AppError>,
-        >,
+    /// Typed queue store operation
+    QueueSnapshot {
+        machine: MachineId,
+        now: chrono::DateTime<chrono::Utc>,
+        thresholds: crate::queue::schedule::NoticeThresholds,
+        reply: RpcReplyPort<Result<crate::queue::schedule::Snapshot, AppError>>,
     },
-    /// Read all requests for one resource in serving order
-    ResourceRequests {
-        authority_machine: MachineId,
-        resource_id: ResourceId,
-        reply: RpcReplyPort<Result<Vec<ResourceRequest>, AppError>>,
+    /// Typed queue store operation
+    QueueResources {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::ResourceRecord>, AppError>>,
     },
-    /// Reconcile one resource queue from current authority-owned state
-    ReconcileResourceQueue {
-        /// Fixed authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource queue to reconcile
-        resource_id: ResourceId,
-        /// Typed durable-state result, including fail-closed attention reasons
-        reply: RpcReplyPort<Result<ResourceQueueReconcileOutcome, AppError>>,
+    /// Typed queue store operation
+    QueueJob {
+        id: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Option<crate::store::queue::JobRecord>, AppError>>,
     },
-    /// Read a durable resource cancellation receipt, checking its full identity
-    ResourceCancellationReceipt {
-        /// Stable resource cancellation identity
-        identity: ResourceCancellationRequestIdentity,
-        /// Saved authority result, if this identity was already handled
-        reply: RpcReplyPort<Result<Option<ResourceCancellationReceipt>, AppError>>,
+    /// Typed queue store operation
+    QueueJobEnv {
+        id: crate::queue::JobId,
+        reply: RpcReplyPort<Result<TaskEnv, AppError>>,
     },
-    /// Cancel a queued or assigned resource request and retain its exact authority result
-    CancelResourceRequestWithReceipt {
-        /// Fixed authority that owns the resource queue
-        authority_machine: MachineId,
-        /// Stable resource cancellation identity
-        identity: ResourceCancellationRequestIdentity,
-        /// Exact validated origin-route proof
-        proof: crate::submission::ResourceRouteProof,
-        /// Durable resource cancellation result
-        reply: RpcReplyPort<Result<ResourceCancellationReceipt, AppError>>,
+    /// Typed queue store operation
+    QueueCheckpoint {
+        task: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::queue::checkpoint::Checkpoint>, AppError>>,
     },
-    /// Bind a preallocated watcher launch identity to the saved release action
-    BindReleaseWatcherForAuthority {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose release action owns this watcher
-        resource_id: ResourceId,
-        /// Exact action, revision, observed task, watcher task, request, and spec digest
-        intent: ReleaseWatcherIntent,
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReleaseWatcherIntent, ResourceStoreError>, AppError>>,
+    /// Typed queue store operation
+    QueueReserve {
+        machine: MachineId,
+        job: crate::queue::JobId,
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        binary: PathBuf,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<crate::queue::ActiveRun, AppError>>,
     },
-    /// Capture the exact trainer checkpoint baseline before the watcher is accepted
-    CaptureReleaseCheckpointBaselineForAuthority {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose release action owns the baseline
-        resource_id: ResourceId,
-        /// Stable release action identity
-        action_id: ActionId,
-        /// Resource revision observed with the release notice
-        expected_state_revision: ResourceRevision,
-        /// Typed checkpoint baseline or attention result
-        reply: RpcReplyPort<
-            Result<Result<ReleaseCheckpointBaseline, ReleaseCheckpointError>, AppError>,
-        >,
+    /// Typed queue store operation
+    QueueStop {
+        stop: crate::queue::schedule::Preempt,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<Option<crate::queue::ActiveRun>, AppError>>,
     },
-    /// Atomically bind and persist the one co-located fixed-ID watcher acceptance
-    AcceptReleaseWatcherForAuthority {
-        /// Fixed task, callback, action, and owner data to accept
-        input: Box<ReleaseWatcherAcceptanceInput>,
-        /// Typed storage outcome inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<ReleaseWatcherAcceptance, ReleaseWatcherAcceptanceError>, AppError>,
-        >,
+    /// Typed queue store operation
+    QueueBeginCleanup {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        reply: RpcReplyPort<Result<u32, AppError>>,
     },
-    /// Validate one authority-local watcher poll and advance its saved stop decision
-    PollReleaseWatcherForAuthority {
-        /// Machine that must own the polled resource
-        authority_machine: MachineId,
-        /// Exact identities sent by the watcher command
-        request: ReleaseWatcherPollRequest,
-        /// Typed poll decision; errors are storage failures the watcher may retry
-        reply: RpcReplyPort<
-            Result<Result<ReleaseWatcherPollOutcome, ReleaseCheckpointError>, AppError>,
-        >,
+    /// Typed queue store operation
+    QueueCleanupResult {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        attempt: u32,
+        result: Result<(), crate::queue::CleanupFailure>,
+        reply: RpcReplyPort<Result<Option<crate::queue::RunPhase>, AppError>>,
     },
-    /// Complete a saved release action and keep the storage result typed
-    CompleteReleaseForAuthority {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose saved release action is completed
-        resource_id: ResourceId,
-        /// Stable identity of the release action
-        action_id: ActionId,
-        /// Resource revision observed with the release notice
-        expected_state_revision: ResourceRevision,
-        /// Storage result inside actor and transport errors
-        reply:
-            RpcReplyPort<Result<Result<ReleaseCompletionResult, CompleteReleaseError>, AppError>>,
+    /// Typed queue store operation
+    QueueAbandon {
+        resource: crate::queue::ResourceId,
+        task: TaskId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
     },
-    /// Close one exact AwaitingReturn loan with an explicit no-resume decision
-    RecordNoResumeForAuthority {
-        /// Exact supervisor authority for the pending return action
-        authority: SupervisorActionAuthority,
-        /// Supervisor's durable decision reason
-        reason: String,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
+    /// Typed queue store operation
+    QueueRecordHead {
+        machine: MachineId,
+        head: Option<(crate::queue::JobId, chrono::DateTime<chrono::Utc>)>,
+        reply: RpcReplyPort<Result<Option<crate::queue::schedule::StoredEpisode>, AppError>>,
     },
-    /// Move the decision deadline of one exact AwaitingReturn action
-    HoldReturnForAuthority {
-        /// Exact supervisor authority for the pending return action
-        authority: SupervisorActionAuthority,
-        /// Requested decision time from now, capped by the window limit
-        hold: Duration,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReturnDecisionWindow, ReturnDecisionError>, AppError>>,
+    /// Typed queue store operation
+    QueueBlocked {
+        machine: MachineId,
+        episode: crate::queue::schedule::StoredEpisode,
+        thresholds: crate::queue::schedule::NoticeThresholds,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<bool, AppError>>,
     },
-    /// Serve the next queued request once the pending return action's window closed
-    ServeAfterReturnDeadline {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose AwaitingReturn loan is checked
-        resource_id: ResourceId,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReturnDeadlineOutcome, ResourceStoreError>, AppError>>,
+    /// Typed queue store operation
+    QueueProtected {
+        reply: RpcReplyPort<Result<Vec<i32>, AppError>>,
     },
-    /// Bind one fixed return task to its action and enter Restoring
-    AcceptReturnTaskForAuthority {
-        /// Authority, fixed identities, typed work, and executor context
-        input: Box<ReturnTaskAcceptanceInput>,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReturnTaskAcceptance, ReturnDecisionError>, AppError>>,
+    /// Typed queue store operation
+    QueueTaskJob {
+        task: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::queue::JobId>, AppError>>,
     },
-    /// Observe one Restoring loan and close it only on a confirmed start
-    ReconcileRestoringLoanForAuthority {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose Restoring loan is observed
-        resource_id: ResourceId,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<RestoreReconcileOutcome, ReturnDecisionError>, AppError>>,
+    /// Typed queue store operation
+    QueueCheckDue {
+        task: TaskId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
     },
-    /// Close a Restoring loan after the supervisor resolves an early task end
-    ResolveEndedRestoreForAuthority {
-        /// Exact authority, bound task, and supervisor reason
-        resolution: Box<EndedRestoreResolution>,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<ReturnClosure, ReturnDecisionError>, AppError>>,
-    },
-    /// Save one operator attestation that a resource with no history starts idle
-    AttestInitialIdleForAuthority {
-        /// Local daemon machine, which must be the resource authority
-        authority_machine: MachineId,
-        /// Exact operator attestation
-        attestation: Box<crate::resource::initial_idle::InitialIdleAttestation>,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<
-                Result<
-                    crate::resource::initial_idle::InitialIdleResolution,
-                    crate::store::InitialIdleError,
-                >,
-                AppError,
-            >,
-        >,
-    },
-    /// Commit one operator attestation that an ended registered trainer no longer holds its GPU
-    ///
-    /// The store saves the receipt and the queue or loan transition in one
-    /// transaction, or returns a typed refusal with no records
-    AttestTrainerGpuFreeForAuthority {
-        /// Local daemon machine, which must be the resource authority
-        authority_machine: MachineId,
-        /// Exact operator attestation
-        attestation: Box<OperatorGpuFreeAttestation>,
-        /// Typed storage result inside actor and transport errors
-        reply:
-            RpcReplyPort<Result<Result<OperatorGpuFreeResolution, OperatorGpuFreeError>, AppError>>,
-    },
-    /// Derive the canonical return task for a remote supervisor without binding it
-    PrepareReturnTaskForAuthority {
-        /// Exact supervisor authority for the pending return action
-        authority: SupervisorActionAuthority,
-        /// Supervisor-chosen fixed identities and typed work
-        launch: Box<ReturnLaunch>,
-        /// Executor environment for a supervisor-supplied command
-        executor_env: TaskEnv,
-        /// Canonical spec and digest inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<PreparedReturnTask, ReturnDecisionError>, AppError>>,
-    },
-    /// Accept one remote-supervisor release watcher for its exact saved intent
-    AcceptRemoteReleaseWatcherForAuthority {
-        /// Authority, fixed identities, and canonical task
-        input: Box<RemoteReleaseWatcherAcceptanceInput>,
-        /// Saved receipt and whether this call inserted the task
-        reply: RpcReplyPort<Result<Result<AcceptedActionTask, ResourceActionError>, AppError>>,
-    },
-    /// Read the release-watcher task identities bound by non-closed loans on this authority
-    ReleaseWatcherTasksForAuthority {
-        /// Authority machine recorded on the resources
-        authority_machine: MachineId,
-        /// Bound watcher task identities
-        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
-    },
-    /// Read the task identities bound by Restoring loans on this authority
-    RestoringTasksForAuthority {
-        /// Authority machine recorded on the resources
-        authority_machine: MachineId,
-        /// Bound return task identities
-        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
-    },
-    /// Bind one first background launch; only an inserted launch may spawn
-    AcceptBackgroundLaunchForAuthority {
-        /// Fixed identities, full spec, and co-located executor context
-        input: Box<BackgroundLaunchInput>,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
-        >,
-    },
-    /// Bind one remote supervisor's first background launch; only an insertion may spawn
-    AcceptRemoteBackgroundLaunchForAuthority {
-        /// Fixed identities, digest, supervisor assignment, spec, and authority environment
-        input: Box<RemoteBackgroundLaunchInput>,
-        /// Typed storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<BackgroundLaunchAcceptance, BackgroundLaunchError>, AppError>,
-        >,
-    },
-    /// Read the latest first background launch of one resource
-    BackgroundLaunchForAuthority {
-        /// Authority machine recorded on the resource
-        authority_machine: MachineId,
-        /// Resource whose launch is read
-        resource_id: ResourceId,
-        /// Latest launch and its derived task-layer phase
-        reply: RpcReplyPort<Result<Option<BackgroundLaunchView>, AppError>>,
-    },
-    /// Read the tasks of first background launches whose rows are still queued
-    QueuedBackgroundLaunchTasksForAuthority {
-        /// Authority machine recorded on the resources
-        authority_machine: MachineId,
-        /// Queued launch task identities
-        reply: RpcReplyPort<Result<Vec<TaskId>, AppError>>,
-    },
-    /// Read one durable supervisor notice
-    SupervisorNotice {
-        /// Stable notice identity
-        notice_id: NoticeId,
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<Option<SupervisorNotice>, SupervisorNoticeStoreError>, AppError>,
-        >,
-    },
-    /// List notices that can receive another delivery attempt
-    PendingSupervisorNotices {
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<Vec<SupervisorNotice>, SupervisorNoticeStoreError>, AppError>,
-        >,
-    },
-    /// Reserve one exact supervisor notice delivery attempt
-    ReserveSupervisorNoticeAttempt {
-        /// Stable notice identity
-        notice_id: NoticeId,
-        /// Stable identity for this delivery attempt
-        attempt_id: DeliveryAttemptId,
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<SupervisorNotice, SupervisorNoticeStoreError>, AppError>>,
-    },
-    /// Settle one exact supervisor notice delivery attempt
-    SettleSupervisorNoticeAttempt {
-        /// Stable notice identity
-        notice_id: NoticeId,
-        /// Stable identity for the in-flight delivery attempt
-        attempt_id: DeliveryAttemptId,
-        /// Result of the exact delivery attempt
-        result: Result<(), String>,
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<Result<Result<SupervisorNotice, SupervisorNoticeStoreError>, AppError>>,
-    },
-    /// Recover in-flight supervisor notices after restart
-    RecoverSendingSupervisorNotices {
-        /// Storage result inside actor and transport errors
-        reply: RpcReplyPort<
-            Result<Result<Vec<SupervisorNotice>, SupervisorNoticeStoreError>, AppError>,
-        >,
-    },
+
     /// Save or reuse a caller-owned cancellation before network delivery
     InsertCancellationRequest {
         request: CancellationRequest,
@@ -645,11 +256,6 @@ pub(crate) enum StoreMsg {
     /// Set delivery complete after a validated executor receipt
     AcknowledgeCancellation {
         receipt: CancellationReceipt,
-        reply: RpcReplyPort<Result<CancellationRequest, AppError>>,
-    },
-    /// Settle one resource cancellation intent with its authority receipt
-    AcknowledgeResourceCancellation {
-        receipt: ResourceCancellationReceipt,
         reply: RpcReplyPort<Result<CancellationRequest, AppError>>,
     },
     /// Store executor receipt and a possible pre-acceptance tombstone
@@ -775,35 +381,6 @@ pub(crate) enum StoreMsg {
     UnknownOriginRoutes {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
-    /// Find unresolved resource origin routes after a daemon restart
-    UnknownResourceOriginRoutes {
-        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
-    },
-    /// Find action-bound origin routes whose authority acceptance is unknown
-    UnknownResourceActionRoutes {
-        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
-    },
-    /// Find remote first background launch routes whose authority acceptance is unknown
-    UnknownResourceBackgroundRoutes {
-        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
-    },
-    /// Apply a definitive authority result to one remote first background launch route
-    ResolveResourceBackgroundRoute {
-        task: TaskId,
-        result: Box<ResourceBackgroundRouteResult>,
-        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
-    },
-    /// Read the one action-bound origin route for a resource action
-    ResourceActionRouteByAction {
-        action: ActionId,
-        reply: RpcReplyPort<Result<Option<OriginRoute>, AppError>>,
-    },
-    /// Apply a definitive authority result to one action-bound origin route
-    ResolveResourceActionRoute {
-        task: TaskId,
-        result: Box<ResourceActionRouteResult>,
-        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
-    },
     /// Durably allocate a request and its origin route before network send
     InsertOriginRoute {
         route: Box<OriginRoute>,
@@ -868,16 +445,6 @@ pub(crate) enum StoreMsg {
     ResolveOriginRoute {
         id: TaskId,
         outcome: SubmissionState,
-        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
-    },
-    /// Apply a definitive resource queue receipt to an origin route
-    ResolveResourceRoute {
-        receipt: ResourceQueueReceipt,
-        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
-    },
-    /// Cancel an origin resource route after pre-activation authority confirmation
-    CancelResourceRouteBeforeLaunch {
-        receipt: ResourceCancellationReceipt,
         reply: RpcReplyPort<Result<OriginRoute, AppError>>,
     },
     /// Accept a sequenced origin event and return only after commit
@@ -957,16 +524,9 @@ pub(crate) enum StoreMsg {
         worker_thread: Option<crate::domain::ThreadId>,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
-    /// Compare-and-swap to the status the reason implies, storing the reason
+    /// Compare-and-swap to the status the reason implies, storing the reason,
+    /// its evidence, and any worker thread
     CasExit {
-        id: TaskId,
-        from: ProcessStatus,
-        reason: ExitReason,
-        evidence: TaskExitEvidence,
-        reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
-    },
-    /// Compare-and-swap to a terminal status and record a worker thread
-    CasExitWithWorkerThread {
         id: TaskId,
         from: ProcessStatus,
         reason: ExitReason,
@@ -991,6 +551,11 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Option<crate::store::TaskContainerRecord>, AppError>>,
     },
+    /// Publish a committed run stop without upgrading a restart to user cancellation
+    QueueSignalStop {
+        id: TaskId,
+        reply: RpcReplyPort<Result<CancelResult, AppError>>,
+    },
     /// Request cancel
     RequestCancel {
         id: TaskId,
@@ -1000,11 +565,6 @@ pub(crate) enum StoreMsg {
     ProduceAttentionEvent {
         id: TaskId,
         reply: RpcReplyPort<Result<bool, AppError>>,
-    },
-    /// Release a legacy direct-send claim after its owner bound passes
-    ReleaseAttention {
-        id: TaskId,
-        reply: RpcReplyPort<Result<(), AppError>>,
     },
     /// Reports in seq order
     Reports {
@@ -1016,9 +576,28 @@ pub(crate) enum StoreMsg {
 /// Owns `rusqlite::Connection` via `Store`
 pub(crate) struct StoreActor;
 
+/// Store connection and the local queue wakeup subscription
+pub(crate) struct StoreState {
+    store: Store,
+    queue: Option<ActorRef<super::queue::QueueMsg>>,
+}
+
+impl std::ops::Deref for StoreState {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for StoreState {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
 impl Actor for StoreActor {
     type Msg = StoreMsg;
-    type State = Store;
+    type State = StoreState;
     type Arguments = PathBuf;
 
     async fn pre_start(
@@ -1026,7 +605,10 @@ impl Actor for StoreActor {
         _myself: ActorRef<Self::Msg>,
         db_path: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(Store::open(&db_path)?)
+        Ok(StoreState {
+            store: Store::open(&db_path)?,
+            queue: None,
+        })
     }
 
     async fn handle(
@@ -1035,386 +617,135 @@ impl Actor for StoreActor {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        let wake_queue = matches!(
+            &message,
+            StoreMsg::CasStatus { .. }
+                | StoreMsg::CasExit { .. }
+                | StoreMsg::RequestCancel { .. }
+                | StoreMsg::QueueInterface { .. }
+        );
         match message {
-            StoreMsg::MigrateLegacyLocal { machine, reply } => {
-                send_reply(reply, state.migrate_legacy_local(machine));
-            }
-            StoreMsg::ResourceReadModels {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .resource_read_models(authority_machine, resource_id)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::BeginResourceControl {
-                authority_machine,
-                operation_id,
+            StoreMsg::QueueEvents { job, reply } => send_reply(reply, state.job_events(job)),
+            StoreMsg::QueueInterface {
+                machine,
                 request,
-                attempt_id,
+                env,
                 reply,
-            } => send_reply(
+            } => send_reply(reply, state.queue_request(machine, &request, &env)),
+            StoreMsg::JobRoute { job, reply } => send_reply(reply, state.job_route(job)),
+            StoreMsg::InsertJobRoute { route, reply } => {
+                send_reply(reply, state.insert_job_route(&route))
+            }
+            StoreMsg::ResolveJobRoute {
+                job,
+                submission,
+                target,
                 reply,
-                state
-                    .begin_resource_control(authority_machine, operation_id, &request, attempt_id)
-                    .map_err(|error| {
-                        control_error(
-                            error,
-                            request.resource_id,
-                            Some(operation_id),
-                            request.expected_revision,
-                        )
-                    }),
-            ),
-            StoreMsg::ReplaceResourceSupervisor {
-                authority_machine,
-                resource_id,
-                expected_revision,
-                supervisor,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .replace_resource_supervisor(
-                        authority_machine,
-                        resource_id,
-                        expected_revision,
-                        supervisor,
-                    )
-                    .map_err(|error| control_error(error, resource_id, None, expected_revision)),
-            ),
-            StoreMsg::RegisterResource {
-                authority_machine,
+            } => send_reply(reply, state.resolve_job_route(job, submission, target)),
+            StoreMsg::PendingJobOutbox { reply } => send_reply(reply, state.pending_job_outbox()),
+            StoreMsg::AckJobEvent { job, seq, reply } => {
+                send_reply(reply, state.acknowledge_job_event(job, seq))
+            }
+            StoreMsg::AcceptJobEvent { event, reply } => {
+                send_reply(reply, state.accept_job_event(&event))
+            }
+            StoreMsg::PendingJobInbox { reply } => send_reply(reply, state.pending_job_inbox()),
+            StoreMsg::SuppressJobNotice { job, seq, reply } => {
+                send_reply(reply, state.suppress_job_notice(job, seq))
+            }
+            StoreMsg::SettleJobEvent { job, seq, reply } => {
+                send_reply(reply, state.settle_job_event(job, seq))
+            }
+            StoreMsg::WatchQueue { queue } => state.queue = Some(queue),
+            StoreMsg::QueueLaunchFailed {
+                machine,
+                job,
                 resource,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .register_resource(authority_machine, &resource)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::ResourceSnapshotsForAuthority {
-                authority_machine,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .resource_snapshots_for_authority(authority_machine)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::BindTrainerAttemptAssociationForAuthority {
-                authority_machine,
-                resource_id,
-                task_id,
-                verified_attempt,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.bind_trainer_attempt_association(
-                    authority_machine,
-                    resource_id,
-                    task_id,
-                    *verified_attempt,
-                )),
-            ),
-            StoreMsg::TrainerAttemptAssociationForTaskForAuthority {
-                authority_machine,
-                task_id,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.trainer_attempt_association_for_task_for_authority(
-                    authority_machine,
-                    task_id,
-                )),
-            ),
-            StoreMsg::AcceptedResourceTasksForAuthority {
-                authority_machine,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .accepted_resource_tasks_for_authority(authority_machine)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::AcceptResourceRequest {
-                authority_machine,
-                request_id,
-                task_id,
-                resource_id,
-                origin_machine,
-                normalized_spec,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .accept_resource_request(
-                        authority_machine,
-                        request_id,
-                        task_id,
-                        resource_id,
-                        origin_machine,
-                        *normalized_spec,
-                    )
-                    .map_err(|error| resource_error(error, Some(task_id), Some(request_id))),
-            ),
-            StoreMsg::AcceptAssignedResourceTask { input, reply } => {
-                send_reply(reply, Ok(state.accept_assigned_resource_task(*input)));
-            }
-            StoreMsg::AcceptUnlaunchableResourceTask {
-                input,
-                failure,
+                task,
+                message,
+                now,
                 reply,
             } => {
                 send_reply(
                     reply,
-                    Ok(state.accept_unlaunchable_resource_task(*input, failure)),
+                    state.fail_job_launch(machine, job, resource, task, message, now),
                 );
             }
-            StoreMsg::AssignedResourceTaskReconcile { input, reply } => {
-                send_reply(
-                    reply,
-                    Ok(state.reconcile_assigned_resource_task_for_authority(input)),
-                );
+            StoreMsg::QueueDetect {
+                machine,
+                detected,
+                reply,
+            } => send_reply(reply, state.ensure_detected_resources(machine, &detected)),
+            StoreMsg::QueueSnapshot {
+                machine,
+                now,
+                thresholds,
+                reply,
+            } => send_reply(reply, state.queue_snapshot(machine, now, thresholds)),
+            StoreMsg::QueueResources { machine, reply } => {
+                send_reply(reply, state.resources_on(machine))
             }
-            StoreMsg::ResourceRequests {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .resource_requests(authority_machine, resource_id)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::ReconcileResourceQueue {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .reconcile_resource_queue_for_authority(authority_machine, resource_id)
-                    .map_err(resource_queue_reconcile_error),
-            ),
-            StoreMsg::ResourceCancellationReceipt { identity, reply } => {
-                let task = identity.task;
-                let request = identity.request;
-                send_reply(
-                    reply,
-                    state
-                        .resource_cancellation_receipt(&identity)
-                        .map_err(|error| resource_error(error, Some(task), Some(request))),
-                );
+            StoreMsg::QueueJob { id, reply } => send_reply(reply, state.job(id)),
+            StoreMsg::QueueJobEnv { id, reply } => send_reply(reply, state.job_env(id)),
+            StoreMsg::QueueCheckpoint { task, reply } => {
+                send_reply(reply, state.run_checkpoint(task))
             }
-            StoreMsg::CancelResourceRequestWithReceipt {
-                authority_machine,
-                identity,
-                proof,
+            StoreMsg::QueueReserve {
+                machine,
+                job,
+                resource,
+                task,
+                binary,
+                now,
                 reply,
-            } => {
-                let task = identity.task;
-                let request = identity.request;
-                send_reply(
-                    reply,
-                    state
-                        .cancel_resource_request_with_receipt(authority_machine, identity, proof)
-                        .map_err(|error| resource_error(error, Some(task), Some(request))),
-                );
+            } => send_reply(
+                reply,
+                state.reserve_run(machine, job, resource, task, binary, now),
+            ),
+            StoreMsg::QueueStop { stop, now, reply } => {
+                send_reply(reply, state.commit_preemption(stop, now))
             }
-            StoreMsg::BindReleaseWatcherForAuthority {
-                authority_machine,
-                resource_id,
-                intent,
+            StoreMsg::QueueBeginCleanup {
+                resource,
+                task,
                 reply,
-            } => send_reply(
-                reply,
-                Ok(state.bind_release_watcher_for_authority(
-                    authority_machine,
-                    resource_id,
-                    intent,
-                )),
-            ),
-            StoreMsg::CaptureReleaseCheckpointBaselineForAuthority {
-                authority_machine,
-                resource_id,
-                action_id,
-                expected_state_revision,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.capture_release_checkpoint_baseline_for_authority(
-                    authority_machine,
-                    resource_id,
-                    action_id,
-                    expected_state_revision,
-                )),
-            ),
-            StoreMsg::AcceptReleaseWatcherForAuthority { input, reply } => send_reply(
-                reply,
-                Ok(state.accept_release_watcher_for_authority(*input)),
-            ),
-            StoreMsg::PollReleaseWatcherForAuthority {
-                authority_machine,
-                request,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.poll_release_watcher_for_authority(authority_machine, request)),
-            ),
-            StoreMsg::RecordNoResumeForAuthority {
-                authority,
-                reason,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.record_no_resume_for_authority(authority, reason)),
-            ),
-            StoreMsg::HoldReturnForAuthority {
-                authority,
-                hold,
-                reply,
-            } => send_reply(reply, Ok(state.hold_return_for_authority(authority, hold))),
-            StoreMsg::ServeAfterReturnDeadline {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.serve_after_return_deadline_for_authority(authority_machine, resource_id)),
-            ),
-            StoreMsg::AcceptReturnTaskForAuthority { input, reply } => {
-                send_reply(reply, Ok(state.accept_return_task_for_authority(*input)))
-            }
-            StoreMsg::ReconcileRestoringLoanForAuthority {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.reconcile_restoring_loan_for_authority(authority_machine, resource_id)),
-            ),
-            StoreMsg::ResolveEndedRestoreForAuthority { resolution, reply } => send_reply(
-                reply,
-                Ok(state.resolve_ended_restore_for_authority(*resolution)),
-            ),
-            StoreMsg::AttestInitialIdleForAuthority {
-                authority_machine,
-                attestation,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.attest_initial_idle_for_authority(authority_machine, *attestation)),
-            ),
-            StoreMsg::AttestTrainerGpuFreeForAuthority {
-                authority_machine,
-                attestation,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.attest_trainer_gpu_free_for_authority(authority_machine, *attestation)),
-            ),
-            StoreMsg::PrepareReturnTaskForAuthority {
-                authority,
-                launch,
-                executor_env,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.prepare_return_task_for_authority(authority, *launch, executor_env)),
-            ),
-            StoreMsg::AcceptRemoteReleaseWatcherForAuthority { input, reply } => send_reply(
-                reply,
-                Ok(state.accept_remote_release_watcher_for_authority(*input)),
-            ),
-            StoreMsg::ReleaseWatcherTasksForAuthority {
-                authority_machine,
-                reply,
-            } => send_reply(
-                reply,
-                state.release_watcher_task_ids_for_authority(authority_machine),
-            ),
-            StoreMsg::AcceptBackgroundLaunchForAuthority { input, reply } => send_reply(
-                reply,
-                Ok(state.accept_background_launch_for_authority(*input)),
-            ),
-            StoreMsg::AcceptRemoteBackgroundLaunchForAuthority { input, reply } => send_reply(
-                reply,
-                Ok(state.accept_remote_background_launch_for_authority(*input)),
-            ),
-            StoreMsg::BackgroundLaunchForAuthority {
-                authority_machine,
-                resource_id,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .background_launch_for_authority(authority_machine, resource_id)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::QueuedBackgroundLaunchTasksForAuthority {
-                authority_machine,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .queued_background_launch_tasks_for_authority(authority_machine)
-                    .map_err(|error| resource_error(error, None, None)),
-            ),
-            StoreMsg::RestoringTasksForAuthority {
-                authority_machine,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .restoring_task_ids_for_authority(authority_machine)
-                    .map_err(|error| AppError::Internal {
-                        message: format!("read restoring resource tasks: {error}"),
-                    }),
-            ),
-            StoreMsg::CompleteReleaseForAuthority {
-                authority_machine,
-                resource_id,
-                action_id,
-                expected_state_revision,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.complete_release_for_authority(
-                    authority_machine,
-                    resource_id,
-                    action_id,
-                    expected_state_revision,
-                )),
-            ),
-            StoreMsg::SupervisorNotice { notice_id, reply } => {
-                send_reply(reply, Ok(state.supervisor_notice(notice_id)));
-            }
-            StoreMsg::PendingSupervisorNotices { reply } => {
-                send_reply(reply, Ok(state.pending_supervisor_notices()));
-            }
-            StoreMsg::ReserveSupervisorNoticeAttempt {
-                notice_id,
-                attempt_id,
-                reply,
-            } => send_reply(
-                reply,
-                Ok(state.reserve_supervisor_notice_attempt(notice_id, attempt_id)),
-            ),
-            StoreMsg::SettleSupervisorNoticeAttempt {
-                notice_id,
-                attempt_id,
+            } => send_reply(reply, state.begin_cleanup_attempt(resource, task)),
+            StoreMsg::QueueCleanupResult {
+                resource,
+                task,
+                attempt,
                 result,
                 reply,
             } => send_reply(
                 reply,
-                Ok(state.settle_supervisor_notice_attempt(notice_id, attempt_id, result)),
+                state.apply_cleanup_result(resource, task, attempt, result),
             ),
-            StoreMsg::RecoverSendingSupervisorNotices { reply } => {
-                send_reply(reply, Ok(state.recover_sending_supervisor_notices()));
+            StoreMsg::QueueAbandon {
+                resource,
+                task,
+                reply,
+            } => send_reply(reply, state.abandon_launch(resource, task)),
+            StoreMsg::QueueRecordHead {
+                machine,
+                head,
+                reply,
+            } => send_reply(reply, state.record_blocked_head(machine, head)),
+            StoreMsg::QueueBlocked {
+                machine,
+                episode,
+                thresholds,
+                now,
+                reply,
+            } => send_reply(
+                reply,
+                state.produce_job_blocked(machine, episode, thresholds, now),
+            ),
+            StoreMsg::QueueProtected { reply } => send_reply(reply, state.cleanup_protected_pids()),
+            StoreMsg::QueueTaskJob { task, reply } => send_reply(reply, state.job_run_link(task)),
+            StoreMsg::QueueCheckDue { task, reply } => {
+                send_reply(reply, state.produce_job_check_due(task))
             }
+
             StoreMsg::InsertCancellationRequest { request, reply } => {
                 send_reply(reply, state.insert_cancellation_request(request));
             }
@@ -1426,9 +757,6 @@ impl Actor for StoreActor {
             }
             StoreMsg::AcknowledgeCancellation { receipt, reply } => {
                 send_reply(reply, state.acknowledge_cancellation(&receipt));
-            }
-            StoreMsg::AcknowledgeResourceCancellation { receipt, reply } => {
-                send_reply(reply, state.acknowledge_resource_cancellation(&receipt));
             }
             StoreMsg::ReceiveCancellation { request, reply } => {
                 send_reply(reply, state.receive_cancellation(request));
@@ -1536,56 +864,6 @@ impl Actor for StoreActor {
             StoreMsg::UnknownOriginRoutes { reply } => {
                 send_reply(reply, state.unknown_origin_routes().map_err(identity_error))
             }
-            StoreMsg::UnknownResourceOriginRoutes { reply } => send_reply(
-                reply,
-                state
-                    .unknown_resource_origin_routes()
-                    .map_err(identity_error),
-            ),
-            StoreMsg::UnknownResourceActionRoutes { reply } => send_reply(
-                reply,
-                state
-                    .unknown_resource_action_routes()
-                    .map_err(identity_error),
-            ),
-            StoreMsg::UnknownResourceBackgroundRoutes { reply } => send_reply(
-                reply,
-                state
-                    .unknown_resource_background_routes()
-                    .map_err(identity_error),
-            ),
-            StoreMsg::ResolveResourceBackgroundRoute {
-                task,
-                result,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .resolve_resource_background_route(task, &result)
-                    .map_err(|error| match error {
-                        IdentityError::Conflict => AppError::ClusterTaskConflict { task },
-                        other => identity_error(other),
-                    }),
-            ),
-            StoreMsg::ResourceActionRouteByAction { action, reply } => send_reply(
-                reply,
-                state
-                    .resource_action_route_by_action(action)
-                    .map_err(identity_error),
-            ),
-            StoreMsg::ResolveResourceActionRoute {
-                task,
-                result,
-                reply,
-            } => send_reply(
-                reply,
-                state
-                    .resolve_resource_action_route(task, &result)
-                    .map_err(|error| match error {
-                        IdentityError::Conflict => AppError::ClusterTaskConflict { task },
-                        other => identity_error(other),
-                    }),
-            ),
             StoreMsg::InsertOriginRoute { route, reply } => send_reply(
                 reply,
                 state.insert_origin_route(&route).map_err(identity_error),
@@ -1629,28 +907,6 @@ impl Actor for StoreActor {
                 state
                     .resolve_origin_route(id, outcome)
                     .map_err(identity_error),
-            ),
-            StoreMsg::ResolveResourceRoute { receipt, reply } => send_reply(
-                reply,
-                state
-                    .resolve_resource_route(&receipt)
-                    .map_err(|error| match error {
-                        IdentityError::Conflict => {
-                            AppError::ClusterTaskConflict { task: receipt.task }
-                        }
-                        other => identity_error(other),
-                    }),
-            ),
-            StoreMsg::CancelResourceRouteBeforeLaunch { receipt, reply } => send_reply(
-                reply,
-                state
-                    .cancel_resource_route_before_launch(&receipt)
-                    .map_err(|error| match error {
-                        IdentityError::Conflict => {
-                            AppError::ClusterTaskConflict { task: receipt.task }
-                        }
-                        other => identity_error(other),
-                    }),
             ),
             StoreMsg::AcceptInboundEvent { event, reply } => {
                 send_reply(
@@ -1738,27 +994,11 @@ impl Actor for StoreActor {
                 from,
                 reason,
                 evidence,
-                reply,
-            } => send_reply(
-                reply,
-                state.cas_exit_with_evidence(id, from, &reason, evidence),
-            ),
-            StoreMsg::CasExitWithWorkerThread {
-                id,
-                from,
-                reason,
-                evidence,
                 worker_thread,
                 reply,
             } => send_reply(
                 reply,
-                state.cas_exit_with_evidence_and_worker_thread(
-                    id,
-                    from,
-                    &reason,
-                    evidence,
-                    worker_thread,
-                ),
+                state.cas_exit_with_evidence(id, from, &reason, evidence, worker_thread),
             ),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
             StoreMsg::ClaimContainerAdoption { id, limit, reply } => {
@@ -1766,13 +1006,16 @@ impl Actor for StoreActor {
             }
             StoreMsg::TaskContainer { id, reply } => send_reply(reply, state.task_container(id)),
             StoreMsg::RequestCancel { id, reply } => send_reply(reply, state.request_cancel(id)),
+            StoreMsg::QueueSignalStop { id, reply } => {
+                send_reply(reply, state.signal_committed_run_stop(id))
+            }
             StoreMsg::ProduceAttentionEvent { id, reply } => {
                 send_reply(reply, state.produce_attention_event(id));
             }
-            StoreMsg::ReleaseAttention { id, reply } => {
-                send_reply(reply, state.release_attention(id));
-            }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
+        }
+        if wake_queue && let Some(queue) = &state.queue {
+            let _ = queue.cast(super::queue::QueueMsg::Reconcile);
         }
         Ok(())
     }

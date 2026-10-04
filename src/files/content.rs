@@ -410,8 +410,12 @@ fn map_io(path: &Path, err: std::io::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::http::HeaderMap;
+    use super::{
+        ByteRange, ContentDispositionKind, MAX_STREAMS_PER_CLIENT, RangeError, StreamSlots,
+        disposition_for, is_inline_media, open_file_stream, parse_range,
+    };
+    use crate::error::AppError;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::tempdir;

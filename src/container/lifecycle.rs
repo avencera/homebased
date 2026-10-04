@@ -76,6 +76,8 @@ pub struct ContainerObservation {
     pub id: ContainerId,
     /// Current state
     pub status: ContainerStatus,
+    /// Exact finish time from Docker, absent when the container has not finished
+    pub finished_at: Option<DateTime<Utc>>,
     /// Value of the Homebased task label, if the container has one
     pub task_label: Option<String>,
 }
@@ -543,9 +545,17 @@ where
         }
     }
 
-    /// Stop, then kill if needed, and finish with a cancelled reason
+    /// Preserve an observed natural exit, otherwise stop and finish as cancelled
     async fn cancel(&mut self, id: &ContainerId, logs: Option<E::Logs>) -> ContainerRunEnd {
+        // the interrupt can win selection after the exact container already exited
+        if let Ok(ContainerProbe::Present(found)) = self.observe(id).await
+            && let Some(code) = found.status.exit_code()
+        {
+            finish_logs(logs, self.timing.log_drain).await;
+            return self.finish(id, code, ExitReason::Exit { code }).await;
+        }
         self.note(&format!("cancel: stopping container {id}"));
+        let stop_issued_at = Utc::now();
         if let Err(EngineError::Unavailable(message)) =
             self.engine.stop(id, self.timing.stop_grace).await
         {
@@ -553,13 +563,13 @@ where
         }
         let deadline = Instant::now() + self.timing.kill_wait;
         let mut killed = false;
-        let status = loop {
-            let status = match self.observe(id).await {
-                Ok(ContainerProbe::Present(found)) => Some(found.status),
+        let found = loop {
+            let found = match self.observe(id).await {
+                Ok(ContainerProbe::Present(found)) => Some(found),
                 Ok(ContainerProbe::Absent) => None,
                 Err(_) => break None,
             };
-            match status {
+            match found.as_ref().map(|found| found.status) {
                 Some(status) if status.is_live() && Instant::now() < deadline => {
                     if !killed {
                         killed = true;
@@ -572,12 +582,24 @@ where
                 Some(ContainerStatus::Removing) if Instant::now() < deadline => {
                     time::sleep(self.timing.poll).await;
                 }
-                status => break status,
+                _ => break found,
             }
         };
         finish_logs(logs, self.timing.log_drain).await;
+        let status = found.as_ref().map(|found| found.status);
         match status.and_then(ContainerStatus::exit_code) {
-            Some(exit_code) => self.finish(id, exit_code, ExitReason::Cancelled).await,
+            Some(exit_code) => {
+                // a stop of an already-finished container did not cause its exit
+                let reason = if found
+                    .and_then(|found| found.finished_at)
+                    .is_some_and(|finished_at| finished_at < stop_issued_at)
+                {
+                    ExitReason::Exit { code: exit_code }
+                } else {
+                    ExitReason::Cancelled
+                };
+                self.finish(id, exit_code, reason).await
+            }
             None if status == Some(ContainerStatus::Created) => {
                 self.remove_unstarted(id, ExitReason::Cancelled).await
             }

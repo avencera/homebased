@@ -48,6 +48,11 @@ impl WatchState {
         }
     }
 
+    fn alert_sent(&mut self, fingerprint: String) {
+        self.last_alerted = Some(fingerprint);
+        self.retries_left = 0;
+    }
+
     fn new_alert(&mut self, report: &ProbeReport) -> Option<String> {
         match report.status {
             ProbeStatus::Compatible => {
@@ -59,7 +64,8 @@ impl WatchState {
                 if self.last_alerted.as_deref() == Some(&fingerprint) {
                     return None;
                 }
-                self.last_alerted = Some(fingerprint.clone());
+                // retry on unchanged runtime metadata until the push succeeds
+                self.retries_left = PROBE_RETRIES;
                 Some(fingerprint)
             }
             ProbeStatus::NotInstalled | ProbeStatus::NotRunning | ProbeStatus::Unavailable => None,
@@ -118,10 +124,10 @@ pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
                 debug!(status = ?report.status, "T3 Code API probe skipped: {failures}");
             }
         }
-        let Some(fingerprint) = state.new_alert(&report) else {
+        let Some(notifier) = notifier.clone() else {
             continue;
         };
-        let Some(notifier) = notifier.clone() else {
+        let Some(fingerprint) = state.new_alert(&report) else {
             continue;
         };
         let notice = Notice {
@@ -133,7 +139,7 @@ pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
             priority: NoticePriority::High,
         };
         match tokio::task::spawn_blocking(move || notifier.send(&notice)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => state.alert_sent(fingerprint),
             Ok(Err(error)) => warn!("T3 API change push failed: {error}"),
             Err(error) => warn!("T3 API change push join: {error}"),
         }
@@ -150,6 +156,18 @@ fn read_runtime(path: PathBuf) -> io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bugfix_failed_alert_remains_eligible_on_the_same_runtime() {
+        let mut state = WatchState::default();
+        let runtime = Some(b"runtime".to_vec());
+        assert!(state.probe_due(runtime.clone()));
+        let changed = report(ProbeStatus::Changed, "one");
+        state.probe_finished(changed.status);
+        assert_eq!(state.new_alert(&changed), Some("api: one".into()));
+        assert!(state.probe_due(runtime));
+        assert_eq!(state.new_alert(&changed), Some("api: one".into()));
+    }
     use super::WatchState;
     use crate::t3::{ProbeCheck, ProbeReport, ProbeStatus};
 
@@ -191,6 +209,7 @@ mod tests {
             state.new_alert(&report(ProbeStatus::Changed, "one")),
             Some("api: one".into())
         );
+        state.alert_sent("api: one".into());
         assert!(state.changed_runtime(Some(b"second".to_vec())));
         assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "one")), None);
         assert!(state.changed_runtime(Some(b"third".to_vec())));

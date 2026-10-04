@@ -364,6 +364,21 @@ impl FleetHandle {
         result
     }
 
+    /// [`Self::connect`], retried once after a fresh probe round
+    ///
+    /// For background senders whose destination may have moved since the
+    /// last scheduled round
+    pub async fn connect_rediscovering(
+        &self,
+        machine: MachineId,
+    ) -> Result<VerifiedDestination, AppError> {
+        if let Ok(destination) = self.connect(machine).await {
+            return Ok(destination);
+        }
+        self.discover_now().await;
+        self.connect(machine).await
+    }
+
     /// Resolve a destination UUID to an address that answers for it now
     ///
     /// Tries addresses in preference order and probes each one. An address
@@ -381,25 +396,14 @@ impl FleetHandle {
         let mut saw_mismatch = false;
         for ranked in plan.addresses {
             let address = ranked.address;
-            let result = probe(&self.shared.client, &address, self.shared.local.protocol).await;
-            let now = Utc::now();
-            let probed = match result {
+            let probed = match self.probe_address(&address).await {
                 Ok(probed) => probed,
                 Err(err) => {
                     last_failure = err.to_string();
-                    self.shared.directory.write().await.record_probe_failure(
-                        &address,
-                        last_failure.clone(),
-                        now,
-                    );
                     continue;
                 }
             };
-            self.shared
-                .directory
-                .write()
-                .await
-                .record_probe(&address, &probed, now);
+
             match check_probed(&address, machine, probed) {
                 Ok(verified) => return Ok(verified),
                 Err(DestinationError::IdentityMismatch { found, .. }) => {

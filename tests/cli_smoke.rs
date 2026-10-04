@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use homebased::agents::{AgentArgvInputs, build_agent_invocation};
-use homebased::domain::AgentKind;
+use homebased::domain::{AgentKind, TaskIdentity};
 use homebased::invocation::ChildInvocation;
 use tempfile::TempDir;
 
@@ -153,7 +153,10 @@ fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> C
         },
         &live_binary(kind),
         feed,
+        TaskIdentity::Preview,
+        None,
     )
+    .unwrap()
 }
 
 fn live_binary(kind: AgentKind) -> PathBuf {
@@ -192,6 +195,10 @@ fn help_documents_flag(help: &str, flag: &str) -> bool {
 }
 
 fn run(bin: &Path, args: &[String]) -> Output {
+    run_with_timeout(bin, args, Duration::from_secs(15))
+}
+
+fn run_with_timeout(bin: &Path, args: &[String], timeout: Duration) -> Output {
     let mut child = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
@@ -201,23 +208,21 @@ fn run(bin: &Path, args: &[String]) -> Output {
         .unwrap_or_else(|err| {
             panic!("spawn {} {args:?}: {err}", bin.display());
         });
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let stdout = pipe_reader(child.stdout.take().expect("piped stdout"));
+    let stderr = pipe_reader(child.stderr.take().expect("piped stderr"));
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                child
-                    .stdout
-                    .take()
-                    .expect("piped stdout")
-                    .read_to_end(&mut stdout)
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let stdout = stdout
+                    .recv_timeout(remaining)
+                    .expect("stdout drain timeout")
                     .expect("read stdout");
-                child
-                    .stderr
-                    .take()
-                    .expect("piped stderr")
-                    .read_to_end(&mut stderr)
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let stderr = stderr
+                    .recv_timeout(remaining)
+                    .expect("stderr drain timeout")
                     .expect("read stderr");
                 return Output {
                     status,
@@ -227,16 +232,25 @@ fn run(bin: &Path, args: &[String]) -> Output {
             }
             Ok(None) if Instant::now() > deadline => {
                 let _ = child.kill();
-                let out = child.wait_with_output().ok();
-                panic!(
-                    "{} {args:?} timed out after 15s; output={out:?}",
-                    bin.display()
-                );
+                let _ = child.wait();
+                panic!("{} {args:?} timed out after {timeout:?}", bin.display());
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(err) => panic!("wait {} {args:?}: {err}", bin.display()),
         }
     }
+}
+
+fn pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 fn combined(out: &Output) -> String {
@@ -248,4 +262,12 @@ fn combined(out: &Output) -> String {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
     text
+}
+
+#[test]
+fn bugfix_smoke_drains_both_pipes_before_child_exit() {
+    let output = run_with_timeout(Path::new("/bin/sh"), &["-c".into(), "dd if=/dev/zero bs=1048576 count=1 2>/dev/null; dd if=/dev/zero bs=1048576 count=1 1>&2 2>/dev/null".into()], Duration::from_secs(2));
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 1048576);
+    assert_eq!(output.stderr.len(), 1048576);
 }

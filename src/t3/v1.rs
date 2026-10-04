@@ -93,13 +93,14 @@ pub(super) fn start_turn(
     thread_id: &str,
     text: &str,
     token: &str,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
 ) -> Result<(), ApiFailure> {
     let snapshot = fetch_snapshot(origin, thread_id, token)?;
-    if snapshot.archived {
-        unarchive(origin, thread_id, text, token)?;
-    }
     if snapshot.deleted {
         return Err(ApiFailure::Refused("T3 thread is deleted".into()));
+    }
+    if snapshot.archived {
+        unarchive(origin, thread_id, text, token)?;
     }
 
     dispatch_turn(
@@ -109,6 +110,7 @@ pub(super) fn start_turn(
         &snapshot.interaction_mode,
         text,
         token,
+        before_send,
     )
 }
 
@@ -293,6 +295,7 @@ fn dispatch_turn(
     interaction_mode: &str,
     text: &str,
     token: &str,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
 ) -> Result<(), ApiFailure> {
     let command_id = deterministic_id("homebased-t3-command", thread_id, text);
     let message_id = deterministic_id("homebased-t3-message", thread_id, text);
@@ -304,6 +307,9 @@ fn dispatch_turn(
         runtime_mode,
         interaction_mode,
     );
+    if let Some(check) = before_send {
+        check().map_err(ApiFailure::Delivery)?;
+    }
     // a transport error can follow a request that T3 already took
     let response = send_json(
         CurlMethod::Post,
