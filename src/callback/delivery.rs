@@ -152,14 +152,60 @@ pub(crate) fn find_saved_inbox_origin(
 /// T3 drops a repeated command, so once a send's reply is lost every later
 /// attempt goes through T3 alone. A socket or `codex queue` fallback could
 /// deliver a second copy. The record survives a daemon restart
-pub(crate) struct PendingT3Send(PathBuf);
+pub(crate) struct PendingT3Send<I = IntentFs>(PathBuf, I);
+
+/// File operations for saving a T3 intent before a request
+pub(crate) trait IntentIo {
+    /// Create the staging file
+    fn create(&self, path: &Path) -> io::Result<fs::File> {
+        fs::File::create(path)
+    }
+
+    /// Write the complete provider record
+    fn write(&self, file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+
+    /// Make the record data durable
+    fn sync_file(&self, file: &fs::File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    /// Make the final record name durable
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+/// Filesystem operations used by production delivery
+pub(crate) struct IntentFs;
+
+impl IntentIo for IntentFs {}
 
 impl PendingT3Send {
+    /// Use the filesystem to keep the intent at `path`
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self(path)
+        Self(path, IntentFs)
+    }
+}
+
+impl<I: IntentIo> PendingT3Send<I> {
+    fn temporary_path(&self) -> PathBuf {
+        let mut path = self.0.as_os_str().to_os_string();
+        path.push(".tmp");
+        PathBuf::from(path)
+    }
+
+    fn parent(&self) -> &Path {
+        self.0
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
     }
 
     fn get(&self, thread: ThreadId) -> Result<Option<ProviderThread>, SendFailure> {
+        // staging files cannot represent a send; discard remnants of an interrupted save
+        let _ = fs::remove_file(self.temporary_path());
         let content = match fs::read_to_string(&self.0) {
             Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -179,17 +225,27 @@ impl PendingT3Send {
             ProviderThread::Claude(_) => "claude",
             ProviderThread::Codex(_) => "codex",
         };
+        let temporary = self.temporary_path();
         let save = || -> io::Result<()> {
-            let mut file = fs::File::create(&self.0)?;
-            file.write_all(provider.as_bytes())?;
-            file.sync_all()?;
-            if let Some(parent) = self.0.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
-            Ok(())
+            let mut file = self.1.create(&temporary)?;
+            self.1.write(&mut file, provider.as_bytes())?;
+            self.1.sync_file(&file)?;
+            fs::rename(&temporary, &self.0)?;
+            self.1.sync_directory(self.parent())
         };
-        save()
+
+        let result = save();
+        let _ = fs::remove_file(&temporary);
+        result
             .map_err(|error| format!("record pending T3 send {}: {error}", self.0.display()).into())
+    }
+
+    fn sync(&self) -> Result<(), SendFailure> {
+        let sync = || -> io::Result<()> {
+            self.1.sync_file(&fs::File::open(&self.0)?)?;
+            self.1.sync_directory(self.parent())
+        };
+        sync().map_err(|error| format!("sync pending T3 send {}: {error}", self.0.display()).into())
     }
 
     fn clear(&self) {
@@ -215,7 +271,7 @@ pub(crate) fn retry_pending_t3(
     thread: ThreadId,
     line: &str,
     log_path: &Path,
-    pending: &PendingT3Send,
+    pending: &PendingT3Send<impl IntentIo>,
     gate: SendGate<'_>,
 ) -> Result<Option<PendingRetry>, SendFailure> {
     let Some(provider_thread) = pending.get(thread)? else {
@@ -451,7 +507,7 @@ fn wake_provider_thread(
     provider_thread: ProviderThread,
     line: &str,
     log_path: &Path,
-    pending: &PendingT3Send,
+    pending: &PendingT3Send<impl IntentIo>,
     gate: SendGate<'_>,
 ) -> Result<WakeOutcome, SendFailure> {
     let _lock = gate.lock()?;
@@ -460,9 +516,13 @@ fn wake_provider_thread(
     };
     let was_pending = pending.get(thread)?.is_some();
     // persist before the request: a lost reply must never enable another route
-    if !was_pending {
+    if was_pending {
+        // a prior save may have reached rename but failed its durability step
+        pending.sync()?;
+    } else {
         pending.record(provider_thread)?;
     }
+
     let outcome = match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check) {
         Ok(outcome) => outcome,
         // with no notice to recheck, a failed dispatch only leaves T3 unavailable
@@ -486,7 +546,7 @@ fn wake_provider_thread(
     Ok(outcome)
 }
 
-fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send) {
+fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send<impl IntentIo>) {
     if let WakeOutcome::Woken { t3_thread } = outcome {
         pending.clear();
         if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
@@ -690,36 +750,5 @@ pub(crate) fn append_fallback(path: &Path, line: &str, stderr: &str) -> Result<(
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn bugfix_t3_send_requires_a_saved_intent() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = crate::submission::CallbackContext {
-            env: crate::domain::TaskEnv {
-                path: String::new(),
-                home: directory.path().display().to_string(),
-            },
-            cwd: directory.path().to_path_buf(),
-            codex: crate::submission::CallbackExecutable::Unavailable {
-                reason: "unused".into(),
-            },
-        };
-        let pending = super::PendingT3Send::new(directory.path().to_path_buf());
-        let thread = "01a0ab97-a7aa-7463-a5b0-8d500e40e431".parse().unwrap();
-        let lock = directory.path().join("delivery.lock");
-        let log = directory.path().join("callback.log");
-        let result = super::wake_provider_thread(
-            &context,
-            crate::t3::ProviderThread::Codex(thread),
-            "message",
-            &log,
-            &pending,
-            super::SendGate {
-                path: &lock,
-                check: None,
-            },
-        );
-        assert!(result.is_err());
-        assert!(!log.exists());
-    }
-}
+#[path = "delivery_tests.rs"]
+mod tests;
