@@ -480,8 +480,9 @@ fn install_dry_run_text() {
         assert!(text.contains("ExecStart="), "{text}");
         assert!(text.contains("Environment=PATH="), "{text}");
         assert!(
+            // agent paths are quoted so a path with spaces stays one value
             text.contains(&format!(
-                "Environment=HOMEBASED_OPENCODE={}",
+                "Environment=HOMEBASED_OPENCODE=\"{}\"",
                 fixture("fake-opencode").display()
             )),
             "{text}"
