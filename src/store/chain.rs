@@ -7,18 +7,16 @@
 //! loop launches the continuation like any held task
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::warn;
 
 use super::Store;
-use super::dependency::{append_unlaunched_event_on, dependent_route_on};
+use super::dependency::dependent_route_on;
 use super::fmt_time;
 use super::lifecycle::reports_from;
-use crate::callback::UnlaunchedEnding;
-use crate::dependency::{HeldCancellation, ReleaseRule, TaskDependencies, TaskOutcome};
+use crate::dependency::{ReleaseRule, TaskDependencies, TaskOutcome};
 use crate::domain::{API_VERSION, AgentKind, ReportOutcome, TaskId, TaskRow, ThreadId, Workload};
 use crate::error::AppError;
 use crate::spec::{NormalizedAgentWorkload, NormalizedSpec, NormalizedWorkload};
@@ -175,6 +173,14 @@ pub(super) fn parking_on(conn: &Connection, run: TaskId) -> Result<Option<Parkin
     let Some(chain) = chain_of_on(conn, run)? else {
         return Ok(None);
     };
+    let cancelled: bool = conn.query_row(
+        "SELECT cancel_requested_at IS NOT NULL FROM tasks WHERE id = ?1",
+        [run.to_string()],
+        |row| row.get(0),
+    )?;
+    if cancelled {
+        return Ok(None);
+    }
     let next: Option<String> = conn
         .query_row(
             "SELECT task_id FROM chain_runs WHERE chain_id = ?1 AND run_number = ?2",
@@ -199,15 +205,16 @@ pub(super) fn parking_on(conn: &Connection, run: TaskId) -> Result<Option<Parkin
 ///
 /// Saves the chain as waiting and the continuation as a held route that any
 /// ending of every target releases. A run whose cancel was already requested
-/// parks with its continuation cancelled, so the chain ends cancelled. `None`
-/// means the run cannot park, which report validation prevents; its exit then
-/// reads as failed
+/// never parks and is classified as cancelled. Otherwise `None` means the
+/// run cannot park, which report validation prevents; its exit reads as failed
 pub(super) fn park_on(
     conn: &Connection,
-    tasks_dir: &Path,
     row: &TaskRow,
     waiting: &WaitingReport,
 ) -> Result<Option<Parking>, AppError> {
+    if row.cancel_requested_at.is_some() {
+        return Ok(None);
+    }
     let Some((route, _)) = dependent_route_on(conn, row.id)? else {
         warn!(task = %row.id, "waiting worker has no origin route here; not parking");
         return Ok(None);
@@ -236,12 +243,12 @@ pub(super) fn park_on(
 
     let worker_thread = worker_thread_on(conn, row.id)?;
     let block = continuation_block(row.id, waiting);
-    let (prompt, resume_thread) = match (agent.agent, worker_thread) {
+    let (prompt, resume_thread) = match (agent.agent, worker_thread.or(agent.resume_thread)) {
         // the same Codex conversation already holds the original prompt
         (AgentKind::Codex, Some(thread)) => (block, Some(thread)),
         _ => (
             format!("{}\n\n{block}", first_agent.prompt.trim_end()),
-            first_agent.resume_thread,
+            None,
         ),
     };
     let continuation = TaskId::new();
@@ -261,7 +268,7 @@ pub(super) fn park_on(
             resume_thread,
         }),
     };
-    let mut held = OriginRoute::new_held(NewHeldRoute {
+    let held = OriginRoute::new_held(NewHeldRoute {
         request: RequestId::new(),
         task: continuation,
         origin_machine: route.origin_machine,
@@ -295,18 +302,6 @@ pub(super) fn park_on(
         },
     )?;
 
-    if row.cancel_requested_at.is_some() {
-        let cause = HeldCancellation::Requested;
-        held.submission = SubmissionState::Held {
-            phase: HeldPhase::Cancelled { cause },
-        };
-        append_unlaunched_event_on(
-            conn,
-            tasks_dir,
-            &mut held,
-            UnlaunchedEnding::Cancelled(cause),
-        )?;
-    }
     Ok(Some(Parking {
         on: waiting.on.clone(),
         continuation,

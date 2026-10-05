@@ -425,7 +425,12 @@ fn build_event(
     process: Option<ProcessPayload>,
     parking: Option<&Parking>,
 ) -> HomebasedEvent {
-    let exit = classify_exit(process.as_ref(), reports, ExitPolicy::of(&row.workload));
+    let exit = classify_exit(
+        process.as_ref(),
+        reports,
+        ExitPolicy::of(&row.workload),
+        row.cancel_requested_at.is_some(),
+    );
     let (event, next_action, parking) = match exit {
         ExitClass::Parked => match parking {
             Some(parking) => (EventKind::TaskWaiting, NextAction::None, Some(parking)),
@@ -598,6 +603,7 @@ impl ExitClass {
 /// | ------------------ | ----------------- | --------- |
 /// | cancelled          | any               | Cancelled |
 /// | runner lost        | any               | Lost      |
+/// | cancel requested   | waiting           | Cancelled |
 /// | exit 0, agent      | waiting           | Parked    |
 /// | other ending       | waiting           | Failed    |
 /// | any exit           | blocked           | Blocked   |
@@ -611,11 +617,14 @@ pub fn classify_exit(
     process: Option<&ProcessPayload>,
     reports: &[TaskReport],
     policy: ExitPolicy,
+    cancel_requested: bool,
 ) -> ExitClass {
     let exit_zero = matches!(process, Some(ProcessPayload::Exit { code: 0 }));
     match (process, reports.last().map(|report| &report.outcome)) {
         (Some(ProcessPayload::Cancelled), _) => ExitClass::Cancelled,
         (Some(ProcessPayload::RunnerLost), _) => ExitClass::Lost,
+        // a run whose cancel was requested never parks, even if it beat the kill
+        (_, Some(ReportOutcome::Waiting(_))) if cancel_requested => ExitClass::Cancelled,
         (_, Some(ReportOutcome::Waiting(_))) if exit_zero && policy != ExitPolicy::NotAgent => {
             ExitClass::Parked
         }

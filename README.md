@@ -407,8 +407,10 @@ NOTES
 
 The orchestrator gets `TASK_WAITING`. Homebased holds a continuation until
 every named task ends, with any outcome, then starts it with the notes: a
-Codex worker continues in its own thread, and other agents start a fresh
-session with the original prompt and the notes. The runs of one unit of work
+Codex continuation resumes the run's thread when one is known and receives
+only the continuation block. Otherwise it starts a fresh session with the
+original prompt plus the block. Other agents always start a fresh session
+with the original prompt plus the block. The runs of one unit of work
 form a chain of at most 20 runs. A task held `after` any run waits for the
 chain's last run, and `task cancel` on any run cancels the run that owns the
 work now. The worker, its origin, and every waited task must be on one

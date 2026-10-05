@@ -220,6 +220,92 @@ fn codex_worker_resumes_its_thread_after_a_failed_target_and_releases_its_depend
 }
 
 #[test]
+fn codex_continuation_without_a_session_header_resumes_the_exiting_runs_thread() {
+    let h = Harness::new();
+    let thread = "01a0e487-b877-76e2-9dc2-806bff0bf687";
+    let first_target = h.submit(&h.gated_target("first-park", 0));
+    let second_target = h.submit(&h.gated_target("second-park", 0));
+    h.set_control("stdout", &format!("session id: {thread}\n"));
+    h.set_control("waiting", &format!("{first_target}\nFirst notes.\n"));
+    let worker = h.submit(&Harness::spec("codex", "original work"));
+    let first = h.delivered(&worker, "TASK_WAITING")["continuation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    h.clear_controls();
+    h.set_control("waiting", &format!("{second_target}\nSecond notes.\n"));
+    h.release_gate("first-park");
+    let second = h.delivered(&first, "TASK_WAITING")["continuation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(h.show(&first).get("worker_thread").is_none());
+    h.set_control("report", "succeeded\nDone.");
+    h.release_gate("second-park");
+    h.delivered(&second, "TASK_SUCCEEDED");
+
+    let meta = h.agent_meta(&second);
+    assert!(meta.contains(&format!(" resume {thread} -")), "{meta}");
+    let feed = h.agent_stdin(&second);
+    assert!(
+        feed.starts_with("--- homebased continuation ---\n"),
+        "{feed}"
+    );
+    assert!(
+        feed.contains(&format!("You are continuing task {first}.")),
+        "{feed}"
+    );
+    assert!(feed.contains("Second notes."), "{feed}");
+    assert!(!feed.contains("original work"), "{feed}");
+}
+
+#[test]
+fn cancel_requested_before_exit_zero_with_waiting_ends_the_chain_without_parking() {
+    let h = Harness::new();
+    let target = h.submit(&h.gated_target("cancel-exit-target", 0));
+    h.set_control("waiting", &format!("{target}\nFirst park.\n"));
+    let worker = h.submit(&Harness::spec("codex", "cancel during continuation"));
+    let continuation = h.delivered(&worker, "TASK_WAITING")["continuation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dependent = h.submit(&after(Harness::task_spec(&["true"]), &[&worker]));
+    h.set_control("sleep", "3");
+    h.release_gate("cancel-exit-target");
+    h.wait_running(&continuation);
+    let out = h.report_waiting(&continuation, &[&target], Some("Wait again."));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // pause the runner so the store can commit the exit-zero race without
+    // the normal cancel monitor replacing it with a cancelled process result
+    let pid = nix::unistd::Pid::from_raw(h.show(&continuation)["pid"].as_i64().unwrap() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+    let store = h.store();
+    let id = continuation.parse().unwrap();
+    store.request_cancel(id).unwrap();
+    let committed = store.cas_exit(
+        id,
+        homebased::domain::ProcessStatus::Running,
+        &homebased::domain::ExitReason::Exit { code: 0 },
+    );
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).unwrap();
+    assert!(committed.unwrap().is_some());
+    let event = h.delivered(&continuation, "TASK_CANCELLED");
+    assert_eq!(event["process"], json!({"kind": "exit", "code": 0}));
+    assert!(event.get("continuation").is_none(), "{event}");
+    assert_eq!(h.delivered_count(&continuation, "TASK_WAITING"), 0);
+    let chain = h.wait_chain(&worker, "ended");
+    assert_eq!(chain["outcome"], "cancelled");
+    assert_eq!(chain["runs"], 2);
+    let cancelled = h.delivered(&dependent, "TASK_CANCELLED");
+    assert_eq!(cancelled["cancel_reason"]["outcome"], "cancelled");
+}
+
+#[test]
 fn claude_worker_continues_in_a_fresh_session_and_its_failure_cancels_dependents() {
     let h = Harness::new();
     let target = h.submit(&Harness::task_spec(&["true"]));

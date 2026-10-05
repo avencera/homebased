@@ -312,9 +312,23 @@ fn exit_classification_table() {
     ];
     for (process, reports, policy, expected) in cases {
         assert_eq!(
-            classify_exit(process.as_ref(), reports, *policy),
+            classify_exit(process.as_ref(), reports, *policy, false),
             *expected,
             "{process:?} {reports:?} {policy:?}"
+        );
+    }
+
+    // a requested cancel stops only parking; a finished report still wins
+    let cancel_requested = [
+        (&waiting[..], Cancelled),
+        (&succeeded[..], Succeeded),
+        (&blocked[..], Blocked),
+    ];
+    for (reports, expected) in cancel_requested {
+        assert_eq!(
+            classify_exit(exit(0).as_ref(), reports, ReportingAgent, true),
+            expected,
+            "cancel requested, {reports:?}"
         );
     }
 }

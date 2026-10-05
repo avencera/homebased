@@ -164,13 +164,14 @@ impl Store {
             Some(&ProcessPayload::from(reason)),
             &reports,
             ExitPolicy::of(&row.workload),
+            row.cancel_requested_at.is_some(),
         );
         let Some(ReportOutcome::Waiting(waiting)) = reports.last().map(|report| &report.outcome)
         else {
             return Ok(());
         };
         if class == ExitClass::Parked {
-            park_on(&self.conn, &self.tasks_dir, &row, waiting)?;
+            park_on(&self.conn, &row, waiting)?;
         }
         Ok(())
     }

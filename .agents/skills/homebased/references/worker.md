@@ -28,7 +28,7 @@ homebased task report --outcome waiting --on <task-id> [--on <task-id> ...] \
 NOTES
 ```
 
-The orchestrator gets `TASK_WAITING`. Homebased holds a continuation task until every task you named has ended, whether it succeeded, failed, or was cancelled, then starts it on its own. A Codex worker continues in the same thread and receives only the block below. Any other worker starts a fresh session whose prompt is your original prompt followed by the block:
+The orchestrator gets `TASK_WAITING`. Homebased holds a continuation task until every task you named has ended, whether it succeeded, failed, or was cancelled, then starts it on its own. A Codex continuation resumes the run's thread when one is known and receives only the block below. If no thread is known, it starts a fresh session with your original prompt followed by the block. Other agents always start a fresh session with your original prompt followed by the block:
 
 ```text
 --- homebased continuation ---
@@ -57,7 +57,7 @@ homebased task report --outcome failed --summary "<what failed, why, what you tr
 homebased task report --outcome blocked --summary "<the exact decision or input you need>"
 ```
 
-Always report. An agent that exits 0 without any report reads as `TASK_FAILED` with `reason: "no_report"`, because the orchestrator cannot tell whether the work finished.
+Always report. An agent given the report trailer that exits 0 without any report reads as `TASK_FAILED` with `reason: "no_report"`, because the orchestrator cannot tell whether the work finished.
 
 - `--id` defaults to `HOMEBASED_TASK_ID`; do not pass it.
 - Use `--summary-file <path>` or `--summary-file -` for a multi-line summary. The cap is 4 KiB; put detail in your normal output, which the orchestrator reads from `output.log`.
