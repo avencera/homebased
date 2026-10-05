@@ -631,7 +631,7 @@ fn callback_pending_does_not_settle_later_state_only_event() {
         payload: EventPayload::Report {
             report: ReportView {
                 seq: 1,
-                outcome: crate::domain::ReportOutcome::Blocked,
+                outcome: crate::domain::ReportKind::Blocked,
                 summary: "need input".into(),
             },
         },
@@ -1061,4 +1061,177 @@ fn outbox_and_inbox_survive_reopen_and_version_three_migrates() {
         EventRouteState::Orphaned
     );
     assert!(reopened.pending_outbound_tasks().unwrap().is_empty());
+}
+
+/// Callback shape that release 0.14 decodes, the last one before waiting
+/// handoff: closed objects, and only the event kinds and report outcomes it knew
+#[expect(
+    dead_code,
+    reason = "the fields only describe the shape an older origin decodes"
+)]
+mod v0_14 {
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct TaskEvent {
+        pub(super) task: Value,
+        pub(super) seq: u64,
+        pub(super) origin_machine: Value,
+        pub(super) execution_machine: Value,
+        pub(super) payload: Payload,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub(super) enum Payload {
+        Callback {
+            event: Box<Event>,
+            state: Option<Value>,
+        },
+        State {
+            status: Value,
+        },
+        Report {
+            report: Report,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Event {
+        pub(super) api_version: u32,
+        pub(super) event: Kind,
+        pub(super) task: Value,
+        pub(super) name: Value,
+        pub(super) workload: Value,
+        pub(super) thread: Value,
+        pub(super) cwd: Value,
+        pub(super) evidence: Value,
+        pub(super) reports: Vec<Report>,
+        pub(super) process: Option<Value>,
+        #[serde(default)]
+        pub(super) timeout_secs: Option<u64>,
+        pub(super) next_action: NextAction,
+        #[serde(default)]
+        pub(super) cancel_reason: Option<Value>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    pub(super) enum Kind {
+        #[serde(rename = "TASK_REPORTED")]
+        Reported,
+        #[serde(rename = "TASK_CHECK_DUE")]
+        CheckDue,
+        #[serde(rename = "TASK_CANCELLED")]
+        Cancelled,
+        #[serde(rename = "TASK_LOST")]
+        Lost,
+        #[serde(rename = "TASK_BLOCKED")]
+        Blocked,
+        #[serde(rename = "TASK_FAILED")]
+        Failed,
+        #[serde(rename = "TASK_SUCCEEDED")]
+        Succeeded,
+        #[serde(rename = "TASK_PREEMPTED")]
+        Preempted,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum NextAction {
+        ReadReport,
+        InspectTask,
+        None,
+        InspectLog,
+        AnswerAndResubmit,
+        ReviewOutput,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Report {
+        pub(super) seq: i64,
+        pub(super) outcome: Outcome,
+        pub(super) summary: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(super) enum Outcome {
+        Succeeded,
+        Failed,
+        Blocked,
+    }
+}
+
+#[test]
+fn an_older_origin_reads_a_no_report_failure_and_a_current_origin_derives_its_reason() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let spec: crate::spec::NormalizedSpec = serde_json::from_value(serde_json::json!({
+        "api_version": 1,
+        "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
+        "name": "remote agent",
+        "cwd": "/tmp",
+        "machine": "executor",
+        "timeout": "4h",
+        "workload": { "type": "agent", "agent": "claude", "prompt": "work", "report_trailer": true }
+    }))
+    .unwrap();
+    let id = TaskId::new();
+    let row = crate::store::new_queued_task(crate::store::NewTask {
+        id,
+        name: spec.name.clone(),
+        thread: spec.thread,
+        workload: crate::invocation::persist_workload(&spec.workload),
+        cwd: "/tmp".into(),
+        timeout: spec.timeout,
+        env: TaskEnv {
+            path: "/bin".into(),
+            home: "/tmp".into(),
+        },
+        binary: "/bin/claude".into(),
+    });
+    store
+        .insert_remote_task(&row, &spec, MachineId::new(), MachineId::new())
+        .unwrap();
+    store
+        .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
+        .unwrap()
+        .unwrap();
+    store
+        .cas_exit(
+            id,
+            ProcessStatus::Running,
+            &crate::domain::ExitReason::Exit { code: 0 },
+        )
+        .unwrap()
+        .unwrap();
+
+    let terminal = store
+        .pending_outbound_events(id)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .event;
+    let wire = serde_json::to_value(&terminal).unwrap();
+    assert!(
+        wire["payload"]["event"].get("reason").is_none(),
+        "the reason never travels: {wire}"
+    );
+    let old: v0_14::TaskEvent = serde_json::from_value(wire.clone()).unwrap();
+    let v0_14::Payload::Callback { event, .. } = old.payload else {
+        panic!("the terminal event is a callback");
+    };
+    assert_eq!(event.event, v0_14::Kind::Failed);
+    assert_eq!(event.next_action, v0_14::NextAction::InspectLog);
+
+    let current: TaskEvent = serde_json::from_value(wire).unwrap();
+    let line = current.callback_message_line().unwrap().unwrap();
+    let delivered: serde_json::Value =
+        serde_json::from_str(line.strip_prefix("HOMEBASED_EVENT ").unwrap()).unwrap();
+    assert_eq!(delivered["event"], "TASK_FAILED");
+    assert_eq!(delivered["reason"], "no_report");
 }

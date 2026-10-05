@@ -4,17 +4,22 @@
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
+use super::chain::{check_waiting_on, park_on, parking_on};
 use super::{Store, fmt_time, parse_time};
-use crate::callback::{ReportView, check_due_event, notify_event, terminal_event};
+use crate::callback::{
+    ExitClass, ExitPolicy, ProcessPayload, ReportView, check_due_event, classify_exit,
+    notify_event, terminal_event,
+};
 use crate::domain::{
     ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence, ProcessStatus, REPORTS_MAX,
-    ReportOutcome, SUMMARY_MAX_BYTES, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
-    Workload, check_report_allowed, check_status_transition,
+    ReportKind, ReportOutcome, SUMMARY_MAX_BYTES, TaskExitEvidence, TaskId, TaskReport, TaskRow,
+    ThreadId, Workload, check_report_allowed, check_status_transition,
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
 use crate::queue::StopCause;
 use crate::submission::ExecutorIdentity;
+use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 
 /// Result of `request_cancel`
 #[derive(Debug)]
@@ -142,7 +147,32 @@ impl Store {
                 from.as_str()
             ],
         )?;
+        if n == 1 && *reason == (ExitReason::Exit { code: 0 }) {
+            self.park_if_waiting(id, reason)?;
+        }
         self.produce_state_event_after_cas(id, n)
+    }
+
+    /// Park a run whose exit classifies as waiting, in its exit transaction
+    ///
+    /// The exit CAS matches once, so a repeated exit, such as the daemon
+    /// applying `exit.json` after the worker's own commit, never parks twice
+    fn park_if_waiting(&self, id: TaskId, reason: &ExitReason) -> Result<(), AppError> {
+        let row = self.require_task(id)?;
+        let reports = self.reports(id)?;
+        let class = classify_exit(
+            Some(&ProcessPayload::from(reason)),
+            &reports,
+            ExitPolicy::of(&row.workload),
+        );
+        let Some(ReportOutcome::Waiting(waiting)) = reports.last().map(|report| &report.outcome)
+        else {
+            return Ok(());
+        };
+        if class == ExitClass::Parked {
+            park_on(&self.conn, &self.tasks_dir, &row, waiting)?;
+        }
+        Ok(())
     }
 
     /// Read the row a matched CAS changed and produce its state event
@@ -183,7 +213,8 @@ impl Store {
         let payload = if row.state.is_terminal() {
             let reports = self.reports(row.id)?;
             let evidence = self.tasks_dir.join(row.id.to_string());
-            let callback = terminal_event(row, &reports, evidence);
+            let parking = parking_on(&self.conn, row.id)?;
+            let callback = terminal_event(row, &reports, evidence, parking.as_ref());
             EventPayload::Callback {
                 event: Box::new(callback),
                 state: Some(row.status()),
@@ -269,11 +300,13 @@ impl Store {
 
     /// Commit a report and its silent or notifying event in one transaction
     ///
-    /// Enforces the report cap, summary length, and terminal rejection
+    /// Enforces the report cap, summary length, and terminal rejection. A
+    /// waiting report is also checked against the tasks it names, in the same
+    /// transaction that saves it
     pub fn append_report(
         &self,
         id: TaskId,
-        outcome: ReportOutcome,
+        outcome: &ReportOutcome,
         summary: &str,
         notify: bool,
     ) -> Result<Vec<TaskReport>, AppError> {
@@ -292,16 +325,30 @@ impl Store {
                     count: existing.len(),
                 });
             }
+            if let ReportOutcome::Waiting(waiting) = outcome {
+                check_waiting_on(&self.conn, &row, &waiting.on)?;
+            }
+            let (waiting_on, notes) = match outcome {
+                ReportOutcome::Waiting(waiting) => (
+                    Some(serde_json::to_string(&waiting.on)?),
+                    Some(waiting.notes.as_str()),
+                ),
+                ReportOutcome::Succeeded | ReportOutcome::Failed | ReportOutcome::Blocked => {
+                    (None, None)
+                }
+            };
             let seq = existing.len() as i64 + 1;
             self.conn.execute(
-                "INSERT INTO reports (task_id, seq, outcome, summary, reported_at)
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO reports (task_id, seq, outcome, summary, reported_at, waiting_on, notes)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     id.to_string(),
                     seq,
-                    outcome.as_str(),
+                    outcome.kind().as_str(),
                     summary,
-                    fmt_time(Utc::now())
+                    fmt_time(Utc::now()),
+                    waiting_on,
+                    notes,
                 ],
             )?;
             let reports = self.reports(id)?;
@@ -334,32 +381,67 @@ impl Store {
     }
 }
 
-fn reports_from(conn: &Connection, id: TaskId) -> Result<Vec<TaskReport>, AppError> {
+/// One saved report row before its outcome is rebuilt
+struct ReportRow {
+    seq: i64,
+    outcome: String,
+    summary: String,
+    reported_at: String,
+    notified_at: Option<String>,
+    waiting_on: Option<String>,
+    notes: Option<String>,
+}
+
+pub(super) fn reports_from(conn: &Connection, id: TaskId) -> Result<Vec<TaskReport>, AppError> {
     let mut statement = conn.prepare(
-        "SELECT seq, outcome, summary, reported_at, notified_at
+        "SELECT seq, outcome, summary, reported_at, notified_at, waiting_on, notes
          FROM reports WHERE task_id = ?1 ORDER BY seq",
     )?;
     let rows = statement
         .query_map(params![id.to_string()], |row| {
-            let seq: i64 = row.get(0)?;
-            let outcome: String = row.get(1)?;
-            let summary: String = row.get(2)?;
-            let reported_at: String = row.get(3)?;
-            let notified_at: Option<String> = row.get(4)?;
-            Ok((seq, outcome, summary, reported_at, notified_at))
+            Ok(ReportRow {
+                seq: row.get(0)?,
+                outcome: row.get(1)?,
+                summary: row.get(2)?,
+                reported_at: row.get(3)?,
+                notified_at: row.get(4)?,
+                waiting_on: row.get(5)?,
+                notes: row.get(6)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(|(seq, outcome, summary, reported_at, notified_at)| {
+        .map(|row| {
             Ok(TaskReport {
-                seq,
-                outcome: ReportOutcome::from_storage(&outcome)?,
-                summary,
-                reported_at: parse_time(&reported_at)?,
-                notified_at: notified_at.as_deref().map(parse_time).transpose()?,
+                seq: row.seq,
+                outcome: report_outcome(&row)?,
+                summary: row.summary,
+                reported_at: parse_time(&row.reported_at)?,
+                notified_at: row.notified_at.as_deref().map(parse_time).transpose()?,
             })
         })
         .collect()
+}
+
+fn report_outcome(row: &ReportRow) -> Result<ReportOutcome, AppError> {
+    let invalid = |message: String| AppError::Internal { message };
+    Ok(match ReportKind::from_storage(&row.outcome)? {
+        ReportKind::Succeeded => ReportOutcome::Succeeded,
+        ReportKind::Failed => ReportOutcome::Failed,
+        ReportKind::Blocked => ReportOutcome::Blocked,
+        ReportKind::Waiting => {
+            let (Some(on), Some(notes)) = (&row.waiting_on, &row.notes) else {
+                return Err(invalid(format!(
+                    "waiting report {} has no targets",
+                    row.seq
+                )));
+            };
+            let on: WaitTargets = serde_json::from_str(on)?;
+            let notes = WaitingNotes::new(notes.clone())
+                .map_err(|error| invalid(format!("waiting report {}: {error}", row.seq)))?;
+            ReportOutcome::Waiting(WaitingReport { on, notes })
+        }
+    })
 }
 
 /// Refuse terminal evidence that no worker path records with this transition

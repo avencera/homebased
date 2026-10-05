@@ -91,9 +91,9 @@ impl From<TaskDependencies> for Vec<TaskId> {
 
 /// How a finished task ended, as its terminal `HOMEBASED_EVENT` named it
 ///
-/// Only [`Self::Succeeded`] releases a held task. It is exactly the ending
-/// that produces `TASK_SUCCEEDED`: exit 0 and a last report that is neither
-/// blocked nor failed
+/// Only [`Self::Succeeded`] releases a held `after` task. It is exactly the
+/// ending that produces `TASK_SUCCEEDED`: exit 0 and a last report of
+/// succeeded, or no report from a workload that need not report
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOutcome {
@@ -114,6 +114,10 @@ pub enum TaskOutcome {
 
 impl TaskOutcome {
     /// Outcome named by a terminal event, or `None` for an interim event
+    ///
+    /// `TASK_WAITING` names none: the run parked, and its chain's last run
+    /// decides the outcome. Recording one here would be permanent, because the
+    /// first saved outcome wins
     #[must_use]
     pub fn from_event(kind: EventKind) -> Option<Self> {
         match kind {
@@ -123,7 +127,7 @@ impl TaskOutcome {
             EventKind::TaskCancelled => Some(Self::Cancelled),
             EventKind::TaskLost => Some(Self::Lost),
             EventKind::TaskPreempted => Some(Self::Preempted),
-            EventKind::TaskReported | EventKind::TaskCheckDue => None,
+            EventKind::TaskReported | EventKind::TaskCheckDue | EventKind::TaskWaiting => None,
         }
     }
 
@@ -262,12 +266,55 @@ pub enum HeldDecision {
     Cancel(DependencyFailure),
 }
 
-/// Decide a held task's next step; the first failed dependency in order wins
+/// Which endings of its dependencies release a held task
+///
+/// `after` is public and releases only on success. A continuation is held
+/// internally until its targets end with any outcome, because it must read
+/// and handle a failure itself
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReleaseRule {
+    /// Every dependency must succeed; any other ending cancels the held task
+    #[default]
+    Succeeded,
+    /// Every dependency must end, with any outcome
+    Ended,
+}
+
+impl ReleaseRule {
+    /// SQLite storage tag
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Ended => "ended",
+        }
+    }
+
+    /// Parse a storage tag
+    #[must_use]
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "succeeded" => Some(Self::Succeeded),
+            "ended" => Some(Self::Ended),
+            _ => None,
+        }
+    }
+}
+
+/// Decide a held task's next step under its release rule
+///
+/// Under [`ReleaseRule::Succeeded`] the first failed dependency in order wins.
+/// Under [`ReleaseRule::Ended`] nothing cancels: the task waits until every
+/// dependency ended
 #[must_use]
-pub fn decide(states: impl IntoIterator<Item = (TaskId, DependencyState)>) -> HeldDecision {
+pub fn decide(
+    states: impl IntoIterator<Item = (TaskId, DependencyState)>,
+    rule: ReleaseRule,
+) -> HeldDecision {
     let mut pending = false;
     for (dependency, state) in states {
         match state {
+            DependencyState::Ended(_) if rule == ReleaseRule::Ended => {}
             DependencyState::Ended(outcome) if !outcome.is_success() => {
                 return HeldDecision::Cancel(DependencyFailure {
                     dependency,
@@ -331,7 +378,7 @@ impl fmt::Display for HeldCancellation {
 mod tests {
     use super::{
         DependencyFailure, DependencyListError, DependencyOutcome, DependencyState, HeldDecision,
-        MAX_DEPENDENCIES, TaskDependencies, TaskOutcome, decide,
+        MAX_DEPENDENCIES, ReleaseRule, TaskDependencies, TaskOutcome, decide,
     };
     use crate::callback::EventKind;
     use crate::domain::TaskId;
@@ -386,6 +433,31 @@ mod tests {
         assert!(!DependencyOutcome::Unknown.is_success());
         assert_eq!(TaskOutcome::from_event(EventKind::TaskReported), None);
         assert_eq!(TaskOutcome::from_event(EventKind::TaskCheckDue), None);
+        assert_eq!(TaskOutcome::from_event(EventKind::TaskWaiting), None);
+    }
+
+    #[test]
+    fn a_continuation_waits_for_every_ending_and_never_cancels() {
+        let a = TaskId::new();
+        let b = TaskId::new();
+        let failed = DependencyState::Ended(TaskOutcome::Failed.into());
+        assert_eq!(
+            decide(
+                [(a, failed), (b, DependencyState::Pending)],
+                ReleaseRule::Ended
+            ),
+            HeldDecision::Wait
+        );
+        assert_eq!(
+            decide(
+                [
+                    (a, failed),
+                    (b, DependencyState::Ended(DependencyOutcome::Unknown))
+                ],
+                ReleaseRule::Ended
+            ),
+            HeldDecision::Release
+        );
     }
 
     #[test]
@@ -394,18 +466,24 @@ mod tests {
         let b = TaskId::new();
         let succeeded = DependencyState::Ended(TaskOutcome::Succeeded.into());
         assert_eq!(
-            decide([(a, succeeded), (b, DependencyState::Pending)]),
+            decide(
+                [(a, succeeded), (b, DependencyState::Pending)],
+                ReleaseRule::Succeeded
+            ),
             HeldDecision::Wait
         );
         assert_eq!(
-            decide([(a, succeeded), (b, succeeded)]),
+            decide([(a, succeeded), (b, succeeded)], ReleaseRule::Succeeded),
             HeldDecision::Release
         );
         assert_eq!(
-            decide([
-                (a, DependencyState::Pending),
-                (b, DependencyState::Ended(TaskOutcome::Blocked.into()))
-            ]),
+            decide(
+                [
+                    (a, DependencyState::Pending),
+                    (b, DependencyState::Ended(TaskOutcome::Blocked.into()))
+                ],
+                ReleaseRule::Succeeded
+            ),
             HeldDecision::Cancel(DependencyFailure {
                 dependency: b,
                 outcome: TaskOutcome::Blocked.into()
@@ -418,7 +496,7 @@ mod tests {
         let a = TaskId::new();
         let unknown = DependencyState::Ended(DependencyOutcome::Unknown);
         assert_eq!(
-            decide([(a, unknown)]),
+            decide([(a, unknown)], ReleaseRule::Succeeded),
             HeldDecision::Cancel(DependencyFailure {
                 dependency: a,
                 outcome: DependencyOutcome::Unknown

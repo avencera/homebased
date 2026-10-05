@@ -15,6 +15,7 @@ use crate::machine::{MachineId, MachineName};
 use crate::queue::QueueError;
 use crate::spec::CwdProblem;
 use crate::submission::RequestId;
+use crate::waiting::WaitingRejection;
 
 /// Hint for a `cwd` that names a path inside the container instead of a host path
 fn cwd_suggestion(path: &std::path::Path, suggested: Option<&std::path::Path>) -> String {
@@ -454,6 +455,9 @@ pub enum AppError {
     /// The GPU priority queue refused a request
     #[error(transparent)]
     Queue(#[from] QueueError),
+    /// A `waiting` report was refused
+    #[error(transparent)]
+    Waiting(#[from] WaitingRejection),
     /// The database was written by a newer build that this binary cannot read
     #[error(
         "database schema version {found} is newer than this build supports ({supported}); \
@@ -570,6 +574,7 @@ impl AppError {
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::DaemonBusy => "daemon_busy",
             Self::Queue(error) => error.code(),
+            Self::Waiting(rejection) => rejection.code(),
             Self::SchemaTooNew { .. } => "schema_too_new",
             Self::Internal { .. } => "internal",
         }
@@ -638,6 +643,8 @@ impl AppError {
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. } => 1,
             Self::Queue(error) => error.exit_code(),
+            Self::Waiting(WaitingRejection::UnknownTarget { .. }) => 3,
+            Self::Waiting(_) => 5,
         }
     }
 
@@ -704,6 +711,8 @@ impl AppError {
             | Self::SchemaTooNew { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::Queue(error) => error.http_status(),
+            Self::Waiting(WaitingRejection::UnknownTarget { .. }) => http::StatusCode::NOT_FOUND,
+            Self::Waiting(_) => http::StatusCode::CONFLICT,
         }
     }
 
@@ -867,6 +876,7 @@ impl AppError {
             Self::DaemonAlreadyRunning => json!({}),
             Self::LockHeld { path } => json!({ "path": path }),
             Self::Queue(error) => error.input(),
+            Self::Waiting(rejection) => rejection.input(),
         }
     }
 

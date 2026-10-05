@@ -754,22 +754,24 @@ impl TaskEnv {
     }
 }
 
-/// Worker-authored outcome
+/// Kind of a worker-authored outcome: the `outcome` tag of a report
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
-pub enum ReportOutcome {
+pub enum ReportKind {
     /// Work completed
     Succeeded,
     /// Work failed
     Failed,
     /// Worker needs a decision
     Blocked,
+    /// Worker parked on other tasks and continues when they end
+    Waiting,
 }
 
-impl ReportOutcome {
+impl ReportKind {
     /// SQLite storage tag
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -777,6 +779,7 @@ impl ReportOutcome {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Blocked => "blocked",
+            Self::Waiting => "waiting",
         }
     }
 
@@ -786,6 +789,7 @@ impl ReportOutcome {
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
             "blocked" => Ok(Self::Blocked),
+            "waiting" => Ok(Self::Waiting),
             other => Err(AppError::Internal {
                 message: format!("unknown report outcome: {other}"),
             }),
@@ -793,14 +797,59 @@ impl ReportOutcome {
     }
 }
 
-impl fmt::Display for ReportOutcome {
+impl fmt::Display for ReportKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
+/// Worker-authored outcome with the data each outcome needs
+///
+/// A waiting report always names its targets and notes, so one without them
+/// cannot be built
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportOutcome {
+    /// Work completed
+    Succeeded,
+    /// Work failed
+    Failed,
+    /// Worker needs a decision
+    Blocked,
+    /// Worker parked on other tasks
+    Waiting(crate::waiting::WaitingReport),
+}
+
+impl ReportOutcome {
+    /// Outcome tag
+    #[must_use]
+    pub fn kind(&self) -> ReportKind {
+        match self {
+            Self::Succeeded => ReportKind::Succeeded,
+            Self::Failed => ReportKind::Failed,
+            Self::Blocked => ReportKind::Blocked,
+            Self::Waiting(_) => ReportKind::Waiting,
+        }
+    }
+
+    /// Data of a waiting report
+    #[must_use]
+    pub fn waiting(&self) -> Option<&crate::waiting::WaitingReport> {
+        match self {
+            Self::Waiting(waiting) => Some(waiting),
+            Self::Succeeded | Self::Failed | Self::Blocked => None,
+        }
+    }
+}
+
+impl fmt::Display for ReportOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind().fmt(f)
+    }
+}
+
 /// One append-only worker report. Belongs to the supervised task, not only to an agent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TaskReportWire", into = "TaskReportWire")]
 pub struct TaskReport {
     /// 1-based sequence
     pub seq: i64,
@@ -811,8 +860,72 @@ pub struct TaskReport {
     /// When the row was appended
     pub reported_at: DateTime<Utc>,
     /// When the origin delivered this report's interim `--notify` event
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notified_at: Option<DateTime<Utc>>,
+}
+
+/// JSON shape of a report: the outcome tag, with a waiting report's targets
+/// and notes beside it
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskReportWire {
+    seq: i64,
+    outcome: ReportKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waiting_on: Option<crate::waiting::WaitTargets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notes: Option<crate::waiting::WaitingNotes>,
+    summary: String,
+    reported_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notified_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<TaskReportWire> for TaskReport {
+    type Error = String;
+
+    fn try_from(wire: TaskReportWire) -> Result<Self, Self::Error> {
+        let outcome = match (wire.outcome, wire.waiting_on, wire.notes) {
+            (ReportKind::Waiting, Some(on), Some(notes)) => {
+                ReportOutcome::Waiting(crate::waiting::WaitingReport { on, notes })
+            }
+            (ReportKind::Waiting, _, _) => {
+                return Err("a waiting report needs waiting_on and notes".into());
+            }
+            (_, Some(_), _) | (_, _, Some(_)) => {
+                return Err("only a waiting report has waiting_on and notes".into());
+            }
+            (ReportKind::Succeeded, None, None) => ReportOutcome::Succeeded,
+            (ReportKind::Failed, None, None) => ReportOutcome::Failed,
+            (ReportKind::Blocked, None, None) => ReportOutcome::Blocked,
+        };
+        Ok(Self {
+            seq: wire.seq,
+            outcome,
+            summary: wire.summary,
+            reported_at: wire.reported_at,
+            notified_at: wire.notified_at,
+        })
+    }
+}
+
+impl From<TaskReport> for TaskReportWire {
+    fn from(report: TaskReport) -> Self {
+        let kind = report.outcome.kind();
+        let (waiting_on, notes) = match report.outcome {
+            ReportOutcome::Waiting(waiting) => (Some(waiting.on), Some(waiting.notes)),
+            ReportOutcome::Succeeded | ReportOutcome::Failed | ReportOutcome::Blocked => {
+                (None, None)
+            }
+        };
+        Self {
+            seq: report.seq,
+            outcome: kind,
+            waiting_on,
+            notes,
+            summary: report.summary,
+            reported_at: report.reported_at,
+            notified_at: report.notified_at,
+        }
+    }
 }
 
 /// Persisted agent workload. Prompt bytes live in task evidence files

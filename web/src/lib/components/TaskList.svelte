@@ -17,6 +17,7 @@
 	import Capsule from './Capsule.svelte';
 	import Elapsed from './Elapsed.svelte';
 	import StatusBadge from './StatusBadge.svelte';
+	import ParkedBadge from './ParkedBadge.svelte';
 	import ThreadLabel from './ThreadLabel.svelte';
 
 	interface Props {
@@ -132,6 +133,7 @@
 						class="flex items-center gap-1 justify-self-end [grid-area:status] lg:justify-self-start"
 					>
 						<StatusBadge status={task.status} />
+						<ParkedBadge {task} />
 						{#if task.cancel_requested_at}
 							<span title={`Cancel requested ${formatTimestamp(task.cancel_requested_at)}`}>
 								<Ban class="size-3 text-amber-600 dark:text-amber-400" aria-hidden="true" />

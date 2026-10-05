@@ -571,6 +571,16 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Vec<TaskReport>, AppError>>,
     },
+    /// What a parked run handed to its continuation
+    Parking {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<crate::waiting::Parking>, AppError>>,
+    },
+    /// Run that owns the work of a task's chain now
+    ChainCurrentRun {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<TaskId>, AppError>>,
+    },
 }
 
 /// Owns `rusqlite::Connection` via `Store`
@@ -1013,6 +1023,10 @@ impl Actor for StoreActor {
                 send_reply(reply, state.produce_attention_event(id));
             }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
+            StoreMsg::Parking { id, reply } => send_reply(reply, state.parking(id)),
+            StoreMsg::ChainCurrentRun { id, reply } => {
+                send_reply(reply, state.chain_current_run(id));
+            }
         }
         if wake_queue && let Some(queue) = &state.queue {
             let _ = queue.cast(super::queue::QueueMsg::Reconcile);

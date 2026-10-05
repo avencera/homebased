@@ -488,7 +488,8 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
     .await?;
     let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
-    let last_event = last_event_for_row(&row, &reports, evidence.clone());
+    let parking = call(&state.store, |reply| StoreMsg::Parking { id, reply }).await?;
+    let last_event = last_event_for_row(&row, &reports, evidence.clone(), parking.as_ref());
     let container = if matches!(row.workload, Workload::Container(_)) {
         let record = call(&state.store, |reply| StoreMsg::TaskContainer { id, reply }).await?;
         ContainerDetail::from_row(&row, record.as_ref())
@@ -580,6 +581,9 @@ async fn cancel(
     .await?;
     if let Some(saved) = saved {
         return Ok(Json(CancelResponse::intent(&saved)));
+    }
+    if let Some(response) = crate::daemon::chains::cancel(&state, id).await? {
+        return Ok(Json(response));
     }
     if let Some(response) = crate::daemon::dependencies::cancel(&state, id).await? {
         return Ok(Json(response));

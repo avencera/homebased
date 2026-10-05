@@ -14,14 +14,15 @@ use crate::daemon::api::views::TaskFollowupSource;
 use crate::daemon::fleet_api::MachinesBody;
 use crate::dependency::TaskDependencies;
 use crate::domain::{
-    ProcessStatus, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId, TaskStatus,
-    ThreadId,
+    ProcessStatus, ReportKind, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId,
+    TaskStatus, ThreadId,
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
 use crate::submission::RequestId;
+use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 
 use super::Ctx;
 
@@ -110,13 +111,19 @@ pub enum TaskCommand {
         id: Option<TaskId>,
         /// Outcome.
         #[arg(long, value_enum)]
-        outcome: ReportOutcome,
+        outcome: ReportKind,
         /// Summary text.
         #[arg(long, conflicts_with = "summary_file")]
         summary: Option<String>,
         /// Summary file, or `-` for stdin.
         #[arg(long)]
         summary_file: Option<String>,
+        /// Task to wait on, repeated for each one. Required with `--outcome waiting`.
+        #[arg(long = "on", value_name = "TASK_ID")]
+        on: Vec<TaskId>,
+        /// Notes for the continuation, or `-` for stdin. Required with `--outcome waiting`.
+        #[arg(long)]
+        notes_file: Option<String>,
         /// Send an interim `TASK_REPORTED` event.
         #[arg(long)]
         notify: bool,
@@ -177,8 +184,19 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             outcome,
             summary,
             summary_file,
+            on,
+            notes_file,
             notify,
-        } => report(ctx, id, outcome, summary, summary_file, notify),
+        } => {
+            let input = ReportInput {
+                outcome,
+                summary,
+                summary_file,
+                on,
+                notes_file,
+            };
+            report(ctx, id, input, notify)
+        }
     }
 }
 
@@ -604,11 +622,45 @@ async fn show(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
             if let Some(worker_thread) = value.get("worker_thread").and_then(Value::as_str) {
                 println!("  worker thread {worker_thread}");
             }
+            print_chain(&value);
             print_dependencies(&value);
             print_waiting_events(&value);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The chain of a run of parked work: whether the work runs, waits, or ended
+fn print_chain(value: &Value) {
+    let Some(chain) = value.get("chain") else {
+        return;
+    };
+    let text = |key: &str| chain.get(key).and_then(Value::as_str).unwrap_or("-");
+    let position = format!(
+        "run {} of {}",
+        chain.get("run").and_then(Value::as_u64).unwrap_or(0),
+        chain.get("runs").and_then(Value::as_u64).unwrap_or(0)
+    );
+    match text("state") {
+        "waiting" => {
+            let on = chain
+                .get("on")
+                .and_then(Value::as_array)
+                .map(|on| {
+                    on.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "  chain {position}: waiting on {on}; continues as {}",
+                text("continuation")
+            );
+        }
+        "running" => println!("  chain {position}: running as {}", text("current")),
+        state => println!("  chain {position}: {state} {}", text("outcome")),
+    }
 }
 
 /// One line per dependency in `after`: pending, or how it ended
@@ -683,12 +735,64 @@ async fn cancel(ctx: &Ctx, id: TaskId) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Report arguments as given, before the outcome is built
+struct ReportInput {
+    outcome: ReportKind,
+    summary: Option<String>,
+    summary_file: Option<String>,
+    on: Vec<TaskId>,
+    notes_file: Option<String>,
+}
+
+impl ReportInput {
+    /// Read the summary and build the outcome with the data its kind needs
+    fn read(self) -> Result<(ReportOutcome, String), AppError> {
+        let usage = |message: &str| AppError::Usage {
+            message: message.into(),
+        };
+        if self.summary_file.as_deref() == Some("-") && self.notes_file.as_deref() == Some("-") {
+            return Err(usage(
+                "only one of --summary-file and --notes-file can read stdin",
+            ));
+        }
+        let summary = match (self.summary, self.summary_file) {
+            (Some(text), None) => text,
+            (None, Some(path)) => read_summary(&path)?,
+            _ => {
+                return Err(usage(
+                    "exactly one of --summary or --summary-file is required",
+                ));
+            }
+        };
+        let outcome = match (self.outcome, self.on.is_empty(), self.notes_file) {
+            (ReportKind::Waiting, _, None) => {
+                return Err(usage(
+                    "--outcome waiting requires --notes-file; use `--notes-file -` with a heredoc",
+                ));
+            }
+            (ReportKind::Waiting, _, Some(path)) => {
+                let on = WaitTargets::new(self.on).map_err(|error| usage(&error.to_string()))?;
+                let notes = WaitingNotes::new(read_summary(&path)?)
+                    .map_err(|error| usage(&error.to_string()))?;
+                ReportOutcome::Waiting(WaitingReport { on, notes })
+            }
+            (_, false, _) | (_, _, Some(_)) => {
+                return Err(usage(
+                    "--on and --notes-file are only for --outcome waiting",
+                ));
+            }
+            (ReportKind::Succeeded, true, None) => ReportOutcome::Succeeded,
+            (ReportKind::Failed, true, None) => ReportOutcome::Failed,
+            (ReportKind::Blocked, true, None) => ReportOutcome::Blocked,
+        };
+        Ok((outcome, summary))
+    }
+}
+
 fn report(
     ctx: &Ctx,
     id: Option<TaskId>,
-    outcome: ReportOutcome,
-    summary: Option<String>,
-    summary_file: Option<String>,
+    input: ReportInput,
     notify: bool,
 ) -> Result<ExitCode, AppError> {
     let id = match id {
@@ -699,22 +803,15 @@ fn report(
             })?
             .parse()?,
     };
-    let summary = match (summary, summary_file) {
-        (Some(text), None) => text,
-        (None, Some(path)) => read_summary(&path)?,
-        _ => {
-            return Err(AppError::Usage {
-                message: "exactly one of --summary or --summary-file is required".into(),
-            });
-        }
-    };
+    let (outcome, summary) = input.read()?;
     let store = Store::open(&ctx.home.db_path())?;
-    let reports = store.append_report(id, outcome, &summary, notify)?;
+    let reports = store.append_report(id, &outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
     let row = store.require_task(id)?;
+    let parking = store.parking(id)?;
     let last_event = match (notify, reports.last()) {
         (true, Some(report)) => Some(notify_event(&row, report, ctx.home.task_dir(id))),
-        _ => last_event_for_row(&row, &reports, ctx.home.task_dir(id)),
+        _ => last_event_for_row(&row, &reports, ctx.home.task_dir(id), parking.as_ref()),
     };
     ctx.print_id(
         &seq.to_string(),

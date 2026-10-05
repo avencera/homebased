@@ -15,10 +15,13 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `thread` | The thread the event was addressed to. |
 | `cwd` | The child's working directory. |
 | `evidence` | Absolute task directory on the execution machine. Agent tasks contain prompt evidence, `output.log`, and `exit.json`. Task workloads omit prompt files. Container tasks also contain `container.cid`, the container ID that Docker wrote. Origin callback logs stay on the origin machine. |
-| `reports` | Worker reports in `seq` order, each `{"seq", "outcome", "summary"}`. `[]` when the worker never reported. |
+| `reports` | Worker reports in `seq` order, each `{"seq", "outcome", "summary"}`. `outcome` is `succeeded`, `failed`, `blocked`, or `waiting`. `[]` when the worker never reported. |
 | `process` | Tagged exit payload, or `null` for interim events. |
 | `timeout_secs` | Present on `TASK_CHECK_DUE`: the configured output-inactivity timeout. |
 | `next_action` | Suggested step. Follow it unless the reports say otherwise. |
+| `waiting_on` | Present only on `TASK_WAITING`: the tasks the worker waits on. |
+| `continuation` | Present only on `TASK_WAITING`: the held task that continues the work once every `waiting_on` task ended. |
+| `reason` | Present only when the event alone does not say why: `"no_report"` on a `TASK_FAILED` for an agent that exited 0 without reporting. |
 | `cancel_reason` | Present only when the origin cancelled a held task before it started: `{"type":"dependency_ended","dependency":"<uuid>","outcome":"failed"}`, or `{"type":"requested"}` after `task cancel`. `outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown` when the dependency ended but no record says how. |
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.
@@ -33,15 +36,24 @@ For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENT
 | --- | --- | --- | --- |
 | `TASK_REPORTED` | `read_report` | Worker sent an interim report with `--notify`. The process is still running; `process` is `null`. | Read the single report. If it is `blocked`, prepare the answer, but do not resubmit yet: the exit event still follows and the worker may have continued. |
 | `TASK_CHECK_DUE` | `inspect_task` | The child was still live after it wrote no output for the full inactivity timeout. `process` is `null`, and status is unchanged. | Inspect current status and recent logs because output can resume after the event. If the evidence does not show whether the task can make progress, tell the user that the state is uncertain and leave it running. Cancel or intervene only when evidence requires it. A terminal event still follows later. |
-| `TASK_SUCCEEDED` | `review_output` | Exit 0 and the last report was `succeeded`, or there were no reports. | Read the last summary. With `reports: []` (normal for task workloads) read `output.log` before trusting the result. Verify the work in `cwd` before telling the user it is done. |
+| `TASK_WAITING` | `none` | An agent worker reported `waiting` and exited 0. It submitted the long tasks in `waiting_on`; `continuation` starts on its own once every one of them ended, however it ended. | Nothing. Tell the user the work is parked on `waiting_on`. Do not act on the events of the `waiting_on` tasks yourself: they still arrive here with their own `next_action`, but the continuation reads and handles them. Act on the continuation's own events. |
+| `TASK_SUCCEEDED` | `review_output` | Exit 0 and the last report was `succeeded`. For a task, a container, or an agent with `report_trailer: false`, exit 0 with no reports. | Read the last summary. With `reports: []` (normal for task workloads) read `output.log` before trusting the result. Verify the work in `cwd` before telling the user it is done. |
 | `TASK_BLOCKED` | `answer_and_resubmit` | The last report was `blocked`. The process has exited. | Answer the question. If it needs the user, ask them. Then submit a new task whose prompt contains the answer (see submit.md). |
-| `TASK_FAILED` | `inspect_log` | Last report `failed`, non-zero exit, signal, or spawn failure. | Run `homebased task log <id> --tail 200`. Decide: fix the prompt and resubmit, raise the check timeout, fix the environment for `spawn_failed`, or report to the user. A held task whose start was refused, for example because its `cwd` no longer exists, has a `spawn_failed` message and no log. |
+| `TASK_FAILED` | `inspect_log` | Last report `failed`, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without any report (`reason: "no_report"`), and one that reported `waiting` and then exited non-zero, which parks nothing. | Run `homebased task log <id> --tail 200`. Decide: fix the prompt and resubmit, raise the check timeout, fix the environment for `spawn_failed`, or report to the user. A held task whose start was refused, for example because its `cwd` no longer exists, has a `spawn_failed` message and no log. |
 | `TASK_CANCELLED` | `none` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, the task never started: a dependency in its `after` list ended without success, or it was cancelled while held. `reports` is `[]`. | Nothing unless the user wants it rerun. For a failed dependency, handle that task's own event first, then submit the held work again. |
 | `TASK_LOST` | `inspect_log` | The worker process disappeared without writing `exit.json`, for example after a machine reboot or a `kill -9`. | Check `homebased --json daemon status`, the log, and `worker.log` in the evidence directory. Resubmit if the work is incomplete. |
 
 ## Held tasks
 
 A task submitted with `after` stays on its origin until each dependency succeeds; the origin sends its events like any other task. When it cannot start, the origin sends its only event itself: `TASK_CANCELLED` with `cancel_reason`, or `TASK_FAILED` with `spawn_failed`. Tasks held on a cancelled task are cancelled in turn, each with a `cancel_reason` that names the task it waited on.
+
+## Parked workers
+
+A worker that needs a long command submits it as its own task, reports `waiting` on it, and exits; you get `TASK_WAITING`. Its run task is finished, and its status reads `succeeded` because the process exited 0, but the work is not: `task show` has a `chain` object whose `state` is `waiting`, with `on` and `continuation`. The continuation is a held task named after the worker with ` (continued)`. It starts once every waited task ended and gets the worker's notes. A Codex worker continues in its own thread. The continuation's events come to this thread like any task's, and it can park again.
+
+- Leave the waited tasks to the continuation. Their `TASK_FAILED` or `TASK_SUCCEEDED` events still arrive, but do not resubmit or fix them yourself unless the user asks.
+- The runs of one unit of work form a chain. A task held `after` any of its runs waits for the chain's last run and starts only if that run succeeds; parking is not an outcome.
+- `task cancel` on any run of a chain cancels the run that owns the work now: the held continuation, or the running one. The response names that run.
 
 ## Duplicates
 

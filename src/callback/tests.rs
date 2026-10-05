@@ -17,15 +17,16 @@ fn run_unconditionally(
 use super::delivery::{find_saved_origin, run_command_deadline};
 use super::send_check::SendGate;
 use super::{
-    EventKind, NextAction, OriginSession, PendingT3Send, ProcessPayload, WorkloadView,
-    check_due_event, exit_event, last_event_for_row, lost_event, notify_event,
-    send_saved_queue_attempt,
+    EventKind, EventReason, ExitClass, ExitPolicy, NextAction, OriginSession, PendingT3Send,
+    ProcessPayload, WorkloadView, check_due_event, classify_exit, exit_event, last_event_for_row,
+    lost_event, notify_event, send_saved_queue_attempt,
 };
 use crate::domain::{
     Agent, AgentKind, AgentWorkload, ExitReason, ProcessGroupExitEvidence, ReportOutcome, TaskEnv,
     TaskId, TaskReport, TaskRow, TaskState, Workload,
 };
 use crate::submission::CallbackContext;
+use crate::waiting::{Parking, WaitTargets, WaitingNotes, WaitingReport};
 use chrono::Utc;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
@@ -155,6 +156,7 @@ fn cancelled_wins() {
         }),
         &[report(1, ReportOutcome::Succeeded)],
         PathBuf::from("/e"),
+        None,
     );
     assert_eq!(event.event, EventKind::TaskCancelled);
     assert_eq!(event.next_action, NextAction::None);
@@ -178,6 +180,7 @@ fn blocked_then_succeeded() {
             report(2, ReportOutcome::Succeeded),
         ],
         PathBuf::from("/e"),
+        None,
     );
     assert_eq!(event.event, EventKind::TaskSucceeded);
     assert_eq!(event.reports.len(), 2);
@@ -229,15 +232,23 @@ fn reasoning_comes_from_agent_argv() {
 }
 
 #[test]
-fn no_reports_exit_zero() {
+fn no_reports_exit_zero_fails_a_reporting_agent_with_a_derived_reason() {
     let event = exit_event(
         &row(TaskState::Finished {
             reason: ExitReason::Exit { code: 0 },
         }),
         &[],
         PathBuf::from("/e"),
+        None,
     );
-    assert_eq!(event.event, EventKind::TaskSucceeded);
+    assert_eq!(event.event, EventKind::TaskFailed);
+    assert_eq!(event.next_action, NextAction::InspectLog);
+    // the reason is derived by readers, never produced into the event itself
+    assert_eq!(event.reason, None);
+    assert_eq!(
+        event.clone().with_derived_reason().reason,
+        Some(EventReason::NoReport)
+    );
     assert!(event.reports.is_empty());
     assert!(matches!(
         event.workload,
@@ -246,6 +257,92 @@ fn no_reports_exit_zero() {
             ..
         }
     ));
+}
+
+fn waiting_report(seq: i64, on: TaskId) -> TaskReport {
+    report(
+        seq,
+        ReportOutcome::Waiting(WaitingReport {
+            on: WaitTargets::new(vec![on]).unwrap(),
+            notes: WaitingNotes::new("next steps".into()).unwrap(),
+        }),
+    )
+}
+
+/// Every row of the exit classification table
+#[test]
+fn exit_classification_table() {
+    use ExitClass::{Blocked, Cancelled, Failed, Lost, NoReport, Parked, Succeeded};
+    use ExitPolicy::{NotAgent, ReportingAgent, SilentAgent};
+
+    let target = TaskId::new();
+    let exit = |code| Some(ProcessPayload::Exit { code });
+    let signal = Some(ProcessPayload::Signal { signal: 9 });
+    let waiting = [waiting_report(1, target)];
+    let blocked = [report(1, ReportOutcome::Blocked)];
+    let failed = [report(1, ReportOutcome::Failed)];
+    let succeeded = [report(1, ReportOutcome::Succeeded)];
+    let none: [TaskReport; 0] = [];
+    let cases: &[(Option<ProcessPayload>, &[TaskReport], ExitPolicy, ExitClass)] = &[
+        (
+            Some(ProcessPayload::Cancelled),
+            &waiting,
+            ReportingAgent,
+            Cancelled,
+        ),
+        (
+            Some(ProcessPayload::RunnerLost),
+            &succeeded,
+            ReportingAgent,
+            Lost,
+        ),
+        (exit(0), &waiting, ReportingAgent, Parked),
+        (exit(0), &waiting, SilentAgent, Parked),
+        (exit(1), &waiting, ReportingAgent, Failed),
+        (signal.clone(), &waiting, ReportingAgent, Failed),
+        (exit(0), &blocked, ReportingAgent, Blocked),
+        (exit(3), &blocked, ReportingAgent, Blocked),
+        (exit(1), &succeeded, ReportingAgent, Failed),
+        (signal, &none, NotAgent, Failed),
+        (exit(0), &failed, ReportingAgent, Failed),
+        (exit(0), &succeeded, ReportingAgent, Succeeded),
+        (exit(0), &none, ReportingAgent, NoReport),
+        (exit(0), &none, SilentAgent, Succeeded),
+        (exit(0), &none, NotAgent, Succeeded),
+    ];
+    for (process, reports, policy, expected) in cases {
+        assert_eq!(
+            classify_exit(process.as_ref(), reports, *policy),
+            *expected,
+            "{process:?} {reports:?} {policy:?}"
+        );
+    }
+}
+
+#[test]
+fn a_parked_exit_names_its_targets_and_continuation_and_asks_nothing() {
+    let target = TaskId::new();
+    let finished = row(TaskState::Finished {
+        reason: ExitReason::Exit { code: 0 },
+    });
+    let parking = Parking {
+        on: WaitTargets::new(vec![target]).unwrap(),
+        continuation: TaskId::new(),
+    };
+    let reports = [waiting_report(1, target)];
+    let event = exit_event(&finished, &reports, PathBuf::from("/e"), Some(&parking));
+    assert_eq!(event.event, EventKind::TaskWaiting);
+    assert_eq!(event.next_action, NextAction::None);
+    assert_eq!(event.waiting_on, Some(parking.on.clone()));
+    assert_eq!(event.continuation, Some(parking.continuation));
+    let line = message_line(&event);
+    assert!(line.contains("\"event\":\"TASK_WAITING\""));
+    assert!(line.contains("\"outcome\":\"waiting\""));
+
+    // without a saved handover nothing resumes the work, so it reads as failed
+    let event = exit_event(&finished, &reports, PathBuf::from("/e"), None);
+    assert_eq!(event.event, EventKind::TaskFailed);
+    assert_eq!(event.waiting_on, None);
 }
 
 #[test]
@@ -281,12 +378,12 @@ fn last_event_uses_the_latest_delivery_timestamp() {
     r.check_due_at = Some(now);
     let mut later_report = report(1, ReportOutcome::Blocked);
     later_report.notified_at = Some(now + chrono::TimeDelta::seconds(1));
-    let event = last_event_for_row(&r, &[later_report], PathBuf::from("/e")).unwrap();
+    let event = last_event_for_row(&r, &[later_report], PathBuf::from("/e"), None).unwrap();
     assert_eq!(event.event, EventKind::TaskReported);
 
     let mut earlier_report = report(2, ReportOutcome::Succeeded);
     earlier_report.notified_at = Some(now - chrono::TimeDelta::seconds(1));
-    let event = last_event_for_row(&r, &[earlier_report], PathBuf::from("/e")).unwrap();
+    let event = last_event_for_row(&r, &[earlier_report], PathBuf::from("/e"), None).unwrap();
     assert_eq!(event.event, EventKind::TaskCheckDue);
 }
 
@@ -296,8 +393,9 @@ fn key_order_starts_with_api_version_event_task() {
         &row(TaskState::Finished {
             reason: ExitReason::Exit { code: 0 },
         }),
-        &[],
+        &[report(1, ReportOutcome::Succeeded)],
         PathBuf::from("/e"),
+        None,
     );
     let line = message_line(&event);
     let json = line.strip_prefix("HOMEBASED_EVENT ").unwrap();

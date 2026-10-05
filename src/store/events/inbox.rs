@@ -430,7 +430,7 @@ impl Store {
         )
         .map_err(storage)?;
         if let Some(outcome) = dependency::terminal_outcome(&event.payload) {
-            dependency::record_outcome_on(&tx, event.task, outcome).map_err(storage)?;
+            dependency::record_outcome_on(&tx, event.task, outcome).map_err(EventError::Storage)?;
         }
         tx.commit().map_err(storage)?;
         Ok(EventAcceptance::Acknowledged {

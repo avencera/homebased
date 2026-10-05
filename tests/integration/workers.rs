@@ -11,6 +11,7 @@ use std::time::Duration;
 #[test]
 fn submit_then_fake_codex_receives_event() {
     let h = Harness::new();
+    h.set_control("report", "succeeded\nDid the work.");
     let id = h.submit(&Harness::spec("claude", "do the work"));
     let show = h.wait_status(&id, "succeeded");
     assert_eq!(show["thread"], THREAD);
@@ -24,7 +25,7 @@ fn submit_then_fake_codex_receives_event() {
         ev["workload"],
         json!({"type": "agent", "agent": "claude", "model": "fable"})
     );
-    assert!(ev["reports"].as_array().unwrap().is_empty());
+    assert_eq!(ev["reports"].as_array().unwrap().len(), 1);
     assert_eq!(ev["process"]["kind"], "exit");
     assert_eq!(ev["process"]["code"], 0);
     let meta = fs::read_to_string(h.record.join("agent-meta.txt")).unwrap();
@@ -482,6 +483,7 @@ fn opencode_success_receives_feed_environment_and_report() {
     fs::create_dir_all(&cwd).unwrap();
     let mut spec = Harness::spec_with_cwd("opencode", "opencode prompt", &cwd);
     spec["workload"]["model"] = json!("zai-coding-plan/glm-5.3-flash");
+    h.set_control("report", "succeeded\nOpenCode finished.");
     let id = h.submit(&spec);
     h.wait_status(&id, "succeeded");
     let _ = h.wait_for_event(&id, "TASK_SUCCEEDED");

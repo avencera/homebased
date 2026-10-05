@@ -11,10 +11,11 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::Store;
+use super::chain::{chain_of_on, end_chain_on};
 use crate::callback::{UnlaunchedEnding, unlaunched_event};
 use crate::dependency::{
-    DependencyLookup, DependencyOutcome, DependencyState, HeldCancellation, TaskDependencies,
-    TaskOutcome,
+    DependencyLookup, DependencyOutcome, DependencyState, HeldCancellation, ReleaseRule,
+    TaskDependencies, TaskOutcome,
 };
 use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
@@ -22,6 +23,7 @@ use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::submission::{
     DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
+use crate::waiting::ChainState;
 
 fn decode_route(json: &str) -> Result<OriginRoute, AppError> {
     let route: OriginRoute = serde_json::from_str(json)?;
@@ -36,7 +38,7 @@ fn decode_after(json: Option<&str>) -> Result<Option<TaskDependencies>, AppError
 }
 
 /// Read one route and its dependencies inside the caller's transaction
-fn dependent_route_on(
+pub(super) fn dependent_route_on(
     conn: &Connection,
     task: TaskId,
 ) -> Result<Option<(OriginRoute, Option<TaskDependencies>)>, AppError> {
@@ -69,16 +71,18 @@ fn save_route_on(conn: &Connection, route: &OriginRoute) -> Result<(), AppError>
 }
 
 /// Save how a task ended; the first terminal outcome wins
+///
+/// When the task owns the work of a chain, the chain ends with it
 pub(super) fn record_outcome_on(
     conn: &Connection,
     task: TaskId,
     outcome: TaskOutcome,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), AppError> {
     conn.execute(
         "UPDATE origin_routes SET outcome=?1 WHERE task_id=?2 AND outcome IS NULL",
         params![outcome.as_str(), task.to_string()],
     )?;
-    Ok(())
+    end_chain_on(conn, task, outcome)
 }
 
 /// Outcome named by a terminal callback event, or `None` for any other event
@@ -201,6 +205,8 @@ pub struct UnlaunchedTask {
     pub held: DependentRoute,
     /// Delivery of the terminal event, once the origin ended the task
     pub callback: CallbackStatus,
+    /// Chain of a held continuation
+    pub chain: Option<crate::waiting::ChainView>,
 }
 
 /// Result of asking the origin to cancel a held route
@@ -273,16 +279,13 @@ impl Store {
 
     /// One task with dependencies that never launched, or `None` for any other task
     pub fn unlaunched_task(&self, task: TaskId) -> Result<Option<UnlaunchedTask>, AppError> {
-        let Some((route, Some(after))) = dependent_route_on(&self.conn, task)? else {
+        let Some(held) = self
+            .dependent_routes(&format!("task_id = '{task}' AND {UNLAUNCHED}"))?
+            .pop()
+        else {
             return Ok(None);
         };
-        if !matches!(
-            route.submission,
-            SubmissionState::Held { .. } | SubmissionState::Rejected { .. }
-        ) {
-            return Ok(None);
-        }
-        self.unlaunched(DependentRoute { route, after }).map(Some)
+        self.unlaunched(held).map(Some)
     }
 
     fn unlaunched(&self, held: DependentRoute) -> Result<UnlaunchedTask, AppError> {
@@ -291,12 +294,17 @@ impl Store {
             .as_ref()
             .and_then(DeliveryState::callback_status)
             .unwrap_or(CallbackStatus::Pending);
-        Ok(UnlaunchedTask { held, callback })
+        let chain = self.chain_view(held.route.task)?;
+        Ok(UnlaunchedTask {
+            held,
+            callback,
+            chain,
+        })
     }
 
     fn dependent_routes(&self, filter: &str) -> Result<Vec<DependentRoute>, AppError> {
         let sql = format!(
-            "SELECT task_id,route_json,after_json FROM origin_routes
+            "SELECT task_id,route_json,after_json,after_rule FROM origin_routes
              WHERE after_json IS NOT NULL AND json_valid(route_json) AND {filter}
              ORDER BY task_id"
         );
@@ -307,17 +315,21 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(task, route_json, after_json)| {
+            .map(|(task, route_json, after_json, rule)| {
                 let route = decode_route(&route_json)?;
                 if route.task.to_string() != task {
                     return Err(AppError::ClusterTaskConflict { task: route.task });
                 }
                 let after = serde_json::from_str(&after_json)?;
-                Ok(DependentRoute { route, after })
+                let rule = ReleaseRule::from_storage(&rule).ok_or_else(|| AppError::Internal {
+                    message: format!("unknown release rule {rule} for {task}"),
+                })?;
+                Ok(DependentRoute { route, after, rule })
             })
             .collect()
     }
@@ -337,6 +349,13 @@ impl Store {
                     "run task {task} cannot be used in after; job dependencies are not supported"
                 ),
             });
+        }
+        // a run of a chain ends with the whole chain, even after it parked
+        if let Some(chain) = chain_of_on(&self.conn, task)? {
+            return Ok(Some(match chain.state {
+                ChainState::Ended { outcome } => DependencyState::Ended(outcome.into()),
+                ChainState::Running { .. } | ChainState::Waiting { .. } => DependencyState::Pending,
+            }));
         }
 
         let saved: Option<(String, Option<String>)> = self

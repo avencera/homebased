@@ -487,10 +487,10 @@ fn local_producer_sequences_reports_and_terminal_state() {
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     store
-        .append_report(id, ReportOutcome::Blocked, "silent", false)
+        .append_report(id, &ReportOutcome::Blocked, "silent", false)
         .unwrap();
     store
-        .append_report(id, ReportOutcome::Succeeded, "notify", true)
+        .append_report(id, &ReportOutcome::Succeeded, "notify", true)
         .unwrap();
     store
         .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
@@ -550,7 +550,7 @@ fn local_producer_rolls_back_state_and_report_when_event_insert_fails() {
     );
     assert!(
         store
-            .append_report(id, ReportOutcome::Succeeded, "body", true)
+            .append_report(id, &ReportOutcome::Succeeded, "body", true)
             .is_err()
     );
     assert!(store.reports(id).unwrap().is_empty());
@@ -661,7 +661,7 @@ fn inactivity_reminder_is_one_event_with_current_reports() {
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     store
-        .append_report(id, ReportOutcome::Blocked, "waiting", false)
+        .append_report(id, &ReportOutcome::Blocked, "waiting", false)
         .unwrap();
     assert!(store.produce_attention_event(id).unwrap());
     assert!(!store.produce_attention_event(id).unwrap());
@@ -873,7 +873,7 @@ fn fleet_disabled_local_notify_and_terminal_callback_use_the_durable_inbox() {
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     store
-        .append_report(id, ReportOutcome::Succeeded, "interim", true)
+        .append_report(id, &ReportOutcome::Succeeded, "interim", true)
         .unwrap();
     store
         .cas_exit(id, ProcessStatus::Running, &ExitReason::Exit { code: 0 })
@@ -953,7 +953,7 @@ fn interim_failure_stays_visible_after_terminal_success_and_terminal_failure_is_
     store
         .append_report(
             interim_failure_id,
-            ReportOutcome::Blocked,
+            &ReportOutcome::Blocked,
             "interim failure",
             true,
         )
@@ -1117,29 +1117,29 @@ fn reports_keep_order_and_refuse_overflow_long_summaries_and_terminal_tasks() {
         .cas_status(id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     let reports = store
-        .append_report(id, ReportOutcome::Blocked, "need x", false)
+        .append_report(id, &ReportOutcome::Blocked, "need x", false)
         .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].seq, 1);
     let reports = store
-        .append_report(id, ReportOutcome::Succeeded, "got x", false)
+        .append_report(id, &ReportOutcome::Succeeded, "got x", false)
         .unwrap();
     assert_eq!(reports.len(), 2);
     assert_eq!(reports[1].seq, 2);
 
     let long = "x".repeat(SUMMARY_MAX_BYTES + 1);
     let err = store
-        .append_report(id, ReportOutcome::Succeeded, &long, false)
+        .append_report(id, &ReportOutcome::Succeeded, &long, false)
         .unwrap_err();
     assert!(matches!(err, AppError::SummaryTooLong { .. }));
 
     for i in 0..18 {
         store
-            .append_report(id, ReportOutcome::Succeeded, &format!("n{i}"), false)
+            .append_report(id, &ReportOutcome::Succeeded, &format!("n{i}"), false)
             .unwrap();
     }
     let err = store
-        .append_report(id, ReportOutcome::Succeeded, "overflow", false)
+        .append_report(id, &ReportOutcome::Succeeded, "overflow", false)
         .unwrap_err();
     assert!(matches!(err, AppError::TooManyReports { count: 20 }));
 
@@ -1150,7 +1150,7 @@ fn reports_keep_order_and_refuse_overflow_long_summaries_and_terminal_tasks() {
         .unwrap()
         .expect("queued task cancels");
     let err = store
-        .append_report(terminal, ReportOutcome::Succeeded, "late", false)
+        .append_report(terminal, &ReportOutcome::Succeeded, "late", false)
         .unwrap_err();
     assert!(matches!(err, AppError::TaskTerminal { .. }));
 }

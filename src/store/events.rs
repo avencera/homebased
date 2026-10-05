@@ -164,6 +164,30 @@ fn validate(event: &TaskEvent) -> Result<(), EventError> {
             message: "TASK_PREEMPTED and the preempted state must appear together".into(),
         });
     }
+    // a parked run names its handover, ended with exit 0, and never crosses machines
+    if let EventPayload::Callback {
+        event: callback,
+        state,
+    } = &event.payload
+    {
+        let waiting = callback.event == EventKind::TaskWaiting;
+        let handover = (
+            callback.waiting_on.is_some(),
+            callback.continuation.is_some(),
+        );
+        let valid = if waiting {
+            handover == (true, true)
+                && *state == Some(ProcessStatus::Succeeded)
+                && event.origin_machine == event.execution_machine
+        } else {
+            handover == (false, false)
+        };
+        if !valid {
+            return Err(EventError::Invalid {
+                message: "TASK_WAITING needs its handover, exit 0, and one machine".into(),
+            });
+        }
+    }
     let reports: &[crate::callback::ReportView] = match &event.payload {
         EventPayload::Callback { event, .. } => &event.reports,
         EventPayload::Report { report } => std::slice::from_ref(report),

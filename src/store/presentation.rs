@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::machine::MachineId;
 use crate::submission::{ExecutorIdentity, OriginRoute};
+use crate::waiting::ChainView;
 
 /// Both machine owners of one accepted execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub struct TaskPresentation {
     pub terminal_callback: Option<CallbackStatus>,
     /// Whether this task's inactivity reminder reached the origin queue
     pub attention_delivered: bool,
+    /// Chain of an agent run that parked or continues parked work
+    pub chain: Option<ChainView>,
 }
 
 /// Which machine delivers a task's callbacks
@@ -81,6 +84,7 @@ impl Store {
                 let task = self.require_task(presentation.id)?;
                 presentation.terminal_callback = self.terminal_callback(&task)?;
                 presentation.attention_delivered = self.attention_callback_delivered(&task)?;
+                presentation.chain = self.chain_view(task.id)?;
                 presentations.insert(presentation.id, presentation);
             }
         }
@@ -313,6 +317,7 @@ fn presentation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPresen
         owners,
         terminal_callback: None,
         attention_delivered: false,
+        chain: None,
     })
 }
 

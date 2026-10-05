@@ -66,6 +66,12 @@ if [ -f "$record/opencode-hold" ]; then
   while :; do sleep 1; done
 fi
 
+if [ -f "$record/report" ]; then
+  homebased task report \
+    --outcome "$(head -n1 "$record/report")" \
+    --summary "$(tail -n +2 "$record/report")"
+fi
+
 if [ -n "${FAKE_REPORT:-}" ]; then
   homebased task report \
     --outcome "${FAKE_OUTCOME:-succeeded}" \

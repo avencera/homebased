@@ -3,6 +3,7 @@
 pub mod actors;
 pub mod api;
 mod cancel_delivery;
+mod chains;
 pub mod cluster;
 pub mod content;
 mod dependencies;
