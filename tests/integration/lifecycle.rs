@@ -464,7 +464,7 @@ fn process_group_cleaned_when_child_leaves_descendant() {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\n# nested sh so $$ is the descendant, not this script\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"{pid}\"; sleep 60' &\nwhile [ ! -f '{pid}' ]; do sleep 0.01; done\nexit 0\n",
+            "#!/bin/sh\n# nested sh so $$ is the descendant, not this script\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; sleep 60' &\nwhile [ ! -f '{pid}' ]; do sleep 0.01; done\nexit 0\n",
             pid = pid_file.display()
         ),
     )
