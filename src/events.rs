@@ -74,6 +74,8 @@ impl TaskEvent {
             return Ok(None);
         };
 
+        // the reason is derived here, so an executor that predates it is read the same way
+        let event = event.as_ref().clone().with_derived_reason();
         let mut value = serde_json::to_value(event)?;
         let object = value.as_object_mut().ok_or_else(|| AppError::Internal {
             message: "callback payload is not an object".into(),
@@ -361,6 +363,9 @@ mod tests {
             timeout_secs: None,
             next_action: NextAction::ReadReport,
             cancel_reason: None,
+            waiting_on: None,
+            continuation: None,
+            reason: None,
         };
         let event = TaskEvent {
             task,

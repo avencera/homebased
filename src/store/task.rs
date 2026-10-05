@@ -7,6 +7,7 @@ use chrono::Utc;
 use nix::unistd::Pid;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::chain::thread_reserved_by_on;
 use super::{Store, fmt_time, parse_time};
 use crate::cleanup::{ProcessIdentity, ProcessStartTime};
 use crate::domain::{
@@ -95,6 +96,10 @@ fn reject_busy_resume_thread_on(conn: &Connection, row: &TaskRow) -> Result<(), 
             thread,
             task: task.parse()?,
         });
+    }
+    // a parked chain resumes this thread later, so it owns it until then
+    if let Some(task) = thread_reserved_by_on(conn, thread, row.id)? {
+        return Err(AppError::ResumeThreadBusy { thread, task });
     }
     Ok(())
 }

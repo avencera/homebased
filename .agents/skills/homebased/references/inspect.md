@@ -10,9 +10,9 @@ homebased --json task list --status running,queued         # in flight
 homebased --quiet task list --status running               # bare ids, one per line
 ```
 
-Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies and has no process yet.
+Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies, or a continuation waits for the tasks its worker parked on, and has no process yet. Status is the process status: a worker that parked exited 0 and reads `succeeded`; its `chain` says the work is still waiting.
 
-Each entry: `id`, `name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `name`.
+Each entry: `id`, `name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`, and `chain` for a run of parked work. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `name`.
 
 `task list` reads tasks stored on this machine. It does not query every Fleet peer. It includes tasks held here, also those that will run on another machine, and held tasks that ended before they started. Those entries also have `after`: one `{"task", "state"}` per dependency, where `state` is `pending`, or `ended` with an `outcome` of `succeeded`, `failed`, `blocked`, `cancelled`, `lost`, or `unknown`. `unknown` means the task ended but no record says how; it never counts as success.
 
@@ -26,13 +26,14 @@ homebased --json task show <id>
 | --- | --- |
 | `name` | Submitted goal label. |
 | `status` | Process status, or `held`, see above. |
-| `after` | Present for a task submitted with `after`: each dependency and its `state`, as in the list. A held task waits for every `pending` entry. |
+| `after` | Present for a task submitted with `after`: each dependency and its `state`, as in the list. A held task waits for every `pending` entry. A held continuation lists the tasks its worker waits on and starts once each one ended, however it ended. |
+| `chain` | Present for an agent run that parked or continues parked work: `id` (the first run), this task's `run` number, the chain's `runs`, and its `state`. `running` names the `current` run; `waiting` names the parked run as `current`, the tasks it waits `on`, and its `continuation`; `ended` has the `outcome` of the last run, which is the outcome of the whole chain. |
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
 | `worker_thread` | Worker thread UUID. A Claude worker's session id, recorded when it starts running; send it new instructions with `message send --worker`. A Codex worker's thread, recorded when the task ends, including lost tasks, if Homebased found a valid session id in the first 64 KiB of `output.log`. Omitted when unknown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
 | `callback` | Delivery of the terminal event to the submitting thread: `pending`, `sending`, `waiting`, `sent`, or `failed`. `null` when this machine delivers no callback for the task: on the executor of a task submitted from another machine (ask the origin), and on a queue run, which reports through its job. Use `failed_events` for per-event callback failures. |
 | `cancel_requested_at` | Set once `task cancel` ran. |
-| `reports` | Worker reports with `seq`, `outcome`, `summary`, `reported_at`, and `notified_at` when `--notify` succeeded. |
+| `reports` | Worker reports with `seq`, `outcome`, `summary`, `reported_at`, and `notified_at` when `--notify` succeeded. A `waiting` report also has `waiting_on` and the worker's `notes`. |
 | `evidence` | Task directory. |
 | `output_log` | Path of the combined stdout and stderr of the child. |
 | `last_event` | The event object already sent, or the one that will be sent. `null` while running with no interim event. |
@@ -105,6 +106,8 @@ homebased --json task cancel <id>
 ```
 
 Sends SIGTERM to the worker, which forwards it to the child's process group, waits for the group to disappear, and sends SIGKILL after 10 seconds if descendants remain. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.
+
+Cancelling any run of a parked chain cancels the run that owns the work now: its held continuation before it starts, or the continuation that already runs. The response `id` names that run. The chain then ends `cancelled`.
 
 Cancelling a held task on its origin cancels it before it starts, sends `TASK_CANCELLED` with `cancel_reason` `requested`, and cancels the tasks held on it. Run it on the machine that accepted the submit; another machine gets a `usage` error. Once a held remote task has begun to start, cancel follows the remote path below.
 

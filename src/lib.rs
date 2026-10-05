@@ -34,6 +34,7 @@ pub mod submission;
 pub mod t3;
 pub mod thread_title;
 pub mod update;
+pub mod waiting;
 
 #[cfg(test)]
 mod dispatcher_tests;

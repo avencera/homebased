@@ -7,6 +7,10 @@
 //! dependency succeeded, and cancels it before launch as soon as one ended any
 //! other way. The loop starts with the daemon, so endings that arrived while
 //! the daemon was down apply on start
+//!
+//! The same loop releases the continuation of a parked agent worker. Its held
+//! route waits on the worker's targets under [`ReleaseRule::Ended`], so it
+//! launches once every target ended, however each one ended
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -22,7 +26,8 @@ use super::cancel_delivery::CancelResponse;
 use super::event_sender::Retry;
 use super::{local_submit, origin_submit};
 use crate::dependency::{
-    DependencyOutcome, DependencyState, HeldCancellation, HeldDecision, TaskDependencies, decide,
+    DependencyOutcome, DependencyState, HeldCancellation, HeldDecision, ReleaseRule,
+    TaskDependencies, decide,
 };
 use crate::domain::{ProcessStatus, TaskId, TaskStatus};
 use crate::error::AppError;
@@ -141,7 +146,7 @@ async fn admit(state: &AppState, after: &TaskDependencies) -> Result<Admission, 
     for (task, state) in states {
         known.push((task, state.ok_or(AppError::UnknownDependency { task })?));
     }
-    match decide(known) {
+    match decide(known, ReleaseRule::Succeeded) {
         HeldDecision::Release => Ok(Admission::Ready),
         HeldDecision::Wait => Ok(Admission::Pending),
         HeldDecision::Cancel(failure) => Err(AppError::DependencyFailed {
@@ -273,7 +278,7 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             unstarted.contains(task) || routes.iter().any(|held| held.route.task == *task)
         });
         let mut cancelled = false;
-        for DependentRoute { route, after } in routes {
+        for DependentRoute { route, after, rule } in routes {
             match &route.submission {
                 SubmissionState::Held {
                     phase: HeldPhase::Waiting,
@@ -284,7 +289,7 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
                     continue;
                 }
             }
-            match decide(known_states(state, &after).await?) {
+            match decide(known_states(state, &after).await?, rule) {
                 HeldDecision::Wait => {}
                 HeldDecision::Release => retry_release(state, retries, route).await,
                 HeldDecision::Cancel(failure) => {

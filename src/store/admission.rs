@@ -3,6 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::Store;
+use super::chain::start_continuation_on;
 use super::events::append_produced_event_on;
 use super::identity::insert_identity_on;
 use super::task::insert_accepted_task_on;
@@ -160,6 +161,7 @@ fn release_held_local_task_records_on(
     validate_local_task_acceptance(row, spec, &route.callback)?;
 
     insert_accepted_task_on(conn, row)?;
+    start_continuation_on(conn, row.id)?;
     route.submission = SubmissionState::Accepted;
     route.last_execution_state = Some(ProcessStatus::Queued);
     route.last_updated_at = chrono::Utc::now();

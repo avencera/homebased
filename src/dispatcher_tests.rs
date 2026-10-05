@@ -643,7 +643,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
         .cas_status(row.id, ProcessStatus::Queued, ProcessStatus::Running)
         .unwrap();
     store
-        .append_report(row.id, ReportOutcome::Succeeded, "done", false)
+        .append_report(row.id, &ReportOutcome::Succeeded, "done", false)
         .unwrap();
     store
         .cas_exit(

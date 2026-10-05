@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::dependency::{HeldCancellation, TaskDependencies};
+use crate::dependency::{HeldCancellation, ReleaseRule, TaskDependencies};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
 use crate::spec::NormalizedSpec;
@@ -190,8 +190,11 @@ pub struct OriginRoute {
 pub struct DependentRoute {
     /// Saved origin route
     pub route: OriginRoute,
-    /// Tasks that must succeed before it launches
+    /// Tasks that must end before it launches
     pub after: TaskDependencies,
+    /// Which endings of `after` release it: success for a submitted `after`,
+    /// any ending for a continuation
+    pub rule: ReleaseRule,
 }
 
 /// Exact identity and origin-owned context used to create a held route

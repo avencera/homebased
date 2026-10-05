@@ -13,6 +13,7 @@ use crate::error::AppError;
 
 mod admission;
 mod cancellation;
+mod chain;
 mod container;
 mod dependency;
 mod events;

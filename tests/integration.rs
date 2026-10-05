@@ -344,6 +344,7 @@ impl Harness {
             "sleep",
             "report",
             "report2",
+            "waiting",
             "notify",
             "exit",
             "queue-fails",
@@ -643,5 +644,7 @@ mod service;
 mod source_rules;
 #[path = "integration/submission.rs"]
 mod submission;
+#[path = "integration/waiting.rs"]
+mod waiting;
 #[path = "integration/workers.rs"]
 mod workers;

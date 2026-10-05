@@ -14,6 +14,7 @@ use crate::domain::{
 use crate::machine::MachineId;
 use crate::store::{TaskPresentation, UnlaunchedTask};
 use crate::submission::{HeldPhase, SubmissionState};
+use crate::waiting::ChainView;
 
 /// `GET /v1/status`.
 #[derive(Debug, Clone, Serialize)]
@@ -91,9 +92,14 @@ pub struct TaskSummary {
     /// Last row update. For a terminal task this is the finish time.
     pub updated_at: DateTime<Utc>,
     /// Tasks that must succeed before this one starts, with their current state.
-    /// Present only for a task submitted with `after`.
+    /// Present only for a task submitted with `after`, and for a held
+    /// continuation, which starts once each of them ended in any way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<Vec<DependencyView>>,
+    /// The chain of an agent run that parked or continues parked work: the
+    /// whole chain's state, so a parked run reads `waiting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<ChainView>,
 }
 
 /// One entry of a task's `after` list.
@@ -138,6 +144,7 @@ impl TaskSummary {
             created_at: row.created_at,
             updated_at: row.updated_at,
             after: None,
+            chain: presentation.and_then(|presentation| presentation.chain.clone()),
         }
     }
 
@@ -195,6 +202,7 @@ impl TaskSummary {
             created_at,
             updated_at: route.last_updated_at,
             after: Some(after),
+            chain: task.chain.clone(),
         })
     }
 }

@@ -14,8 +14,10 @@ meta="$record/agent-meta-$task.txt"
   printf 'HOME=%s\n' "${HOME:-}"
   printf 'HOMEBASED_TASK_ID=%s\n' "${HOMEBASED_TASK_ID:-}"
   printf 'HOMEBASED_HOME=%s\n' "${HOMEBASED_HOME:-}"
+  printf 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=%s\n' "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS:-}"
 } > "$meta"
 cp "$meta" "$record/agent-meta.txt"
+printf '%s\n' "$task" >> "$record/agent-runs.txt"
 
 if [ -f "$record/ignore-term" ]; then
   trap '' TERM
@@ -62,6 +64,26 @@ run_report() {
   homebased task report --outcome "$outcome" --summary "$summary" $extra
 }
 
+exit_code="${FAKE_EXIT:-0}"
+if [ -f "$record/exit" ]; then
+  exit_code=$(cat "$record/exit")
+fi
+
+# park once: the first line names the tasks to wait on and the rest is the
+# notes. The first run that claims the control consumes it, so its
+# continuation runs on the remaining controls
+waiting="$record/waiting-$task"
+if [ -f "$record/waiting" ] && mv "$record/waiting" "$waiting" 2>/dev/null; then
+  targets=$(head -n1 "$waiting")
+  set --
+  for target in $targets; do
+    set -- "$@" --on "$target"
+  done
+  tail -n +2 "$waiting" | homebased task report --outcome waiting "$@" \
+    --summary "waiting on $targets" --notes-file -
+  exit "$exit_code"
+fi
+
 if [ -n "${FAKE_REPORT:-}" ]; then
   extra=
   if [ -n "${FAKE_NOTIFY:-}" ]; then
@@ -76,8 +98,4 @@ if [ -n "${FAKE_REPORT2:-}" ]; then
 fi
 run_report "$record/report2"
 
-exit_code="${FAKE_EXIT:-0}"
-if [ -f "$record/exit" ]; then
-  exit_code=$(cat "$record/exit")
-fi
 exit "$exit_code"

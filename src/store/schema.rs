@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,47 @@ pub const SCHEMA_VERSION: i64 = 1;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 0] = [];
+const MIGRATIONS: [Migration; 1] = [add_waiting_handoff];
+
+/// Version 2: waiting reports, the continuation release rule, and run chains
+fn add_waiting_handoff(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE reports ADD COLUMN {REPORT_WAITING_ON};
+         ALTER TABLE reports ADD COLUMN {REPORT_NOTES};
+         ALTER TABLE origin_routes ADD COLUMN {ROUTE_AFTER_RULE};
+         {CHAIN_TABLES}"
+    ))
+}
+
+/// Targets of a `waiting` report, as a JSON array; set exactly on waiting reports
+const REPORT_WAITING_ON: &str =
+    "waiting_on TEXT CHECK ((outcome = 'waiting') = (waiting_on IS NOT NULL))";
+
+/// Notes of a `waiting` report; set exactly on waiting reports
+const REPORT_NOTES: &str = "notes TEXT CHECK ((outcome = 'waiting') = (notes IS NOT NULL))";
+
+/// Which endings of `after_json` release a held route: public `after` needs
+/// success, and a continuation is released by any ending
+const ROUTE_AFTER_RULE: &str = "after_rule TEXT NOT NULL DEFAULT 'succeeded'
+    CHECK (after_rule IN ('succeeded', 'ended'))";
+
+/// A chain owns the logical work of an agent that parked at least once. Its
+/// id is the first run's task id, `state_json` is a `ChainState`, and each
+/// run task, including a held continuation, has one numbered row
+const CHAIN_TABLES: &str = "
+CREATE TABLE task_chains (
+    id TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE chain_runs (
+    task_id TEXT PRIMARY KEY,
+    chain_id TEXT NOT NULL REFERENCES task_chains(id),
+    run_number INTEGER NOT NULL CHECK (run_number >= 1),
+    UNIQUE (chain_id, run_number)
+);
+";
 
 const _: () = assert!(
     MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1,
@@ -36,7 +76,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<(), AppError> {
         return Ok(());
     }
     if version == 0 {
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(&schema())?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -57,7 +97,17 @@ pub(super) fn migrate(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Every table of schema version 1
+/// Every table of the current schema version
+fn schema() -> String {
+    SCHEMA
+        .replace("{REPORT_WAITING_ON}", REPORT_WAITING_ON)
+        .replace("{REPORT_NOTES}", REPORT_NOTES)
+        .replace("{ROUTE_AFTER_RULE}", ROUTE_AFTER_RULE)
+        .replace("{CHAIN_TABLES}", CHAIN_TABLES)
+}
+
+/// Every table of the current schema, with the version 2 columns and tables
+/// shared with [`add_waiting_handoff`] as placeholders
 ///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -132,6 +182,8 @@ CREATE TABLE reports (
     summary TEXT NOT NULL,
     reported_at TEXT NOT NULL,
     notified_at TEXT,
+    {REPORT_WAITING_ON},
+    {REPORT_NOTES},
     PRIMARY KEY (task_id, seq),
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
@@ -152,7 +204,8 @@ CREATE TABLE origin_routes (
     route_json TEXT NOT NULL,
     after_json TEXT,
     outcome TEXT
-        CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted'))
+        CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted')),
+    {ROUTE_AFTER_RULE}
 );
 
 CREATE TABLE executor_identities (
@@ -377,14 +430,14 @@ CREATE TABLE resource_job_delivery (
     job_id TEXT PRIMARY KEY REFERENCES resource_jobs(id),
     acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
 );
-";
+{CHAIN_TABLES}";
 
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::{SCHEMA_VERSION, migrate};
+    use super::{SCHEMA_VERSION, migrate, schema};
     use crate::error::AppError;
     use crate::store::Store;
 
@@ -454,6 +507,66 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         assert_eq!(user_version(&conn), newer);
         assert_eq!(table_names(&conn), ["future"]);
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY name"
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_version_1_database_migrates_to_the_fresh_schema_and_keeps_its_reports() {
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+
+        // version 1 is the current schema without what version 2 added
+        let v1 = schema()
+            .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
+            .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
+            .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
+            .replace(super::CHAIN_TABLES, "");
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(&v1).unwrap();
+        assert!(!columns(&old, "reports").contains(&"notes".to_string()));
+        old.pragma_update(None, "user_version", 1).unwrap();
+        old.execute_batch(
+            "INSERT INTO tasks (id,thread_id,name,workload_json,cwd,timeout_secs,env_path,
+                 env_home,binary,status,created_at,updated_at,process_group_exit_evidence)
+             VALUES ('t','th','n','{}','/','1','/','/','/b','running','x','x','unconfirmed');
+             INSERT INTO reports (task_id,seq,outcome,summary,reported_at)
+             VALUES ('t',1,'blocked','old','x');",
+        )
+        .unwrap();
+
+        migrate(&old).unwrap();
+        assert_eq!(user_version(&old), SCHEMA_VERSION);
+        assert_eq!(table_names(&old), table_names(&fresh));
+        for table in ["reports", "origin_routes", "task_chains", "chain_runs"] {
+            assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
+        }
+        let kept: String = old
+            .query_row("SELECT summary FROM reports WHERE task_id='t'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "old");
+        // a waiting report must carry its targets and notes
+        assert!(
+            old.execute(
+                "INSERT INTO reports (task_id,seq,outcome,summary,reported_at)
+                 VALUES ('t',2,'waiting','w','x')",
+                [],
+            )
+            .is_err()
+        );
     }
 
     #[test]

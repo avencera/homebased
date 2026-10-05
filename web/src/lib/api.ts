@@ -55,8 +55,8 @@ export type AgentKind = typeof AgentKindSchema.Type;
 const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'waiting', 'sent', 'failed');
 export type CallbackStatus = typeof CallbackStatusSchema.Type;
 
-/** Worker-authored outcome of one report. */
-const ReportOutcomeSchema = Schema.Literal('succeeded', 'failed', 'blocked');
+/** Worker-authored outcome of one report. `waiting` parks an agent worker on other tasks. */
+const ReportOutcomeSchema = Schema.Literal('succeeded', 'failed', 'blocked', 'waiting');
 export type ReportOutcome = typeof ReportOutcomeSchema.Type;
 
 /** Why the process ended, once known. Tagged by `kind` in JSON. */
@@ -137,6 +137,33 @@ const DaemonStatusSchema = Schema.Struct({
 });
 export type DaemonStatus = typeof DaemonStatusSchema.Type;
 
+/** Fields every chain state carries: the chain id, this task's run number, and the run count. */
+const ChainRunFields = {
+	/** Task id of the chain's first run. */
+	id: Schema.String,
+	/** 1-based position of this task in the chain. */
+	run: Schema.Finite,
+	/** Runs the chain has so far, including a held continuation. */
+	runs: Schema.Finite
+};
+
+/**
+ * Chain of an agent run that parked or continues parked work. `waiting` means the run in
+ * `current` parked on the tasks in `on`, and `continuation` starts once they all ended.
+ */
+const ChainSchema = Schema.Union(
+	Schema.Struct({ ...ChainRunFields, state: Schema.Literal('running'), current: Schema.String }),
+	Schema.Struct({
+		...ChainRunFields,
+		state: Schema.Literal('waiting'),
+		current: Schema.String,
+		on: Schema.Array(Schema.String),
+		continuation: Schema.String
+	}),
+	Schema.Struct({ ...ChainRunFields, state: Schema.Literal('ended'), outcome: Schema.String })
+);
+export type Chain = typeof ChainSchema.Type;
+
 /** One row of `GET /v1/tasks`. */
 const TaskSummarySchema = Schema.Struct({
 	id: Schema.String,
@@ -167,9 +194,16 @@ const TaskSummarySchema = Schema.Struct({
 	cancel_requested_at: Schema.NullOr(Schema.String),
 	created_at: Schema.String,
 	/** For a terminal task this is the finish time. */
-	updated_at: Schema.String
+	updated_at: Schema.String,
+	/** Chain of a run of parked work. A parked run's own status reads `succeeded`. */
+	chain: Schema.optional(ChainSchema)
 });
 export type TaskSummary = typeof TaskSummarySchema.Type;
+
+/** Whether this task is the run that parked its chain, so its work is still waiting. */
+export function isParked(task: TaskSummary): boolean {
+	return task.chain?.state === 'waiting' && task.chain.current === task.id;
+}
 
 /** Where a browser opens one machine's dashboard. */
 const MachineLocationSchema = Schema.Union(

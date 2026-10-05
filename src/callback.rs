@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use crate::container::GpuRequest;
 use crate::dependency::HeldCancellation;
 use crate::domain::{
-    AgentKind, ExitReason, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow, TaskState,
-    ThreadId, Workload,
+    AgentKind, ExitReason, ReportKind, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow,
+    TaskState, ThreadId, Workload,
 };
 use crate::spec::NormalizedSpec;
+use crate::waiting::{Parking, WaitTargets};
 
 pub(crate) use delivery::{
     CodexWakeError, OriginSession, PendingRetry, PendingT3Send, ReachableOrigin, append_fallback,
@@ -184,12 +185,37 @@ pub enum EventKind {
     TaskLost,
     /// Last report is blocked.
     TaskBlocked,
+    /// The worker parked on other tasks; its continuation runs once they end.
+    TaskWaiting,
     /// Failure or non-zero exit.
     TaskFailed,
     /// Success.
     TaskSucceeded,
     /// Stopped for higher-priority work; its job is queued again.
     TaskPreempted,
+}
+
+/// Why an event names the outcome it does, when its fields alone do not say
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventReason {
+    /// An agent with the report trailer exited 0 without reporting
+    NoReport,
+}
+
+impl EventReason {
+    /// Reason an event implies, derived from its own fields
+    ///
+    /// Only a missing report turns exit 0 into `TASK_FAILED` with no reports,
+    /// so the reason never travels between machines: each reader derives it,
+    /// and an executor stays readable by an origin that predates the field
+    #[must_use]
+    pub fn derive(event: &HomebasedEvent) -> Option<Self> {
+        let no_report = event.event == EventKind::TaskFailed
+            && event.process == Some(ProcessPayload::Exit { code: 0 })
+            && event.reports.is_empty();
+        no_report.then_some(Self::NoReport)
+    }
 }
 
 /// Suggested orchestrator next step.
@@ -255,7 +281,7 @@ pub struct ReportView {
     /// Sequence number.
     pub seq: i64,
     /// Outcome.
-    pub outcome: ReportOutcome,
+    pub outcome: ReportKind,
     /// Summary.
     pub summary: String,
 }
@@ -264,7 +290,7 @@ impl From<&TaskReport> for ReportView {
     fn from(report: &TaskReport) -> Self {
         Self {
             seq: report.seq,
-            outcome: report.outcome,
+            outcome: report.outcome.kind(),
             summary: report.summary.clone(),
         }
     }
@@ -302,17 +328,45 @@ pub struct HomebasedEvent {
     /// Why the origin cancelled a held task before it launched. Present only on that `TASK_CANCELLED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<HeldCancellation>,
+    /// Tasks the worker waits on. Present only on `TASK_WAITING`, with `continuation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<WaitTargets>,
+    /// Held task that continues the work once every `waiting_on` task ends.
+    /// Present only on `TASK_WAITING`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TaskId>,
+    /// Why the event names its outcome, such as `no_report`. Derived by each
+    /// reader with [`EventReason::derive`]; never stored or sent between machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<EventReason>,
 }
 
-/// Build an exit event from the row's stored reason.
+impl HomebasedEvent {
+    /// The event with its derived `reason` filled in, as readers see it
+    #[must_use]
+    pub fn with_derived_reason(mut self) -> Self {
+        self.reason = EventReason::derive(&self);
+        self
+    }
+}
+
+/// Build an exit event from the row's stored reason
+///
+/// `parking` is the handover the store saved when the run parked, so a
+/// waiting exit names its targets and continuation
 #[must_use]
-pub fn exit_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
+pub fn exit_event(
+    row: &TaskRow,
+    reports: &[TaskReport],
+    evidence: PathBuf,
+    parking: Option<&Parking>,
+) -> HomebasedEvent {
     build_event(
         row,
         reports,
         evidence,
         row.exit_reason().map(ProcessPayload::from),
-        None,
+        parking,
     )
 }
 
@@ -337,7 +391,7 @@ pub fn preempted_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
     HomebasedEvent {
         event: EventKind::TaskPreempted,
         next_action: NextAction::None,
-        ..exit_event(row, reports, evidence)
+        ..exit_event(row, reports, evidence, None)
     }
 }
 
@@ -358,6 +412,9 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         timeout_secs: Some(row.timeout.as_secs()),
         next_action: NextAction::InspectTask,
         cancel_reason: None,
+        waiting_on: None,
+        continuation: None,
+        reason: None,
     }
 }
 
@@ -366,9 +423,26 @@ fn build_event(
     reports: &[TaskReport],
     evidence: PathBuf,
     process: Option<ProcessPayload>,
-    timeout_secs: Option<u64>,
+    parking: Option<&Parking>,
 ) -> HomebasedEvent {
-    let (event, next_action) = derive_exit(process.as_ref(), reports);
+    let exit = classify_exit(
+        process.as_ref(),
+        reports,
+        ExitPolicy::of(&row.workload),
+        row.cancel_requested_at.is_some(),
+    );
+    let (event, next_action, parking) = match exit {
+        ExitClass::Parked => match parking {
+            Some(parking) => (EventKind::TaskWaiting, NextAction::None, Some(parking)),
+            // a waiting exit always parks in the transaction that ends it, so a
+            // missing handover means the store refused it; nothing will resume
+            None => (EventKind::TaskFailed, NextAction::InspectLog, None),
+        },
+        other => {
+            let (event, next_action) = other.event();
+            (event, next_action, None)
+        }
+    };
     HomebasedEvent {
         api_version: crate::domain::API_VERSION,
         event,
@@ -380,9 +454,12 @@ fn build_event(
         evidence,
         reports: reports.iter().map(ReportView::from).collect(),
         process,
-        timeout_secs,
+        timeout_secs: None,
         next_action,
         cancel_reason: None,
+        waiting_on: parking.map(|parking| parking.on.clone()),
+        continuation: parking.map(|parking| parking.continuation),
+        reason: None,
     }
 }
 
@@ -433,6 +510,9 @@ pub fn unlaunched_event(
         timeout_secs: None,
         next_action: NextAction::None,
         cancel_reason,
+        waiting_on: None,
+        continuation: None,
+        reason: None,
     }
 }
 
@@ -453,28 +533,109 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         timeout_secs: None,
         next_action: NextAction::ReadReport,
         cancel_reason: None,
+        waiting_on: None,
+        continuation: None,
+        reason: None,
     }
 }
 
-fn derive_exit(
+/// What the persisted workload says about an exit with no report
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitPolicy {
+    /// An agent fed the report trailer: it was told to report, so silence is a failure
+    ReportingAgent,
+    /// An agent without the trailer: exit 0 with no report is success
+    SilentAgent,
+    /// A command or a container: exit 0 is success, and it cannot park
+    NotAgent,
+}
+
+impl ExitPolicy {
+    /// Policy of a persisted workload
+    #[must_use]
+    pub fn of(workload: &Workload) -> Self {
+        match workload {
+            Workload::Agent(agent) if agent.report_trailer => Self::ReportingAgent,
+            Workload::Agent(_) => Self::SilentAgent,
+            Workload::Task(_) | Workload::Container(_) => Self::NotAgent,
+        }
+    }
+}
+
+/// How a finished process is classified, from its raw ending and last report
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitClass {
+    /// Cancelled, whatever the worker reported
+    Cancelled,
+    /// The runner was lost
+    Lost,
+    /// An agent exited 0 after a final `waiting` report: the store parks it
+    Parked,
+    /// The last report is blocked
+    Blocked,
+    /// Non-zero exit, signal, spawn failure, or a final `failed` report
+    Failed,
+    /// A reporting agent exited 0 without any report
+    NoReport,
+    /// Exit 0 with a final `succeeded` report, or no report where none is required
+    Succeeded,
+}
+
+impl ExitClass {
+    /// Event and next action of every class except [`Self::Parked`], whose
+    /// event depends on the saved handover
+    #[must_use]
+    pub fn event(self) -> (EventKind, NextAction) {
+        match self {
+            Self::Cancelled => (EventKind::TaskCancelled, NextAction::None),
+            Self::Lost => (EventKind::TaskLost, NextAction::InspectLog),
+            Self::Parked => (EventKind::TaskWaiting, NextAction::None),
+            Self::Blocked => (EventKind::TaskBlocked, NextAction::AnswerAndResubmit),
+            Self::Failed | Self::NoReport => (EventKind::TaskFailed, NextAction::InspectLog),
+            Self::Succeeded => (EventKind::TaskSucceeded, NextAction::ReviewOutput),
+        }
+    }
+}
+
+/// Classify a finished process; raw process status stays in the event's `process`
+///
+/// | Process            | Last report       | Class     |
+/// | ------------------ | ----------------- | --------- |
+/// | cancelled          | any               | Cancelled |
+/// | runner lost        | any               | Lost      |
+/// | cancel requested   | waiting           | Cancelled |
+/// | exit 0, agent      | waiting           | Parked    |
+/// | other ending       | waiting           | Failed    |
+/// | any exit           | blocked           | Blocked   |
+/// | other ending       | other             | Failed    |
+/// | exit 0             | failed            | Failed    |
+/// | exit 0             | succeeded         | Succeeded |
+/// | exit 0             | none, reporting   | NoReport  |
+/// | exit 0             | none, other       | Succeeded |
+#[must_use]
+pub fn classify_exit(
     process: Option<&ProcessPayload>,
     reports: &[TaskReport],
-) -> (EventKind, NextAction) {
-    if matches!(process, Some(ProcessPayload::Cancelled)) {
-        return (EventKind::TaskCancelled, NextAction::None);
-    }
-    if matches!(process, Some(ProcessPayload::RunnerLost)) {
-        return (EventKind::TaskLost, NextAction::InspectLog);
-    }
-    let last = reports.last().map(|r| r.outcome);
-    if last == Some(ReportOutcome::Blocked) {
-        return (EventKind::TaskBlocked, NextAction::AnswerAndResubmit);
-    }
+    policy: ExitPolicy,
+    cancel_requested: bool,
+) -> ExitClass {
     let exit_zero = matches!(process, Some(ProcessPayload::Exit { code: 0 }));
-    if last == Some(ReportOutcome::Failed) || !exit_zero {
-        return (EventKind::TaskFailed, NextAction::InspectLog);
+    match (process, reports.last().map(|report| &report.outcome)) {
+        (Some(ProcessPayload::Cancelled), _) => ExitClass::Cancelled,
+        (Some(ProcessPayload::RunnerLost), _) => ExitClass::Lost,
+        // a run whose cancel was requested never parks, even if it beat the kill
+        (_, Some(ReportOutcome::Waiting(_))) if cancel_requested => ExitClass::Cancelled,
+        (_, Some(ReportOutcome::Waiting(_))) if exit_zero && policy != ExitPolicy::NotAgent => {
+            ExitClass::Parked
+        }
+        (_, Some(ReportOutcome::Waiting(_))) => ExitClass::Failed,
+        (_, Some(ReportOutcome::Blocked)) => ExitClass::Blocked,
+        _ if !exit_zero => ExitClass::Failed,
+        (_, Some(ReportOutcome::Failed)) => ExitClass::Failed,
+        (_, Some(ReportOutcome::Succeeded)) => ExitClass::Succeeded,
+        (_, None) if policy == ExitPolicy::ReportingAgent => ExitClass::NoReport,
+        (_, None) => ExitClass::Succeeded,
     }
-    (EventKind::TaskSucceeded, NextAction::ReviewOutput)
 }
 
 /// The event a terminal row owes its thread: `TASK_LOST` for a lost runner,
@@ -482,9 +643,14 @@ fn derive_exit(
 /// exit event. Every exit-callback path builds its event here so
 /// the lost-versus-exit choice lives in one place.
 #[must_use]
-pub fn terminal_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) -> HomebasedEvent {
+pub fn terminal_event(
+    row: &TaskRow,
+    reports: &[TaskReport],
+    evidence: PathBuf,
+    parking: Option<&Parking>,
+) -> HomebasedEvent {
     match row.state {
-        TaskState::Finished { .. } => exit_event(row, reports, evidence),
+        TaskState::Finished { .. } => exit_event(row, reports, evidence, parking),
         TaskState::Preempted { .. } => preempted_event(row, reports, evidence),
         TaskState::Queued | TaskState::Running { .. } | TaskState::Lost => {
             lost_event(row, reports, evidence)
@@ -492,12 +658,24 @@ pub fn terminal_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf) 
     }
 }
 
-/// Last event for `task show`, if the process is terminal or a notify happened.
+/// Last event for `task show`, if the process is terminal or a notify happened,
+/// with its derived `reason`
 #[must_use]
 pub fn last_event_for_row(
     row: &TaskRow,
     reports: &[TaskReport],
     evidence: PathBuf,
+    parking: Option<&Parking>,
+) -> Option<HomebasedEvent> {
+    last_event_without_reason(row, reports, evidence, parking)
+        .map(HomebasedEvent::with_derived_reason)
+}
+
+fn last_event_without_reason(
+    row: &TaskRow,
+    reports: &[TaskReport],
+    evidence: PathBuf,
+    parking: Option<&Parking>,
 ) -> Option<HomebasedEvent> {
     match row.state {
         TaskState::Queued | TaskState::Running { .. } => {
@@ -519,7 +697,7 @@ pub fn last_event_for_row(
             }
         }
         TaskState::Lost => Some(lost_event(row, reports, evidence)),
-        TaskState::Finished { .. } => Some(exit_event(row, reports, evidence)),
+        TaskState::Finished { .. } => Some(exit_event(row, reports, evidence, parking)),
         TaskState::Preempted { .. } => Some(preempted_event(row, reports, evidence)),
     }
 }

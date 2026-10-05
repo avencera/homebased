@@ -7,7 +7,8 @@
 			outcome: {
 				succeeded: 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/40 dark:text-emerald-300',
 				failed: 'bg-red-500/10 text-red-700 ring-red-500/40 dark:text-red-300',
-				blocked: 'bg-amber-500/10 text-amber-700 ring-amber-500/40 dark:text-amber-300'
+				blocked: 'bg-amber-500/10 text-amber-700 ring-amber-500/40 dark:text-amber-300',
+				waiting: 'bg-violet-500/10 text-violet-700 ring-violet-500/40 dark:text-violet-300'
 			}
 		}
 	});
@@ -25,6 +26,7 @@
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import ParkedBadge from '$lib/components/ParkedBadge.svelte';
 	import ThreadLabel from '$lib/components/ThreadLabel.svelte';
 	import { LOG_TAIL_LINES, TaskStore } from '$lib/daemon.svelte';
 	import { ThreadTitleStore } from '$lib/thread-titles.svelte';
@@ -78,6 +80,7 @@
 			</h1>
 			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 			<StatusBadge status={task.status} />
+			<ParkedBadge {task} />
 			<span class="text-muted-foreground">
 				updated {formatTimestamp(task.updated_at)}
 			</span>

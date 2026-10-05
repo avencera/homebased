@@ -127,13 +127,35 @@ fn build_standard_agent_invocation(
     {
         args.extend(["resume".into(), thread.to_string(), "-".into()]);
     }
+    let environment = match inputs.kind {
+        AgentKind::Claude => claude_environment(),
+        AgentKind::Codex | AgentKind::Grok | AgentKind::OpenCode => ChildEnvironment::default(),
+    };
     ChildInvocation {
         program: binary.to_path_buf(),
         args,
         stdin,
-        environment: ChildEnvironment::default(),
+        environment,
         managed_environment: None,
     }
+}
+
+/// Environment of every Claude worker
+///
+/// Headless `claude -p` ends its process, and with it any Claude-managed
+/// background task, when the turn ends. Disabling background tasks removes
+/// `run_in_background` from Bash and Agent and stops a timed-out foreground
+/// command from moving to the background. Shell-level detachment such as `&`
+/// or `nohup` is not blocked; the report trailer tells workers not to use it.
+///
+/// `Monitor` stays available: in Claude Code 2.1.288 a `claude -p` process
+/// keeps running until a monitored command ends, with or without this
+/// variable, so its work does not outlive the turn
+fn claude_environment() -> ChildEnvironment {
+    ChildEnvironment::from_pairs(vec![(
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(),
+        "1".into(),
+    )])
 }
 
 fn build_opencode_invocation_with_config(

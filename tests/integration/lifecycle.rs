@@ -16,6 +16,7 @@ fn daemon_restart_keeps_worker() {
     let mut h = Harness::new();
     let spec = Harness::spec("claude", "sleeping");
     h.set_control("sleep", "8");
+    h.set_control("report", "succeeded\nSlept.");
     let spec_path = h.home.join("spec.json");
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     let out = h
@@ -199,6 +200,7 @@ fn kill9_worker_marks_lost() {
 fn attention_reminder_and_cancel() {
     let mut h = Harness::new();
     h.set_control("sleep", "12");
+    h.set_control("report", "succeeded\nPaid attention.");
     // empty output.log is not activity, so a backdated created_at is overdue
     let id = h.submit(&Harness::spec("claude", "attention me"));
     assert!(wait_until(Duration::from_secs(5), || h.show(&id)["status"]
@@ -462,7 +464,7 @@ fn process_group_cleaned_when_child_leaves_descendant() {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\n# nested sh so $$ is the descendant, not this script\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"{pid}\"; sleep 60' &\nwhile [ ! -f '{pid}' ]; do sleep 0.01; done\nexit 0\n",
+            "#!/bin/sh\n# nested sh so $$ is the descendant, not this script\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; sleep 60' &\nwhile [ ! -f '{pid}' ]; do sleep 0.01; done\nexit 0\n",
             pid = pid_file.display()
         ),
     )
@@ -510,6 +512,7 @@ fn process_group_cleaned_when_child_leaves_descendant() {
 #[test]
 fn cancel_on_terminal_task_is_idempotent() {
     let h = Harness::new();
+    h.set_control("report", "succeeded\nQuick.");
     let id = h.submit(&Harness::spec("claude", "quick"));
     h.wait_status(&id, "succeeded");
     // the success callback can land after the status flips, so count from it

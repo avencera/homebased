@@ -390,6 +390,32 @@ way, the held task is cancelled before it starts and its thread gets
 environment and callback context saved at submit. `task cancel` cancels a held
 task before it starts. Tasks held on a cancelled task are cancelled too.
 
+### Long commands inside an agent worker
+
+An agent worker must not wait in the foreground for a long command or detach
+it: headless `claude -p` ends with its turn and kills what it started, so
+Claude workers run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`. The report
+trailer tells every worker to submit the command as its own task instead, then
+report `waiting` with notes for later and exit:
+
+```bash
+homebased task report --outcome waiting --on <task-id> \
+  --summary "<what is running and why>" --notes-file - <<'NOTES'
+<what each outcome means and the next steps>
+NOTES
+```
+
+The orchestrator gets `TASK_WAITING`. Homebased holds a continuation until
+every named task ends, with any outcome, then starts it with the notes: a
+Codex continuation resumes the run's thread when one is known and receives
+only the continuation block. Otherwise it starts a fresh session with the
+original prompt plus the block. Other agents always start a fresh session
+with the original prompt plus the block. The runs of one unit of work
+form a chain of at most 20 runs. A task held `after` any run waits for the
+chain's last run, and `task cancel` on any run cancels the run that owns the
+work now. The worker, its origin, and every waited task must be on one
+machine.
+
 `homebased task schema` prints the JSON Schema. The full field contract is in [`.agents/skills/homebased/references/submit.md`](.agents/skills/homebased/references/submit.md).
 
 ### Inspect and cancel
@@ -448,9 +474,10 @@ to ignore duplicates.
 | --- | --- |
 | `TASK_REPORTED` | Worker sent an interim report. The process is still running. |
 | `TASK_CHECK_DUE` | No output for the full inactivity timeout. The child is still live. |
-| `TASK_SUCCEEDED` | Exit 0, or last report was `succeeded`. |
+| `TASK_WAITING` | An agent worker submitted long tasks, reported `waiting` on them, and exited. Homebased continues the work in a new run, `continuation`, once every task in `waiting_on` ends. |
+| `TASK_SUCCEEDED` | Exit 0 and last report was `succeeded`, or exit 0 with no report from a task, a container, or an agent without the report trailer. |
 | `TASK_BLOCKED` | Last report was `blocked`. The process has exited. Answer and submit a new spec. There is no resume. |
-| `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. |
+| `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |
 | `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started. |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
 

@@ -10,11 +10,33 @@ use std::time::Duration;
 fn report_variants() {
     let h = Harness::new();
 
+    // an agent told to report that exits 0 without one did not finish its work
     let id = h.submit(&Harness::spec("claude", "no report"));
     h.wait_status(&id, "succeeded");
-    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let msgs = h.wait_for_event(&id, "TASK_FAILED");
     let ev = event_json(&msgs[0]);
     assert_eq!(ev["reports"], json!([]));
+    assert_eq!(ev["process"], json!({"kind": "exit", "code": 0}));
+    assert_eq!(ev["reason"], "no_report");
+    assert_eq!(ev["next_action"], "inspect_log");
+    let show = h.show(&id);
+    assert_eq!(show["last_event"]["event"], "TASK_FAILED");
+    assert_eq!(show["last_event"]["reason"], "no_report");
+
+    // without the trailer, and for a command, exit 0 alone is success
+    let mut silent = Harness::spec("claude", "no trailer");
+    silent["workload"]["report_trailer"] = json!(false);
+    let id = h.submit(&silent);
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let ev = event_json(
+        msgs.iter()
+            .rev()
+            .find(|m| event_json(m)["task"] == id)
+            .unwrap(),
+    );
+    assert!(ev.get("reason").is_none(), "{ev}");
+    let id = h.submit(&Harness::task_spec(&["true"]));
+    h.wait_for_event(&id, "TASK_SUCCEEDED");
 
     let spec_path = h.home.join("spec-r.json");
     let spec = Harness::spec("claude", "reports");

@@ -53,6 +53,8 @@ The prompt must stand alone. The worker has no access to this conversation.
 - Give paths relative to `cwd` or absolute. Name the files the worker should read first.
 - Say what to do if blocked: report `blocked` with the exact question. The worker cannot ask you mid-task.
 - Do not add reporting instructions. `homebased` appends a fixed trailer that tells the worker how to call `homebased task report`. Leave `report_trailer` at its default `true`.
+- Do not tell the worker how to wait for long commands, and do not ask for a `RESUME.md`. The trailer tells it to submit a long command as its own task, report `waiting` with notes, and exit. Homebased then continues the work in a new run once those tasks end, and you get `TASK_WAITING` meanwhile. See [worker.md](worker.md#long-commands-submit-and-wait).
+- Claude workers run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, because `claude -p` ends with its turn and would kill Claude-managed background work. Their Bash and Agent tools have no `run_in_background`, and a foreground command that reaches its timeout is killed. Shell detachment such as `&` or `nohup` is not blocked; the trailer forbids it.
 
 Task workloads do not create prompt evidence files.
 
@@ -145,7 +147,7 @@ Agent-only fields under `workload`:
 | `prompt` or `prompt_file` | exactly one | For local tasks, a relative `prompt_file` resolves against `cwd`. For remote tasks, use an absolute path on the origin machine. The CLI reads that file and sends its text; the executor never receives the origin path. Prefer `prompt_file`. |
 | `model` | no | Passed through unchanged: `-m` for codex and grok, `--model` for claude and opencode. OpenCode accepts provider-qualified values such as `provider/model#variant`; Homebased does not maintain a model allowlist. |
 | `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. Claude runs under a session id that Homebased assigns, so its `extra_args` cannot contain `--session-id`, `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, or `--from-pr` (`invalid_spec`). An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. OpenCode defaults to `--format json` and allows an explicit format, but reserves the agent, `cwd`, model, prompt, session, server, and standalone controls. |
-| `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. |
+| `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. With the trailer, an agent that exits 0 without reporting ends `TASK_FAILED` with `reason: "no_report"`; without it, exit 0 alone is success. |
 | `resume_thread` | no | A non-null value is Codex-only. Null is treated as absent for any agent. Resume this Codex thread and send the prompt on stdin. Use `task followup` for a terminal worker; only one follow-up can resume a thread at a time. |
 
 Task-only fields under `workload`:
@@ -222,7 +224,8 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 }
 ```
 
-- Success means `TASK_SUCCEEDED`: exit 0 and a last report that is not `blocked` or `failed`. Any other ending cancels the held task before it starts, and so does an `unknown` outcome: a task that ended with no record of how.
+- Success means `TASK_SUCCEEDED`: exit 0 and a last report of `succeeded`, or exit 0 with no report for a task, a container, or an agent with `report_trailer: false`. An agent told to report that exits 0 without a report fails. Any other ending cancels the held task before it starts, and so does an `unknown` outcome: a task that ended with no record of how.
+- An agent worker that parks on its own long tasks (`TASK_WAITING`) is not done. A task held after it, or after any later run of the same work, waits for the last run and starts only if that run succeeds. The worker's continuation itself is held until each task it waits on ended in any way; that rule is internal and `after` never uses it.
 - Every dependency must be a task submitted through this daemon. Another task fails with `unknown_dependency`. A dependency that already ended without success fails with `dependency_failed`.
 - If every dependency already succeeded, the task starts at once and the response status is `queued`. Otherwise the response status is `held` and the task id is final.
 - A held task starts with the environment, `cwd`, and callback context saved at submit. A remote held task waits while its execution machine is unreachable and starts when it is back.
