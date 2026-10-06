@@ -1,5 +1,6 @@
 //! macOS LaunchAgent plist.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -17,6 +18,9 @@ pub const LABEL: &str = "dev.praveen.homebased";
 
 /// How long a bootstrap may retry while launchd finishes the bootout
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(10);
+
+/// Claude config directory variable baked into the plist
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 /// Plist path.
 #[must_use]
@@ -86,6 +90,17 @@ pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
             xml_escape(&path.display().to_string())
         ));
     }
+    let claude_config_dir = claude_config_dir(
+        std::env::var_os(CLAUDE_CONFIG_DIR_ENV),
+        std::env::var_os("HOME"),
+    );
+    if let Some(path) = claude_config_dir {
+        env.push_str(&format!(
+            "    <key>{CLAUDE_CONFIG_DIR_ENV}</key>\n    <string>{}</string>\n",
+            xml_escape(&path.display().to_string())
+        ));
+    }
+
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -116,6 +131,23 @@ pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
         xml_escape(&bin.display().to_string()),
         xml_escape(&home.display().to_string()),
     ))
+}
+
+/// Claude config directory for agents the daemon starts
+///
+/// Over SSH the login keychain is locked, so `claude` keeps its login in
+/// `~/.claude/.credentials.json`. The daemon runs in the GUI session, where
+/// `claude` reads a keychain copy instead, and the two drift until the keychain
+/// copy can no longer refresh. An explicit directory makes `claude` look up a
+/// different keychain item, miss it, and use the shared file. The installing
+/// shell's own `CLAUDE_CONFIG_DIR` wins so a separate account stays separate
+fn claude_config_dir(installer: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    if let Some(dir) = installer.filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+
+    let home = home.filter(|home| !home.is_empty())?;
+    Some(PathBuf::from(home).join(".claude"))
 }
 
 /// Write, lint, and bootstrap with an optional explicit config file.
@@ -379,6 +411,33 @@ mod tests {
             text.contains("/tmp/config &amp; &lt;quoted&quot;.toml&gt;"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn plist_points_claude_at_a_config_dir() {
+        // without it the daemon's claude reads a stale keychain login
+        let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
+        let text = render(&home, None).unwrap();
+        let dir = parse_string_value(&text, CLAUDE_CONFIG_DIR_ENV);
+        assert!(dir.is_some_and(|dir| !dir.is_empty()), "{text}");
+    }
+
+    #[test]
+    fn claude_config_dir_prefers_installer_then_home() {
+        let cases = [
+            (Some("/srv/claude"), Some("/Users/a"), Some("/srv/claude")),
+            (None, Some("/Users/a"), Some("/Users/a/.claude")),
+            (Some(""), Some("/Users/a"), Some("/Users/a/.claude")),
+            (None, Some(""), None),
+            (None, None, None),
+        ];
+        for (installer, home, expected) in cases {
+            assert_eq!(
+                claude_config_dir(installer.map(OsString::from), home.map(OsString::from)),
+                expected.map(PathBuf::from),
+                "installer={installer:?} home={home:?}"
+            );
+        }
     }
 
     #[test]
