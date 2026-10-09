@@ -94,6 +94,7 @@ fn build_standard_agent_invocation(
                 args.push("--model".into());
                 args.push(model.to_string());
             }
+            add_claude_autocompact_default(&mut args, inputs.model, inputs.extra_args);
             args.push("--permission-mode".into());
             args.push("auto".into());
             args.push("--no-session-persistence".into());
@@ -470,6 +471,22 @@ fn add_claude_output_defaults(args: &mut Vec<String>, extra_args: &[String]) {
     }
 }
 
+/// Keep Haiku workers within a 100K auto-compact window unless the caller
+/// supplies an explicit window
+fn add_claude_autocompact_default(
+    args: &mut Vec<String>,
+    model: Option<&str>,
+    extra_args: &[String],
+) {
+    let haiku = model.is_some_and(|model| model == "haiku" || model.starts_with("claude-haiku-"));
+    let explicit = extra_args
+        .iter()
+        .any(|arg| arg == "--autocompact" || arg.starts_with("--autocompact="));
+    if haiku && !explicit {
+        args.extend(["--autocompact".into(), "100k".into()]);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormatArg<'a> {
     Absent,
@@ -609,6 +626,72 @@ mod tests {
                 "--verbose",
             ]
         );
+    }
+
+    #[test]
+    fn claude_haiku_defaults_to_a_100k_autocompact_window() {
+        for model in ["haiku", "claude-haiku-5-5", "claude-haiku-4-5-20251001"] {
+            let args = build_with_extra(
+                AgentKind::Claude,
+                Some(model),
+                Path::new("/state/tasks/id/prompt.feed.txt"),
+                &[],
+            )
+            .to_vec();
+            assert_eq!(count_arg(&args, "--autocompact"), 1, "{model}");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--autocompact", "100k"]),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_models_do_not_get_the_haiku_autocompact_default() {
+        for (kind, model) in [
+            (AgentKind::Claude, None),
+            (AgentKind::Claude, Some("sonnet")),
+            (AgentKind::Claude, Some("fable")),
+            (AgentKind::Codex, Some("haiku")),
+        ] {
+            let args = build_with_extra(
+                kind,
+                model,
+                Path::new("/state/tasks/id/prompt.feed.txt"),
+                &[],
+            )
+            .to_vec();
+            assert_eq!(args.first().map(String::as_str), Some("/bin/agent"));
+            assert!(
+                !args.iter().any(|arg| arg == "--autocompact"),
+                "{kind:?} {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_haiku_keeps_an_explicit_autocompact_window() {
+        for extra in [
+            vec!["--autocompact".into(), "200k".into()],
+            vec!["--autocompact=auto".into()],
+        ] {
+            let args = build_with_extra(
+                AgentKind::Claude,
+                Some("haiku"),
+                Path::new("/state/tasks/id/prompt.feed.txt"),
+                &extra,
+            )
+            .to_vec();
+            assert!(args.ends_with(&extra));
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("--autocompact"))
+                    .count(),
+                1
+            );
+            assert!(!args.iter().any(|arg| arg == "100k"));
+        }
     }
 
     #[test]

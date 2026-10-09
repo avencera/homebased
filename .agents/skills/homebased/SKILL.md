@@ -28,6 +28,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Prefer `workload.type: "task"` for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
 - Set `timeout` to match the work (default 1h, min 30m). Quiet `output.log` for that long sends `TASK_CHECK_DUE`; it never kills the child.
 - Claude streams JSON output by default. Set `--output-format` in `extra_args` only when the task needs another format.
+- Claude workloads with model `haiku` or a `claude-haiku-*` model ID use `--autocompact 100k` by default. Set `--autocompact` in `extra_args` to use another window.
 - OpenCode runs in standalone mode with JSON output and receives the prompt on stdin. Its `model` may be a provider-qualified value such as `provider/model#variant`; its child-only full work permissions do not change persistent OpenCode configuration.
 
 ## Route
