@@ -527,7 +527,7 @@ fn wake_provider_thread(
         pending.record(provider_thread)?;
     }
 
-    let start = turn_start(context, provider_thread, log_path);
+    let start = turn_start(context, provider_thread);
     let outcome =
         match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check, start) {
             Ok(outcome) => outcome,
@@ -553,31 +553,12 @@ fn wake_provider_thread(
 }
 
 /// How the T3 thread takes the line, from the Claude session's transcript
-///
-/// A retry after T3 took a compaction finds its boundary in the transcript,
-/// or reuses the same command id, so it does not compact twice
-fn turn_start(
-    context: &CallbackContext,
-    provider_thread: ProviderThread,
-    log_path: &Path,
-) -> TurnStart {
+fn turn_start(context: &CallbackContext, provider_thread: ProviderThread) -> TurnStart {
     let ProviderThread::Claude(thread) = provider_thread else {
         return TurnStart::Auto;
     };
-    let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
-        return TurnStart::Auto;
-    };
-    let start = usage.turn_start(Utc::now());
-    if start == TurnStart::CompactFirst
-        && let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path)
-    {
-        let _ = writeln!(
-            log,
-            "t3 compact first: {} context tokens past the prompt cache",
-            usage.tokens()
-        );
-    }
-    start
+    ContextUse::read(Path::new(&context.env.home), thread)
+        .map_or(TurnStart::Auto, |usage| usage.turn_start(Utc::now()))
 }
 
 fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send<impl IntentIo>) {

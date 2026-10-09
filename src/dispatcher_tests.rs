@@ -455,8 +455,8 @@ fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
 #[derive(Default, Clone, Copy)]
 struct V2Thread {
     archived: bool,
-    /// The session's last request carried a large context two hours ago
-    stale_context: bool,
+    /// The session's last request carried a large context 56 minutes ago
+    idle_large_context: bool,
 }
 
 async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDelivery {
@@ -470,8 +470,8 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
         .thread(T3_THREAD_ID, "V2 thread", thread.archived)
         .native("claudeAgent", &route.thread.to_string(), T3_THREAD_ID);
     let socket = live_claude_session(&route);
-    if thread.stale_context {
-        write_transcript(&route, 120, 250_000);
+    if thread.idle_large_context {
+        write_transcript(&route, 56, 250_000);
     }
     let mut persisted = Store::open(&home.db_path()).unwrap();
     persisted.insert_origin_route(&route).unwrap();
@@ -556,22 +556,17 @@ async fn live_claude_session_owned_by_t3_v2_gets_the_event_through_t3() {
 }
 
 #[tokio::test]
-async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
+async fn event_for_a_session_due_an_idle_compaction_queues_behind_it() {
     let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
-    let dispatched = || {
-        FakeResponse::WebSocket(vec![rpc_exit(
-            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
-        )])
-    };
-    let server = FakeT3Server::start(
-        Some(2),
-        vec![ticket(), dispatched(), ticket(), dispatched()],
-    );
+    let dispatched = FakeResponse::WebSocket(vec![rpc_exit(
+        serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+    )]);
+    let server = FakeT3Server::start(Some(2), vec![ticket(), dispatched]);
 
     let result = deliver_to_t3_v2_claude(
         &server.origin,
         V2Thread {
-            stale_context: true,
+            idle_large_context: true,
             ..V2Thread::default()
         },
     )
@@ -590,76 +585,16 @@ async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
             serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
         })
         .collect();
-    assert_eq!(payloads.len(), 2);
-    assert_eq!(payloads[0]["text"], "/compact");
+    // T3 refuses to steer into a running compaction, so the event waits for it
+    assert_eq!(payloads.len(), 1);
     assert!(
-        payloads[1]["text"]
+        payloads[0]["text"]
             .as_str()
             .unwrap()
             .contains("HOMEBASED_EVENT")
     );
-    assert_eq!(payloads[1]["dispatchMode"]["type"], "queue_after_active");
-}
-
-#[tokio::test]
-async fn event_refused_after_a_compaction_retries_through_t3_not_the_socket() {
-    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
-    let dispatched = || {
-        FakeResponse::WebSocket(vec![rpc_exit(
-            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
-        )])
-    };
-    let refused = FakeResponse::WebSocket(vec![rpc_exit(serde_json::json!({
-        "_tag": "Failure",
-        "cause": [{
-            "_tag": "Fail",
-            "error": { "_tag": "OrchestrationV2DispatchCommandError", "message": "busy" }
-        }]
-    }))]);
-    let server = FakeT3Server::start(
-        Some(2),
-        vec![
-            ticket(),
-            dispatched(),
-            ticket(),
-            refused,
-            ticket(),
-            dispatched(),
-            ticket(),
-            dispatched(),
-        ],
-    );
-
-    let result = deliver_to_t3_v2_claude(
-        &server.origin,
-        V2Thread {
-            stale_context: true,
-            ..V2Thread::default()
-        },
-    )
-    .await;
-
-    // the socket would reach the session in the middle of its compaction
-    assert!(result.socket.is_empty(), "{:?}", result.socket);
-    assert!(
-        matches!(
-            result.delivery,
-            DeliveryState::Delivered { attempts: 2, .. }
-        ),
-        "{:?}",
-        result.delivery
-    );
-    let payloads: Vec<serde_json::Value> = server
-        .requests()
-        .iter()
-        .filter(|request| request.method == "WS")
-        .map(|request| {
-            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
-        })
-        .collect();
-    assert_eq!(payloads.len(), 4);
-    // the retry repeats the compaction's command id, which T3 drops
-    assert_eq!(payloads[0]["commandId"], payloads[2]["commandId"]);
+    assert_eq!(payloads[0]["dispatchMode"]["type"], "queue_after_active");
+    assert!(payloads[0].get("deliveryIntent").is_none());
 }
 
 #[tokio::test]

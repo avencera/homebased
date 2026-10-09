@@ -25,6 +25,11 @@
 //! - The same route accepts `thread.unarchive` with `commandId` and `threadId`.
 //!   A turn in an archived thread is recorded but never starts, so homebased
 //!   unarchives the thread first
+//! - A `thread.turn.start` whose text is exactly `/compact` runs as a
+//!   compaction (`ProviderCommandReactor.ts`) when no turn is running. Turns
+//!   that arrive during it wait in memory and start once it finishes. A
+//!   repeated `commandId` replays its first result, so each compaction needs
+//!   its own id
 
 use std::path::Path;
 
@@ -33,7 +38,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ApiFailure, ProbeCheck, ProbeStatus, ProviderThread, deterministic_id, failed,
+    ApiFailure, COMPACT_COMMAND, ProbeCheck, ProbeStatus, ProviderThread, deterministic_id, failed,
     non_empty_string, passed, percent_encode, query_thread, send_empty, send_json,
     state_connection,
 };
@@ -103,15 +108,46 @@ pub(super) fn start_turn(
         unarchive(origin, thread_id, text, token)?;
     }
 
-    dispatch_turn(
-        origin,
-        thread_id,
-        &snapshot.runtime_mode,
-        &snapshot.interaction_mode,
+    let turn = Turn {
+        command_id: deterministic_id("homebased-t3-command", thread_id, text),
+        message_id: deterministic_id("homebased-t3-message", thread_id, text),
         text,
-        token,
-        before_send,
-    )
+    };
+    dispatch_turn(origin, thread_id, &snapshot, &turn, token, before_send)
+}
+
+/// Start a `/compact` turn in `thread_id`, keyed by `key`
+///
+/// The ids derive from `key`, not the text, so each idle period compacts once
+/// while a later one can compact again. T3 holds turns that arrive during the
+/// compaction and starts them once it finishes. An archived thread is left
+/// alone, because V1 records a turn there but never starts it
+pub(super) fn compact(
+    origin: &str,
+    thread_id: &str,
+    key: &str,
+    token: &str,
+) -> Result<(), ApiFailure> {
+    let snapshot = fetch_snapshot(origin, thread_id, token)?;
+    if snapshot.deleted || snapshot.archived {
+        return Err(ApiFailure::Refused(
+            "T3 thread is deleted or archived".into(),
+        ));
+    }
+
+    let turn = Turn {
+        command_id: deterministic_id("homebased-t3-compact-command", thread_id, key),
+        message_id: deterministic_id("homebased-t3-compact-message", thread_id, key),
+        text: COMPACT_COMMAND,
+    };
+    dispatch_turn(origin, thread_id, &snapshot, &turn, token, None)
+}
+
+/// One user message to start as a turn, with ids T3 deduplicates by
+struct Turn<'a> {
+    command_id: String,
+    message_id: String,
+    text: &'a str,
 }
 
 /// Check the snapshot and dispatch contracts without starting a turn
@@ -291,21 +327,18 @@ fn timestamp_field(value: Option<&Value>) -> Option<bool> {
 fn dispatch_turn(
     origin: &str,
     thread_id: &str,
-    runtime_mode: &str,
-    interaction_mode: &str,
-    text: &str,
+    snapshot: &ThreadSnapshot,
+    turn: &Turn<'_>,
     token: &str,
     before_send: Option<&crate::callback::send_check::SendCheck>,
 ) -> Result<(), ApiFailure> {
-    let command_id = deterministic_id("homebased-t3-command", thread_id, text);
-    let message_id = deterministic_id("homebased-t3-message", thread_id, text);
     let body = dispatch_body(
         thread_id,
-        &command_id,
-        &message_id,
-        text,
-        runtime_mode,
-        interaction_mode,
+        &turn.command_id,
+        &turn.message_id,
+        turn.text,
+        &snapshot.runtime_mode,
+        &snapshot.interaction_mode,
     );
     if let Some(check) = before_send {
         check().map_err(ApiFailure::Delivery)?;

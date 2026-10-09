@@ -172,19 +172,21 @@ Claude Code caches a conversation for an hour. After that, the next turn
 re-reads the whole context at full price, and every request in that turn
 carries it. Interactive Claude Code compacts a long idle session before the
 cache lapses, but T3 runs Claude through the Agent SDK, which does not. So
-homebased compacts Claude sessions that T3 V2 threads own:
+homebased compacts Claude sessions that T3 threads own while they wait.
 
-- While a thread waits on a task or queue job, the daemon checks it every
-  minute. Once the session has been idle for 55 minutes with at least 200,000
-  context tokens, homebased sends `/compact` to the thread. The cache is still
-  warm, so the compaction costs a fraction of a cold read. Any activity in the
-  thread moves the 55 minutes, and each idle period gets one attempt. A queue
-  job counts until its ending event reaches the thread, or for at most seven
-  days, in case its queue machine never reports one.
-- An event for a session whose last request was over an hour ago and carried
-  at least 100,000 tokens sends `/compact` first and queues the event behind
-  it. An event that may meet a running idle compaction also waits for it,
-  because T3 refuses to steer into a compaction.
+While a thread waits on a task or queue job, the daemon checks it every minute.
+Once the session has been idle for 55 minutes with at least 200,000 context
+tokens, homebased sends `/compact` to the thread. The cache is still warm, so
+the compaction costs a fraction of a cold read. Any activity in the thread moves
+the 55 minutes, and each idle period gets one attempt. A queue job counts until
+its ending event reaches the thread, or for at most seven days, in case its
+queue machine never reports one. After the cache lapsed, nothing compacts: a
+compaction would pay the same cold read that the next turn pays anyway.
+
+T3 holds a message that arrives during the compaction and starts it once the
+compaction finishes. Under the V2 orchestrator, from 54 idle minutes on, an
+event for such a session explicitly waits for the active run, because V2
+refuses to steer into a running compaction.
 
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.

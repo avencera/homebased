@@ -4,9 +4,9 @@
 //! arrives later pays to read the whole context again, and every later request
 //! carries it too. Interactive Claude Code compacts a long idle session before
 //! the cache lapses, but Agent SDK hosts such as T3 Code do not, so homebased
-//! asks the host to compact. While a callback is still pending, it compacts at
-//! 55 idle minutes, while the cache is warm; a callback that arrives after the
-//! cache lapsed compacts first
+//! asks the host to compact while a callback is still pending, at 55 idle
+//! minutes, while the cache is warm. After the cache lapsed, a compaction would
+//! pay the same cold read the next turn pays anyway, so none runs
 //!
 //! The session transcript (`~/.claude/projects/<cwd key>/<id>.jsonl`) is the
 //! source: each assistant line carries the API `usage` of its request, and a
@@ -25,12 +25,6 @@ use crate::t3::TurnStart;
 
 /// Idle time after which the one-hour prompt cache has lapsed
 const CACHE_LIFETIME: TimeDelta = TimeDelta::hours(1);
-
-/// Smallest context worth compacting after the cache lapsed
-///
-/// Compaction drops detail, and re-reading a small context costs little. This
-/// matches the threshold of Claude Code's own stale-resume prompt
-const MIN_LAPSED_CONTEXT_TOKENS: u64 = 100_000;
 
 /// Idle time after which an idle compaction runs while the cache is still warm
 ///
@@ -72,16 +66,12 @@ impl ContextUse {
 
     /// How a T3 thread takes a message for this session at `now`
     ///
-    /// A large context whose cache lapsed compacts first. A thread due an idle
-    /// compaction may be running one, which T3 refuses to steer into, so the
-    /// message waits for the active run
+    /// A thread due an idle compaction may be running one, which T3 refuses to
+    /// steer into, so the message waits for the active run. The transcript
+    /// shows a compaction only once it finishes
     pub(crate) fn turn_start(&self, now: DateTime<Utc>) -> TurnStart {
         let idle = now - self.last_active;
-        if idle >= CACHE_LIFETIME && self.tokens >= MIN_LAPSED_CONTEXT_TOKENS {
-            TurnStart::CompactFirst
-        } else if idle >= IDLE_COMPACTION_AFTER - QUEUE_MARGIN
-            && self.tokens >= MIN_IDLE_CONTEXT_TOKENS
-        {
+        if idle >= IDLE_COMPACTION_AFTER - QUEUE_MARGIN && self.tokens >= MIN_IDLE_CONTEXT_TOKENS {
             TurnStart::AfterActive
         } else {
             TurnStart::Auto
@@ -89,9 +79,6 @@ impl ContextUse {
     }
 
     /// Whether to compact an idle session at `now`, while its cache is warm
-    ///
-    /// Once the cache lapsed, a compaction waits for a callback that needs the
-    /// context, see [`ContextUse::turn_start`]
     pub(crate) fn idle_compaction_due(&self, now: DateTime<Utc>) -> bool {
         let idle = now - self.last_active;
         self.tokens >= MIN_IDLE_CONTEXT_TOKENS
@@ -249,43 +236,37 @@ mod tests {
     }
 
     #[test]
-    fn compacts_first_only_a_large_context_whose_cache_lapsed() {
+    fn reads_the_last_request_and_skips_lines_that_are_not_context() {
         let metadata = json!({ "type": "last-prompt", "lastPrompt": "hi" });
-        let stale = context(&[assistant(90, 150_000), metadata.clone()]).unwrap();
-        assert_eq!(stale.tokens(), 151_302);
-        assert_eq!(stale.turn_start(now()), TurnStart::CompactFirst);
-
-        let warm = context(&[assistant(30, 150_000), metadata]).unwrap();
-        assert_eq!(warm.turn_start(now()), TurnStart::Auto);
-
-        let small = context(&[assistant(90, 20_000)]).unwrap();
-        assert_eq!(small.turn_start(now()), TurnStart::Auto);
+        let idle = context(&[assistant(56, 250_000), metadata]).unwrap();
+        assert_eq!(idle.tokens(), 251_302);
+        assert!(idle.idle_compaction_due(now()));
 
         // a later user line is activity even before a reply has usage
         let answered = context(&[
-            assistant(90, 150_000),
+            assistant(56, 250_000),
             json!({ "type": "user", "timestamp": at(5), "message": { "content": "go" } }),
         ])
         .unwrap();
-        assert_eq!(answered.turn_start(now()), TurnStart::Auto);
+        assert!(!answered.idle_compaction_due(now()));
 
         // an API error line has zero usage and hides nothing
-        let errored = context(&[assistant(90, 150_000), {
-            let mut line = assistant(80, 0);
+        let errored = context(&[assistant(56, 250_000), {
+            let mut line = assistant(56, 0);
             line["message"]["usage"] = json!({ "input_tokens": 0, "output_tokens": 0 });
             line
         }])
         .unwrap();
-        assert_eq!(errored.turn_start(now()), TurnStart::CompactFirst);
+        assert_eq!(errored.tokens(), 251_302);
 
         // a subagent's request is not the session's context
-        let sidechain = context(&[assistant(90, 150_000), {
+        let sidechain = context(&[assistant(56, 250_000), {
             let mut line = assistant(5, 10);
             line["isSidechain"] = json!(true);
             line
         }])
         .unwrap();
-        assert_eq!(sidechain.turn_start(now()), TurnStart::CompactFirst);
+        assert!(sidechain.idle_compaction_due(now()));
     }
 
     #[test]
@@ -302,6 +283,8 @@ mod tests {
         assert_eq!(large(56).turn_start(now()), TurnStart::AfterActive);
         assert_eq!(large(54).turn_start(now()), TurnStart::AfterActive);
         assert_eq!(large(50).turn_start(now()), TurnStart::Auto);
+        // the compaction may still run once the window closed
+        assert_eq!(large(90).turn_start(now()), TurnStart::AfterActive);
         assert_eq!(medium.turn_start(now()), TurnStart::Auto);
     }
 
