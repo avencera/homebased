@@ -10,6 +10,7 @@ mod dependencies;
 pub mod event_sender;
 pub mod fleet_api;
 pub mod fleet_tasks;
+pub(crate) mod idle_compaction;
 mod inspection;
 mod keyed_locks;
 mod local_submit;
@@ -167,6 +168,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
+    let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
     // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -209,6 +211,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     dependency_release.abort();
     cancellation.abort();
     t3_watcher.abort();
+    idle_compactor.abort();
     if !supervisor_died {
         supervisor.stop(None);
         if let Err(err) = handle.await {

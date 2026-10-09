@@ -250,7 +250,7 @@ fn has_transcript(projects: &Path, thread: ThreadId) -> bool {
     transcript_path(projects, thread).is_some()
 }
 
-fn transcript_path(projects: &Path, thread: ThreadId) -> Option<PathBuf> {
+pub(super) fn transcript_path(projects: &Path, thread: ThreadId) -> Option<PathBuf> {
     let entries = fs::read_dir(projects).ok()?;
     let file = format!("{thread}.jsonl");
     entries

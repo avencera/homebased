@@ -26,6 +26,10 @@
 //!   turn. An unknown thread fails with `OrchestrationV2DispatchCommandError`
 //! - V2 runs a turn in an archived thread and leaves it archived, where nobody
 //!   sees it, so homebased sends `thread.unarchive` first
+//! - A `message.dispatch` whose text is exactly `/compact` runs as a
+//!   compaction turn (`RunExecutionService.ts`). T3 rejects a message that
+//!   would steer into it, so the message after it uses `queue_after_active`
+//!   without `deliveryIntent`, like the web client's "compact first" send
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,13 +40,15 @@ use uuid::Uuid;
 
 use super::rpc::{self, Exit};
 use super::{
-    ApiFailure, ProbeCheck, ProbeStatus, ProviderThread, deterministic_id, failed, passed,
-    state_connection,
+    ApiFailure, ProbeCheck, ProbeStatus, ProviderThread, TurnStart, deterministic_id, failed,
+    passed, state_connection,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const DISPATCH_METHOD: &str = "orchestration.dispatchCommand";
 const DISPATCH_ERROR: &str = "OrchestrationV2DispatchCommandError";
+/// Message text that T3 runs as a compaction turn instead of a prompt
+const COMPACT_COMMAND: &str = "/compact";
 const NATIVE_THREAD_SQL: &str = "
     SELECT t.thread_id
     FROM orchestration_v2_projection_provider_threads p
@@ -118,7 +124,9 @@ pub(super) fn schema_matches(path: &Path) -> bool {
 /// Send `text` to `thread_id` as a message that T3 starts, steers, or queues
 ///
 /// An archived thread is unarchived first. V2 would run the turn while the
-/// thread stays archived, where nobody sees it
+/// thread stays archived, where nobody sees it. With
+/// [`TurnStart::CompactFirst`], a `/compact` turn runs first and `text` queues
+/// behind it
 pub(super) fn start_turn(
     origin: &str,
     state: &Path,
@@ -126,6 +134,7 @@ pub(super) fn start_turn(
     text: &str,
     token: &str,
     before_send: Option<&crate::callback::send_check::SendCheck>,
+    start: TurnStart,
 ) -> Result<(), ApiFailure> {
     // the turn reaches the agent either way, so a failed unarchive only costs visibility
     if is_archived(state, thread_id) {
@@ -140,12 +149,81 @@ pub(super) fn start_turn(
 
     let command_id = deterministic_id("homebased-t3-command", thread_id, text);
     let message_id = deterministic_id("homebased-t3-message", thread_id, text);
-    let payload = dispatch_payload(thread_id, &command_id, &message_id, text);
+    let delivery = match start {
+        TurnStart::Auto => Delivery::Auto,
+        TurnStart::AfterActive | TurnStart::CompactFirst => Delivery::AfterActive,
+    };
+    let payload = dispatch_payload(thread_id, &command_id, &message_id, text, delivery);
+    if start == TurnStart::CompactFirst {
+        return compact_then_send(origin, thread_id, text, token, &payload, before_send);
+    }
+    dispatch(origin, token, &payload, before_send)
+}
+
+/// Compact the thread, keyed by the message `text`, then send `payload`
+///
+/// T3 rejects steering into a compaction, so `payload` waits for the active
+/// run. A refused compaction most likely met one an earlier message started,
+/// so the message waits either way
+fn compact_then_send(
+    origin: &str,
+    thread_id: &str,
+    text: &str,
+    token: &str,
+    payload: &Value,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
+) -> Result<(), ApiFailure> {
+    let compaction_may_run = match compact(origin, thread_id, text, token, before_send) {
+        Ok(()) | Err(ApiFailure::Uncertain(_)) => true,
+        Err(failure @ ApiFailure::Delivery(_)) => return Err(failure),
+        // compaction is best effort, so the message still goes
+        Err(_) => false,
+    };
+    match dispatch(origin, token, payload, before_send) {
+        // a socket fallback would reach the session mid-compaction, so a
+        // failure keeps retries on T3, which drops the repeated compaction
+        Err(failure) if compaction_may_run && !matches!(failure, ApiFailure::Delivery(_)) => {
+            Err(ApiFailure::Uncertain(failure.detail()))
+        }
+        sent => sent,
+    }
+}
+
+/// Start a `/compact` turn, keyed by `key`
+///
+/// The ids derive from `key`, so a retry for the same message or idle period
+/// does not compact twice, while a later one can compact again. T3 refuses it
+/// while a run is active
+pub(super) fn compact(
+    origin: &str,
+    thread_id: &str,
+    key: &str,
+    token: &str,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
+) -> Result<(), ApiFailure> {
+    let command_id = deterministic_id("homebased-t3-compact-command", thread_id, key);
+    let message_id = deterministic_id("homebased-t3-compact-message", thread_id, key);
+    let payload = dispatch_payload(
+        thread_id,
+        &command_id,
+        &message_id,
+        COMPACT_COMMAND,
+        Delivery::Auto,
+    );
+    dispatch(origin, token, &payload, before_send)
+}
+
+fn dispatch(
+    origin: &str,
+    token: &str,
+    payload: &Value,
+    before_send: Option<&crate::callback::send_check::SendCheck>,
+) -> Result<(), ApiFailure> {
     match rpc::call_checked(
         origin,
         token,
         DISPATCH_METHOD,
-        &payload,
+        payload,
         RPC_TIMEOUT,
         before_send,
     ) {
@@ -179,6 +257,7 @@ pub(super) fn probe_api(origin: &str, token: &str, checks: &mut Vec<ProbeCheck>)
         &Uuid::now_v7().to_string(),
         &Uuid::now_v7().to_string(),
         "homebased compatibility probe",
+        Delivery::Auto,
     );
     let failure = match rpc::call(origin, token, DISPATCH_METHOD, &payload, RPC_TIMEOUT) {
         Ok(Exit::Failure(cause)) => dispatch_failure(&cause),
@@ -206,11 +285,26 @@ pub(super) fn probe_api(origin: &str, token: &str, checks: &mut Vec<ProbeCheck>)
     }
 }
 
-// matches what the T3 web client sends for a user message; with `deliveryIntent`
-// set, T3 decides whether the message starts a turn, steers the active run, or
-// waits for it, so a busy thread may fold it into the current turn
-fn dispatch_payload(thread_id: &str, command_id: &str, message_id: &str, text: &str) -> Value {
-    json!({
+/// How T3 places a dispatched message relative to the thread's active run
+#[derive(Clone, Copy)]
+enum Delivery {
+    /// T3 decides whether the message starts a turn, steers the active run, or
+    /// waits for it, so a busy thread may fold it into the current turn
+    Auto,
+    /// The message waits for the active run, as the T3 web client queues a
+    /// message behind its own "compact first" turn
+    AfterActive,
+}
+
+// matches what the T3 web client sends for a user message
+fn dispatch_payload(
+    thread_id: &str,
+    command_id: &str,
+    message_id: &str,
+    text: &str,
+    delivery: Delivery,
+) -> Value {
+    let mut payload = json!({
         "type": "message.dispatch",
         "commandId": command_id,
         "createdBy": "user",
@@ -219,9 +313,17 @@ fn dispatch_payload(thread_id: &str, command_id: &str, message_id: &str, text: &
         "messageId": message_id,
         "text": text,
         "attachments": [],
-        "deliveryIntent": "auto",
-        "dispatchMode": { "type": "start_immediately" }
-    })
+    });
+    match delivery {
+        Delivery::Auto => {
+            payload["deliveryIntent"] = json!("auto");
+            payload["dispatchMode"] = json!({ "type": "start_immediately" });
+        }
+        Delivery::AfterActive => {
+            payload["dispatchMode"] = json!({ "type": "queue_after_active" });
+        }
+    }
+    payload
 }
 
 /// A typed dispatch refusal, or a changed contract for any other failure

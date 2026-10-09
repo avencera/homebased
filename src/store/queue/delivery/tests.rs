@@ -11,8 +11,12 @@ use crate::queue::{JobEvent, JobEventKind, JobId, QueueError};
 use crate::submission::{CallbackContext, CallbackExecutable};
 
 fn route() -> JobRoute {
+    route_for("77777777-7777-4777-8777-777777777777")
+}
+
+fn route_for(thread: &str) -> JobRoute {
     let spec = JobSpec::parse_value(&serde_json::json!({
-        "api_version": 1, "thread": "77777777-7777-4777-8777-777777777777",
+        "api_version": 1, "thread": thread,
         "name": "route test", "cwd": "/tmp", "priority": "low", "preempt": { "mode": "wait" },
         "workload": { "type": "task", "command": ["/bin/true"] }
     }))
@@ -156,4 +160,61 @@ fn suppressed_inbox_notice_retains_content_and_settles_in_order() {
     assert!(suppressed);
     store.settle_job_event(route.job, 2).unwrap();
     assert!(store.pending_job_inbox().unwrap().is_empty());
+}
+
+#[test]
+fn a_job_thread_waits_until_an_ending_reaches_it() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let thread = |n: u8| format!("{n}{n}{n}{n}{n}{n}{n}{n}-7777-4777-8777-777777777777");
+    let queued = route_for(&thread(1));
+    let ended = route_for(&thread(2));
+    let ending_unsent = route_for(&thread(3));
+    let notified = route_for(&thread(4));
+    let rejected = route_for(&thread(5));
+    let abandoned = route_for(&thread(6));
+    for route in [
+        &queued,
+        &ended,
+        &ending_unsent,
+        &notified,
+        &rejected,
+        &abandoned,
+    ] {
+        store.insert_job_route(route).unwrap();
+    }
+
+    store.accept_job_event(&event(&ended, 1)).unwrap();
+    store.settle_job_event(ended.job, 1).unwrap();
+    store.accept_job_event(&event(&ending_unsent, 1)).unwrap();
+    let mut notice = event(&notified, 1);
+    notice.event.event = JobEventKind::JobBlocked;
+    store.accept_job_event(&notice).unwrap();
+    store.settle_job_event(notified.job, 1).unwrap();
+    let refusal = JobSubmission::Rejected {
+        error: serde_json::json!({ "error": "invalid_spec" }),
+        status: 400,
+    };
+    store
+        .resolve_job_route(rejected.job, refusal, None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE resource_job_routes SET created_at = '2026-01-01T00:00:00.000Z'
+             WHERE job_id = ?1",
+            [abandoned.job.to_string()],
+        )
+        .unwrap();
+
+    let waiting: Vec<_> = store
+        .waiting_threads()
+        .unwrap()
+        .into_iter()
+        .map(|(thread, _)| thread)
+        .collect();
+    assert_eq!(
+        waiting,
+        [queued.thread, ending_unsent.thread, notified.thread]
+    );
 }

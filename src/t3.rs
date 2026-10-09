@@ -257,14 +257,74 @@ pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<Option<Prot
     }
 }
 
+/// How a woken T3 V2 thread runs the message relative to its active run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnStart {
+    /// T3 starts the message, steers the active run with it, or queues it
+    Auto,
+    /// The message waits for the active run, which may be a compaction that
+    /// T3 refuses to steer into
+    AfterActive,
+    /// A compaction turn runs first and the message waits for it
+    CompactFirst,
+}
+
 /// Start a T3 turn for the thread that owns this provider session
 ///
-/// `before_send` rechecks an unsent notice at the final dispatch boundary
+/// `before_send` rechecks an unsent notice at the final dispatch boundary.
+/// Protocol 1 ignores `start` and lets T3 place the message
 pub(crate) fn wake_thread_checked(
     env: &T3Env,
     provider_thread: ProviderThread,
     text: &str,
     before_send: Option<&SendCheck>,
+    start: TurnStart,
+) -> Result<WakeOutcome, SendFailure> {
+    with_owner(env, provider_thread, |owner| match owner.store {
+        Store::V1(_) => v1::start_turn(owner.origin, owner.thread, text, owner.token, before_send),
+        Store::V2(path) => v2::start_turn(
+            owner.origin,
+            path,
+            owner.thread,
+            text,
+            owner.token,
+            before_send,
+            start,
+        ),
+    })
+}
+
+/// Start a `/compact` turn in the T3 thread that owns a Claude session
+///
+/// `key` names the idle period being compacted, so T3 drops a repeated
+/// request for it. Protocol 1 has no compaction turn and is refused
+pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOutcome {
+    with_owner(env, ProviderThread::Claude(thread), |owner| {
+        match owner.store {
+            Store::V1(_) => Err(ApiFailure::Refused(
+                "T3 orchestration protocol 1 has no compaction turn".into(),
+            )),
+            Store::V2(_) => v2::compact(owner.origin, owner.thread, key, owner.token, None),
+        }
+    })
+    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
+/// Running T3 server, thread, and bearer token for one provider session
+struct Owner<'a> {
+    origin: &'a str,
+    store: &'a Store,
+    thread: &'a str,
+    token: &'a str,
+}
+
+/// Run `action` against the T3 thread that owns `provider_thread`
+///
+/// The bearer token is revoked after `action` returns
+fn with_owner(
+    env: &T3Env,
+    provider_thread: ProviderThread,
+    action: impl FnOnce(Owner<'_>) -> Result<(), ApiFailure>,
 ) -> Result<WakeOutcome, SendFailure> {
     let userdata = env.userdata();
     if !userdata.is_dir() {
@@ -293,18 +353,14 @@ pub(crate) fn wake_thread_checked(
         Err(IssueError::Unavailable(detail)) => return Ok(WakeOutcome::Unavailable(detail)),
         Err(IssueError::Changed(detail)) => return Ok(WakeOutcome::ApiChanged(detail)),
     };
-    let started = match store {
-        Store::V1(_) => v1::start_turn(&server.origin, &t3_thread, text, &token.value, before_send),
-        Store::V2(path) => v2::start_turn(
-            &server.origin,
-            &path,
-            &t3_thread,
-            text,
-            &token.value,
-            before_send,
-        ),
-    };
-    match started {
+
+    let done = action(Owner {
+        origin: &server.origin,
+        store: &store,
+        thread: &t3_thread,
+        token: &token.value,
+    });
+    match done {
         Ok(()) => Ok(WakeOutcome::Woken { t3_thread }),
         Err(ApiFailure::Delivery(failure)) => Err(failure),
         Err(failure) => Ok(failure.into_wake_outcome()),
@@ -944,14 +1000,14 @@ mod tests {
 
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
     use super::{
-        ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, WakeOutcome, deterministic_id,
-        load_runtime, owner, probe, wake_thread_checked,
+        ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome,
+        deterministic_id, load_runtime, owner, probe, wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
     /// Start a T3 turn with no notice to recheck
     fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
-        wake_thread_checked(env, provider_thread, text, None)
+        wake_thread_checked(env, provider_thread, text, None, TurnStart::Auto)
             .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
     }
 
@@ -1466,6 +1522,69 @@ mod tests {
     }
 
     #[test]
+    fn v2_compaction_runs_first_and_the_message_queues_behind_it() {
+        if !curl_available() {
+            return;
+        }
+        // the second wake's compaction meets the first one still running
+        let server = FakeT3Server::start(
+            Some(2),
+            vec![
+                ticket(),
+                dispatched(),
+                ticket(),
+                dispatched(),
+                ticket(),
+                unknown_thread_error(),
+                ticket(),
+                dispatched(),
+            ],
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "V2 thread", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+        let compact_then_wake = |text| {
+            wake_thread_checked(
+                &fixture.env,
+                claude_thread(),
+                text,
+                None,
+                TurnStart::CompactFirst,
+            )
+            .unwrap()
+        };
+
+        let woken = WakeOutcome::Woken {
+            t3_thread: T3_THREAD_ID.into(),
+        };
+        assert_eq!(compact_then_wake("first event"), woken);
+        assert_eq!(compact_then_wake("second event"), woken);
+        let payloads: Vec<Value> = server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "WS")
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap()["payload"].clone())
+            .collect();
+        let texts: Vec<&str> = payloads
+            .iter()
+            .map(|payload| payload["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            ["/compact", "first event", "/compact", "second event"]
+        );
+        assert_eq!(payloads[0]["dispatchMode"]["type"], "start_immediately");
+        assert_eq!(payloads[1]["dispatchMode"]["type"], "queue_after_active");
+        assert!(payloads[1].get("deliveryIntent").is_none());
+        assert_eq!(payloads[3]["dispatchMode"]["type"], "queue_after_active");
+        // each event gets its own compaction, so T3 does not drop the second as a repeat
+        assert_ne!(payloads[0]["commandId"], payloads[2]["commandId"]);
+        assert_ne!(payloads[0]["commandId"], payloads[1]["commandId"]);
+    }
+
+    #[test]
     fn v2_wakes_an_imported_v1_session_and_unarchives_its_thread_first() {
         if !curl_available() {
             return;
@@ -1708,8 +1827,13 @@ mod tests {
             assert_eq!(requests[0].method, "GET");
             Err(SendFailure::Suppressed)
         });
-        let outcome =
-            super::wake_thread_checked(&fixture.env, claude_thread(), "JOB_BLOCKED", Some(&check));
+        let outcome = super::wake_thread_checked(
+            &fixture.env,
+            claude_thread(),
+            "JOB_BLOCKED",
+            Some(&check),
+            TurnStart::Auto,
+        );
         assert!(matches!(outcome, Err(SendFailure::Suppressed)));
         assert_eq!(
             server.requests().len(),

@@ -15,16 +15,20 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tracing::warn;
 
 use super::claude_inbox::{ClaudeInbox, ClaudeSession};
 use super::send_check::{SendFailure, SendGate};
+use super::stale_context::ContextUse;
 use crate::domain::{TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
-use crate::t3::{Protocol, ProviderThread, T3Env, WakeOutcome, owner, wake_thread_checked};
+use crate::t3::{
+    Protocol, ProviderThread, T3Env, TurnStart, WakeOutcome, owner, wake_thread_checked,
+};
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
@@ -523,17 +527,19 @@ fn wake_provider_thread(
         pending.record(provider_thread)?;
     }
 
-    let outcome = match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check) {
-        Ok(outcome) => outcome,
-        // with no notice to recheck, a failed dispatch only leaves T3 unavailable
-        Err(failure) if gate.check.is_none() => WakeOutcome::Unavailable(failure.to_string()),
-        Err(failure) => {
-            if !was_pending {
-                pending.clear();
+    let start = turn_start(context, provider_thread, log_path);
+    let outcome =
+        match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check, start) {
+            Ok(outcome) => outcome,
+            // with no notice to recheck, a failed dispatch only leaves T3 unavailable
+            Err(failure) if gate.check.is_none() => WakeOutcome::Unavailable(failure.to_string()),
+            Err(failure) => {
+                if !was_pending {
+                    pending.clear();
+                }
+                return Err(failure);
             }
-            return Err(failure);
-        }
-    };
+        };
     if !was_pending
         && !matches!(
             outcome,
@@ -544,6 +550,34 @@ fn wake_provider_thread(
     }
     record_wake(&outcome, log_path, pending);
     Ok(outcome)
+}
+
+/// How the T3 thread takes the line, from the Claude session's transcript
+///
+/// A retry after T3 took a compaction finds its boundary in the transcript,
+/// or reuses the same command id, so it does not compact twice
+fn turn_start(
+    context: &CallbackContext,
+    provider_thread: ProviderThread,
+    log_path: &Path,
+) -> TurnStart {
+    let ProviderThread::Claude(thread) = provider_thread else {
+        return TurnStart::Auto;
+    };
+    let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
+        return TurnStart::Auto;
+    };
+    let start = usage.turn_start(Utc::now());
+    if start == TurnStart::CompactFirst
+        && let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path)
+    {
+        let _ = writeln!(
+            log,
+            "t3 compact first: {} context tokens past the prompt cache",
+            usage.tokens()
+        );
+    }
+    start
 }
 
 fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send<impl IntentIo>) {

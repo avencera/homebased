@@ -121,6 +121,14 @@ and a retry with the same `--message-id` goes only through T3, which drops the
 repeat. With T3 unreachable, that retry keeps failing instead of sending a
 second copy another way.
 
+A Claude session that a T3 V2 thread owns may be compacted while it waits.
+When a task or queue job for it is still running, the daemon sends `/compact` to that
+thread after 55 idle minutes if the context has at least 200,000 tokens, while
+the prompt cache is still warm. When a message or event arrives over an hour
+after the last request with at least 100,000 context tokens, Homebased sends
+`/compact` first. Either way the message waits behind the compaction, so the
+agent reads it with a compacted summary instead of its full history.
+
 `--reply-to <message-uuid>` links a reply to an earlier message. Use
 `--conversation <uuid>` to set a shared conversation UUID. By default, the
 conversation UUID is the message UUID.

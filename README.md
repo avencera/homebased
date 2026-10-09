@@ -168,6 +168,27 @@ archived T3 thread is unarchived first, so the turn runs and you can see it. A
 thread that T3 imported from its older orchestrator continues in a new provider
 session with the earlier context handed over.
 
+Claude Code caches a conversation for an hour. After that, the next turn
+re-reads the whole context at full price, and every request in that turn
+carries it. Interactive Claude Code compacts a long idle session before the
+cache lapses, but T3 runs Claude through the Agent SDK, which does not. So
+homebased compacts Claude sessions that T3 V2 threads own:
+
+- While a thread waits on a task or queue job, the daemon checks it every
+  minute. Once the session has been idle for 55 minutes with at least 200,000
+  context tokens, homebased sends `/compact` to the thread. The cache is still
+  warm, so the compaction costs a fraction of a cold read. Any activity in the
+  thread moves the 55 minutes, and each idle period gets one attempt. A queue
+  job counts until its ending event reaches the thread, or for at most seven
+  days, in case its queue machine never reports one.
+- An event for a session whose last request was over an hour ago and carried
+  at least 100,000 tokens sends `/compact` first and queues the event behind
+  it. An event that may meet a running idle compaction also waits for it,
+  because T3 refuses to steer into a compaction.
+
+Homebased reads idle time and context size from the session transcript in
+`~/.claude/projects/`.
+
 If T3 may have taken an event but its reply was lost, every later attempt goes
 only through T3, which drops a repeated send, so the event never arrives twice
 through another route. When delivery finally gives up, homebased writes the

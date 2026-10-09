@@ -1,16 +1,25 @@
 //! Durable origin and executor task identities
 
+use chrono::{TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::Store;
+use super::{Store, fmt_time};
 use crate::dependency::TaskDependencies;
-use crate::domain::TaskId;
+use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::queue::delivery::JobRoute;
 use crate::submission::{
-    ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute, PreAcceptanceRejection,
-    RejectionTombstone, RequestId, SubmissionState,
+    CallbackContext, ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute,
+    PreAcceptanceRejection, RejectionTombstone, RequestId, SubmissionState,
 };
+
+/// Age after which a queue job route no longer counts as waiting
+///
+/// Nothing closes a route whose queue owner never reports an ending, such as a
+/// machine that left the fleet. GPU jobs can run for days, so this is longer
+/// than the task wait limit
+const JOB_WAIT_LIMIT: TimeDelta = TimeDelta::days(7);
 
 /// A durable identity operation failed without changing its existing owner
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +138,64 @@ fn storage(error: rusqlite::Error) -> IdentityError {
 }
 
 impl Store {
+    /// Origin threads that still wait for a task or queue job callback, each
+    /// with the saved callback context of its first such route
+    ///
+    /// An accepted, unconfirmed, or held task submission calls back until its
+    /// task reports an outcome. A rejected or cancelled submission never does.
+    /// A run that parked has a terminal state but no outcome, and its
+    /// continuation has a route of its own. A queue job waits until an ending
+    /// event reached the thread, or until [`JOB_WAIT_LIMIT`] passes
+    pub fn waiting_threads(&self) -> Result<Vec<(ThreadId, CallbackContext)>, AppError> {
+        let mut tasks = self.conn.prepare(
+            "SELECT route_json FROM origin_routes
+             WHERE outcome IS NULL AND json_valid(route_json)
+               AND COALESCE(json_extract(route_json, '$.last_execution_state'), 'queued')
+                   IN ('queued', 'running')
+               AND (json_extract(route_json, '$.submission.type')
+                        IN ('accepted', 'acceptance_unknown')
+                    OR json_extract(route_json, '$.submission.phase.type')
+                        IN ('waiting', 'launching'))
+             ORDER BY task_id",
+        )?;
+        let task_routes = tasks
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        // settled, not just accepted: an ending still owed to the thread keeps it waiting
+        let mut jobs = self.conn.prepare(
+            "SELECT r.route_json FROM resource_job_routes r
+             WHERE json_valid(r.route_json) AND r.created_at >= ?1
+               AND json_extract(r.route_json, '$.submission.state') != 'rejected'
+               AND NOT EXISTS (
+                   SELECT 1 FROM resource_job_inbox i
+                   WHERE i.job_id = r.job_id AND i.seq <= r.settled_seq
+                     AND json_extract(i.event_json, '$.event.event')
+                         IN ('JOB_SUCCEEDED', 'JOB_FAILED', 'JOB_CANCELLED'))
+             ORDER BY r.job_id",
+        )?;
+        let job_routes = jobs
+            .query_map([fmt_time(Utc::now() - JOB_WAIT_LIMIT)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut threads: Vec<(ThreadId, CallbackContext)> = Vec::new();
+        let mut add = |thread: ThreadId, callback: CallbackContext| {
+            if !threads.iter().any(|(waiting, _)| *waiting == thread) {
+                threads.push((thread, callback));
+            }
+        };
+        for json in task_routes {
+            let route: OriginRoute = serde_json::from_str(&json)?;
+            add(route.thread, route.callback);
+        }
+        for json in job_routes {
+            let route: JobRoute = serde_json::from_str(&json)?;
+            add(route.thread, route.callback);
+        }
+        Ok(threads)
+    }
+
     /// Insert an origin route once; an identical request returns the saved route
     pub fn insert_origin_route(
         &mut self,

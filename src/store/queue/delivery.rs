@@ -91,8 +91,12 @@ impl Store {
                 return Ok(saved);
             }
             self.conn.execute(
-                "INSERT INTO resource_job_routes(job_id,route_json) VALUES (?1,?2)",
-                params![route.job.to_string(), serde_json::to_string(route)?],
+                "INSERT INTO resource_job_routes(job_id,route_json,created_at) VALUES (?1,?2,?3)",
+                params![
+                    route.job.to_string(),
+                    serde_json::to_string(route)?,
+                    fmt_time(Utc::now())
+                ],
             )?;
             Ok(route.clone())
         })

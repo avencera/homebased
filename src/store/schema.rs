@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 2;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 1] = [add_waiting_handoff];
+const MIGRATIONS: [Migration; 2] = [add_waiting_handoff, add_job_route_created_at];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
 fn add_waiting_handoff(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -30,6 +30,23 @@ fn add_waiting_handoff(conn: &Connection) -> Result<(), rusqlite::Error> {
          {CHAIN_TABLES}"
     ))
 }
+
+/// Version 3: when each queue job route was saved
+///
+/// A route saved before this version is dated at the upgrade, so a job still
+/// running then keeps the full [`JOB_ROUTE_CREATED_AT`] window
+fn add_job_route_created_at(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE resource_job_routes ADD COLUMN {JOB_ROUTE_CREATED_AT};
+         UPDATE resource_job_routes SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');"
+    ))
+}
+
+/// When a queue job route was saved, as RFC 3339 UTC with milliseconds
+///
+/// Nothing closes a job route whose queue owner never reports an ending, so
+/// readers that wait on unfinished jobs bound them by this age
+const JOB_ROUTE_CREATED_AT: &str = "created_at TEXT";
 
 /// Targets of a `waiting` report, as a JSON array; set exactly on waiting reports
 const REPORT_WAITING_ON: &str =
@@ -104,10 +121,11 @@ fn schema() -> String {
         .replace("{REPORT_NOTES}", REPORT_NOTES)
         .replace("{ROUTE_AFTER_RULE}", ROUTE_AFTER_RULE)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
+        .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
 }
 
-/// Every table of the current schema, with the version 2 columns and tables
-/// shared with [`add_waiting_handoff`] as placeholders
+/// Every table of the current schema, with the columns and tables shared with
+/// [`add_waiting_handoff`] and [`add_job_route_created_at`] as placeholders
 ///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -415,7 +433,8 @@ CREATE TABLE resource_job_routes (
     job_id TEXT PRIMARY KEY,
     route_json TEXT NOT NULL,
     accepted_seq INTEGER NOT NULL DEFAULT 0 CHECK (accepted_seq >= 0),
-    settled_seq INTEGER NOT NULL DEFAULT 0 CHECK (settled_seq >= 0 AND settled_seq <= accepted_seq)
+    settled_seq INTEGER NOT NULL DEFAULT 0 CHECK (settled_seq >= 0 AND settled_seq <= accepted_seq),
+    {JOB_ROUTE_CREATED_AT}
 );
 
 CREATE TABLE resource_job_inbox (
@@ -532,7 +551,9 @@ mod tests {
             .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
-            .replace(super::CHAIN_TABLES, "");
+            .replace(super::CHAIN_TABLES, "")
+            // the last column of its table, unlike the `created_at` of tasks
+            .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
         old.execute_batch(&v1).unwrap();
         assert!(!columns(&old, "reports").contains(&"notes".to_string()));
@@ -542,14 +563,21 @@ mod tests {
                  env_home,binary,status,created_at,updated_at,process_group_exit_evidence)
              VALUES ('t','th','n','{}','/','1','/','/','/b','running','x','x','unconfirmed');
              INSERT INTO reports (task_id,seq,outcome,summary,reported_at)
-             VALUES ('t',1,'blocked','old','x');",
+             VALUES ('t',1,'blocked','old','x');
+             INSERT INTO resource_job_routes (job_id,route_json) VALUES ('j','{}');",
         )
         .unwrap();
 
         migrate(&old).unwrap();
         assert_eq!(user_version(&old), SCHEMA_VERSION);
         assert_eq!(table_names(&old), table_names(&fresh));
-        for table in ["reports", "origin_routes", "task_chains", "chain_runs"] {
+        for table in [
+            "reports",
+            "origin_routes",
+            "task_chains",
+            "chain_runs",
+            "resource_job_routes",
+        ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
         let kept: String = old
@@ -558,6 +586,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(kept, "old");
+        // a job running at the upgrade is dated then, not left undated
+        let dated: Option<String> = old
+            .query_row(
+                "SELECT created_at FROM resource_job_routes WHERE job_id='j'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(dated.unwrap().ends_with('Z'));
         // a waiting report must carry its targets and notes
         assert!(
             old.execute(

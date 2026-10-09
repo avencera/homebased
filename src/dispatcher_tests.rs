@@ -15,6 +15,7 @@ use crate::daemon::actors::callback::{
     CallbackActor, CallbackArgs, CallbackMsg, WakeFailure, dispatch_inbox,
 };
 use crate::daemon::actors::{StoreActor, StoreMsg, call};
+use crate::daemon::idle_compaction::{Attempts, scan};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId};
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
@@ -354,7 +355,111 @@ struct T3ClaudeDelivery {
 }
 
 /// Deliver one callback to a live Claude session that a T3 V2 thread owns
-async fn deliver_to_t3_v2_claude(origin: &str, archived: bool) -> T3ClaudeDelivery {
+/// Claude transcript whose last request carried `tokens` `minutes_ago`
+fn write_transcript(route: &OriginRoute, minutes_ago: i64, tokens: u64) {
+    let project = PathBuf::from(&route.callback.env.home).join(".claude/projects/-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let line = serde_json::json!({
+        "type": "assistant",
+        "timestamp": (chrono::Utc::now() - chrono::TimeDelta::minutes(minutes_ago)).to_rfc3339(),
+        "message": { "usage": { "input_tokens": 2, "cache_read_input_tokens": tokens } }
+    });
+    std::fs::write(
+        project.join(format!("{}.jsonl", route.thread)),
+        line.to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    // room for a second compaction, so a repeat would show up
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![ticket(), dispatched(), ticket(), dispatched()],
+    );
+    let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
+    let userdata = configure_t3(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
+    V2State::create(&userdata.join("statev2.sqlite"))
+        .thread(T3_THREAD_ID, "V2 thread", false)
+        .native("claudeAgent", &route.thread.to_string(), T3_THREAD_ID);
+    write_transcript(&route, 56, 250_000);
+    // a thread whose task already reported its outcome waits for nothing
+    let mut finished = route.clone();
+    finished.request = RequestId::new();
+    finished.task = TaskId::new();
+    finished.thread = crate::domain::ThreadId(uuid::Uuid::now_v7());
+    write_transcript(&finished, 56, 250_000);
+    // a run that parked has a terminal state but never records an outcome
+    let mut parked = route.clone();
+    parked.request = RequestId::new();
+    parked.task = TaskId::new();
+    parked.thread = crate::domain::ThreadId(uuid::Uuid::now_v7());
+    write_transcript(&parked, 56, 250_000);
+    let mut store = Store::open(&home.db_path()).unwrap();
+    store.insert_origin_route(&route).unwrap();
+    store.insert_origin_route(&finished).unwrap();
+    store.insert_origin_route(&parked).unwrap();
+    rusqlite::Connection::open(home.db_path())
+        .unwrap()
+        .execute(
+            "UPDATE origin_routes
+             SET route_json = json_set(route_json, '$.last_execution_state', 'succeeded')
+             WHERE task_id = ?1",
+            [parked.task.to_string()],
+        )
+        .unwrap();
+    rusqlite::Connection::open(home.db_path())
+        .unwrap()
+        .execute(
+            "UPDATE origin_routes SET outcome = 'succeeded' WHERE task_id = ?1",
+            [finished.task.to_string()],
+        )
+        .unwrap();
+
+    let threads = store.waiting_threads().unwrap();
+    let attempts = scan(threads.clone(), Attempts::new(), chrono::Utc::now());
+    scan(threads.clone(), attempts, chrono::Utc::now());
+
+    assert_eq!(
+        threads
+            .iter()
+            .map(|(thread, _)| *thread)
+            .collect::<Vec<_>>(),
+        [route.thread]
+    );
+    let dispatches: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect();
+    assert_eq!(dispatches.len(), 1, "{dispatches:?}");
+    assert_eq!(dispatches[0]["text"], "/compact");
+    assert_eq!(dispatches[0]["threadId"], T3_THREAD_ID);
+}
+
+/// State of the T3 V2 thread that owns the live Claude session
+#[derive(Default, Clone, Copy)]
+struct V2Thread {
+    archived: bool,
+    /// The session's last request carried a large context two hours ago
+    stale_context: bool,
+}
+
+async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDelivery {
     let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
     let userdata = configure_t3(
         &mut route,
@@ -362,9 +467,12 @@ async fn deliver_to_t3_v2_claude(origin: &str, archived: bool) -> T3ClaudeDelive
         i32::try_from(std::process::id()).unwrap(),
     );
     V2State::create(&userdata.join("statev2.sqlite"))
-        .thread(T3_THREAD_ID, "V2 thread", archived)
+        .thread(T3_THREAD_ID, "V2 thread", thread.archived)
         .native("claudeAgent", &route.thread.to_string(), T3_THREAD_ID);
     let socket = live_claude_session(&route);
+    if thread.stale_context {
+        write_transcript(&route, 120, 250_000);
+    }
     let mut persisted = Store::open(&home.db_path()).unwrap();
     persisted.insert_origin_route(&route).unwrap();
     persisted
@@ -427,7 +535,7 @@ async fn live_claude_session_owned_by_t3_v2_gets_the_event_through_t3() {
         ],
     );
 
-    let result = deliver_to_t3_v2_claude(&server.origin, false).await;
+    let result = deliver_to_t3_v2_claude(&server.origin, V2Thread::default()).await;
 
     assert!(result.socket.is_empty(), "{:?}", result.socket);
     assert!(matches!(
@@ -448,8 +556,115 @@ async fn live_claude_session_owned_by_t3_v2_gets_the_event_through_t3() {
 }
 
 #[tokio::test]
+async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![ticket(), dispatched(), ticket(), dispatched()],
+    );
+
+    let result = deliver_to_t3_v2_claude(
+        &server.origin,
+        V2Thread {
+            stale_context: true,
+            ..V2Thread::default()
+        },
+    )
+    .await;
+
+    assert!(result.socket.is_empty(), "{:?}", result.socket);
+    assert!(matches!(
+        result.delivery,
+        DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    let payloads: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0]["text"], "/compact");
+    assert!(
+        payloads[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("HOMEBASED_EVENT")
+    );
+    assert_eq!(payloads[1]["dispatchMode"]["type"], "queue_after_active");
+}
+
+#[tokio::test]
+async fn event_refused_after_a_compaction_retries_through_t3_not_the_socket() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let refused = FakeResponse::WebSocket(vec![rpc_exit(serde_json::json!({
+        "_tag": "Failure",
+        "cause": [{
+            "_tag": "Fail",
+            "error": { "_tag": "OrchestrationV2DispatchCommandError", "message": "busy" }
+        }]
+    }))]);
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![
+            ticket(),
+            dispatched(),
+            ticket(),
+            refused,
+            ticket(),
+            dispatched(),
+            ticket(),
+            dispatched(),
+        ],
+    );
+
+    let result = deliver_to_t3_v2_claude(
+        &server.origin,
+        V2Thread {
+            stale_context: true,
+            ..V2Thread::default()
+        },
+    )
+    .await;
+
+    // the socket would reach the session in the middle of its compaction
+    assert!(result.socket.is_empty(), "{:?}", result.socket);
+    assert!(
+        matches!(
+            result.delivery,
+            DeliveryState::Delivered { attempts: 2, .. }
+        ),
+        "{:?}",
+        result.delivery
+    );
+    let payloads: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect();
+    assert_eq!(payloads.len(), 4);
+    // the retry repeats the compaction's command id, which T3 drops
+    assert_eq!(payloads[0]["commandId"], payloads[2]["commandId"]);
+}
+
+#[tokio::test]
 async fn live_claude_session_falls_back_to_its_socket_when_t3_is_unreachable() {
-    let result = deliver_to_t3_v2_claude("http://127.0.0.1:1", false).await;
+    let result = deliver_to_t3_v2_claude("http://127.0.0.1:1", V2Thread::default()).await;
 
     assert_eq!(result.socket.len(), 1);
     assert!(result.socket[0].contains("HOMEBASED_EVENT"));
@@ -474,7 +689,7 @@ async fn lost_t3_reply_retries_through_t3_instead_of_the_socket() {
         ],
     );
 
-    let result = deliver_to_t3_v2_claude(&server.origin, false).await;
+    let result = deliver_to_t3_v2_claude(&server.origin, V2Thread::default()).await;
 
     assert!(result.socket.is_empty(), "{:?}", result.socket);
     assert!(
@@ -509,7 +724,14 @@ async fn archived_t3_thread_is_unarchived_and_gets_the_event_through_t3() {
     };
     let server = FakeT3Server::start(Some(2), vec![ticket(), success(), ticket(), success()]);
 
-    let result = deliver_to_t3_v2_claude(&server.origin, true).await;
+    let result = deliver_to_t3_v2_claude(
+        &server.origin,
+        V2Thread {
+            archived: true,
+            ..V2Thread::default()
+        },
+    )
+    .await;
 
     assert!(result.socket.is_empty(), "{:?}", result.socket);
     assert!(matches!(result.delivery, DeliveryState::Delivered { .. }));
@@ -536,7 +758,7 @@ async fn uncertain_t3_send_waits_for_t3_instead_of_using_the_socket() {
         ],
     );
 
-    let result = deliver_to_t3_v2_claude(&server.origin, false).await;
+    let result = deliver_to_t3_v2_claude(&server.origin, V2Thread::default()).await;
 
     assert!(result.socket.is_empty(), "{:?}", result.socket);
     assert!(!result.completed);

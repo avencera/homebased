@@ -5,6 +5,7 @@ pub(crate) mod claude_inbox;
 mod delivery;
 pub mod destination;
 pub(crate) mod send_check;
+pub(crate) mod stale_context;
 #[cfg(test)]
 mod tests;
 

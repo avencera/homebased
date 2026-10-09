@@ -31,8 +31,8 @@ use crate::store::{
     UnlaunchedTask,
 };
 use crate::submission::{
-    CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute, RejectionTombstone,
-    RequestId, SubmissionState,
+    CallbackContext, CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute,
+    RejectionTombstone, RequestId, SubmissionState,
 };
 
 fn identity_error(error: IdentityError) -> AppError {
@@ -401,6 +401,10 @@ pub(crate) enum StoreMsg {
     InboundEvents {
         id: TaskId,
         reply: RpcReplyPort<Result<Vec<InboxEvent>, AppError>>,
+    },
+    /// Read origin threads that still wait for a task callback
+    WaitingThreads {
+        reply: RpcReplyPort<Result<Vec<(ThreadId, CallbackContext)>, AppError>>,
     },
     /// Read routes that wait for dependencies or for their launch to be answered
     HeldRoutes {
@@ -894,6 +898,7 @@ impl Actor for StoreActor {
             StoreMsg::InboundEvents { id, reply } => {
                 send_reply(reply, state.inbound_events(id).map_err(event_error));
             }
+            StoreMsg::WaitingThreads { reply } => send_reply(reply, state.waiting_threads()),
             StoreMsg::HeldRoutes { reply } => send_reply(reply, state.held_routes()),
             StoreMsg::UnstartedDependentTasks { reply } => {
                 send_reply(reply, state.unstarted_dependent_tasks());
