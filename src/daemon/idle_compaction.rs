@@ -81,8 +81,7 @@ pub(crate) fn scan(
             PathBuf::from(&context.env.home),
             context.env.path.clone().into(),
         );
-        let key = format!("idle since {}", usage.last_active().to_rfc3339());
-        let outcome = compact_thread(&env, thread, &key);
+        let outcome = compact_thread(&env, thread, &usage.compaction_key());
         compaction_log::record(log, Trigger::Idle, thread, &usage, &outcome, now);
         match outcome {
             WakeOutcome::Woken { t3_thread } => info!(

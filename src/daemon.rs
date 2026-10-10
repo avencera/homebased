@@ -6,7 +6,7 @@ mod cancel_delivery;
 mod chains;
 pub mod claude_threads;
 pub mod cluster;
-mod compaction_log;
+pub(crate) mod compaction_log;
 pub mod content;
 mod dependencies;
 pub mod event_sender;
@@ -146,6 +146,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         .map_or(FleetState::Disabled, |runtime| {
             FleetState::Enabled(runtime.handle())
         });
+    compaction_log::set_default(home.compaction_log_path());
     let state = AppState {
         home: home.clone(),
         store,

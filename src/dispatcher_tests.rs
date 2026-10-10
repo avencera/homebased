@@ -469,8 +469,8 @@ fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
 #[derive(Default, Clone, Copy)]
 struct V2Thread {
     archived: bool,
-    /// The session's last request carried a large context 56 minutes ago
-    idle_large_context: bool,
+    /// Minutes since the session's last request, which carried a large context
+    large_context_idle_minutes: Option<i64>,
 }
 
 async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDelivery {
@@ -484,8 +484,8 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
         .thread(T3_THREAD_ID, "V2 thread", thread.archived)
         .native("claudeAgent", &route.thread.to_string(), T3_THREAD_ID);
     let socket = live_claude_session(&route);
-    if thread.idle_large_context {
-        write_transcript(&route, 56, 250_000);
+    if let Some(minutes) = thread.large_context_idle_minutes {
+        write_transcript(&route, minutes, 250_000);
     }
     let mut persisted = Store::open(&home.db_path()).unwrap();
     persisted.insert_origin_route(&route).unwrap();
@@ -570,6 +570,52 @@ async fn live_claude_session_owned_by_t3_v2_gets_the_event_through_t3() {
 }
 
 #[tokio::test]
+async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![ticket(), dispatched(), ticket(), dispatched()],
+    );
+
+    let result = deliver_to_t3_v2_claude(
+        &server.origin,
+        V2Thread {
+            large_context_idle_minutes: Some(120),
+            ..V2Thread::default()
+        },
+    )
+    .await;
+
+    assert!(result.socket.is_empty(), "{:?}", result.socket);
+    assert!(matches!(
+        result.delivery,
+        DeliveryState::Delivered { attempts: 1, .. }
+    ));
+    let payloads: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0]["text"], "/compact");
+    assert!(
+        payloads[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("HOMEBASED_EVENT")
+    );
+    assert_eq!(payloads[1]["dispatchMode"]["type"], "queue_after_active");
+}
+
+#[tokio::test]
 async fn event_for_a_session_due_an_idle_compaction_queues_behind_it() {
     let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
     let dispatched = FakeResponse::WebSocket(vec![rpc_exit(
@@ -580,7 +626,7 @@ async fn event_for_a_session_due_an_idle_compaction_queues_behind_it() {
     let result = deliver_to_t3_v2_claude(
         &server.origin,
         V2Thread {
-            idle_large_context: true,
+            large_context_idle_minutes: Some(56),
             ..V2Thread::default()
         },
     )

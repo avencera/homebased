@@ -146,8 +146,7 @@ fn compact_session(
     };
 
     // a repeated click in the same idle period reuses the command id, which T3 drops
-    let key = format!("manual since {}", usage.last_active().to_rfc3339());
-    let outcome = compact_thread(env, session, &key);
+    let outcome = compact_thread(env, session, &usage.compaction_key());
     compaction_log::record(log, Trigger::Manual, session, &usage, &outcome, Utc::now());
     match outcome {
         WakeOutcome::Woken { .. } => (CompactOutcome::Started, None),

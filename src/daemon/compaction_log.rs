@@ -6,7 +6,8 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -24,6 +25,32 @@ pub enum Trigger {
     Idle,
     /// The dashboard's Compact button
     Manual,
+    /// A callback that arrived after the prompt cache lapsed
+    Callback,
+}
+
+/// Log the daemon writes callback compactions to
+///
+/// Callback delivery runs deep in transport code that has no homebased home,
+/// so the daemon sets the path once at startup instead of threading it through
+static DEFAULT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the log [`record_default`] writes to, once per process
+pub fn set_default(path: PathBuf) {
+    let _ = DEFAULT_PATH.set(path);
+}
+
+/// [`record`] to the log set by [`set_default`], if any
+pub fn record_default(
+    trigger: Trigger,
+    session: ThreadId,
+    usage: &ContextUse,
+    outcome: &WakeOutcome,
+    now: DateTime<Utc>,
+) {
+    if let Some(path) = DEFAULT_PATH.get() {
+        record(path, trigger, session, usage, outcome, now);
+    }
 }
 
 /// One compaction request

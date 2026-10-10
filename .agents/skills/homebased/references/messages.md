@@ -124,9 +124,10 @@ second copy another way.
 A Claude session that a T3 thread owns may be compacted while it waits.
 When a task or queue job for it is still running, the daemon sends `/compact` to that
 thread after 55 idle minutes if the context has at least 200,000 tokens, while
-the prompt cache is still warm. A message that arrives during the compaction
-waits behind it, so the agent reads it with a compacted summary instead of its
-full history.
+the prompt cache is still warm. A message for such a session whose cache
+already lapsed, with at least 200,000 context tokens, sends `/compact` first.
+A message that arrives during a compaction waits behind it, so the agent reads
+it with a compacted summary instead of its full history.
 
 `--reply-to <message-uuid>` links a reply to an earlier message. Use
 `--conversation <uuid>` to set a shared conversation UUID. By default, the

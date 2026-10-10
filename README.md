@@ -180,13 +180,21 @@ tokens, homebased sends `/compact` to the thread. The cache is still warm, so
 the compaction costs a fraction of a cold read. Any activity in the thread moves
 the 55 minutes, and each idle period gets one attempt. A queue job counts until
 its ending event reaches the thread, or for at most seven days, in case its
-queue machine never reports one. After the cache lapsed, nothing compacts: a
-compaction would pay the same cold read that the next turn pays anyway.
+queue machine never reports one.
+
+An event or message for a session whose cache already lapsed, with at least
+200,000 context tokens, sends `/compact` first and then the event. The event's
+turn would write the whole context back to the one-hour cache, while Claude
+Code's compaction request writes it at the cheaper five-minute rate, and every
+later request then reads the summary instead of the full context. Nothing
+compacts a cold thread until a message arrives, so a thread that is never
+resumed costs nothing.
 
 T3 holds a message that arrives during the compaction and starts it once the
-compaction finishes. Under the V2 orchestrator, from 54 idle minutes on, an
-event for such a session explicitly waits for the active run, because V2
-refuses to steer into a running compaction.
+compaction finishes. Stable T3 keeps that hold in memory, so a T3 restart during
+the compaction drops the message. Under the V2 orchestrator, from 54 idle
+minutes on, an event for such a session explicitly waits for the active run,
+because V2 refuses to steer into a running compaction.
 
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.
@@ -200,10 +208,10 @@ threads are not listed. Its Compact button sends `/compact` to one thread. A
 second click in the same idle period is dropped. Under the V2 orchestrator,
 every thread counts as active.
 
-Every compaction request, from the idle scan or the dashboard, is appended to
-`compactions.jsonl` in the homebased home directory. Each line records the
-trigger, session, T3 thread, context tokens, idle seconds, whether the cache
-was warm, and T3's answer. The size after compaction is in the session
+Every compaction request, from the idle scan, a cold event, or the dashboard,
+is appended to `compactions.jsonl` in the homebased home directory. Each line
+records the trigger, session, T3 thread, context tokens, idle seconds, whether
+the cache was warm, and T3's answer. The size after compaction is in the session
 transcript's `compact_boundary` line.
 
 If T3 may have taken an event but its reply was lost, every later attempt goes

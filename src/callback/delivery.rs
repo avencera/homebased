@@ -23,11 +23,13 @@ use tracing::warn;
 use super::claude_inbox::{ClaudeInbox, ClaudeSession};
 use super::send_check::{SendFailure, SendGate};
 use super::stale_context::ContextUse;
+use crate::daemon::compaction_log::{self, Trigger};
 use crate::domain::{TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 use crate::t3::{
-    Protocol, ProviderThread, T3Env, TurnStart, WakeOutcome, owner, wake_thread_checked,
+    Protocol, ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, owner,
+    wake_thread_checked,
 };
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -527,7 +529,7 @@ fn wake_provider_thread(
         pending.record(provider_thread)?;
     }
 
-    let start = turn_start(context, provider_thread);
+    let start = turn_start(context, provider_thread, log_path, gate);
     let outcome =
         match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check, start) {
             Ok(outcome) => outcome,
@@ -553,12 +555,39 @@ fn wake_provider_thread(
 }
 
 /// How the T3 thread takes the line, from the Claude session's transcript
-fn turn_start(context: &CallbackContext, provider_thread: ProviderThread) -> TurnStart {
+///
+/// A large context whose cache lapsed is compacted first. Its turn would write
+/// the whole context to the one-hour cache, while Claude Code's compaction
+/// request writes it at the cheaper five-minute rate, and every later request
+/// reads the summary instead of the whole context. The line then waits behind
+/// the compaction. A retry reuses the idle period's
+/// key, which T3 drops, or finds the compaction in the transcript
+fn turn_start(
+    context: &CallbackContext,
+    provider_thread: ProviderThread,
+    log_path: &Path,
+    gate: SendGate<'_>,
+) -> TurnStart {
     let ProviderThread::Claude(thread) = provider_thread else {
         return TurnStart::Auto;
     };
-    ContextUse::read(Path::new(&context.env.home), thread)
-        .map_or(TurnStart::Auto, |usage| usage.turn_start(Utc::now()))
+    let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
+        return TurnStart::Auto;
+    };
+    let now = Utc::now();
+    // a line that may no longer be sent must not start a compaction either
+    if usage.cold_compaction_due(now) && gate.check().is_ok() {
+        let outcome = compact_thread(&t3_env(context), thread, &usage.compaction_key());
+        compaction_log::record_default(Trigger::Callback, thread, &usage, &outcome, now);
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
+            let _ = writeln!(
+                log,
+                "t3 compact first: {} context tokens past the prompt cache: {outcome:?}",
+                usage.tokens()
+            );
+        }
+    }
+    usage.turn_start(now)
 }
 
 fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send<impl IntentIo>) {

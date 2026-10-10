@@ -5,8 +5,10 @@
 //! carries it too. Interactive Claude Code compacts a long idle session before
 //! the cache lapses, but Agent SDK hosts such as T3 Code do not, so homebased
 //! asks the host to compact while a callback is still pending, at 55 idle
-//! minutes, while the cache is warm. After the cache lapsed, a compaction would
-//! pay the same cold read the next turn pays anyway, so none runs
+//! minutes, while the cache is warm. A callback that arrives after the cache
+//! lapsed compacts first: the compaction's cold write costs less than the
+//! callback's turn would pay, and every later request then reads the small
+//! summary instead of the whole context
 //!
 //! The session transcript (`~/.claude/projects/<cwd key>/<id>.jsonl`) is the
 //! source: each assistant line carries the API `usage` of its request, and a
@@ -84,6 +86,19 @@ impl ContextUse {
         self.tokens >= MIN_IDLE_CONTEXT_TOKENS
             && idle >= IDLE_COMPACTION_AFTER
             && idle < CACHE_LIFETIME
+    }
+
+    /// Whether to compact before a callback at `now`, after the cache lapsed
+    pub(crate) fn cold_compaction_due(&self, now: DateTime<Utc>) -> bool {
+        self.tokens >= MIN_IDLE_CONTEXT_TOKENS && !self.cache_warm(now)
+    }
+
+    /// Key naming this idle period for a compaction request
+    ///
+    /// Every compaction of one idle period shares it, so T3 drops a repeat from
+    /// the idle scan, a callback, or the dashboard while the first still runs
+    pub(crate) fn compaction_key(&self) -> String {
+        format!("idle since {}", self.last_active.to_rfc3339())
     }
 
     /// Whether the prompt cache from the last request is still alive at `now`

@@ -132,8 +132,8 @@
 
 	<p class="mt-2 text-muted-foreground">
 		Open T3 threads whose Claude context is at least {tokens(minTokens)} tokens. Compacting while the
-		cache is warm reads the context at the cached price; a cold thread pays one full read, which its next
-		message would pay anyway.
+		cache is warm reads the context at the cached price. A cold thread pays one full read, which its next
+		message would pay anyway, and every later request then reads the short summary.
 	</p>
 
 	{#if error}
