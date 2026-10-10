@@ -31,6 +31,7 @@ use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
 use crate::report::REPORT_TRAILER;
 use crate::run_env;
 use crate::store::{self, Store};
+use crate::usage;
 
 mod container;
 
@@ -277,6 +278,7 @@ fn record_exit(
     row: &TaskRow,
 ) -> Result<(), AppError> {
     store::write_exit_json(&paths.exit_json, reason, evidence.clone())?;
+    record_usage(store, row, paths);
     let worker_thread = worker_thread(row, paths);
     if store
         .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence, worker_thread)?
@@ -286,6 +288,18 @@ fn record_exit(
         warn!(%id, status = %current.status(), "cas_exit failed");
     }
     Ok(())
+}
+
+/// Save the worker's token usage before the exit commits, so the exit event carries it
+///
+/// Usage is an observation, so a failure is logged and never holds the exit back
+fn record_usage(store: &Store, row: &TaskRow, paths: &TaskPaths) {
+    let Some(usage) = usage::read_task_usage(&row.workload, &paths.output) else {
+        return;
+    };
+    if let Err(err) = store.record_task_usage(row.id, &usage) {
+        warn!(id = %row.id, "record usage: {err}");
+    }
 }
 
 const WORKER_THREAD_LOG_PREFIX_BYTES: usize = 64 * 1024;

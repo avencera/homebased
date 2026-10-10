@@ -66,6 +66,31 @@ homebased --json task log <id>       # {"id", "log", "truncated"}
 
 The local daemon reads `output.log` on the execution machine. For a remote task, it gets the log from the executor over Fleet. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines and reads at most 1 MiB of log bytes. A longer line can return only its end. `truncated` is true when earlier lines or bytes were dropped. If the executor is offline or the log has been removed, the CLI returns `task_unavailable`. A task prevented before it started has no log and returns `task_not_started`.
 
+## Usage
+
+Claude workers run without session persistence, so their tokens never reach `~/.claude/projects`. Homebased reads Claude Code's own accounting from each finished Claude worker's `output.log` and keeps it per task.
+
+```bash
+homebased --json task usage --since 7d                   # totals, every grouping, and every task
+homebased --json task usage --since 24h --thread <uuid>  # one thread's workers
+homebased task usage --by thread                         # table by model (default), day, thread, or task
+```
+
+The JSON has `since`, `totals`, `by_model`, `by_day`, `by_thread`, and `tasks`. Totals and groups have `tasks`, `partial_tasks`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, and `cost_usd`. A group's `key` is the model id, the `YYYY-MM-DD` submission day in the machine's time zone, or the thread id. Each task has `task`, `name`, `thread`, `cwd`, `evidence`, `status`, `created_at`, and `usage`: `complete`, `turns`, the same token fields, and `models` with one entry per model. Tasks count by submission time. `cost_usd` is the list-price cost Claude Code reports, not subscription usage.
+
+`complete: false` means a run stopped before Claude Code wrote its final accounting, such as a cancelled or lost worker. Its input and cache tokens are exact, its output tokens are a lower bound, and it adds no cost.
+
+To find where usage went, read this together with the session transcripts:
+
+- `thread` is the submitter: a Claude Code session, in `~/.claude/projects/*/<thread>.jsonl`, or a Codex thread, in `~/.codex/sessions/**/rollout-*-<thread>.jsonl`.
+- A Claude worker's own session id is its task id, so a task whose `thread` is another task's `task` was submitted by that worker.
+- Worker tokens appear only here, never in those transcripts, so adding the two never counts a token twice.
+- `<evidence>/prompt.txt` says what the worker was asked to do.
+
+Usage covers Claude workers that ran on this machine. Run the command on each Fleet machine that executes workers. Codex, Grok, OpenCode, task, and container workloads have no usage here.
+
+The terminal event of a Claude worker that ran on its submitting machine carries the same `usage` object, and `task show` on the executing machine has it in `last_event`.
+
 ## Dashboard
 
 The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn.
@@ -77,7 +102,7 @@ curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit and cancel are refused there with 405; they belong to the Unix socket. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, `GET /v1/usage?since=<RFC 3339>&thread=<uuid>`, which returns the `task usage` JSON, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. The dashboard's usage page shows the same report. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit and cancel are refused there with 405; they belong to the Unix socket. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
 
 A queue run can be `preempted` while its job waits to resume. Use [resource-queue.md](resource-queue.md) to inspect the job and its run history. Run task IDs cannot be used in `after`.
 

@@ -23,11 +23,13 @@ mod peer_read;
 pub mod queue_api;
 mod t3_watch;
 mod thread_titles;
+pub mod usage_api;
 pub mod web;
 
 use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ractor::{Actor, ActorRef};
 use tokio::net::{TcpListener, UnixListener};
@@ -172,6 +174,17 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
+    // a blocking task cannot be aborted, so shutdown sets this flag instead
+    let usage_backfill_stop = Arc::new(AtomicBool::new(false));
+    tokio::task::spawn_blocking({
+        let home = home.clone();
+        let stop = usage_backfill_stop.clone();
+        move || match crate::usage::backfill(&home, &stop) {
+            Ok(0) => {}
+            Ok(read) => info!(read, "backfilled task usage"),
+            Err(err) => warn!("backfill task usage: {err}"),
+        }
+    });
     // listeners share one shutdown: the signal task flips the flag once
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -215,6 +228,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     cancellation.abort();
     t3_watcher.abort();
     idle_compactor.abort();
+    usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {
         supervisor.stop(None);
         if let Err(err) = handle.await {

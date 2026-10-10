@@ -41,7 +41,7 @@ Pick the first row that matches, then read only that file.
 | A message starting with `HOMEBASED_EVENT ` arrived | [events.md](references/events.md) |
 | GPU work, resource queues, job specs, priority, preemption, or Attention | [resource-queue.md](references/resource-queue.md) |
 | Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
-| Listing, showing, reading logs, or cancelling tasks | [inspect.md](references/inspect.md) |
+| Listing, showing, reading logs, or cancelling tasks, or finding the tokens workers spent | [inspect.md](references/inspect.md) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |
 | A command exited non-zero, `daemon_unavailable`, or the socket is down | [errors.md](references/errors.md) |

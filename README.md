@@ -509,6 +509,28 @@ one or more known peers could not be checked. Retry the lookup; the daemon only
 returns `task_not_found` after every machine in the current known Fleet gives a
 definitive negative result.
 
+### Worker usage
+
+Claude workers run without session persistence, so their tokens never reach
+`~/.claude/projects`. Homebased reads Claude Code's accounting from each
+finished worker's `output.log` and keeps it per task:
+
+```sh
+homebased task usage --since 7d --by thread
+homebased --json task usage --since 24h
+```
+
+The report covers workers that ran on this machine. The JSON has totals,
+groups by model, day, and thread, and each task with its thread, cwd, task
+directory, and tokens and list-price cost per model. A task's `thread` is the
+Claude Code session or Codex thread that submitted it, so the report can be read
+together with the session transcripts. A worker stopped before Claude Code's
+final accounting is marked `complete: false`; its output tokens and cost are
+lower bounds. The terminal event of a Claude worker that ran on its submitting
+machine carries the same `usage`, and the dashboard's usage page shows the
+report. Tasks that ended before this was recorded get their usage when the
+daemon starts.
+
 ### Events
 
 Delivery is at-least-once. For new events, use `(task, seq)` to detect a

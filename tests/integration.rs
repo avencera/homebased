@@ -162,6 +162,20 @@ impl Harness {
         v["id"].as_str().unwrap().to_string()
     }
 
+    fn usage_report(&self) -> Value {
+        let out = self
+            .cmd()
+            .args(["--json", "task", "usage", "--since", "1h"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
     fn show(&self, id: &str) -> Value {
         let out = self
             .cmd()

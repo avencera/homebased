@@ -26,6 +26,10 @@ use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 
 use super::Ctx;
 
+mod usage;
+
+pub use usage::UsageGrouping;
+
 /// Task subcommands.
 #[derive(Debug, Subcommand)]
 #[command(after_help = crate::cli::AFTER_HELP)]
@@ -98,6 +102,18 @@ pub enum TaskCommand {
         /// Last N lines.
         #[arg(long)]
         tail: Option<usize>,
+    },
+    /// Token usage of finished Claude workers, which their own sessions do not keep.
+    Usage {
+        /// Count tasks submitted within this long, such as `24h` or `7d`.
+        #[arg(long, default_value = "7d", value_parser = humantime::parse_duration)]
+        since: Duration,
+        /// Only tasks from this thread.
+        #[arg(long)]
+        thread: Option<ThreadId>,
+        /// Rows of the human table. `--json` prints every grouping and task.
+        #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
+        by: UsageGrouping,
     },
     /// Cancel a task. Idempotent if already terminal.
     Cancel {
@@ -178,6 +194,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::List { status, thread } => list(ctx, status, thread).await,
         TaskCommand::Show { id } => show(ctx, id).await,
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
+        TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,

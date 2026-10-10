@@ -51,6 +51,7 @@ pub fn read_routes() -> Router<AppState> {
         .merge(crate::daemon::fleet_tasks::read_routes())
         .merge(crate::daemon::thread_titles::read_routes())
         .merge(crate::daemon::claude_threads::read_routes())
+        .merge(crate::daemon::usage_api::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
@@ -491,7 +492,12 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
     let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let parking = call(&state.store, |reply| StoreMsg::Parking { id, reply }).await?;
-    let last_event = last_event_for_row(&row, &reports, evidence.clone(), parking.as_ref());
+    let mut last_event = last_event_for_row(&row, &reports, evidence.clone(), parking.as_ref());
+    if row.state.is_terminal()
+        && let Some(event) = &mut last_event
+    {
+        event.usage = call(&state.store, |reply| StoreMsg::TaskUsage { id, reply }).await?;
+    }
     let container = if matches!(row.workload, Workload::Container(_)) {
         let record = call(&state.store, |reply| StoreMsg::TaskContainer { id, reply }).await?;
         ContainerDetail::from_row(&row, record.as_ref())

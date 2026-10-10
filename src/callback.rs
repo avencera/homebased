@@ -20,6 +20,7 @@ use crate::domain::{
     TaskState, ThreadId, Workload,
 };
 use crate::spec::NormalizedSpec;
+use crate::usage::TaskUsage;
 use crate::waiting::{Parking, WaitTargets};
 
 pub(crate) use delivery::{
@@ -340,6 +341,9 @@ pub struct HomebasedEvent {
     /// reader with [`EventReason::derive`]; never stored or sent between machines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<EventReason>,
+    /// Token usage of a finished Claude worker. Present only on terminal events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TaskUsage>,
 }
 
 impl HomebasedEvent {
@@ -416,6 +420,7 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         waiting_on: None,
         continuation: None,
         reason: None,
+        usage: None,
     }
 }
 
@@ -461,6 +466,7 @@ fn build_event(
         waiting_on: parking.map(|parking| parking.on.clone()),
         continuation: parking.map(|parking| parking.continuation),
         reason: None,
+        usage: None,
     }
 }
 
@@ -514,6 +520,7 @@ pub fn unlaunched_event(
         waiting_on: None,
         continuation: None,
         reason: None,
+        usage: None,
     }
 }
 
@@ -537,6 +544,7 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         waiting_on: None,
         continuation: None,
         reason: None,
+        usage: None,
     }
 }
 

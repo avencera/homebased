@@ -14,6 +14,7 @@
 		type ProcessStatus
 	} from '$lib/api';
 	import Elapsed from '$lib/components/Elapsed.svelte';
+	import NavMenu from '$lib/components/NavMenu.svelte';
 	import Capsule from '$lib/components/Capsule.svelte';
 	import QueuePanel from '$lib/components/QueuePanel.svelte';
 	import TaskList from '$lib/components/TaskList.svelte';
@@ -176,9 +177,7 @@
 				{/each}
 			</span>
 		{/if}
-		<a href={resolve('/queue')} class="text-primary hover:underline">queue</a>
-		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
-		<a href={resolve('/threads')} class="text-primary hover:underline">threads</a>
+		<NavMenu />
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
 				<span class="hidden sm:inline">updated</span>

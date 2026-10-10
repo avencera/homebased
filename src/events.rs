@@ -366,6 +366,7 @@ mod tests {
             waiting_on: None,
             continuation: None,
             reason: None,
+            usage: None,
         };
         let event = TaskEvent {
             task,

@@ -625,6 +625,71 @@ const CompactResultSchema = Schema.Struct({
 });
 export type CompactResult = typeof CompactResultSchema.Type;
 
+/** Token counts and cost shared by every usage grouping. */
+const UsageTotalsFields = {
+	input_tokens: Schema.Number,
+	output_tokens: Schema.Number,
+	cache_read_tokens: Schema.Number,
+	cache_write_tokens: Schema.Number,
+	cost_usd: Schema.Number
+};
+
+/** Sum over the grouped tasks; `partial_tasks` counts tasks whose output and cost are lower bounds. */
+const UsageTotalsSchema = Schema.Struct({
+	tasks: Schema.Number,
+	partial_tasks: Schema.Number,
+	...UsageTotalsFields
+});
+export type UsageTotals = typeof UsageTotalsSchema.Type;
+
+/** One row of a usage grouping: a model, a local day, or a thread. */
+const UsageGroupSchema = Schema.Struct({
+	key: Schema.String,
+	tasks: Schema.Number,
+	partial_tasks: Schema.Number,
+	...UsageTotalsFields
+});
+export type UsageGroup = typeof UsageGroupSchema.Type;
+
+const ModelUsageSchema = Schema.Struct({
+	model: Schema.String,
+	...UsageTotalsFields
+});
+export type ModelUsage = typeof ModelUsageSchema.Type;
+
+const TaskUsageSchema = Schema.Struct({
+	/** False when the worker stopped before Claude Code wrote its final accounting. */
+	complete: Schema.Boolean,
+	turns: Schema.Number,
+	...UsageTotalsFields,
+	models: Schema.Array(ModelUsageSchema)
+});
+export type TaskUsage = typeof TaskUsageSchema.Type;
+
+const UsageTaskSchema = Schema.Struct({
+	task: Schema.String,
+	name: Schema.String,
+	thread: Schema.String,
+	cwd: Schema.String,
+	evidence: Schema.String,
+	status: ProcessStatusSchema,
+	created_at: Schema.String,
+	usage: TaskUsageSchema
+});
+export type UsageTask = typeof UsageTaskSchema.Type;
+
+/** `GET /v1/usage`: finished Claude worker tasks since a time, costliest first. */
+const UsageReportSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	since: Schema.String,
+	totals: UsageTotalsSchema,
+	by_model: Schema.Array(UsageGroupSchema),
+	by_day: Schema.Array(UsageGroupSchema),
+	by_thread: Schema.Array(UsageGroupSchema),
+	tasks: Schema.Array(UsageTaskSchema)
+});
+export type UsageReport = typeof UsageReportSchema.Type;
+
 /** Error envelope body: `{ error: { ... } }`. */
 export interface ApiErrorBody {
 	code: string;
@@ -753,6 +818,13 @@ export function releaseAttention(
 /** `GET /v1/claude/threads`: open T3 Claude threads with a large context, largest first. */
 export function fetchLargeClaudeThreads(): Promise<LargeClaudeThreads> {
 	return getJson('/claude/threads', LargeClaudeThreadsSchema);
+}
+
+/** `GET /v1/usage`: Claude token use and cost of finished tasks since `since`, optionally of one thread. */
+export function fetchUsage(since: Date, thread?: string): Promise<UsageReport> {
+	const query = new URLSearchParams({ since: since.toISOString() });
+	if (thread) query.set('thread', thread);
+	return getJson(`/usage?${query}`, UsageReportSchema);
 }
 
 /**

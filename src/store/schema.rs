@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,11 @@ pub const SCHEMA_VERSION: i64 = 3;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 2] = [add_waiting_handoff, add_job_route_created_at];
+const MIGRATIONS: [Migration; 3] = [
+    add_waiting_handoff,
+    add_job_route_created_at,
+    add_task_usage,
+];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
 fn add_waiting_handoff(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +45,26 @@ fn add_job_route_created_at(conn: &Connection) -> Result<(), rusqlite::Error> {
          UPDATE resource_job_routes SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');"
     ))
 }
+
+/// Version 4: token usage read from finished agent workers' output
+///
+/// Tasks that ended before this version get theirs from the daemon's backfill
+fn add_task_usage(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(TASK_USAGE_TABLE)
+}
+
+/// Usage of a finished task, read from its output. `models_json` is a JSON
+/// array of `ModelUsage`, empty when the output held no usage, so the
+/// backfill never reads that task again
+const TASK_USAGE_TABLE: &str = "
+CREATE TABLE task_usage (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    turns INTEGER NOT NULL CHECK (turns >= 0),
+    models_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+";
 
 /// When a queue job route was saved, as RFC 3339 UTC with milliseconds
 ///
@@ -122,10 +146,12 @@ fn schema() -> String {
         .replace("{ROUTE_AFTER_RULE}", ROUTE_AFTER_RULE)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
+        .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
-/// [`add_waiting_handoff`] and [`add_job_route_created_at`] as placeholders
+/// [`add_waiting_handoff`], [`add_job_route_created_at`], and
+/// [`add_task_usage`] as placeholders
 ///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -449,7 +475,8 @@ CREATE TABLE resource_job_delivery (
     job_id TEXT PRIMARY KEY REFERENCES resource_jobs(id),
     acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
 );
-{CHAIN_TABLES}";
+{CHAIN_TABLES}
+{TASK_USAGE_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +579,7 @@ mod tests {
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
             .replace(super::CHAIN_TABLES, "")
+            .replace(super::TASK_USAGE_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -577,6 +605,7 @@ mod tests {
             "task_chains",
             "chain_runs",
             "resource_job_routes",
+            "task_usage",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }

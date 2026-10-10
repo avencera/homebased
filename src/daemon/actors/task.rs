@@ -15,6 +15,7 @@ use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
 use crate::runner;
 use crate::store::{self, CancelResult};
+use crate::usage;
 
 /// Retry interval when an attention event cannot be committed
 const ATTENTION_RETRY: Duration = Duration::from_secs(30);
@@ -403,6 +404,7 @@ async fn apply_lost(actor: &TaskActor, row: TaskRow) -> Result<TaskRow, AppError
     }
     let id = row.id;
     let paths = actor.home.task_paths(id);
+    record_usage(actor, &row).await;
     let worker_thread = runner::worker_thread(&row, &paths);
     let cas = call(&actor.store, |reply| StoreMsg::CasStatus {
         id,
@@ -434,6 +436,7 @@ async fn apply_exit(
     }
     let id = row.id;
     let paths = actor.home.task_paths(id);
+    record_usage(actor, &row).await;
     let worker_thread = runner::worker_thread(&row, &paths);
     let cas = call(&actor.store, |reply| StoreMsg::CasExit {
         id,
@@ -447,6 +450,36 @@ async fn apply_exit(
     match cas {
         Some(row) => Ok(row),
         None => require_task(&actor.store, id).await,
+    }
+}
+
+/// Save a stopped worker's token usage before its exit commits, so the exit
+/// event carries it
+///
+/// The read runs off the async workers, since a log can be large. Usage is an
+/// observation, so a failure is logged and never holds the exit back
+async fn record_usage(actor: &TaskActor, row: &TaskRow) {
+    let id = row.id;
+    let workload = row.workload.clone();
+    let output = actor.home.task_paths(id).output;
+    let read =
+        tokio::task::spawn_blocking(move || usage::read_task_usage(&workload, &output)).await;
+    let usage = match read {
+        Ok(Some(usage)) => usage,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(%id, "read usage: {err}");
+            return;
+        }
+    };
+    if let Err(err) = call(&actor.store, |reply| StoreMsg::RecordUsage {
+        id,
+        usage,
+        reply,
+    })
+    .await
+    {
+        tracing::warn!(%id, "record usage: {err}");
     }
 }
 

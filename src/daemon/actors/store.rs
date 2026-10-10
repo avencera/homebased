@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
 use crate::cancellation::{
@@ -14,6 +15,7 @@ use crate::domain::{
     ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
 use crate::error::AppError;
+use crate::usage::TaskUsage;
 use std::num::NonZeroU64;
 
 use crate::events::{
@@ -538,6 +540,23 @@ pub(crate) enum StoreMsg {
         worker_thread: Option<crate::domain::ThreadId>,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
+    /// Save a task's token usage
+    RecordUsage {
+        id: TaskId,
+        usage: TaskUsage,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read a task's token usage
+    TaskUsage {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<TaskUsage>, AppError>>,
+    },
+    /// Usage of the tasks submitted since a time, optionally from one thread
+    UsageSince {
+        since: DateTime<Utc>,
+        thread: Option<ThreadId>,
+        reply: RpcReplyPort<Result<Vec<(TaskRow, TaskUsage)>, AppError>>,
+    },
     /// Record the worker pid
     SetPid {
         id: TaskId,
@@ -1015,6 +1034,15 @@ impl Actor for StoreActor {
                 reply,
                 state.cas_exit_with_evidence(id, from, &reason, evidence, worker_thread),
             ),
+            StoreMsg::RecordUsage { id, usage, reply } => {
+                send_reply(reply, state.record_task_usage(id, &usage));
+            }
+            StoreMsg::TaskUsage { id, reply } => send_reply(reply, state.task_usage(id)),
+            StoreMsg::UsageSince {
+                since,
+                thread,
+                reply,
+            } => send_reply(reply, state.usage_since(since, thread)),
             StoreMsg::SetPid { id, pid, reply } => send_reply(reply, state.set_pid(id, pid)),
             StoreMsg::ClaimContainerAdoption { id, limit, reply } => {
                 send_reply(reply, state.claim_task_container_adoption(id, limit));

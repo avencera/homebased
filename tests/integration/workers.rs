@@ -637,3 +637,59 @@ fn large_prompt_early_exit_keeps_code() {
     assert_eq!(ev["event"], "TASK_FAILED");
     assert_ne!(ev["process"]["kind"], "spawn_failed");
 }
+
+/// A worker's stream: one run that ended with Claude Code's accounting, then a
+/// run stopped before it, whose message `m2` repeats with growing output
+const CLAUDE_STREAM: &str = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":2,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}}
+{"type":"result","subtype":"success","num_turns":3,"total_cost_usd":1.5,"modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":200,"cacheReadInputTokens":1000,"cacheCreationInputTokens":300,"costUSD":1.25},"claude-haiku-5-5":{"inputTokens":4,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":40,"costUSD":0.25}}}
+{"type":"assistant","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":2000,"cache_creation_input_tokens":60}}}
+{"type":"assistant","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":7,"cache_read_input_tokens":2000,"cache_creation_input_tokens":60}}}
+"#;
+
+#[test]
+fn claude_worker_usage_reaches_its_event_and_the_usage_report() {
+    let mut h = Harness::new();
+    h.set_control("stdout", CLAUDE_STREAM);
+    h.set_control("report", "succeeded\nDone.");
+    let id = h.submit(&Harness::spec("claude", "spend tokens"));
+    h.wait_status(&id, "succeeded");
+
+    let msgs = h.wait_for_event(&id, "TASK_SUCCEEDED");
+    let usage = &event_json(&msgs[0])["usage"];
+    assert_eq!(usage["complete"], false, "{usage}");
+    assert_eq!(usage["turns"], 4, "{usage}");
+    assert_eq!(usage["cost_usd"], 1.5, "{usage}");
+    assert_eq!(usage["input_tokens"], 17, "{usage}");
+    assert_eq!(usage["output_tokens"], 227, "{usage}");
+    assert_eq!(usage["cache_read_tokens"], 3000, "{usage}");
+    assert_eq!(usage["cache_write_tokens"], 400, "{usage}");
+    let models = usage["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2, "{usage}");
+    assert_eq!(models[0]["model"], "claude-opus-5-5");
+    assert_eq!(models[0]["output_tokens"], 207);
+    assert_eq!(models[1]["model"], "claude-haiku-5-5");
+    assert_eq!(h.show(&id)["last_event"]["usage"], *usage);
+
+    let report = h.usage_report();
+    assert_eq!(report["totals"]["tasks"], 1, "{report}");
+    assert_eq!(report["totals"]["partial_tasks"], 1, "{report}");
+    assert_eq!(report["totals"]["cost_usd"], 1.5, "{report}");
+    assert_eq!(report["by_model"][0]["key"], "claude-opus-5-5", "{report}");
+    assert_eq!(report["by_model"][0]["cost_usd"], 1.25, "{report}");
+    assert_eq!(report["by_thread"][0]["key"], THREAD, "{report}");
+    assert_eq!(report["tasks"][0]["task"], id, "{report}");
+    assert_eq!(report["tasks"][0]["usage"], *usage, "{report}");
+    let evidence = report["tasks"][0]["evidence"].as_str().unwrap();
+    assert!(evidence.ends_with(&id), "{evidence}");
+
+    // a task that ended before usage was recorded gets it when the daemon starts
+    let conn = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+    conn.execute("DELETE FROM task_usage", []).unwrap();
+    drop(conn);
+    assert_eq!(h.usage_report()["totals"]["tasks"], 0);
+    h.restart_daemon();
+    assert!(wait_until(Duration::from_secs(10), || {
+        h.usage_report()["tasks"][0]["usage"] == *usage
+    }));
+}

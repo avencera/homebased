@@ -206,6 +206,7 @@ impl Store {
         let ExecutorIdentity::Accepted(record) = &mut identity else {
             return Err(AppError::ClusterTaskConflict { task: row.id });
         };
+        let local_origin = record.origin_machine == record.execution_machine;
         record.state = row.status();
         self.conn.execute(
             "UPDATE executor_identities SET identity_json=?1 WHERE task_id=?2",
@@ -215,7 +216,18 @@ impl Store {
             let reports = self.reports(row.id)?;
             let evidence = self.tasks_dir.join(row.id.to_string());
             let parking = parking_on(&self.conn, row.id)?;
-            let callback = terminal_event(row, &reports, evidence, parking.as_ref());
+            let mut callback = terminal_event(row, &reports, evidence, parking.as_ref());
+            // the exit path saves usage before this transaction, so the event
+            // that ends the task reports what it spent. Only an event that stays
+            // on this machine carries it: a peer on an older release rejects the
+            // unknown field and would stall the task's events until it updates.
+            // Usage is an observation, so a read error never fails the transition
+            if local_origin {
+                callback.usage = self.task_usage(row.id).unwrap_or_else(|err| {
+                    tracing::warn!(id = %row.id, "read usage: {err}");
+                    None
+                });
+            }
             EventPayload::Callback {
                 event: Box::new(callback),
                 state: Some(row.status()),

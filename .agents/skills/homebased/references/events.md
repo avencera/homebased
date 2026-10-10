@@ -22,6 +22,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `waiting_on` | Present only on `TASK_WAITING`: the tasks the worker waits on. |
 | `continuation` | Present only on `TASK_WAITING`: the held task that continues the work once every `waiting_on` task ended. |
 | `reason` | Present only when the event alone does not say why: `"no_report"` on a `TASK_FAILED` for an agent that exited 0 without reporting. |
+| `usage` | Present only on the terminal event of a Claude worker that ran on the machine that submitted it: the tokens and list-price cost it spent, per model, as in `task usage` ([inspect.md](inspect.md)). `complete: false` marks a worker stopped before Claude Code's final accounting. |
 | `cancel_reason` | Present only when the origin cancelled a held task before it started: `{"type":"dependency_ended","dependency":"<uuid>","outcome":"failed"}`, or `{"type":"requested"}` after `task cancel`. `outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown` when the dependency ended but no record says how. |
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.

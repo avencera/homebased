@@ -16,7 +16,7 @@ use crate::domain::{
 };
 use crate::error::AppError;
 
-const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
+pub(super) const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, check_due_at, pid, cancel_requested_at,
     created_at, updated_at, process_group_exit_evidence, container_exit_evidence, child_pid,
     child_start_time
@@ -249,7 +249,7 @@ fn find_project_root(cwd: &Path) -> Option<PathBuf> {
     })
 }
 
-fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
+pub(super) fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     let id: String = row.get(0)?;
     let thread: String = row.get(1)?;
     let name: String = row.get(2)?;

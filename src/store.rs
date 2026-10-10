@@ -26,6 +26,7 @@ mod schema;
 mod task;
 #[cfg(test)]
 mod tests;
+mod usage;
 
 pub use admission::LocalAdmission;
 pub use container::TaskContainerRecord;
