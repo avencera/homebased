@@ -109,7 +109,7 @@ owns agent threads:
 
 ```toml
 [notify.ntfy]
-topic = "praveen_homebased_9630420"
+topic = "homebased_k7q2xm4p"
 # server = "https://ntfy.sh"
 # token_file = "~/.config/homebased/ntfy-token"
 ```

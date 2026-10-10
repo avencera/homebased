@@ -509,10 +509,9 @@ address = "http://training:7677"
 
     #[test]
     fn ntfy_config_uses_server_default_and_normalizes_trailing_slashes() {
-        let config =
-            Config::parse("[notify.ntfy]\ntopic = \"praveen_homebased_9630420\"\n").unwrap();
+        let config = Config::parse("[notify.ntfy]\ntopic = \"homebased_k7q2xm4p\"\n").unwrap();
         let ntfy = config.notify.ntfy.unwrap();
-        assert_eq!(ntfy.topic().as_str(), "praveen_homebased_9630420");
+        assert_eq!(ntfy.topic().as_str(), "homebased_k7q2xm4p");
         assert_eq!(ntfy.server(), "https://ntfy.sh");
         assert_eq!(ntfy.token_file(), None);
 
