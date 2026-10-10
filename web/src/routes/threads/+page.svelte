@@ -15,6 +15,8 @@
 
 	// each read scans the tail of every open thread's transcript, so poll slowly
 	const REFRESH_MS = 60_000;
+	// settled threads idle longer than this are left out, even behind "show more"
+	const SETTLED_LIMIT_MS = 48 * 60 * 60 * 1000;
 
 	let threads = $state<readonly LargeClaudeThread[]>([]);
 	let minTokens = $state(200_000);
@@ -26,6 +28,53 @@
 	/** Thread the confirmation dialog names. */
 	let target = $state<LargeClaudeThread | null>(null);
 	let confirming = $state(false);
+	let showSettled = $state(false);
+
+	/** One block of the list, in the order the page shows them. */
+	interface Tier {
+		key: string;
+		title: string;
+		note: string;
+		threads: readonly LargeClaudeThread[];
+		stale: boolean;
+	}
+
+	const tiers = $derived.by((): Tier[] => {
+		const pick = (settled: boolean, warm: boolean) =>
+			threads.filter((thread) => thread.settled === settled && thread.cache_warm === warm);
+		return [
+			{
+				key: 'active',
+				title: 'Active, last hour',
+				note: 'cache warm',
+				threads: pick(false, true),
+				stale: false
+			},
+			{
+				key: 'settled',
+				title: 'Settled in T3, last hour',
+				note: 'cache warm',
+				threads: pick(true, true),
+				stale: false
+			},
+			{
+				key: 'stale',
+				title: 'Active, idle over an hour',
+				note: 'cache cold, so compacting reads the full context once',
+				threads: pick(false, false),
+				stale: true
+			}
+		];
+	});
+
+	const settledCold = $derived(
+		threads.filter(
+			(thread) =>
+				thread.settled &&
+				!thread.cache_warm &&
+				(lastFetched ?? Date.now()) - Date.parse(thread.last_active) <= SETTLED_LIMIT_MS
+		)
+	);
 
 	async function refresh() {
 		try {
@@ -111,59 +160,100 @@
 			<span>Cache</span>
 			<span></span>
 		</div>
-		{#if lastFetched !== null && threads.length === 0}
+		{#if lastFetched !== null && tiers.every((tier) => tier.threads.length === 0) && settledCold.length === 0}
 			<p class="px-3 py-6 text-center text-muted-foreground">
 				No open thread has {tokens(minTokens)} tokens of context
 			</p>
 		{/if}
-		<ul>
-			{#each threads as thread (thread.session)}
-				{@const result = results[thread.session]}
-				<li
-					class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-border/70 px-3 py-2 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_5rem_7rem_5rem_6rem]"
-				>
-					<span class="flex min-w-0 flex-col">
-						<span class="truncate font-medium" title={thread.title}>{thread.title}</span>
-						<span class="font-mono text-[11px] text-muted-foreground" title={thread.session}>
-							{shortId(thread.session)}
-							{#if result}
-								<span
-									class={result.outcome === 'started'
-										? 'text-emerald-700 dark:text-emerald-300'
-										: 'text-red-700 dark:text-red-300'}
-								>
-									· {resultText(result)}
-								</span>
-							{/if}
-						</span>
-					</span>
-					<span class="font-mono">{tokens(thread.tokens)}</span>
-					<span class="text-muted-foreground"><Elapsed from={thread.last_active} /></span>
-					<span>
-						{#if thread.cache_warm}
-							<span class="text-emerald-700 dark:text-emerald-300">warm</span>
-						{:else}
-							<span class="text-muted-foreground">cold</span>
-						{/if}
-					</span>
-					<span class="flex justify-end">
-						<button
-							type="button"
-							disabled={pending !== null}
-							onclick={() => {
-								target = thread;
-								confirming = true;
-							}}
-							class="rounded border border-border px-2 py-0.5 text-[11px] leading-5 font-medium hover:bg-accent focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-40"
-						>
-							{pending === thread.session ? 'Sending' : 'Compact'}
-						</button>
-					</span>
-				</li>
-			{/each}
-		</ul>
+		{#each tiers as tier (tier.key)}
+			{#if tier.threads.length > 0}
+				{@render heading(tier.title, tier.note, tier.stale)}
+				<ul>
+					{#each tier.threads as thread (thread.session)}
+						{@render row(thread)}
+					{/each}
+				</ul>
+			{/if}
+		{/each}
+		{#if settledCold.length > 0}
+			{#if showSettled}
+				{@render heading('Settled in T3, idle 1 to 48 hours', 'cache cold', false)}
+				<ul>
+					{#each settledCold as thread (thread.session)}
+						{@render row(thread)}
+					{/each}
+				</ul>
+			{/if}
+			<button
+				type="button"
+				onclick={() => (showSettled = !showSettled)}
+				class="w-full border-t border-border px-3 py-2 text-left text-primary hover:bg-accent focus-visible:outline-2 focus-visible:outline-primary"
+			>
+				{showSettled ? 'Hide' : 'Show'}
+				{settledCold.length} settled {settledCold.length === 1 ? 'thread' : 'threads'} idle up to 48 hours
+			</button>
+		{/if}
 	</section>
 </div>
+
+{#snippet heading(title: string, note: string, stale: boolean)}
+	<h2
+		class={[
+			'border-b border-border px-3 py-1.5 text-[11px] font-semibold tracking-wide uppercase',
+			stale
+				? 'bg-amber-500/10 text-amber-800 dark:text-amber-300'
+				: 'bg-muted/50 text-muted-foreground'
+		]}
+	>
+		{title}
+		<span class="font-normal tracking-normal normal-case">· {note}</span>
+	</h2>
+{/snippet}
+
+{#snippet row(thread: LargeClaudeThread)}
+	{@const result = results[thread.session]}
+	<li
+		class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-border/70 px-3 py-2 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_5rem_7rem_5rem_6rem]"
+	>
+		<span class="flex min-w-0 flex-col">
+			<span class="truncate font-medium" title={thread.title}>{thread.title}</span>
+			<span class="font-mono text-[11px] text-muted-foreground" title={thread.session}>
+				{shortId(thread.session)}
+				{#if result}
+					<span
+						class={result.outcome === 'started'
+							? 'text-emerald-700 dark:text-emerald-300'
+							: 'text-red-700 dark:text-red-300'}
+					>
+						· {resultText(result)}
+					</span>
+				{/if}
+			</span>
+		</span>
+		<span class="font-mono">{tokens(thread.tokens)}</span>
+		<span class="text-muted-foreground"><Elapsed from={thread.last_active} /></span>
+		<span>
+			{#if thread.cache_warm}
+				<span class="text-emerald-700 dark:text-emerald-300">warm</span>
+			{:else}
+				<span class="text-muted-foreground">cold</span>
+			{/if}
+		</span>
+		<span class="flex justify-end">
+			<button
+				type="button"
+				disabled={pending !== null}
+				onclick={() => {
+					target = thread;
+					confirming = true;
+				}}
+				class="rounded border border-border px-2 py-0.5 text-[11px] leading-5 font-medium hover:bg-accent focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-40"
+			>
+				{pending === thread.session ? 'Sending' : 'Compact'}
+			</button>
+		</span>
+	</li>
+{/snippet}
 
 <ConfirmDialog
 	bind:open={confirming}

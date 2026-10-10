@@ -82,8 +82,9 @@ const REQUIRED_STATE_SQL: &str = "
 
 // threads imported from V1 have no provider thread and resolve only through
 // the copied V1 session table, as in `find_thread`
+// V2's settled state is unverified, so its threads all count as unsettled
 const OPEN_CLAUDE_THREADS_SQL: &str = "
-    SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title
+    SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
     WHERE p.provider = 'claudeAgent'
@@ -92,7 +93,7 @@ const OPEN_CLAUDE_THREADS_SQL: &str = "
       AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
     ORDER BY p.updated_at DESC";
 const OPEN_LEGACY_CLAUDE_THREADS_SQL: &str = "
-    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title
+    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title, 0
     FROM provider_session_runtime r
     JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
     WHERE r.provider_name = 'claudeAgent'

@@ -28,6 +28,8 @@ pub struct LargeClaudeThread {
     pub t3_thread: String,
     /// T3 thread title
     pub title: String,
+    /// Whether the thread is settled in T3's sidebar
+    pub settled: bool,
     /// Context tokens of the last request or compaction
     pub tokens: u64,
     /// Time of the last session activity
@@ -118,6 +120,7 @@ fn large_threads(env: &T3Env, now: DateTime<Utc>) -> Result<Vec<LargeClaudeThrea
                 session: thread.session,
                 t3_thread: thread.t3_thread,
                 title: thread.title,
+                settled: thread.settled,
                 tokens: usage.tokens(),
                 last_active: usage.last_active(),
                 cache_warm: usage.cache_warm(now),
@@ -208,14 +211,16 @@ mod tests {
                 resume_cursor_json TEXT, last_seen_at TEXT NOT NULL);
              CREATE TABLE projection_threads (
                 thread_id TEXT PRIMARY KEY, title TEXT NOT NULL,
-                archived_at TEXT, deleted_at TEXT);",
+                archived_at TEXT, deleted_at TEXT, settled_override TEXT);",
         )
         .unwrap();
-        let add = |name: &str, provider: &str, archived: Option<&str>, tokens, minutes_ago| {
+        let add = |name: &str, provider: &str, override_: Option<&str>, tokens, minutes_ago| {
+            let archived = (override_ == Some("archived")).then_some("2026-10-01");
+            let settled = override_.filter(|value| *value != "archived");
             let session = Uuid::now_v7().to_string();
             db.execute(
-                "INSERT INTO projection_threads VALUES (?1, ?1, ?2, NULL)",
-                rusqlite::params![name, archived],
+                "INSERT INTO projection_threads VALUES (?1, ?1, ?2, NULL, ?3)",
+                rusqlite::params![name, archived, settled],
             )
             .unwrap();
             db.execute(
@@ -226,10 +231,10 @@ mod tests {
             transcript(home.path(), &session, minutes_ago, tokens);
             session
         };
-        let warm = add("warm", "claudeAgent", None, 300_000, 10);
-        let cold = add("cold", "claudeAgent", None, 500_000, 120);
+        let warm = add("warm", "claudeAgent", Some("active"), 300_000, 10);
+        let cold = add("cold", "claudeAgent", Some("settled"), 500_000, 120);
         add("small", "claudeAgent", None, 50_000, 10);
-        add("archived", "claudeAgent", Some("2026-10-01"), 400_000, 10);
+        add("archived", "claudeAgent", Some("archived"), 400_000, 10);
         add("codex", "codex", None, 400_000, 10);
 
         let env = T3Env::new(home.path().to_path_buf(), "/bin".into());
@@ -241,10 +246,14 @@ mod tests {
                 (
                     thread.session.to_string(),
                     thread.title.as_str(),
+                    thread.settled,
                     thread.cache_warm,
                 )
             })
             .collect();
-        assert_eq!(listed, [(cold, "cold", false), (warm, "warm", true)]);
+        assert_eq!(
+            listed,
+            [(cold, "cold", true, false), (warm, "warm", false, true)]
+        );
     }
 }

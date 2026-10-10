@@ -318,10 +318,12 @@ pub(crate) struct OpenClaudeThread {
     pub(crate) t3_thread: String,
     /// T3 thread title
     pub(crate) title: String,
+    /// Whether the thread is settled in T3's sidebar
+    pub(crate) settled: bool,
 }
 
-/// Session id, T3 thread id, and title of one row in a state database
-type ClaudeThreadRow = (String, String, String);
+/// Session id, T3 thread id, title, and settled flag of one row in a state database
+type ClaudeThreadRow = (String, String, String, bool);
 
 /// Claude sessions whose T3 thread is neither archived nor deleted, newest first
 ///
@@ -340,7 +342,7 @@ pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, 
     };
 
     let mut threads: Vec<OpenClaudeThread> = Vec::new();
-    for (session, t3_thread, title) in rows {
+    for (session, t3_thread, title, settled) in rows {
         // a session id that is not a UUID cannot be a Claude Code session
         let Ok(session) = session.parse::<ThreadId>() else {
             continue;
@@ -350,20 +352,24 @@ pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, 
                 session,
                 t3_thread,
                 title,
+                settled,
             });
         }
     }
     Ok(threads)
 }
 
-/// Every row of a query that selects a session id, T3 thread id, and title
+/// Every row of a query that selects a session id, T3 thread id, title, and
+/// settled flag
 fn claude_thread_rows(path: &Path, sql: &str) -> Result<Vec<ClaudeThreadRow>, String> {
     let db = state_connection(path).map_err(|_| "T3 state cannot be read".to_string())?;
     let mut statement = db
         .prepare(sql)
         .map_err(|_| "T3 thread list query failed".to_string())?;
     statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .and_then(Iterator::collect)
         .map_err(|_| "T3 thread list query failed".to_string())
 }

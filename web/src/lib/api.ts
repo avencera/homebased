@@ -604,6 +604,7 @@ const LargeClaudeThreadSchema = Schema.Struct({
 	session: Schema.String,
 	t3_thread: Schema.String,
 	title: Schema.String,
+	settled: Schema.Boolean,
 	tokens: Schema.Number,
 	last_active: Schema.String,
 	cache_warm: Schema.Boolean

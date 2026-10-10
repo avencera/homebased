@@ -70,7 +70,8 @@ const LATEST_THREAD_SQL: &str = "
     LIMIT 1";
 
 const OPEN_CLAUDE_THREADS_SQL: &str = "
-    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title
+    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title,
+           coalesce(t.settled_override = 'settled', 0)
     FROM provider_session_runtime r
     JOIN projection_threads t ON t.thread_id = r.thread_id
     WHERE r.provider_name = 'claudeAgent'

@@ -192,9 +192,13 @@ Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.
 
 The dashboard's threads page lists open T3 Claude threads with at least
-200,000 context tokens, largest first, with their idle time and whether the
-cache is still warm. Its Compact button sends `/compact` to one thread. A
-second click in the same idle period is dropped.
+200,000 context tokens, with their idle time and whether the cache is still
+warm. It groups them as threads active in the last hour, threads settled in T3
+in the last hour, and active threads idle over an hour, which have a cold
+cache. A button reveals settled threads idle up to 48 hours; older settled
+threads are not listed. Its Compact button sends `/compact` to one thread. A
+second click in the same idle period is dropped. Under the V2 orchestrator,
+every thread counts as active.
 
 Every compaction request, from the idle scan or the dashboard, is appended to
 `compactions.jsonl` in the homebased home directory. Each line records the
