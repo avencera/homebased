@@ -178,6 +178,7 @@
 		{/if}
 		<a href={resolve('/queue')} class="text-primary hover:underline">queue</a>
 		<a href={resolve('/files')} class="text-primary hover:underline">files</a>
+		<a href={resolve('/threads')} class="text-primary hover:underline">threads</a>
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
 				<span class="hidden sm:inline">updated</span>

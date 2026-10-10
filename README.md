@@ -191,6 +191,17 @@ refuses to steer into a running compaction.
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.
 
+The dashboard's threads page lists open T3 Claude threads with at least
+200,000 context tokens, largest first, with their idle time and whether the
+cache is still warm. Its Compact button sends `/compact` to one thread. A
+second click in the same idle period is dropped.
+
+Every compaction request, from the idle scan or the dashboard, is appended to
+`compactions.jsonl` in the homebased home directory. Each line records the
+trigger, session, T3 thread, context tokens, idle seconds, whether the cache
+was warm, and T3's answer. The size after compaction is in the session
+transcript's `compact_boundary` line.
+
 If T3 may have taken an event but its reply was lost, every later attempt goes
 only through T3, which drops a repeated send, so the event never arrives twice
 through another route. When delivery finally gives up, homebased writes the

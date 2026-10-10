@@ -90,7 +90,7 @@ pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read API, guarded queue controls, and the embedded single-page app
+/// Read API, guarded queue and compaction controls, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -98,7 +98,11 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         None => api::read_routes(),
     };
     routes
-        .merge(super::queue_api::control_routes().layer(middleware::from_fn(browser_write_guard)))
+        .merge(
+            super::queue_api::control_routes()
+                .merge(super::claude_threads::control_routes())
+                .layer(middleware::from_fn(browser_write_guard)),
+        )
         .fallback(asset)
         .layer(middleware::from_fn(move |request: Request, next: Next| {
             let policy = policy.clone();

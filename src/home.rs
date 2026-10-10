@@ -18,6 +18,8 @@ pub const DB_NAME: &str = "homebased_v1.sqlite";
 pub const DAEMON_LOCK: &str = "daemon.lock";
 /// Log that records callbacks `codex queue` could not deliver.
 pub const FALLBACK_LOG: &str = "callback-fallback.log";
+/// JSON lines log of Claude session compaction requests, kept for analysis.
+pub const COMPACTION_LOG: &str = "compactions.jsonl";
 /// Per-task process-shared lock that serializes callback delivery.
 pub const DELIVERY_LOCK: &str = "delivery.lock";
 /// Stable machine UUID for this installation.
@@ -102,6 +104,12 @@ impl Home {
     #[must_use]
     pub fn fallback_log_path(&self) -> PathBuf {
         self.root.join(FALLBACK_LOG)
+    }
+
+    /// Compaction request log path.
+    #[must_use]
+    pub fn compaction_log_path(&self) -> PathBuf {
+        self.root.join(COMPACTION_LOG)
     }
 
     /// Stable machine UUID file.

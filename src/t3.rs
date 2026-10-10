@@ -309,6 +309,65 @@ pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOu
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
 }
 
+/// Open T3 thread that owns a Claude session
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenClaudeThread {
+    /// Claude Code session id
+    pub(crate) session: ThreadId,
+    /// T3 thread id
+    pub(crate) t3_thread: String,
+    /// T3 thread title
+    pub(crate) title: String,
+}
+
+/// Session id, T3 thread id, and title of one row in a state database
+type ClaudeThreadRow = (String, String, String);
+
+/// Claude sessions whose T3 thread is neither archived nor deleted, newest first
+///
+/// Reads the state database on disk, so the server need not run. V2 stops
+/// writing `state.sqlite` once it copied it, so a usable `statev2.sqlite` wins
+pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, String> {
+    let userdata = env.userdata();
+    let store = [Protocol::V2, Protocol::V1]
+        .into_iter()
+        .map(|protocol| Store::path(&userdata, protocol))
+        .find(|store| store.file().is_file() && store.schema_matches());
+    let rows = match &store {
+        Some(Store::V1(path)) => v1::open_claude_threads(path)?,
+        Some(Store::V2(path)) => v2::open_claude_threads(path)?,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut threads: Vec<OpenClaudeThread> = Vec::new();
+    for (session, t3_thread, title) in rows {
+        // a session id that is not a UUID cannot be a Claude Code session
+        let Ok(session) = session.parse::<ThreadId>() else {
+            continue;
+        };
+        if !threads.iter().any(|thread| thread.session == session) {
+            threads.push(OpenClaudeThread {
+                session,
+                t3_thread,
+                title,
+            });
+        }
+    }
+    Ok(threads)
+}
+
+/// Every row of a query that selects a session id, T3 thread id, and title
+fn claude_thread_rows(path: &Path, sql: &str) -> Result<Vec<ClaudeThreadRow>, String> {
+    let db = state_connection(path).map_err(|_| "T3 state cannot be read".to_string())?;
+    let mut statement = db
+        .prepare(sql)
+        .map_err(|_| "T3 thread list query failed".to_string())?;
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .and_then(Iterator::collect)
+        .map_err(|_| "T3 thread list query failed".to_string())
+}
+
 /// Running T3 server, thread, and bearer token for one provider session
 struct Owner<'a> {
     origin: &'a str,

@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, call};
+use super::compaction_log::{self, Trigger};
 use crate::callback::stale_context::ContextUse;
 use crate::domain::ThreadId;
 use crate::submission::CallbackContext;
@@ -29,6 +30,7 @@ pub(crate) type Attempts = HashMap<ThreadId, DateTime<Utc>>;
 /// Check waiting threads for as long as the daemon runs
 pub(super) async fn run(state: AppState) {
     let mut attempts = Attempts::new();
+    let log = state.home.compaction_log_path();
     let mut tick = tokio::time::interval(SCAN_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -40,8 +42,11 @@ pub(super) async fn run(state: AppState) {
                 continue;
             }
         };
+        let log = log.clone();
         attempts =
-            match tokio::task::spawn_blocking(move || scan(threads, attempts, Utc::now())).await {
+            match tokio::task::spawn_blocking(move || scan(threads, attempts, Utc::now(), &log))
+                .await
+            {
                 Ok(attempts) => attempts,
                 Err(error) => {
                     warn!("idle compaction scan join: {error}");
@@ -51,7 +56,8 @@ pub(super) async fn run(state: AppState) {
     }
 }
 
-/// Start one compaction per idle period of each due thread
+/// Start one compaction per idle period of each due thread, recording each
+/// request in the compaction log at `log`
 ///
 /// T3 also drops a repeated request for the same period, so a lost attempt
 /// record costs only a token round trip
@@ -59,6 +65,7 @@ pub(crate) fn scan(
     threads: Vec<(ThreadId, CallbackContext)>,
     mut attempts: Attempts,
     now: DateTime<Utc>,
+    log: &Path,
 ) -> Attempts {
     attempts.retain(|thread, _| threads.iter().any(|(waiting, _)| waiting == thread));
     for (thread, context) in threads {
@@ -75,7 +82,9 @@ pub(crate) fn scan(
             context.env.path.clone().into(),
         );
         let key = format!("idle since {}", usage.last_active().to_rfc3339());
-        match compact_thread(&env, thread, &key) {
+        let outcome = compact_thread(&env, thread, &key);
+        compaction_log::record(log, Trigger::Idle, thread, &usage, &outcome, now);
+        match outcome {
             WakeOutcome::Woken { t3_thread } => info!(
                 %thread,
                 t3_thread,

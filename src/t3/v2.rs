@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use super::rpc::{self, Exit};
 use super::{
-    ApiFailure, COMPACT_COMMAND, ProbeCheck, ProbeStatus, ProviderThread, TurnStart,
-    deterministic_id, failed, passed, state_connection,
+    ApiFailure, COMPACT_COMMAND, ClaudeThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
+    TurnStart, claude_thread_rows, deterministic_id, failed, passed, state_connection,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +79,37 @@ const REQUIRED_STATE_SQL: &str = "
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
     LIMIT 0";
+
+// threads imported from V1 have no provider thread and resolve only through
+// the copied V1 session table, as in `find_thread`
+const OPEN_CLAUDE_THREADS_SQL: &str = "
+    SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title
+    FROM orchestration_v2_projection_provider_threads p
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+    WHERE p.provider = 'claudeAgent'
+      AND t.deleted_at IS NULL AND t.archived_at IS NULL
+      AND json_valid(p.payload_json)
+      AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
+    ORDER BY p.updated_at DESC";
+const OPEN_LEGACY_CLAUDE_THREADS_SQL: &str = "
+    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title
+    FROM provider_session_runtime r
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
+    WHERE r.provider_name = 'claudeAgent'
+      AND t.deleted_at IS NULL AND t.archived_at IS NULL
+      AND json_valid(r.resume_cursor_json)
+      AND json_type(r.resume_cursor_json, '$.resume') = 'text'
+    ORDER BY r.last_seen_at DESC";
+
+/// Claude sessions whose thread is neither archived nor deleted, newest first
+pub(super) fn open_claude_threads(path: &Path) -> Result<Vec<ClaudeThreadRow>, String> {
+    let mut rows = claude_thread_rows(path, OPEN_CLAUDE_THREADS_SQL)?;
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    if has_legacy_table(&db)? {
+        rows.extend(claude_thread_rows(path, OPEN_LEGACY_CLAUDE_THREADS_SQL)?);
+    }
+    Ok(rows)
+}
 
 /// T3 thread that owns `provider_thread`, if any
 pub(super) fn find_thread(

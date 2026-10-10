@@ -40,7 +40,7 @@ const QUEUE_MARGIN: TimeDelta = TimeDelta::minutes(1);
 
 /// Smallest context worth an idle compaction, which runs even if no callback
 /// comes back before the cache would lapse
-const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
+pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
 
 /// Transcript suffix scanned for the last request
 ///
@@ -84,6 +84,11 @@ impl ContextUse {
         self.tokens >= MIN_IDLE_CONTEXT_TOKENS
             && idle >= IDLE_COMPACTION_AFTER
             && idle < CACHE_LIFETIME
+    }
+
+    /// Whether the prompt cache from the last request is still alive at `now`
+    pub(crate) fn cache_warm(&self, now: DateTime<Utc>) -> bool {
+        now - self.last_active < CACHE_LIFETIME
     }
 
     /// Context tokens of the last request or compaction

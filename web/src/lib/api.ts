@@ -600,6 +600,30 @@ const ReleaseResultSchema = Schema.Struct({
 });
 export type ReleaseResult = typeof ReleaseResultSchema.Type;
 
+const LargeClaudeThreadSchema = Schema.Struct({
+	session: Schema.String,
+	t3_thread: Schema.String,
+	title: Schema.String,
+	tokens: Schema.Number,
+	last_active: Schema.String,
+	cache_warm: Schema.Boolean
+});
+export type LargeClaudeThread = typeof LargeClaudeThreadSchema.Type;
+
+const LargeClaudeThreadsSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	min_tokens: Schema.Number,
+	threads: Schema.Array(LargeClaudeThreadSchema)
+});
+export type LargeClaudeThreads = typeof LargeClaudeThreadsSchema.Type;
+
+const CompactResultSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	outcome: Schema.Literal('started', 'not_found', 'refused', 'unavailable'),
+	detail: Schema.optional(Schema.String)
+});
+export type CompactResult = typeof CompactResultSchema.Type;
+
 /** Error envelope body: `{ error: { ... } }`. */
 export interface ApiErrorBody {
 	code: string;
@@ -722,6 +746,23 @@ export function releaseAttention(
 		`/resource/release${machineQuery(machine)}`,
 		{ operation_id: operationId, attention },
 		ReleaseResultSchema
+	);
+}
+
+/** `GET /v1/claude/threads`: open T3 Claude threads with a large context, largest first. */
+export function fetchLargeClaudeThreads(): Promise<LargeClaudeThreads> {
+	return getJson('/claude/threads', LargeClaudeThreadsSchema);
+}
+
+/**
+ * `POST /v1/claude/threads/{session}/compact`. A repeat in the same idle period reuses T3's
+ * command id, so a double click compacts once.
+ */
+export function compactClaudeThread(session: string): Promise<CompactResult> {
+	return postJson(
+		`/claude/threads/${encodeURIComponent(session)}/compact`,
+		{},
+		CompactResultSchema
 	);
 }
 

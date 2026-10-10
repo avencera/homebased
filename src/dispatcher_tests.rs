@@ -428,8 +428,9 @@ fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
         .unwrap();
 
     let threads = store.waiting_threads().unwrap();
-    let attempts = scan(threads.clone(), Attempts::new(), chrono::Utc::now());
-    scan(threads.clone(), attempts, chrono::Utc::now());
+    let log = home.compaction_log_path();
+    let attempts = scan(threads.clone(), Attempts::new(), chrono::Utc::now(), &log);
+    scan(threads.clone(), attempts, chrono::Utc::now(), &log);
 
     assert_eq!(
         threads
@@ -449,6 +450,19 @@ fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
     assert_eq!(dispatches.len(), 1, "{dispatches:?}");
     assert_eq!(dispatches[0]["text"], "/compact");
     assert_eq!(dispatches[0]["threadId"], T3_THREAD_ID);
+    // one line per request, joinable to the transcript by session
+    let logged: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0]["trigger"], "idle");
+    assert_eq!(logged[0]["outcome"], "started");
+    assert_eq!(logged[0]["session"], route.thread.to_string());
+    assert_eq!(logged[0]["t3_thread"], T3_THREAD_ID);
+    assert_eq!(logged[0]["tokens"], 250_002);
+    assert_eq!(logged[0]["cache_warm"], true);
 }
 
 /// State of the T3 V2 thread that owns the live Claude session

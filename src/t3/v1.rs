@@ -38,9 +38,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ApiFailure, COMPACT_COMMAND, ProbeCheck, ProbeStatus, ProviderThread, deterministic_id, failed,
-    non_empty_string, passed, percent_encode, query_thread, send_empty, send_json,
-    state_connection,
+    ApiFailure, COMPACT_COMMAND, ClaudeThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
+    claude_thread_rows, deterministic_id, failed, non_empty_string, passed, percent_encode,
+    query_thread, send_empty, send_json, state_connection,
 };
 use crate::curl::{CurlMethod, CurlResponse};
 
@@ -68,6 +68,21 @@ const LATEST_THREAD_SQL: &str = "
     WHERE t.deleted_at IS NULL
     ORDER BY r.last_seen_at DESC
     LIMIT 1";
+
+const OPEN_CLAUDE_THREADS_SQL: &str = "
+    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title
+    FROM provider_session_runtime r
+    JOIN projection_threads t ON t.thread_id = r.thread_id
+    WHERE r.provider_name = 'claudeAgent'
+      AND t.deleted_at IS NULL AND t.archived_at IS NULL
+      AND json_valid(r.resume_cursor_json)
+      AND json_type(r.resume_cursor_json, '$.resume') = 'text'
+    ORDER BY r.last_seen_at DESC";
+
+/// Claude sessions whose thread is neither archived nor deleted, newest first
+pub(super) fn open_claude_threads(path: &Path) -> Result<Vec<ClaudeThreadRow>, String> {
+    claude_thread_rows(path, OPEN_CLAUDE_THREADS_SQL)
+}
 
 /// T3 thread that owns `provider_thread`, if any
 pub(super) fn find_thread(
