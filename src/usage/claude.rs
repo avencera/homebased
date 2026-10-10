@@ -64,8 +64,19 @@ impl Scan {
                 num_turns,
                 model_usage,
             } => {
-                for (model, usage) in model_usage {
-                    *self.models.entry(model).or_default() += Tokens::from(usage);
+                let tokens: Vec<_> = model_usage
+                    .into_iter()
+                    .map(|(model, usage)| (model, Tokens::from(usage)))
+                    .filter(|(_, tokens)| !tokens.is_zero())
+                    .collect();
+                // a run that ends in an error can report no usage at all; its
+                // messages then stay pending and count as an incomplete run
+                if tokens.is_empty() {
+                    return;
+                }
+
+                for (model, tokens) in tokens {
+                    *self.models.entry(model).or_default() += tokens;
                 }
                 self.turns += num_turns;
                 // the result counts every message of its run

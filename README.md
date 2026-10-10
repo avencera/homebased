@@ -525,8 +525,8 @@ groups by model, day, and thread, and each task with its thread, cwd, task
 directory, and tokens and list-price cost per model. A task's `thread` is the
 Claude Code session or Codex thread that submitted it, so the report can be read
 together with the session transcripts. A worker stopped before Claude Code's
-final accounting is marked `complete: false`; its output tokens and cost are
-lower bounds. The terminal event of a Claude worker that ran on its submitting
+final accounting is marked `complete: false`; its tokens and cost are lower
+bounds. The terminal event of a Claude worker that ran on its submitting
 machine carries the same `usage`, and the dashboard's usage page shows the
 report. Tasks that ended before this was recorded get their usage when the
 daemon starts.

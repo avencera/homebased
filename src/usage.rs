@@ -107,8 +107,8 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskUsage {
     /// Whether every run ended with Claude Code's final accounting. A run
-    /// stopped before it has exact input and cache tokens, but its output
-    /// tokens are a lower bound and its cost is missing
+    /// without it counts only the messages its log shows, so its tokens are
+    /// lower bounds, output most of all, and its cost is missing
     pub complete: bool,
     /// Assistant turns
     pub turns: u64,

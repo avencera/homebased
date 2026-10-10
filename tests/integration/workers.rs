@@ -639,12 +639,14 @@ fn large_prompt_early_exit_keeps_code() {
 }
 
 /// A worker's stream: one run that ended with Claude Code's accounting, then a
-/// run stopped before it, whose message `m2` repeats with growing output
+/// run whose message `m2` repeats with growing output and that ended in an
+/// error result reporting no usage
 const CLAUDE_STREAM: &str = r#"{"type":"system","subtype":"init"}
 {"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":2,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}}
 {"type":"result","subtype":"success","num_turns":3,"total_cost_usd":1.5,"modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":200,"cacheReadInputTokens":1000,"cacheCreationInputTokens":300,"costUSD":1.25},"claude-haiku-5-5":{"inputTokens":4,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":40,"costUSD":0.25}}}
 {"type":"assistant","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":2000,"cache_creation_input_tokens":60}}}
 {"type":"assistant","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":7,"cache_read_input_tokens":2000,"cache_creation_input_tokens":60}}}
+{"type":"result","subtype":"error_during_execution","num_turns":1,"modelUsage":{}}
 "#;
 
 #[test]

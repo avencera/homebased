@@ -78,7 +78,7 @@ fn print_human(value: &Value, start: chrono::DateTime<Utc>, by: UsageGrouping) {
         cost(totals, partial > 0),
     );
     if partial > 0 {
-        println!("{partial} stopped early: their output tokens and cost are lower bounds");
+        println!("{partial} stopped early: their tokens and cost are lower bounds");
     }
     println!();
 

@@ -9,7 +9,7 @@ use tokio::task::AbortHandle;
 
 use crate::daemon::actors::{StoreMsg, call};
 use crate::domain::{
-    ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskRow, TaskState, Workload,
+    AgentKind, ExitReason, ProcessStatus, TaskExitEvidence, TaskId, TaskRow, TaskState, Workload,
 };
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode};
@@ -337,6 +337,7 @@ async fn apply_after_lock(actor: &TaskActor, id: TaskId) -> Result<AfterLock, Ap
         return Ok(AfterLock::Settled);
     };
     if row.state.is_terminal() {
+        record_missing_usage(actor, &row).await;
         return Ok(AfterLock::Settled);
     }
     let paths = actor.home.task_paths(id);
@@ -480,6 +481,22 @@ async fn record_usage(actor: &TaskActor, row: &TaskRow) {
     .await
     {
         tracing::warn!(%id, "record usage: {err}");
+    }
+}
+
+/// Record usage for a Claude worker whose runner committed its exit without it
+///
+/// A runner started by an older release is still running when the daemon
+/// updates, and the backfill skips it because it has not ended yet
+async fn record_missing_usage(actor: &TaskActor, row: &TaskRow) {
+    if !matches!(&row.workload, Workload::Agent(agent) if agent.agent.kind == AgentKind::Claude) {
+        return;
+    }
+    let id = row.id;
+    match call(&actor.store, |reply| StoreMsg::TaskUsage { id, reply }).await {
+        Ok(Some(_)) => {}
+        Ok(None) => record_usage(actor, row).await,
+        Err(err) => tracing::warn!(%id, "read usage: {err}"),
     }
 }
 

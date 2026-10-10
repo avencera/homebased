@@ -58,12 +58,12 @@ export function formatCost(usd: number): string {
 
 /** Why a task's cost is an undercount: its worker stopped before Claude Code's final tally. */
 export const TASK_NOTE =
-	'This worker stopped before Claude Code wrote its final tally, so its cost is missing and its output tokens are undercounted. Input and cache tokens are exact.';
+	'This worker stopped before Claude Code wrote its final tally, so its cost is missing and its tokens are undercounted, output most of all.';
 
 /** Why a group's cost is an undercount, naming how many of its tasks stopped early. */
 export function groupNote(stopped: number, tasks: number): string {
 	const which = stopped === 1 ? '1 task' : `${stopped} tasks`;
-	return `${which} of ${tasks} stopped before Claude Code wrote the final tally, so this cost and output are undercounts. Input and cache tokens are exact.`;
+	return `${which} of ${tasks} stopped before Claude Code wrote the final tally, so this cost and its tokens are undercounts.`;
 }
 
 /** Model id without the vendor prefix, for dense tables. */

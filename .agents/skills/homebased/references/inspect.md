@@ -78,7 +78,7 @@ homebased task usage --by thread                         # table by model (defau
 
 The JSON has `since`, `totals`, `by_model`, `by_day`, `by_thread`, and `tasks`. Totals and groups have `tasks`, `partial_tasks`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, and `cost_usd`. A group's `key` is the model id, the `YYYY-MM-DD` submission day in the machine's time zone, or the thread id. Each task has `task`, `name`, `thread`, `cwd`, `evidence`, `status`, `created_at`, and `usage`: `complete`, `turns`, the same token fields, and `models` with one entry per model. Tasks count by submission time. `cost_usd` is the list-price cost Claude Code reports, not subscription usage.
 
-`complete: false` means a run stopped before Claude Code wrote its final accounting, such as a cancelled or lost worker. Its input and cache tokens are exact, its output tokens are a lower bound, and it adds no cost.
+`complete: false` means a run ended without Claude Code's final accounting, such as a cancelled, lost, or failed worker. It counts only the messages its log shows, so its tokens are lower bounds, output most of all, and it adds no cost.
 
 To find where usage went, read this together with the session transcripts:
 
