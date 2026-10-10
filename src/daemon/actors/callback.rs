@@ -412,6 +412,8 @@ impl AttemptOutcome {
             Ok(()) => Self::Settle(DeliveryOutcome::Delivered),
             Err(SendFailure::Suppressed) => Self::Suppressed,
             Err(SendFailure::Failed(message)) => Self::Settle(DeliveryOutcome::Retryable(message)),
+            // a hold is expected, so it waits without a push alert
+            Err(SendFailure::Held(reason)) => Self::Settle(DeliveryOutcome::Deferred(reason)),
         }
     }
 }
@@ -619,6 +621,7 @@ impl OriginAttempt {
         SendGate {
             path: &self.paths.delivery_lock,
             check: self.before_send.as_ref(),
+            hold: true,
         }
     }
 
@@ -765,6 +768,9 @@ impl OriginAttempt {
             Ok(()) => AttemptOutcome::Settle(DeliveryOutcome::Delivered),
             Err(SendFailure::Suppressed) => AttemptOutcome::Suppressed,
             Err(SendFailure::Failed(reason)) => AttemptOutcome::WakeFailed(reason),
+            Err(SendFailure::Held(reason)) => {
+                AttemptOutcome::Settle(DeliveryOutcome::Deferred(reason))
+            }
         })
     }
 }

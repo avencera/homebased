@@ -207,6 +207,7 @@ impl Fixture {
             SendGate {
                 path: &self.lock,
                 check: Some(&check),
+                hold: false,
             },
         )
     }
@@ -225,6 +226,7 @@ impl Fixture {
             SendGate {
                 path: &self.lock,
                 check: Some(&check),
+                hold: false,
             },
         )
     }

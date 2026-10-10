@@ -127,7 +127,9 @@ thread after 55 idle minutes if the context has at least 200,000 tokens, while
 the prompt cache is still warm. A message for such a session whose cache
 already lapsed, with at least 200,000 context tokens, sends `/compact` first.
 A message that arrives during a compaction waits behind it, so the agent reads
-it with a compacted summary instead of its full history.
+it with a compacted summary instead of its full history. A task or queue job
+event waits in the homebased inbox until the compaction finishes, for at most
+12 minutes, so it can arrive a few minutes late.
 
 `--reply-to <message-uuid>` links a reply to an earlier message. Use
 `--conversation <uuid>` to set a shared conversation UUID. By default, the

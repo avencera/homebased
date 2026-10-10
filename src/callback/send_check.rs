@@ -11,6 +11,10 @@ pub(crate) enum SendFailure {
     /// Eligibility or transport could not be confirmed
     #[error("{0}")]
     Failed(String),
+    /// Nothing was sent: the line waits in the inbox while T3 compacts the
+    /// session, and a later attempt sends it
+    #[error("{0}")]
+    Held(String),
 }
 
 impl From<String> for SendFailure {
@@ -27,6 +31,11 @@ pub(crate) type SendCheck = Arc<dyn Fn() -> Result<(), SendFailure> + Send + Syn
 pub(crate) struct SendGate<'a> {
     pub(crate) path: &'a std::path::Path,
     pub(crate) check: Option<&'a SendCheck>,
+    /// Whether a line for a session T3 is compacting may wait in the durable
+    /// inbox instead of T3's in-memory queue
+    ///
+    /// Only inbox events can wait; a direct message answers its sender now
+    pub(crate) hold: bool,
 }
 
 impl SendGate<'_> {

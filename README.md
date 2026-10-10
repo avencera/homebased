@@ -190,11 +190,16 @@ later request then reads the summary instead of the full context. Nothing
 compacts a cold thread until a message arrives, so a thread that is never
 resumed costs nothing.
 
-T3 holds a message that arrives during the compaction and starts it once the
-compaction finishes. Stable T3 keeps that hold in memory, so a T3 restart during
-the compaction drops the message. Under the V2 orchestrator, from 54 idle
-minutes on, an event for such a session explicitly waits for the active run,
-because V2 refuses to steer into a running compaction.
+A task or queue job event that starts a compaction waits in the homebased inbox
+until the transcript shows the compaction finished, then goes as a normal turn.
+The inbox survives a T3 or daemon restart, while T3 keeps its own queue only in
+memory. If the compaction has not finished after 12 minutes, the event goes
+anyway. A direct message cannot wait, because its sender needs an answer, so
+it goes right after `/compact` and T3 holds it until the compaction finishes.
+
+Under the V2 orchestrator, from 54 idle minutes on, an event for such a session
+explicitly waits for the active run, because V2 refuses to steer into a running
+compaction.
 
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.

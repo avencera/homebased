@@ -347,6 +347,10 @@ async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
 struct T3ClaudeDelivery {
     /// Messages the live session socket received
     socket: Vec<String>,
+    /// State after the first inbox run
+    first_delivery: DeliveryState,
+    /// Whether the T3 send record existed after the first inbox run
+    first_pending: bool,
     delivery: DeliveryState,
     /// Whether the inbox drained instead of waiting
     completed: bool,
@@ -356,6 +360,23 @@ struct T3ClaudeDelivery {
 
 /// Deliver one callback to a live Claude session that a T3 V2 thread owns
 /// Claude transcript whose last request carried `tokens` `minutes_ago`
+/// Append the boundary Claude Code writes when a compaction finishes
+fn finish_compaction(route: &OriginRoute) {
+    let path = PathBuf::from(&route.callback.env.home)
+        .join(".claude/projects/-work")
+        .join(format!("{}.jsonl", route.thread));
+    let boundary = serde_json::json!({
+        "type": "system",
+        "subtype": "compact_boundary",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "compactMetadata": { "preTokens": 250_002, "postTokens": 12_000 }
+    });
+    let mut transcript = std::fs::read_to_string(&path).unwrap();
+    transcript.push('\n');
+    transcript.push_str(&boundary.to_string());
+    std::fs::write(path, transcript).unwrap();
+}
+
 fn write_transcript(route: &OriginRoute, minutes_ago: i64, tokens: u64) {
     let project = PathBuf::from(&route.callback.env.home).join(".claude/projects/-work");
     std::fs::create_dir_all(&project).unwrap();
@@ -471,6 +492,11 @@ struct V2Thread {
     archived: bool,
     /// Minutes since the session's last request, which carried a large context
     large_context_idle_minutes: Option<i64>,
+    /// After the first attempt, the transcript shows a finished compaction and
+    /// the inbox runs again
+    compaction_finishes: bool,
+    /// An earlier attempt left the event waiting for a compaction 13 minutes ago
+    stale_hold: bool,
 }
 
 async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDelivery {
@@ -493,6 +519,13 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
         .accept_inbound_event(&event(&route, 1, true))
         .unwrap();
     drop(persisted);
+    let pending_path = home.task_paths(route.task).dir.join("t3-pending-1");
+    if thread.stale_hold {
+        std::fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
+        std::fs::write(&pending_path, "claude").unwrap();
+        let since = chrono::Utc::now() - chrono::TimeDelta::minutes(13);
+        std::fs::write(pending_path.with_extension("hold"), since.to_rfc3339()).unwrap();
+    }
 
     let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
         .await
@@ -510,20 +543,27 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
     )
     .await
     .unwrap();
-    let completed = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
+    let delivery_state = || {
+        Store::open(&home.db_path())
+            .unwrap()
+            .inbound_events(route.task)
+            .unwrap()[0]
+            .delivery
+            .clone()
+    };
+    let mut completed = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
         .await
         .unwrap();
-    let delivery = Store::open(&home.db_path())
-        .unwrap()
-        .inbound_events(route.task)
-        .unwrap()[0]
-        .delivery
-        .clone();
-    let pending = home
-        .task_paths(route.task)
-        .dir
-        .join("t3-pending-1")
-        .exists();
+    let first_delivery = delivery_state();
+    let first_pending = pending_path.exists();
+    if thread.compaction_finishes {
+        finish_compaction(&route);
+        completed = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
+            .await
+            .unwrap();
+    }
+    let delivery = delivery_state();
+    let pending = pending_path.exists();
 
     callback.stop(None);
     callback_handle.await.unwrap();
@@ -531,6 +571,8 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
     store_handle.await.unwrap();
     T3ClaudeDelivery {
         socket: socket_messages(&socket),
+        first_delivery,
+        first_pending,
         delivery,
         completed,
         pending,
@@ -570,7 +612,7 @@ async fn live_claude_session_owned_by_t3_v2_gets_the_event_through_t3() {
 }
 
 #[tokio::test]
-async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
+async fn claude_session_past_its_prompt_cache_waits_in_the_inbox_for_its_compaction() {
     let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
     let dispatched = || {
         FakeResponse::WebSocket(vec![rpc_exit(
@@ -586,16 +628,23 @@ async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
         &server.origin,
         V2Thread {
             large_context_idle_minutes: Some(120),
+            compaction_finishes: true,
             ..V2Thread::default()
         },
     )
     .await;
 
+    // T3 keeps a queued turn only in memory, so the event waits in the inbox
+    assert!(
+        matches!(result.first_delivery, DeliveryState::AwaitingThread { .. }),
+        "{:?}",
+        result.first_delivery
+    );
+    // the record keeps retries on T3, away from the socket of the compacting process
+    assert!(result.first_pending);
     assert!(result.socket.is_empty(), "{:?}", result.socket);
-    assert!(matches!(
-        result.delivery,
-        DeliveryState::Delivered { attempts: 1, .. }
-    ));
+    assert!(matches!(result.delivery, DeliveryState::Delivered { .. }));
+    assert!(!result.pending);
     let payloads: Vec<serde_json::Value> = server
         .requests()
         .iter()
@@ -612,7 +661,54 @@ async fn claude_session_past_its_prompt_cache_compacts_before_the_event() {
             .unwrap()
             .contains("HOMEBASED_EVENT")
     );
-    assert_eq!(payloads[1]["dispatchMode"]["type"], "queue_after_active");
+    // the compacted session has a fresh cache and nothing running
+    assert_eq!(payloads[1]["dispatchMode"]["type"], "start_immediately");
+}
+
+#[tokio::test]
+async fn event_stops_waiting_for_a_compaction_that_never_finishes() {
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![
+            FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" })),
+            FakeResponse::WebSocket(vec![rpc_exit(
+                serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+            )]),
+        ],
+    );
+
+    let result = deliver_to_t3_v2_claude(
+        &server.origin,
+        V2Thread {
+            large_context_idle_minutes: Some(120),
+            stale_hold: true,
+            ..V2Thread::default()
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(result.delivery, DeliveryState::Delivered { .. }),
+        "{:?}",
+        result.delivery
+    );
+    let payloads: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect();
+    // no second compaction: the event goes behind whatever T3 still runs
+    assert_eq!(payloads.len(), 1);
+    assert!(
+        payloads[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("HOMEBASED_EVENT")
+    );
+    assert_eq!(payloads[0]["dispatchMode"]["type"], "queue_after_active");
 }
 
 #[tokio::test]

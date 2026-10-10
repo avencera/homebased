@@ -476,6 +476,7 @@ mod tests {
                 crate::callback::send_check::SendGate {
                     path: &home.path().join("delivery.lock"),
                     check: None,
+                    hold: false,
                 },
             )
             .unwrap();
@@ -588,6 +589,7 @@ mod tests {
             SendGate {
                 path: &lock,
                 check: Some(&check),
+                hold: false,
             },
         );
         assert!(matches!(result, Err(SendFailure::Suppressed)));

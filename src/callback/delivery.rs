@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tracing::warn;
@@ -36,6 +36,12 @@ use crate::t3::{
 pub const QUEUE_ATTEMPT_TIMEOUT_SECS: u64 = 20;
 /// [`QUEUE_ATTEMPT_TIMEOUT_SECS`] as a [`Duration`].
 pub const QUEUE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(QUEUE_ATTEMPT_TIMEOUT_SECS);
+
+/// Longest an inbox event waits for a T3 compaction before it is sent anyway
+///
+/// T3 gives a compaction 10 minutes. A compaction lost to a T3 restart never
+/// writes its boundary, so the event must not wait for it forever
+const COMPACTION_HOLD_LIMIT: TimeDelta = TimeDelta::minutes(12);
 
 /// Extra time to reap a child after its process group receives SIGKILL.
 const QUEUE_REAP_TIMEOUT_SECS: u64 = 2;
@@ -256,6 +262,30 @@ impl<I: IntentIo> PendingT3Send<I> {
 
     fn clear(&self) {
         let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(self.hold_path());
+    }
+
+    /// Marker holding when this event began waiting for a T3 compaction
+    fn hold_path(&self) -> PathBuf {
+        let mut path = self.0.as_os_str().to_os_string();
+        path.push(".hold");
+        PathBuf::from(path)
+    }
+
+    fn hold_since(&self) -> Option<DateTime<Utc>> {
+        let since = fs::read_to_string(self.hold_path()).ok()?;
+        DateTime::parse_from_rfc3339(since.trim())
+            .ok()
+            .map(|since| since.with_timezone(&Utc))
+    }
+
+    // a lost marker only restarts the wait limit, so it needs no fsync
+    fn start_hold(&self, now: DateTime<Utc>) {
+        let _ = fs::write(self.hold_path(), now.to_rfc3339());
+    }
+
+    fn end_hold(&self) {
+        let _ = fs::remove_file(self.hold_path());
     }
 }
 
@@ -318,6 +348,7 @@ pub(crate) fn send_saved_queue_attempt(
     let gate = SendGate {
         path: delivery_lock,
         check: None,
+        hold: false,
     };
     send_direct_message(context, thread, line, log_path, pending, gate)
         .map_err(|error| error.to_string())
@@ -529,7 +560,8 @@ fn wake_provider_thread(
         pending.record(provider_thread)?;
     }
 
-    let start = turn_start(context, provider_thread, log_path, gate);
+    // a held line keeps its pending record, so later attempts go only through T3
+    let start = turn_start(context, provider_thread, log_path, pending, gate)?;
     let outcome =
         match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check, start) {
             Ok(outcome) => outcome,
@@ -559,35 +591,81 @@ fn wake_provider_thread(
 /// A large context whose cache lapsed is compacted first. Its turn would write
 /// the whole context to the one-hour cache, while Claude Code's compaction
 /// request writes it at the cheaper five-minute rate, and every later request
-/// reads the summary instead of the whole context. The line then waits behind
-/// the compaction. A retry reuses the idle period's
-/// key, which T3 drops, or finds the compaction in the transcript
+/// reads the summary instead of the whole context.
+///
+/// With [`SendGate::hold`], the line then waits in the inbox, which survives a
+/// T3 restart, and [`SendFailure::Held`] asks for a later attempt. Each attempt
+/// repeats the compaction under the idle period's key, which T3 drops, until
+/// the transcript shows it finished or [`COMPACTION_HOLD_LIMIT`] passed.
+/// Otherwise the line goes now and T3 holds it in memory behind the compaction
 fn turn_start(
     context: &CallbackContext,
     provider_thread: ProviderThread,
     log_path: &Path,
+    pending: &PendingT3Send<impl IntentIo>,
     gate: SendGate<'_>,
-) -> TurnStart {
+) -> Result<TurnStart, SendFailure> {
     let ProviderThread::Claude(thread) = provider_thread else {
-        return TurnStart::Auto;
+        return Ok(TurnStart::Auto);
     };
     let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
-        return TurnStart::Auto;
+        return Ok(TurnStart::Auto);
     };
     let now = Utc::now();
+    if !usage.cold_compaction_due(now) {
+        pending.end_hold();
+        return Ok(usage.turn_start(now));
+    }
     // a line that may no longer be sent must not start a compaction either
-    if usage.cold_compaction_due(now) && gate.check().is_ok() {
-        let outcome = compact_thread(&t3_env(context), thread, &usage.compaction_key());
+    if gate.check().is_err() {
+        return Ok(usage.turn_start(now));
+    }
+    let held_since = pending.hold_since();
+    if held_since.is_some_and(|since| now - since >= COMPACTION_HOLD_LIMIT) {
+        callback_log(
+            log_path,
+            "t3 compaction did not finish in time; sending the event behind it",
+        );
+        return Ok(usage.turn_start(now));
+    }
+
+    let outcome = compact_thread(&t3_env(context), thread, &usage.compaction_key());
+    if held_since.is_none() {
         compaction_log::record_default(Trigger::Callback, thread, &usage, &outcome, now);
-        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
-            let _ = writeln!(
-                log,
+        callback_log(
+            log_path,
+            &format!(
                 "t3 compact first: {} context tokens past the prompt cache: {outcome:?}",
                 usage.tokens()
-            );
-        }
+            ),
+        );
     }
-    usage.turn_start(now)
+    let compacting = match outcome {
+        WakeOutcome::Woken { .. } => true,
+        // once T3 took the compaction, a failed repeat must not send the line
+        // into it; T3 may refuse the repeat because the compaction still runs
+        WakeOutcome::Unavailable(_) | WakeOutcome::Uncertain(_) | WakeOutcome::Refused(_) => {
+            held_since.is_some()
+        }
+        WakeOutcome::NotT3Thread | WakeOutcome::ApiChanged(_) => false,
+    };
+    if !(compacting && gate.hold) {
+        return Ok(usage.turn_start(now));
+    }
+    if held_since.is_none() {
+        pending.start_hold(now);
+    }
+    Err(SendFailure::Held(format!(
+        "waiting for T3 to compact Claude session {thread} ({} context tokens)",
+        usage.tokens()
+    )))
+}
+
+/// Append one line to the callback log, which is evidence only
+fn callback_log(path: &Path, line: &str) {
+    if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(log, "{line}");
+    }
 }
 
 fn record_wake(outcome: &WakeOutcome, log_path: &Path, pending: &PendingT3Send<impl IntentIo>) {
@@ -661,7 +739,7 @@ pub(super) fn run_command_deadline(
     match gate.check() {
         Ok(()) => {}
         Err(SendFailure::Suppressed) => return Ok(None),
-        Err(SendFailure::Failed(message)) => return Err(message),
+        Err(SendFailure::Failed(message) | SendFailure::Held(message)) => return Err(message),
     }
     clear_close_on_exec(lock_fd).map_err(|err| format!("prepare delivery lock: {err}"))?;
     let mut child = cmd.spawn().map_err(|err| err.to_string())?;

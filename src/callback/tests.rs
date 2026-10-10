@@ -9,6 +9,7 @@ fn run_unconditionally(
         SendGate {
             path: delivery_lock,
             check: None,
+            hold: false,
         },
     )?
     .ok_or_else(|| "unconditional callback was suppressed".into())
