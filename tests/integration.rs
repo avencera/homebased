@@ -490,6 +490,7 @@ impl Drop for Harness {
             let _ = child.kill();
             let _ = child.wait();
             let _ = fs::remove_file(self.home.join("homebased.sock"));
+            worker_cleanup::stop_workers(&self.home);
             return;
         }
         if self.home.join("homebased.sock").exists() {
@@ -660,5 +661,7 @@ mod source_rules;
 mod submission;
 #[path = "integration/waiting.rs"]
 mod waiting;
+#[path = "support/worker_cleanup.rs"]
+mod worker_cleanup;
 #[path = "integration/workers.rs"]
 mod workers;

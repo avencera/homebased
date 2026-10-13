@@ -29,6 +29,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[path = "support/worker_cleanup.rs"]
+mod worker_cleanup;
+
 struct Daemon {
     _dir: TempDir,
     state_home: PathBuf,
@@ -350,6 +353,7 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
+        worker_cleanup::stop_workers(&self.state_home);
     }
 }
 

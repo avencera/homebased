@@ -171,6 +171,7 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
+        worker_cleanup::stop_workers(&self.home);
     }
 }
 
@@ -518,3 +519,5 @@ mod peers;
 mod resource_jobs;
 #[path = "fleet/submission.rs"]
 mod submission;
+#[path = "support/worker_cleanup.rs"]
+mod worker_cleanup;
