@@ -61,6 +61,28 @@ jobs:
         run: |
           npm ci
           npm run build
+      # macOS keys privacy grants (TCC) to an ad-hoc binary by its hash, so each
+      # release re-prompted; a stable certificate lets a grant survive updates.
+      # A missing secret fails the release instead of shipping unsigned
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          : "${IDENTITY:?set the MACOS_SIGNING_IDENTITY repository variable}"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$keychain" | grep -F "\"$IDENTITY\""
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: homebased
@@ -70,6 +92,9 @@ jobs:
           tar: unix
           checksum: sha256
           locked: true
+          # ignored on Linux hosts; the prefix makes the identifier com.avencera.homebased
+          codesign: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          codesign-prefix: com.avencera.
 
   upload-install-script:
     needs: create-release

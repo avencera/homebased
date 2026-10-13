@@ -2,6 +2,7 @@
 
 - Install homebased only from GitHub releases, on every machine, including this Mac mini. Do not run `just release local` or `cargo xtask release local`, and do not copy a locally built binary into place.
 - Release flow: commit, `just bump <part>`, commit the bump, push, `just release github`, then wait for the Release workflow to pass (`gh run watch <id> --exit-status`).
+- The Release workflow signs macOS binaries with the InfraOps LLC Developer ID (team Q8UP8C53Y8) from the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the `MACOS_SIGNING_IDENTITY` variable, so macOS privacy grants survive updates. The macOS jobs fail rather than ship unsigned when these are missing.
 - Deploy after the release has its assets. Prefer `cmd fleet update`, which updates ai5090, `code`, and the calling machine and syncs the skill on each. Otherwise run `homebased update` on each machine, or the install script with `--tag vX.Y.Z` when no working binary exists, then run `~/code/dotfiles/bin/homebased-skill-sync` there. Then check `homebased --version` and `homebased --json daemon status`.
 
 # Homebased skill
