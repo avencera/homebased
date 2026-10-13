@@ -3,7 +3,9 @@
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use nix::errno::Errno;
@@ -33,7 +35,7 @@ pub(super) fn list_pids() -> io::Result<Vec<Pid>> {
     Ok(pids)
 }
 
-/// Start time, group, and state from `/proc/<pid>/stat`, owner from `/proc/<pid>`
+/// Start time, parent, group, and state from `/proc/<pid>/stat`, owner from `/proc/<pid>`
 pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let directory = format!("/proc/{pid}");
     let stat = match fs::read_to_string(format!("{directory}/stat")) {
@@ -47,12 +49,13 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     match parse_stat(&stat) {
         // an unreaped zombie keeps its stat entry, so report its exit with the
         // identity it ran under, as the macOS reader does
-        Some(('Z' | 'X', _, start)) => Read::Exited(ProcessIdentity {
+        Some(('Z' | 'X', _, _, start)) => Read::Exited(ProcessIdentity {
             pid,
             start: ProcessStartTime(start),
         }),
-        Some((_, pgid, start)) => Read::Found(ProcessInfo {
+        Some((_, ppid, pgid, start)) => Read::Found(ProcessInfo {
             start: ProcessStartTime(start),
+            ppid: Pid::from_raw(ppid),
             pgid: Pid::from_raw(pgid),
             uid,
         }),
@@ -60,17 +63,31 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     }
 }
 
-/// State (field 3), process group (field 5), and start time (field 22)
+/// The executable a live process runs, or `None` when the read fails
+///
+/// The kernel appends ` (deleted)` once the file is replaced, as an update does,
+/// so the suffix is dropped to compare against the path that now holds it
+pub(super) fn executable_path(pid: Pid) -> Option<PathBuf> {
+    let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let bytes = path.as_os_str().as_bytes();
+    Some(match bytes.strip_suffix(b" (deleted)") {
+        Some(original) => Path::new(std::ffi::OsStr::from_bytes(original)).to_path_buf(),
+        None => path,
+    })
+}
+
+/// State (field 3), parent (field 4), process group (field 5), and start time (field 22)
 ///
 /// The command name in field 2 may hold spaces and parentheses, so fields are
 /// counted from the last `)`
-fn parse_stat(stat: &str) -> Option<(char, i32, u64)> {
+fn parse_stat(stat: &str) -> Option<(char, i32, i32, u64)> {
     let after_name = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = after_name.split_whitespace().collect();
     let state = fields.first()?.chars().next()?;
+    let ppid = fields.get(1)?.parse().ok()?;
     let pgid = fields.get(2)?.parse().ok()?;
     let start = fields.get(19)?.parse().ok()?;
-    Some((state, pgid, start))
+    Some((state, ppid, pgid, start))
 }
 
 fn read_error<T>(error: &io::Error) -> Read<T> {
@@ -138,7 +155,7 @@ mod tests {
     #[test]
     fn stat_fields_count_from_the_last_parenthesis() {
         let stat = "4242 (odd ) name) S 1 4240 4240 0 -1 4194560 120 0 0 0 1 2 0 0 20 0 1 0 987654 1000 200";
-        assert_eq!(parse_stat(stat), Some(('S', 4240, 987_654)));
+        assert_eq!(parse_stat(stat), Some(('S', 1, 4240, 987_654)));
         assert_eq!(parse_stat("4242 (short) S 1"), None);
     }
 }

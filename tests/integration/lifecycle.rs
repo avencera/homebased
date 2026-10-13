@@ -1,6 +1,6 @@
 //! Task lifecycle across daemon restarts, signals, cancels, inactivity checks, and cleanup
 
-use super::{Harness, THREAD, event_json, fixture, wait_until};
+use super::{Harness, THREAD, event_json, fixture, process_is_live, wait_until};
 use homebased::domain::{
     Agent, AgentKind, AgentWorkload, ExitReason, ProcessStatus, TaskEnv, TaskId, Workload,
 };
@@ -147,6 +147,61 @@ fn inherited_run_markers_reach_neither_the_worker_nor_the_task_child() {
     let cancel = h.cmd().args(["task", "cancel", &id]).output().unwrap();
     assert!(cancel.status.success());
     h.wait_status(&id, "cancelled");
+}
+
+/// Starts `sleep` in its own process group without the run marker, as Codex
+/// starts an MCP server, and returns the file its PID is written to
+fn detach_command(h: &Harness) -> (String, std::path::PathBuf) {
+    let pidfile = h.record.join("leftover-pid");
+    let command = format!(
+        "perl -e 'setpgrp(0, 0); exec @ARGV' env -u HOMEBASED_TASK_ID sleep 300 & echo $! > '{}'",
+        pidfile.display()
+    );
+    (command, pidfile)
+}
+
+fn leftover_pid(pidfile: &std::path::Path) -> i32 {
+    fs::read_to_string(pidfile).unwrap().trim().parse().unwrap()
+}
+
+#[test]
+fn an_agent_run_stops_a_detached_process_without_the_run_marker() {
+    let h = Harness::new();
+    let (command, pidfile) = detach_command(&h);
+    h.set_control("detach", &command);
+    // the worker records descendants once a second, so the agent outlives a poll
+    h.set_control("sleep", "2");
+    h.set_control("report", "succeeded\nDetached.");
+    let id = h.submit(&Harness::spec("codex", "detach"));
+    h.wait_status(&id, "succeeded");
+
+    let pid = leftover_pid(&pidfile);
+    let stopped = wait_until(Duration::from_secs(5), || !process_is_live(pid));
+    if !stopped {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    assert!(stopped, "the leftover outlived its agent run");
+}
+
+#[test]
+fn a_plain_task_leaves_its_detached_process_running() {
+    let h = Harness::new();
+    let (command, pidfile) = detach_command(&h);
+    let script = format!("{command}; sleep 2");
+    let id = h.submit(&Harness::task_spec(&["/bin/sh", "-c", &script]));
+    h.wait_status(&id, "succeeded");
+
+    // a plain task may start a server that other work shares
+    let pid = leftover_pid(&pidfile);
+    let alive = process_is_live(pid);
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    assert!(alive, "a plain task's detached process was stopped");
 }
 
 #[cfg(target_os = "linux")]

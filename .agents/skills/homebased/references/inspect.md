@@ -130,7 +130,7 @@ A queue run can be `preempted` while its job waits to resume. Use [resource-queu
 homebased --json task cancel <id>
 ```
 
-Sends SIGTERM to the worker, which forwards it to the child's process group, waits for the group to disappear, and sends SIGKILL after 10 seconds if descendants remain. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.
+Sends SIGTERM to the worker, which forwards it to the child's process group, waits for the group to disappear, and sends SIGKILL after 10 seconds if descendants remain. When an agent run ends, the worker also stops what the run started outside that group: processes that carry its `HOMEBASED_TASK_ID`, and descendants it recorded once a second while the run was alive, such as MCP servers an agent CLI starts in their own process group. It never stops a homebased process or what one started, so a daemon started from a task keeps running. A plain `task` run leaves such processes alone, since a build may start a server that other work shares. The exit event arrives as `TASK_CANCELLED`. Cancelling a terminal task exits 0 and changes nothing. A queued task with no worker yet is cancelled directly.
 
 Cancelling any run of a parked chain cancels the run that owns the work now: its held continuation before it starts, or the continuation that already runs. The response `id` names that run. The chain then ends `cancelled`.
 

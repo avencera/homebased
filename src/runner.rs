@@ -20,7 +20,7 @@ use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::cleanup;
+use crate::cleanup::{self, DescendantTracker};
 use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
     TaskRow, TaskState, ThreadId, Workload,
@@ -39,6 +39,9 @@ const KILL_GRACE: Duration = Duration::from_secs(10);
 const KILL_REAP_GRACE: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(50);
 const CANCELLATION_POLL: Duration = Duration::from_millis(250);
+/// How often the worker records the child's descendants; long-lived leftovers
+/// such as MCP servers are seen on the first poll after they start
+const DESCENDANT_POLL: Duration = Duration::from_secs(1);
 /// Lock wait for the worker's connection. A worker that cannot claim its row
 /// leaves the task lost, and nothing waits on it, so it outlasts slow daemon commits
 const WORKER_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -414,7 +417,12 @@ async fn run_child(
             process_group_exit_evidence: ProcessGroupExitEvidence::Unconfirmed,
         });
     };
-    record_child_identity(store, id, child_pgid);
+    let child_identity = record_child_identity(store, id, child_pgid);
+    // only agent CLIs are expected to end everything they start; a plain task
+    // may leave a shared server, such as a build cache daemon, that others use
+    let mut descendants = child_identity
+        .filter(|_| matches!(row.workload, Workload::Agent(_)))
+        .map(DescendantTracker::new);
     if let Err(error) = store.confirm_job_run_started(id) {
         let (evidence, _) = cancel_child_group(&mut child, child_pgid).await;
         return Ok(TaskRunExit {
@@ -439,6 +447,8 @@ async fn run_child(
 
     let mut cancellation_poll = time::interval(CANCELLATION_POLL);
     cancellation_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut descendant_poll = time::interval(DESCENDANT_POLL);
+    descendant_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let cause = loop {
         tokio::select! {
             status = child.wait() => {
@@ -447,10 +457,14 @@ async fn run_child(
                         message: err.to_string(),
                     }
                 });
+                // recorded descendants still lead to what they started since
+                observe(descendants.as_mut());
                 // direct-child exit is not proof the process group is empty
                 let process_group_exit_evidence = cleanup_process_group(child_pgid).await;
+                stop_leftovers(id, store, descendants).await;
                 return Ok(TaskRunExit { reason, process_group_exit_evidence });
             }
+            _ = descendant_poll.tick() => observe(descendants.as_mut()),
             _ = sigterm.recv() => break ChildCancellationCause::Signal,
             _ = cancellation_poll.tick() => match store.require_task(id) {
                 Ok(row) if row.cancel_requested_at.is_some() => {
@@ -485,25 +499,64 @@ async fn run_child(
     } else {
         ExitReason::Signal { signal: 15 }
     };
-    Ok(stop_child(&mut child, child_pgid, reason).await)
+    // the tree is intact until the group is signalled, so this catches
+    // descendants started since the last poll
+    observe(descendants.as_mut());
+    let exit = stop_child(&mut child, child_pgid, reason).await;
+    stop_leftovers(id, store, descendants).await;
+    Ok(exit)
 }
 
-/// Save the child's identity for cleanup after a lost worker
+/// Save the child's identity for cleanup after a lost worker and return it
 ///
 /// The child is not reaped yet, so its PID cannot be reused before the read. A
-/// failure only weakens later lost-worker cleanup, so the task keeps running
-fn record_child_identity(store: &Store, id: TaskId, pid: i32) {
+/// failure only weakens later cleanup, so the task keeps running
+fn record_child_identity(store: &Store, id: TaskId, pid: i32) -> Option<cleanup::ProcessIdentity> {
     let identity = match cleanup::process_identity(Pid::from_raw(pid)) {
         Ok(identity) => identity,
         Err(err) => {
             warn!(%id, pid, "read child identity: {err}");
-            return;
+            return None;
         }
     };
     match store.set_child_identity(id, identity) {
         Ok(true) => {}
         Ok(false) => warn!(%id, %identity, "child identity not recorded: task row changed"),
         Err(err) => warn!(%id, %identity, "record child identity: {err}"),
+    }
+    Some(identity)
+}
+
+fn observe(descendants: Option<&mut DescendantTracker>) {
+    if let Some(tracker) = descendants {
+        tracker.observe();
+    }
+}
+
+/// Stop what an agent run left outside the child's process group
+///
+/// Group cleanup cannot reach these: processes that carry the run marker after
+/// leaving the group, and recorded descendants that also dropped the marker,
+/// such as the MCP servers Codex starts. Workers that hold their run lock are
+/// never signalled, whatever the record says. The sweep logs what it stopped
+/// and why it could not finish
+async fn stop_leftovers(id: TaskId, store: &Store, descendants: Option<DescendantTracker>) {
+    let Some(tracker) = descendants else {
+        return;
+    };
+    let protected = match store.cleanup_protected_pids() {
+        Ok(pids) => pids.into_iter().map(Pid::from_raw).collect(),
+        Err(err) => {
+            warn!(%id, "read workers to protect; skipping leftover cleanup: {err}");
+            return;
+        }
+    };
+    let sweep = move || {
+        let adopted = tracker.into_adopted();
+        cleanup::sweep_run(id, &adopted, &protected, cleanup::CleanupTiming::STANDARD)
+    };
+    if let Err(error) = tokio::task::spawn_blocking(sweep).await {
+        warn!(%id, "leftover cleanup: {error}");
     }
 }
 

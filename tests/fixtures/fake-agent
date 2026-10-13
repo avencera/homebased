@@ -42,6 +42,12 @@ if [ -f "$record/stdout" ]; then
   cat "$record/stdout"
 fi
 
+# run the control's command in this shell, so what it starts in the background
+# is the agent's own child, as an MCP server is the agent CLI's
+if [ -f "$record/detach" ]; then
+  eval "$(cat "$record/detach")"
+fi
+
 sleep_for="${FAKE_SLEEP:-}"
 if [ -f "$record/sleep" ]; then
   sleep_for=$(cat "$record/sleep")

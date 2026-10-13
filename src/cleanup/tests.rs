@@ -17,9 +17,10 @@ use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::{Pid, setsid};
 
 use super::{
-    CleanupFailure, CleanupTiming, Environment, GroupAttribution, GroupOutcome, ProcessIdentity,
-    ProcessInfo, ProcessSource, ProcessStartTime, Read, SweepOutcome, SystemProcesses,
-    cleanup_lost_group_with, process_identity, sweep_marker, sweep_marker_with,
+    CleanupFailure, CleanupTiming, DescendantTracker, Environment, GroupAttribution, GroupOutcome,
+    ProcessIdentity, ProcessInfo, ProcessSource, ProcessStartTime, Read, SweepOutcome,
+    SystemProcesses, cleanup_lost_group_with, process_identity, sweep_marker, sweep_marker_with,
+    sweep_run,
 };
 use crate::domain::TaskId;
 use crate::run_env;
@@ -45,6 +46,8 @@ const FAST: CleanupTiming = CleanupTiming {
 /// - `sleep`: live until killed
 /// - `escape`: start a `sleep` helper in a new session, record it, and exit, so
 ///   the helper is orphaned like a double-forked daemon
+/// - `detach-and-live`: start an unmarked `sleep` helper in a new session,
+///   record it, and live, as Codex does with an MCP server
 /// - `spawner`: ignore SIGTERM and start a new-session `sleep` helper every
 ///   100 ms, recording each, until killed
 /// - `group-leader`: start a `sleep` helper in this process group, record it, and live
@@ -65,6 +68,15 @@ fn helper_process() {
         "escape" => {
             let child = helper_command("sleep", None).new_session().spawn().unwrap();
             record(pidfile.as_deref(), child);
+        }
+        "detach-and-live" => {
+            let child = helper_command("sleep", None)
+                .new_session()
+                .env_remove(run_env::TASK_ID)
+                .spawn()
+                .unwrap();
+            record(pidfile.as_deref(), child);
+            std::thread::sleep(HELPER_LIFETIME);
         }
         "spawner" => {
             // SAFETY: ignoring a signal installs no handler
@@ -319,6 +331,54 @@ fn sweep_kills_marked_processes_that_left_the_group_and_spares_others() {
 }
 
 #[test]
+fn recorded_descendants_without_the_marker_are_stopped_after_their_parent_exits() {
+    let marker = TaskId::new();
+    let (mut spawned, pidfile) = Spawned::new();
+    let root = spawned.start(
+        &mut helper_command("detach-and-live", Some(&pidfile)),
+        Some(marker),
+    );
+    let detached = spawned.recorded(&pidfile, 1)[0];
+    let bystander = spawned.start(helper_command("sleep", None).new_session(), None);
+
+    // helpers run this test binary, so a boundary named after it would stop the walk
+    let mut tracker = DescendantTracker::with_boundary(root, Some("not-a-helper".into()));
+    tracker.observe();
+    assert!(tracker.recorded().contains(&detached), "{tracker:?}");
+
+    // once the root exits the detached helper is reparented, so only the
+    // record still ties it to the run
+    kill(root.pid, Signal::SIGKILL).unwrap();
+    spawned.reap(root.pid);
+    tracker.observe();
+    assert!(tracker.recorded().contains(&detached), "{tracker:?}");
+
+    let outcome = sweep_run(marker, &tracker.into_adopted(), &BTreeSet::new(), FAST);
+
+    assert!(signalled(&outcome).contains(&detached), "{outcome:?}");
+    assert!(wait_dead(detached));
+    assert!(
+        is_alive(bystander),
+        "an unrecorded, unmarked process must not be signalled"
+    );
+}
+
+#[test]
+fn descendant_tracking_stops_at_the_boundary_executable() {
+    let (mut spawned, pidfile) = Spawned::new();
+    let root = spawned.start(&mut helper_command("detach-and-live", Some(&pidfile)), None);
+    let detached = spawned.recorded(&pidfile, 1)[0];
+    // helpers run this test binary, which stands in for a homebased daemon
+    // started from inside a run
+    let own = std::env::current_exe().unwrap();
+
+    let mut tracker = DescendantTracker::with_boundary(root, own.file_name().map(Into::into));
+    tracker.observe();
+
+    assert!(!tracker.recorded().contains(&detached), "{tracker:?}");
+}
+
+#[test]
 fn rescans_catch_a_descendant_created_during_cleanup() {
     let marker = TaskId::new();
     let (mut spawned, pidfile) = Spawned::new();
@@ -528,6 +588,7 @@ impl ProcessSource for RefusedEnvironment {
 
         Read::Found(ProcessInfo {
             start: self.identity.start,
+            ppid: Pid::from_raw(1),
             pgid: self.identity.pid,
             uid: self.uid,
         })
@@ -824,6 +885,7 @@ impl ProcessSource for ForkThenExit {
         }
         Read::Found(ProcessInfo {
             start: ProcessStartTime(1),
+            ppid: Pid::from_raw(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
         })
@@ -910,6 +972,7 @@ impl ProcessSource for ForkChain {
         }
         Read::Found(ProcessInfo {
             start: ProcessStartTime(1),
+            ppid: Pid::from_raw(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
         })

@@ -1,8 +1,10 @@
 //! Process table access on macOS through libproc and `sysctl(KERN_PROCARGS2)`
 
-use std::ffi::c_int;
+use std::ffi::{OsString, c_int};
 use std::io;
 use std::mem;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::ptr;
 
 use nix::errno::Errno;
@@ -41,7 +43,7 @@ pub(super) fn list_pids() -> io::Result<Vec<Pid>> {
     }
 }
 
-/// Start time, group, and owner from `PROC_PIDTBSDINFO`; a zombie is `Exited`
+/// Start time, parent, group, and owner from `PROC_PIDTBSDINFO`; a zombie is `Exited`
 pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let Ok(size) = c_int::try_from(mem::size_of::<libc::proc_bsdinfo>()) else {
         return Read::Refused(Errno::EOVERFLOW);
@@ -69,7 +71,7 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
         return Read::Refused(Errno::EIO);
     }
 
-    let Ok(pgid) = i32::try_from(info.pbi_pgid) else {
+    let (Ok(ppid), Ok(pgid)) = (i32::try_from(info.pbi_ppid), i32::try_from(info.pbi_pgid)) else {
         return Read::Refused(Errno::EIO);
     };
     let start = ProcessStartTime(
@@ -82,6 +84,7 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     }
     Read::Found(ProcessInfo {
         start,
+        ppid: Pid::from_raw(ppid),
         pgid: Pid::from_raw(pgid),
         uid: info.pbi_uid,
     })
@@ -248,6 +251,17 @@ fn environment_block(buffer: &[u8]) -> Option<&[u8]> {
         end += length + 1;
     }
     Some(&rest[..end])
+}
+
+/// The executable a live process runs, or `None` when the read fails
+pub(super) fn executable_path(pid: Pid) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let size = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: the kernel writes at most `size` bytes into the buffer
+    let length = unsafe { libc::proc_pidpath(pid.as_raw(), buffer.as_mut_ptr().cast(), size) };
+    let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
+    buffer.truncate(length);
+    Some(PathBuf::from(OsString::from_vec(buffer)))
 }
 
 /// Uses the PID as the signal handle because macOS has no pidfd

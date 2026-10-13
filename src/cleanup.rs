@@ -3,7 +3,9 @@
 //! A run's process group is cleaned up by its worker. Work that left the
 //! group, such as a double-forked daemon or a child in a new session, still
 //! carries the run's `HOMEBASED_TASK_ID` in its environment, so a sweep reads
-//! every process's environment and stops the ones that carry the marker
+//! every process's environment and stops the ones that carry the marker. Work
+//! that also dropped the marker is tied to the run only by the descendants its
+//! worker recorded while the run was alive, see [`DescendantTracker`]
 //!
 //! Same-user processes with unreadable environments that started at or after
 //! the workload start hold cleanup for a person to check, but are never signalled
@@ -36,6 +38,7 @@ use tracing::{info, warn};
 use crate::domain::TaskId;
 use crate::run_env;
 
+mod descendants;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -47,6 +50,8 @@ mod tests;
 use linux as os;
 #[cfg(target_os = "macos")]
 use macos as os;
+
+pub use descendants::DescendantTracker;
 
 /// Kernel start time of a process, in an OS-specific unit
 ///
@@ -317,6 +322,28 @@ pub fn sweep_marker(
     }
 }
 
+/// Stop what a finished run left running outside its process group
+///
+/// Targets are the processes that carry `marker` and the recorded descendants
+/// in `adopted`, which may have dropped the marker. An adopted process is
+/// matched by PID and start time, so a later process that reused its PID is
+/// never signalled. Protection, signalling, rescans, and bounds are those of
+/// [`sweep_marker`]; unreadable processes are ignored
+#[must_use]
+pub fn sweep_run(
+    marker: TaskId,
+    adopted: &BTreeSet<ProcessIdentity>,
+    protected: &BTreeSet<Pid>,
+    timing: CleanupTiming,
+) -> SweepOutcome {
+    match SystemProcesses::new() {
+        Ok(mut source) => sweep_with(&mut source, marker, None, adopted, protected, timing),
+        Err(error) => SweepOutcome::Incomplete(CleanupFailure::EnumerationFailed {
+            message: error.to_string(),
+        }),
+    }
+}
+
 /// Stop the process group of a worker that was lost with its child
 ///
 /// The group is signalled only while its recorded leader keeps its identity,
@@ -345,7 +372,26 @@ pub(crate) fn sweep_marker_with<S: ProcessSource>(
     protected: &BTreeSet<Pid>,
     timing: CleanupTiming,
 ) -> SweepOutcome {
+    sweep_with(
+        source,
+        marker,
+        run_start,
+        &BTreeSet::new(),
+        protected,
+        timing,
+    )
+}
+
+fn sweep_with<S: ProcessSource>(
+    source: &mut S,
+    marker: TaskId,
+    run_start: Option<ProcessStartTime>,
+    adopted: &BTreeSet<ProcessIdentity>,
+    protected: &BTreeSet<Pid>,
+    timing: CleanupTiming,
+) -> SweepOutcome {
     let mut sweeper = Sweeper::new(source, marker, run_start, protected, timing);
+    sweeper.adopted = adopted.clone();
     let result = sweeper.sweep();
     let signalled: Vec<_> = sweeper.signalled.iter().copied().collect();
     if let Err(failure) = result {
@@ -400,6 +446,7 @@ pub(crate) enum Read<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessInfo {
     pub(crate) start: ProcessStartTime,
+    pub(crate) ppid: Pid,
     pub(crate) pgid: Pid,
     pub(crate) uid: u32,
 }
@@ -503,6 +550,7 @@ impl ProcessSource for SystemProcesses {
 /// What a live process's environment establishes about the run
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Observation {
+    /// The process carries the marker or is an adopted descendant
     Marked(ProcessIdentity),
     Suspect(ProcessIdentity),
     /// The process exited between enumeration and inspection, so a child it
@@ -535,6 +583,8 @@ struct Sweeper<'a, S> {
     marker: TaskId,
     marker_value: Vec<u8>,
     run_start: Option<ProcessStartTime>,
+    /// Recorded run descendants, targets even without the marker
+    adopted: BTreeSet<ProcessIdentity>,
     protected: BTreeSet<Pid>,
     timing: CleanupTiming,
     own_uid: u32,
@@ -566,6 +616,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             marker,
             marker_value: marker.to_string().into_bytes(),
             run_start,
+            adopted: BTreeSet::new(),
             protected,
             timing,
             own_uid: geteuid().as_raw(),
@@ -743,13 +794,22 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         Ok(scan)
     }
 
-    /// A live marked target or a same-user unreadable suspect within the run bound
+    /// A live marked or adopted target, or a same-user unreadable suspect within the run bound
     fn observe(&mut self, pid: Pid) -> Option<Observation> {
         let info = match self.source.info(pid) {
             Read::Found(info) => info,
             Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
             Read::Refused(_) => return None,
         };
+        let identity = ProcessIdentity {
+            pid,
+            start: info.start,
+        };
+        // the start time was just read, so a PID reused since it was recorded
+        // does not match
+        if self.adopted.contains(&identity) {
+            return Some(Observation::Marked(identity));
+        }
         let environment = match self.source.environment(pid) {
             Read::Found(environment) => environment,
             Read::Exited(_) | Read::Gone => return Some(Observation::Vanished),
