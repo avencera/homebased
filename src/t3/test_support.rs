@@ -279,7 +279,8 @@ impl V2State {
                 thread_id TEXT,
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL
+                payload_json TEXT NOT NULL,
+                driver TEXT
              );",
         )
         .unwrap();
@@ -298,18 +299,31 @@ impl V2State {
         self
     }
 
-    /// A provider thread whose native id is the Claude session or Codex thread
-    pub(crate) fn native(self, provider: &str, native_id: &str, thread_id: &str) -> Self {
-        let payload = json!({ "nativeThreadRef": { "driver": provider, "nativeId": native_id } });
+    /// A provider thread of the default instance of `driver`, whose native id
+    /// is the Claude session or Codex thread
+    pub(crate) fn native(self, driver: &str, native_id: &str, thread_id: &str) -> Self {
+        self.instance(driver, driver, native_id, thread_id)
+    }
+
+    /// A provider thread of a configured provider `instance` of `driver`
+    pub(crate) fn instance(
+        self,
+        instance: &str,
+        driver: &str,
+        native_id: &str,
+        thread_id: &str,
+    ) -> Self {
+        let payload = json!({ "nativeThreadRef": { "driver": driver, "nativeId": native_id } });
         self.0
             .execute(
                 "INSERT INTO orchestration_v2_projection_provider_threads
-                 (provider_thread_id, thread_id, provider, updated_at, payload_json)
-                 VALUES (?1, ?2, ?3, '2026-10-02T20:00:00Z', ?4)",
+                 (provider_thread_id, thread_id, provider, driver, updated_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, '2026-10-02T20:00:00Z', ?5)",
                 rusqlite::params![
                     format!("provider-thread:{native_id}"),
                     thread_id,
-                    provider,
+                    instance,
+                    driver,
                     payload.to_string()
                 ],
             )

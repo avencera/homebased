@@ -225,8 +225,8 @@ through another route. When delivery finally gives up, homebased writes the
 event to `callback-fallback.log` and sends a push notification.
 
 Run `homebased t3 check` after T3 updates to check that the local API still
-works. It reports the protocol it found. V2 support was verified against the
-T3 Code 0.0.46 preview, before any stable release shipped it.
+works. It reports the protocol it found. V2 support was verified against
+T3 Code 0.1.0, the first stable release with V2.
 
 A Claude session with a transcript but no live process is waiting, not gone.
 Some hosts, such as T3 Code before its V2 orchestrator, start a new `claude`

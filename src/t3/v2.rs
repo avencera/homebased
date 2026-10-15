@@ -1,12 +1,14 @@
 //! T3 orchestration protocol 2, the orchestrator from pingdotgg/t3code#2829
 //!
-//! Pinned at T3 Code `main` commit `e9298af6` on 2026-10-02 and verified with
-//! preview `0.0.46-preview.20261002.2598`; no nightly or stable release had it
-//! yet. When V2 reaches stable and `homebased t3 check` fails, compare these
-//! files in pingdotgg/t3code: `packages/contracts/src/environmentHttp.ts` (HTTP
-//! routes), `packages/contracts/src/orchestrationV2.ts` (`message.dispatch` and
-//! `ORCHESTRATION_V2_WS_METHODS`), and
-//! `apps/server/src/persistence/Migrations/055_OrchestrationV2.ts` (tables).
+//! Pinned at T3 Code `v0.1.0`, the first stable release with V2; every
+//! contract below is unchanged from `main` commit `e9298af6`, where it was
+//! first verified. When `homebased t3 check` fails after a T3 update, compare
+//! these files in pingdotgg/t3code: `packages/contracts/src/environmentHttp.ts`
+//! (HTTP routes), `packages/contracts/src/orchestrationV2.ts`
+//! (`message.dispatch` and `ORCHESTRATION_V2_WS_METHODS`),
+//! `apps/server/src/persistence/Migrations/055_OrchestrationV2.ts`, and
+//! `apps/server/src/persistence/Migrations/OrchestrationV2/Foundation.ts`
+//! (tables).
 //! V2 removed `POST /api/orchestration/dispatch`, which is why a turn goes over
 //! the client WebSocket in [`super::rpc`]. If `environmentHttp.ts` gains an
 //! authenticated HTTP route that dispatches commands or wakes a thread, use it
@@ -14,10 +16,12 @@
 //!
 //! - `statev2.sqlite` replaces `state.sqlite`, which V2 copies once at its first
 //!   start and never writes again. `orchestration_v2_projection_provider_threads`
-//!   maps `provider` (`claudeAgent` or `codex`) and
+//!   maps `driver` (`claudeAgent` or `codex`) and
 //!   `payload_json.$.nativeThreadRef.nativeId` (the Claude session or Codex
 //!   thread id) to `thread_id`; `orchestration_v2_projection_threads` has
-//!   `archived_at` and `deleted_at`
+//!   `archived_at` and `deleted_at`. `provider` holds the provider instance id,
+//!   which equals the driver only for the default instance. `driver` is
+//!   nullable, so a lookup falls back to `provider`
 //! - Threads imported from V1 keep their ids but get no provider thread, so
 //!   their sessions resolve only through the copied V1 `provider_session_runtime`
 //!   table. A turn there starts a new provider session with a context handoff
@@ -52,7 +56,7 @@ const NATIVE_THREAD_SQL: &str = "
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
     WHERE t.deleted_at IS NULL
-      AND p.provider = ?1
+      AND COALESCE(p.driver, p.provider) = ?1
       AND CASE WHEN json_valid(p.payload_json)
           THEN json_extract(p.payload_json, '$.nativeThreadRef.nativeId') = ?2
           ELSE 0 END
@@ -74,7 +78,7 @@ const LEGACY_TABLE_SQL: &str =
 const ARCHIVED_SQL: &str =
     "SELECT archived_at IS NOT NULL FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
 const REQUIRED_STATE_SQL: &str = "
-    SELECT p.thread_id, p.provider, p.payload_json, p.updated_at,
+    SELECT p.thread_id, p.provider, p.driver, p.payload_json, p.updated_at,
            t.thread_id, t.title, t.archived_at, t.deleted_at
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
@@ -87,7 +91,7 @@ const OPEN_CLAUDE_THREADS_SQL: &str = "
     SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
-    WHERE p.provider = 'claudeAgent'
+    WHERE COALESCE(p.driver, p.provider) = 'claudeAgent'
       AND t.deleted_at IS NULL AND t.archived_at IS NULL
       AND json_valid(p.payload_json)
       AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'

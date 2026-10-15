@@ -7,9 +7,8 @@
 //! after a T3 update
 //!
 //! T3 speaks one of two orchestration protocols: [`v1`] in stable `0.0.45` and
-//! earlier, and [`v2`] after pingdotgg/t3code#2829. Every wake and probe asks
-//! the running server which one it speaks, so an update that ships V2 needs no
-//! homebased change unless V2 changed again first
+//! earlier, and [`v2`] from stable `0.1.0`, after pingdotgg/t3code#2829. Every
+//! wake and probe asks the running server which one it speaks
 //!
 //! Both protocols share:
 //!
@@ -22,7 +21,8 @@
 //!   `orchestrationProtocolVersion`, `1` or `2`
 //! - The `t3` CLI is the running server's executable
 //!   (`~/.t3/runtime/versions/<version>/t3`), found through `/proc/<pid>/exe`
-//!   or `ps`, else `t3` on PATH. The macOS desktop app does not put it on PATH
+//!   or `ps`, else the desktop app's launcher `~/.t3/bin/t3`, else `t3` on
+//!   PATH. The desktop app puts neither on PATH
 //! - `t3 auth session issue --json --ttl 5m --label homebased` returns
 //!   `sessionId` and `token` for a bearer session. Revoke it with
 //!   `t3 auth session revoke <sessionId>` after every use; `t3 --version`
@@ -738,14 +738,28 @@ struct CliOutput {
 /// Executable of the running T3 server, when it is the `t3` binary
 ///
 /// The server binary is also the CLI and always matches the server version.
-/// The macOS desktop app starts it from `~/.t3/runtime/versions/<version>/t3`
-/// without putting `t3` on PATH
+/// The background service starts it from `~/.t3/runtime/versions/<version>/t3`
+/// without putting `t3` on PATH. The desktop app instead runs its bundled
+/// server under Electron, so its server process is not a `t3` binary; see
+/// [`DESKTOP_CLI_SHIM`]
 fn server_executable(pid: i32) -> Option<PathBuf> {
     let executable = fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .or_else(|| process_path_from_ps(pid))?;
     let is_t3 = executable.file_name().is_some_and(|name| name == "t3");
     (is_t3 && executable.is_file()).then_some(executable)
+}
+
+/// Launcher for the desktop app's bundled CLI, relative to the user's home
+///
+/// T3 Code `0.1.0` and later desktop apps write it and keep it off PATH so it
+/// never shadows another `t3`; `apps/desktop/src/app/DesktopCliShim.ts`
+const DESKTOP_CLI_SHIM: &str = ".t3/bin/t3";
+
+/// The desktop app's CLI launcher, when one is installed
+fn desktop_cli_shim(env: &T3Env) -> Option<PathBuf> {
+    let shim = env.home.join(DESKTOP_CLI_SHIM);
+    shim.is_file().then_some(shim)
 }
 
 /// macOS has no `/proc`; `ps -o comm=` prints the full executable path there
@@ -763,7 +777,7 @@ fn process_path_from_ps(pid: i32) -> Option<PathBuf> {
 
 impl T3Cli {
     fn resolve(env: &T3Env, server_pid: i32) -> Result<Self, String> {
-        let executable = match server_executable(server_pid) {
+        let executable = match server_executable(server_pid).or_else(|| desktop_cli_shim(env)) {
             Some(executable) => executable,
             None => {
                 let cwd = std::env::current_dir()
@@ -1065,7 +1079,8 @@ mod tests {
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
     use super::{
         ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome,
-        compact_thread, deterministic_id, load_runtime, owner, probe, wake_thread_checked,
+        compact_thread, deterministic_id, load_runtime, open_claude_threads, owner, probe,
+        wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1628,6 +1643,27 @@ mod tests {
         assert_eq!(payload["commandId"], second_rpc["payload"]["commandId"]);
         assert_eq!(payload["messageId"], second_rpc["payload"]["messageId"]);
         assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
+    }
+
+    #[test]
+    fn v2_finds_a_session_of_a_configured_provider_instance_by_its_driver() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(2), Vec::new());
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "V2 thread", false)
+            .instance("claude-work", "claudeAgent", SESSION_ID, T3_THREAD_ID);
+
+        assert_eq!(
+            owner(&fixture.env, claude_thread()).unwrap(),
+            Some(Protocol::V2)
+        );
+        let open = open_claude_threads(&fixture.env).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].t3_thread, T3_THREAD_ID);
     }
 
     #[test]
