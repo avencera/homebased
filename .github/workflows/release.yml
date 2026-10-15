@@ -24,11 +24,11 @@ env:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/create-gh-release-action@v1
 
   upload-assets:
@@ -42,15 +42,15 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version-file: web/.node-version
           cache: npm
@@ -98,11 +98,11 @@ jobs:
 
   upload-install-script:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Upload install.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
