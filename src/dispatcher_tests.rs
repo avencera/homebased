@@ -26,21 +26,6 @@ use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, wri
 
 const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
 
-fn t3_snapshot() -> serde_json::Value {
-    serde_json::json!({
-        "snapshotSequence": 9,
-        "thread": {
-            "id": T3_THREAD_ID,
-            "title": "Fake thread",
-            "runtimeMode": "full-access",
-            "interactionMode": "default",
-            "archivedAt": null,
-            "deletedAt": null
-        },
-        "page": {}
-    })
-}
-
 /// T3 user data with a runtime file and a fake `t3` CLI, but no state database
 fn configure_t3(route: &mut OriginRoute, origin: &str, pid: i32) -> PathBuf {
     let callback_home = PathBuf::from(&route.callback.env.home);
@@ -63,35 +48,9 @@ fn configure_t3(route: &mut OriginRoute, origin: &str, pid: i32) -> PathBuf {
 
 fn configure_t3_codex(route: &mut OriginRoute, origin: &str, pid: i32) -> PathBuf {
     let userdata = configure_t3(route, origin, pid);
-    let db = rusqlite::Connection::open(userdata.join("state.sqlite")).unwrap();
-    db.execute_batch(
-        "CREATE TABLE provider_session_runtime (
-            thread_id TEXT PRIMARY KEY,
-            provider_name TEXT,
-            last_seen_at TEXT,
-            resume_cursor_json TEXT
-         );
-         CREATE TABLE projection_threads (
-            thread_id TEXT PRIMARY KEY,
-            deleted_at TEXT
-         );",
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO projection_threads (thread_id) VALUES (?1)",
-        [T3_THREAD_ID],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO provider_session_runtime
-         (thread_id, provider_name, last_seen_at, resume_cursor_json)
-         VALUES (?1, 'codex', '2026-09-26T17:00:00Z', ?2)",
-        rusqlite::params![
-            T3_THREAD_ID,
-            serde_json::json!({"threadId": route.thread.to_string()}).to_string()
-        ],
-    )
-    .unwrap();
+    V2State::create(&userdata.join("statev2.sqlite"))
+        .thread(T3_THREAD_ID, "V2 thread", false)
+        .native("codex", &route.thread.to_string(), T3_THREAD_ID);
     PathBuf::from(&route.callback.env.home).join("commands")
 }
 
@@ -271,10 +230,12 @@ async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
     let (_dir, home, mut route) =
         fixture("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/commands\"\nexit 0\n");
     let server = FakeT3Server::start(
-        Some(1),
+        Some(2),
         vec![
-            FakeResponse::http(200, &t3_snapshot()),
-            FakeResponse::http(200, &serde_json::json!({ "sequence": 10 })),
+            FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" })),
+            FakeResponse::WebSocket(vec![rpc_exit(
+                serde_json::json!({ "_tag": "Success", "value": { "sequence": 10 } }),
+            )]),
         ],
     );
     let commands = configure_t3_codex(
@@ -325,8 +286,8 @@ async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
     );
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].path.starts_with("/api/orchestration/threads/"));
-    assert!(requests[1].body.contains("\"type\":\"thread.turn.start\""));
+    assert_eq!(requests[0].path, "/api/auth/websocket-ticket");
+    assert!(requests[1].body.contains("\"type\":\"message.dispatch\""));
     assert!(requests[1].body.contains(&route.task.to_string()));
     assert!(
         !call(&callback, |reply| CallbackMsg::InspectAlert {

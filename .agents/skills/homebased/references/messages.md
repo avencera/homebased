@@ -104,13 +104,11 @@ the source route to reply.
 The receiver delivers the line in one of three ways:
 
 - A live Claude Code session gets it as its next user turn through its
-  messaging socket. When a T3 Code thread on the V2 orchestrator owns the
-  session, T3 takes the message instead so the thread shows it, and the socket
-  is the fallback.
+  messaging socket. When a T3 Code thread owns the session, T3 takes the
+  message instead so the thread shows it, and the socket is the fallback.
 - A Claude Code session with no live process gets it as a new turn in the T3
-  Code thread that owns the session. T3 Code before V2 runs no Claude process
-  between turns, so this is the usual case for an idle T3 session there. If no
-  T3 thread owns the session, the send fails with `message_delivery_failed`.
+  Code thread that owns the session. If no T3 thread owns the session, the
+  send fails with `message_delivery_failed`.
 - A Codex thread that a T3 Code thread owns gets it as a new turn in that
   thread, so T3 shows it. If T3 cannot take it, or no T3 thread owns the Codex
   thread, it goes through `codex queue`.

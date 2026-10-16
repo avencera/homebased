@@ -28,8 +28,7 @@ use crate::domain::{TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 use crate::t3::{
-    Protocol, ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, owner,
-    wake_thread_checked,
+    ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, owner, wake_thread_checked,
 };
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -83,9 +82,9 @@ pub(crate) fn check_saved_callback(context: &CallbackContext) -> Result<(), Stri
 pub(crate) enum OriginSession {
     /// A live Claude session can take the event now
     Reachable(ReachableOrigin),
-    /// A live Claude session that a T3 orchestration V2 thread owns
+    /// A live Claude session that a T3 thread owns
     ///
-    /// V2 keeps the Claude process between turns, but shows a turn that a
+    /// T3 keeps the Claude process between turns, but shows a turn that a
     /// socket message starts as "Background task completed.", so T3 takes the
     /// event and the socket is the fallback
     T3Claude(ReachableOrigin),
@@ -124,8 +123,8 @@ pub(super) fn find_saved_origin(
         ClaudeSession::Live(inbox) => {
             let origin = ReachableOrigin(inbox);
             match owner(&t3_env(context), ProviderThread::Claude(thread)) {
-                Ok(Some(Protocol::V2)) => Ok(OriginSession::T3Claude(origin)),
-                Ok(Some(Protocol::V1) | None) => Ok(OriginSession::Reachable(origin)),
+                Ok(true) => Ok(OriginSession::T3Claude(origin)),
+                Ok(false) => Ok(OriginSession::Reachable(origin)),
                 Err(error) => {
                     warn!(%thread, "T3 ownership unknown, using the Claude session socket: {error}");
                     Ok(OriginSession::Reachable(origin))
@@ -151,9 +150,9 @@ pub(crate) fn find_saved_inbox_origin(
 ) -> Result<OriginSession, String> {
     match find_saved_origin(context, thread)? {
         OriginSession::Codex => match owner(&t3_env(context), ProviderThread::Codex(thread)) {
-            Ok(None) => Ok(OriginSession::Codex),
+            Ok(false) => Ok(OriginSession::Codex),
             // try T3 when its state database could not confirm ownership
-            Ok(Some(_)) | Err(_) => Ok(OriginSession::T3Codex),
+            Ok(true) | Err(_) => Ok(OriginSession::T3Codex),
         },
         origin => Ok(origin),
     }
@@ -332,9 +331,8 @@ pub(crate) fn retry_pending_t3(
 /// Make exactly one bounded direct-message delivery attempt
 ///
 /// A live Claude session takes the line through its socket inbox, or through
-/// T3 when a T3 V2 thread owns it. A stopped Claude session gets a new turn from
-/// the T3 thread that owns it, because a host such as T3 Code before V2 runs no
-/// Claude process between turns. A Codex thread takes it as a turn in the T3
+/// T3 when a T3 thread owns it. A stopped Claude session gets a new turn from
+/// the T3 thread that owns it. A Codex thread takes it as a turn in the T3
 /// thread that owns it, else through `codex queue`, so only that path needs the
 /// Codex executable. After a T3 send whose reply was lost, only T3 is tried
 pub(crate) fn send_saved_queue_attempt(
@@ -381,7 +379,7 @@ fn send_direct_message(
         OriginSession::Stopped => {
             wake_stopped_session(context, thread, line, log_path, pending, gate)
         }
-        // T3 V2 runs a `codex queue` message without showing it in the thread,
+        // T3 runs a `codex queue` message without showing it in the thread,
         // so a thread that T3 owns takes the message as a T3 turn
         OriginSession::T3Codex => {
             match wake_codex_thread(context, thread, line, log_path, pending, gate)? {

@@ -14,17 +14,18 @@
 //! authenticated HTTP route that dispatches commands or wakes a thread, use it
 //! and delete the WebSocket client
 //!
-//! - `statev2.sqlite` replaces `state.sqlite`, which V2 copies once at its first
-//!   start and never writes again. `orchestration_v2_projection_provider_threads`
+//! - `statev2.sqlite` replaces the previous orchestrator's `state.sqlite`, which
+//!   V2 copies once at its first start and never writes again.
+//!   `orchestration_v2_projection_provider_threads`
 //!   maps `driver` (`claudeAgent` or `codex`) and
 //!   `payload_json.$.nativeThreadRef.nativeId` (the Claude session or Codex
 //!   thread id) to `thread_id`; `orchestration_v2_projection_threads` has
 //!   `archived_at` and `deleted_at`. `provider` holds the provider instance id,
 //!   which equals the driver only for the default instance. `driver` is
 //!   nullable, so a lookup falls back to `provider`
-//! - Threads imported from V1 keep their ids but get no provider thread, so
-//!   their sessions resolve only through the copied V1 `provider_session_runtime`
-//!   table. A turn there starts a new provider session with a context handoff
+//! - Threads imported from the previous orchestrator keep their ids but get no
+//!   provider thread, so their sessions resolve only through the copied
+//!   `provider_session_runtime` table. A turn there starts a new provider session with a context handoff
 //! - `orchestration.dispatchCommand` takes `message.dispatch` and returns integer
 //!   `sequence`; a repeated `commandId` returns the first result without a second
 //!   turn. An unknown thread fails with `OrchestrationV2DispatchCommandError`
@@ -84,8 +85,8 @@ const REQUIRED_STATE_SQL: &str = "
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
     LIMIT 0";
 
-// threads imported from V1 have no provider thread and resolve only through
-// the copied V1 session table, as in `find_thread`
+// imported threads have no provider thread and resolve only through the copied
+// session table, as in `find_thread`
 // V2's settled state is unverified, so its threads all count as unsettled
 const OPEN_CLAUDE_THREADS_SQL: &str = "
     SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0

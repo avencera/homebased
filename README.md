@@ -159,14 +159,13 @@ Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `syst
 
 Homebased can wake stopped Claude sessions and T3-owned Codex threads through
 T3 Code's undocumented local API; if a Codex wake fails, it queues the event
-with `codex queue`. Homebased asks the running T3 server which orchestration
-protocol it speaks and uses the matching API, so it works with T3 releases
-before and after the V2 orchestrator. V2 keeps a Claude process between turns,
-so an event for a live Claude session that a V2 thread owns also goes through
-T3, which shows it in the thread; the session socket is the fallback. An
-archived T3 thread is unarchived first, so the turn runs and you can see it. A
-thread that T3 imported from its older orchestrator continues in a new provider
-session with the earlier context handed over.
+with `codex queue`. It needs T3 Code 0.1.0 or later; an older server fails
+`homebased t3 check` with a request to update T3 Code. T3 keeps a Claude
+process between turns, so an event for a live Claude session that a T3 thread
+owns also goes through T3, which shows it in the thread; the session socket is
+the fallback. An archived T3 thread is unarchived first, so the turn runs and
+you can see it. A thread that T3 imported from its older orchestrator continues
+in a new provider session with the earlier context handed over.
 
 Claude Code caches a conversation for an hour. After that, the next turn
 re-reads the whole context at full price, and every request in that turn
@@ -197,9 +196,8 @@ memory. If the compaction has not finished after 12 minutes, the event goes
 anyway. A direct message cannot wait, because its sender needs an answer, so
 it goes right after `/compact` and T3 holds it until the compaction finishes.
 
-Under the V2 orchestrator, from 54 idle minutes on, an event for such a session
-explicitly waits for the active run, because V2 refuses to steer into a running
-compaction.
+From 54 idle minutes on, an event for such a session explicitly waits for the
+active run, because T3 refuses to steer into a running compaction.
 
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`.
@@ -210,8 +208,8 @@ warm. It groups them as threads active in the last hour, threads settled in T3
 in the last hour, and active threads idle over an hour, which have a cold
 cache. A button reveals settled threads idle up to 48 hours; older settled
 threads are not listed. Its Compact button sends `/compact` to one thread. A
-second click in the same idle period is dropped. Under the V2 orchestrator,
-every thread counts as active.
+second click in the same idle period is dropped. Homebased does not read
+settled state from T3 Code 0.1.0, so every thread counts as active.
 
 Every compaction request, from the idle scan, a cold event, or the dashboard,
 is appended to `compactions.jsonl` in the homebased home directory. Each line
@@ -225,12 +223,10 @@ through another route. When delivery finally gives up, homebased writes the
 event to `callback-fallback.log` and sends a push notification.
 
 Run `homebased t3 check` after T3 updates to check that the local API still
-works. It reports the protocol it found. V2 support was verified against
-T3 Code 0.1.0, the first stable release with V2.
+works. It reports the orchestration protocol it found and was verified
+against T3 Code 0.1.0.
 
 A Claude session with a transcript but no live process is waiting, not gone.
-Some hosts, such as T3 Code before its V2 orchestrator, start a new `claude`
-process for each turn.
 Homebased keeps the event in the task inbox and watches
 `~/.claude/sessions/`. When a live process for that session id appears, it
 sends the event, keeping the task's events in order. `homebased task show`
@@ -571,7 +567,7 @@ the origin thread for a task with `--task <task-uuid>` alone. This is the
 origin thread, not the task worker. A send to its own source thread returns
 `message_to_self`; use `task followup` for a finished Codex worker. A Claude
 session with no live process gets the message as a new turn in the T3 Code
-thread that owns it, and so does a live session that a T3 V2 thread owns. A
+thread that owns it, and so does a live session that a T3 thread owns. A
 Codex thread that T3 owns also gets it as a T3 turn, and any other Codex thread
 gets it through `codex queue`. Pass the same
 `--message-id <uuid>` to retry after a lost response. Delivery is synchronous

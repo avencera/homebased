@@ -179,12 +179,12 @@ mod tests {
     use std::path::Path;
 
     use chrono::{TimeDelta, Utc};
-    use rusqlite::Connection;
     use serde_json::json;
     use uuid::Uuid;
 
     use super::large_threads;
     use crate::t3::T3Env;
+    use crate::t3::test_support::V2State;
 
     /// Claude transcript whose last request carried `tokens` `minutes_ago`
     fn transcript(home: &Path, session: &str, minutes_ago: i64, tokens: u64) {
@@ -203,38 +203,24 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let userdata = home.path().join(".t3/userdata");
         fs::create_dir_all(&userdata).unwrap();
-        let db = Connection::open(userdata.join("state.sqlite")).unwrap();
-        db.execute_batch(
-            "CREATE TABLE provider_session_runtime (
-                thread_id TEXT PRIMARY KEY, provider_name TEXT NOT NULL,
-                resume_cursor_json TEXT, last_seen_at TEXT NOT NULL);
-             CREATE TABLE projection_threads (
-                thread_id TEXT PRIMARY KEY, title TEXT NOT NULL,
-                archived_at TEXT, deleted_at TEXT, settled_override TEXT);",
-        )
-        .unwrap();
-        let add = |name: &str, provider: &str, override_: Option<&str>, tokens, minutes_ago| {
-            let archived = (override_ == Some("archived")).then_some("2026-10-01");
-            let settled = override_.filter(|value| *value != "archived");
+        let mut state = V2State::create(&userdata.join("statev2.sqlite"));
+        let mut sessions = Vec::new();
+        let threads = [
+            ("warm", "claudeAgent", false, 300_000, 10),
+            ("cold", "claudeAgent", false, 500_000, 120),
+            ("small", "claudeAgent", false, 50_000, 10),
+            ("archived", "claudeAgent", true, 400_000, 10),
+            ("codex", "codex", false, 400_000, 10),
+        ];
+        for (name, driver, archived, tokens, minutes_ago) in threads {
             let session = Uuid::now_v7().to_string();
-            db.execute(
-                "INSERT INTO projection_threads VALUES (?1, ?1, ?2, NULL, ?3)",
-                rusqlite::params![name, archived, settled],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO provider_session_runtime VALUES (?1, ?2, ?3, '2026-10-09')",
-                rusqlite::params![name, provider, json!({ "resume": session }).to_string()],
-            )
-            .unwrap();
+            state = state
+                .thread(name, name, archived)
+                .native(driver, &session, name);
             transcript(home.path(), &session, minutes_ago, tokens);
-            session
-        };
-        let warm = add("warm", "claudeAgent", Some("active"), 300_000, 10);
-        let cold = add("cold", "claudeAgent", Some("settled"), 500_000, 120);
-        add("small", "claudeAgent", None, 50_000, 10);
-        add("archived", "claudeAgent", Some("archived"), 400_000, 10);
-        add("codex", "codex", None, 400_000, 10);
+            sessions.push(session);
+        }
+        let (warm, cold) = (sessions[0].clone(), sessions[1].clone());
 
         let env = T3Env::new(home.path().to_path_buf(), "/bin".into());
         let threads = large_threads(&env, Utc::now()).unwrap();
@@ -245,14 +231,10 @@ mod tests {
                 (
                     thread.session.to_string(),
                     thread.title.as_str(),
-                    thread.settled,
                     thread.cache_warm,
                 )
             })
             .collect();
-        assert_eq!(
-            listed,
-            [(cold, "cold", true, false), (warm, "warm", false, true)]
-        );
+        assert_eq!(listed, [(cold, "cold", false), (warm, "warm", true)]);
     }
 }

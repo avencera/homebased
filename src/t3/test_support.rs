@@ -331,7 +331,8 @@ impl V2State {
         self
     }
 
-    /// The copied V1 session table that maps a thread imported from V1
+    /// The copied session table that maps a thread imported from the previous
+    /// orchestrator
     pub(crate) fn legacy(
         self,
         provider: &str,
