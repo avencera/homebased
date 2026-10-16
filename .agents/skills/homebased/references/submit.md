@@ -137,6 +137,7 @@ GitHub CI watcher as a normal task:
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
+| `hold` | no | `true` keeps a T3 Code Codex thread in T3's Working shelf while the task is pending. Same as `task submit --hold`. No effect elsewhere. See [t3.md](t3.md). |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
 Agent-only fields under `workload`:

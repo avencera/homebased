@@ -34,6 +34,7 @@
 //! commands with a deadline. The callback dispatcher must call this module from
 //! `spawn_blocking`
 
+mod hold;
 mod rpc;
 mod v2;
 
@@ -242,6 +243,8 @@ pub(crate) enum TurnStart {
     /// The message waits for the active run, which may be a compaction that
     /// T3 refuses to steer into
     AfterActive,
+    /// The message becomes a run that T3 never starts, which holds the thread
+    Defer,
 }
 
 /// Start a T3 turn for the thread that owns this provider session
@@ -274,6 +277,49 @@ pub(crate) fn wake_thread_checked(
 pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOutcome {
     with_owner(env, ProviderThread::Claude(thread), |owner| {
         v2::compact(owner.origin, owner.thread, key, owner.token, None)
+    })
+    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
+pub(crate) use hold::{HOLD_MARKER, ThreadActivity, ThreadView};
+
+/// Activity of the T3 thread that owns a Codex session
+///
+/// Reads the state database on disk, so the server need not run. `None` means
+/// no T3 thread owns the session
+pub(crate) fn hold_view(env: &T3Env, thread: ThreadId) -> Result<Option<ThreadView>, String> {
+    let userdata = env.userdata();
+    let Some(t3_thread) = find_thread(&userdata, ProviderThread::Codex(thread))? else {
+        return Ok(None);
+    };
+    hold::view(&state_path(&userdata), &t3_thread).map(Some)
+}
+
+/// Hold the idle T3 thread that owns a Codex session with a placeholder run
+///
+/// The thread is read again right before the dispatch, so one that started a
+/// run since the caller looked is refused instead of getting a queued message
+pub(crate) fn hold_thread(env: &T3Env, thread: ThreadId, text: &str) -> WakeOutcome {
+    with_owner(env, ProviderThread::Codex(thread), |owner| {
+        let view = hold::view(owner.state, owner.thread).map_err(ApiFailure::Unavailable)?;
+        if view.activity != ThreadActivity::Idle {
+            return Err(ApiFailure::Refused("thread is not idle".into()));
+        }
+        hold::start(owner.origin, owner.token, owner.thread, text, &view.key)
+    })
+    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
+/// End the placeholder run `run`, so a message queued behind it runs
+pub(crate) fn release_hold(env: &T3Env, thread: ThreadId, run: &str) -> WakeOutcome {
+    with_owner(env, ProviderThread::Codex(thread), |owner| {
+        hold::interrupt(
+            owner.origin,
+            owner.token,
+            owner.thread,
+            run,
+            "homebased hold ended",
+        )
     })
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
 }
@@ -917,14 +963,16 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
+    use super::test_support::{
+        FakeResponse, FakeT3Server, Fixture, SESSION_ID, T3_THREAD_ID, TOKEN, dispatched, live_pid,
+        rpc_exit, ticket,
+    };
     use super::{
         ProbeStatus, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome, compact_thread,
         deterministic_id, load_runtime, open_claude_threads, owner, probe, wake_thread_checked,
@@ -935,23 +983,6 @@ mod tests {
     fn wake_thread(env: &T3Env, provider_thread: ProviderThread, text: &str) -> WakeOutcome {
         wake_thread_checked(env, provider_thread, text, None, TurnStart::Auto)
             .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
-    }
-
-    const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
-    const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
-    const TOKEN: &str = "fake-secret-token";
-
-    fn ticket() -> FakeResponse {
-        FakeResponse::http(
-            200,
-            &json!({ "ticket": "fake-ticket", "expiresAt": "later" }),
-        )
-    }
-
-    fn dispatched() -> FakeResponse {
-        FakeResponse::WebSocket(vec![rpc_exit(
-            json!({ "_tag": "Success", "value": { "sequence": 47 } }),
-        )])
     }
 
     fn unknown_thread_error() -> FakeResponse {
@@ -982,74 +1013,6 @@ mod tests {
 
     fn codex_thread() -> ProviderThread {
         ProviderThread::Codex(thread_id())
-    }
-
-    struct Fixture {
-        dir: TempDir,
-        env: T3Env,
-        revoke_log: PathBuf,
-    }
-
-    impl Fixture {
-        /// User data whose state database maps the Claude session to a T3 thread
-        fn mapped(server: Option<&FakeT3Server>, pid: i32) -> Self {
-            let fixture = Self::empty(server, pid);
-            fixture
-                .v2_state()
-                .thread(T3_THREAD_ID, "Fake thread", false)
-                .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
-            fixture
-        }
-
-        /// User data with a runtime file and a fake `t3` CLI, but no state database
-        fn empty(server: Option<&FakeT3Server>, pid: i32) -> Self {
-            let dir = TempDir::new().unwrap();
-            let userdata = dir.path().join(".t3/userdata");
-            fs::create_dir_all(&userdata).unwrap();
-            let origin = server.map_or("http://127.0.0.1:1", |server| server.origin.as_str());
-            write_runtime(&userdata, origin, pid);
-
-            let bin = dir.path().join("bin");
-            fs::create_dir_all(&bin).unwrap();
-            let revoke_log = dir.path().join("revocations.log");
-            let script_path = bin.join("t3");
-            let script = format!(
-                "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'auth session issue') printf '%s\\n' '{{\"sessionId\":\"fake-session\",\"token\":\"{TOKEN}\",\"method\":\"bearer-access-token\",\"scopes\":[]}}' ;;\n  'auth session revoke') printf '%s\\n' \"$4\" >> {} ;;\n  *) if [ \"$1\" = '--version' ]; then printf '%s\\n' 't3 1.2.3'; else exit 3; fi ;;\nesac\n",
-                shell_quote(&revoke_log.to_string_lossy())
-            );
-            fs::write(&script_path, script).unwrap();
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-            Self {
-                env: T3Env::new(dir.path().to_path_buf(), bin.into_os_string()),
-                dir,
-                revoke_log,
-            }
-        }
-
-        fn userdata(&self) -> PathBuf {
-            self.dir.path().join(".t3/userdata")
-        }
-
-        fn v2_state(&self) -> V2State {
-            V2State::create(&self.userdata().join("statev2.sqlite"))
-        }
-
-        fn revocations(&self) -> Vec<String> {
-            fs::read_to_string(&self.revoke_log)
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        }
-    }
-
-    fn shell_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-
-    fn live_pid() -> i32 {
-        i32::try_from(std::process::id()).unwrap()
     }
 
     #[test]

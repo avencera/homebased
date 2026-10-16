@@ -27,6 +27,7 @@ use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 use super::Ctx;
 
 mod usage;
+mod wait;
 
 pub use usage::UsageGrouping;
 
@@ -48,6 +49,9 @@ pub enum TaskCommand {
         /// Let a Homebased worker send events to a thread other than its parent task's thread
         #[arg(long)]
         allow_other_thread: bool,
+        /// Keep a T3 Code Codex thread in T3's Working shelf while the task, or the chain of runs it parks, is pending. Ignored for any other thread
+        #[arg(long)]
+        hold: bool,
     },
     /// Resume a finished Codex worker with more information.
     Followup {
@@ -115,6 +119,20 @@ pub enum TaskCommand {
         #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
         by: UsageGrouping,
     },
+    /// Print each callback event of tasks as it arrives, until all of them end.
+    ///
+    /// Arm this with Claude Code's Monitor tool in a T3 Code thread. Events of
+    /// these tasks then reach the agent through this command's stdout instead of a
+    /// new turn, and T3 shows the thread as waiting while it runs. Follows waiting
+    /// chains and rides out a daemon restart.
+    Wait {
+        /// Full task UUIDs, 1 to 16 of them.
+        #[arg(required = true, num_args = 1..)]
+        tasks: Vec<TaskId>,
+        /// Thread that submitted the tasks. Defaults to the session environment.
+        #[arg(long)]
+        thread: Option<ThreadId>,
+    },
     /// Cancel a task. Idempotent if already terminal.
     Cancel {
         /// Full task UUID.
@@ -164,7 +182,8 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             dry_run,
             request_id,
             allow_other_thread,
-        } => submit(ctx, &spec, dry_run, request_id, allow_other_thread).await,
+            hold,
+        } => submit(ctx, &spec, dry_run, request_id, allow_other_thread, hold).await,
         TaskCommand::Followup {
             task,
             message,
@@ -195,6 +214,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::Show { id } => show(ctx, id).await,
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
+        TaskCommand::Wait { tasks, thread } => wait::wait(ctx, tasks, thread).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,
@@ -223,20 +243,23 @@ async fn submit(
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
     allow_other_thread: bool,
+    hold: bool,
 ) -> Result<ExitCode, AppError> {
     let spec = load_spec(spec_path)?;
     let normalized = spec::normalize(&spec)?;
     let submission = Submission {
         spec: normalized,
         after: spec.after,
+        hold: hold || spec.hold,
     };
     submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
 }
 
-/// One submit request: the normalized spec and the origin-only dependencies beside it
+/// One submit request: the normalized spec and the origin-only fields beside it
 struct Submission {
     spec: crate::spec::NormalizedSpec,
     after: Option<TaskDependencies>,
+    hold: bool,
 }
 
 async fn submit_normalized(
@@ -249,6 +272,7 @@ async fn submit_normalized(
     let Submission {
         spec: normalized,
         after,
+        hold,
     } = submission;
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
@@ -266,6 +290,9 @@ async fn submit_normalized(
     });
     if let Some(after) = after {
         body["after"] = json!(after);
+    }
+    if hold {
+        body["hold"] = json!(true);
     }
 
     let client = Client::new(ctx.home.sock_path());
@@ -391,6 +418,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
     let submission = Submission {
         spec: spec::normalize(&parsed)?,
         after: None,
+        hold: false,
     };
     submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
 }

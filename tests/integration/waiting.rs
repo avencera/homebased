@@ -12,7 +12,7 @@ use std::time::Duration;
 
 impl Harness {
     /// A task that waits until `gate` exists under the record directory, then exits with `code`
-    fn gated_target(&self, gate: &str, code: i32) -> Value {
+    pub(super) fn gated_target(&self, gate: &str, code: i32) -> Value {
         let gate = self.record.join(gate);
         Self::task_spec(&[
             "/bin/sh",
@@ -24,7 +24,7 @@ impl Harness {
         ])
     }
 
-    fn release_gate(&self, gate: &str) {
+    pub(super) fn release_gate(&self, gate: &str) {
         fs::write(self.record.join(gate), "").unwrap();
     }
 

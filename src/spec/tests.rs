@@ -336,6 +336,7 @@ fn relative_prompt_file_resolves_against_cwd() {
         cwd: dir.path().to_path_buf(),
         timeout: default_timeout(),
         after: None,
+        hold: false,
         workload: SubmitWorkloadValidated::Agent(SubmitAgent {
             agent: AgentKind::Claude,
             model: None,
@@ -782,4 +783,16 @@ fn bugfix_missing_task_command_has_its_own_pointer() {
             matches!(result, Err(AppError::InvalidSpec { pointer, value, .. }) if pointer == "/workload/command" && value.is_null())
         );
     }
+}
+
+#[test]
+fn hold_is_off_unless_the_spec_asks_for_it() {
+    assert!(!parse_spec_value(&example_agent_json()).unwrap().hold);
+
+    let mut held = example_agent_json();
+    held["hold"] = json!(true);
+    assert!(parse_spec_value(&held).unwrap().hold);
+
+    held["hold"] = json!("yes");
+    assert!(parse_spec_value(&held).is_err());
 }

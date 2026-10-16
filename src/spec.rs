@@ -131,6 +131,10 @@ struct SubmitSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "after_schema")]
     after: Option<Value>,
+    /// Keep the submitting T3 Code Codex thread in T3's Working shelf while this
+    /// task, or the chain of runs it parks, is pending. Ignored for any other thread
+    #[serde(default)]
+    hold: bool,
     /// Workload variant. Parsed from `Value` after the envelope so nested
     /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
@@ -325,6 +329,10 @@ pub struct SubmitSpec {
     /// Origin-only: it travels beside the normalized spec, never inside it, so
     /// an executor cannot receive it
     pub after: Option<TaskDependencies>,
+    /// Keep the submitting T3 Codex thread in T3's Working shelf while the task is pending
+    ///
+    /// Origin-only, like `after`: it travels beside the normalized spec
+    pub hold: bool,
     /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
@@ -597,6 +605,7 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         machine: wire.machine,
         timeout: wire.timeout,
         after,
+        hold: wire.hold,
         workload,
     })
 }

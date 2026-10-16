@@ -66,6 +66,14 @@ homebased --json task log <id>       # {"id", "log", "truncated"}
 
 The local daemon reads `output.log` on the execution machine. For a remote task, it gets the log from the executor over Fleet. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines and reads at most 1 MiB of log bytes. A longer line can return only its end. `truncated` is true when earlier lines or bytes were dropped. If the executor is offline or the log has been removed, the CLI returns `task_unavailable`. A task prevented before it started has no log and returns `task_not_started`.
 
+## Wait
+
+```bash
+homebased task wait <id> [<id> ...]    # 1-16 ids, no duplicates
+```
+
+Streams one `HOMEBASED_EVENT {...}` line per callback event of tasks this session submitted, follows `TASK_WAITING` to the continuation run, and exits 0 when every task has its final outcome. It takes those events in place of normal delivery while it runs, and an event it did not print goes through normal delivery after about 5 seconds. It reconnects silently across a daemon restart for up to 5 minutes. A task of another thread or machine, or a queue run, returns `wait_unavailable`, an unknown id returns `task_not_found`, and a malformed id list is a usage error. It is meant for the `Monitor` tool of a Claude Code session in a T3 Code thread; [t3.md](t3.md) has the full contract.
+
 ## Usage
 
 Claude workers run without session persistence, so their tokens never reach `~/.claude/projects`. Homebased reads Claude Code's own accounting from each finished Claude worker's `output.log` and keeps it per task.

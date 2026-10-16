@@ -21,9 +21,11 @@ pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
 pub mod queue_api;
+mod t3_hold;
 mod t3_watch;
 mod thread_titles;
 pub mod usage_api;
+mod wait_api;
 pub mod web;
 
 use std::fs::File;
@@ -38,7 +40,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::daemon::actors::{StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, call};
+use crate::daemon::actors::{
+    StoreMsg, SupervisorActor, SupervisorArgs, SupervisorMsg, WaiterRegistry, call,
+};
 use crate::daemon::keyed_locks::KeyedLocks;
 use crate::daemon::web::WebListen;
 use crate::domain::TaskId;
@@ -80,6 +84,10 @@ pub struct AppState {
     pub(crate) locks: DaemonLocks,
     /// Agent stores that name the threads on this machine, when `HOME` is known
     pub thread_titles: Option<TitleSources>,
+    /// Connected `task wait` streams, shared with the callback actor
+    pub(crate) waiters: WaiterRegistry,
+    /// Flips to `true` when the daemon starts shutting down; open streams end then
+    pub(crate) shutdown: watch::Receiver<bool>,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -142,6 +150,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
             message: format!("spawn supervisor: {err}"),
         })?;
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply }).await?;
+    let waiters = call(&supervisor, |reply| SupervisorMsg::GetWaiters { reply }).await?;
     let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
     let fleet = fleet_runtime
         .as_ref()
@@ -149,6 +158,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
             FleetState::Enabled(runtime.handle())
         });
     compaction_log::set_default(home.compaction_log_path());
+    // listeners and open `task wait` streams share one shutdown
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = AppState {
         home: home.clone(),
         store,
@@ -161,6 +172,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         message_receiver: message_receiver::MessageReceiver::default(),
         locks: DaemonLocks::default(),
         thread_titles: TitleSources::from_env(),
+        waiters,
+        shutdown: shutdown_rx.clone(),
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),
@@ -174,6 +187,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
+    let t3_holder = tokio::spawn(t3_hold::run(state.clone()));
     // a blocking task cannot be aborted, so shutdown sets this flag instead
     let usage_backfill_stop = Arc::new(AtomicBool::new(false));
     tokio::task::spawn_blocking({
@@ -185,8 +199,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
             Err(err) => warn!("backfill task usage: {err}"),
         }
     });
-    // listeners share one shutdown: the signal task flips the flag once
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // the signal task flips the flag once
     tokio::spawn(async move {
         shutdown_signal().await;
         // a send error means both servers already stopped
@@ -228,6 +241,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     cancellation.abort();
     t3_watcher.abort();
     idle_compactor.abort();
+    t3_holder.abort();
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {
         supervisor.stop(None);

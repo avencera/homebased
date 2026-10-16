@@ -2232,6 +2232,9 @@ async fn notice_ends_during_callback_preparation() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: crate::daemon::actors::WaiterRegistry::spawn(None)
+                .await
+                .unwrap(),
         },
     )
     .await

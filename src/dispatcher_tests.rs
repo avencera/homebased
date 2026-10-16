@@ -11,6 +11,7 @@ use ractor::Actor;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::daemon::actors::WaiterRegistry;
 use crate::daemon::actors::callback::{
     CallbackActor, CallbackArgs, CallbackMsg, WakeFailure, dispatch_inbox,
 };
@@ -146,6 +147,10 @@ fn event(route: &OriginRoute, seq: u64, callback: bool) -> TaskEvent {
 }
 
 async fn dispatch(home: &Home, id: TaskId) {
+    dispatch_with(home, id, WaiterRegistry::spawn(None).await.unwrap()).await;
+}
+
+async fn dispatch_with(home: &Home, id: TaskId, waiters: WaiterRegistry) {
     let (store, handle) = StoreActor::spawn(None, StoreActor, home.db_path())
         .await
         .unwrap();
@@ -158,11 +163,12 @@ async fn dispatch(home: &Home, id: TaskId) {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: waiters.clone(),
         },
     )
     .await
     .unwrap();
-    dispatch_inbox(store.clone(), home.clone(), id, callback.clone())
+    dispatch_inbox(store.clone(), home.clone(), id, callback.clone(), waiters)
         .await
         .unwrap();
     callback.stop(None);
@@ -262,14 +268,21 @@ async fn t3_owned_codex_callback_uses_t3_without_codex_queue() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
     .unwrap();
     assert!(
-        dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
-            .await
-            .unwrap()
+        dispatch_inbox(
+            store.clone(),
+            home.clone(),
+            route.task,
+            callback.clone(),
+            WaiterRegistry::spawn(None).await.unwrap()
+        )
+        .await
+        .unwrap()
     );
 
     assert!(!commands.exists());
@@ -500,6 +513,7 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -512,16 +526,28 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
             .delivery
             .clone()
     };
-    let mut completed = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
-        .await
-        .unwrap();
+    let mut completed = dispatch_inbox(
+        store.clone(),
+        home.clone(),
+        route.task,
+        callback.clone(),
+        WaiterRegistry::spawn(None).await.unwrap(),
+    )
+    .await
+    .unwrap();
     let first_delivery = delivery_state();
     let first_pending = pending_path.exists();
     if thread.compaction_finishes {
         finish_compaction(&route);
-        completed = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
-            .await
-            .unwrap();
+        completed = dispatch_inbox(
+            store.clone(),
+            home.clone(),
+            route.task,
+            callback.clone(),
+            WaiterRegistry::spawn(None).await.unwrap(),
+        )
+        .await
+        .unwrap();
     }
     let delivery = delivery_state();
     let pending = pending_path.exists();
@@ -846,14 +872,21 @@ async fn unavailable_t3_codex_wake_falls_back_and_marks_delivery() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
     .unwrap();
     assert!(
-        dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
-            .await
-            .unwrap()
+        dispatch_inbox(
+            store.clone(),
+            home.clone(),
+            route.task,
+            callback.clone(),
+            WaiterRegistry::spawn(None).await.unwrap()
+        )
+        .await
+        .unwrap()
     );
 
     assert_eq!(lines(&commands).len(), 1);
@@ -1036,6 +1069,7 @@ async fn duplicate_wakes_share_one_in_flight_dispatcher() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1087,6 +1121,7 @@ async fn push_only_after_failed_wake_until_delivery() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1174,6 +1209,7 @@ async fn stopped_claude_session_waits_and_retry_delivers_to_live_socket() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1314,6 +1350,7 @@ async fn throttled_wake_check_waits_without_a_push() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1325,9 +1362,15 @@ async fn throttled_wake_check_waits_without_a_push() {
             .unwrap()
     );
 
-    let drained = dispatch_inbox(store.clone(), home.clone(), route.task, callback.clone())
-        .await
-        .unwrap();
+    let drained = dispatch_inbox(
+        store.clone(),
+        home.clone(),
+        route.task,
+        callback.clone(),
+        WaiterRegistry::spawn(None).await.unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert!(!drained);
     let entry = call(&store, |reply| StoreMsg::EarliestInbox {
@@ -1431,6 +1474,7 @@ async fn callback_actor_survives_an_unavailable_store() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1531,6 +1575,7 @@ async fn new_claude_process_receives_each_waiting_event_exactly_once() {
             notifier: None,
             machine_name: "test".into(),
             claude_sessions: Some(sessions.clone()),
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
         },
     )
     .await
@@ -1636,4 +1681,100 @@ async fn new_claude_process_receives_each_waiting_event_exactly_once() {
     callback_handle.await.unwrap();
     store.stop(None);
     store_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn waiter_takes_pending_events_in_order_instead_of_normal_delivery() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nprintf 'delivered\\n' >> \"$HOME/commands\"\n");
+    let mut store = Store::open(&home.db_path()).unwrap();
+    store.insert_origin_route(&route).unwrap();
+    for (seq, callback) in [(1, true), (2, false), (3, true)] {
+        store
+            .accept_inbound_event(&event(&route, seq, callback))
+            .unwrap();
+    }
+    drop(store);
+    let waiters = WaiterRegistry::spawn(None).await.unwrap();
+    let (session, mut events) = waiters.open(route.thread).await.unwrap();
+    session.watch(route.task);
+    let reader = tokio::spawn({
+        let (waiters, waiter) = (waiters.clone(), session.id());
+        async move {
+            let mut seqs = Vec::new();
+            while seqs.len() < 2 {
+                let event = events.recv().await.unwrap();
+                seqs.push(event.seq);
+                waiters.confirm(waiter, event.task, event.seq);
+            }
+            seqs
+        }
+    });
+
+    dispatch_with(&home, route.task, waiters).await;
+
+    assert_eq!(reader.await.unwrap(), [1, 3]);
+    assert!(
+        !PathBuf::from(&route.callback.env.home)
+            .join("commands")
+            .exists(),
+        "normal delivery must not also run"
+    );
+    let settled: Vec<_> = Store::open(&home.db_path())
+        .unwrap()
+        .inbound_events(route.task)
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| match row.delivery {
+            DeliveryState::Delivered { attempts, .. } => Some((row.event.seq.get(), attempts)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(settled, [(1, 1), (3, 1)]);
+}
+
+#[tokio::test]
+async fn event_falls_back_to_normal_delivery_when_its_waiter_is_gone() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nprintf 'delivered\\n' >> \"$HOME/commands\"\n");
+    let mut store = Store::open(&home.db_path()).unwrap();
+    store.insert_origin_route(&route).unwrap();
+    store.accept_inbound_event(&event(&route, 1, true)).unwrap();
+    drop(store);
+    let waiters = WaiterRegistry::spawn(None).await.unwrap();
+    let (session, events) = waiters.open(route.thread).await.unwrap();
+    session.watch(route.task);
+    drop(events);
+
+    dispatch_with(&home, route.task, waiters).await;
+
+    assert_eq!(
+        lines(&PathBuf::from(&route.callback.env.home).join("commands")).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn event_goes_to_the_most_recently_registered_waiter() {
+    let (_dir, home, route) = fixture("#!/bin/sh\nprintf 'delivered\\n' >> \"$HOME/commands\"\n");
+    let mut store = Store::open(&home.db_path()).unwrap();
+    store.insert_origin_route(&route).unwrap();
+    store.accept_inbound_event(&event(&route, 1, true)).unwrap();
+    drop(store);
+    let waiters = WaiterRegistry::spawn(None).await.unwrap();
+    let (older, mut older_events) = waiters.open(route.thread).await.unwrap();
+    older.watch(route.task);
+    let (newer, mut newer_events) = waiters.open(route.thread).await.unwrap();
+    newer.watch(route.task);
+    let reader = tokio::spawn({
+        let (waiters, waiter) = (waiters.clone(), newer.id());
+        async move {
+            let event = newer_events.recv().await.unwrap();
+            waiters.confirm(waiter, event.task, event.seq);
+            event.seq
+        }
+    });
+
+    dispatch_with(&home, route.task, waiters).await;
+
+    assert_eq!(reader.await.unwrap(), 1);
+    assert!(older_events.try_recv().is_err());
 }

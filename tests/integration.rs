@@ -659,6 +659,8 @@ mod service;
 mod source_rules;
 #[path = "integration/submission.rs"]
 mod submission;
+#[path = "integration/task_wait.rs"]
+mod task_wait;
 #[path = "integration/waiting.rs"]
 mod waiting;
 #[path = "support/worker_cleanup.rs"]

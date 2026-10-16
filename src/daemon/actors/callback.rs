@@ -15,7 +15,7 @@ use crate::callback::{
     append_fallback, check_saved_callback, find_saved_inbox_origin, retry_pending_t3,
     send_codex_queue_attempt, send_t3_claude, wake_codex_thread, wake_stopped_session,
 };
-use crate::daemon::actors::{StoreMsg, call, send_reply};
+use crate::daemon::actors::{StoreMsg, WaiterRegistry, call, send_reply};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
@@ -111,6 +111,8 @@ pub struct CallbackArgs {
     /// A new or changed entry retries waiting events at once instead of at the
     /// next periodic scan
     pub claude_sessions: Option<PathBuf>,
+    /// Connected `task wait` streams that take events in place of normal delivery
+    pub waiters: WaiterRegistry,
 }
 
 /// Holds store ref, home, and retry state
@@ -122,6 +124,7 @@ pub struct CallbackState {
     wake_times: HashMap<ThreadId, Instant>,
     alerted_threads: HashSet<ThreadId>,
     active_inbox: HashSet<TaskId>,
+    waiters: WaiterRegistry,
     registry_watch: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -233,6 +236,7 @@ impl Actor for CallbackActor {
             wake_times: HashMap::new(),
             alerted_threads: HashSet::new(),
             active_inbox: HashSet::new(),
+            waiters: args.waiters,
             registry_watch,
         })
     }
@@ -366,9 +370,10 @@ async fn start_inbox_worker(myself: &ActorRef<CallbackMsg>, state: &mut Callback
     state.active_inbox.insert(id);
     let store = state.store.clone();
     let home = state.home.clone();
+    let waiters = state.waiters.clone();
     let myself = myself.clone();
     tokio::spawn(async move {
-        let completed = match dispatch_inbox(store, home, id, myself.clone()).await {
+        let completed = match dispatch_inbox(store, home, id, myself.clone(), waiters).await {
             Ok(completed) => completed,
             Err(error) => {
                 warn!(%id, "origin inbox dispatch: {error}");
@@ -427,6 +432,7 @@ pub(crate) async fn dispatch_inbox(
     home: Home,
     id: TaskId,
     callback: ActorRef<CallbackMsg>,
+    waiters: WaiterRegistry,
 ) -> Result<bool, AppError> {
     loop {
         let Some(entry) = call(&store, |reply| StoreMsg::EarliestInbox { id, reply }).await? else {
@@ -472,20 +478,27 @@ pub(crate) async fn dispatch_inbox(
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
-            let paths = home.task_paths(id);
-            let pending = PendingT3Send::new(paths.dir.join(format!("t3-pending-{}", seq.get())));
-            let attempt = OriginAttempt {
-                context: route.callback.clone(),
-                thread: route.thread,
-                line,
-                paths: CallbackPaths {
-                    callback_log: paths.callback_log,
-                    delivery_lock: paths.delivery_lock,
-                },
-                pending,
-                before_send: None,
-            };
-            attempt.run(&callback).await?
+            // a connected `task wait` stream prints the line for the agent that
+            // armed it; waking the thread as well would wake the agent twice
+            if waiters.hand_off(route.thread, &entry.event, &line).await {
+                AttemptOutcome::Settle(DeliveryOutcome::Delivered)
+            } else {
+                let paths = home.task_paths(id);
+                let pending =
+                    PendingT3Send::new(paths.dir.join(format!("t3-pending-{}", seq.get())));
+                let attempt = OriginAttempt {
+                    context: route.callback.clone(),
+                    thread: route.thread,
+                    line,
+                    paths: CallbackPaths {
+                        callback_log: paths.callback_log,
+                        delivery_lock: paths.delivery_lock,
+                    },
+                    pending,
+                    before_send: None,
+                };
+                attempt.run(&callback).await?
+            }
         };
         let (outcome, failed_wake) =
             outcome

@@ -204,6 +204,7 @@ async fn hold(
         request,
         callback_cwd,
         after: _,
+        hold: _,
     } = body;
     let (execution_machine, callback) = match &spec.machine {
         Some(name) => (

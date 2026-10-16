@@ -74,6 +74,14 @@ pub enum AppError {
         /// Why this task cannot be resumed
         reason: FollowupBlocker,
     },
+    /// A task's events cannot be streamed to this waiter
+    #[error("cannot wait on task {task}: {reason}")]
+    WaitUnavailable {
+        /// Task named by `task wait`
+        task: TaskId,
+        /// Why this waiter cannot take its events
+        reason: WaitBlocker,
+    },
     /// A task's worker cannot take a direct message
     #[error("the worker for task {task} cannot take a message: {reason}")]
     WorkerMessageUnavailable {
@@ -494,6 +502,27 @@ pub enum FollowupBlocker {
     NoWorkerThread,
 }
 
+/// Why `task wait` cannot take a task's events
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitBlocker {
+    /// The task reports to another thread
+    #[error("the task reports to another thread")]
+    NotOwner,
+    /// The task reports to another machine
+    #[error(
+        "the task reports to another machine, and only tasks that report here can be waited on"
+    )]
+    Remote,
+    /// The task has no callback route, as a GPU queue run has none
+    #[error(
+        "the task has no callback route; a GPU queue run reports through the events of its job"
+    )]
+    NoCallbackRoute,
+}
+
 /// Why a task's worker cannot take a direct message
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
@@ -523,6 +552,7 @@ impl AppError {
             Self::TaskUnavailable { .. } => "task_unavailable",
             Self::TaskNotStarted { .. } => "task_not_started",
             Self::FollowupUnavailable { .. } => "followup_unavailable",
+            Self::WaitUnavailable { .. } => "wait_unavailable",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
@@ -623,6 +653,7 @@ impl AppError {
             | Self::TaskTerminal { .. }
             | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
+            | Self::WaitUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
@@ -678,6 +709,7 @@ impl AppError {
             | Self::TaskTerminal { .. }
             | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
+            | Self::WaitUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
@@ -739,6 +771,9 @@ impl AppError {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
             Self::FollowupUnavailable { task, reason } => {
+                json!({ "task": task, "reason": reason })
+            }
+            Self::WaitUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }
             Self::WorkerMessageUnavailable { task, reason } => {

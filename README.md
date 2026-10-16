@@ -234,6 +234,30 @@ lists each waiting event with its reason and the time delivery gives up.
 After 3 days the event is marked failed and is written to
 `callback-fallback.log`.
 
+### Wait for tasks in a T3 thread
+
+```sh
+homebased task wait <id> [<id> ...]
+```
+
+`task wait` streams the `HOMEBASED_EVENT` line of each callback event for 1 to
+16 of this thread's tasks to stdout and exits 0 once every task has its final
+outcome, following `TASK_WAITING` to the continuation run. While it runs, the
+daemon gives those events to it in place of normal delivery. It counts an
+event delivered only once the command confirms it printed the line, so an
+event the command never confirmed goes through normal delivery after about 5
+seconds, possibly as a repeat. It reconnects silently across a daemon restart
+for up to 5 minutes. It is meant for a Claude Code `Monitor` in a T3 Code
+thread, which T3 shows as Waiting. A task of another thread or machine returns
+`wait_unavailable`, and so does a queue run, which has no callback route.
+
+A Codex thread cannot run a `Monitor`. Submit with `--hold` (or `"hold": true`
+in the spec) from a T3 Code Codex thread, and the daemon keeps the thread in
+T3's Working shelf while the task is pending. It adds a placeholder message
+that T3 never starts once the thread is idle, and interrupts it to deliver
+each event as a normal turn or to let a message the user sent run. The flag
+does nothing for other threads.
+
 ### Fleet
 
 Fleet is off by default. Add this config to each machine that should join the

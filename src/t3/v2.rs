@@ -43,6 +43,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::hold;
 use super::rpc::{self, Exit};
 use super::{
     ApiFailure, COMPACT_COMMAND, ClaudeThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
@@ -180,6 +181,12 @@ pub(super) fn start_turn(
         let _ = rpc::call(origin, token, DISPATCH_METHOD, &unarchive, RPC_TIMEOUT);
     }
 
+    // a thread held by homebased only runs this turn once the hold ends, so
+    // queue it behind the hold and end the hold; any doubt keeps the plain path
+    if let Some(run) = hold::active_hold(state, thread_id) {
+        return hold::deliver_through(origin, token, thread_id, &run, text, before_send);
+    }
+
     let command_id = deterministic_id("homebased-t3-command", thread_id, text);
     let message_id = deterministic_id("homebased-t3-message", thread_id, text);
     let payload = dispatch_payload(thread_id, &command_id, &message_id, text, start);
@@ -210,7 +217,7 @@ pub(super) fn compact(
     dispatch(origin, token, &payload, before_send)
 }
 
-fn dispatch(
+pub(super) fn dispatch(
     origin: &str,
     token: &str,
     payload: &Value,
@@ -235,7 +242,7 @@ fn dispatch(
     }
 }
 
-fn is_archived(state: &Path, thread_id: &str) -> bool {
+pub(super) fn is_archived(state: &Path, thread_id: &str) -> bool {
     state_connection(state)
         .ok()
         .and_then(|db| {
@@ -283,7 +290,7 @@ pub(super) fn probe_api(origin: &str, token: &str, checks: &mut Vec<ProbeCheck>)
 }
 
 // matches what the T3 web client sends for a user message
-fn dispatch_payload(
+pub(super) fn dispatch_payload(
     thread_id: &str,
     command_id: &str,
     message_id: &str,
@@ -310,6 +317,10 @@ fn dispatch_payload(
         }
         TurnStart::AfterActive => {
             payload["dispatchMode"] = json!({ "type": "queue_after_active" });
+        }
+        // a run that T3 creates but never starts, so the thread stays working
+        TurnStart::Defer => {
+            payload["dispatchMode"] = json!({ "type": "defer_start" });
         }
     }
     payload

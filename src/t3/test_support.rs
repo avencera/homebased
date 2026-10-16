@@ -1,8 +1,10 @@
 //! Fake T3 server and state databases for tests
 
+use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -10,7 +12,10 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tungstenite::Message;
+
+use super::T3Env;
 
 /// One canned reply, used in order; the environment descriptor is answered
 /// separately and never consumes a reply
@@ -281,6 +286,22 @@ impl V2State {
                 updated_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 driver TEXT
+             );
+             CREATE TABLE orchestration_v2_projection_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'codex',
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+                payload_json TEXT NOT NULL
+             );
+             CREATE TABLE orchestration_v2_projection_messages (
+                message_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+                payload_json TEXT NOT NULL
              );",
         )
         .unwrap();
@@ -294,6 +315,33 @@ impl V2State {
                 "INSERT INTO orchestration_v2_projection_threads (thread_id, title, archived_at)
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![thread_id, title, archived_at],
+            )
+            .unwrap();
+        self
+    }
+
+    /// Run `ordinal` of `thread_id` in `status`, started by the user message `text`
+    pub(crate) fn run(self, thread_id: &str, ordinal: i64, status: &str, text: &str) -> Self {
+        let message_id = format!("message-{thread_id}-{ordinal}");
+        self.0
+            .execute(
+                "INSERT INTO orchestration_v2_projection_messages (message_id, thread_id, payload_json)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![message_id, thread_id, json!({ "text": text }).to_string()],
+            )
+            .unwrap();
+        self.0
+            .execute(
+                "INSERT INTO orchestration_v2_projection_runs
+                 (run_id, thread_id, ordinal, status, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("run-{thread_id}-{ordinal}"),
+                    thread_id,
+                    ordinal,
+                    status,
+                    json!({ "userMessageId": message_id }).to_string()
+                ],
             )
             .unwrap();
         self
@@ -364,4 +412,90 @@ impl V2State {
             .unwrap();
         self
     }
+}
+
+pub(crate) const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
+pub(crate) const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
+pub(crate) const TOKEN: &str = "fake-secret-token";
+
+pub(crate) fn ticket() -> FakeResponse {
+    FakeResponse::http(
+        200,
+        &json!({ "ticket": "fake-ticket", "expiresAt": "later" }),
+    )
+}
+
+pub(crate) fn dispatched() -> FakeResponse {
+    FakeResponse::WebSocket(vec![rpc_exit(
+        json!({ "_tag": "Success", "value": { "sequence": 47 } }),
+    )])
+}
+
+/// User data, a runtime file and a fake `t3` CLI in a temporary home
+pub(crate) struct Fixture {
+    pub(crate) dir: TempDir,
+    pub(crate) env: T3Env,
+    revoke_log: PathBuf,
+}
+
+impl Fixture {
+    /// User data whose state database maps the Claude session to a T3 thread
+    pub(crate) fn mapped(server: Option<&FakeT3Server>, pid: i32) -> Self {
+        let fixture = Self::empty(server, pid);
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Fake thread", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+        fixture
+    }
+
+    /// User data with a runtime file and a fake `t3` CLI, but no state database
+    pub(crate) fn empty(server: Option<&FakeT3Server>, pid: i32) -> Self {
+        let dir = TempDir::new().unwrap();
+        let userdata = dir.path().join(".t3/userdata");
+        fs::create_dir_all(&userdata).unwrap();
+        let origin = server.map_or("http://127.0.0.1:1", |server| server.origin.as_str());
+        write_runtime(&userdata, origin, pid);
+
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let revoke_log = dir.path().join("revocations.log");
+        let script_path = bin.join("t3");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'auth session issue') printf '%s\\n' '{{\"sessionId\":\"fake-session\",\"token\":\"{TOKEN}\",\"method\":\"bearer-access-token\",\"scopes\":[]}}' ;;\n  'auth session revoke') printf '%s\\n' \"$4\" >> {} ;;\n  *) if [ \"$1\" = '--version' ]; then printf '%s\\n' 't3 1.2.3'; else exit 3; fi ;;\nesac\n",
+            shell_quote(&revoke_log.to_string_lossy())
+        );
+        fs::write(&script_path, script).unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        Self {
+            env: T3Env::new(dir.path().to_path_buf(), bin.into_os_string()),
+            dir,
+            revoke_log,
+        }
+    }
+
+    pub(crate) fn userdata(&self) -> PathBuf {
+        self.dir.path().join(".t3/userdata")
+    }
+
+    pub(crate) fn v2_state(&self) -> V2State {
+        V2State::create(&self.userdata().join("statev2.sqlite"))
+    }
+
+    pub(crate) fn revocations(&self) -> Vec<String> {
+        fs::read_to_string(&self.revoke_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn live_pid() -> i32 {
+    i32::try_from(std::process::id()).unwrap()
 }

@@ -23,6 +23,7 @@ mod message;
 mod presentation;
 pub mod queue;
 mod schema;
+mod t3_hold;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -35,6 +36,7 @@ pub(crate) use events::EventRetentionBatch;
 pub use identity::IdentityError;
 pub use lifecycle::CancelResult;
 pub use presentation::{TaskOwners, TaskPresentation};
+pub use t3_hold::PendingHold;
 pub use task::{NewTask, new_queued_task};
 
 /// Open or create the database

@@ -10,8 +10,8 @@ description: Run long, unattended agent CLIs and general task commands through t
 ## Rules that hold everywhere
 
 - Never run `codex queue` yourself, never write to a Claude Code messaging socket yourself, and never tell a worker to do either. Delivery belongs to `homebased`.
-- A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`. When a T3 Code thread owns the session or Codex thread, the daemon starts the turn through T3 instead, so the thread shows it; [messages.md](references/messages.md) has the exact rules.
-- Inside a T3 Code thread whose `t3-code` MCP server offers `delegate_task`, prefer that tool for an `agent` workload that needs no Homebased feature, so T3 shows the child under the thread. Homebased stays the choice for `task` and `container` workloads, Fleet, the resource queue, and `after`. Without T3, nothing changes.
+- A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`.
+- Inside a T3 Code thread (the `t3-code` MCP tools are present), read [t3.md](references/t3.md) before submitting: T3 delivery, `delegate_task`, and `task wait`.
 - Submit through the daemon on the machine that owns the Codex thread. To run the child elsewhere, enable Fleet and set `machine` in the JSON spec. The submitting machine remains the origin and sends callbacks to the original thread; the selected Fleet machine executes the child.
 - Send all GPU work through the resource queue. Read [resource-queue.md](references/resource-queue.md) for priority, checkpoints, job events, and cleanup.
 - Put task fields in the JSON spec and submit with `homebased task submit --spec <file|->`. Use `--request-id <uuid>` when a caller needs a stable retry identity.
@@ -43,6 +43,7 @@ Pick the first row that matches, then read only that file.
 | GPU work, resource queues, job specs, priority, preemption, or Attention | [resource-queue.md](references/resource-queue.md) |
 | Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks, or finding the tokens workers spent | [inspect.md](references/inspect.md) |
+| Inside a T3 Code thread (the `t3-code` MCP tools are present) | [t3.md](references/t3.md) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |
 | A command exited non-zero, `daemon_unavailable`, or the socket is down | [errors.md](references/errors.md) |

@@ -5,6 +5,7 @@ pub(crate) mod queue;
 pub mod store;
 pub mod supervisor;
 pub mod task;
+pub mod waiter;
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ pub use callback::{CallbackActor, CallbackMsg};
 pub(crate) use store::{StoreActor, StoreMsg};
 pub(crate) use supervisor::{SupervisorActor, SupervisorArgs, SupervisorMsg};
 pub use task::{TaskActor, TaskMsg};
+pub use waiter::{WaiterActor, WaiterMsg, WaiterRegistry};
 
 /// Request-reply against any daemon actor with the shared timeout, flattening
 /// transport failures into `AppError::Internal`

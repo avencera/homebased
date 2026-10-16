@@ -50,12 +50,52 @@ impl Client {
         })
     }
 
+    /// POST JSON and read the response body as it arrives, line by line
+    ///
+    /// The stream has no overall timeout: a long-lived response such as
+    /// `task wait` ends when the daemon ends it. A non-success status is an
+    /// error, as for `post`
+    pub async fn post_lines(&self, path: &str, body: &Value) -> Result<LineStream, AppError> {
+        let res = self.send("POST", path, Some(body)).await?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(LineStream {
+                body: res.into_body(),
+                buffer: Vec::new(),
+            });
+        }
+
+        let bytes = read_body(res).await?;
+        Err(map_error(status, &bytes))
+    }
+
     async fn request(
         &self,
         method: &str,
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, AppError> {
+        let res = self.send(method, path, body).await?;
+        let status = res.status();
+        let bytes = read_body(res).await?;
+        if status.is_success() {
+            if bytes.is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_slice(&bytes).map_err(|err| AppError::Internal {
+                message: format!("decode: {err}"),
+            });
+        }
+
+        Err(map_error(status, &bytes))
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Response<Incoming>, AppError> {
         let stream =
             UnixStream::connect(&self.sock)
                 .await
@@ -88,32 +128,58 @@ impl Client {
             .map_err(|err| AppError::Internal {
                 message: format!("build request: {err}"),
             })?;
-        let res: Response<Incoming> =
-            sender
-                .send_request(req)
-                .await
-                .map_err(|err| AppError::DaemonUnavailable {
-                    message: format!("send: {err}"),
-                })?;
-        let status = res.status();
-        let bytes = res
-            .into_body()
-            .collect()
+        sender
+            .send_request(req)
             .await
             .map_err(|err| AppError::DaemonUnavailable {
-                message: format!("read body: {err}"),
-            })?
-            .to_bytes();
-        if status.is_success() {
-            if bytes.is_empty() {
-                return Ok(Value::Null);
-            }
-            return serde_json::from_slice(&bytes).map_err(|err| AppError::Internal {
-                message: format!("decode: {err}"),
-            });
-        }
+                message: format!("send: {err}"),
+            })
+    }
+}
 
-        Err(map_error(status, &bytes))
+async fn read_body(res: Response<Incoming>) -> Result<Bytes, AppError> {
+    Ok(res
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| AppError::DaemonUnavailable {
+            message: format!("read body: {err}"),
+        })?
+        .to_bytes())
+}
+
+/// Response body of a streaming request, read one line at a time
+pub struct LineStream {
+    body: Incoming,
+    buffer: Vec<u8>,
+}
+
+impl LineStream {
+    /// Next complete line without its newline, or `None` when the daemon ended the stream
+    ///
+    /// A final line without a newline was cut off mid-write and is dropped
+    pub async fn next_line(&mut self) -> Result<Option<Vec<u8>>, AppError> {
+        loop {
+            if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
+                line.pop();
+                return Ok(Some(line));
+            }
+            let frame =
+                self.body
+                    .frame()
+                    .await
+                    .transpose()
+                    .map_err(|err| AppError::DaemonUnavailable {
+                        message: format!("read body: {err}"),
+                    })?;
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+            if let Ok(data) = frame.into_data() {
+                self.buffer.extend_from_slice(&data);
+            }
+        }
     }
 }
 
@@ -203,6 +269,14 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             let reason = decode_field(input, "reason");
             match (task, reason) {
                 (Some(task), Some(reason)) => AppError::FollowupUnavailable { task, reason },
+                _ => AppError::Internal { message },
+            }
+        }
+        "wait_unavailable" => {
+            let task = decode_field(input, "task");
+            let reason = decode_field(input, "reason");
+            match (task, reason) {
+                (Some(task), Some(reason)) => AppError::WaitUnavailable { task, reason },
                 _ => AppError::Internal { message },
             }
         }

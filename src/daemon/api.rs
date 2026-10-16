@@ -68,6 +68,7 @@ pub fn write_routes() -> Router<AppState> {
         .merge(crate::daemon::queue_api::submit_routes())
         .merge(crate::daemon::queue_api::control_routes())
         .merge(crate::daemon::claude_threads::control_routes())
+        .merge(crate::daemon::wait_api::routes())
         .route("/v1/tasks", post(submit))
         .route("/v1/tasks/dry-run", post(dry_run))
         .route("/v1/tasks/{id}/cancel", post(cancel))
@@ -154,6 +155,8 @@ pub(super) struct SubmitBody {
     pub(super) callback_cwd: Option<PathBuf>,
     /// Origin-only dependencies, kept beside the spec so no executor receives them
     pub(super) after: Option<TaskDependencies>,
+    /// Origin-only request to keep a T3 Codex thread in the Working shelf
+    pub(super) hold: bool,
 }
 
 /// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
@@ -172,6 +175,8 @@ struct SubmitEnvelope {
     callback_cwd: Option<PathBuf>,
     #[serde(default)]
     after: Option<Value>,
+    #[serde(default)]
+    hold: bool,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -204,6 +209,7 @@ where
             request,
             callback_cwd: envelope.callback_cwd,
             after,
+            hold: envelope.hold,
         }))
     }
 }
@@ -277,7 +283,13 @@ async fn submit(
     SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
     let request_id = body.request;
+    let hold = body.hold;
     let (id, status) = crate::daemon::dependencies::submit(&state, body).await?;
+    // a lost mark only drops the hold, and delivery then runs as it always did
+    if hold && let Err(error) = call(&state.store, |reply| StoreMsg::MarkT3Hold { id, reply }).await
+    {
+        tracing::warn!(%id, "save task hold: {error}");
+    }
     Ok((
         StatusCode::OK,
         Json(SubmitResponse {

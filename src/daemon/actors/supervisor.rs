@@ -9,7 +9,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
 use crate::daemon::actors::queue::{QUEUE_NAME, QueueActor, QueueArgs, QueueMsg};
 use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
-use crate::daemon::actors::{StoreActor, StoreMsg, call, send_reply};
+use crate::daemon::actors::{StoreActor, StoreMsg, WaiterRegistry, call, send_reply};
 use crate::domain::{
     AgentKind, ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskEnv, TaskId, TaskRow,
 };
@@ -51,6 +51,10 @@ pub(crate) enum SupervisorMsg {
     /// Store ref for `AppState` reads
     GetStore {
         reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
+    },
+    /// Registry of `task wait` streams for `AppState`
+    GetWaiters {
+        reply: RpcReplyPort<Result<WaiterRegistry, AppError>>,
     },
     /// Persist a queued row under its admission, spawn its worker, and watch it
     Launch {
@@ -111,6 +115,7 @@ pub(crate) struct SupervisorState {
     machine: MachineId,
     store: ActorRef<StoreMsg>,
     callback: ActorRef<CallbackMsg>,
+    waiters: WaiterRegistry,
     tasks: HashMap<TaskId, ActorRef<TaskMsg>>,
     queue: Option<ActorRef<QueueMsg>>,
 }
@@ -188,6 +193,7 @@ impl Actor for SupervisorActor {
         )
         .await?;
         let machine = load_or_create_machine_id(&home)?;
+        let waiters = WaiterRegistry::spawn(Some(myself.get_cell())).await?;
         let (callback, _callback_handle) = CallbackActor::spawn_linked(
             Some(CALLBACK_NAME.into()),
             CallbackActor,
@@ -197,6 +203,7 @@ impl Actor for SupervisorActor {
                 notifier,
                 machine_name,
                 claude_sessions: std::env::home_dir().map(|home| home.join(".claude/sessions")),
+                waiters: waiters.clone(),
             },
             myself.get_cell(),
         )
@@ -207,6 +214,7 @@ impl Actor for SupervisorActor {
             machine,
             store,
             callback,
+            waiters,
             tasks: HashMap::new(),
             queue: None,
         };
@@ -273,6 +281,7 @@ impl Actor for SupervisorActor {
             }
             SupervisorMsg::GetCallback { reply } => send_reply(reply, Ok(state.callback.clone())),
             SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
+            SupervisorMsg::GetWaiters { reply } => send_reply(reply, Ok(state.waiters.clone())),
             SupervisorMsg::Launch {
                 row,
                 spec,
