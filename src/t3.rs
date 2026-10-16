@@ -6,11 +6,12 @@
 //! contracts that an update can change without notice. Run `homebased t3 check`
 //! after a T3 update
 //!
-//! T3 speaks one of two orchestration protocols: [`v1`] in stable `0.0.45` and
-//! earlier, and [`v2`] from stable `0.1.0`, after pingdotgg/t3code#2829. Every
-//! wake and probe asks the running server which one it speaks
+//! T3 Code `0.1.0` is the first stable release with orchestration protocol 2,
+//! after pingdotgg/t3code#2829, and the only one supported; see [`v2`]. Every
+//! wake and probe asks the running server which protocol it speaks and reports
+//! an older or newer T3 as an incompatible API
 //!
-//! Both protocols share:
+//! The local contracts are:
 //!
 //! - User data lives in `~/.t3/userdata`; `server-runtime.json` has `version`,
 //!   `pid`, and `origin`. Version 1 and a live PID identify a running server.
@@ -18,7 +19,8 @@
 //!   `host`, `port`, and `startedAt`; a service-managed server omits `host`
 //!   and adds `serviceManaged`, so the client ignores those fields
 //! - `GET /.well-known/t3/environment` needs no token and returns
-//!   `orchestrationProtocolVersion`, `1` or `2`
+//!   `orchestrationProtocolVersion`; T3 `0.0.42` and earlier omit it, which T3
+//!   defines as protocol 1, like the value `1` itself
 //! - The `t3` CLI is the running server's executable
 //!   (`~/.t3/runtime/versions/<version>/t3`), found through `/proc/<pid>/exe`
 //!   or `ps`, else the desktop app's launcher `~/.t3/bin/t3`, else `t3` on
@@ -33,7 +35,6 @@
 //! `spawn_blocking`
 
 mod rpc;
-mod v1;
 mod v2;
 
 use std::ffi::OsString;
@@ -49,18 +50,19 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Builder;
 
 use crate::callback::send_check::{SendCheck, SendFailure};
-use crate::curl::{CurlMethod, CurlRequest, CurlResponse};
+use crate::curl::{CurlMethod, CurlRequest};
 use crate::domain::ThreadId;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Orchestration protocol this client speaks
+const ORCHESTRATION_PROTOCOL: u32 = 2;
 // the descriptor read gates live Claude deliveries, so a stalled T3 must not hold them long
 const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
@@ -99,26 +101,6 @@ impl T3Env {
     }
 }
 
-/// T3 orchestration protocol, which decides the state database and turn API
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    /// `state.sqlite` and HTTP dispatch, see [`v1`]
-    V1,
-    /// `statev2.sqlite` and WebSocket RPC dispatch, see [`v2`]
-    V2,
-}
-
-impl Protocol {
-    /// Wire number that T3 reports as `orchestrationProtocolVersion`
-    #[must_use]
-    pub fn number(self) -> u32 {
-        match self {
-            Self::V1 => 1,
-            Self::V2 => 2,
-        }
-    }
-}
-
 /// Provider session that T3 can resume in its owning thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderThread {
@@ -129,7 +111,8 @@ pub enum ProviderThread {
 }
 
 impl ProviderThread {
-    /// T3 provider name, the V1 resume cursor path, and the native id
+    /// T3 provider name, the resume cursor path of a session imported from the
+    /// previous orchestrator, and the native id
     fn mapping(self) -> (&'static str, &'static str, ThreadId) {
         match self {
             Self::Claude(thread) => ("claudeAgent", "$.resume", thread),
@@ -234,33 +217,24 @@ impl ProbeReport {
     }
 }
 
-/// Protocol of the T3 thread that owns this provider session, if one does
+/// Whether a T3 thread owns this provider session
 ///
-/// Reads every state database on disk first, so a session that no database
-/// maps needs no request to T3. A mapped session counts only in the database of
-/// the running server's protocol; an error means T3 could not say which
-pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<Option<Protocol>, String> {
+/// Reads the state database on disk first, so a session it does not map needs
+/// no request to T3. A mapped session needs a server that speaks the supported
+/// protocol; an error means T3 could not say
+pub fn owner(env: &T3Env, provider_thread: ProviderThread) -> Result<bool, String> {
     let userdata = env.userdata();
-    if !userdata.is_dir() {
-        return Ok(None);
+    if find_thread(&userdata, provider_thread)?.is_none() {
+        return Ok(false);
     }
-
-    let lookups = Store::lookups(&userdata, provider_thread);
-    if lookups.iter().all(|(_, found)| matches!(found, Ok(None))) {
-        return Ok(None);
-    }
-    let server = connect(&userdata).map_err(|failure| failure.detail())?;
-    match Store::active(lookups, server.protocol) {
-        Some((store, Ok(Some(_)))) => Ok(Some(store.protocol())),
-        Some((_, Err(detail))) => Err(detail),
-        Some((_, Ok(None))) | None => Ok(None),
-    }
+    connect(&userdata).map_err(|failure| failure.detail())?;
+    Ok(true)
 }
 
 /// Message text that T3 runs as a compaction turn instead of a prompt
 const COMPACT_COMMAND: &str = "/compact";
 
-/// How a woken T3 V2 thread runs the message relative to its active run
+/// How a woken T3 thread runs the message relative to its active run
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnStart {
     /// T3 starts the message, steers the active run with it, or queues it
@@ -272,8 +246,7 @@ pub(crate) enum TurnStart {
 
 /// Start a T3 turn for the thread that owns this provider session
 ///
-/// `before_send` rechecks an unsent notice at the final dispatch boundary.
-/// Protocol 1 ignores `start` and lets T3 place the message
+/// `before_send` rechecks an unsent notice at the final dispatch boundary
 pub(crate) fn wake_thread_checked(
     env: &T3Env,
     provider_thread: ProviderThread,
@@ -281,17 +254,16 @@ pub(crate) fn wake_thread_checked(
     before_send: Option<&SendCheck>,
     start: TurnStart,
 ) -> Result<WakeOutcome, SendFailure> {
-    with_owner(env, provider_thread, |owner| match owner.store {
-        Store::V1(_) => v1::start_turn(owner.origin, owner.thread, text, owner.token, before_send),
-        Store::V2(path) => v2::start_turn(
+    with_owner(env, provider_thread, |owner| {
+        v2::start_turn(
             owner.origin,
-            path,
+            owner.state,
             owner.thread,
             text,
             owner.token,
             before_send,
             start,
-        ),
+        )
     })
 }
 
@@ -301,10 +273,7 @@ pub(crate) fn wake_thread_checked(
 /// request for it. T3 refuses it while a turn runs
 pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOutcome {
     with_owner(env, ProviderThread::Claude(thread), |owner| {
-        match owner.store {
-            Store::V1(_) => v1::compact(owner.origin, owner.thread, key, owner.token),
-            Store::V2(_) => v2::compact(owner.origin, owner.thread, key, owner.token, None),
-        }
+        v2::compact(owner.origin, owner.thread, key, owner.token, None)
     })
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
 }
@@ -327,19 +296,13 @@ type ClaudeThreadRow = (String, String, String, bool);
 
 /// Claude sessions whose T3 thread is neither archived nor deleted, newest first
 ///
-/// Reads the state database on disk, so the server need not run. V2 stops
-/// writing `state.sqlite` once it copied it, so a usable `statev2.sqlite` wins
+/// Reads the state database on disk, so the server need not run
 pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, String> {
-    let userdata = env.userdata();
-    let store = [Protocol::V2, Protocol::V1]
-        .into_iter()
-        .map(|protocol| Store::path(&userdata, protocol))
-        .find(|store| store.file().is_file() && store.schema_matches());
-    let rows = match &store {
-        Some(Store::V1(path)) => v1::open_claude_threads(path)?,
-        Some(Store::V2(path)) => v2::open_claude_threads(path)?,
-        None => return Ok(Vec::new()),
-    };
+    let state = state_path(&env.userdata());
+    if !state.is_file() || !v2::schema_matches(&state) {
+        return Ok(Vec::new());
+    }
+    let rows = v2::open_claude_threads(&state)?;
 
     let mut threads: Vec<OpenClaudeThread> = Vec::new();
     for (session, t3_thread, title, settled) in rows {
@@ -377,7 +340,7 @@ fn claude_thread_rows(path: &Path, sql: &str) -> Result<Vec<ClaudeThreadRow>, St
 /// Running T3 server, thread, and bearer token for one provider session
 struct Owner<'a> {
     origin: &'a str,
-    store: &'a Store,
+    state: &'a Path,
     thread: &'a str,
     token: &'a str,
 }
@@ -391,22 +354,14 @@ fn with_owner(
     action: impl FnOnce(Owner<'_>) -> Result<(), ApiFailure>,
 ) -> Result<WakeOutcome, SendFailure> {
     let userdata = env.userdata();
-    if !userdata.is_dir() {
-        return Ok(WakeOutcome::NotT3Thread);
-    }
-
-    let lookups = Store::lookups(&userdata, provider_thread);
-    if lookups.iter().all(|(_, found)| matches!(found, Ok(None))) {
-        return Ok(WakeOutcome::NotT3Thread);
-    }
+    let t3_thread = match find_thread(&userdata, provider_thread) {
+        Ok(Some(t3_thread)) => t3_thread,
+        Ok(None) => return Ok(WakeOutcome::NotT3Thread),
+        Err(detail) => return Ok(WakeOutcome::Unavailable(detail)),
+    };
     let server = match connect(&userdata) {
         Ok(server) => server,
         Err(failure) => return Ok(failure.into_wake_outcome()),
-    };
-    let (store, t3_thread) = match Store::active(lookups, server.protocol) {
-        Some((store, Ok(Some(t3_thread)))) => (store, t3_thread),
-        Some((_, Err(detail))) => return Ok(WakeOutcome::Unavailable(detail)),
-        Some((_, Ok(None))) | None => return Ok(WakeOutcome::NotT3Thread),
     };
     let cli = match T3Cli::resolve(env, server.pid) {
         Ok(cli) => cli,
@@ -420,7 +375,7 @@ fn with_owner(
 
     let done = action(Owner {
         origin: &server.origin,
-        store: &store,
+        state: &state_path(&userdata),
         thread: &t3_thread,
         token: &token.value,
     });
@@ -466,33 +421,26 @@ pub fn probe(env: &T3Env) -> ProbeReport {
     let cli = T3Cli::resolve(env, runtime.pid);
     report.t3_version = cli.as_ref().ok().and_then(T3Cli::version);
 
-    let protocol = match server_protocol(&runtime.origin) {
-        Ok(protocol) => protocol,
-        Err(failure) => {
-            report.checks.push(failed("protocol", failure.detail()));
-            return report.finish(failure.probe_status());
-        }
-    };
-    report.orchestration_protocol = Some(protocol.number());
+    if let Err(failure) = require_protocol(&runtime.origin) {
+        report.checks.push(failed("protocol", failure.detail()));
+        return report.finish(failure.probe_status());
+    }
+    report.orchestration_protocol = Some(ORCHESTRATION_PROTOCOL);
     report.checks.push(passed(
         "protocol",
-        &format!("server speaks orchestration protocol {}", protocol.number()),
+        &format!("server speaks orchestration protocol {ORCHESTRATION_PROTOCOL}"),
     ));
 
-    let store = Store::path(&userdata, protocol);
-    if !store.schema_matches() {
+    if !v2::schema_matches(&state_path(&userdata)) {
         report.checks.push(failed(
             "state_schema",
-            format!(
-                "{} does not have the required thread columns",
-                store.file_name()
-            ),
+            "statev2.sqlite does not have the required thread columns",
         ));
         return report.finish(ProbeStatus::Changed);
     }
     report.checks.push(passed(
         "state_schema",
-        &format!("required {} columns exist", store.file_name()),
+        "required statev2.sqlite columns exist",
     ));
 
     let cli = match cli {
@@ -517,112 +465,47 @@ pub fn probe(env: &T3Env) -> ProbeReport {
         .checks
         .push(passed("token_issue", "short-lived session token issued"));
 
-    let status = match &store {
-        Store::V1(path) => v1::probe_api(&runtime.origin, path, &token.value, &mut report.checks),
-        Store::V2(_) => v2::probe_api(&runtime.origin, &token.value, &mut report.checks),
-    };
+    let status = v2::probe_api(&runtime.origin, &token.value, &mut report.checks);
     report.finish(status)
 }
 
-/// T3 thread that one state database maps a provider session to
-type Lookup = Result<Option<String>, String>;
-
-/// State database of one orchestration protocol
-enum Store {
-    /// `state.sqlite`
-    V1(PathBuf),
-    /// `statev2.sqlite`
-    V2(PathBuf),
+/// State database of the running server
+///
+/// Protocol 2 copies the previous orchestrator's `state.sqlite` into it once
+/// and never writes `state.sqlite` again, so only this database is current
+fn state_path(userdata: &Path) -> PathBuf {
+    userdata.join("statev2.sqlite")
 }
 
-impl Store {
-    fn path(userdata: &Path, protocol: Protocol) -> Self {
-        match protocol {
-            Protocol::V1 => Self::V1(userdata.join("state.sqlite")),
-            Protocol::V2 => Self::V2(userdata.join("statev2.sqlite")),
-        }
+/// T3 thread that the state database maps a provider session to, if any
+///
+/// A missing database maps nothing
+fn find_thread(userdata: &Path, provider_thread: ProviderThread) -> Result<Option<String>, String> {
+    let state = state_path(userdata);
+    if !state.is_file() {
+        return Ok(None);
     }
-
-    /// The lookup of `provider_thread` in each state database on disk
-    ///
-    /// Each database answers on its own, so an unreadable inactive database
-    /// cannot hide a mapping in the active one
-    fn lookups(userdata: &Path, provider_thread: ProviderThread) -> Vec<(Self, Lookup)> {
-        [Protocol::V2, Protocol::V1]
-            .into_iter()
-            .map(|protocol| Self::path(userdata, protocol))
-            .filter(|store| store.file().is_file())
-            .map(|store| {
-                let found = store.find_thread(provider_thread);
-                (store, found)
-            })
-            .collect()
-    }
-
-    /// The lookup in the running server's database
-    ///
-    /// V2 copies `state.sqlite` into `statev2.sqlite` once and then stops
-    /// writing `state.sqlite`, so only that database is current
-    fn active(lookups: Vec<(Self, Lookup)>, protocol: Protocol) -> Option<(Self, Lookup)> {
-        lookups
-            .into_iter()
-            .find(|(store, _)| store.protocol() == protocol)
-    }
-
-    fn file(&self) -> &Path {
-        match self {
-            Self::V1(path) | Self::V2(path) => path,
-        }
-    }
-
-    fn file_name(&self) -> &'static str {
-        match self {
-            Self::V1(_) => "state.sqlite",
-            Self::V2(_) => "statev2.sqlite",
-        }
-    }
-
-    fn protocol(&self) -> Protocol {
-        match self {
-            Self::V1(_) => Protocol::V1,
-            Self::V2(_) => Protocol::V2,
-        }
-    }
-
-    fn find_thread(&self, provider_thread: ProviderThread) -> Result<Option<String>, String> {
-        match self {
-            Self::V1(path) => v1::find_thread(path, provider_thread),
-            Self::V2(path) => v2::find_thread(path, provider_thread),
-        }
-    }
-
-    fn schema_matches(&self) -> bool {
-        match self {
-            Self::V1(path) => v1::schema_matches(path),
-            Self::V2(path) => v2::schema_matches(path),
-        }
-    }
+    v2::find_thread(&state, provider_thread)
 }
 
-/// Running T3 server and the orchestration protocol it reports
+/// Running T3 server whose protocol this client supports
 #[derive(Debug, Clone)]
 struct Server {
     pid: i32,
     origin: String,
-    protocol: Protocol,
 }
 
 fn connect(userdata: &Path) -> Result<Server, ApiFailure> {
     let runtime = load_runtime(userdata).map_err(ApiFailure::Unavailable)?;
-    let protocol = server_protocol(&runtime.origin)?;
+    require_protocol(&runtime.origin)?;
     Ok(Server {
         pid: runtime.pid,
         origin: runtime.origin,
-        protocol,
     })
 }
 
-fn server_protocol(origin: &str) -> Result<Protocol, ApiFailure> {
+/// Fail unless the server at `origin` speaks [`ORCHESTRATION_PROTOCOL`]
+fn require_protocol(origin: &str) -> Result<(), ApiFailure> {
     let response = crate::curl::send(&CurlRequest {
         method: CurlMethod::Get,
         url: &format!("{origin}/.well-known/t3/environment"),
@@ -654,8 +537,10 @@ fn server_protocol(origin: &str) -> Result<Protocol, ApiFailure> {
     };
     match version {
         // T3 `0.0.42` and earlier omit the field, which T3 defines as protocol 1
-        None | Some(1) => Ok(Protocol::V1),
-        Some(2) => Ok(Protocol::V2),
+        None | Some(1) => Err(ApiFailure::Changed(
+            "T3 Code older than 0.1.0 is not supported; update T3 Code".into(),
+        )),
+        Some(version) if version == u64::from(ORCHESTRATION_PROTOCOL) => Ok(()),
         Some(version) => Err(ApiFailure::Changed(format!(
             "server speaks unsupported orchestration protocol {version}"
         ))),
@@ -708,17 +593,6 @@ fn state_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     let connection = Connection::open_with_flags(path, flags)?;
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(connection)
-}
-
-fn query_thread(
-    path: &Path,
-    sql: &str,
-    params: impl rusqlite::Params,
-) -> Result<Option<String>, String> {
-    let db = state_connection(path).map_err(|_| "state.sqlite cannot be read".to_string())?;
-    db.query_row(sql, params, |row| row.get(0))
-        .optional()
-        .map_err(|_| "state.sqlite thread lookup failed".to_string())
 }
 
 /// The `t3` executable, run with the PATH and HOME that located it
@@ -1006,31 +880,6 @@ fn deterministic_id(salt: &str, thread_id: &str, text: &str) -> String {
     Builder::from_custom_bytes(bytes).into_uuid().to_string()
 }
 
-fn send_empty(method: CurlMethod, url: &str, token: &str) -> Result<CurlResponse, String> {
-    crate::curl::send(&CurlRequest {
-        method,
-        url,
-        bearer: Some(token),
-        json_body: None,
-        timeout: HTTP_TIMEOUT,
-    })
-}
-
-fn send_json(
-    method: CurlMethod,
-    url: &str,
-    token: &str,
-    body: &Value,
-) -> Result<CurlResponse, String> {
-    crate::curl::send(&CurlRequest {
-        method,
-        url,
-        bearer: Some(token),
-        json_body: Some(body),
-        timeout: HTTP_TIMEOUT,
-    })
-}
-
 /// Percent-encode everything except RFC 3986 unreserved bytes
 fn percent_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
@@ -1071,16 +920,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use rusqlite::Connection;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
     use super::{
-        ProbeStatus, Protocol, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome,
-        compact_thread, deterministic_id, load_runtime, open_claude_threads, owner, probe,
-        wake_thread_checked,
+        ProbeStatus, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome, compact_thread,
+        deterministic_id, load_runtime, open_claude_threads, owner, probe, wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1093,27 +940,6 @@ mod tests {
     const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";
     const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
     const TOKEN: &str = "fake-secret-token";
-
-    fn snapshot(thread_id: &str) -> Value {
-        json!({
-            "snapshotSequence": 9,
-            "thread": {
-                "id": thread_id,
-                "title": "Fake thread",
-                "modelSelection": { "model": "keep-existing" },
-                "runtimeMode": "full-access",
-                "interactionMode": "default",
-                "archivedAt": null,
-                "deletedAt": null,
-                "session": { "status": "ready", "activeTurnId": null }
-            },
-            "page": {}
-        })
-    }
-
-    fn dispatch_ok() -> FakeResponse {
-        FakeResponse::http(200, &json!({ "sequence": 10 }))
-    }
 
     fn ticket() -> FakeResponse {
         FakeResponse::http(
@@ -1165,62 +991,14 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(server: Option<&FakeT3Server>, mapped: bool, pid: i32) -> Self {
-            let mapping = mapped.then_some(("claudeAgent", "resume", SESSION_ID));
-            Self::with_mapping(server, mapping, pid)
-        }
-
-        /// A V1 `state.sqlite`, optionally mapping one provider session
-        fn with_mapping(
-            server: Option<&FakeT3Server>,
-            mapping: Option<(&str, &str, &str)>,
-            pid: i32,
-        ) -> Self {
+        /// User data whose state database maps the Claude session to a T3 thread
+        fn mapped(server: Option<&FakeT3Server>, pid: i32) -> Self {
             let fixture = Self::empty(server, pid);
-            fixture.v1_state(mapping);
             fixture
-        }
-
-        fn v1_state(&self, mapping: Option<(&str, &str, &str)>) {
-            let db = Connection::open(self.userdata().join("state.sqlite")).unwrap();
-            db.execute_batch(
-                "CREATE TABLE provider_session_runtime (
-                    thread_id TEXT PRIMARY KEY,
-                    provider_name TEXT,
-                    adapter_key TEXT,
-                    runtime_mode TEXT,
-                    status TEXT,
-                    last_seen_at TEXT,
-                    resume_cursor_json TEXT,
-                    runtime_payload_json TEXT,
-                    provider_instance_id TEXT
-                 );
-                 CREATE TABLE projection_threads (
-                    thread_id TEXT PRIMARY KEY,
-                    title TEXT,
-                    deleted_at TEXT
-                 );",
-            )
-            .unwrap();
-            let Some((provider, cursor, session_id)) = mapping else {
-                return;
-            };
-            db.execute(
-                "INSERT INTO projection_threads (thread_id, title) VALUES (?1, 'Fake thread')",
-                [T3_THREAD_ID],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO provider_session_runtime
-                 (thread_id, provider_name, last_seen_at, resume_cursor_json)
-                 VALUES (?1, ?2, '2026-09-26T17:00:00Z', ?3)",
-                rusqlite::params![
-                    T3_THREAD_ID,
-                    provider,
-                    json!({(cursor): session_id}).to_string()
-                ],
-            )
-            .unwrap();
+                .v2_state()
+                .thread(T3_THREAD_ID, "Fake thread", false)
+                .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+            fixture
         }
 
         /// User data with a runtime file and a fake `t3` CLI, but no state database
@@ -1275,73 +1053,24 @@ mod tests {
     }
 
     #[test]
-    fn wake_success_reuses_stable_ids_and_revokes_tokens() {
-        if !curl_available() {
-            return;
-        }
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-        assert_eq!(
-            owner(&fixture.env, claude_thread()).unwrap(),
-            Some(Protocol::V1)
-        );
-        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
-        let first = wake_thread(&fixture.env, claude_thread(), "resume this task");
-        let second = wake_thread(&fixture.env, claude_thread(), "resume this task");
-
-        assert_eq!(
-            first,
-            WakeOutcome::Woken {
-                t3_thread: T3_THREAD_ID.into()
-            }
-        );
-        assert_eq!(second, first);
-        let requests = server.requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].method, "GET");
-        assert_eq!(
-            requests[0].path,
-            format!("/api/orchestration/threads/{T3_THREAD_ID}?turnLimit=1")
-        );
-        assert!(requests[0].headers.contains(&format!("Bearer {TOKEN}")));
-        let first_body: Value = serde_json::from_str(&requests[1].body).unwrap();
-        let second_body: Value = serde_json::from_str(&requests[3].body).unwrap();
-        assert_eq!(first_body["runtimeMode"], "full-access");
-        assert_eq!(first_body["interactionMode"], "default");
-        assert_eq!(first_body["message"]["text"], "resume this task");
-        assert!(first_body.get("modelSelection").is_none());
-        assert_eq!(first_body["commandId"], second_body["commandId"]);
-        assert_eq!(
-            first_body["message"]["messageId"],
-            second_body["message"]["messageId"]
-        );
-        assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
-    }
-
-    #[test]
     fn provider_mapping_keeps_claude_and_codex_sessions_separate() {
         // no T3 server answers here: an unmapped session needs none, and a
         // mapped one cannot be confirmed without it
-        let codex_fixture =
-            Fixture::with_mapping(None, Some(("codex", "threadId", SESSION_ID)), live_pid());
+        let codex_fixture = Fixture::empty(None, live_pid());
+        codex_fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Fake thread", false)
+            .native("codex", SESSION_ID, T3_THREAD_ID);
         assert!(owner(&codex_fixture.env, codex_thread()).is_err());
-        assert_eq!(owner(&codex_fixture.env, claude_thread()).unwrap(), None);
+        assert_eq!(owner(&codex_fixture.env, claude_thread()), Ok(false));
         assert_eq!(
             wake_thread(&codex_fixture.env, claude_thread(), "message"),
             WakeOutcome::NotT3Thread
         );
 
-        let claude_fixture = Fixture::new(None, true, live_pid());
+        let claude_fixture = Fixture::mapped(None, live_pid());
         assert!(owner(&claude_fixture.env, claude_thread()).is_err());
-        assert_eq!(owner(&claude_fixture.env, codex_thread()).unwrap(), None);
+        assert_eq!(owner(&claude_fixture.env, codex_thread()), Ok(false));
         assert_eq!(
             wake_thread(&claude_fixture.env, codex_thread(), "message"),
             WakeOutcome::NotT3Thread
@@ -1353,21 +1082,15 @@ mod tests {
         if !curl_available() {
             return;
         }
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-            ],
-        );
-        let fixture = Fixture::with_mapping(
-            Some(&server),
-            Some(("codex", "threadId", SESSION_ID)),
-            live_pid(),
-        );
+        let server = FakeT3Server::start(Some(2), vec![ticket(), dispatched()]);
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Fake thread", false)
+            .native("codex", SESSION_ID, T3_THREAD_ID);
 
-        assert!(owner(&fixture.env, codex_thread()).unwrap().is_some());
-        assert_eq!(owner(&fixture.env, claude_thread()).unwrap(), None);
+        assert_eq!(owner(&fixture.env, codex_thread()), Ok(true));
+        assert_eq!(owner(&fixture.env, claude_thread()), Ok(false));
         assert_eq!(
             wake_thread(&fixture.env, codex_thread(), "resume this task"),
             WakeOutcome::Woken {
@@ -1380,7 +1103,13 @@ mod tests {
 
     #[test]
     fn wake_returns_not_t3_thread_without_a_mapping() {
-        let fixture = Fixture::new(None, false, live_pid());
+        let fixture = Fixture::empty(None, live_pid());
+        assert_eq!(
+            wake_thread(&fixture.env, claude_thread(), "message"),
+            WakeOutcome::NotT3Thread
+        );
+
+        fixture.v2_state();
         assert_eq!(
             wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::NotT3Thread
@@ -1390,7 +1119,7 @@ mod tests {
 
     #[test]
     fn wake_returns_unavailable_for_a_dead_server_pid() {
-        let fixture = Fixture::new(None, true, i32::MAX);
+        let fixture = Fixture::mapped(None, i32::MAX);
         assert!(matches!(
             wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::Unavailable(_)
@@ -1399,168 +1128,22 @@ mod tests {
     }
 
     #[test]
-    fn bugfix_deleted_archived_thread_is_not_unarchived() {
-        if !curl_available() {
-            return;
-        }
-        let mut deleted = snapshot(T3_THREAD_ID);
-        deleted["thread"]["archivedAt"] = json!("2026-09-26T17:00:00Z");
-        deleted["thread"]["deletedAt"] = json!("2026-09-26T17:00:00Z");
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &deleted),
-                FakeResponse::http(200, &json!({ "sequence": 11 })),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-        assert!(matches!(
-            wake_thread(&fixture.env, claude_thread(), "message"),
-            WakeOutcome::Refused(_)
-        ));
-        assert_eq!(server.requests().len(), 1);
-    }
-
-    #[test]
-    fn wake_unarchives_an_archived_thread_before_its_turn() {
-        if !curl_available() {
-            return;
-        }
-        // V1 records a turn in an archived thread but never starts it
-        let mut archived = snapshot(T3_THREAD_ID);
-        archived["thread"]["archivedAt"] = json!("2026-09-26T17:00:00Z");
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &archived),
-                FakeResponse::http(200, &json!({ "sequence": 11 })),
-                dispatch_ok(),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-
-        assert_eq!(
-            wake_thread(&fixture.env, claude_thread(), "message"),
-            WakeOutcome::Woken {
-                t3_thread: T3_THREAD_ID.into()
-            }
-        );
-        let types = server
-            .requests()
-            .iter()
-            .skip(1)
-            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap()["type"].clone())
-            .collect::<Vec<_>>();
-        assert_eq!(types, ["thread.unarchive", "thread.turn.start"]);
-        assert_eq!(fixture.revocations(), ["fake-session"]);
-    }
-
-    #[test]
-    fn wake_marks_dispatch_400_as_changed_and_revokes_the_token() {
+    fn compaction_sends_compact_with_ids_keyed_by_idle_period() {
         if !curl_available() {
             return;
         }
         let server = FakeT3Server::start(
-            Some(1),
+            Some(2),
             vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                FakeResponse::http(400, &json!({})),
+                ticket(),
+                dispatched(),
+                ticket(),
+                dispatched(),
+                ticket(),
+                dispatched(),
             ],
         );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-
-        assert_eq!(
-            wake_thread(&fixture.env, claude_thread(), "message"),
-            WakeOutcome::ApiChanged("turn dispatch returned HTTP 400".into())
-        );
-        assert_eq!(fixture.revocations(), ["fake-session"]);
-    }
-
-    #[test]
-    fn probe_reports_compatible_api_and_version() {
-        if !curl_available() {
-            return;
-        }
-        // T3 `0.0.42` and earlier have no protocol field, which means V1
-        let server = FakeT3Server::start(
-            None,
-            vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                FakeResponse::http(
-                    500,
-                    &json!({
-                        "_tag": "EnvironmentInternalError",
-                        "code": "internal_error",
-                        "reason": "orchestration_dispatch_failed",
-                        "traceId": "discard-this"
-                    }),
-                ),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-
-        let report = probe(&fixture.env);
-        assert_eq!(report.status, ProbeStatus::Compatible);
-        assert_eq!(report.t3_version.as_deref(), Some("t3 1.2.3"));
-        assert_eq!(report.orchestration_protocol, Some(1));
-        assert!(report.checks.iter().all(|check| check.ok));
-        assert!(fixture.revocations().contains(&"fake-session".to_string()));
-        let requests = server.requests();
-        assert_eq!(requests.len(), 2);
-        let dispatch: Value = serde_json::from_str(&requests[1].body).unwrap();
-        assert_eq!(dispatch["type"], "thread.turn.start");
-        assert_ne!(dispatch["threadId"], T3_THREAD_ID);
-        assert!(dispatch.get("modelSelection").is_none());
-    }
-
-    #[test]
-    fn probe_fingerprints_a_missing_snapshot_field_stably() {
-        if !curl_available() {
-            return;
-        }
-        let mut invalid = snapshot(T3_THREAD_ID);
-        invalid["thread"]
-            .as_object_mut()
-            .unwrap()
-            .remove("runtimeMode");
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &invalid),
-                FakeResponse::http(200, &invalid),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-
-        let first = probe(&fixture.env);
-        let second = probe(&fixture.env);
-        assert_eq!(first.status, ProbeStatus::Changed);
-        assert_eq!(first.t3_version.as_deref(), Some("t3 1.2.3"));
-        assert_eq!(
-            first.fingerprint().as_deref(),
-            Some("thread_snapshot: thread snapshot has no valid runtimeMode")
-        );
-        assert_eq!(first.fingerprint(), second.fingerprint());
-        assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
-    }
-
-    #[test]
-    fn v1_compaction_sends_compact_with_ids_keyed_by_idle_period() {
-        if !curl_available() {
-            return;
-        }
-        let server = FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-            ],
-        );
-        let fixture = Fixture::new(Some(&server), true, live_pid());
+        let fixture = Fixture::mapped(Some(&server), live_pid());
 
         let woken = WakeOutcome::Woken {
             t3_thread: T3_THREAD_ID.into(),
@@ -1571,26 +1154,24 @@ mod tests {
         let dispatches: Vec<Value> = server
             .requests()
             .iter()
-            .filter(|request| request.path == "/api/orchestration/dispatch")
-            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .filter(|request| request.method == "WS")
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap()["payload"].clone())
             .collect();
         assert_eq!(dispatches.len(), 3);
         assert!(
             dispatches
                 .iter()
-                .all(|body| body["message"]["text"] == "/compact")
+                .all(|payload| payload["type"] == "message.dispatch"
+                    && payload["text"] == "/compact")
         );
         // T3 replays a repeated command id, so a retry in one idle period is a no-op
         assert_eq!(dispatches[0]["commandId"], dispatches[1]["commandId"]);
         assert_ne!(dispatches[1]["commandId"], dispatches[2]["commandId"]);
-        assert_ne!(
-            dispatches[1]["message"]["messageId"],
-            dispatches[2]["message"]["messageId"]
-        );
+        assert_ne!(dispatches[1]["messageId"], dispatches[2]["messageId"]);
     }
 
     #[test]
-    fn v2_wake_dispatches_a_message_over_the_websocket_with_stable_ids() {
+    fn wake_dispatches_a_message_over_the_websocket_with_stable_ids() {
         if !curl_available() {
             return;
         }
@@ -1598,19 +1179,10 @@ mod tests {
             Some(2),
             vec![ticket(), dispatched(), ticket(), dispatched()],
         );
-        let fixture = Fixture::empty(Some(&server), live_pid());
-        // V2 stops writing state.sqlite, so its mappings must not count
-        fixture.v1_state(Some(("codex", "threadId", SESSION_ID)));
-        fixture
-            .v2_state()
-            .thread(T3_THREAD_ID, "V2 thread", false)
-            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+        let fixture = Fixture::mapped(Some(&server), live_pid());
 
-        assert_eq!(
-            owner(&fixture.env, claude_thread()).unwrap(),
-            Some(Protocol::V2)
-        );
-        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
+        assert_eq!(owner(&fixture.env, claude_thread()), Ok(true));
+        assert_eq!(owner(&fixture.env, codex_thread()), Ok(false));
         let first = wake_thread(&fixture.env, claude_thread(), "resume this task");
         let second = wake_thread(&fixture.env, claude_thread(), "resume this task");
 
@@ -1646,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_finds_a_session_of_a_configured_provider_instance_by_its_driver() {
+    fn finds_a_session_of_a_configured_provider_instance_by_its_driver() {
         if !curl_available() {
             return;
         }
@@ -1657,17 +1229,14 @@ mod tests {
             .thread(T3_THREAD_ID, "V2 thread", false)
             .instance("claude-work", "claudeAgent", SESSION_ID, T3_THREAD_ID);
 
-        assert_eq!(
-            owner(&fixture.env, claude_thread()).unwrap(),
-            Some(Protocol::V2)
-        );
+        assert_eq!(owner(&fixture.env, claude_thread()), Ok(true));
         let open = open_claude_threads(&fixture.env).unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].t3_thread, T3_THREAD_ID);
     }
 
     #[test]
-    fn v2_wakes_an_imported_v1_session_and_unarchives_its_thread_first() {
+    fn wakes_an_imported_session_and_unarchives_its_thread_first() {
         if !curl_available() {
             return;
         }
@@ -1681,10 +1250,7 @@ mod tests {
             .thread(T3_THREAD_ID, "Imported thread", true)
             .legacy("claudeAgent", "resume", SESSION_ID, T3_THREAD_ID);
 
-        assert_eq!(
-            owner(&fixture.env, claude_thread()).unwrap(),
-            Some(Protocol::V2)
-        );
+        assert_eq!(owner(&fixture.env, claude_thread()), Ok(true));
         assert_eq!(
             wake_thread(&fixture.env, claude_thread(), "message"),
             WakeOutcome::Woken {
@@ -1703,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_reply_after_the_request_left_is_uncertain_unless_t3_refused() {
+    fn reply_after_the_request_left_is_uncertain_unless_t3_refused() {
         if !curl_available() {
             return;
         }
@@ -1720,11 +1286,7 @@ mod tests {
                 unknown_thread_error(),
             ],
         );
-        let fixture = Fixture::empty(Some(&server), live_pid());
-        fixture
-            .v2_state()
-            .thread(T3_THREAD_ID, "V2 thread", false)
-            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+        let fixture = Fixture::mapped(Some(&server), live_pid());
 
         let wake = || wake_thread(&fixture.env, claude_thread(), "message");
         assert!(matches!(wake(), WakeOutcome::Uncertain(_)));
@@ -1733,23 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_inactive_database_does_not_hide_the_active_one() {
-        if !curl_available() {
-            return;
-        }
-        let server = FakeT3Server::start(Some(1), Vec::new());
-        let fixture = Fixture::new(Some(&server), true, live_pid());
-        fs::write(fixture.userdata().join("statev2.sqlite"), b"not a database").unwrap();
-
-        assert_eq!(
-            owner(&fixture.env, claude_thread()).unwrap(),
-            Some(Protocol::V1)
-        );
-        assert_eq!(owner(&fixture.env, codex_thread()).unwrap(), None);
-    }
-
-    #[test]
-    fn v2_probe_reports_the_protocol_and_accepts_the_typed_unknown_thread_error() {
+    fn probe_reports_the_protocol_and_accepts_the_typed_unknown_thread_error() {
         if !curl_available() {
             return;
         }
@@ -1760,6 +1306,7 @@ mod tests {
         let report = probe(&fixture.env);
 
         assert_eq!(report.status, ProbeStatus::Compatible, "{report:?}");
+        assert_eq!(report.t3_version.as_deref(), Some("t3 1.2.3"));
         assert_eq!(report.orchestration_protocol, Some(2));
         assert!(report.checks.iter().all(|check| check.ok));
         let rpc: Value = serde_json::from_str(&server.requests()[1].body).unwrap();
@@ -1769,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_probe_flags_a_rejected_websocket_protocol() {
+    fn probe_flags_a_rejected_websocket_protocol() {
         if !curl_available() {
             return;
         }
@@ -1798,11 +1345,12 @@ mod tests {
             return;
         }
         let server = FakeT3Server::start(Some(3), Vec::new());
-        let fixture = Fixture::new(Some(&server), true, live_pid());
+        let fixture = Fixture::mapped(Some(&server), live_pid());
 
         let report = probe(&fixture.env);
 
         assert_eq!(report.status, ProbeStatus::Changed);
+        assert_eq!(report.orchestration_protocol, None);
         assert_eq!(
             report.fingerprint().as_deref(),
             Some("protocol: server speaks unsupported orchestration protocol 3")
@@ -1814,12 +1362,36 @@ mod tests {
     }
 
     #[test]
+    fn t3_older_than_protocol_2_is_an_api_change_that_says_to_update() {
+        if !curl_available() {
+            return;
+        }
+        let detail = "T3 Code older than 0.1.0 is not supported; update T3 Code";
+        // T3 `0.0.42` and earlier omit the protocol field
+        for protocol in [None, Some(1)] {
+            let server = FakeT3Server::start(protocol, Vec::new());
+            let fixture = Fixture::mapped(Some(&server), live_pid());
+
+            let report = probe(&fixture.env);
+
+            assert_eq!(report.status, ProbeStatus::Changed);
+            assert_eq!(report.orchestration_protocol, None);
+            assert_eq!(report.fingerprint(), Some(format!("protocol: {detail}")));
+            assert_eq!(
+                wake_thread(&fixture.env, claude_thread(), "message"),
+                WakeOutcome::ApiChanged(detail.into())
+            );
+            assert_eq!(owner(&fixture.env, claude_thread()), Err(detail.into()));
+        }
+    }
+
+    #[test]
     fn probe_reports_not_installed_and_not_running() {
         let dir = TempDir::new().unwrap();
         let no_userdata = T3Env::new(dir.path().to_path_buf(), OsString::new());
         assert_eq!(probe(&no_userdata).status, ProbeStatus::NotInstalled);
 
-        let fixture = Fixture::new(None, true, i32::MAX);
+        let fixture = Fixture::empty(None, i32::MAX);
         assert_eq!(probe(&fixture.env).status, ProbeStatus::NotRunning);
     }
 
@@ -1850,7 +1422,7 @@ mod tests {
     #[test]
     fn missing_cli_is_unavailable_not_an_api_change() {
         let pid = i32::try_from(std::process::id()).unwrap();
-        let mut fixture = Fixture::new(None, true, pid);
+        let mut fixture = Fixture::empty(None, pid);
         fixture.env = T3Env::new(fixture.env.home.clone(), OsString::new());
 
         let report = probe(&fixture.env);
@@ -1884,29 +1456,25 @@ mod tests {
         assert_eq!(first, deterministic_id("command", T3_THREAD_ID, "text"));
         assert_ne!(first, deterministic_id("message", T3_THREAD_ID, "text"));
     }
+
     #[test]
     fn t3_notice_rechecks_eligibility_after_preparation() {
         use crate::callback::send_check::{SendCheck, SendFailure};
         if !curl_available() {
             return;
         }
-        let server = std::sync::Arc::new(FakeT3Server::start(
-            Some(1),
-            vec![
-                FakeResponse::http(200, &snapshot(T3_THREAD_ID)),
-                dispatch_ok(),
-            ],
-        ));
-        let fixture = Fixture::new(Some(&server), true, live_pid());
+        let server =
+            std::sync::Arc::new(FakeT3Server::start(Some(2), vec![ticket(), dispatched()]));
+        let fixture = Fixture::mapped(Some(&server), live_pid());
         let prepared = server.clone();
         let check: SendCheck = std::sync::Arc::new(move || {
             let requests = prepared.requests();
             assert_eq!(
                 requests.len(),
                 1,
-                "eligibility must follow the T3 snapshot lookup"
+                "eligibility must follow the websocket ticket and precede the message"
             );
-            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, "/api/auth/websocket-ticket");
             Err(SendFailure::Suppressed)
         });
         let outcome = super::wake_thread_checked(
