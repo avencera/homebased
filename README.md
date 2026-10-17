@@ -364,7 +364,10 @@ Submit specs use `api_version: 1` and a `workload` object. The required top-leve
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
 Codex agent specs may set `workload.resume_thread` to resume a Codex thread
-with the new prompt. Use `task followup` for a finished Codex task so Homebased
+with the new prompt. Claude workers discard their session at exit unless the
+spec sets `workload.persist_session: true`; a Claude spec's `resume_thread`
+forks such a saved session into the new task's session. Use `task followup` for
+a finished Codex task, or a Claude task that saved its session, so Homebased
 uses its recorded worker thread and keeps the task settings.
 
 Agent example:
@@ -504,9 +507,11 @@ session id when it starts running. A Codex task records the thread from its
 session header when it ends, whether it succeeds, fails, is cancelled, or is
 lost.
 `task followup` accepts `--message` or `--message-file`, and resumes only a
-terminal Codex task with a recorded worker thread. Only one follow-up can resume
-a thread at a time. `resume_thread_busy`
-names the active task; wait for its event before trying again.
+terminal Codex task with a recorded worker thread or a terminal Claude task
+submitted with `persist_session: true`. Only one follow-up can resume a Codex
+thread at a time. `resume_thread_busy` names the active task; wait for its
+event before trying again. Each Claude follow-up forks the saved session, so
+several can branch from one task.
 
 Run `task followup` on the task's origin or execution machine. A request from
 another machine returns `followup_wrong_machine`. Use `--request-id <uuid>` to
@@ -531,7 +536,8 @@ definitive negative result.
 
 ### Worker usage
 
-Claude workers run without session persistence, so their tokens never reach
+Claude workers run without session persistence unless submitted with
+`persist_session: true`, so their tokens usually never reach
 `~/.claude/projects`. Homebased reads Claude Code's accounting from each
 finished worker's `output.log` and keeps it per task:
 
@@ -589,7 +595,7 @@ homebased --json message send \
 The CLI can also select a Codex thread by receiver-side `--cwd`, or send to
 the origin thread for a task with `--task <task-uuid>` alone. This is the
 origin thread, not the task worker. A send to its own source thread returns
-`message_to_self`; use `task followup` for a finished Codex worker. A Claude
+`message_to_self`; use `task followup` for a finished worker. A Claude
 session with no live process gets the message as a new turn in the T3 Code
 thread that owns it, and so does a live session that a T3 thread owns. A
 Codex thread that T3 owns also gets it as a T3 turn, and any other Codex thread

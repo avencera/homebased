@@ -404,7 +404,7 @@ pub enum AppError {
     },
     /// A message destination is the sender's own thread
     #[error(
-        "destination thread {thread} is the sender's own thread; --task targets the task's origin thread, not its worker; use --worker for a running worker or `homebased task followup` for a finished Codex worker"
+        "destination thread {thread} is the sender's own thread; --task targets the task's origin thread, not its worker; use --worker for a running worker or `homebased task followup` for a finished worker"
     )]
     MessageToSelf {
         /// Thread that is both sender and destination
@@ -485,19 +485,24 @@ pub enum AppError {
     },
 }
 
-/// Why a task cannot be resumed as a Codex worker
+/// Why a finished task's worker cannot be resumed
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FollowupBlocker {
-    /// The task workload is not a Codex agent
-    #[error("the workload is not a Codex agent")]
-    NotCodex,
+    /// The task workload is not a Codex or Claude agent
+    #[error("the workload is not a Codex or Claude agent")]
+    UnsupportedAgent,
+    /// The Claude worker ran without `persist_session`, so its session was discarded
+    #[error(
+        "the Claude worker did not save its session; submit with persist_session: true to follow it up later"
+    )]
+    SessionNotSaved,
     /// The task has no known terminal status
     #[error("the task is not terminal")]
     NotTerminal,
-    /// The task has no recorded Codex worker thread
+    /// The task has no recorded worker thread
     #[error("the task has no recorded worker thread")]
     NoWorkerThread,
 }
@@ -536,7 +541,7 @@ pub enum WorkerMessageBlocker {
     NoWorkerThread,
     /// The worker has exited and reads no further messages
     #[error(
-        "the task is terminal; use `homebased task followup` to resume a finished Codex worker"
+        "the task is terminal; use `homebased task followup` to resume a finished Codex worker or a Claude worker that saved its session"
     )]
     Terminal,
 }

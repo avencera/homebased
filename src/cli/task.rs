@@ -53,7 +53,7 @@ pub enum TaskCommand {
         #[arg(long)]
         hold: bool,
     },
-    /// Resume a finished Codex worker with more information.
+    /// Resume a finished Codex worker, or a Claude worker that saved its session.
     Followup {
         /// Full source task UUID.
         task: TaskId,
@@ -401,7 +401,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         "timeout": format!("{timeout_secs}s"),
         "workload": {
             "type": "agent",
-            "agent": "codex",
+            "agent": source.agent,
             "model": source.model,
             "prompt": prompt,
             "extra_args": source.extra_args,
@@ -409,6 +409,14 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
             "resume_thread": resume_thread,
         },
     });
+    // a saved Claude session stays resumable only if each follow-up saves its own fork
+    if source.persist_session
+        && let Some(workload) = submit_spec
+            .get_mut("workload")
+            .and_then(Value::as_object_mut)
+    {
+        workload.insert("persist_session".into(), Value::Bool(true));
+    }
     if local_machine == execution_machine
         && let Some(object) = submit_spec.as_object_mut()
     {

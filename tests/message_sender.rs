@@ -974,6 +974,7 @@ fn worker_message_reaches_a_running_claude_worker_on_its_execution_machine() {
                 extra_args: vec![],
                 report_trailer: false,
                 resume_thread: None,
+                persist_session: false,
             }),
             cwd: cwd.clone(),
             timeout: Duration::from_secs(1800),

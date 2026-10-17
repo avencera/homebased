@@ -23,8 +23,10 @@ pub struct AgentArgvInputs<'a> {
     pub cwd: &'a Path,
     /// Extra argv appended after the unattended flags.
     pub extra_args: &'a [String],
-    /// Codex thread to resume, when set.
+    /// Worker thread to resume, when set. For Claude this is a saved session
     pub resume_thread: Option<ThreadId>,
+    /// Save the Claude session instead of discarding it at exit
+    pub persist_session: bool,
 }
 
 /// Build unattended argv for an agent workload with the task identity and
@@ -97,7 +99,16 @@ fn build_standard_agent_invocation(
             add_claude_autocompact_default(&mut args, inputs.model, inputs.extra_args);
             args.push("--permission-mode".into());
             args.push("auto".into());
-            args.push("--no-session-persistence".into());
+            if !inputs.persist_session {
+                args.push("--no-session-persistence".into());
+            }
+            // forking leaves the source transcript untouched, so follow-ups on
+            // one task never share a session and the worker keeps its own id
+            if let Some(thread) = inputs.resume_thread {
+                args.push("--resume".into());
+                args.push(thread.to_string());
+                args.push("--fork-session".into());
+            }
             // a fixed session id makes the running worker addressable by
             // `message send --worker` without reading its output
             args.push("--session-id".into());
@@ -245,7 +256,8 @@ pub(crate) fn validate_agent_extra_args(
 
 /// Claude workers run under the session id homebased assigns, which is how
 /// `message send --worker` reaches them. A second id would conflict with it,
-/// and resuming another session would move the worker off it
+/// and resuming another session would move the worker off it. Follow-ups go
+/// through `resume_thread`, which forks into the assigned id
 fn validate_claude_extra_args(extra_args: &[String]) -> Result<(), AgentExtraArgsError> {
     let Some((index, message)) = extra_args
         .iter()
@@ -265,7 +277,7 @@ fn forbidden_claude_argument(arg: &str) -> Option<&'static str> {
     match flag {
         "--session-id" => Some("--session-id is managed by homebased"),
         "--resume" | "-r" | "--continue" | "-c" | "--fork-session" | "--from-pr" => {
-            Some("session continuation is not allowed; homebased assigns the worker session id")
+            Some("session continuation is managed by homebased; use resume_thread")
         }
         _ => None,
     }
@@ -538,6 +550,7 @@ mod tests {
                 cwd: Path::new("/work"),
                 extra_args,
                 resume_thread: None,
+                persist_session: false,
             },
             Path::new("/bin/agent"),
             feed,
@@ -570,6 +583,7 @@ mod tests {
                 cwd: Path::new("/work"),
                 extra_args,
                 resume_thread: None,
+                persist_session: false,
             },
             Path::new("/bin/opencode"),
             Path::new("/state/tasks/id/prompt.feed.txt"),
@@ -866,6 +880,7 @@ mod tests {
                 cwd: Path::new("/work"),
                 extra_args,
                 resume_thread: None,
+                persist_session: false,
             },
             Path::new("/bin/claude"),
             Path::new("/state/tasks/id/prompt.feed.txt"),
@@ -1008,6 +1023,7 @@ mod tests {
                 cwd: Path::new("/work/tree"),
                 extra_args: &extra_args,
                 resume_thread: Some(thread),
+                persist_session: false,
             },
             Path::new("/bin/codex"),
             Path::new("/state/tasks/id/prompt.feed.txt"),
@@ -1233,6 +1249,7 @@ mod tests {
                     cwd: Path::new("/work"),
                     extra_args: &[],
                     resume_thread: None,
+                    persist_session: false,
                 },
                 Path::new("/bin/agent"),
                 feed,

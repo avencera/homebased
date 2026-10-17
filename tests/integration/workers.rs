@@ -200,6 +200,73 @@ fn codex_worker_thread_is_recorded_and_followup_resumes_the_worker() {
 }
 
 #[test]
+fn saved_claude_session_followup_forks_into_the_new_task_session() {
+    let h = Harness::new();
+    let mut spec = Harness::spec("claude", "original prompt");
+    spec["workload"]["persist_session"] = json!(true);
+    let source = h.submit(&spec);
+    h.wait_status(&source, "succeeded");
+    let source_argv = h.agent_meta(&source);
+    assert!(
+        !source_argv.contains("--no-session-persistence"),
+        "{source_argv}"
+    );
+
+    let followup = h
+        .cmd()
+        .args([
+            "--json",
+            "task",
+            "followup",
+            &source,
+            "--message",
+            "Review the new information",
+            "--thread",
+            THREAD,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        followup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&followup.stderr)
+    );
+    let followup_json: Value = serde_json::from_slice(&followup.stdout).unwrap();
+    let followup_id = followup_json["id"].as_str().unwrap();
+    let followup_show = h.wait_status(followup_id, "succeeded");
+    assert_eq!(followup_show["worker_thread"], followup_id);
+    let argv = h.agent_meta(followup_id);
+    assert!(!argv.contains("--no-session-persistence"), "{argv}");
+    assert!(
+        argv.contains(&format!(
+            "--resume {source} --fork-session --session-id {followup_id}"
+        )),
+        "{argv}"
+    );
+
+    // the fork saves its own session, so the follow-up can be followed up too
+    let second = h
+        .cmd()
+        .args([
+            "--json",
+            "task",
+            "followup",
+            followup_id,
+            "--message",
+            "One more thing",
+            "--thread",
+            THREAD,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[test]
 fn task_followup_reports_each_blocker() {
     let h = Harness::new();
     h.set_control("sleep", "30");
@@ -217,11 +284,14 @@ fn task_followup_reports_each_blocker() {
     // clearing the control before the cancel can let it exit 0 first
     h.clear_controls();
 
-    let claude = h.submit(&Harness::spec("claude", "not codex"));
+    let claude = h.submit(&Harness::spec("claude", "session not saved"));
     h.wait_status(&claude, "succeeded");
     let claude_error = followup_error(&h, &claude);
     assert_eq!(claude_error["error"]["code"], "followup_unavailable");
-    assert_eq!(claude_error["error"]["input"]["reason"], "not_codex");
+    assert_eq!(
+        claude_error["error"]["input"]["reason"],
+        "session_not_saved"
+    );
 
     let codex = h.submit(&Harness::spec("codex", "no session header"));
     let codex_show = h.wait_status(&codex, "succeeded");

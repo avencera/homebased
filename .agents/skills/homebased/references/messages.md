@@ -53,7 +53,7 @@ exists.
 `--task` targets the task's origin thread, not the worker's thread. If the
 source thread is also the destination, the send fails with `message_to_self`.
 Use `homebased task followup <task-id> --message "..."` to resume a finished
-Codex worker with new information. See [submit.md](submit.md).
+Codex worker, or a Claude worker that saved its session, with new information. See [submit.md](submit.md).
 
 ## Send to a running worker
 
@@ -80,7 +80,8 @@ that it acted on the message.
   worker records its thread only when it finishes, so it cannot take a live
   message.
 - `worker_message_unavailable` with `reason: terminal` once the task has ended.
-  Use `homebased task followup` to resume a finished Codex worker.
+  Use `homebased task followup` to resume a finished Codex worker or a Claude
+  worker that saved its session.
 - `task_not_found` or `cluster_lookup_incomplete` when no checked machine has
   the task.
 - `message_to_self` when the source task is the worker's own task.

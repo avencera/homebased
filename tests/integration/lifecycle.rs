@@ -729,6 +729,7 @@ fn reconcile_delivers_a_pending_callback_on_a_terminal_row() {
             extra_args: vec![],
             report_trailer: false,
             resume_thread: None,
+            persist_session: false,
         }),
         cwd: cwd.clone(),
         timeout: spec.timeout,

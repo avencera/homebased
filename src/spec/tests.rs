@@ -248,8 +248,9 @@ fn pointer_on_bad_array_element() {
 }
 
 #[test]
-fn resume_thread_is_rejected_for_non_codex_agents() {
+fn resume_thread_is_rejected_for_agents_that_cannot_resume() {
     let mut value = valid_agent();
+    value["workload"]["agent"] = json!("grok");
     value["workload"]["resume_thread"] = json!("01a0e487-b877-76e2-9dc2-806bff0bf685");
     let err = parse_spec_value(&value).unwrap_err();
     assert!(matches!(
@@ -257,6 +258,18 @@ fn resume_thread_is_rejected_for_non_codex_agents() {
         AppError::InvalidSpec { pointer, value, .. }
             if pointer == "/workload/resume_thread"
                 && value == json!("01a0e487-b877-76e2-9dc2-806bff0bf685")
+    ));
+}
+
+#[test]
+fn persist_session_is_rejected_for_non_claude_agents() {
+    let mut value = valid_agent();
+    value["workload"]["agent"] = json!("codex");
+    value["workload"]["persist_session"] = json!(true);
+    let err = parse_spec_value(&value).unwrap_err();
+    assert!(matches!(
+        err,
+        AppError::InvalidSpec { pointer, .. } if pointer == "/workload/persist_session"
     ));
 }
 
@@ -344,6 +357,7 @@ fn relative_prompt_file_resolves_against_cwd() {
             extra_args: vec![],
             report_trailer: true,
             resume_thread: None,
+            persist_session: false,
         }),
     };
     let normalized = normalize(&spec).unwrap();

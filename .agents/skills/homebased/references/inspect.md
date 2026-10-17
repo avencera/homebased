@@ -52,7 +52,7 @@ When the task is not stored locally, `task show` checks known Fleet machines in 
 The lookup scope is the known Fleet at the time of the request. If any machine cannot give a definitive answer, the CLI returns the retryable `cluster_lookup_incomplete` error with the unchecked machine UUIDs. It returns `task_not_found` only when every machine in that scope gives a definitive negative answer. A known route whose executor cannot be reached is not `task_not_found`.
 
 Use `homebased task followup <id> --message "..."` to resume a terminal Codex
-worker. Run it on the task's origin or execution machine. Only one follow-up
+worker, or a Claude worker submitted with `persist_session: true`. Run it on the task's origin or execution machine. Only one follow-up
 can resume a thread at a time. It reads `worker_thread` from the executor task
 view, including for a Fleet task. See [submit.md](submit.md) for its options
 and limits.
@@ -76,7 +76,7 @@ Streams one `HOMEBASED_EVENT {...}` line per callback event of tasks this sessio
 
 ## Usage
 
-Claude workers run without session persistence, so their tokens never reach `~/.claude/projects`. Homebased reads Claude Code's own accounting from each finished Claude worker's `output.log` and keeps it per task.
+Claude workers run without session persistence unless submitted with `persist_session: true`, so their tokens usually never reach `~/.claude/projects`. Homebased reads Claude Code's own accounting from each finished Claude worker's `output.log` and keeps it per task.
 
 ```bash
 homebased --json task usage --since 7d                   # totals, every grouping, and every task

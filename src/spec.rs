@@ -88,9 +88,13 @@ pub struct SubmitAgentWorkload {
     /// Append the reporting trailer to the child feed
     #[serde(default = "default_true")]
     pub report_trailer: bool,
-    /// Resume this Codex thread
+    /// Resume this worker thread: a Codex thread, or a Claude session saved
+    /// by `persist_session`
     #[serde(default)]
     pub resume_thread: Option<ThreadId>,
+    /// Save the Claude session so a finished worker can take `task followup`
+    #[serde(default)]
+    pub persist_session: bool,
 }
 
 /// Wire task workload: argv only. Command is validated after deserialize so
@@ -169,7 +173,8 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
                     "prompt_file": { "type": "string" },
                     "extra_args": { "type": "array", "items": { "type": "string" } },
                     "report_trailer": { "type": "boolean", "default": true },
-                    "resume_thread": resume_thread
+                    "resume_thread": resume_thread,
+                    "persist_session": { "type": "boolean", "default": false }
                 },
                 "required": ["type", "agent"],
                 "additionalProperties": false,
@@ -291,8 +296,10 @@ pub struct SubmitAgent {
     pub extra_args: Vec<String>,
     /// Trailer flag
     pub report_trailer: bool,
-    /// Thread to resume when the agent is Codex
+    /// Worker thread to resume, for Codex or Claude
     pub resume_thread: Option<ThreadId>,
+    /// Save the Claude session for later follow-ups
+    pub persist_session: bool,
 }
 
 /// Validated submit workload before prompt resolution
@@ -353,9 +360,13 @@ pub struct NormalizedAgentWorkload {
     pub extra_args: Vec<String>,
     /// Trailer flag
     pub report_trailer: bool,
-    /// Thread to resume when the agent is Codex
+    /// Worker thread to resume, for Codex or Claude
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_thread: Option<ThreadId>,
+    /// Save the Claude session for later follow-ups
+    // omitted when false so executors that predate the field still accept the spec
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persist_session: bool,
 }
 
 /// Normalized task workload
@@ -479,7 +490,7 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
             message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
-    validate_resume_thread_field(kind, &content)?;
+    validate_agent_session_fields(kind, &content)?;
     match kind {
         "agent" => {
             let agent: NormalizedAgentWorkload = deserialize_under(&content, "/workload")?;
@@ -643,7 +654,7 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
             message: WORKLOAD_TYPE_MESSAGE.into(),
         })?;
     let content = workload_content(workload_raw);
-    validate_resume_thread_field(kind, &content)?;
+    validate_agent_session_fields(kind, &content)?;
     match kind {
         "agent" => {
             let agent: SubmitAgentWorkload = deserialize_under(&content, "/workload")?;
@@ -657,6 +668,7 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
                 extra_args: agent.extra_args,
                 report_trailer: agent.report_trailer,
                 resume_thread: agent.resume_thread,
+                persist_session: agent.persist_session,
             }))
         }
         "task" => {
@@ -676,16 +688,34 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
     }
 }
 
-fn validate_resume_thread_field(kind: &str, workload: &Value) -> Result<(), AppError> {
+/// Codex always keeps its threads, so it can resume any of them. Claude keeps
+/// a session only under `persist_session`, which no other agent supports
+fn validate_agent_session_fields(kind: &str, workload: &Value) -> Result<(), AppError> {
+    let agent = if kind == "agent" {
+        workload.get("agent").and_then(Value::as_str)
+    } else {
+        None
+    };
     if let Some(resume_thread) = workload
         .get("resume_thread")
         .filter(|value| !value.is_null())
-        && (kind != "agent" || workload.get("agent").and_then(Value::as_str) != Some("codex"))
+        && !matches!(agent, Some("codex" | "claude"))
     {
         return Err(AppError::InvalidSpec {
             pointer: "/workload/resume_thread".into(),
             value: resume_thread.clone(),
-            message: "resume_thread is only valid with agent: codex".into(),
+            message: "resume_thread is only valid with agent: codex or claude".into(),
+        });
+    }
+    if let Some(persist_session) = workload
+        .get("persist_session")
+        .filter(|value| value.as_bool() == Some(true))
+        && agent != Some("claude")
+    {
+        return Err(AppError::InvalidSpec {
+            pointer: "/workload/persist_session".into(),
+            value: persist_session.clone(),
+            message: "persist_session is only valid with agent: claude".into(),
         });
     }
     Ok(())
@@ -754,6 +784,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
                 extra_args: agent.extra_args.clone(),
                 report_trailer: agent.report_trailer,
                 resume_thread: agent.resume_thread,
+                persist_session: agent.persist_session,
             })
         }
         SubmitWorkloadValidated::Task { command } => {

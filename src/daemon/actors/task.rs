@@ -726,6 +726,7 @@ mod tests {
                 extra_args: vec![],
                 report_trailer: false,
                 resume_thread: None,
+                persist_session: false,
             }),
             cwd,
             timeout: spec.timeout,

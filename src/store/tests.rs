@@ -30,6 +30,7 @@ fn agent_row(id: TaskId) -> TaskRow {
             extra_args: vec!["--verbose".into()],
             report_trailer: true,
             resume_thread: None,
+            persist_session: false,
         }),
         cwd: Path::new("/tmp").to_path_buf(),
         timeout: Duration::from_secs(4 * 3600),

@@ -50,6 +50,7 @@ fn row(state: TaskState) -> TaskRow {
             extra_args: vec![],
             report_trailer: true,
             resume_thread: None,
+            persist_session: false,
         }),
         cwd: PathBuf::from("/work"),
         timeout: Duration::from_secs(4 * 3600),
@@ -127,6 +128,7 @@ fn workload_view_publishes_reasoning_level() {
         extra_args: vec!["--config".into(), "model_reasoning_effort=\"max\"".into()],
         report_trailer: true,
         resume_thread: None,
+        persist_session: false,
     });
     let json = serde_json::to_value(WorkloadView::from(&workload)).unwrap();
     assert_eq!(
@@ -193,6 +195,7 @@ fn codex_luna(extra_args: &[String]) -> Workload {
         extra_args: extra_args.to_vec(),
         report_trailer: true,
         resume_thread: None,
+        persist_session: false,
     })
 }
 

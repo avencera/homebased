@@ -365,6 +365,7 @@ pub fn invocation_from_normalized(
                     cwd,
                     extra_args: &agent.extra_args,
                     resume_thread: agent.resume_thread,
+                    persist_session: agent.persist_session,
                 },
                 &binary,
                 feed,
@@ -427,6 +428,7 @@ pub fn invocation_from_workload(
                     cwd,
                     extra_args: &agent.extra_args,
                     resume_thread: agent.resume_thread,
+                    persist_session: agent.persist_session,
                 },
                 binary,
                 agent_prompt_feed,
@@ -473,6 +475,7 @@ pub fn persist_agent_workload(agent: &NormalizedAgentWorkload) -> AgentWorkload 
         extra_args: agent.extra_args.clone(),
         report_trailer: agent.report_trailer,
         resume_thread: agent.resume_thread,
+        persist_session: agent.persist_session,
     }
 }
 

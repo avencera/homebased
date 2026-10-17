@@ -147,9 +147,10 @@ Agent-only fields under `workload`:
 | `agent` | yes | `codex`, `claude`, `grok`, or `opencode`. |
 | `prompt` or `prompt_file` | exactly one | For local tasks, a relative `prompt_file` resolves against `cwd`. For remote tasks, use an absolute path on the origin machine. The CLI reads that file and sends its text; the executor never receives the origin path. Prefer `prompt_file`. |
 | `model` | no | Passed through unchanged: `-m` for codex and grok, `--model` for claude and opencode. OpenCode accepts provider-qualified values such as `provider/model#variant`; Homebased does not maintain a model allowlist. |
-| `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. Claude runs under a session id that Homebased assigns, so its `extra_args` cannot contain `--session-id`, `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, or `--from-pr` (`invalid_spec`). An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. OpenCode defaults to `--format json` and allows an explicit format, but reserves the agent, `cwd`, model, prompt, session, server, and standalone controls. |
+| `extra_args` | no | Array of strings added after the unattended flags. Exact spellings of Homebased-managed standalone switches are reserved tokens: Homebased treats every exact match as that switch, not as another option's value, and emits each at most once. Other tokens keep their order and spelling. Claude defaults to `--output-format stream-json --verbose`. Claude runs under a session id that Homebased assigns, so its `extra_args` cannot contain `--session-id`, `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, or `--from-pr` (`invalid_spec`); use `resume_thread` instead. An explicit `--output-format` in either `--output-format VALUE` or `--output-format=VALUE` form replaces the format default; `stream-json` still gets `--verbose` unless `extra_args` already has it. OpenCode defaults to `--format json` and allows an explicit format, but reserves the agent, `cwd`, model, prompt, session, server, and standalone controls. |
 | `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. With the trailer, an agent that exits 0 without reporting ends `TASK_FAILED` with `reason: "no_report"`; without it, exit 0 alone is success. |
-| `resume_thread` | no | A non-null value is Codex-only. Null is treated as absent for any agent. Resume this Codex thread and send the prompt on stdin. Use `task followup` for a terminal worker; only one follow-up can resume a thread at a time. |
+| `resume_thread` | no | A non-null value is valid only for `codex` and `claude`. Null is treated as absent for any agent. Codex resumes this thread and gets the prompt on stdin; only one follow-up can resume a Codex thread at a time. Claude forks this saved session into the new task's session id, so the source transcript is unchanged and several follow-ups can branch from it. Use `task followup` for a terminal worker. |
+| `persist_session` | no | Claude-only, default `false`. `true` saves the worker's session under `~/.claude/projects` so `task followup` can resume it after it ends. It also lists the session in `claude --resume` for that `cwd`. Without it, the session is discarded at exit. |
 
 Task-only fields under `workload`:
 
@@ -242,17 +243,19 @@ Tell the user the task id, the workload, the inactivity timeout, and that result
 
 To change course while a Claude worker is still running, send it new instructions with `homebased message send --worker <task-id>` instead; see [messages.md](messages.md).
 
-Use `task followup` to resume a finished Codex worker with its prior thread context:
+Use `task followup` to resume a finished Codex worker, or a finished Claude worker that saved its session, with its prior context:
 
 ```bash
 homebased --json task followup <task-id> \
   --message "The missing detail is X. Continue the task and report the result."
 ```
 
-The source must be a terminal Codex task with a recorded `worker_thread`. The
-thread is recorded when a Codex task printed a session header, whether it
-succeeds, fails, is cancelled, or is lost. Run follow-up on the task's origin
-or execution machine.
+The source must be a terminal Codex task with a recorded `worker_thread`, or a
+terminal Claude task submitted with `persist_session: true`. A Codex thread is
+recorded when the task printed a session header, whether it succeeds, fails, is
+cancelled, or is lost. A Claude follow-up forks the saved session into its own
+session, which it also saves, so it can be followed up in turn. Run follow-up
+on the task's origin or execution machine, where the session is stored.
 Followup keeps its working directory, timeout, model, extra arguments, and
 report-trailer setting. Use `--thread <uuid>` to choose the thread that receives
 the new task's events, and `--name <name>` to set its task name.
@@ -261,6 +264,7 @@ the new task's events, and `--name <name>` to set its task name.
 than its parent task's thread. `--dry-run` prints the normal submit preview
 without starting the worker. A running task cannot be resumed because that
 would put two writers on one thread. `resume_thread_busy` names the active
-task; wait for its event before trying again. For other agents, write a new
+Codex task; wait for its event before trying again. For other agents, or a
+Claude task that did not save its session, write a new
 prompt that includes the answer or fix and points to the previous task's
 `evidence` directory.

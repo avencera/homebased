@@ -88,49 +88,76 @@ async fn followup_source(
     Path(id): Path<TaskId>,
 ) -> Result<Json<TaskFollowupSource>, AppError> {
     if let Some(row) = call(&state.store, |reply| StoreMsg::GetTask { id, reply }).await? {
-        return followup_source_from_workload(id, &row.workload).map(Json);
+        let Workload::Agent(agent) = &row.workload else {
+            return Err(followup_unavailable(id, FollowupBlocker::UnsupportedAgent));
+        };
+        return followup_source_for(
+            id,
+            FollowupAgent {
+                kind: agent.agent.kind,
+                model: agent.agent.model.as_ref(),
+                extra_args: &agent.extra_args,
+                report_trailer: agent.report_trailer,
+                persist_session: agent.persist_session,
+            },
+        )
+        .map(Json);
     }
     let route = call(&state.store, |reply| StoreMsg::OriginRoute { id, reply })
         .await?
         .ok_or(AppError::TaskNotFound { id })?;
-    match &route.spec.workload {
-        NormalizedWorkload::Agent(agent) if agent.agent == AgentKind::Codex => {
-            Ok(Json(TaskFollowupSource {
-                api_version: API_VERSION,
-                model: agent.model.clone(),
-                extra_args: agent.extra_args.clone(),
-                report_trailer: agent.report_trailer,
-            }))
-        }
-        _ => Err(AppError::FollowupUnavailable {
-            task: id,
-            reason: FollowupBlocker::NotCodex,
-        }),
-    }
+    let NormalizedWorkload::Agent(agent) = &route.spec.workload else {
+        return Err(followup_unavailable(id, FollowupBlocker::UnsupportedAgent));
+    };
+    followup_source_for(
+        id,
+        FollowupAgent {
+            kind: agent.agent,
+            model: agent.model.as_ref(),
+            extra_args: &agent.extra_args,
+            report_trailer: agent.report_trailer,
+            persist_session: agent.persist_session,
+        },
+    )
+    .map(Json)
 }
 
-fn followup_source_from_workload(
+/// Agent fields shared by the persisted and the origin-route workload
+struct FollowupAgent<'a> {
+    kind: AgentKind,
+    model: Option<&'a String>,
+    extra_args: &'a [String],
+    report_trailer: bool,
+    persist_session: bool,
+}
+
+fn followup_source_for(
     id: TaskId,
-    workload: &Workload,
+    agent: FollowupAgent<'_>,
 ) -> Result<TaskFollowupSource, AppError> {
-    let Workload::Agent(agent) = workload else {
-        return Err(AppError::FollowupUnavailable {
-            task: id,
-            reason: FollowupBlocker::NotCodex,
-        });
-    };
-    if agent.agent.kind != AgentKind::Codex {
-        return Err(AppError::FollowupUnavailable {
-            task: id,
-            reason: FollowupBlocker::NotCodex,
-        });
+    match agent.kind {
+        AgentKind::Codex => {}
+        // without a saved transcript there is nothing for `--resume` to load
+        AgentKind::Claude if agent.persist_session => {}
+        AgentKind::Claude => {
+            return Err(followup_unavailable(id, FollowupBlocker::SessionNotSaved));
+        }
+        AgentKind::Grok | AgentKind::OpenCode => {
+            return Err(followup_unavailable(id, FollowupBlocker::UnsupportedAgent));
+        }
     }
     Ok(TaskFollowupSource {
         api_version: API_VERSION,
-        model: agent.agent.model.clone(),
-        extra_args: agent.extra_args.clone(),
+        agent: agent.kind,
+        model: agent.model.cloned(),
+        extra_args: agent.extra_args.to_vec(),
         report_trailer: agent.report_trailer,
+        persist_session: agent.persist_session,
     })
+}
+
+fn followup_unavailable(task: TaskId, reason: FollowupBlocker) -> AppError {
+    AppError::FollowupUnavailable { task, reason }
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusBody>, AppError> {

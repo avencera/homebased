@@ -266,6 +266,7 @@ pub(super) fn park_on(
             extra_args: agent.extra_args.clone(),
             report_trailer: agent.report_trailer,
             resume_thread,
+            persist_session: agent.persist_session,
         }),
     };
     let held = OriginRoute::new_held(NewHeldRoute {

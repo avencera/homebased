@@ -150,6 +150,7 @@ fn unattended_argv(kind: AgentKind, cwd: &Path, prompt_file: Option<&Path>) -> C
             cwd,
             extra_args: &[],
             resume_thread: None,
+            persist_session: false,
         },
         &live_binary(kind),
         feed,

@@ -940,9 +940,12 @@ pub struct AgentWorkload {
     /// Whether the reporting trailer is fed to the child
     #[serde(default = "default_true")]
     pub report_trailer: bool,
-    /// Existing Codex conversation to resume
+    /// Existing worker conversation to resume, Codex or Claude
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_thread: Option<ThreadId>,
+    /// Whether a Claude worker saves its session for follow-ups
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persist_session: bool,
 }
 
 fn default_true() -> bool {

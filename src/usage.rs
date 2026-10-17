@@ -1,8 +1,9 @@
 //! Token usage of agent workers, read from their output when they stop
 //!
-//! Claude workers run with `--no-session-persistence`, so their usage never
-//! reaches `~/.claude/projects`. The task's `output.log` still holds Claude
-//! Code's own accounting, and this module records it per task
+//! Claude workers run with `--no-session-persistence` unless their spec sets
+//! `persist_session`, so their usage usually never reaches `~/.claude/projects`.
+//! The task's `output.log` still holds Claude Code's own accounting, and this
+//! module records it per task
 
 mod claude;
 mod report;

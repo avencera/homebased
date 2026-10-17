@@ -207,18 +207,22 @@ impl TaskSummary {
     }
 }
 
-/// Private Codex settings used to resume a task from the local CLI.
+/// Private agent settings used to resume a task from the local CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskFollowupSource {
     /// Public API version.
     pub api_version: u32,
+    /// Agent CLI that ran the source task, Codex or Claude.
+    pub agent: crate::domain::AgentKind,
     /// Model selected by the source task.
     pub model: Option<String>,
     /// Extra arguments selected by the source task.
     pub extra_args: Vec<String>,
-    /// Whether the source task fed the reporting trailer to Codex.
+    /// Whether the source task fed the reporting trailer to its agent.
     pub report_trailer: bool,
+    /// Whether the source task saved its Claude session. Always false for Codex.
+    pub persist_session: bool,
 }
 
 /// `GET /v1/tasks`.
