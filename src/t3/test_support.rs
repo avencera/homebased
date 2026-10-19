@@ -275,9 +275,15 @@ impl V2State {
                 thread_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL DEFAULT 'project',
                 title TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '2026-10-02T19:00:00Z',
                 archived_at TEXT,
                 deleted_at TEXT,
                 payload_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE TABLE projection_projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_root TEXT NOT NULL
              );
              CREATE TABLE orchestration_v2_projection_provider_threads (
                 provider_thread_id TEXT PRIMARY KEY,
@@ -315,6 +321,30 @@ impl V2State {
                 "INSERT INTO orchestration_v2_projection_threads (thread_id, title, archived_at)
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![thread_id, title, archived_at],
+            )
+            .unwrap();
+        self
+    }
+
+    /// The project that threads join by default
+    pub(crate) fn project(self, title: &str, workspace_root: &str) -> Self {
+        self.0
+            .execute(
+                "INSERT INTO projection_projects (project_id, title, workspace_root)
+                 VALUES ('project', ?1, ?2)",
+                rusqlite::params![title, workspace_root],
+            )
+            .unwrap();
+        self
+    }
+
+    /// Replace the T3 payload of `thread_id`
+    pub(crate) fn payload(self, thread_id: &str, payload: &serde_json::Value) -> Self {
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_threads SET payload_json = ?2
+                 WHERE thread_id = ?1",
+                rusqlite::params![thread_id, payload.to_string()],
             )
             .unwrap();
         self

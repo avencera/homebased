@@ -600,14 +600,37 @@ const ReleaseResultSchema = Schema.Struct({
 });
 export type ReleaseResult = typeof ReleaseResultSchema.Type;
 
+const ThreadPullRequestSchema = Schema.Struct({
+	number: Schema.Number,
+	url: Schema.String,
+	state: Schema.NullOr(Schema.String)
+});
+
+/** What T3 records about a thread beyond its title. Every field may be missing. */
+const ThreadDetailsSchema = Schema.Struct({
+	project: Schema.NullOr(Schema.String),
+	workspace: Schema.NullOr(Schema.String),
+	branch: Schema.NullOr(Schema.String),
+	model: Schema.NullOr(Schema.String),
+	effort: Schema.NullOr(Schema.String),
+	parent_title: Schema.NullOr(Schema.String),
+	pull_request: Schema.NullOr(ThreadPullRequestSchema),
+	created_at: Schema.NullOr(Schema.String)
+});
+export type ThreadDetails = typeof ThreadDetailsSchema.Type;
+
 const LargeClaudeThreadSchema = Schema.Struct({
 	session: Schema.String,
 	t3_thread: Schema.String,
 	title: Schema.String,
 	settled: Schema.Boolean,
 	tokens: Schema.Number,
+	// older daemons do not send it
+	tokens_estimated: Schema.optional(Schema.Boolean),
 	last_active: Schema.String,
-	cache_warm: Schema.Boolean
+	cache_warm: Schema.Boolean,
+	// older daemons do not send it
+	details: Schema.optional(ThreadDetailsSchema)
 });
 export type LargeClaudeThread = typeof LargeClaudeThreadSchema.Type;
 
@@ -815,9 +838,18 @@ export function releaseAttention(
 	);
 }
 
-/** `GET /v1/claude/threads`: open T3 Claude threads with a large context, largest first. */
-export function fetchLargeClaudeThreads(): Promise<LargeClaudeThreads> {
-	return getJson('/claude/threads', LargeClaudeThreadsSchema);
+/**
+ * `GET /v1/claude/threads`: open T3 Claude threads with a large context, largest first. `all`
+ * lists every open thread, and `include` adds those sessions at any size.
+ */
+export function fetchLargeClaudeThreads(
+	options: { all?: boolean; include?: readonly string[] } = {}
+): Promise<LargeClaudeThreads> {
+	const query = new URLSearchParams();
+	if (options.all) query.set('all', 'true');
+	if (options.include?.length) query.set('include', options.include.join(','));
+	const search = query.size > 0 ? `?${query}` : '';
+	return getJson(`/claude/threads${search}`, LargeClaudeThreadsSchema);
 }
 
 /** `GET /v1/usage`: Claude token use and cost of finished tasks since `since`, optionally of one thread. */

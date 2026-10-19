@@ -12,7 +12,8 @@
 //!
 //! The session transcript (`~/.claude/projects/<cwd key>/<id>.jsonl`) is the
 //! source: each assistant line carries the API `usage` of its request, and a
-//! `compact_boundary` system line carries the size after a compaction
+//! `compact_boundary` system line carries the size of the conversation after a
+//! compaction, which the next request then reports in full
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -50,10 +51,21 @@ pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
 /// misses when tool output after it fills the suffix, and then nothing compacts
 const TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Context the system prompt and tool definitions add to the conversation
+/// size a compaction records
+///
+/// On 23 compactions on the Mac mini, the first request after each read 26k to
+/// 44k more than the recorded size, the next prompt included. This puts the
+/// estimate within 8% of that request at the median and 23% at worst
+const PROMPT_OVERHEAD_TOKENS: u64 = 30_000;
+
 /// Context size and last activity of a Claude session
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextUse {
     tokens: u64,
+    /// Whether `tokens` is an estimate after a compaction, until the next
+    /// request reports the real size
+    estimated: bool,
     last_active: DateTime<Utc>,
 }
 
@@ -111,6 +123,12 @@ impl ContextUse {
         self.tokens
     }
 
+    /// Whether [`Self::tokens`] is an estimate, until the next request reports
+    /// the real size
+    pub(crate) fn tokens_estimated(&self) -> bool {
+        self.estimated
+    }
+
     /// Time of the last session activity
     pub(crate) fn last_active(&self) -> DateTime<Utc> {
         self.last_active
@@ -132,9 +150,19 @@ impl ContextUse {
                 continue;
             };
             let last_active = *last_active.get_or_insert(at);
-            if let Some(tokens) = line.context_tokens() {
+            if line.subtype.as_deref() == Some("compact_boundary") {
+                // an unknown size after compaction is small enough to skip
+                let conversation = line.compact_metadata.and_then(|meta| meta.post_tokens);
+                return Some(Self {
+                    tokens: conversation.unwrap_or(0) + PROMPT_OVERHEAD_TOKENS,
+                    estimated: true,
+                    last_active,
+                });
+            }
+            if let Some(tokens) = line.request_tokens() {
                 return Some(Self {
                     tokens,
+                    estimated: false,
                     last_active,
                 });
             }
@@ -158,15 +186,7 @@ struct Line {
 }
 
 impl Line {
-    fn context_tokens(&self) -> Option<u64> {
-        if self.subtype.as_deref() == Some("compact_boundary") {
-            // an unknown size after compaction is small enough to skip
-            let after = self
-                .compact_metadata
-                .as_ref()
-                .and_then(|meta| meta.post_tokens);
-            return Some(after.unwrap_or(0));
-        }
+    fn request_tokens(&self) -> Option<u64> {
         let usage = self.message.as_ref()?.usage.as_ref()?;
         // the reply joins the context of the next request
         let tokens = [
@@ -309,19 +329,21 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_since_the_last_request_resets_the_size() {
-        let compacted = context(&[
-            assistant(200, 700_000),
-            json!({
-                "type": "system",
-                "subtype": "compact_boundary",
-                "timestamp": at(120),
-                "compactMetadata": { "preTokens": 701_302, "postTokens": 14_131 }
-            }),
-        ])
-        .unwrap();
+    fn a_compaction_since_the_last_request_resets_the_size_until_the_next_request() {
+        let boundary = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "timestamp": at(120),
+            "compactMetadata": { "preTokens": 701_302, "postTokens": 14_131 }
+        });
 
-        assert_eq!(compacted.tokens(), 14_131);
+        let compacted = context(&[assistant(200, 700_000), boundary.clone()]).unwrap();
+        assert_eq!(compacted.tokens(), 14_131 + PROMPT_OVERHEAD_TOKENS);
+        assert!(compacted.tokens_estimated());
         assert_eq!(compacted.turn_start(now()), TurnStart::Auto);
+
+        let measured = context(&[assistant(200, 700_000), boundary, assistant(5, 40_000)]).unwrap();
+        assert_eq!(measured.tokens(), 41_302);
+        assert!(!measured.tokens_estimated());
     }
 }

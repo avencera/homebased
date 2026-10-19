@@ -335,6 +335,43 @@ pub(crate) struct OpenClaudeThread {
     pub(crate) title: String,
     /// Whether the thread is settled in T3's sidebar
     pub(crate) settled: bool,
+    /// Project, branch, model, and other context T3 records for the thread
+    pub(crate) details: ThreadDetails,
+}
+
+/// What T3 records about a thread beyond its title, for display
+///
+/// Every field is optional: older threads lack some of them, and they come
+/// from T3 payloads that no protocol check covers
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ThreadDetails {
+    /// T3 project title
+    pub project: Option<String>,
+    /// Directory the thread works in: its worktree, else the project root
+    pub workspace: Option<String>,
+    /// Git branch of the thread
+    pub branch: Option<String>,
+    /// Model the thread runs
+    pub model: Option<String>,
+    /// Reasoning effort of the model
+    pub effort: Option<String>,
+    /// Title of the thread that started this one as a subagent
+    pub parent_title: Option<String>,
+    /// Latest pull request linked to the thread
+    pub pull_request: Option<PullRequest>,
+    /// When T3 created the thread
+    pub created_at: Option<String>,
+}
+
+/// Pull request linked to a T3 thread
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PullRequest {
+    /// Pull request number
+    pub number: i64,
+    /// Web address of the pull request
+    pub url: String,
+    /// `open`, `closed`, or `merged` when T3 last synced it
+    pub state: Option<String>,
 }
 
 /// Session id, T3 thread id, title, and settled flag of one row in a state database
@@ -349,6 +386,7 @@ pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, 
         return Ok(Vec::new());
     }
     let rows = v2::open_claude_threads(&state)?;
+    let details = v2::thread_details(&state);
 
     let mut threads: Vec<OpenClaudeThread> = Vec::new();
     for (session, t3_thread, title, settled) in rows {
@@ -356,12 +394,19 @@ pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, 
         let Ok(session) = session.parse::<ThreadId>() else {
             continue;
         };
-        if !threads.iter().any(|thread| thread.session == session) {
+        // rows come newest first, and a T3 thread resumes only its newest
+        // session, so an older session of a listed thread is left out
+        let listed = threads
+            .iter()
+            .any(|thread| thread.session == session || thread.t3_thread == t3_thread);
+        if !listed {
+            let details = details.get(&t3_thread).cloned().unwrap_or_default();
             threads.push(OpenClaudeThread {
                 session,
                 t3_thread,
                 title,
                 settled,
+                details,
             });
         }
     }
@@ -974,8 +1019,9 @@ mod tests {
         rpc_exit, ticket,
     };
     use super::{
-        ProbeStatus, ProviderThread, T3Cli, T3Env, TurnStart, WakeOutcome, compact_thread,
-        deterministic_id, load_runtime, open_claude_threads, owner, probe, wake_thread_checked,
+        ProbeStatus, ProviderThread, PullRequest, T3Cli, T3Env, ThreadDetails, TurnStart,
+        WakeOutcome, compact_thread, deterministic_id, load_runtime, open_claude_threads, owner,
+        probe, wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1178,6 +1224,87 @@ mod tests {
         assert_eq!(payload["commandId"], second_rpc["payload"]["commandId"]);
         assert_eq!(payload["messageId"], second_rpc["payload"]["messageId"]);
         assert_eq!(fixture.revocations(), ["fake-session", "fake-session"]);
+    }
+
+    #[test]
+    fn reads_the_project_branch_model_and_parent_of_open_threads() {
+        let fixture = Fixture::empty(None, live_pid());
+        let parent_session = "0b9f1a5e-3a8e-4a57-9d55-0d3c1b8f6e21";
+        fixture
+            .v2_state()
+            .project("homebased", "/code/homebased")
+            .thread("parent", "Plan the release", false)
+            .native("claudeAgent", parent_session, "parent")
+            .thread(T3_THREAD_ID, "Port the renderer", false)
+            .payload(
+                T3_THREAD_ID,
+                &json!({
+                    "branch": "t3/port-renderer",
+                    "worktreePath": "/worktrees/t3-7d0d1506",
+                    "modelSelection": {
+                        "model": "claude-opus-5-5",
+                        "options": [{ "id": "thinking", "value": true }, { "id": "effort", "value": "high" }]
+                    },
+                    "lineage": { "parentThreadId": "parent" },
+                    "pullRequests": [
+                        { "number": 7, "url": "https://example.test/pull/7", "snapshot": { "state": "closed" } },
+                        { "number": 9, "url": "https://example.test/pull/9", "snapshot": { "state": "open" } }
+                    ]
+                }),
+            )
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
+
+        let open = open_claude_threads(&fixture.env).unwrap();
+        let details = |t3_thread: &str| {
+            let thread = open.iter().find(|thread| thread.t3_thread == t3_thread);
+            thread.unwrap().details.clone()
+        };
+
+        assert_eq!(
+            details(T3_THREAD_ID),
+            ThreadDetails {
+                project: Some("homebased".to_owned()),
+                workspace: Some("/worktrees/t3-7d0d1506".to_owned()),
+                branch: Some("t3/port-renderer".to_owned()),
+                model: Some("claude-opus-5-5".to_owned()),
+                effort: Some("high".to_owned()),
+                parent_title: Some("Plan the release".to_owned()),
+                pull_request: Some(PullRequest {
+                    number: 9,
+                    url: "https://example.test/pull/9".to_owned(),
+                    state: Some("open".to_owned()),
+                }),
+                created_at: Some("2026-10-02T19:00:00Z".to_owned()),
+            }
+        );
+        // a thread without a worktree works in its project root
+        assert_eq!(
+            details("parent"),
+            ThreadDetails {
+                project: Some("homebased".to_owned()),
+                workspace: Some("/code/homebased".to_owned()),
+                created_at: Some("2026-10-02T19:00:00Z".to_owned()),
+                ..ThreadDetails::default()
+            }
+        );
+    }
+
+    #[test]
+    fn lists_only_the_session_a_t3_thread_resumes() {
+        let fixture = Fixture::empty(None, live_pid());
+        let imported = "5f0c9a52-8e44-4c3e-9a63-6b1d2c7e8f10";
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Imported then resumed", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID)
+            .legacy("claudeAgent", "resume", imported, T3_THREAD_ID);
+
+        let open = open_claude_threads(&fixture.env).unwrap();
+        let sessions: Vec<String> = open
+            .iter()
+            .map(|thread| thread.session.to_string())
+            .collect();
+        assert_eq!(sessions, [SESSION_ID]);
     }
 
     #[test]

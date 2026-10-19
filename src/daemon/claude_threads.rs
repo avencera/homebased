@@ -3,21 +3,22 @@
 //!
 //! A thread is listed when T3 Code owns its Claude session, the T3 thread is
 //! neither archived nor deleted, and the session transcript shows at least
-//! [`MIN_IDLE_CONTEXT_TOKENS`] context tokens. Compaction goes through T3, which
-//! holds messages that arrive during it
+//! [`MIN_IDLE_CONTEXT_TOKENS`] context tokens, or the dashboard asked for every
+//! thread or for its session, to follow its size after a compaction.
+//! Compaction goes through T3, which holds messages that arrive during it
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::compaction_log::{self, Trigger};
 use crate::callback::stale_context::{ContextUse, MIN_IDLE_CONTEXT_TOKENS};
 use crate::domain::{API_VERSION, ThreadId};
 use crate::error::AppError;
-use crate::t3::{T3Env, WakeOutcome, compact_thread, open_claude_threads};
+use crate::t3::{T3Env, ThreadDetails, WakeOutcome, compact_thread, open_claude_threads};
 
 /// One open Claude thread with a large context
 #[derive(Debug, Serialize)]
@@ -32,11 +33,16 @@ pub struct LargeClaudeThread {
     pub settled: bool,
     /// Context tokens of the last request or compaction
     pub tokens: u64,
+    /// Whether `tokens` is an estimate after a compaction, until the next
+    /// request reports the real size
+    pub tokens_estimated: bool,
     /// Time of the last session activity
     pub last_active: DateTime<Utc>,
     /// Whether the one-hour prompt cache is still alive, so compacting reads
     /// the context at the cached price
     pub cache_warm: bool,
+    /// Project, branch, model, and other context T3 records for the thread
+    pub details: ThreadDetails,
 }
 
 /// `GET /v1/claude/threads` answer
@@ -86,8 +92,45 @@ pub fn control_routes() -> Router<AppState> {
     Router::new().route("/v1/claude/threads/{session}/compact", post(compact))
 }
 
-async fn list() -> Result<Json<LargeClaudeThreads>, AppError> {
-    let threads = run_blocking(|| large_threads(&T3Env::from_env(), Utc::now())).await??;
+/// `GET /v1/claude/threads` query
+#[derive(Debug, Default, Deserialize)]
+struct ListQuery {
+    /// List every open thread, whatever its size
+    #[serde(default)]
+    all: bool,
+    /// Comma-separated sessions to list below the size too, so the dashboard
+    /// can show a thread's size after it compacts
+    include: Option<String>,
+}
+
+/// Which open threads a listing returns
+#[derive(Debug, Default)]
+struct Listing {
+    all: bool,
+    include: Vec<ThreadId>,
+}
+
+impl Listing {
+    fn lists(&self, session: ThreadId, tokens: u64) -> bool {
+        self.all || tokens >= MIN_IDLE_CONTEXT_TOKENS || self.include.contains(&session)
+    }
+}
+
+impl From<ListQuery> for Listing {
+    fn from(query: ListQuery) -> Self {
+        let ids = query.include.as_deref().unwrap_or_default().split(',');
+        Self {
+            all: query.all,
+            // a stale or mistyped id names no thread, so it is skipped
+            include: ids.filter_map(|id| id.trim().parse().ok()).collect(),
+        }
+    }
+}
+
+async fn list(Query(query): Query<ListQuery>) -> Result<Json<LargeClaudeThreads>, AppError> {
+    let listing = Listing::from(query);
+    let threads =
+        run_blocking(move || large_threads(&T3Env::from_env(), Utc::now(), &listing)).await??;
     Ok(Json(LargeClaudeThreads {
         api_version: API_VERSION,
         min_tokens: MIN_IDLE_CONTEXT_TOKENS,
@@ -109,22 +152,31 @@ async fn compact(
     }))
 }
 
-/// Open T3 Claude threads whose context reached the listing size
-fn large_threads(env: &T3Env, now: DateTime<Utc>) -> Result<Vec<LargeClaudeThread>, AppError> {
+/// Open T3 Claude threads whose context reached the listing size, or the
+/// others that `listing` asks for
+fn large_threads(
+    env: &T3Env,
+    now: DateTime<Utc>,
+    listing: &Listing,
+) -> Result<Vec<LargeClaudeThread>, AppError> {
     let open = open_claude_threads(env).map_err(|message| AppError::Internal { message })?;
     let mut threads: Vec<LargeClaudeThread> = open
         .into_iter()
         .filter_map(|thread| {
             let usage = ContextUse::read(&env.home, thread.session)?;
-            (usage.tokens() >= MIN_IDLE_CONTEXT_TOKENS).then(|| LargeClaudeThread {
-                session: thread.session,
-                t3_thread: thread.t3_thread,
-                title: thread.title,
-                settled: thread.settled,
-                tokens: usage.tokens(),
-                last_active: usage.last_active(),
-                cache_warm: usage.cache_warm(now),
-            })
+            listing
+                .lists(thread.session, usage.tokens())
+                .then(|| LargeClaudeThread {
+                    session: thread.session,
+                    t3_thread: thread.t3_thread,
+                    title: thread.title,
+                    settled: thread.settled,
+                    tokens: usage.tokens(),
+                    tokens_estimated: usage.tokens_estimated(),
+                    last_active: usage.last_active(),
+                    cache_warm: usage.cache_warm(now),
+                    details: thread.details,
+                })
         })
         .collect();
     threads.sort_by_key(|thread| std::cmp::Reverse(thread.tokens));
@@ -182,7 +234,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::large_threads;
+    use super::{Listing, large_threads};
     use crate::t3::T3Env;
     use crate::t3::test_support::V2State;
 
@@ -220,21 +272,43 @@ mod tests {
             transcript(home.path(), &session, minutes_ago, tokens);
             sessions.push(session);
         }
-        let (warm, cold) = (sessions[0].clone(), sessions[1].clone());
-
+        let (warm, cold, small) = (
+            sessions[0].clone(),
+            sessions[1].clone(),
+            sessions[2].clone(),
+        );
         let env = T3Env::new(home.path().to_path_buf(), "/bin".into());
-        let threads = large_threads(&env, Utc::now()).unwrap();
+        let listed = |listing: Listing| -> Vec<(String, String, bool)> {
+            let threads = large_threads(&env, Utc::now(), &listing).unwrap();
+            threads
+                .into_iter()
+                .map(|thread| (thread.session.to_string(), thread.title, thread.cache_warm))
+                .collect()
+        };
 
-        let listed: Vec<_> = threads
-            .iter()
-            .map(|thread| {
-                (
-                    thread.session.to_string(),
-                    thread.title.as_str(),
-                    thread.cache_warm,
-                )
-            })
-            .collect();
-        assert_eq!(listed, [(cold, "cold", false), (warm, "warm", true)]);
+        assert_eq!(
+            listed(Listing::default()),
+            [
+                (cold.clone(), "cold".to_owned(), false),
+                (warm.clone(), "warm".to_owned(), true)
+            ]
+        );
+        // a requested session is listed below the size, but never a closed thread
+        let include = vec![sessions[2].parse().unwrap(), sessions[3].parse().unwrap()];
+        let with_small = [
+            (cold, "cold".to_owned(), false),
+            (warm, "warm".to_owned(), true),
+            (small, "small".to_owned(), true),
+        ];
+        let requested = Listing {
+            all: false,
+            include,
+        };
+        assert_eq!(listed(requested), with_small);
+        let all = Listing {
+            all: true,
+            include: Vec::new(),
+        };
+        assert_eq!(listed(all), with_small);
     }
 }

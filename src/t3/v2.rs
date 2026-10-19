@@ -36,18 +36,21 @@
 //!   would steer into it, so the message after it uses `queue_after_active`
 //!   without `deliveryIntent`, like the web client's "compact first" send
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Row};
 use serde_json::{Value, json};
+use tracing::debug;
 use uuid::Uuid;
 
 use super::hold;
 use super::rpc::{self, Exit};
 use super::{
     ApiFailure, COMPACT_COMMAND, ClaudeThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
-    TurnStart, claude_thread_rows, deterministic_id, failed, passed, state_connection,
+    PullRequest, ThreadDetails, TurnStart, claude_thread_rows, deterministic_id, failed, passed,
+    state_connection,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -107,6 +110,26 @@ const OPEN_LEGACY_CLAUDE_THREADS_SQL: &str = "
       AND json_valid(r.resume_cursor_json)
       AND json_type(r.resume_cursor_json, '$.resume') = 'text'
     ORDER BY r.last_seen_at DESC";
+// effort is one entry of the model options list, and the last linked pull
+// request is the newest
+const THREAD_DETAILS_SQL: &str = "
+    SELECT t.thread_id, pr.title,
+           COALESCE(json_extract(t.payload_json, '$.worktreePath'), pr.workspace_root),
+           json_extract(t.payload_json, '$.branch'),
+           json_extract(t.payload_json, '$.modelSelection.model'),
+           (SELECT json_extract(o.value, '$.value')
+            FROM json_each(t.payload_json, '$.modelSelection.options') o
+            WHERE json_extract(o.value, '$.id') = 'effort'),
+           parent.title,
+           json_extract(t.payload_json, '$.pullRequests[#-1].number'),
+           json_extract(t.payload_json, '$.pullRequests[#-1].url'),
+           json_extract(t.payload_json, '$.pullRequests[#-1].snapshot.state'),
+           t.created_at
+    FROM orchestration_v2_projection_threads t
+    LEFT JOIN projection_projects pr ON pr.project_id = t.project_id
+    LEFT JOIN orchestration_v2_projection_threads parent
+      ON parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
+    WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND json_valid(t.payload_json)";
 
 /// Claude sessions whose thread is neither archived nor deleted, newest first
 pub(super) fn open_claude_threads(path: &Path) -> Result<Vec<ClaudeThreadRow>, String> {
@@ -116,6 +139,45 @@ pub(super) fn open_claude_threads(path: &Path) -> Result<Vec<ClaudeThreadRow>, S
         rows.extend(claude_thread_rows(path, OPEN_LEGACY_CLAUDE_THREADS_SQL)?);
     }
     Ok(rows)
+}
+
+/// Details of every open thread, by T3 thread id
+///
+/// Empty when the query fails, so a T3 change to these display-only fields
+/// hides them instead of breaking the thread list
+pub(super) fn thread_details(path: &Path) -> HashMap<String, ThreadDetails> {
+    let read = || -> rusqlite::Result<HashMap<String, ThreadDetails>> {
+        let db = state_connection(path)?;
+        let mut statement = db.prepare(THREAD_DETAILS_SQL)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, details_from_row(row)?)))?
+            .collect()
+    };
+    read().unwrap_or_else(|error| {
+        debug!(%error, "T3 thread details cannot be read");
+        HashMap::new()
+    })
+}
+
+fn details_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadDetails> {
+    let number: Option<i64> = row.get(7)?;
+    let url: Option<String> = row.get(8)?;
+    let pull_request = number.zip(url).map(|(number, url)| PullRequest {
+        number,
+        url,
+        state: row.get(9).ok().flatten(),
+    });
+
+    Ok(ThreadDetails {
+        project: row.get(1)?,
+        workspace: row.get(2)?,
+        branch: row.get(3)?,
+        model: row.get(4)?,
+        effort: row.get(5)?,
+        parent_title: row.get(6)?,
+        pull_request,
+        created_at: row.get(10)?,
+    })
 }
 
 /// T3 thread that owns `provider_thread`, if any
