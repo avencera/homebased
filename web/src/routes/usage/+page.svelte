@@ -96,7 +96,7 @@
 	const num = `${td} text-right font-mono tabular-nums`;
 </script>
 
-<div class="mx-auto max-w-5xl px-4 py-4">
+<div class="mx-auto max-w-[112rem] px-4 py-4 lg:px-6">
 	<header class="flex flex-wrap items-center gap-x-3 gap-y-1">
 		<a href={resolve('/')} class="inline-flex items-center gap-1 text-primary hover:underline">
 			<ArrowLeft class="size-3.5" />
@@ -268,7 +268,9 @@
 					{#each groups as group (group.key)}
 						{@const partial = group.partial_tasks > 0}
 						<tr class="group">
-							<td class="{td} max-w-64 min-w-0">{@render keyCell(group)}</td>
+							<td class="{td} max-w-64 min-w-0 lg:max-w-md 2xl:max-w-2xl"
+								>{@render keyCell(group)}</td
+							>
 							<td class={num}>
 								{formatCost(group.cost_usd)}{#if partial}<PartialNote
 										text={groupNote(group.partial_tasks, group.tasks)}
@@ -318,7 +320,7 @@
 {#snippet taskRow(task: UsageTask)}
 	{@const usage = task.usage}
 	<tr class="group">
-		<td class="{td} max-w-64 min-w-0">
+		<td class="{td} max-w-64 min-w-0 lg:max-w-md 2xl:max-w-2xl">
 			<a
 				href={resolve('/tasks/[id]', { id: task.task })}
 				class="block truncate font-medium text-foreground hover:text-primary"
@@ -340,7 +342,7 @@
 		<td class={num}>{formatTokens(usage.cache_read_tokens)}</td>
 		<td class={num}>{formatTokens(usage.cache_write_tokens)}</td>
 		<td
-			class="{td} max-w-40 truncate font-mono"
+			class="{td} max-w-40 truncate font-mono lg:max-w-xs"
 			title={usage.models.map((m) => m.model).join(', ')}
 		>
 			{models(task)}
