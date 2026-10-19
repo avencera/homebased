@@ -123,7 +123,7 @@
      at least the safe-area insets the browser reports, so the boxes end above the home indicator
      and any browser bar that claims the edge -->
 <div
-	class="fixed inset-0 mx-auto flex max-w-7xl flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4"
+	class="fixed inset-0 mx-auto flex max-w-page flex-col overflow-hidden pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:p-4 lg:px-6"
 >
 	<header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 sm:gap-x-4">
 		<h1 class="text-base font-semibold tracking-tight">homebased</h1>

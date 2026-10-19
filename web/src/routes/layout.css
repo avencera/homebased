@@ -28,6 +28,11 @@
 	}
 }
 
+/* Page width on desktop, shared so every page lines up */
+@theme {
+	--container-page: 112rem;
+}
+
 @theme inline {
 	--color-background: var(--background);
 	--color-foreground: var(--foreground);

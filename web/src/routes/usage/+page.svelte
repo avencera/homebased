@@ -96,7 +96,7 @@
 	const num = `${td} text-right font-mono tabular-nums`;
 </script>
 
-<div class="mx-auto max-w-[112rem] px-4 py-4 lg:px-6">
+<div class="mx-auto max-w-page px-4 py-4 lg:px-6">
 	<header class="flex flex-wrap items-center gap-x-3 gap-y-1">
 		<a href={resolve('/')} class="inline-flex items-center gap-1 text-primary hover:underline">
 			<ArrowLeft class="size-3.5" />
