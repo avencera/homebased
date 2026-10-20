@@ -16,6 +16,7 @@
 		fetchContentOrigin,
 		fetchDirectory,
 		resolvePath,
+		type ContentOrigin,
 		type DirectoryListing,
 		type FileEntry,
 		type FileEntryKind
@@ -26,7 +27,7 @@
 	let listing = $state<DirectoryListing | null>(null);
 	let error = $state<ApiError | null>(null);
 	let pathInput = $state('/');
-	let contentPort = $state<number | null>(null);
+	let contentOrigin = $state<ContentOrigin | null>(null);
 	let loading = $state(false);
 	// a slow listing must not replace a newer navigation
 	let loadGeneration = 0;
@@ -41,11 +42,10 @@
 		void load(generation, currentToken, currentPath);
 	});
 
-	async function ensureOrigin(): Promise<number> {
-		if (contentPort !== null) return contentPort;
-		const origin = await fetchContentOrigin();
-		contentPort = origin.port;
-		return origin.port;
+	async function ensureOrigin(): Promise<ContentOrigin> {
+		if (contentOrigin !== null) return contentOrigin;
+		contentOrigin = await fetchContentOrigin();
+		return contentOrigin;
 	}
 
 	async function load(generation: number, currentToken: string | null, currentPath: string | null) {
@@ -71,11 +71,11 @@
 					});
 					return;
 				}
-				const port = await ensureOrigin();
+				const origin = await ensureOrigin();
 				if (generation !== loadGeneration) return;
 				const url = resolved.content_path
-					? contentUrlForPath(port, resolved.content_path)
-					: contentUrlForToken(port, resolved.token);
+					? contentUrlForPath(origin, resolved.content_path)
+					: contentUrlForToken(origin, resolved.token);
 				window.location.replace(url);
 				return;
 			}
@@ -121,10 +121,10 @@
 		const opened = window.open('about:blank', '_blank');
 		if (opened) opened.opener = null;
 		try {
-			const port = await ensureOrigin();
+			const origin = await ensureOrigin();
 			const url = entry.content_path
-				? contentUrlForPath(port, entry.content_path)
-				: contentUrlForToken(port, entry.token);
+				? contentUrlForPath(origin, entry.content_path)
+				: contentUrlForToken(origin, entry.token);
 			if (opened) opened.location.replace(url);
 			else window.location.assign(url);
 		} catch (cause) {

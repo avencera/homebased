@@ -298,7 +298,8 @@ export type DirectoryListing = typeof DirectoryListingSchema.Type;
 /** `GET /v1/files/origin`. */
 const ContentOriginSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
-	port: Schema.Finite
+	port: Schema.Finite,
+	https_port: Schema.optional(Schema.NullOr(Schema.Finite))
 });
 export type ContentOrigin = typeof ContentOriginSchema.Type;
 
@@ -955,20 +956,25 @@ export function fetchContentOrigin(): Promise<ContentOrigin> {
  * Absolute URL on the content origin for a UTF-8 filesystem path. Uses the
  * current browser hostname so loopback, LAN, and Tailscale clients match.
  */
-export function contentUrlForPath(port: number, absolutePath: string): string {
+export function contentUrlForPath(origin: ContentOrigin, absolutePath: string): string {
 	const trimmed = absolutePath.startsWith('/') ? absolutePath.slice(1) : absolutePath;
 	const segments = trimmed.split('/').map(encodeURIComponent).join('/');
-	return `${contentOriginBase(port)}/raw/${segments}`;
+	return `${contentOriginBase(origin)}/raw/${segments}`;
 }
 
 /** Absolute URL on the content origin for an opaque path token. */
-export function contentUrlForToken(port: number, token: string): string {
-	return `${contentOriginBase(port)}/by-token/${encodeURIComponent(token)}`;
+export function contentUrlForToken(origin: ContentOrigin, token: string): string {
+	return `${contentOriginBase(origin)}/by-token/${encodeURIComponent(token)}`;
 }
 
-function contentOriginBase(port: number): string {
+/**
+ * An https page cannot load the daemon's plain-HTTP content port, so it uses
+ * the port an HTTPS proxy serves it on when the daemon reports one.
+ */
+function contentOriginBase(origin: ContentOrigin): string {
 	const { protocol, hostname } = window.location;
 	const host = hostname.includes(':') ? `[${hostname}]` : hostname;
+	const port = protocol === 'https:' ? (origin.https_port ?? origin.port) : origin.port;
 	return `${protocol}//${host}:${port}`;
 }
 

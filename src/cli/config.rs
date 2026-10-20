@@ -46,6 +46,7 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
             "machine_name_source": name_source,
             "fleet": config.fleet,
             "sleep": config.sleep,
+            "dashboard": config.dashboard,
         }))?,
         OutputMode::Quiet => println!("{}", location.path().display()),
         OutputMode::Human => {

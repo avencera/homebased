@@ -72,6 +72,9 @@ pub struct AppState {
     pub web: Option<SocketAddr>,
     /// Content-origin port on the same host as the dashboard, when bound
     pub content: Option<SocketAddr>,
+    /// Port where an HTTPS proxy fronts the content origin, from
+    /// `dashboard.content_https_port`
+    pub content_https_port: Option<u16>,
     /// Concurrent raw-file stream permits
     pub stream_slots: StreamSlots,
     /// Stable machine UUID, this boot's UUID, name, and protocol range
@@ -131,7 +134,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let web_listener = web::bind(web_listen).await;
     let web_addr = web_listener.as_ref().and_then(bound_addr);
     let (content_listener, content_addr) = match web_addr {
-        Some(addr) => match content::bind(addr).await {
+        Some(addr) => match content::bind(addr, config.dashboard.content_port).await {
             Some((listener, bound)) => (Some(listener), Some(bound)),
             None => (None, None),
         },
@@ -166,6 +169,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         supervisor: supervisor.clone(),
         web: web_addr,
         content: content_addr,
+        content_https_port: config.dashboard.content_https_port,
         stream_slots: StreamSlots::new(),
         machine,
         fleet,

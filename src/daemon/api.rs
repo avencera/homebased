@@ -613,6 +613,7 @@ async fn files_origin(State(state): State<AppState>) -> Result<Json<ContentOrigi
     Ok(Json(ContentOriginBody {
         api_version: API_VERSION,
         port,
+        https_port: state.content_https_port,
     }))
 }
 

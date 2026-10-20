@@ -102,6 +102,44 @@ Homebased reads `~/.config/homebased/config.toml` when the daemon starts. A miss
 
 The HTTP listener is off by default. Fleet peers use this listener. The dashboard is also served here when its assets are built. There is no application token: any peer that can reach the listener can use Fleet routes and can read every regular file available to the daemon user through the dashboard file browser. Text, raster images, and HTML open on a separate content origin; other files download.
 
+### Dashboard over HTTPS (Tailscale)
+
+The dashboard listener speaks plain HTTP. To reach it over HTTPS from a
+tailnet, put `tailscale serve` in front of it. File previews load raw bytes
+from a second listener, the content origin, so that listener needs a proxied
+port too. By default the OS picks the content port at each start, which a
+proxy cannot be set up for ahead of time. Pin it in
+`~/.config/homebased/config.toml`:
+
+```toml
+[dashboard]
+# plain-HTTP port of the content origin; omitted keeps an OS-chosen port
+content_port = 7679
+# port where an HTTPS proxy such as tailscale serve fronts content_port
+content_https_port = 7680
+```
+
+Then proxy both listeners and restart the daemon:
+
+```sh
+tailscale serve --bg --https=7678 http://127.0.0.1:7677   # dashboard
+tailscale serve --bg --https=7680 http://127.0.0.1:7679   # content origin
+homebased daemon restart
+```
+
+Open `https://<machine>.<tailnet>.ts.net:7678/`. A page served over HTTPS
+loads previews from `https://<machine>.<tailnet>.ts.net:7680/`; a page served
+over plain HTTP keeps using `content_port` directly.
+
+`content_https_port` must differ from `content_port`. With
+`HOMEBASED_WEB_LISTEN=0.0.0.0:7677` the daemon holds its ports on every
+interface, so the proxy cannot listen on the same port number on the
+machine's tailnet address. The same goes for the dashboard: it is served on
+`7678` rather than `7677`. `content_https_port` requires `content_port`, and
+neither may be `0`. If `content_port` is busy, the daemon logs a warning and
+runs without a content origin rather than moving to another port, so file
+previews fail until you free the port and restart.
+
 ### Push notifications (ntfy)
 
 Add this section to `~/.config/homebased/config.toml` on every machine that

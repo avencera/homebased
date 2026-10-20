@@ -76,6 +76,23 @@ There is no application login or access token. Network reachability is the acces
 
 The listener has no application login or access token. It exposes Fleet routes and the optional dashboard. Bind a non-loopback address only on a trusted network. A bind failure (busy port) is a warning: the daemon keeps serving the socket and `daemon status` reports `"web": null`.
 
+To serve the dashboard over HTTPS with `tailscale serve`, pin the content origin in `config.toml` and proxy both listeners on ports other than the daemon's own (the daemon listens on every interface, so the proxy cannot reuse a port it holds). Validate and restart afterward:
+
+```toml
+[dashboard]
+content_port = 7679         # plain-HTTP content origin; omitted keeps an OS-chosen port
+content_https_port = 7680   # port the proxy serves content_port on
+```
+
+```bash
+tailscale serve --bg --https=7678 http://127.0.0.1:7677   # dashboard
+tailscale serve --bg --https=7680 http://127.0.0.1:7679   # content origin
+homebased --json config validate
+homebased daemon restart
+```
+
+`content_port` must not be `0`; `content_https_port` requires `content_port` and must differ from it. A busy `content_port` is a warning that leaves file previews off; the daemon does not pick another port. `GET /v1/files/origin` reports `port` and `https_port` (`null` when unset); an `https:` page uses `https_port`.
+
 ## Upgrade
 
 From a GitHub release (replaces the installed binary, then restarts the daemon and dashboard):

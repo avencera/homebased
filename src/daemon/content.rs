@@ -20,9 +20,11 @@ use crate::files::{
     HostPolicy, PathToken, StreamSlots, decode_path, host_guard, open_file_stream, path_display,
 };
 
-/// Bind the content listener on the same IP as the dashboard, port chosen by the OS.
-pub async fn bind(dashboard: SocketAddr) -> Option<(TcpListener, SocketAddr)> {
-    let bind = SocketAddr::new(dashboard.ip(), 0);
+/// Bind the content listener on the same IP as the dashboard. A configured
+/// port is bound exactly; a busy one leaves the origin off instead of moving
+/// to a port that no HTTPS proxy points at. Without one, the OS picks.
+pub async fn bind(dashboard: SocketAddr, port: Option<u16>) -> Option<(TcpListener, SocketAddr)> {
+    let bind = SocketAddr::new(dashboard.ip(), port.unwrap_or(0));
     match TcpListener::bind(bind).await {
         Ok(listener) => match listener.local_addr() {
             Ok(addr) => Some((listener, addr)),

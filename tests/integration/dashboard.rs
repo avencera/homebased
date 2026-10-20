@@ -151,6 +151,7 @@ fn dashboard_file_browser_and_content_origin() {
     assert_eq!(origin.status, 200, "{origin:?}");
     let origin_body: Value = serde_json::from_str(&origin.body).unwrap();
     let content_port = origin_body["port"].as_u64().unwrap() as u16;
+    assert!(origin_body["https_port"].is_null(), "{origin_body}");
     let content_host = addr.split(':').next().unwrap();
     let content_addr = format!("{content_host}:{content_port}");
 
@@ -225,4 +226,63 @@ fn dashboard_file_browser_and_content_origin() {
         !origin.head.contains("access-control-allow-origin"),
         "{origin:?}"
     );
+}
+
+/// A port that was free a moment ago, for a config that must name one
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn restart_with_dashboard_config(h: &mut Harness, toml: &str) {
+    let config = h.dir.path().join("config.toml");
+    fs::write(&config, toml).unwrap();
+    h.restart_daemon_with_env(&[("HOMEBASED_CONFIG", config.to_str().unwrap())]);
+}
+
+#[test]
+fn configured_content_port_is_bound_and_reported_with_its_https_port() {
+    let mut h = Harness::with_dashboard();
+    let port = free_port();
+    let https_port = free_port();
+    restart_with_dashboard_config(
+        &mut h,
+        &format!("[dashboard]\ncontent_port = {port}\ncontent_https_port = {https_port}\n"),
+    );
+    let addr = dashboard_addr(&h);
+
+    let origin = http_get(&addr, "/v1/files/origin");
+    assert_eq!(origin.status, 200, "{origin:?}");
+    let body: Value = serde_json::from_str(&origin.body).unwrap();
+    assert_eq!(body["port"], port, "{body}");
+    assert_eq!(body["https_port"], https_port, "{body}");
+
+    let file = h.dir.path().join("note.txt");
+    fs::write(&file, b"fixed port").unwrap();
+    let host = addr.split(':').next().unwrap();
+    let served = http_get(
+        &format!("{host}:{port}"),
+        &format!("/raw{}", file.to_string_lossy()),
+    );
+    assert_eq!(served.status, 200, "{served:?}");
+    assert_eq!(served.body, "fixed port");
+}
+
+#[test]
+fn busy_content_port_leaves_the_origin_off_instead_of_moving() {
+    let mut h = Harness::with_dashboard();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    restart_with_dashboard_config(&mut h, &format!("[dashboard]\ncontent_port = {port}\n"));
+    let addr = dashboard_addr(&h);
+
+    // the dashboard itself still serves
+    let status = http_get(&addr, "/v1/status");
+    assert_eq!(status.status, 200, "{status:?}");
+    let origin = http_get(&addr, "/v1/files/origin");
+    assert_eq!(origin.status, 500, "{origin:?}");
+    drop(held);
 }

@@ -112,6 +112,23 @@ pub struct Config {
     pub sleep: SleepPolicy,
     /// Notice thresholds for the local resource queue
     pub resource: ResourceConfig,
+    /// Dashboard content-origin ports
+    pub dashboard: Dashboard,
+}
+
+/// Ports of the dashboard's separate content origin
+///
+/// The content listener serves raw file bytes on its own port so previewed
+/// files cannot read the dashboard's origin. By default the OS picks that
+/// port, which an HTTPS proxy cannot be pointed at ahead of time
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Dashboard {
+    /// Plain-HTTP port the daemon binds for the content origin. `None` keeps
+    /// an OS-chosen port
+    pub content_port: Option<u16>,
+    /// Port where an HTTPS proxy such as `tailscale serve` fronts
+    /// `content_port`. Browsers on an `https:` page use it instead
+    pub content_https_port: Option<u16>,
 }
 
 /// Resource queue notice settings; these never stop a job
@@ -211,6 +228,50 @@ struct RawConfig {
     power: RawPower,
     #[serde(default)]
     resource: RawResource,
+    #[serde(default)]
+    dashboard: RawDashboard,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDashboard {
+    #[serde(default)]
+    content_port: Option<u16>,
+    #[serde(default)]
+    content_https_port: Option<u16>,
+}
+
+impl RawDashboard {
+    fn validate(self) -> Result<Dashboard, String> {
+        let Self {
+            content_port,
+            content_https_port,
+        } = self;
+        if content_port == Some(0) {
+            return Err(
+                "dashboard.content_port must not be 0; omit it for an OS-chosen port".into(),
+            );
+        }
+        if content_https_port == Some(0) {
+            return Err("dashboard.content_https_port must not be 0".into());
+        }
+        if content_https_port.is_some() && content_port.is_none() {
+            return Err(
+                "dashboard.content_https_port requires dashboard.content_port, because an OS-chosen port cannot be proxied"
+                    .into(),
+            );
+        }
+        if content_https_port.is_some() && content_https_port == content_port {
+            return Err(
+                "dashboard.content_https_port must differ from dashboard.content_port; the proxy cannot share the port the daemon holds"
+                    .into(),
+            );
+        }
+        Ok(Dashboard {
+            content_port,
+            content_https_port,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -362,6 +423,7 @@ impl RawConfig {
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
         let resource = self.resource.validate()?;
+        let dashboard = self.dashboard.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -388,6 +450,7 @@ impl RawConfig {
             notify,
             sleep,
             resource,
+            dashboard,
         })
     }
 }
@@ -415,7 +478,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{Config, ConfigLocation, MachineNameSource, TailscaleDiscovery};
+    use super::{Config, ConfigLocation, Dashboard, MachineNameSource, TailscaleDiscovery};
     use crate::daemon::web::DEFAULT_PORT;
     use crate::power::SleepPolicy;
 
@@ -438,6 +501,46 @@ mod tests {
             "[resource.notify_blocked_after]\nyeld = \"1m\"\n",
         ] {
             assert!(Config::parse(text).is_err());
+        }
+    }
+
+    #[test]
+    fn dashboard_content_ports_parse_and_reject_unusable_pairs() {
+        assert_eq!(Config::parse("").unwrap().dashboard, Dashboard::default());
+        let config =
+            Config::parse("[dashboard]\ncontent_port = 7679\ncontent_https_port = 7680\n").unwrap();
+        assert_eq!(
+            config.dashboard,
+            Dashboard {
+                content_port: Some(7679),
+                content_https_port: Some(7680),
+            }
+        );
+        let config = Config::parse("[dashboard]\ncontent_port = 7679\n").unwrap();
+        assert_eq!(config.dashboard.content_https_port, None);
+
+        for (text, needle) in [
+            (
+                "[dashboard]\ncontent_port = 0\n",
+                "content_port must not be 0",
+            ),
+            (
+                "[dashboard]\ncontent_port = 7679\ncontent_https_port = 0\n",
+                "content_https_port must not be 0",
+            ),
+            (
+                "[dashboard]\ncontent_https_port = 7680\n",
+                "requires dashboard.content_port",
+            ),
+            (
+                "[dashboard]\ncontent_port = 7679\ncontent_https_port = 7679\n",
+                "must differ",
+            ),
+            ("[dashboard]\ncontent_port = 70000\n", "content_port"),
+            ("[dashboard]\ncontent_prt = 7679\n", "content_prt"),
+        ] {
+            let err = Config::parse(text).unwrap_err();
+            assert!(err.contains(needle), "{text:?}: {err}");
         }
     }
 

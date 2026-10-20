@@ -105,6 +105,9 @@ pub struct ContentOriginBody {
     pub api_version: u32,
     /// TCP port of the content listener on the same host as the dashboard
     pub port: u16,
+    /// Port where an HTTPS proxy fronts the content listener, for pages
+    /// served over HTTPS. `null` when none is configured
+    pub https_port: Option<u16>,
 }
 
 /// Resolve a user-entered absolute UTF-8 path
