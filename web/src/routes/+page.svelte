@@ -307,8 +307,8 @@
 		</TaskList>
 		{#if showQueue}
 			<QueuePanel
-				resources={queue.resources}
-				jobs={queue.jobs}
+				machines={queue.machines}
+				queues={queue.queues}
 				jobName={(id) => queue.jobName(id)}
 				class="min-h-0"
 			/>

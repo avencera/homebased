@@ -189,6 +189,65 @@ async fn fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_queue_view_shows_peer_runs_and_waiting_jobs() {
+    let (origin, executor) = dependency_fleet("job-view");
+    let running = JobId::new();
+    let waiting = JobId::new();
+    let _jobs = Jobs {
+        executor: &executor,
+        ids: vec![running, waiting],
+    };
+    submit_ok(
+        &origin,
+        running,
+        &spec(
+            &origin,
+            &executor,
+            "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done",
+        ),
+    );
+    assert!(wait_until(Duration::from_secs(10), || executor
+        .home
+        .join("ready")
+        .exists()));
+    submit_ok(&origin, waiting, &spec(&origin, &executor, "exit 0"));
+
+    let response = ClusterClient::default()
+        .get(&origin.address(), "/v1/fleet/queues")
+        .await
+        .unwrap();
+    assert_eq!(response.status.as_u16(), 200);
+    let view: Value = serde_json::from_slice(&response.body).unwrap();
+    fs::write(executor.home.join("finish"), "").unwrap();
+
+    let machines = view["machines"].as_array().unwrap();
+    assert_eq!(machines[0]["machine"], origin.machine_id().to_string());
+    assert_eq!(machines[0]["location"]["type"], "local");
+    let peer = machines
+        .iter()
+        .find(|machine| machine["machine"] == executor.machine_id().to_string())
+        .expect("executor listed");
+    assert_eq!(peer["read"]["state"], "online", "{view}");
+
+    let queue = view["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|queue| queue["machine"] == executor.machine_id().to_string())
+        .expect("executor queue");
+    let gpu = queue["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["resource"]["name"] == "gpu0")
+        .expect("executor gpu0");
+    assert_eq!(gpu["run"]["job"], running.to_string());
+    let jobs: Vec<&Value> = queue["jobs"].as_array().unwrap().iter().collect();
+    assert!(jobs.iter().any(|job| job["id"] == waiting.to_string()));
+    assert!(jobs.iter().all(|job| job["machine"] == queue["machine"]));
+}
+
 #[test]
 fn fleet_lost_submit_response_retries_and_conflicts_without_duplicate_work() {
     use std::io::Write;

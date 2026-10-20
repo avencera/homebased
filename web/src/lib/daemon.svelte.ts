@@ -6,8 +6,8 @@ import { SvelteMap } from 'svelte/reactivity';
 import {
 	IN_FLIGHT_STATUSES,
 	asApiError,
+	fetchFleetQueues,
 	fetchJob,
-	fetchJobs,
 	fetchLogTail,
 	fetchFleetTasks,
 	fetchResources,
@@ -19,8 +19,8 @@ import {
 	type FleetMachine,
 	type FleetTask,
 	type JobDetail,
-	type JobRecord,
 	type LogTail,
+	type MachineQueue,
 	type ResourceRecord,
 	type TaskDetail,
 	type TaskQuery
@@ -180,12 +180,16 @@ export class TaskStore {
 	}
 }
 
-/** This machine's GPU queue: its resources and every job that has not ended. */
+/** Queue page and panel: every machine's resources and queue. */
 export class QueueStore {
-	/** By name. */
-	resources = $state<readonly ResourceRecord[]>([]);
-	/** Serving order. */
-	jobs = $state<readonly JobRecord[]>([]);
+	/** This machine first, then every known peer and whether it answered. */
+	machines = $state<readonly FleetMachine[]>([]);
+	/** One per machine that answered, in `machines` order. */
+	queues = $state<readonly MachineQueue[]>([]);
+	/** Every machine's resources. */
+	resources = $derived(this.queues.flatMap((queue) => queue.resources));
+	/** Every machine's jobs, each machine's in serving order. */
+	jobs = $derived(this.queues.flatMap((queue) => queue.jobs));
 	/**
 	 * Names of ended jobs whose run still holds a resource while it cleans up or waits for a release.
 	 * The queue list holds only jobs that have not ended, and a job's name never changes.
@@ -207,16 +211,15 @@ export class QueueStore {
 		});
 	}
 
-	/** Fetch resources and jobs together so a run and its job agree. */
 	async refresh(): Promise<void> {
 		const generation = ++this.#generation;
 		try {
-			const [resources, jobs] = await Promise.all([fetchResources(), fetchJobs()]);
+			const fleet = await fetchFleetQueues();
 			if (generation !== this.#generation) return;
-			this.resources = resources.resources;
-			this.jobs = jobs.jobs;
+			this.machines = fleet.machines;
+			this.queues = fleet.queues;
 			this.error = null;
-			void this.#loadEndedJobNames(resources.machine);
+			void this.#loadEndedJobNames();
 		} catch (cause) {
 			if (generation !== this.#generation) return;
 			this.error = asApiError(cause);
@@ -229,12 +232,16 @@ export class QueueStore {
 		return this.jobs.find((job) => job.id === id)?.spec.name ?? this.endedJobNames.get(id) ?? null;
 	}
 
-	async #loadEndedJobNames(machine: string): Promise<void> {
+	async #loadEndedJobNames(): Promise<void> {
 		const missing = this.resources.flatMap((record) =>
-			record.run && this.jobName(record.run.job) === null ? [record.run.job] : []
+			record.run && this.jobName(record.run.job) === null
+				? [{ job: record.run.job, machine: record.machine }]
+				: []
 		);
 		if (missing.length === 0) return;
-		const found = await Promise.allSettled(missing.map((id) => fetchJob(id, machine)));
+		const found = await Promise.allSettled(
+			missing.map(({ job, machine }) => fetchJob(job, machine))
+		);
 		for (const result of found) {
 			if (result.status === 'fulfilled') {
 				this.endedJobNames.set(result.value.job.id, result.value.job.spec.name);
@@ -257,6 +264,7 @@ export class JobStore {
 	lastFetched = $state<number | null>(null);
 
 	#id: () => string;
+	#machine: () => string | null;
 	#visible = new IsDocumentVisible();
 	#generation = 0;
 	#loadedId = '';
@@ -268,10 +276,12 @@ export class JobStore {
 			this.detail.runs.some((run) => run.cleanup === null)
 	);
 
-	constructor(id: () => string) {
+	/** `machine` names the job's queue when the job page link knows it; null uses the saved route. */
+	constructor(id: () => string, machine: () => string | null = () => null) {
 		this.#id = id;
+		this.#machine = machine;
 		startPolling({
-			key: id,
+			key: () => `${id()}|${machine() ?? ''}`,
 			active: () => this.#visible.current && this.#pollable,
 			run: () => void this.refresh()
 		});
@@ -286,12 +296,14 @@ export class JobStore {
 	async refresh(): Promise<void> {
 		const generation = ++this.#generation;
 		const id = this.#id();
-		if (this.#loadedId !== id) {
+		const machine = this.#machine();
+		const key = `${id}|${machine ?? ''}`;
+		if (this.#loadedId !== key) {
 			this.detail = null;
 			this.resources = [];
 		}
 		try {
-			const [detail, local] = await Promise.all([fetchJob(id), fetchResources()]);
+			const [detail, local] = await Promise.all([fetchJob(id, machine), fetchResources()]);
 			const remote = detail.job.machine !== local.machine;
 			const resources = remote ? await fetchResources(detail.job.machine) : local;
 			if (generation !== this.#generation) return;
@@ -299,7 +311,7 @@ export class JobStore {
 			this.resources = resources.resources;
 			this.localMachine = local.machine;
 			this.error = null;
-			this.#loadedId = id;
+			this.#loadedId = key;
 		} catch (cause) {
 			if (generation !== this.#generation) return;
 			this.error = asApiError(cause);

@@ -46,7 +46,12 @@
 	import { cn } from '$lib/utils';
 
 	const id = $derived(page.params.id ?? '');
-	const store = new JobStore(() => id);
+	// fleet queue links name the job's machine, which this daemon may hold no route for
+	const machine = $derived(page.url.searchParams.get('machine'));
+	const store = new JobStore(
+		() => id,
+		() => machine
+	);
 	const control = new QueueControl(() => store.refresh());
 	const detail = $derived(store.detail);
 	const job = $derived(detail?.job ?? null);

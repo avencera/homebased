@@ -1,29 +1,24 @@
 //! Fleet-wide task list for the dashboard
 //!
-//! The browser reads one origin only, so this daemon reads every known peer and
-//! merges their public task summaries. A peer that cannot answer is reported
-//! with its reason and never hides the tasks of the other machines
+//! Merges every machine's public task summaries, read through
+//! [`super::fleet_view`], into one entry per task
 
 use std::collections::HashMap;
 
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
-use tracing::warn;
 
 use super::AppState;
 use super::api::views::TaskSummary;
 use super::api::{ListQuery, TaskFilter, local_task_summaries};
 use super::cluster::check_api_version;
+use super::fleet_view::{FleetMachine, read_fleet};
 use super::peer_read::read_peer;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
-use crate::fleet::address::MachineAddress;
-use crate::fleet::directory::{PeerView, Reachability};
-use crate::machine::{MachineId, MachineName};
+use crate::machine::MachineId;
 
 /// Peer route that answers one daemon's own task summaries
 const CLUSTER_TASK_LIST_PATH: &str = "/v1/cluster/task-list";
@@ -37,47 +32,6 @@ pub struct FleetTaskList {
     pub machines: Vec<FleetMachine>,
     /// One entry per task UUID, newest first
     pub tasks: Vec<FleetTask>,
-}
-
-/// One machine of the fleet task list
-#[derive(Debug, Serialize)]
-pub struct FleetMachine {
-    /// Stable installation UUID
-    pub machine: MachineId,
-    /// Display name
-    pub name: MachineName,
-    /// Homebased version of the machine's daemon, from the last probe for a peer
-    pub version: String,
-    /// Where a browser opens this machine's dashboard
-    pub location: MachineLocation,
-    /// Result of reading this machine's tasks
-    pub read: MachineRead,
-}
-
-/// Dashboard location of one machine
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum MachineLocation {
-    /// The daemon that serves this response, so the browser uses its own origin
-    Local,
-    /// A peer dashboard at its best-ranked address, when one is known
-    Peer {
-        /// Base URL of the peer daemon
-        address: Option<MachineAddress>,
-    },
-}
-
-/// Result of one machine's task read
-#[derive(Debug, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum MachineRead {
-    /// The machine answered; its tasks are in the list
-    Online,
-    /// The machine did not answer; its tasks are missing from the list
-    Unavailable {
-        /// Why the read failed
-        message: String,
-    },
 }
 
 /// One logical task and the machine that runs it
@@ -124,40 +78,28 @@ async fn fleet_tasks(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<FleetTaskList>, AppError> {
     let filter = TaskFilter::parse(query)?;
-    let local = state.machine.identity.machine;
     let local_tasks = local_task_summaries(&state, filter.clone()).await?;
-
-    let mut machines = vec![FleetMachine {
-        machine: local,
-        name: state.machine.name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        location: MachineLocation::Local,
-        read: MachineRead::Online,
-    }];
-    let mut records = vec![(local, local_tasks)];
-    for (peer, result) in read_peers(&state, &filter).await {
-        let read = match result {
-            Ok(tasks) => {
-                records.push((peer.machine, tasks));
-                MachineRead::Online
+    let prefix = filter.query_prefix();
+    let read = read_fleet(&state, local_tasks, |fleet, machine| {
+        let fleet = fleet.clone();
+        let path = format!(
+            "{CLUSTER_TASK_LIST_PATH}?{prefix}api_version={API_VERSION}&destination_machine={machine}"
+        );
+        async move {
+            let body = read_peer::<ClusterTaskList>(&fleet, machine, &path).await?;
+            if body.machine == machine {
+                Ok(body.tasks)
+            } else {
+                Err("peer answered for another machine".to_owned())
             }
-            Err(message) => MachineRead::Unavailable { message },
-        };
-        machines.push(FleetMachine {
-            machine: peer.machine,
-            name: peer.name.clone(),
-            version: peer.version.clone(),
-            location: MachineLocation::Peer {
-                address: peer.addresses.first().map(|ranked| ranked.address.clone()),
-            },
-            read,
-        });
-    }
+        }
+    })
+    .await;
 
     Ok(Json(FleetTaskList {
         api_version: API_VERSION,
-        machines,
-        tasks: merge_records(records),
+        machines: read.machines,
+        tasks: merge_records(read.answers),
     }))
 }
 
@@ -179,73 +121,6 @@ async fn cluster_task_list(
         machine: state.machine.identity.machine,
         tasks: local_task_summaries(&state, filter).await?,
     }))
-}
-
-/// Read every known peer in parallel, in directory order
-///
-/// A peer the directory already marks offline is not dialled, so one machine
-/// that is down does not hold every refresh for the full read timeout
-async fn read_peers(
-    state: &AppState,
-    filter: &TaskFilter,
-) -> Vec<(PeerView, Result<Vec<TaskSummary>, String>)> {
-    let Some(fleet) = state.fleet.handle() else {
-        return Vec::new();
-    };
-    let local = state.machine.identity.machine;
-    let peers: Vec<PeerView> = fleet
-        .peers()
-        .await
-        .into_iter()
-        .filter(|peer| peer.machine != local)
-        .collect();
-
-    let mut jobs = JoinSet::new();
-    for (index, peer) in peers.iter().enumerate() {
-        if matches!(peer.reachability, Reachability::Offline { .. }) {
-            continue;
-        }
-        let fleet = fleet.clone();
-        let machine = peer.machine;
-        let path = format!(
-            "{CLUSTER_TASK_LIST_PATH}?{}api_version={API_VERSION}&destination_machine={machine}",
-            filter.query_prefix()
-        );
-        jobs.spawn(peer_worker(index, async move {
-            read_peer::<ClusterTaskList>(&fleet, machine, &path)
-                .await
-                .and_then(|body| {
-                    if body.machine == machine {
-                        Ok(body.tasks)
-                    } else {
-                        Err("peer answered for another machine".to_owned())
-                    }
-                })
-        }));
-    }
-
-    let mut results: Vec<Result<Vec<TaskSummary>, String>> = peers
-        .iter()
-        .map(|_| Err("machine is offline".to_owned()))
-        .collect();
-    while let Some(joined) = jobs.join_next().await {
-        match joined {
-            Ok((index, result)) => results[index] = result,
-            Err(error) => warn!("fleet task read worker failed: {error}"),
-        }
-    }
-    peers.into_iter().zip(results).collect()
-}
-
-async fn peer_worker(
-    index: usize,
-    read: impl std::future::Future<Output = Result<Vec<TaskSummary>, String>>,
-) -> (usize, Result<Vec<TaskSummary>, String>) {
-    let result = std::panic::AssertUnwindSafe(read)
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| Err("peer task read worker panicked".into()));
-    (index, result)
 }
 
 /// Merge per-machine records into one entry per task, newest first
@@ -280,15 +155,6 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn bugfix_peer_panic_names_the_worker_failure() {
-        let mut workers = tokio::task::JoinSet::new();
-        workers.spawn(super::peer_worker(7, async { panic!("peer read panic") }));
-        let (index, result) = workers.join_next().await.unwrap().unwrap();
-        assert_eq!(index, 7);
-        assert!(result.unwrap_err().contains("worker panicked"));
-    }
-
     use serde_json::json;
 
     use super::{ClusterTaskList, merge_records};

@@ -24,6 +24,8 @@ pub enum QueueRequest {
     Resources,
     /// Non-terminal jobs in serving order
     Jobs,
+    /// Resources and jobs read together, so a run and its job agree
+    Overview,
     /// One job and every attempt
     Show {
         /// Job identity
@@ -95,6 +97,17 @@ pub struct JobList {
     pub jobs: Vec<JobRecord>,
 }
 
+/// One machine's resources and non-terminal jobs from a single store read
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueOverview {
+    /// Machine whose queue this is
+    pub machine: MachineId,
+    /// Resources by name, with their runs
+    pub resources: Vec<ResourceRecord>,
+    /// Jobs, highest level first, then by position
+    pub jobs: Vec<JobRecord>,
+}
+
 /// One job with its active run, every attempt, and its events
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDetail {
@@ -146,6 +159,11 @@ impl Store {
             })?,
             QueueRequest::Jobs => serde_json::to_value(JobList {
                 machine,
+                jobs: self.machine_queue(machine)?,
+            })?,
+            QueueRequest::Overview => serde_json::to_value(QueueOverview {
+                machine,
+                resources: self.resources_on(machine)?,
                 jobs: self.machine_queue(machine)?,
             })?,
             QueueRequest::Show { job } => {

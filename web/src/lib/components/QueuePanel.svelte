@@ -1,38 +1,50 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
-	import type { JobRecord, ResourceRecord } from '$lib/api';
+	import type { FleetMachine, MachineQueue } from '$lib/api';
+	import { machineHue } from '$lib/colors';
 	import { shortId } from '$lib/format';
 	import { phaseLabel, phaseSince, resourceState, waitingJobs } from '$lib/queue-view';
 	import { cn } from '$lib/utils';
+	import Capsule from './Capsule.svelte';
 	import Elapsed from './Elapsed.svelte';
 	import LevelBadge from './LevelBadge.svelte';
 	import QueueBadge from './QueueBadge.svelte';
 
 	interface Props {
-		resources: readonly ResourceRecord[];
-		/** Serving order. */
-		jobs: readonly JobRecord[];
+		/** This machine first, then every known peer. */
+		machines: readonly FleetMachine[];
+		/** One per machine that answered. */
+		queues: readonly MachineQueue[];
 		/** Name of a job, including an ended one whose run still holds a resource. */
 		jobName: (id: string) => string | null;
 		class?: string;
 	}
 
-	let { resources, jobs, jobName, class: className }: Props = $props();
+	let { machines, queues, jobName, class: className }: Props = $props();
 
 	/** Waiting jobs shown before the rest collapse into a count. */
 	const NEXT_LIMIT = 5;
 
-	const waiting = $derived(waitingJobs(jobs));
+	const machineNames = $derived(
+		new Map(machines.map((machine) => [machine.machine, machine.name]))
+	);
+	const resources = $derived(queues.flatMap((queue) => queue.resources));
+	// each machine serves its own queue, so order holds within a machine only
+	const waiting = $derived(queues.flatMap((queue) => waitingJobs(queue.jobs)));
+
+	function machineName(id: string): string {
+		return machineNames.get(id) ?? shortId(id);
+	}
 </script>
 
 <section
-	aria-label="GPU queue"
+	aria-label="GPU queues"
 	class={cn('flex flex-col overflow-hidden rounded-lg border border-border bg-card', className)}
 >
 	<header
 		class="flex shrink-0 items-center gap-2 border-b border-border bg-muted px-3 py-1.5 text-[11px] tracking-wide text-muted-foreground uppercase"
 	>
-		<span>GPU queue</span>
+		<span>GPU queues</span>
 		<a
 			href={resolve('/queue')}
 			class="ml-auto tracking-normal text-primary normal-case hover:underline">open</a
@@ -44,8 +56,10 @@
 				{@const run = record.run}
 				{@const name = run ? jobName(run.job) : null}
 				{@const since = run ? phaseSince(run.phase) : null}
+				{@const machine = machineName(record.machine)}
 				<li class="flex flex-col gap-1 px-3 py-2">
 					<div class="flex items-center gap-2">
+						<Capsule hue={machineHue(machine)} dot title={`Queue on ${machine}`}>{machine}</Capsule>
 						<span class="font-mono font-medium">{record.resource.name}</span>
 						<QueueBadge
 							state={resourceState(record)}
@@ -61,7 +75,7 @@
 					</div>
 					{#if run}
 						<a
-							href={resolve('/queue/jobs/[id]', { id: run.job })}
+							href={resolve(`/queue/jobs/${encodeURIComponent(run.job)}?machine=${record.machine}`)}
 							class="truncate text-foreground hover:text-primary"
 							title={name ?? run.job}
 						>
@@ -82,12 +96,15 @@
 					<li class="flex items-center gap-2 px-3 py-1.5">
 						<LevelBadge priority={job.priority} class="w-12 shrink-0" />
 						<a
-							href={resolve('/queue/jobs/[id]', { id: job.id })}
-							class="min-w-0 truncate hover:text-primary"
+							href={resolve(`/queue/jobs/${encodeURIComponent(job.id)}?machine=${job.machine}`)}
+							class="min-w-0 flex-1 truncate hover:text-primary"
 							title={job.spec.name}
 						>
 							{job.spec.name}
 						</a>
+						<span class="shrink-0 text-[11px] text-muted-foreground"
+							>{machineName(job.machine)}</span
+						>
 					</li>
 				{/each}
 			</ol>

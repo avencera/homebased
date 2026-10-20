@@ -49,7 +49,7 @@ Cancellation stops queued work directly. For an active job, it requests a stop a
 
 Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, and cancel use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.
 
-The web listener serves queue reads and move, cancel, and release. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
+The web listener serves queue reads and move, cancel, and release. `GET /v1/fleet/queues` and the dashboard's `/queue` page show the resources and jobs of every Fleet machine. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
 
 ## Clear Attention after a machine check
 

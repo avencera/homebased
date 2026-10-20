@@ -213,14 +213,14 @@ const MachineLocationSchema = Schema.Union(
 );
 export type MachineLocation = typeof MachineLocationSchema.Type;
 
-/** Result of reading one machine's tasks for the fleet list. */
+/** Result of reading one machine for a fleet-wide view. */
 const MachineReadSchema = Schema.Union(
 	Schema.Struct({ state: Schema.Literal('online') }),
 	Schema.Struct({ state: Schema.Literal('unavailable'), message: Schema.String })
 );
 export type MachineRead = typeof MachineReadSchema.Type;
 
-/** One machine of `GET /v1/fleet/tasks`. */
+/** One machine of `GET /v1/fleet/tasks` or `GET /v1/fleet/queues`. */
 const FleetMachineSchema = Schema.Struct({
 	machine: Schema.String,
 	name: Schema.String,
@@ -512,13 +512,24 @@ const JobRecordSchema = Schema.Struct({
 });
 export type JobRecord = typeof JobRecordSchema.Type;
 
-/** `GET /v1/resource/jobs`: every non-terminal job, in serving order. */
-const JobListSchema = Schema.Struct({
-	api_version: ApiVersionSchema,
+/** One machine's resources and jobs in `GET /v1/fleet/queues`, read together. */
+const MachineQueueSchema = Schema.Struct({
 	machine: Schema.String,
+	/** By name. */
+	resources: Schema.Array(ResourceRecordSchema),
+	/** Serving order. */
 	jobs: Schema.Array(JobRecordSchema)
 });
-export type JobList = typeof JobListSchema.Type;
+export type MachineQueue = typeof MachineQueueSchema.Type;
+
+/** `GET /v1/fleet/queues`. The serving machine comes first. */
+const FleetQueuesSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	machines: Schema.Array(FleetMachineSchema),
+	/** One per machine that answered, in `machines` order. */
+	queues: Schema.Array(MachineQueueSchema)
+});
+export type FleetQueues = typeof FleetQueuesSchema.Type;
 
 /** Attributable cleanup result after a run: `Ok` or the failure. */
 const CleanupResultSchema = Schema.Union(
@@ -802,9 +813,9 @@ export function fetchResources(machine?: string | null): Promise<ResourceList> {
 	return getJson(`/resources${machineQuery(machine)}`, ResourceListSchema);
 }
 
-/** `GET /v1/resource/jobs`: one machine's queue in serving order. */
-export function fetchJobs(machine?: string | null): Promise<JobList> {
-	return getJson(`/resource/jobs${machineQuery(machine)}`, JobListSchema);
+/** `GET /v1/fleet/queues`: every machine's resources and queue. */
+export function fetchFleetQueues(): Promise<FleetQueues> {
+	return getJson('/fleet/queues', FleetQueuesSchema);
 }
 
 /** `GET /v1/resource/jobs/{job}`, from the job's saved authority unless a machine is given. */
