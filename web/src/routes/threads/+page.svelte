@@ -92,6 +92,11 @@
 		stale: boolean;
 	}
 
+	// cold threads cost a full read to compact whatever their size, so they list newest first
+	function newestFirst(list: readonly LargeClaudeThread[]): LargeClaudeThread[] {
+		return list.toSorted((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
+	}
+
 	const tiers = $derived.by((): Tier[] => {
 		const pick = (settled: boolean, isWarm: boolean) =>
 			listed.filter(
@@ -116,18 +121,20 @@
 				key: 'stale',
 				title: 'Active, idle over an hour',
 				note: 'cache cold, so compacting reads the full context once',
-				threads: pick(false, false),
+				threads: newestFirst(pick(false, false)),
 				stale: true
 			}
 		];
 	});
 
 	const settledCold = $derived(
-		listed.filter(
-			(thread) =>
-				thread.settled &&
-				!warm(thread) &&
-				(lastFetched ?? Date.now()) - Date.parse(thread.last_active) <= SETTLED_LIMIT_MS
+		newestFirst(
+			listed.filter(
+				(thread) =>
+					thread.settled &&
+					!warm(thread) &&
+					(lastFetched ?? Date.now()) - Date.parse(thread.last_active) <= SETTLED_LIMIT_MS
+			)
 		)
 	);
 
