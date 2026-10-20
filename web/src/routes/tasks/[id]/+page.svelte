@@ -20,9 +20,11 @@
 	import { page } from '$app/state';
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
-	import { isInFlight } from '$lib/api';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+	import { asApiError, cancelTask, isInFlight, type ApiError } from '$lib/api';
 	import CallbackBadge from '$lib/components/CallbackBadge.svelte';
 	import CommandArgv from '$lib/components/CommandArgv.svelte';
+	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import CopyPath from '$lib/components/CopyPath.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
@@ -50,6 +52,26 @@
 	const threadRef = $derived(task ? { machine: task.origin_machine, thread: task.thread } : null);
 	const threadTitles = new ThreadTitleStore(() => (threadRef ? [threadRef] : []));
 	const threadName = $derived(threadRef ? threadTitles.title(threadRef) : null);
+
+	let confirmingCancel = $state(false);
+	let cancelling = $state(false);
+	let cancelError = $state<ApiError | null>(null);
+	// a requested cancel shows its timestamp instead, so a second click cannot look like a new one
+	const cancellable = $derived(live && task?.cancel_requested_at === null);
+
+	async function cancel() {
+		const id = page.params.id ?? '';
+		cancelling = true;
+		cancelError = null;
+		try {
+			await cancelTask(id);
+			await store.refresh();
+		} catch (cause) {
+			cancelError = asApiError(cause);
+		} finally {
+			cancelling = false;
+		}
+	}
 
 	let logBox = $state<HTMLElement | null>(null);
 	// Auto-follow starts on and stops as soon as the reader scrolls up.
@@ -89,6 +111,21 @@
 					cancel requested {formatTimestamp(task.cancel_requested_at)}
 				</span>
 			{/if}
+			{#if cancellable}
+				<button
+					type="button"
+					disabled={cancelling}
+					onclick={() => (confirmingCancel = true)}
+					class="inline-flex items-center gap-1 rounded border border-red-500/50 bg-red-500/10 px-2 py-0.5 text-[11px] leading-5 font-medium text-red-700 hover:bg-red-500/20 focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-40 dark:text-red-300"
+				>
+					{#if cancelling}
+						<LoaderCircle class="size-3 animate-spin" />
+						Cancelling
+					{:else}
+						Cancel task
+					{/if}
+				</button>
+			{/if}
 		{:else}
 			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
 		{/if}
@@ -100,6 +137,18 @@
 			{/if}
 		</span>
 	</header>
+
+	{#if cancelError}
+		<p
+			class="mt-3 flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-red-700 dark:text-red-300"
+		>
+			<CircleAlert class="mt-0.5 size-4 shrink-0" />
+			<span>
+				cancel failed: <span class="font-mono">{cancelError.code}</span>
+				&mdash; {cancelError.message}
+			</span>
+		</p>
+	{/if}
 
 	{#if store.error}
 		<p
@@ -308,3 +357,18 @@
 		{/if}
 	{/if}
 </div>
+
+{#if task}
+	<ConfirmDialog
+		bind:open={confirmingCancel}
+		title={`Cancel ${task.name}?`}
+		confirmLabel="Cancel task"
+		onConfirm={() => void cancel()}
+	>
+		{#if task.status === 'running'}
+			The worker stops and its processes are cleaned up.
+		{:else}
+			The task never starts.
+		{/if}
+	</ConfirmDialog>
+{/if}

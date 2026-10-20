@@ -593,6 +593,21 @@ const CancelResultSchema = Schema.Union(
 );
 export type CancelResult = typeof CancelResultSchema.Type;
 
+/**
+ * `POST /v1/tasks/{id}/cancel`: the task's status when this machine runs it, or a saved
+ * cancellation intent that the daemon delivers to the machine that does.
+ */
+const TaskCancelResultSchema = Schema.Union(
+	Schema.Struct({ api_version: ApiVersionSchema, id: Schema.String, status: ProcessStatusSchema }),
+	Schema.Struct({
+		api_version: ApiVersionSchema,
+		id: Schema.String,
+		execution_machine: Schema.String,
+		delivery: Schema.Struct({ state: Schema.Literal('pending', 'delivered') })
+	})
+);
+export type TaskCancelResult = typeof TaskCancelResultSchema.Type;
+
 /** `POST /v1/resource/release`. */
 const ReleaseResultSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
@@ -824,6 +839,14 @@ export function cancelJob(id: string, machine: string, operationId: string): Pro
 		{ operation_id: operationId },
 		CancelResultSchema
 	);
+}
+
+/**
+ * `POST /v1/tasks/{id}/cancel`. Repeating it is safe: a cancelled task stays cancelled and a
+ * saved intent is returned again.
+ */
+export function cancelTask(id: string): Promise<TaskCancelResult> {
+	return postJson(`/tasks/${encodeURIComponent(id)}/cancel`, {}, TaskCancelResultSchema);
 }
 
 /** `POST /v1/resource/release`: leave one exact `Attention`, never a later one. */

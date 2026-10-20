@@ -2,13 +2,13 @@
 //! fleet is enabled, the `/v1/cluster/*` routes
 //!
 //! Off unless `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. A TCP port
-//! is reachable from web pages. Ordinary task submit and cancel, job submit,
-//! and resource registration stay on the Unix socket. With fleet enabled,
+//! is reachable from web pages. Task submit, job submit, and resource
+//! registration stay on the Unix socket. With fleet enabled,
 //! `/v1/cluster/*` accepts task executions, queue requests (including submit
 //! and registration), and job events from peers within the existing trusted
 //! LAN and tailnet boundary. Peer authentication is deferred
-//! Queue controls that move, cancel, or release accepted jobs require
-//! same-origin JSON
+//! Task cancel and the queue controls that move, cancel, or release accepted
+//! jobs require same-origin JSON
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -90,7 +90,7 @@ pub fn url_for(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// Read API, guarded queue and compaction controls, and the embedded single-page app
+/// Read API, guarded task, queue, and compaction controls, and the embedded single-page app
 pub fn router(state: AppState, bind: SocketAddr) -> Router {
     let policy = HostPolicy { bind };
     let routes = match state.fleet.handle() {
@@ -99,7 +99,8 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
     };
     routes
         .merge(
-            super::queue_api::control_routes()
+            api::control_routes()
+                .merge(super::queue_api::control_routes())
                 .merge(super::claude_threads::control_routes())
                 .layer(middleware::from_fn(browser_write_guard)),
         )
@@ -121,10 +122,17 @@ pub(super) async fn browser_write_guard(request: Request, next: Next) -> Respons
     let fetch_site = headers
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok());
-    let allowed = !matches!(fetch_site, Some("cross-site" | "same-site"))
-        && origin.is_none_or(|origin| {
-            host.is_some_and(|host| origin.to_str().ok() == Some(format!("http://{host}").as_str()))
+    // an HTTPS proxy in front, such as Tailscale Serve, keeps the Host it answered on, so the
+    // page's https origin names the same authority as a direct http one
+    let same_origin = |origin: &str| {
+        host.is_some_and(|host| {
+            ["http://", "https://"]
+                .iter()
+                .any(|scheme| origin.strip_prefix(scheme) == Some(host))
         })
+    };
+    let allowed = !matches!(fetch_site, Some("cross-site" | "same-site"))
+        && origin.is_none_or(|origin| origin.to_str().is_ok_and(same_origin))
         && headers
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())

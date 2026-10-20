@@ -101,7 +101,7 @@ The terminal event of a Claude worker that ran on its submitting machine carries
 
 ## Dashboard
 
-The daemon serves a read-only HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn.
+The daemon serves an HTTP dashboard only when `--web-listen` / `HOMEBASED_WEB_LISTEN` is a host:port. Open that URL in a browser to see the tasks of every Fleet machine, their status, and their log tail without an agent turn. A queued, held, or running task's page has a Cancel task button.
 
 ```bash
 homebased --json daemon status       # "web" holds the URL, or null when the dashboard is off or the socket is down
@@ -110,7 +110,7 @@ curl -s "http://main:7677/v1/fleet/tasks?status=queued,running"
 curl -s "http://main:7677/v1/tasks/<id>/log?tail=200"
 ```
 
-The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, `GET /v1/usage?since=<RFC 3339>&thread=<uuid>`, which returns the `task usage` JSON, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. The dashboard's usage page shows the same report. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit and cancel are refused there with 405; they belong to the Unix socket. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
+The listener answers `GET /v1/status`, `GET /v1/tasks`, `GET /v1/fleet/tasks`, `GET /v1/tasks/<id>`, `GET /v1/usage?since=<RFC 3339>&thread=<uuid>`, which returns the `task usage` JSON, and `GET /v1/tasks/<id>/log?tail=<lines>`, which returns `{"id", "log", "truncated"}`. The dashboard's usage page shows the same report. `/v1/tasks` lists only this machine. `/v1/fleet/tasks` takes the same `status` and `thread` filters and adds every Fleet peer: `machines` has each machine's name, Homebased daemon version, location, and whether its task read succeeded, and `tasks` has one entry per task with the machine that runs it. The local daemon reports its package version; a peer reports the version from its last identity probe, including when its task read fails. A peer that does not answer is listed as `unavailable` with a reason, and the tasks of the other machines stay. Task submit is refused there with 405; it belongs to the Unix socket. `POST /v1/tasks/<id>/cancel` is served there for same-origin JSON requests, the same guard as the queue controls, and answers like `homebased task cancel`. Queue reads and move, cancel, and release are available on the web listener. Job submit and resource registration are socket-only. See [setup.md](setup.md) for `--web-listen`.
 
 A queue run can be `preempted` while its job waits to resume. Use [resource-queue.md](resource-queue.md) to inspect the job and its run history. Run task IDs cannot be used in `after`.
 

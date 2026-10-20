@@ -115,6 +115,48 @@ fn web_listener_serves_read_only_api() {
 }
 
 #[test]
+fn dashboard_cancels_a_running_task_from_the_same_origin_only() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let h = Harness::with_dashboard();
+    h.set_control("sleep", "30");
+    let id = h.submit(&Harness::spec("claude", "cancel me"));
+    h.wait_status(&id, "running");
+
+    let addr = dashboard_addr(&h);
+    let path = format!("/v1/tasks/{id}/cancel");
+    let request = |origin: &str| {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\n\
+             Connection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+
+    // another site's page must not stop work through the LAN port
+    let foreign = request("http://other.example");
+    assert!(foreign.starts_with("HTTP/1.1 403"), "{foreign}");
+    assert_eq!(h.show(&id)["status"], "running");
+
+    // an HTTPS proxy that keeps the Host header serves the page from the https origin
+    let allowed = request(&format!("https://{addr}"));
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    h.wait_status(&id, "cancelled");
+
+    // cancelling a finished task answers its final status instead of failing
+    let again = request(&format!("http://{addr}"));
+    assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+    assert!(again.contains("\"status\":\"cancelled\""), "{again}");
+}
+
+#[test]
 fn dashboard_file_browser_and_content_origin() {
     let h = Harness::with_dashboard();
     let addr = dashboard_addr(&h);

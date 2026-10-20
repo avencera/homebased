@@ -61,17 +61,24 @@ pub fn read_routes() -> Router<AppState> {
         .route("/v1/files/{token}", get(files_list))
 }
 
-/// Routes that change state. Unix socket only: the socket is mode 0600, while a
-/// loopback port is reachable from any page the user has open
+/// Routes that change state. The socket is mode 0600, while a TCP port is
+/// reachable from any page the user has open, so the dashboard mounts only the
+/// controls that stop or reorder work, behind its same-origin guard
 pub fn write_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::daemon::queue_api::submit_routes())
         .merge(crate::daemon::queue_api::control_routes())
         .merge(crate::daemon::claude_threads::control_routes())
         .merge(crate::daemon::wait_api::routes())
+        .merge(control_routes())
         .route("/v1/tasks", post(submit))
         .route("/v1/tasks/dry-run", post(dry_run))
-        .route("/v1/tasks/{id}/cancel", post(cancel))
+}
+
+/// Task controls that only stop work. The dashboard serves them behind its
+/// same-origin JSON guard; submit stays socket-only because it runs commands
+pub fn control_routes() -> Router<AppState> {
+    Router::new().route("/v1/tasks/{id}/cancel", post(cancel))
 }
 
 /// Full API for the Unix socket
