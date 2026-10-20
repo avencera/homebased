@@ -22,6 +22,17 @@
 			}
 		}
 	});
+
+	/** Header tint per level, for a block of that level's jobs. */
+	export const levelTint = tv({
+		variants: {
+			priority: {
+				high: 'border-rose-500/30 bg-rose-500/8',
+				medium: 'border-amber-500/30 bg-amber-500/8',
+				low: 'border-slate-400/30 bg-slate-500/6'
+			}
+		}
+	});
 </script>
 
 <script lang="ts">

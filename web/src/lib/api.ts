@@ -930,6 +930,12 @@ export function peerTaskHref(machine: FleetMachine | undefined, id: string): str
 	return `${machine.location.address.replace(/\/+$/, '')}/tasks/${encodeURIComponent(id)}`;
 }
 
+/** Queue page on a peer's own dashboard, or null for this machine or a peer without an address. */
+export function peerQueueHref(machine: FleetMachine): string | null {
+	if (machine.location.type !== 'peer' || !machine.location.address) return null;
+	return `${machine.location.address.replace(/\/+$/, '')}/queue`;
+}
+
 /** One thread and the machine that runs it. */
 export interface ThreadRef {
 	/** Machine that runs the thread. Omitted for the machine that serves the dashboard. */
