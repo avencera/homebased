@@ -4,7 +4,7 @@
 //! macOS, so marked test processes are this test binary re-executed into
 //! [`helper_process`], which is an ordinary binary on both platforms
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -720,6 +720,139 @@ fn unreadable_suspect_exit_requires_two_new_empty_scans() {
         "cleanup finished after {} scans, before the suspect exited and two empty scans followed",
         source.scans
     );
+}
+
+/// A process table where one same-user process refuses its environment and
+/// its ancestors are readable only through `info`
+struct Ancestry {
+    suspect: Pid,
+    table: BTreeMap<Pid, ProcessInfo>,
+}
+
+impl Ancestry {
+    /// `chain` runs from the suspect up to its oldest listed ancestor, as
+    /// `(uid, start)`; the last one's parent is init
+    fn new(chain: &[(u32, u64)]) -> Self {
+        let pids: Vec<_> = (0..chain.len())
+            .map(|index| Pid::from_raw(1000 + index as i32))
+            .collect();
+        let table = chain
+            .iter()
+            .enumerate()
+            .map(|(index, &(uid, start))| {
+                let ppid = pids.get(index + 1).copied().unwrap_or(Pid::from_raw(1));
+                let info = ProcessInfo {
+                    start: ProcessStartTime(start),
+                    ppid,
+                    pgid: pids[index],
+                    uid,
+                };
+                (pids[index], info)
+            })
+            .collect();
+
+        Self {
+            suspect: pids[0],
+            table,
+        }
+    }
+}
+
+impl ProcessSource for Ancestry {
+    type Handle = Pid;
+
+    fn list(&mut self) -> io::Result<Vec<Pid>> {
+        Ok(self.table.keys().copied().collect())
+    }
+
+    fn info(&mut self, pid: Pid) -> Read<ProcessInfo> {
+        self.table
+            .get(&pid)
+            .copied()
+            .map_or(Read::Gone, Read::Found)
+    }
+
+    fn environment(&mut self, pid: Pid) -> Read<Environment> {
+        // only the suspect hides its environment; same-user ancestors read
+        // as unmarked, and other-user reads are refused as on a real machine
+        let own_uid = nix::unistd::geteuid().as_raw();
+        match self.table.get(&pid) {
+            Some(info) if pid != self.suspect && info.uid == own_uid => {
+                Read::Found(Environment::default())
+            }
+            Some(_) => Read::Refused(Errno::EACCES),
+            None => Read::Gone,
+        }
+    }
+
+    fn pin(&mut self, _: Pid) -> Read<Pid> {
+        panic!("an unreadable process must never be a signal target")
+    }
+
+    fn send(&mut self, _: &Pid, _: Signal) -> Result<(), Errno> {
+        panic!("an unreadable process must never be signalled")
+    }
+
+    fn send_group(&mut self, _: Pid, _: Signal) -> Result<(), Errno> {
+        panic!("a marker sweep must never signal a group")
+    }
+}
+
+#[test]
+fn unreadable_process_under_an_older_daemon_does_not_hold_cleanup() {
+    let own = nix::unistd::geteuid().as_raw();
+    let root = own.wrapping_add(1);
+    let run_start = 100;
+    let cases = [
+        // user sshd-session, root sshd-session monitor, root sshd listener
+        (
+            "ssh login during the run",
+            vec![(own, 150), (root, 150), (root, 50)],
+            false,
+        ),
+        // run shell ran `sudo -u` back to this user
+        (
+            "sudo from the run",
+            vec![(own, 150), (root, 150), (own, 120)],
+            true,
+        ),
+        (
+            "other-user parent adopted by init",
+            vec![(own, 150), (root, 150)],
+            true,
+        ),
+        ("orphan adopted by init", vec![(own, 150)], true),
+    ];
+
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (name, chain, suspect) in cases {
+        let mut source = Ancestry::new(&chain);
+        let identity = ProcessIdentity {
+            pid: source.suspect,
+            start: ProcessStartTime(chain[0].1),
+        };
+        let outcome = sweep_marker_with(
+            &mut source,
+            TaskId::new(),
+            Some(ProcessStartTime(run_start)),
+            &BTreeSet::new(),
+            REFUSAL_TIMING,
+        );
+        actual.push((name, outcome));
+        expected.push((
+            name,
+            if suspect {
+                SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects {
+                    suspects: vec![identity],
+                })
+            } else {
+                SweepOutcome::Completed { signalled: vec![] }
+            },
+        ));
+    }
+
+    assert_eq!(actual, expected);
 }
 
 #[test]

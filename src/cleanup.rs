@@ -8,7 +8,9 @@
 //! worker recorded while the run was alive, see [`DescendantTracker`]
 //!
 //! Same-user processes with unreadable environments that started at or after
-//! the workload start hold cleanup for a machine check, but are never signalled
+//! the workload start hold cleanup for a machine check, but are never signalled.
+//! One that another user's older daemon started, such as an ssh login's
+//! `sshd-session`, is not run work and does not hold cleanup
 //!
 //! Cleanup reports whether attributable cleanup completed. It is not proof
 //! that a GPU is free: a process with a cleared environment, another user's
@@ -116,6 +118,10 @@ pub fn process_identity(pid: Pid) -> io::Result<ProcessIdentity> {
 /// Consecutive empty scans that finish cleanup even when listed processes
 /// keep exiting before inspection, as they do on a busy machine
 const BUSY_EMPTY_SCANS: u32 = 8;
+
+/// Deepest ancestor chain a suspect check climbs, a bound against a cycle
+/// seen through PID reuse between reads
+const MAX_ANCESTRY: usize = 64;
 
 /// Waits and bounds for one cleanup
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,12 +863,46 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
 
         // older processes cannot be run descendants; long-lived agents may
         // deny environment reads, so they must not hold a later run's resource
-        self.run_start
-            .filter(|start| info.start >= *start)
-            .map(|_| ProcessIdentity {
-                pid,
-                start: info.start,
-            })
+        let run_start = self.run_start.filter(|start| info.start >= *start)?;
+        if self.started_by_older_daemon(info.ppid, run_start) {
+            return None;
+        }
+
+        Some(ProcessIdentity {
+            pid,
+            start: info.start,
+        })
+    }
+
+    /// Whether another user's process from before the run started this one
+    ///
+    /// An ssh login makes a same-user `sshd-session` that hides its environment,
+    /// under a root `sshd-session` monitor that the older root `sshd` listener
+    /// forked. The walk climbs other-user ancestors until one predates the run.
+    /// Work a run hands to such a daemon, as with `ssh localhost`, is already
+    /// outside what cleanup can attribute. A same-user ancestor, init, or an
+    /// unreadable link keeps the process a suspect, so `sudo -u` from the run
+    /// and orphans adopted by init still hold the resource
+    fn started_by_older_daemon(&mut self, mut ancestor: Pid, run_start: ProcessStartTime) -> bool {
+        for _ in 0..MAX_ANCESTRY {
+            // init adopts orphaned run work, so it attributes nothing
+            if ancestor.as_raw() <= 1 {
+                return false;
+            }
+
+            let Read::Found(info) = self.source.info(ancestor) else {
+                return false;
+            };
+            if info.uid == self.own_uid {
+                return false;
+            }
+            if info.start < run_start {
+                return true;
+            }
+            ancestor = info.ppid;
+        }
+
+        false
     }
 
     fn lost_group(&mut self, leader: ProcessIdentity) -> Result<GroupAttribution, CleanupFailure> {
