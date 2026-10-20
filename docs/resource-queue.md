@@ -53,7 +53,7 @@ The web listener serves queue reads and move, cancel, and release. `GET /v1/flee
 
 ## Clear Attention after a machine check
 
-`Attention` means Homebased could not finish cleanup safely. The resource stays held until a person checks the machine and releases that exact Attention UUID. Other resources can continue to serve work. A job result does not prove that its resource is clear.
+`Attention` means Homebased could not finish cleanup safely. The resource stays held until an agent or person checks the machine and releases that exact Attention UUID. Other resources can continue to serve work. A job result does not prove that its resource is clear.
 
 If a same-user process started at or after the run's recorded workload start and its environment cannot be read, cleanup treats it as a suspect. It is never signalled without a readable run marker. Its scan is not empty. If it remains unreadable at the cleanup bound, the resource enters `Attention`; the cleanup message names its PID and kernel start time. Check that exact process on the authority machine. Unreadable processes that started before the run, and unreadable processes under another user, are ignored. If the workload start was not recorded, unreadable processes are ignored as before.
 

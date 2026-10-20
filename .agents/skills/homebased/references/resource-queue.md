@@ -127,7 +127,7 @@ Use `homebased --json` before each command and parse the result. All results car
 | `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, and run history. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
-| `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. A person must inspect the machine first. |
+| `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |
 
 Move with `--front`, `--back`, or `--priority <low-or-medium-or-high>`. Front and back can include priority. Priority alone joins the new level's back. `--before <job>` and `--after <job>` take the target's level. An optional priority must match that level. Do not combine two placement flags or move relative to the same job.
 
@@ -155,7 +155,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `JOB_FAILED` | Inspect the run log and `process`. Later steps did not start. |
 | `JOB_CANCELLED` | Cancellation took effect. Inspect cleanup if the resource remains held. |
 | `JOB_PREEMPTED` | The job is queued again. Let the queue resume it. Do not resubmit. |
-| `JOB_ATTENTION` | Cleanup could not finish safely. Ask a person to inspect the machine. |
+| `JOB_ATTENTION` | Cleanup could not finish safely. Check the machine and release the hold if nothing from the run remains. |
 | `JOB_BLOCKED` | Inspect the listed blockers. This is a notice, never a stop. |
 | `JOB_CHECK_DUE` | Inspect the current run and its recent output. Inactivity does not stop it. |
 
@@ -173,9 +173,9 @@ Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `
 
 ## Attention and cleanup limits
 
-After a run ends, Homebased cleans up its process group, marked processes, and container before it serves new work on that resource. If cleanup cannot finish safely, the resource enters `Attention`. Other resources can still serve work. A person must inspect the machine, stop remaining work, and release the exact Attention ID. An agent must not release it from a timeout or assume that exit means the GPU is free.
+After a run ends, Homebased cleans up its process group, marked processes, and container before it serves new work on that resource. If cleanup cannot finish safely, the resource enters `Attention`. Other resources can still serve work. Check the machine yourself: stop any remaining work from the run, then release the exact Attention ID. Do not release it only because a timeout passed or the job exited, and do not assume that exit means the GPU is free. Ask the user only when you cannot tell whether a remaining process belongs to the run. Report each release with the processes you checked and why they did not belong to the run.
 
-If a same-user process started at or after the run's recorded workload start and its environment cannot be read, cleanup treats it as a suspect. It is never signalled without a readable run marker. Its scan is not empty. If it remains unreadable at the cleanup bound, the resource enters `Attention`; the cleanup message names its PID and kernel start time. Check that exact process on the authority machine. Unreadable processes that started before the run, and unreadable processes under another user, are ignored. If the workload start was not recorded, unreadable processes are ignored as before.
+If a same-user process started at or after the run's recorded workload start and its environment cannot be read, cleanup treats it as a suspect. It is never signalled without a readable run marker. Its scan is not empty. If it remains unreadable at the cleanup bound, the resource enters `Attention`; the cleanup message names its PID and kernel start time. Check that exact process on the authority machine. A suspect that is an ssh session (`sshd-session`) or another process that the run did not start, with no GPU processes left in `nvidia-smi`, does not block a release. Unreadable processes that started before the run, and unreadable processes under another user, are ignored. If the workload start was not recorded, unreadable processes are ignored as before.
 
 Cleanup cannot reliably find work with a cleared environment, work under another user, or Apple platform binaries in a new session. It cannot attribute work handed to an existing `tmux` or `screen` server, `launchctl`, `systemd-run`, `docker run`, or `ssh`. Do not use these escapes inside a script. Keep work in the run and preserve its marker. Use a container workload instead of starting Docker inside a host command.
 

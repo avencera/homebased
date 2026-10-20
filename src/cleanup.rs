@@ -8,7 +8,7 @@
 //! worker recorded while the run was alive, see [`DescendantTracker`]
 //!
 //! Same-user processes with unreadable environments that started at or after
-//! the workload start hold cleanup for a person to check, but are never signalled
+//! the workload start hold cleanup for a machine check, but are never signalled
 //!
 //! Cleanup reports whether attributable cleanup completed. It is not proof
 //! that a GPU is free: a process with a cleared environment, another user's
@@ -143,7 +143,7 @@ impl CleanupTiming {
     };
 }
 
-/// Why cleanup could not finish; the resource needs a person to check the machine
+/// Why cleanup could not finish; the resource needs a machine check before release
 ///
 /// It is stored with the resource's `Attention`, so it has a serde form
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,7 +163,7 @@ pub enum CleanupFailure {
     },
     /// Same-user processes started during the run, but their markers could not be read
     UnreadableSuspects {
-        /// Processes that need a person to check their PID and kernel start time
+        /// Processes to check by PID and kernel start time
         suspects: Vec<ProcessIdentity>,
     },
     /// A protected process, such as the daemon or a task worker, carried the

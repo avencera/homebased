@@ -802,7 +802,7 @@ pub enum RunPhase {
         /// Cleanup attempt the next result must name, starting at 1
         attempt: u32,
     },
-    /// Cleanup could not finish; only a person's release leaves this phase
+    /// Cleanup could not finish; only an explicit release leaves this phase
     Attention {
         /// Identity a release must name
         id: AttentionId,
@@ -834,7 +834,7 @@ impl RunPhase {
     }
 }
 
-/// Why cleanup after a run could not finish, so its resource needs a person
+/// Why cleanup after a run could not finish, so its resource needs a machine check
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CleanupFailure {
