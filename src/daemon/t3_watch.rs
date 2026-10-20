@@ -19,6 +19,8 @@ const PROBE_RETRIES: u8 = 5;
 struct WatchState {
     last_runtime: Option<Vec<u8>>,
     last_alerted: Option<String>,
+    /// Changed fingerprint from the previous probe, alerted only if the next agrees
+    unconfirmed: Option<String>,
     retries_left: u8,
 }
 
@@ -57,6 +59,7 @@ impl WatchState {
         match report.status {
             ProbeStatus::Compatible => {
                 self.last_alerted = None;
+                self.unconfirmed = None;
                 None
             }
             ProbeStatus::Changed => {
@@ -64,8 +67,16 @@ impl WatchState {
                 if self.last_alerted.as_deref() == Some(&fingerprint) {
                     return None;
                 }
-                // retry on unchanged runtime metadata until the push succeeds
+                // retry on unchanged runtime metadata until a second probe
+                // confirms the change and the push succeeds
                 self.retries_left = PROBE_RETRIES;
+                // one probe can fail on a transient `t3` glitch, such as the
+                // first probe after a daemon restart, so a lone result is not
+                // proof that the contract changed
+                if self.unconfirmed.as_ref() != Some(&fingerprint) {
+                    self.unconfirmed = Some(fingerprint);
+                    return None;
+                }
                 Some(fingerprint)
             }
             ProbeStatus::NotInstalled | ProbeStatus::NotRunning | ProbeStatus::Unavailable => None,
@@ -73,7 +84,8 @@ impl WatchState {
     }
 }
 
-/// Probe a changed T3 runtime and alert once for each incompatible API fingerprint
+/// Probe a changed T3 runtime and alert once for each incompatible API
+/// fingerprint that two consecutive probes report
 pub(crate) async fn run(notifier: Option<Arc<Notifier>>, machine_name: String) {
     let env = T3Env::from_env();
     let runtime = env.home.join(".t3/userdata/server-runtime.json");
@@ -164,9 +176,37 @@ mod tests {
         assert!(state.probe_due(runtime.clone()));
         let changed = report(ProbeStatus::Changed, "one");
         state.probe_finished(changed.status);
+        assert_eq!(state.new_alert(&changed), None);
+        assert!(state.probe_due(runtime.clone()));
         assert_eq!(state.new_alert(&changed), Some("api: one".into()));
         assert!(state.probe_due(runtime));
         assert_eq!(state.new_alert(&changed), Some("api: one".into()));
+    }
+
+    #[test]
+    fn bugfix_one_failed_probe_does_not_alert() {
+        let mut state = WatchState::default();
+        let runtime = Some(b"runtime".to_vec());
+        assert!(state.probe_due(runtime.clone()));
+        let glitch = report(ProbeStatus::Changed, "t3 token output is not valid JSON");
+        state.probe_finished(glitch.status);
+        assert_eq!(state.new_alert(&glitch), None);
+
+        assert!(state.probe_due(runtime.clone()));
+        state.probe_finished(ProbeStatus::Compatible);
+        assert_eq!(state.new_alert(&report(ProbeStatus::Compatible, "")), None);
+        assert!(!state.probe_due(runtime));
+    }
+
+    #[test]
+    fn a_different_changed_fingerprint_restarts_confirmation() {
+        let mut state = WatchState::default();
+        assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "one")), None);
+        assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "two")), None);
+        assert_eq!(
+            state.new_alert(&report(ProbeStatus::Changed, "two")),
+            Some("api: two".into())
+        );
     }
     use super::WatchState;
     use crate::t3::{ProbeCheck, ProbeReport, ProbeStatus};
@@ -205,6 +245,7 @@ mod tests {
         assert!(!state.changed_runtime(None));
         assert!(state.changed_runtime(Some(b"first".to_vec())));
         assert!(!state.changed_runtime(Some(b"first".to_vec())));
+        assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "one")), None);
         assert_eq!(
             state.new_alert(&report(ProbeStatus::Changed, "one")),
             Some("api: one".into())
@@ -213,12 +254,14 @@ mod tests {
         assert!(state.changed_runtime(Some(b"second".to_vec())));
         assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "one")), None);
         assert!(state.changed_runtime(Some(b"third".to_vec())));
+        assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "two")), None);
         assert_eq!(
             state.new_alert(&report(ProbeStatus::Changed, "two")),
             Some("api: two".into())
         );
         state.new_alert(&report(ProbeStatus::Compatible, ""));
         assert!(state.changed_runtime(Some(b"fourth".to_vec())));
+        assert_eq!(state.new_alert(&report(ProbeStatus::Changed, "two")), None);
         assert_eq!(
             state.new_alert(&report(ProbeStatus::Changed, "two")),
             Some("api: two".into())

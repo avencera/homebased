@@ -262,7 +262,9 @@ event to `callback-fallback.log` and sends a push notification.
 
 Run `homebased t3 check` after T3 updates to check that the local API still
 works. It reports the orchestration protocol it found and was verified
-against T3 Code 0.1.0.
+against T3 Code 0.1.0. The daemon runs the same check when it starts and whenever T3 restarts, and
+sends a push notification only when two checks a minute apart find the same
+incompatibility.
 
 A Claude session with a transcript but no live process is waiting, not gone.
 Homebased keeps the event in the task inbox and watches

@@ -40,7 +40,7 @@ mod v2;
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -780,11 +780,24 @@ impl T3Cli {
             .stdout
             .take()
             .ok_or_else(|| format!("could not read {label} output"))?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.take(CLI_OUTPUT_LIMIT).read_to_end(&mut bytes);
-            let _ = sender.send(bytes);
+            let mut stdout = stdout.take(CLI_OUTPUT_LIMIT);
+            let mut chunk = [0_u8; 8192];
+            // send each read as it arrives, so output written before exit
+            // survives a pipe that never reaches EOF
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if sender.send(chunk[..read].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -808,8 +821,18 @@ impl T3Cli {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        // a descendant can keep the pipe open after the direct child exits
-        let stdout = receiver.recv_timeout(CLI_DRAIN_TIMEOUT).unwrap_or_default();
+        // a descendant, or any process that inherited the write end while the
+        // daemon spawned it, can keep the pipe open after the direct child
+        // exits; keep what arrived instead of discarding it
+        let drain_deadline = Instant::now() + CLI_DRAIN_TIMEOUT;
+        let mut stdout = Vec::new();
+        while let Some(left) = drain_deadline.checked_duration_since(Instant::now()) {
+            match receiver.recv_timeout(left) {
+                Ok(chunk) => stdout.extend_from_slice(&chunk),
+                Err(_) => break,
+            }
+        }
+
         Ok(CliOutput {
             success: status.success(),
             stdout,
@@ -847,6 +870,10 @@ impl T3Cli {
             return Err(IssueError::Unavailable(
                 "t3 auth session issue failed".into(),
             ));
+        }
+
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Err(IssueError::Changed("t3 token output is empty".into()));
         }
 
         let value =
@@ -1538,6 +1565,28 @@ mod tests {
 
         assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bugfix_output_survives_a_pipe_held_open_after_exit() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("t3");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '{\"ok\":true}\\n'\nsleep 5 &\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = T3Cli {
+            executable: script,
+            env: T3Env::new(dir.path().to_path_buf(), std::env::var_os("PATH").unwrap()),
+            timeout: Duration::from_secs(5),
+        };
+
+        let output = cli.run("t3 auth session issue", &[]).unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.stdout, b"{\"ok\":true}\n");
     }
 
     #[test]
