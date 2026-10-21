@@ -3,7 +3,6 @@
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
-	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import { machineHue } from '$lib/colors';
 	import {
 		IN_FLIGHT_STATUSES,
@@ -37,13 +36,6 @@
 
 	const visibleTasks = $derived(
 		project ? store.tasks.filter((entry) => projectName(entry.task) === project) : store.tasks
-	);
-	const unavailableMachines = $derived(
-		store.machines.flatMap((machine) =>
-			machine.read.state === 'unavailable'
-				? [{ name: machine.name, message: machine.read.message }]
-				: []
-		)
 	);
 	// the merged fleet list holds each task once, from the machine that runs it
 	const inFlightByMachine = $derived.by(() => {
@@ -112,10 +104,6 @@
 
 	function toggleFinished() {
 		applyStatuses(showFinished ? [...IN_FLIGHT_STATUSES] : [...PROCESS_STATUSES]);
-	}
-
-	function machineList(names: readonly string[]): string {
-		return names.join(', ');
 	}
 </script>
 
@@ -198,27 +186,6 @@
 				&mdash; {store.error.message}
 			</span>
 		</p>
-	{/if}
-
-	{#if unavailableMachines.length > 0}
-		<div
-			class="mt-3 flex items-start gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2"
-			role="status"
-		>
-			<TriangleAlert class="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
-			<div class="min-w-0">
-				<p>
-					{machineList(unavailableMachines.map((machine) => machine.name))}
-					{unavailableMachines.length === 1 ? 'is' : 'are'} offline. Tasks from the other machines are
-					still shown.
-				</p>
-				<ul class="text-muted-foreground">
-					{#each unavailableMachines as machine (machine.name)}
-						<li><span class="font-medium">{machine.name}</span>: {machine.message}</li>
-					{/each}
-				</ul>
-			</div>
-		</div>
 	{/if}
 
 	<!-- one swipeable row on phones, wrapped on wider screens -->
