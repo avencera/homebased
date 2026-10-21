@@ -184,7 +184,23 @@ fn install_t3(home: &Path, origin: &str) {
 }
 
 fn run_json(daemon: &Daemon, args: &[&str]) -> (i32, Value) {
-    let output = daemon.cmd().arg("--json").args(args).output().unwrap();
+    run_json_in_thread(daemon, None, args)
+}
+
+/// Runs the command the way an agent in `thread` would, with no thread when `None`
+fn run_json_in_thread(daemon: &Daemon, thread: Option<&str>, args: &[&str]) -> (i32, Value) {
+    let mut cmd = daemon.cmd();
+    for var in [
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        cmd.env_remove(var);
+    }
+    if let Some(thread) = thread {
+        cmd.env("CLAUDE_CODE_SESSION_ID", thread);
+    }
+    let output = cmd.arg("--json").args(args).output().unwrap();
     let stream = if output.status.success() {
         &output.stdout
     } else {
@@ -201,7 +217,7 @@ fn run_json(daemon: &Daemon, args: &[&str]) -> (i32, Value) {
 }
 
 #[test]
-fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route() {
+fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route_only_when_asked() {
     if which::which("curl").is_err() {
         return;
     }
@@ -224,15 +240,14 @@ fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route() {
         &project,
         "--message",
         "Fix the flaky upload test",
-        "--source-thread",
-        &source,
+        "--reply-route",
         "--request-id",
         &request,
     ];
 
-    let (code, launched) = run_json(&origin, &launch);
+    let (code, launched) = run_json_in_thread(&origin, Some(&source), &launch);
     assert_eq!(code, 0, "{launched}");
-    let (code, retried) = run_json(&origin, &launch);
+    let (code, retried) = run_json_in_thread(&origin, Some(&source), &launch);
     assert_eq!(code, 0, "{retried}");
 
     let thread = launched["thread"]["thread_id"].as_str().unwrap();
@@ -264,6 +279,26 @@ fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route() {
         "{text}"
     );
 
+    let (code, handed_off) = run_json_in_thread(
+        &origin,
+        Some(&source),
+        &[
+            "t3",
+            "launch",
+            "--machine",
+            "t3-executor",
+            "--project",
+            &project,
+            "--message",
+            "Take over the upload fix",
+        ],
+    );
+    assert_eq!(code, 0, "{handed_off}");
+    assert_eq!(
+        t3.launches()[2]["payload"]["initialMessage"]["text"],
+        "Take over the upload fix"
+    );
+
     let (code, listed) = run_json(&origin, &["t3", "projects", "--machine", "t3-executor"]);
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["projects"][0]["id"], "project-app");
@@ -287,7 +322,7 @@ fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route() {
     );
     assert_eq!(code, 3, "{missing}");
     assert_eq!(missing["error"]["code"], "t3_project_not_found");
-    assert_eq!(t3.launches().len(), 2);
+    assert_eq!(t3.launches().len(), 3);
 }
 
 #[test]
@@ -316,7 +351,6 @@ fn a_lost_t3_reply_reaches_the_caller_with_the_request_id_to_retry() {
             "Lost reply",
             "--request-id",
             &request,
-            "--no-reply-route",
         ],
     );
 

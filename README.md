@@ -323,9 +323,10 @@ the project setup script, and starts the first message.
 - The thread runs `full-access` unless `--runtime-mode` says otherwise, since
   nobody on that machine is there to approve its actions. `--plan` starts it
   in plan mode.
-- The first message ends with the calling thread and machine and the
-  `homebased message send` command that reaches them, so the new agent can
-  report back. `--no-reply-route` leaves it out.
+- The new thread is a hand-off: nothing in it points back to the thread that
+  launched it. `--reply-route` ends the first message with the calling thread
+  and machine and the `homebased message send` command that reaches them, so
+  the new agent can report back; `--source-thread <id>` names another thread.
 - The output has the thread id and a `t3code://threads/<environment>/<thread>`
   link that opens it in T3 Code.
 - T3 launches once per `--request-id`, so repeating the command with the same

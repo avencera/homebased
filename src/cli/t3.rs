@@ -91,12 +91,13 @@ pub struct LaunchArgs {
     /// Stable UUID for an explicit retry after an unknown outcome
     #[arg(long)]
     request_id: Option<Uuid>,
-    /// Thread to name as the reply route; defaults to the calling agent's thread
+    /// End the first message with the calling agent's thread and the command
+    /// that messages it, so the new agent can report back
+    #[arg(long, conflicts_with = "source_thread")]
+    reply_route: bool,
+    /// Like --reply-route, but name this thread instead of the calling one
     #[arg(long)]
     source_thread: Option<ThreadId>,
-    /// Leave the reply route out of the first message
-    #[arg(long, conflicts_with = "source_thread")]
-    no_reply_route: bool,
 }
 
 /// Run one T3 Code command
@@ -159,10 +160,13 @@ async fn launch(ctx: &Ctx, args: LaunchArgs) -> Result<ExitCode, AppError> {
         .provider
         .zip(args.model)
         .map(|(provider, model)| ModelChoice { provider, model });
-    let source_thread = if args.no_reply_route {
-        None
-    } else {
-        args.source_thread.or_else(calling_thread)
+    // launches are hand-offs: the user takes over the new thread, so it only
+    // learns how to reach this one when asked
+    let source_thread = match (args.reply_route, args.source_thread) {
+        (true, _) => Some(calling_thread().ok_or_else(|| AppError::Usage {
+            message: "--reply-route found no calling agent thread; pass --source-thread".into(),
+        })?),
+        (false, thread) => thread,
     };
 
     let request = T3LaunchRequest {
