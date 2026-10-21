@@ -19,6 +19,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
 - Event delivery is at-least-once. Deduplicate by `(task, seq)`.
 - Use `homebased message send` for a direct message to a Claude Code session or Codex thread. Address a session by its id or by a task whose origin it is, never by its display name, which changes each time the session restarts. Read [messages.md](references/messages.md) for destination, source, and retry rules.
+- Use `homebased t3 launch --machine <name>` to start a new top-level T3 Code thread on another Fleet machine, such as `code`. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
 - `message send --task` targets the task's origin thread, not its worker. Use `message send --worker <task>` to give a running Claude worker new instructions; it reads them at its next turn boundary. Use `homebased task followup` to resume a terminal Codex worker, or a Claude worker submitted with `persist_session: true`, with new information. Run follow-up on the task's origin or execution machine. Only one follow-up can resume a thread at a time; wait for the active task's event after `resume_thread_busy`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
 - To start work only after other tasks succeed, submit it now with `after` in the spec. The daemon holds it, starts it when every dependency succeeds, and cancels it if one ends any other way. Do not wait for the events to submit the next phase.
@@ -44,6 +45,7 @@ Pick the first row that matches, then read only that file.
 | Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks, or finding the tokens workers spent | [inspect.md](references/inspect.md) |
 | Inside a T3 Code thread (the `t3-code` MCP tools are present) | [t3.md](references/t3.md) |
+| Starting a T3 Code thread on another machine | [t3.md](references/t3.md#launching-a-thread-on-another-machine) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
 | Sending a direct message to a session or thread | [messages.md](references/messages.md) |
 | A command exited non-zero, `daemon_unavailable`, or the socket is down | [errors.md](references/errors.md) |

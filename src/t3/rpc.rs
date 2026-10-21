@@ -27,8 +27,8 @@ const REQUEST_ID: &str = "1";
 /// Decoded `Exit` of one RPC call
 #[derive(Debug)]
 pub(super) enum Exit {
-    /// The handler succeeded; callers need only that T3 took the request
-    Success,
+    /// The handler succeeded with this value
+    Success(Value),
     /// The handler failed; each item is one encoded cause
     Failure(Vec<Value>),
 }
@@ -283,7 +283,9 @@ fn is_this_request(id: Option<&Value>) -> bool {
 fn decode_exit(exit: Option<&Value>) -> Result<Exit, ApiFailure> {
     let exit = exit.ok_or_else(|| ApiFailure::Changed("T3 RPC Exit has no exit".into()))?;
     match exit.get("_tag").and_then(Value::as_str) {
-        Some("Success") => Ok(Exit::Success),
+        Some("Success") => Ok(Exit::Success(
+            exit.get("value").cloned().unwrap_or(Value::Null),
+        )),
         Some("Failure") => exit
             .get("cause")
             .and_then(Value::as_array)

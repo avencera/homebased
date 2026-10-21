@@ -457,6 +457,27 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "message_receiver_unavailable" => AppError::MessageUnavailable { message },
+        "t3_project_not_found" => AppError::T3ProjectNotFound {
+            selector: decode_field(input, "selector").unwrap_or_default(),
+            projects: decode_field(input, "projects").unwrap_or_default(),
+        },
+        "t3_launch_refused" => AppError::T3LaunchRefused {
+            message: decode_field(input, "message").unwrap_or(message),
+        },
+        "t3_unavailable" => AppError::T3Unavailable {
+            message: decode_field(input, "message").unwrap_or(message),
+        },
+        "t3_incompatible" => AppError::T3Incompatible {
+            message: decode_field(input, "message").unwrap_or(message),
+        },
+        "t3_launch_outcome_unknown" => match decode_field(input, "request_id") {
+            Some(request) => AppError::T3LaunchOutcomeUnknown {
+                request,
+                machine: decode_field(input, "machine"),
+                message: decode_field(input, "message").unwrap_or(message),
+            },
+            None => AppError::Internal { message },
+        },
         "invalid_cwd" => {
             let path_at = |key: &str| input.get(key).and_then(Value::as_str).map(PathBuf::from);
             let problem = decode_field(input, "problem");

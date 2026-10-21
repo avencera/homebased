@@ -293,7 +293,7 @@ pub(super) fn dispatch(
         RPC_TIMEOUT,
         before_send,
     ) {
-        Ok(Exit::Success) => Ok(()),
+        Ok(Exit::Success(_)) => Ok(()),
         // only T3's typed refusal proves it did not take the message
         Ok(Exit::Failure(cause)) => match dispatch_failure(&cause) {
             ApiFailure::Refused(detail) => Err(ApiFailure::Refused(detail)),
@@ -327,7 +327,7 @@ pub(super) fn probe_api(origin: &str, token: &str, checks: &mut Vec<ProbeCheck>)
     );
     let failure = match rpc::call(origin, token, DISPATCH_METHOD, &payload, RPC_TIMEOUT) {
         Ok(Exit::Failure(cause)) => dispatch_failure(&cause),
-        Ok(Exit::Success) => {
+        Ok(Exit::Success(_)) => {
             ApiFailure::Changed("message dispatch accepted an unknown thread".into())
         }
         Err(error) => error.failure,

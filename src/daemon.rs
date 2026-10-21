@@ -24,6 +24,7 @@ mod origin_submit;
 mod peer_read;
 pub mod queue_api;
 mod t3_hold;
+pub mod t3_launch;
 mod t3_watch;
 mod thread_titles;
 pub mod usage_api;

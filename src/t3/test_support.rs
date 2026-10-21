@@ -283,7 +283,9 @@ impl V2State {
              CREATE TABLE projection_projects (
                 project_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
-                workspace_root TEXT NOT NULL
+                workspace_root TEXT NOT NULL,
+                deleted_at TEXT,
+                default_model_selection_json TEXT
              );
              CREATE TABLE orchestration_v2_projection_provider_threads (
                 provider_thread_id TEXT PRIMARY KEY,
@@ -333,6 +335,30 @@ impl V2State {
                 "INSERT INTO projection_projects (project_id, title, workspace_root)
                  VALUES ('project', ?1, ?2)",
                 rusqlite::params![title, workspace_root],
+            )
+            .unwrap();
+        self
+    }
+
+    /// A project with its own id and, optionally, its own default model
+    pub(crate) fn launch_project(
+        self,
+        project_id: &str,
+        title: &str,
+        workspace_root: &str,
+        default_model: Option<&serde_json::Value>,
+    ) -> Self {
+        self.0
+            .execute(
+                "INSERT INTO projection_projects
+                 (project_id, title, workspace_root, default_model_selection_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project_id,
+                    title,
+                    workspace_root,
+                    default_model.map(ToString::to_string)
+                ],
             )
             .unwrap();
         self

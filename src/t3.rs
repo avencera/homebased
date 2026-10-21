@@ -1,4 +1,5 @@
-//! T3 Code client for waking provider sessions and checking its local API
+//! T3 Code client for waking provider sessions, launching threads, and
+//! checking its local API
 //!
 //! # T3 Code internals this depends on
 //!
@@ -30,13 +31,22 @@
 //!   `t3 auth session revoke <sessionId>` after every use; `t3 --version`
 //!   supplies the optional probe version
 //!
+//! Launching a new thread adds the contracts listed in [`launch`]
+//!
 //! Calls use the blocking system `curl` helper, a blocking WebSocket, and `t3`
 //! commands with a deadline. The callback dispatcher must call this module from
 //! `spawn_blocking`
 
 mod hold;
+mod launch;
 mod rpc;
 mod v2;
+
+pub use launch::{
+    InteractionMode, LaunchError, LaunchSpec, LaunchedThread,
+    MESSAGE_MAX_BYTES as LAUNCH_MESSAGE_MAX_BYTES, ModelChoice, ModelOption, OptionValue,
+    RuntimeMode, T3Project, Workspace, launch_thread, projects,
+};
 
 use std::ffi::OsString;
 use std::fs;

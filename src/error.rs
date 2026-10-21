@@ -446,6 +446,46 @@ pub enum AppError {
         /// Safe failure summary
         message: String,
     },
+    /// T3 Code on the launching machine has no project that matches
+    #[error("T3 project not found: {selector}; known projects: {}", projects.join(", "))]
+    T3ProjectNotFound {
+        /// Project id, path, or title the caller gave
+        selector: String,
+        /// Title and root of the projects T3 has, up to 50
+        projects: Vec<String>,
+    },
+    /// The thread cannot launch as requested, or T3 Code refused it
+    #[error("T3 thread launch refused: {message}")]
+    T3LaunchRefused {
+        /// Why the launch did not happen
+        message: String,
+    },
+    /// T3 Code is not installed, not running, or speaks another API
+    #[error("T3 unavailable: {message}")]
+    T3Unavailable {
+        /// Safe failure summary
+        message: String,
+    },
+    /// T3 Code or the launching machine's homebased speaks another API, so
+    /// retrying cannot help until one of them is updated
+    #[error("T3 incompatible: {message}")]
+    T3Incompatible {
+        /// What does not match and what to update
+        message: String,
+    },
+    /// The launch request may have reached T3 Code, but its result did not come back
+    #[error(
+        "T3 launch outcome unknown for request {request}{}: {message}; retry with --request-id {request}",
+        machine.map_or_else(String::new, |machine| format!(" on machine {machine}"))
+    )]
+    T3LaunchOutcomeUnknown {
+        /// Request UUID to reuse; T3 launches once per request
+        request: uuid::Uuid,
+        /// Launching machine, when the request got that far
+        machine: Option<MachineId>,
+        /// Why the result is unknown
+        message: String,
+    },
     /// Machines share no cluster protocol version
     #[error("machine {machine} speaks cluster protocol {remote}, this daemon accepts {local}")]
     ClusterProtocolIncompatible {
@@ -606,6 +646,11 @@ impl AppError {
             Self::MessageDeliveryFailed { .. } => "message_delivery_failed",
             Self::MessageOutcomeUnknown { .. } => "message_outcome_unknown",
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
+            Self::T3ProjectNotFound { .. } => "t3_project_not_found",
+            Self::T3LaunchRefused { .. } => "t3_launch_refused",
+            Self::T3Unavailable { .. } => "t3_unavailable",
+            Self::T3LaunchOutcomeUnknown { .. } => "t3_launch_outcome_unknown",
+            Self::T3Incompatible { .. } => "t3_incompatible",
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::DaemonBusy => "daemon_busy",
             Self::Queue(error) => error.code(),
@@ -678,6 +723,9 @@ impl AppError {
             Self::MessageDeliveryFailed { .. }
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. } => 1,
+            Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => 1,
+            Self::T3ProjectNotFound { .. } => 3,
+            Self::T3LaunchRefused { .. } | Self::T3Incompatible { .. } => 5,
             Self::Queue(error) => error.exit_code(),
             Self::Waiting(WaitingRejection::UnknownTarget { .. }) => 3,
             Self::Waiting(_) => 5,
@@ -708,7 +756,15 @@ impl AppError {
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::MachineNotFound { .. } => http::StatusCode::NOT_FOUND,
-            Self::AgentThreadNotFound { .. } => http::StatusCode::NOT_FOUND,
+            Self::AgentThreadNotFound { .. } | Self::T3ProjectNotFound { .. } => {
+                http::StatusCode::NOT_FOUND
+            }
+            Self::T3LaunchRefused { .. } | Self::T3Incompatible { .. } => {
+                http::StatusCode::CONFLICT
+            }
+            Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => {
+                http::StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Permission { .. } => http::StatusCode::FORBIDDEN,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -767,6 +823,8 @@ impl AppError {
                 | Self::MessageDeliveryFailed { .. }
                 | Self::MessageOutcomeUnknown { .. }
                 | Self::MessageUnavailable { .. }
+                | Self::T3Unavailable { .. }
+                | Self::T3LaunchOutcomeUnknown { .. }
         )
     }
 
@@ -824,6 +882,17 @@ impl AppError {
                 json!({ "message_id": id, "machine": machine, "message": message })
             }
             Self::MessageUnavailable { message } => json!({ "message": message }),
+            Self::T3ProjectNotFound { selector, projects } => {
+                json!({ "selector": selector, "projects": projects })
+            }
+            Self::T3LaunchRefused { message }
+            | Self::T3Unavailable { message }
+            | Self::T3Incompatible { message } => json!({ "message": message }),
+            Self::T3LaunchOutcomeUnknown {
+                request,
+                machine,
+                message,
+            } => json!({ "request_id": request, "machine": machine, "message": message }),
             Self::InvalidCwd {
                 path,
                 problem,

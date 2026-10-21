@@ -88,6 +88,7 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(write_routes())
         .route("/v1/tasks/{id}/followup-source", get(followup_source))
         .merge(crate::daemon::fleet_api::socket_routes())
+        .merge(crate::daemon::t3_launch::socket_routes())
         .with_state(state)
 }
 

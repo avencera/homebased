@@ -157,7 +157,10 @@ fn reject_message_to_self(
     Ok(())
 }
 
-async fn resolve_machine(state: &AppState, selector: &str) -> Result<MachineId, AppError> {
+pub(super) async fn resolve_machine(
+    state: &AppState,
+    selector: &str,
+) -> Result<MachineId, AppError> {
     if let Ok(machine) = selector.parse::<MachineId>() {
         return Ok(machine);
     }

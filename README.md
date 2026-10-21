@@ -298,6 +298,45 @@ that T3 never starts once the thread is idle, and interrupts it to deliver
 each event as a normal turn or to let a message the user sent run. The flag
 does nothing for other threads.
 
+### Launch a T3 thread on any machine
+
+```sh
+homebased t3 projects --machine code
+homebased t3 launch --machine code --project ~/code/app \
+  --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
+  [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high]
+```
+
+`t3 launch` starts an ordinary top-level T3 Code thread in the T3 on another
+Fleet machine, or on this one without `--machine`, as if someone had started
+it there. The daemon forwards the request to that machine's daemon, which
+calls T3's `orchestration.launchThread`: T3 creates the thread, prepares its
+workspace (the project root, a new worktree, or `--existing-worktree`), runs
+the project setup script, and starts the first message.
+
+- `--project` takes a T3 project id, the project's workspace root on that
+  machine (absolute or `~/`), or its exact title. `t3 projects` lists them with
+  the model a launch uses by default.
+- Without `--provider` and `--model`, the thread runs the default model from
+  that machine's T3 settings. When neither the settings nor the project name
+  one, the launch fails and asks for both.
+- The thread runs `full-access` unless `--runtime-mode` says otherwise, since
+  nobody on that machine is there to approve its actions. `--plan` starts it
+  in plan mode.
+- The first message ends with the calling thread and machine and the
+  `homebased message send` command that reaches them, so the new agent can
+  report back. `--no-reply-route` leaves it out.
+- The output has the thread id and a `t3code://threads/<environment>/<thread>`
+  link that opens it in T3 Code.
+- T3 launches once per `--request-id`, so repeating the command with the same
+  id after `t3_launch_outcome_unknown` returns the same thread.
+- A workspace that cannot be prepared, such as a base branch that does not
+  exist, fails the run inside the new thread rather than the command.
+
+A machine whose homebased predates this command answers `t3_incompatible` and
+needs `homebased update`. A `~/` path, quoted or expanded by the shell,
+resolves under the home of the machine that launches the thread.
+
 ### Fleet
 
 Fleet is off by default. Add this config to each machine that should join the

@@ -106,7 +106,7 @@ pub enum Command {
         #[command(subcommand)]
         command: resource::ResourceCommand,
     },
-    /// Check the T3 Code local API
+    /// Check T3 Code and launch threads in it on any Fleet machine
     T3 {
         /// T3 Code subcommand
         #[command(subcommand)]

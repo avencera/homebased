@@ -519,5 +519,7 @@ mod peers;
 mod resource_jobs;
 #[path = "fleet/submission.rs"]
 mod submission;
+#[path = "fleet/t3_launch.rs"]
+mod t3_launch;
 #[path = "support/worker_cleanup.rs"]
 mod worker_cleanup;
