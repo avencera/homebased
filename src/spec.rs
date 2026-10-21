@@ -19,6 +19,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
+use crate::machine_wait::{CoalesceKey, MachineWait};
 
 mod host;
 #[cfg(test)]
@@ -60,6 +61,42 @@ fn after_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "maxItems": MAX_DEPENDENCIES,
         "uniqueItems": true
     })
+}
+
+fn coalesce_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:-]+$",
+        "minLength": 1,
+        "maxLength": crate::machine_wait::MAX_COALESCE_KEY_LEN
+    })
+}
+
+/// Rules between top-level fields, which the derived per-field schema cannot state
+///
+/// Each mirrors a check in `validate_spec`, so the schema and the parser agree
+fn cross_field_rules() -> Value {
+    json!([
+        {
+            "if": { "properties": { "workload": { "properties": { "type": { "const": "agent" } } } } },
+            "then": { "required": ["thread"] }
+        },
+        {
+            "if": { "properties": { "hold": { "const": true } }, "required": ["hold"] },
+            "then": { "required": ["thread"] }
+        },
+        {
+            "if": { "properties": { "wait_for_machine": { "const": true } }, "required": ["wait_for_machine"] },
+            "then": { "required": ["machine"] }
+        },
+        {
+            "if": { "required": ["coalesce"] },
+            "then": {
+                "properties": { "wait_for_machine": { "const": true } },
+                "required": ["wait_for_machine"]
+            }
+        }
+    ])
 }
 
 fn default_true() -> bool {
@@ -114,8 +151,11 @@ struct SubmitSpecWire {
     /// Must be 1
     #[schemars(schema_with = "api_version_schema")]
     api_version: u32,
-    /// Codex thread that receives `HOMEBASED_EVENT`
-    thread: ThreadId,
+    /// Codex thread or Claude Code session that receives `HOMEBASED_EVENT`.
+    /// A `task` or `container` workload without `hold` may omit it: its events
+    /// are recorded and shown, but reach no session
+    #[serde(default)]
+    thread: Option<ThreadId>,
     /// Human-readable name. Non-unique
     name: TaskName,
     /// Existing host directory on the machine that runs the task. For a
@@ -139,6 +179,15 @@ struct SubmitSpecWire {
     /// task, or the chain of runs it parks, is pending. Ignored for any other thread
     #[serde(default)]
     hold: bool,
+    /// While `machine` is unreachable, hold the task on this daemon and send
+    /// it once the machine answers, instead of failing the submit
+    #[serde(default)]
+    wait_for_machine: bool,
+    /// With `wait_for_machine`: once this task is accepted, cancel every older
+    /// task with the same key and machine that still waits on this daemon
+    #[serde(default)]
+    #[schemars(schema_with = "coalesce_schema")]
+    coalesce: Option<String>,
     /// Workload variant. Parsed from `Value` after the envelope so nested
     /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
@@ -321,7 +370,7 @@ pub enum SubmitWorkloadValidated {
 pub struct SubmitSpec {
     /// Must be 1
     pub api_version: u32,
-    /// Codex thread that receives `HOMEBASED_EVENT`
+    /// Codex thread that receives `HOMEBASED_EVENT`, or [`ThreadId::DETACHED`]
     pub thread: ThreadId,
     /// Human-readable name
     pub name: TaskName,
@@ -340,6 +389,10 @@ pub struct SubmitSpec {
     ///
     /// Origin-only, like `after`: it travels beside the normalized spec
     pub hold: bool,
+    /// Hold the task on its origin while its machine is unreachable
+    ///
+    /// Origin-only, like `after`: it travels beside the normalized spec
+    pub machine_wait: Option<MachineWait>,
     /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
@@ -469,6 +522,13 @@ pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError>
     check_api_version(envelope.api_version, "/api_version")?;
     check_timeout(envelope.timeout, "/timeout")?;
     let workload = parse_normalized_workload(&envelope.workload)?;
+    if envelope.thread.is_detached() && matches!(workload, NormalizedWorkload::Agent(_)) {
+        return Err(AppError::InvalidSpec {
+            pointer: "/thread".into(),
+            value: json!(envelope.thread),
+            message: "an agent workload needs a thread to report to".into(),
+        });
+    }
     Ok(NormalizedSpec {
         api_version: envelope.api_version,
         thread: envelope.thread,
@@ -608,17 +668,87 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
     check_timeout(wire.timeout, "/timeout")?;
     let after = wire.after.as_ref().map(parse_after).transpose()?;
     let workload = parse_submit_workload(&wire.workload)?;
+    let agent = matches!(workload, SubmitWorkloadValidated::Agent(_));
+    let thread = submit_thread(wire.thread, agent, wire.hold)?;
+    let machine_wait =
+        parse_machine_wait(wire.wait_for_machine, wire.coalesce, wire.machine.is_some())?;
     Ok(SubmitSpec {
         api_version: wire.api_version,
-        thread: wire.thread,
+        thread,
         name: wire.name,
         cwd: wire.cwd,
         machine: wire.machine,
         timeout: wire.timeout,
         after,
         hold: wire.hold,
+        machine_wait,
         workload,
     })
+}
+
+/// The spec thread, or [`ThreadId::DETACHED`] for a task submitted without one
+///
+/// An agent must report to a session, and a T3 hold needs a thread to hold,
+/// so both need a thread. The nil UUID is the detached spelling, so a spec may
+/// not name it
+fn submit_thread(thread: Option<ThreadId>, agent: bool, hold: bool) -> Result<ThreadId, AppError> {
+    match thread {
+        Some(thread) if thread.is_detached() => Err(AppError::InvalidSpec {
+            pointer: "/thread".into(),
+            value: json!(thread),
+            message: "thread must not be the nil UUID; omit it to submit without a thread".into(),
+        }),
+        Some(thread) => Ok(thread),
+        None if agent => Err(AppError::InvalidSpec {
+            pointer: "/thread".into(),
+            value: Value::Null,
+            message: "an agent workload needs a thread to report to".into(),
+        }),
+        None if hold => Err(AppError::InvalidSpec {
+            pointer: "/hold".into(),
+            value: json!(true),
+            message: "hold needs a thread to hold".into(),
+        }),
+        None => Ok(ThreadId::DETACHED),
+    }
+}
+
+/// Parse `wait_for_machine` and `coalesce`, with pointers at the top level
+///
+/// The submit spec and the daemon socket envelope both carry them there, so
+/// both report the same pointers
+pub fn parse_machine_wait(
+    wait_for_machine: bool,
+    coalesce: Option<String>,
+    remote: bool,
+) -> Result<Option<MachineWait>, AppError> {
+    let coalesce = coalesce
+        .map(|key| {
+            CoalesceKey::new(key.clone()).map_err(|error| AppError::InvalidSpec {
+                pointer: "/coalesce".into(),
+                value: json!(key),
+                message: error.to_string(),
+            })
+        })
+        .transpose()?;
+    if !wait_for_machine {
+        return match coalesce {
+            Some(key) => Err(AppError::InvalidSpec {
+                pointer: "/coalesce".into(),
+                value: json!(key),
+                message: "coalesce needs wait_for_machine".into(),
+            }),
+            None => Ok(None),
+        };
+    }
+    if !remote {
+        return Err(AppError::InvalidSpec {
+            pointer: "/wait_for_machine".into(),
+            value: json!(true),
+            message: "wait_for_machine needs machine".into(),
+        });
+    }
+    Ok(Some(MachineWait { coalesce }))
 }
 
 /// Parse a top-level `after` value, with pointers under `/after`
@@ -810,5 +940,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
 /// JSON Schema for the submit spec
 pub fn schema_json() -> Result<Value, AppError> {
     let schema = schemars::schema_for!(SubmitSpecWire);
-    Ok(serde_json::to_value(&schema)?)
+    let mut schema = serde_json::to_value(&schema)?;
+    schema["allOf"] = cross_field_rules();
+    Ok(schema)
 }

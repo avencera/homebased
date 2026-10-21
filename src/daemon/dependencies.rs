@@ -11,12 +11,17 @@
 //! The same loop releases the continuation of a parked agent worker. Its held
 //! route waits on the worker's targets under [`ReleaseRule::Ended`], so it
 //! launches once every target ended, however each one ended
+//!
+//! It also sends a remote task submitted with `wait_for_machine` while its
+//! machine was unreachable. That route has no dependencies, so it is ready at
+//! once, and each launch attempt waits for the machine to answer. Its
+//! `coalesce` key cancels the older routes it replaces here too
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use tokio::time::MissedTickBehavior;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
@@ -32,6 +37,8 @@ use crate::dependency::{
 use crate::domain::{ProcessStatus, TaskId, TaskStatus};
 use crate::error::AppError;
 use crate::invocation::resolve_workload_binary;
+use crate::machine::MachineId;
+use crate::machine_wait::CoalesceKey;
 use crate::spec::{self, NormalizedSpec};
 use crate::store::HeldCancel;
 use crate::submission::{
@@ -41,14 +48,30 @@ use crate::submission::{
 /// How often the loop re-reads held routes; launches and endings are rare
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Accept a submit, holding it on this daemon when a dependency is still pending
+/// Accept a submit, holding it on this daemon when a dependency is still
+/// pending or, with `wait_for_machine`, while its machine is unreachable
 pub(super) async fn submit(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, TaskStatus), AppError> {
-    let Some(after) = body.after.clone() else {
+    let coalesce = body
+        .machine_wait
+        .as_ref()
+        .and_then(|wait| wait.coalesce.clone());
+    let submitted = admit_or_hold(state, body).await?;
+    if let Some(key) = coalesce {
+        supersede(state, &key, submitted.0).await;
+    }
+    Ok(submitted)
+}
+
+async fn admit_or_hold(
+    state: &AppState,
+    body: SubmitBody,
+) -> Result<(TaskId, TaskStatus), AppError> {
+    if !body.terms().may_hold() {
         return launch(state, body).await;
-    };
+    }
     // a retry resolves against its saved route, held or launched
     let request = body.request;
     if call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
@@ -60,10 +83,78 @@ pub(super) async fn submit(
     {
         return launch(state, body).await;
     }
-    match admit(state, &after).await? {
-        Admission::Ready => launch(state, body).await,
-        Admission::Pending => hold(state, body, after).await,
+    if let Some(after) = &body.after
+        && let Admission::Pending = admit(state, after).await?
+    {
+        return hold(state, body).await;
     }
+    if body.machine_wait.is_none() {
+        return launch(state, body).await;
+    }
+    hold_and_send(state, body).await
+}
+
+/// Hold a task that waits for its machine, then try to send it at once
+///
+/// Holding first means a send that loses its reply, as when the machine
+/// sleeps mid-request, leaves a launching route that the release loop resends
+/// under the same task UUID, instead of an unknown acceptance nothing retries
+async fn hold_and_send(
+    state: &AppState,
+    body: SubmitBody,
+) -> Result<(TaskId, TaskStatus), AppError> {
+    let (task, _) = hold(state, body).await?;
+    let route = call(&state.store, |reply| StoreMsg::OriginRoute {
+        id: task,
+        reply,
+    })
+    .await?
+    .ok_or(AppError::RouteNotFound { task })?;
+    match origin_submit::release(state, route).await {
+        Ok(()) | Err(AppError::MachineUnavailable { .. }) => {}
+        // the release loop retries it
+        Err(error) => debug!(%task, "first send of a task that waits for its machine: {error}"),
+    }
+    let route = call(&state.store, |reply| StoreMsg::OriginRoute {
+        id: task,
+        reply,
+    })
+    .await?
+    .ok_or(AppError::RouteNotFound { task })?;
+    origin_submit::finish_saved(state, route).await
+}
+
+/// Cancel the older waiting tasks that an accepted coalesced submit replaces
+///
+/// The submit already succeeded, so a failure here is logged and the older
+/// task keeps waiting: running it too repeats work that replaced it anyway
+async fn supersede(state: &AppState, key: &CoalesceKey, by: TaskId) {
+    if let Err(error) = try_supersede(state, key, by).await {
+        warn!(%by, coalesce = %key, "cancel superseded tasks: {error}");
+    }
+}
+
+async fn try_supersede(state: &AppState, key: &CoalesceKey, by: TaskId) -> Result<(), AppError> {
+    let route = call(&state.store, |reply| StoreMsg::OriginRoute {
+        id: by,
+        reply,
+    })
+    .await?
+    .ok_or(AppError::RouteNotFound { task: by })?;
+    let key = key.clone();
+    let older = call(&state.store, |reply| StoreMsg::CoalescedWaitingRoutes {
+        key,
+        execution_machine: route.execution_machine,
+        newer: by,
+        reply,
+    })
+    .await?;
+    for older in older {
+        let _request_guard = state.locks.origin_submissions.lock(older.request).await;
+        // a route whose launch began meanwhile may already run, so it is left alone
+        cancel_held(state, older.task, HeldCancellation::Superseded { by }).await?;
+    }
+    Ok(())
 }
 
 /// Check the dependencies of a dry run the way a submit would, saving nothing
@@ -72,13 +163,13 @@ pub(super) async fn preview(
     after: &TaskDependencies,
 ) -> Result<Vec<DependencyView>, AppError> {
     admit(state, after).await?;
-    views(state, after).await
+    views(state, Some(after)).await
 }
 
-/// Dependency states in `after` order, for inspection
+/// Dependency states in `after` order, for inspection; none for a route without `after`
 pub(super) async fn views(
     state: &AppState,
-    after: &TaskDependencies,
+    after: Option<&TaskDependencies>,
 ) -> Result<Vec<DependencyView>, AppError> {
     Ok(known_states(state, after)
         .await?
@@ -162,8 +253,11 @@ async fn admit(state: &AppState, after: &TaskDependencies) -> Result<Admission, 
 /// deleted. If one is gone anyway, it can never be shown to succeed
 async fn known_states(
     state: &AppState,
-    after: &TaskDependencies,
+    after: Option<&TaskDependencies>,
 ) -> Result<Vec<(TaskId, DependencyState)>, AppError> {
+    let Some(after) = after else {
+        return Ok(Vec::new());
+    };
     let tasks = after.tasks().to_vec();
     let states = call(&state.store, |reply| StoreMsg::DependencyStates {
         tasks,
@@ -193,11 +287,8 @@ async fn launch(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatu
 ///
 /// The execution machine may be offline while the task waits, so a remote
 /// spec is checked by its executor only at launch
-async fn hold(
-    state: &AppState,
-    body: SubmitBody,
-    after: TaskDependencies,
-) -> Result<(TaskId, TaskStatus), AppError> {
+async fn hold(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatus), AppError> {
+    let terms = body.terms();
     let SubmitBody {
         spec,
         env,
@@ -205,11 +296,12 @@ async fn hold(
         callback_cwd,
         after: _,
         hold: _,
+        machine_wait: _,
     } = body;
     let (execution_machine, callback) = match &spec.machine {
         Some(name) => (
             origin_submit::execution_machine(state, name).await?,
-            origin_submit::callback_context(env, callback_cwd)?,
+            origin_submit::callback_context(env, callback_cwd, spec.thread)?,
         ),
         None => (
             state.machine.identity.machine,
@@ -225,7 +317,7 @@ async fn hold(
         callback,
         spec,
     });
-    let saved = origin_submit::insert_route(state, route, Some(after)).await?;
+    let saved = origin_submit::insert_route(state, route, terms).await?;
     let SubmissionState::Held { phase } = &saved.submission else {
         // an identical concurrent request saved a route that already launched
         return Err(origin_submit::conflict(
@@ -279,6 +371,8 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             unstarted.contains(task) || routes.iter().any(|held| held.route.task == *task)
         });
         let mut cancelled = false;
+        // a sleeping machine costs a probe timeout per attempt, so one pass asks it once
+        let mut unreachable = HashSet::new();
         for DependentRoute { route, after, rule } in routes {
             match &route.submission {
                 SubmissionState::Held {
@@ -286,13 +380,15 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
                 } => {}
                 // the executor may hold the task, so only a resend can resolve it
                 _ => {
-                    retry_release(state, retries, route).await;
+                    retry_release(state, retries, &mut unreachable, route).await;
                     continue;
                 }
             }
-            match decide(known_states(state, &after).await?, rule) {
+            match decide(known_states(state, after.as_ref()).await?, rule) {
                 HeldDecision::Wait => {}
-                HeldDecision::Release => retry_release(state, retries, route).await,
+                HeldDecision::Release => {
+                    retry_release(state, retries, &mut unreachable, route).await;
+                }
                 HeldDecision::Cancel(failure) => {
                     let _request_guard = state.locks.origin_submissions.lock(route.request).await;
                     let result = cancel_held(state, route.task, failure.into()).await?;
@@ -307,16 +403,27 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
 }
 
 /// Launch one ready route unless its last attempt failed too recently
-async fn retry_release(state: &AppState, retries: &mut HashMap<TaskId, Retry>, route: OriginRoute) {
+///
+/// A route for a machine that did not answer earlier in this pass waits for the next pass
+async fn retry_release(
+    state: &AppState,
+    retries: &mut HashMap<TaskId, Retry>,
+    unreachable: &mut HashSet<MachineId>,
+    route: OriginRoute,
+) {
     let task = route.task;
-    if backing_off(retries, task) {
+    let machine = route.execution_machine;
+    if backing_off(retries, task) || unreachable.contains(&machine) {
         return;
     }
-    let released = if route.origin_machine == route.execution_machine {
+    let released = if route.origin_machine == machine {
         local_submit::release(state, route).await
     } else {
         origin_submit::release(state, route).await
     };
+    if matches!(released, Err(AppError::MachineUnavailable { .. })) {
+        unreachable.insert(machine);
+    }
     record_attempt(retries, task, released, "held task launch deferred");
 }
 
@@ -357,7 +464,12 @@ fn record_attempt(
         retries.remove(&task);
         return;
     };
-    warn!(%task, "{deferred}: {error}");
+    // a held remote task may wait days for a sleeping machine
+    if matches!(error, AppError::MachineUnavailable { .. }) {
+        debug!(%task, "{deferred}: {error}");
+    } else {
+        warn!(%task, "{deferred}: {error}");
+    }
     let retry = Retry::after_failure(retries.get(&task).copied(), Instant::now());
     retries.insert(task, retry);
 }

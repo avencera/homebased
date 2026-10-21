@@ -201,7 +201,8 @@ impl TaskSummary {
             cancel_requested_at: None,
             created_at,
             updated_at: route.last_updated_at,
-            after: Some(after),
+            // a task that waits only for its machine has no `after`
+            after: task.held.after.as_ref().map(|_| after),
             chain: task.chain.clone(),
         })
     }

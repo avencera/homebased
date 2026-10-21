@@ -138,6 +138,21 @@ pub const THREAD_ENV_VARS: [&str; 3] = [
 #[serde(transparent)]
 pub struct ThreadId(pub Uuid);
 
+impl ThreadId {
+    /// Thread of a task submitted without one: its events are recorded but
+    /// reach no session
+    ///
+    /// It is the nil UUID on the wire, so an executor that requires a thread
+    /// still accepts the task, and no Codex or Claude session can have it
+    pub const DETACHED: Self = Self(Uuid::nil());
+
+    /// Whether this is [`Self::DETACHED`]
+    #[must_use]
+    pub fn is_detached(self) -> bool {
+        self == Self::DETACHED
+    }
+}
+
 impl fmt::Display for ThreadId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

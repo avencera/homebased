@@ -44,6 +44,8 @@ pub enum ThreadDestination {
     ClaudeSession,
     /// A Codex thread with a session rollout file
     CodexThread,
+    /// No thread: the task was submitted without one, so its events reach no session
+    Detached,
 }
 
 impl ThreadDestination {
@@ -51,6 +53,7 @@ impl ThreadDestination {
         match self {
             Self::ClaudeSession => "Claude Code session",
             Self::CodexThread => "Codex thread",
+            Self::Detached => "no thread",
         }
     }
 }
@@ -129,6 +132,9 @@ impl SubmitOrigin {
             });
         }
 
+        if thread.is_detached() {
+            return Ok(ThreadDestination::Detached);
+        }
         let known = self.known_threads();
         if let Some(destination) = known.get(&thread.0) {
             return Ok(*destination);

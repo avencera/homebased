@@ -456,7 +456,9 @@ pub(crate) async fn dispatch_inbox(
             AttemptOutcome::Settle(DeliveryOutcome::Permanent(last_error.unwrap_or_else(
                 || "queue attempt budget exhausted after daemon restart".into(),
             )))
-        } else if let Err(error) = check_saved_callback(&route.callback) {
+        } else if !route.thread.is_detached()
+            && let Err(error) = check_saved_callback(&route.callback)
+        {
             AttemptOutcome::Settle(DeliveryOutcome::Permanent(error))
         } else if let Err(error) = home.prepare_task(id) {
             AttemptOutcome::Settle(DeliveryOutcome::Permanent(format!(
@@ -481,6 +483,9 @@ pub(crate) async fn dispatch_inbox(
             // a connected `task wait` stream prints the line for the agent that
             // armed it; waking the thread as well would wake the agent twice
             if waiters.hand_off(route.thread, &entry.event, &line).await {
+                AttemptOutcome::Settle(DeliveryOutcome::Delivered)
+            } else if route.thread.is_detached() {
+                // no session can receive it; the inbox keeps the event for inspection
                 AttemptOutcome::Settle(DeliveryOutcome::Delivered)
             } else {
                 let paths = home.task_paths(id);

@@ -273,8 +273,15 @@ mod tests {
         Store::open(&path).unwrap();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch("DROP TABLE t3_hold_tasks; PRAGMA user_version = 4;")
-                .unwrap();
+            // version 4 had neither the hold table nor what version 6 added
+            conn.execute_batch(
+                "DROP TABLE t3_hold_tasks;
+                 DROP INDEX origin_routes_coalesce;
+                 ALTER TABLE origin_routes DROP COLUMN coalesce_key;
+                 ALTER TABLE origin_routes DROP COLUMN wait_for_machine;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
         }
 
         let store = Store::open(&path).unwrap();

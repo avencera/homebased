@@ -439,7 +439,7 @@ OpenCode agent workloads use `opencode run --standalone` with JSON events and th
 
 ### Spec
 
-Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread UUID that should receive events. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
+Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread or Claude Code session UUID that should receive events. A `task` or `container` workload without `hold` may omit `thread`: its events are recorded and shown by `task show` and the dashboard, but no session is woken. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
 
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
@@ -543,6 +543,37 @@ way, the held task is cancelled before it starts and its thread gets
 `TASK_CANCELLED` with a `cancel_reason`. A held task starts with the
 environment and callback context saved at submit. `task cancel` cancels a held
 task before it starts. Tasks held on a cancelled task are cancelled too.
+
+### Wait for an offline machine
+
+A remote submit fails with `machine_unavailable` when its machine does not
+answer. Set `wait_for_machine: true` to hold the task on the submitting daemon
+instead, for a laptop that sleeps. The submit returns `held`, and the daemon
+sends the task once the machine answers, usually within a minute of it waking.
+When the machine is already up, the task starts at once.
+
+Set `coalesce` with `wait_for_machine` for work where only the newest request
+matters, such as an update. Once a submit with a `coalesce` key is accepted,
+every older task with the same key and machine that still waits on this daemon
+is cancelled with `cancel_reason` `superseded`. A task whose launch already
+began is left alone.
+
+```json
+{
+  "api_version": 1,
+  "name": "fleet update",
+  "cwd": "~/",
+  "machine": "mba",
+  "wait_for_machine": true,
+  "coalesce": "fleet-update",
+  "workload": { "type": "task", "command": ["cmd", "fleet", "update", "--local"] }
+}
+```
+
+`task list` on the submitting machine shows waiting tasks as `held`, and
+`task show` adds `wait_for_machine` and `coalesce`. `task cancel` cancels a
+waiting task before it starts. Only the submitting daemon holds the task, so
+two machines that each submit with the same key both send theirs.
 
 ### Long commands inside an agent worker
 
@@ -657,7 +688,7 @@ to ignore duplicates.
 | `TASK_SUCCEEDED` | Exit 0 and last report was `succeeded`, or exit 0 with no report from a task, a container, or an agent without the report trailer. |
 | `TASK_BLOCKED` | Last report was `blocked`. The process has exited. Answer and submit a new spec. There is no resume. |
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |
-| `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started. |
+| `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started: a dependency ended, `task cancel` asked, or a newer task with the same `coalesce` key replaced it (`superseded`). |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
 
 ### Direct messages

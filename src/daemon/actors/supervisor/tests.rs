@@ -330,7 +330,13 @@ fn save_held_local_route(home: &Home, row: &TaskRow, spec: &NormalizedSpec) -> R
     let after = crate::dependency::TaskDependencies::new(vec![TaskId::new()]).unwrap();
     Store::open(&home.db_path())
         .unwrap()
-        .insert_origin_route_after(&route, Some(&after))
+        .insert_origin_route_with(
+            &route,
+            &crate::submission::ReleaseTerms {
+                after: Some(after.clone()),
+                machine_wait: None,
+            },
+        )
         .unwrap();
     request
 }

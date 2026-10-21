@@ -511,6 +511,8 @@ mod dependencies;
 mod events;
 #[path = "fleet/inspection.rs"]
 mod inspection;
+#[path = "fleet/machine_wait.rs"]
+mod machine_wait;
 #[path = "fleet/messages.rs"]
 mod messages;
 #[path = "fleet/peers.rs"]

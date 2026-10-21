@@ -350,6 +350,7 @@ fn relative_prompt_file_resolves_against_cwd() {
         timeout: default_timeout(),
         after: None,
         hold: false,
+        machine_wait: None,
         workload: SubmitWorkloadValidated::Agent(SubmitAgent {
             agent: AgentKind::Claude,
             model: None,
@@ -809,4 +810,54 @@ fn hold_is_off_unless_the_spec_asks_for_it() {
 
     held["hold"] = json!("yes");
     assert!(parse_spec_value(&held).is_err());
+}
+
+#[test]
+fn only_a_command_without_hold_may_omit_its_thread() {
+    let mut task = valid_task();
+    task.as_object_mut().unwrap().remove("thread");
+    assert_verdict(&task, true, "a task without a thread");
+    assert!(parse_spec_value(&task).unwrap().thread.is_detached());
+
+    let mut held = task.clone();
+    held["hold"] = json!(true);
+    assert_verdict(&held, false, "a held task without a thread");
+
+    let mut agent = valid_agent();
+    agent.as_object_mut().unwrap().remove("thread");
+    assert_verdict(&agent, false, "an agent without a thread");
+
+    // the nil UUID is how a detached thread travels, so a spec cannot name it
+    let mut nil = valid_task();
+    nil["thread"] = json!(ThreadId::DETACHED);
+    assert!(parse_spec_value(&nil).is_err());
+
+    // an executor refuses a detached agent from a peer that skipped the check
+    let mut normalized = valid_agent();
+    normalized["thread"] = json!(ThreadId::DETACHED);
+    normalized["timeout"] = json!("1h");
+    assert!(parse_normalized_value(&normalized).is_err());
+}
+
+#[test]
+fn machine_wait_needs_a_machine_and_coalesce_needs_the_wait() {
+    let mut remote = valid_task();
+    remote["machine"] = json!("mba");
+    remote["wait_for_machine"] = json!(true);
+    remote["coalesce"] = json!("fleet-update");
+    assert_verdict(&remote, true, "a coalesced machine wait");
+    let wait = parse_spec_value(&remote).unwrap().machine_wait.unwrap();
+    assert_eq!(wait.coalesce.unwrap().as_str(), "fleet-update");
+
+    let mut local = remote.clone();
+    local.as_object_mut().unwrap().remove("machine");
+    assert_verdict(&local, false, "a machine wait without a machine");
+
+    let mut unwaited = remote.clone();
+    unwaited.as_object_mut().unwrap().remove("wait_for_machine");
+    assert_verdict(&unwaited, false, "coalesce without a machine wait");
+
+    let mut spaced = remote;
+    spaced["coalesce"] = json!("fleet update");
+    assert_verdict(&spaced, false, "a coalesce key with a space");
 }

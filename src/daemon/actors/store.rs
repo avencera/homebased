@@ -23,6 +23,7 @@ use crate::events::{
     OutboxEvent, TaskEvent, WaitingInboxEvent,
 };
 use crate::machine::MachineId;
+use crate::machine_wait::CoalesceKey;
 use crate::message::{
     MessageAttempt, MessageDelivery, MessageId, MessageReceipt, MessageSendRequest,
     OutboundMessageBinding, Recipient,
@@ -34,7 +35,7 @@ use crate::store::{
 };
 use crate::submission::{
     CallbackContext, CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute,
-    RejectionTombstone, RequestId, SubmissionState,
+    RejectionTombstone, ReleaseTerms, RequestId, SubmissionState,
 };
 
 fn identity_error(error: IdentityError) -> AppError {
@@ -383,16 +384,24 @@ pub(crate) enum StoreMsg {
     UnknownOriginRoutes {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
-    /// Durably allocate a request and its origin route before network send
+    /// Durably allocate a request and its origin route, with the release
+    /// terms it was submitted with, before any network send
     InsertOriginRoute {
         route: Box<OriginRoute>,
+        terms: ReleaseTerms,
         reply: RpcReplyPort<Result<OriginRoute, AppError>>,
     },
-    /// Allocate an origin route with the dependencies it was submitted with
-    InsertOriginRouteAfter {
-        route: Box<OriginRoute>,
-        after: TaskDependencies,
-        reply: RpcReplyPort<Result<OriginRoute, AppError>>,
+    /// Read the release terms saved with one origin route
+    RouteTerms {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<ReleaseTerms>, AppError>>,
+    },
+    /// Read older waiting routes that a newer submit with this coalesce key replaces
+    CoalescedWaitingRoutes {
+        key: CoalesceKey,
+        execution_machine: MachineId,
+        newer: TaskId,
+        reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
     /// Read the dependencies saved with one origin route
     RouteDependencies {
@@ -910,19 +919,27 @@ impl Actor for StoreActor {
             StoreMsg::UnknownOriginRoutes { reply } => {
                 send_reply(reply, state.unknown_origin_routes().map_err(identity_error))
             }
-            StoreMsg::InsertOriginRoute { route, reply } => send_reply(
-                reply,
-                state.insert_origin_route(&route).map_err(identity_error),
-            ),
-            StoreMsg::InsertOriginRouteAfter {
+            StoreMsg::InsertOriginRoute {
                 route,
-                after,
+                terms,
                 reply,
             } => send_reply(
                 reply,
                 state
-                    .insert_origin_route_after(&route, Some(&after))
+                    .insert_origin_route_with(&route, &terms)
                     .map_err(identity_error),
+            ),
+            StoreMsg::RouteTerms { id, reply } => {
+                send_reply(reply, state.route_terms(id).map_err(identity_error));
+            }
+            StoreMsg::CoalescedWaitingRoutes {
+                key,
+                execution_machine,
+                newer,
+                reply,
+            } => send_reply(
+                reply,
+                state.coalesced_waiting_routes(&key, execution_machine, newer),
             ),
             StoreMsg::RouteDependencies { id, reply } => {
                 send_reply(reply, state.route_dependencies(id));

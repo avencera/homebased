@@ -164,19 +164,26 @@ impl IdentitySummary {
 
 /// Inspect a task from the local socket, regardless of execution machine
 ///
-/// A task submitted here with `after` also shows its dependencies and their state
+/// A task submitted here with `after` also shows its dependencies and their
+/// state, and one submitted with `wait_for_machine` shows that and its `coalesce` key
 pub(super) async fn show(state: &AppState, id: TaskId) -> Result<Value, AppError> {
     let mut value = show_task(state, id).await?;
-    let after = call(&state.store, |reply| StoreMsg::RouteDependencies {
-        id,
-        reply,
-    })
-    .await?;
-    if let Some(after) = after
-        && let Some(object) = value.as_object_mut()
-    {
-        let views = crate::daemon::dependencies::views(state, &after).await?;
+    let terms = call(&state.store, |reply| StoreMsg::RouteTerms { id, reply }).await?;
+    let Some(terms) = terms else {
+        return Ok(value);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(value);
+    };
+    if let Some(after) = &terms.after {
+        let views = crate::daemon::dependencies::views(state, Some(after)).await?;
         object.insert("after".into(), json!(views));
+    }
+    if let Some(wait) = &terms.machine_wait {
+        object.insert("wait_for_machine".into(), json!(true));
+        if let Some(key) = &wait.coalesce {
+            object.insert("coalesce".into(), json!(key));
+        }
     }
     Ok(value)
 }
@@ -246,7 +253,7 @@ async fn unlaunched_detail(state: &AppState, id: TaskId) -> Result<Option<Value>
     else {
         return Ok(None);
     };
-    let after = crate::daemon::dependencies::views(state, &task.held.after).await?;
+    let after = crate::daemon::dependencies::views(state, task.held.after.as_ref()).await?;
     let Some(summary) = TaskSummary::from_unlaunched(&task, after) else {
         return Ok(None);
     };

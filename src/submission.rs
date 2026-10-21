@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::dependency::{HeldCancellation, ReleaseRule, TaskDependencies};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
+use crate::machine_wait::MachineWait;
 use crate::spec::NormalizedSpec;
 
 /// The executable saved for callbacks owned by the origin
@@ -99,7 +100,8 @@ pub struct CallbackContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HeldPhase {
-    /// At least one dependency has not finished
+    /// At least one dependency has not finished, or the execution machine has
+    /// not answered a launch yet
     Waiting,
     /// Every dependency succeeded and the launch may have reached the remote executor
     ///
@@ -182,7 +184,28 @@ pub struct OriginRoute {
     pub last_settled_seq: u64,
 }
 
-/// One origin route with the dependencies it was submitted with
+/// Origin-only submit fields that decide when a route launches
+///
+/// The store saves them beside the route, like its spec, so they stay on the
+/// origin and never enter the route summary that peers read. They take part in
+/// the retry identity: the same request with other terms is a conflict
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseTerms {
+    /// Tasks that must succeed first
+    pub after: Option<TaskDependencies>,
+    /// Hold the route while its execution machine is unreachable
+    pub machine_wait: Option<MachineWait>,
+}
+
+impl ReleaseTerms {
+    /// Whether a route with these terms may start held instead of launching
+    #[must_use]
+    pub fn may_hold(&self) -> bool {
+        self.after.is_some() || self.machine_wait.is_some()
+    }
+}
+
+/// One origin route that was held, or may be, with the dependencies it was submitted with
 ///
 /// The store saves the dependencies beside the route, like its spec, so they
 /// stay on the origin and never enter the route summary that peers read
@@ -190,8 +213,9 @@ pub struct OriginRoute {
 pub struct DependentRoute {
     /// Saved origin route
     pub route: OriginRoute,
-    /// Tasks that must end before it launches
-    pub after: TaskDependencies,
+    /// Tasks that must end before it launches, or `None` for a route that
+    /// waits only for its execution machine
+    pub after: Option<TaskDependencies>,
     /// Which endings of `after` release it: success for a submitted `after`,
     /// any ending for a continuation
     pub rule: ReleaseRule,

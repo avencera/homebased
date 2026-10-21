@@ -4,14 +4,14 @@ use chrono::{TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, fmt_time};
-use crate::dependency::TaskDependencies;
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::machine_wait::{CoalesceKey, MachineWait};
 use crate::queue::delivery::JobRoute;
 use crate::submission::{
     CallbackContext, ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute,
-    PreAcceptanceRejection, RejectionTombstone, RequestId, SubmissionState,
+    PreAcceptanceRejection, RejectionTombstone, ReleaseTerms, RequestId, SubmissionState,
 };
 
 /// Age after which a queue job route no longer counts as waiting
@@ -90,6 +90,38 @@ fn validate_route(route: &OriginRoute) -> Result<(), IdentityError> {
 ///
 /// Direct retries keep the first route's generated task, destination, and
 /// callback context
+/// Release terms saved with one route, or `None` when no route has the task
+fn release_terms_on(
+    conn: &Connection,
+    task: TaskId,
+) -> Result<Option<ReleaseTerms>, IdentityError> {
+    let saved: Option<(Option<String>, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT after_json,wait_for_machine,coalesce_key FROM origin_routes WHERE task_id=?1",
+            [task.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some((after, wait_for_machine, coalesce)) = saved else {
+        return Ok(None);
+    };
+    let after = after.as_deref().map(decode).transpose()?;
+    let coalesce = coalesce
+        .map(CoalesceKey::new)
+        .transpose()
+        .map_err(|error| {
+            IdentityError::Storage(AppError::Internal {
+                message: format!("invalid saved coalesce key for {task}: {error}"),
+            })
+        })?;
+    let machine_wait = wait_for_machine.then_some(MachineWait { coalesce });
+    Ok(Some(ReleaseTerms {
+        after,
+        machine_wait,
+    }))
+}
+
 fn same_route_identity(left: &OriginRoute, right: &OriginRoute) -> bool {
     left.request == right.request
         && left.origin_machine == right.origin_machine
@@ -181,7 +213,8 @@ impl Store {
 
         let mut threads: Vec<(ThreadId, CallbackContext)> = Vec::new();
         let mut add = |thread: ThreadId, callback: CallbackContext| {
-            if !threads.iter().any(|(waiting, _)| *waiting == thread) {
+            // no session waits on a task submitted without a thread
+            if !thread.is_detached() && !threads.iter().any(|(waiting, _)| *waiting == thread) {
                 threads.push((thread, callback));
             }
         };
@@ -201,43 +234,42 @@ impl Store {
         &mut self,
         route: &OriginRoute,
     ) -> Result<OriginRoute, IdentityError> {
-        self.insert_origin_route_after(route, None)
+        self.insert_origin_route_with(route, &ReleaseTerms::default())
     }
 
-    /// Insert an origin route with the dependencies it was submitted with
+    /// Insert an origin route with the release terms it was submitted with
     ///
-    /// The dependencies take part in the retry identity: the same request with
-    /// a different `after` list is a conflict. Only a route with dependencies
-    /// may start held
-    pub fn insert_origin_route_after(
+    /// The terms take part in the retry identity: the same request with a
+    /// different `after` list or machine wait is a conflict. Only a route with
+    /// dependencies or a machine wait may start held
+    pub fn insert_origin_route_with(
         &mut self,
         route: &OriginRoute,
-        after: Option<&TaskDependencies>,
+        terms: &ReleaseTerms,
     ) -> Result<OriginRoute, IdentityError> {
         validate_route(route)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let saved: Option<(String, Option<String>)> = tx
+        let saved: Option<String> = tx
             .query_row(
-                "SELECT route_json,after_json FROM origin_routes WHERE request_id=?1",
+                "SELECT route_json FROM origin_routes WHERE request_id=?1",
                 [route.request.0.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()
             .map_err(storage)?;
-        if let Some((saved, saved_after)) = saved {
+        if let Some(saved) = saved {
             let existing = decode_route(&saved)?;
-            let saved_after: Option<TaskDependencies> =
-                saved_after.as_deref().map(decode).transpose()?;
-            if !same_route_identity(&existing, route) || saved_after.as_ref() != after {
+            let saved_terms = release_terms_on(&tx, existing.task)?;
+            if !same_route_identity(&existing, route) || saved_terms.as_ref() != Some(terms) {
                 return Err(IdentityError::Conflict);
             }
             return Ok(existing);
         }
         if let SubmissionState::Held { phase } = &route.submission
-            && (after.is_none() || !matches!(phase, HeldPhase::Waiting))
+            && (!terms.may_hold() || !matches!(phase, HeldPhase::Waiting))
         {
             return Err(IdentityError::Conflict);
         }
@@ -251,15 +283,23 @@ impl Store {
         if occupied {
             return Err(IdentityError::Conflict);
         }
-        let after_json = after.map(encode).transpose()?;
+        let after_json = terms.after.as_ref().map(encode).transpose()?;
+        let coalesce = terms
+            .machine_wait
+            .as_ref()
+            .and_then(|wait| wait.coalesce.as_ref())
+            .map(CoalesceKey::as_str);
         tx.execute(
-            "INSERT INTO origin_routes (request_id,task_id,route_json,after_json)
-             VALUES (?1,?2,?3,?4)",
+            "INSERT INTO origin_routes
+                 (request_id,task_id,route_json,after_json,wait_for_machine,coalesce_key)
+             VALUES (?1,?2,?3,?4,?5,?6)",
             params![
                 route.request.0.to_string(),
                 route.task.to_string(),
                 encode(route)?,
-                after_json
+                after_json,
+                terms.machine_wait.is_some(),
+                coalesce,
             ],
         )
         .map_err(storage)?;
@@ -287,6 +327,11 @@ impl Store {
         }
 
         Ok(route)
+    }
+
+    /// Release terms saved with a route, or `None` when no route has the task
+    pub fn route_terms(&self, task: TaskId) -> Result<Option<ReleaseTerms>, IdentityError> {
+        release_terms_on(&self.conn, task)
     }
 
     /// Read a saved origin route by global task UUID

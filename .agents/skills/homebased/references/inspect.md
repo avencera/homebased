@@ -10,7 +10,7 @@ homebased --json task list --status running,queued         # in flight
 homebased --quiet task list --status running               # bare ids, one per line
 ```
 
-Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies, or a continuation waits for the tasks its worker parked on, and has no process yet. Status is the process status: a worker that parked exited 0 and reads `succeeded`; its `chain` says the work is still waiting.
+Status values: `held`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted`. `--status` accepts repeats or a comma list. `held` means the task waits on this machine for its `after` dependencies or, with `wait_for_machine`, for its execution machine to answer, or a continuation waits for the tasks its worker parked on, and has no process yet. Status is the process status: a worker that parked exited 0 and reads `succeeded`; its `chain` says the work is still waiting.
 
 Each entry: `id`, `name`, `status`, `workload`, `worker_thread`, `thread`, `cwd`, `project_root`, `origin_machine`, `execution_machine`, `pid`, `callback`, `timeout_secs`, `check_timeout`, `exit_reason`, `cancel_requested_at`, `created_at`, `updated_at`, and `chain` for a run of parked work. `worker_thread` is the worker's own thread. A Claude task records its session id when it starts running. A Codex task records it when the task ends, whether it succeeds, fails, is cancelled, or is lost, if Homebased finds a session header in the first 64 KiB of `output.log`. It is omitted when unknown. `project_root`, `origin_machine`, and `execution_machine` can be absent. Entries come back in id order, which is creation order. Human list output shows `name`.
 
@@ -26,6 +26,7 @@ homebased --json task show <id>
 | --- | --- |
 | `name` | Submitted goal label. |
 | `status` | Process status, or `held`, see above. |
+| `wait_for_machine`, `coalesce` | Present on the origin for a task submitted with `wait_for_machine`, and its `coalesce` key when it has one. |
 | `after` | Present for a task submitted with `after`: each dependency and its `state`, as in the list. A held task waits for every `pending` entry. A held continuation lists the tasks its worker waits on and starts once each one ended, however it ended. |
 | `chain` | Present for an agent run that parked or continues parked work: `id` (the first run), this task's `run` number, the chain's `runs`, and its `state`. `running` names the `current` run; `waiting` names the parked run as `current`, the tasks it waits `on`, and its `continuation`; `ended` has the `outcome` of the last run, which is the outcome of the whole chain. |
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |

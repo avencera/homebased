@@ -12,8 +12,7 @@ use super::api::{DryRunResponse, SubmitBody};
 use super::cluster::{
     AbandonExecution, IdentityBody, PreviewBody, PreviewExecution, SubmitExecution,
 };
-use crate::dependency::TaskDependencies;
-use crate::domain::{API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskStatus};
+use crate::domain::{API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
@@ -22,7 +21,8 @@ use crate::invocation::resolve_agent_binary;
 use crate::machine::{MachineId, MachineName};
 use crate::spec::{self, NormalizedSpec};
 use crate::submission::{
-    CallbackContext, ExecutorIdentity, HeldPhase, OriginRoute, SubmissionState,
+    CallbackContext, CallbackExecutable, ExecutorIdentity, HeldPhase, OriginRoute, ReleaseTerms,
+    SubmissionState,
 };
 
 /// Submit a remote request once or resolve its saved outcome without resending
@@ -57,7 +57,8 @@ pub(super) async fn submit(
             machine: machine_name.to_string(),
         })?;
     let destination = fleet.connect(machine).await?;
-    let callback = callback_context(body.env, body.callback_cwd)?;
+    let terms = body.terms();
+    let callback = callback_context(body.env, body.callback_cwd, body.spec.thread)?;
     let task = TaskId::new();
     let route = OriginRoute {
         request,
@@ -73,7 +74,7 @@ pub(super) async fn submit(
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
-    let saved = insert_route(state, route, body.after).await?;
+    let saved = insert_route(state, route, terms).await?;
     if saved.task != task {
         return finish_saved(state, saved).await;
     }
@@ -86,30 +87,19 @@ pub(super) async fn submit(
     resolve_identity(state, saved, identity.identity).await
 }
 
-/// Save a new route with its dependencies, or return the route an identical request saved
+/// Save a new route with its release terms, or return the route an identical request saved
 pub(super) async fn insert_route(
     state: &AppState,
     route: OriginRoute,
-    after: Option<TaskDependencies>,
+    terms: ReleaseTerms,
 ) -> Result<OriginRoute, AppError> {
     let request = route.request;
-    let inserted = match after {
-        Some(after) => {
-            call(&state.store, |reply| StoreMsg::InsertOriginRouteAfter {
-                route: Box::new(route),
-                after,
-                reply,
-            })
-            .await
-        }
-        None => {
-            call(&state.store, |reply| StoreMsg::InsertOriginRoute {
-                route: Box::new(route),
-                reply,
-            })
-            .await
-        }
-    };
+    let inserted = call(&state.store, |reply| StoreMsg::InsertOriginRoute {
+        route: Box::new(route),
+        terms,
+        reply,
+    })
+    .await;
     let error = match inserted {
         Ok(saved) => return Ok(saved),
         Err(error) => error,
@@ -127,7 +117,7 @@ pub(super) async fn insert_route(
     }
 }
 
-/// Refuse a retry whose spec or dependencies differ from the saved request
+/// Refuse a retry whose spec or release terms differ from the saved request
 async fn check_retry(
     state: &AppState,
     route: &OriginRoute,
@@ -139,13 +129,16 @@ async fn check_retry(
             "request UUID has different normalized content",
         ));
     }
-    let saved_after = call(&state.store, |reply| StoreMsg::RouteDependencies {
+    let saved = call(&state.store, |reply| StoreMsg::RouteTerms {
         id: route.task,
         reply,
     })
     .await?;
-    if saved_after != body.after {
-        return Err(conflict(route, "request UUID has different dependencies"));
+    if saved != Some(body.terms()) {
+        return Err(conflict(
+            route,
+            "request UUID has different after, wait_for_machine, or coalesce",
+        ));
     }
     Ok(())
 }
@@ -170,9 +163,12 @@ pub(super) async fn execution_machine(
 }
 
 /// Origin-only callback context for a remote task, from the submitting shell
+///
+/// A task without a thread wakes no session, so it needs no Codex executable
 pub(super) fn callback_context(
     env: TaskEnv,
     callback_cwd: Option<std::path::PathBuf>,
+    thread: ThreadId,
 ) -> Result<CallbackContext, AppError> {
     let callback_cwd = callback_cwd.ok_or_else(|| AppError::InvalidSpec {
         pointer: "/callback_cwd".into(),
@@ -187,11 +183,17 @@ pub(super) fn callback_context(
         });
     }
     spec::check_cwd(&callback_cwd)?;
-    let codex = resolve_agent_binary(AgentKind::Codex, &env.path, &callback_cwd)?;
+    let codex = if thread.is_detached() {
+        CallbackExecutable::Unavailable {
+            reason: "the task was submitted without a thread".into(),
+        }
+    } else {
+        resolve_agent_binary(AgentKind::Codex, &env.path, &callback_cwd)?.into()
+    };
     Ok(CallbackContext {
         env,
         cwd: callback_cwd,
-        codex: codex.into(),
+        codex,
     })
 }
 
@@ -290,7 +292,7 @@ fn local_machine_selector(machine: &MachineName) -> AppError {
     }
 }
 
-async fn finish_saved(
+pub(super) async fn finish_saved(
     state: &AppState,
     route: OriginRoute,
 ) -> Result<(TaskId, TaskStatus), AppError> {

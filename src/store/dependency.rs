@@ -20,6 +20,8 @@ use crate::dependency::{
 use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
+use crate::machine::MachineId;
+use crate::machine_wait::CoalesceKey;
 use crate::submission::{
     DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
@@ -195,7 +197,7 @@ fn unrecorded_outcome(route: &OriginRoute) -> Option<DependencyOutcome> {
         .then_some(DependencyOutcome::Unknown)
 }
 
-/// Routes with dependencies whose task never launched: held, cancelled, or refused
+/// Held routes whose task never launched: held, cancelled, or refused
 const UNLAUNCHED: &str = "json_extract(route_json, '$.submission.type') IN ('held', 'rejected')";
 
 /// One task that its origin holds or ended before launch, for the task list
@@ -266,7 +268,7 @@ impl Store {
             .collect()
     }
 
-    /// Routes with dependencies that never launched a task: held, cancelled, or refused
+    /// Holdable routes that never launched a task: held, cancelled, or refused
     ///
     /// The origin is the only machine with a record of these tasks, so its task
     /// list shows them
@@ -277,7 +279,7 @@ impl Store {
             .collect()
     }
 
-    /// One task with dependencies that never launched, or `None` for any other task
+    /// One holdable task that never launched, or `None` for any other task
     pub fn unlaunched_task(&self, task: TaskId) -> Result<Option<UnlaunchedTask>, AppError> {
         let Some(held) = self
             .dependent_routes(&format!("task_id = '{task}' AND {UNLAUNCHED}"))?
@@ -302,10 +304,12 @@ impl Store {
         })
     }
 
+    /// Routes that may be held: those with dependencies, and those that wait for their machine
     fn dependent_routes(&self, filter: &str) -> Result<Vec<DependentRoute>, AppError> {
         let sql = format!(
             "SELECT task_id,route_json,after_json,after_rule FROM origin_routes
-             WHERE after_json IS NOT NULL AND json_valid(route_json) AND {filter}
+             WHERE (after_json IS NOT NULL OR wait_for_machine = 1)
+               AND json_valid(route_json) AND {filter}
              ORDER BY task_id"
         );
         let mut statement = self.conn.prepare(&sql)?;
@@ -314,7 +318,7 @@ impl Store {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                 ))
             })?
@@ -325,13 +329,45 @@ impl Store {
                 if route.task.to_string() != task {
                     return Err(AppError::ClusterTaskConflict { task: route.task });
                 }
-                let after = serde_json::from_str(&after_json)?;
+                let after = decode_after(after_json.as_deref())?;
                 let rule = ReleaseRule::from_storage(&rule).ok_or_else(|| AppError::Internal {
                     message: format!("unknown release rule {rule} for {task}"),
                 })?;
                 Ok(DependentRoute { route, after, rule })
             })
             .collect()
+    }
+
+    /// Older routes that a newer submit with this coalesce key and machine replaces
+    ///
+    /// Only routes that still wait on this origin are returned: a launching or
+    /// launched one may already run on its executor. UUID v7 task ids sort by
+    /// creation, so a retry of an older request never replaces a newer one
+    pub fn coalesced_waiting_routes(
+        &self,
+        key: &CoalesceKey,
+        execution_machine: MachineId,
+        newer: TaskId,
+    ) -> Result<Vec<OriginRoute>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT route_json FROM origin_routes
+             WHERE coalesce_key = ?1 AND task_id < ?2 AND json_valid(route_json)
+               AND json_extract(route_json, '$.execution_machine') = ?3
+               AND json_extract(route_json, '$.submission.type') = 'held'
+               AND json_extract(route_json, '$.submission.phase.type') = 'waiting'
+             ORDER BY task_id",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    key.as_str(),
+                    newer.to_string(),
+                    execution_machine.to_string()
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter().map(|json| decode_route(json)).collect()
     }
 
     /// State of each dependency, or `None` for a task with no origin route here
@@ -496,9 +532,11 @@ mod tests {
     use crate::domain::{TaskEnv, TaskId};
     use crate::events::EventPayload;
     use crate::machine::MachineId;
+    use crate::machine_wait::{CoalesceKey, MachineWait};
     use crate::store::Store;
     use crate::submission::{
-        CallbackContext, HeldPhase, NewHeldRoute, OriginRoute, RequestId, SubmissionState,
+        CallbackContext, HeldPhase, NewHeldRoute, OriginRoute, ReleaseTerms, RequestId,
+        SubmissionState,
     };
 
     fn held_route(execution_machine: MachineId) -> OriginRoute {
@@ -533,6 +571,13 @@ mod tests {
         TaskDependencies::new(vec![TaskId::new()]).unwrap()
     }
 
+    fn after_terms(after: TaskDependencies) -> ReleaseTerms {
+        ReleaseTerms {
+            after: Some(after),
+            machine_wait: None,
+        }
+    }
+
     fn terminal_callback(store: &Store, task: TaskId) -> crate::callback::HomebasedEvent {
         let events = store.inbound_events(task).unwrap();
         assert_eq!(events.len(), 1);
@@ -554,20 +599,20 @@ mod tests {
 
         let after = after();
         store
-            .insert_origin_route_after(&route, Some(&after))
+            .insert_origin_route_with(&route, &after_terms(after.clone()))
             .unwrap();
         let mut retry = route.clone();
         retry.task = TaskId::new();
         assert_eq!(
             store
-                .insert_origin_route_after(&retry, Some(&after))
+                .insert_origin_route_with(&retry, &after_terms(after.clone()))
                 .unwrap()
                 .task,
             route.task
         );
         assert!(
             store
-                .insert_origin_route_after(&retry, Some(&self::after()))
+                .insert_origin_route_with(&retry, &after_terms(self::after()))
                 .is_err()
         );
         assert_eq!(store.route_dependencies(route.task).unwrap(), Some(after));
@@ -577,13 +622,80 @@ mod tests {
         );
     }
 
+    fn machine_terms(coalesce: Option<&str>) -> ReleaseTerms {
+        ReleaseTerms {
+            after: None,
+            machine_wait: Some(MachineWait {
+                coalesce: coalesce.map(|key| CoalesceKey::new(key.into()).unwrap()),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_machine_wait_holds_without_dependencies_and_coalesces_only_older_waiting_routes() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let machine = MachineId::new();
+        let key = CoalesceKey::new("fleet-update".into()).unwrap();
+
+        // without a machine wait or dependencies a route cannot start held
+        let plain = held_route(machine);
+        assert!(store.insert_origin_route(&plain).is_err());
+
+        let oldest = held_route(machine);
+        let launching = held_route(machine);
+        let elsewhere = held_route(MachineId::new());
+        let other_key = held_route(machine);
+        let newest = held_route(machine);
+        for (route, terms) in [
+            (&oldest, machine_terms(Some("fleet-update"))),
+            (&launching, machine_terms(Some("fleet-update"))),
+            (&elsewhere, machine_terms(Some("fleet-update"))),
+            (&other_key, machine_terms(Some("other"))),
+            (&newest, machine_terms(Some("fleet-update"))),
+        ] {
+            store.insert_origin_route_with(route, &terms).unwrap();
+        }
+        store.begin_held_launch(launching.task).unwrap();
+
+        // the same request with other terms is a conflict
+        assert!(
+            store
+                .insert_origin_route_with(&oldest, &machine_terms(None))
+                .is_err()
+        );
+        assert_eq!(
+            store.route_terms(oldest.task).unwrap(),
+            Some(machine_terms(Some("fleet-update")))
+        );
+
+        let held = store.held_routes().unwrap();
+        assert_eq!(held.len(), 5);
+        assert!(held.iter().all(|route| route.after.is_none()));
+
+        let replaced: Vec<_> = store
+            .coalesced_waiting_routes(&key, machine, newest.task)
+            .unwrap()
+            .into_iter()
+            .map(|route| route.task)
+            .collect();
+        assert_eq!(replaced, [oldest.task]);
+        // an older request never replaces a newer one
+        assert!(
+            store
+                .coalesced_waiting_routes(&key, machine, oldest.task)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn cancelling_a_held_route_is_idempotent_and_ends_it_as_cancelled() {
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let route = held_route(MachineId::new());
         store
-            .insert_origin_route_after(&route, Some(&after()))
+            .insert_origin_route_with(&route, &after_terms(after()))
             .unwrap();
 
         let cause = HeldCancellation::Requested;
@@ -621,7 +733,7 @@ mod tests {
         let mut store = Store::open(&dir.path().join("db")).unwrap();
         let route = held_route(MachineId::new());
         store
-            .insert_origin_route_after(&route, Some(&after()))
+            .insert_origin_route_with(&route, &after_terms(after()))
             .unwrap();
         let launching = store.begin_held_launch(route.task).unwrap();
         assert!(matches!(

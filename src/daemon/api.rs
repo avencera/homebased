@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
@@ -32,9 +32,10 @@ use crate::files::{
     resolve_absolute_path,
 };
 use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
+use crate::machine_wait::MachineWait;
 use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
 use crate::store::CancelResult;
-use crate::submission::RequestId;
+use crate::submission::{ReleaseTerms, RequestId};
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -193,6 +194,18 @@ pub(super) struct SubmitBody {
     pub(super) after: Option<TaskDependencies>,
     /// Origin-only request to keep a T3 Codex thread in the Working shelf
     pub(super) hold: bool,
+    /// Origin-only request to hold the task while its machine is unreachable
+    pub(super) machine_wait: Option<MachineWait>,
+}
+
+impl SubmitBody {
+    /// Origin-only fields that decide when the task launches
+    pub(super) fn terms(&self) -> ReleaseTerms {
+        ReleaseTerms {
+            after: self.after.clone(),
+            machine_wait: self.machine_wait.clone(),
+        }
+    }
 }
 
 /// Top-level socket envelope. `spec` and `env` stay as `Value` so each can be
@@ -213,6 +226,10 @@ struct SubmitEnvelope {
     after: Option<Value>,
     #[serde(default)]
     hold: bool,
+    #[serde(default)]
+    wait_for_machine: bool,
+    #[serde(default)]
+    coalesce: Option<String>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -237,6 +254,18 @@ where
         // parse_normalized_value already enforces api_version and min timeout
         let spec = spec::parse_normalized_value(&spec_value).map_err(|err| prefix("/spec", err))?;
         let after = envelope.after.as_ref().map(spec::parse_after).transpose()?;
+        let machine_wait = spec::parse_machine_wait(
+            envelope.wait_for_machine,
+            envelope.coalesce,
+            spec.machine.is_some(),
+        )?;
+        if envelope.hold && spec.thread.is_detached() {
+            return Err(AppError::InvalidSpec {
+                pointer: "/hold".into(),
+                value: json!(true),
+                message: "hold needs a thread to hold".into(),
+            });
+        }
         // a caller without its own request UUID gets a fresh one, so every task has a retry identity
         let request = envelope.request_id.unwrap_or_default();
         Ok(Self(SubmitBody {
@@ -246,6 +275,7 @@ where
             callback_cwd: envelope.callback_cwd,
             after,
             hold: envelope.hold,
+            machine_wait,
         }))
     }
 }
@@ -499,7 +529,7 @@ pub(super) async fn local_task_summaries(
     let mut tasks = TaskList::from_rows(&rows, &presentations).tasks;
     let unlaunched = call(&state.store, |reply| StoreMsg::UnlaunchedTasks { reply }).await?;
     for task in unlaunched {
-        let after = crate::daemon::dependencies::views(state, &task.held.after).await?;
+        let after = crate::daemon::dependencies::views(state, task.held.after.as_ref()).await?;
         if let Some(summary) = TaskSummary::from_unlaunched(&task, after)
             && filter.matches(summary.status, summary.thread)
         {

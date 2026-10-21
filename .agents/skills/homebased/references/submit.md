@@ -131,13 +131,15 @@ GitHub CI watcher as a normal task:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `api_version` | yes | Always `1`. |
-| `thread` | yes | Codex thread or Claude Code session UUID from step 1. It must exist on the submitting machine (`unknown_thread`). |
+| `thread` | yes, except below | Codex thread or Claude Code session UUID from step 1. It must exist on the submitting machine (`unknown_thread`). A `task` or `container` workload without `hold` may omit it, for work started from a plain terminal: its events are recorded and shown by `task show`, but no session gets them. The nil UUID is refused. |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | A host directory that already exists and is accessible on the machine that runs the task. For local tasks, a directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. For a `container`, `cwd` is still a host path, never a path inside the container: use a mount `source` or another host directory, and set `workdir` for the directory inside the container. A missing `cwd` fails the submit with `invalid_cwd`. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
 | `hold` | no | `true` keeps a T3 Code Codex thread in T3's Working shelf while the task is pending. Same as `task submit --hold`. No effect elsewhere. See [t3.md](t3.md). |
+| `wait_for_machine` | no | `true` holds a remote task on this daemon while `machine` is unreachable, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
+| `coalesce` | no | With `wait_for_machine`: a key of 1 to 64 ASCII letters, digits, `.`, `_`, `-`, or `:`. Once this task is accepted, older tasks with the same key and machine that still wait on this daemon are cancelled. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
 Agent-only fields under `workload`:
@@ -234,6 +236,16 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 - When a dependency ends without success, the held task gets `TASK_CANCELLED` with a `cancel_reason` that names the dependency. Tasks held on it are cancelled the same way. `homebased task cancel` on a held task cancels it before it starts.
 - `after` is part of the request identity: a retry with the same request UUID and a different `after` returns `submission_conflict`. A dry run checks the dependencies and stores nothing.
 - `task followup` has no `after`. Write a spec to chain a follow-up.
+
+### Wait for an offline machine
+
+Set `wait_for_machine: true` with `machine` for a machine that is often asleep, such as a laptop. While it does not answer, the submit returns `"status": "held"` and this daemon keeps the task. The daemon sends it once the machine answers, usually within a minute of it waking. When the machine is up, the task starts at once, as without the field.
+
+Add `coalesce` when only the newest request matters, such as an update. Once a submit with a key is accepted, every older task with the same key and machine that still waits here is cancelled with `cancel_reason` `{"type":"superseded","by":"<newer task>"}`. A task whose launch already began is left alone.
+
+- `wait_for_machine` and `coalesce` stay on this daemon, like `after`, and are part of the request identity: a retry with the same request UUID must repeat them.
+- A waiting task shows as `held` in `task list` here; `task show` adds `wait_for_machine` and `coalesce`. `task cancel` cancels it before it starts.
+- Only this daemon knows the task, so the same key submitted through two daemons sends both tasks.
 
 ## 6. End the turn
 

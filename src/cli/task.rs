@@ -19,6 +19,7 @@ use crate::domain::{
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::machine_wait::MachineWait;
 use crate::spec::{self, load_spec};
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -251,6 +252,7 @@ async fn submit(
         spec: normalized,
         after: spec.after,
         hold: hold || spec.hold,
+        machine_wait: spec.machine_wait,
     };
     submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
 }
@@ -260,6 +262,7 @@ struct Submission {
     spec: crate::spec::NormalizedSpec,
     after: Option<TaskDependencies>,
     hold: bool,
+    machine_wait: Option<MachineWait>,
 }
 
 async fn submit_normalized(
@@ -273,7 +276,15 @@ async fn submit_normalized(
         spec: normalized,
         after,
         hold,
+        machine_wait,
     } = submission;
+    if hold && normalized.thread.is_detached() {
+        return Err(AppError::InvalidSpec {
+            pointer: "/hold".into(),
+            value: json!(true),
+            message: "hold needs a thread to hold".into(),
+        });
+    }
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
     }
@@ -293,6 +304,12 @@ async fn submit_normalized(
     }
     if hold {
         body["hold"] = json!(true);
+    }
+    if let Some(wait) = machine_wait {
+        body["wait_for_machine"] = json!(true);
+        if let Some(key) = wait.coalesce {
+            body["coalesce"] = json!(key);
+        }
     }
 
     let client = Client::new(ctx.home.sock_path());
@@ -427,6 +444,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         spec: spec::normalize(&parsed)?,
         after: None,
         hold: false,
+        machine_wait: None,
     };
     submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
 }
@@ -718,6 +736,12 @@ fn print_chain(value: &Value) {
 
 /// One line per dependency in `after`: pending, or how it ended
 fn print_dependencies(value: &Value) {
+    if value.get("wait_for_machine").and_then(Value::as_bool) == Some(true) {
+        match value.get("coalesce").and_then(Value::as_str) {
+            Some(key) => println!("  waits for its machine, coalesce {key}"),
+            None => println!("  waits for its machine"),
+        }
+    }
     let Some(after) = value.get("after").and_then(Value::as_array) else {
         return;
     };

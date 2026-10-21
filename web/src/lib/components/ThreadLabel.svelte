@@ -28,6 +28,10 @@
 
 	let { thread, title, idLength = 8, filter, class: className }: Props = $props();
 
+	// a task submitted without a thread carries the nil UUID; no session can have it
+	const DETACHED_THREAD = '00000000-0000-0000-0000-000000000000';
+	let detached = $derived(thread === DETACHED_THREAD);
+
 	let open = $state(false);
 
 	function toggleFilter() {
@@ -36,57 +40,61 @@
 	}
 </script>
 
-<!-- a mouse opens the full name on hover; touch has no hover, so a tap opens it -->
-<Popover.Root bind:open>
-	<Popover.Trigger
-		openOnHover
-		openDelay={250}
-		class={cn(
-			'inline-flex max-w-full min-w-0 cursor-pointer items-baseline gap-1.5 rounded text-left hover:text-foreground',
-			filter?.active && 'text-primary',
-			className
-		)}
-		aria-label={title ? `Thread ${title}` : `Thread ${thread}`}
-	>
-		{#if title}
-			<span class="truncate font-sans">{title}</span>
-		{/if}
-		<span class="shrink-0 font-mono text-[11px] text-muted-foreground">
-			{shortId(thread, idLength)}
-		</span>
-	</Popover.Trigger>
-	<Popover.Portal>
-		<Popover.Content
-			side="bottom"
-			align="start"
-			sideOffset={4}
-			collisionPadding={8}
-			class="z-50 flex w-max max-w-[min(22rem,calc(100vw-1rem))] flex-col gap-1.5 rounded-md border border-border bg-card p-2.5 text-[13px] text-foreground shadow-lg"
+{#if detached}
+	<span class={cn('text-muted-foreground', className)}>no thread</span>
+{:else}
+	<!-- a mouse opens the full name on hover; touch has no hover, so a tap opens it -->
+	<Popover.Root bind:open>
+		<Popover.Trigger
+			openOnHover
+			openDelay={250}
+			class={cn(
+				'inline-flex max-w-full min-w-0 cursor-pointer items-baseline gap-1.5 rounded text-left hover:text-foreground',
+				filter?.active && 'text-primary',
+				className
+			)}
+			aria-label={title ? `Thread ${title}` : `Thread ${thread}`}
 		>
 			{#if title}
-				<p class="font-medium break-words">{title}</p>
-			{:else}
-				<p class="text-muted-foreground">No title found for this thread</p>
+				<span class="truncate font-sans">{title}</span>
 			{/if}
-			<CopyPath value={thread} class="-ml-1 text-[11px] text-muted-foreground" />
-			{#if filter}
-				<button
-					type="button"
-					onclick={toggleFilter}
-					class="inline-flex items-center gap-1 self-start text-primary hover:underline"
-				>
-					<Funnel class="size-3" aria-hidden="true" />
-					{filter.active ? 'Show tasks from all threads' : 'Show only tasks from this thread'}
-				</button>
-			{:else}
-				<a
-					href={resolve(`/?thread=${thread}`)}
-					class="inline-flex items-center gap-1 self-start text-primary hover:underline"
-				>
-					<Funnel class="size-3" aria-hidden="true" />
-					Show tasks from this thread
-				</a>
-			{/if}
-		</Popover.Content>
-	</Popover.Portal>
-</Popover.Root>
+			<span class="shrink-0 font-mono text-[11px] text-muted-foreground">
+				{shortId(thread, idLength)}
+			</span>
+		</Popover.Trigger>
+		<Popover.Portal>
+			<Popover.Content
+				side="bottom"
+				align="start"
+				sideOffset={4}
+				collisionPadding={8}
+				class="z-50 flex w-max max-w-[min(22rem,calc(100vw-1rem))] flex-col gap-1.5 rounded-md border border-border bg-card p-2.5 text-[13px] text-foreground shadow-lg"
+			>
+				{#if title}
+					<p class="font-medium break-words">{title}</p>
+				{:else}
+					<p class="text-muted-foreground">No title found for this thread</p>
+				{/if}
+				<CopyPath value={thread} class="-ml-1 text-[11px] text-muted-foreground" />
+				{#if filter}
+					<button
+						type="button"
+						onclick={toggleFilter}
+						class="inline-flex items-center gap-1 self-start text-primary hover:underline"
+					>
+						<Funnel class="size-3" aria-hidden="true" />
+						{filter.active ? 'Show tasks from all threads' : 'Show only tasks from this thread'}
+					</button>
+				{:else}
+					<a
+						href={resolve(`/?thread=${thread}`)}
+						class="inline-flex items-center gap-1 self-start text-primary hover:underline"
+					>
+						<Funnel class="size-3" aria-hidden="true" />
+						Show tasks from this thread
+					</a>
+				{/if}
+			</Popover.Content>
+		</Popover.Portal>
+	</Popover.Root>
+{/if}

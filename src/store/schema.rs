@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,11 +19,12 @@ pub const SCHEMA_VERSION: i64 = 5;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
     add_t3_holds,
+    add_machine_waits,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -58,6 +59,30 @@ fn add_task_usage(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn add_t3_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(T3_HOLD_TABLE)
 }
+
+/// Version 6: remote routes that wait for their machine, and their coalesce keys
+fn add_machine_waits(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE origin_routes ADD COLUMN {ROUTE_WAIT_FOR_MACHINE};
+         ALTER TABLE origin_routes ADD COLUMN {ROUTE_COALESCE_KEY};
+         {ROUTE_COALESCE_INDEX}"
+    ))
+}
+
+/// Whether the route was submitted with `wait_for_machine`, so it may be held
+/// with no dependencies until its execution machine answers
+const ROUTE_WAIT_FOR_MACHINE: &str =
+    "wait_for_machine INTEGER NOT NULL DEFAULT 0 CHECK (wait_for_machine IN (0, 1))";
+
+/// `coalesce` key of a route submitted with `wait_for_machine`
+const ROUTE_COALESCE_KEY: &str =
+    "coalesce_key TEXT CHECK (coalesce_key IS NULL OR wait_for_machine = 1)";
+
+/// Finds the older waiting routes that a newer submit with the same key cancels
+const ROUTE_COALESCE_INDEX: &str = "
+CREATE INDEX origin_routes_coalesce ON origin_routes (coalesce_key)
+    WHERE coalesce_key IS NOT NULL;
+";
 
 /// Tasks submitted with `--hold`. The flag lives beside the route, like its
 /// dependencies, so it stays on the origin and never reaches an executor. A row
@@ -160,6 +185,9 @@ fn schema() -> String {
         .replace("{REPORT_WAITING_ON}", REPORT_WAITING_ON)
         .replace("{REPORT_NOTES}", REPORT_NOTES)
         .replace("{ROUTE_AFTER_RULE}", ROUTE_AFTER_RULE)
+        .replace("{ROUTE_WAIT_FOR_MACHINE}", ROUTE_WAIT_FOR_MACHINE)
+        .replace("{ROUTE_COALESCE_KEY}", ROUTE_COALESCE_KEY)
+        .replace("{ROUTE_COALESCE_INDEX}", ROUTE_COALESCE_INDEX)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
         .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
@@ -167,8 +195,8 @@ fn schema() -> String {
 }
 
 /// Every table of the current schema, with the columns and tables shared with
-/// [`add_waiting_handoff`], [`add_job_route_created_at`], and
-/// [`add_task_usage`], and [`add_t3_holds`] as placeholders
+/// [`add_waiting_handoff`], [`add_job_route_created_at`],
+/// [`add_task_usage`], [`add_t3_holds`], and [`add_machine_waits`] as placeholders
 ///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -266,8 +294,11 @@ CREATE TABLE origin_routes (
     after_json TEXT,
     outcome TEXT
         CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted')),
-    {ROUTE_AFTER_RULE}
+    {ROUTE_AFTER_RULE},
+    {ROUTE_WAIT_FOR_MACHINE},
+    {ROUTE_COALESCE_KEY}
 );
+{ROUTE_COALESCE_INDEX}
 
 CREATE TABLE executor_identities (
     task_id TEXT PRIMARY KEY,
@@ -595,6 +626,9 @@ mod tests {
         let v1 = schema()
             .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
+            .replace(&format!(",\n    {}", super::ROUTE_WAIT_FOR_MACHINE), "")
+            .replace(&format!(",\n    {}", super::ROUTE_COALESCE_KEY), "")
+            .replace(super::ROUTE_COALESCE_INDEX, "")
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
             .replace(super::CHAIN_TABLES, "")
             .replace(super::TASK_USAGE_TABLE, "")

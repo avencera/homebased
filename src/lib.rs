@@ -21,6 +21,7 @@ pub mod home;
 pub mod install;
 pub mod invocation;
 pub mod machine;
+pub mod machine_wait;
 pub mod message;
 pub mod notify;
 pub mod power;

@@ -347,6 +347,11 @@ pub enum HeldCancellation {
     },
     /// `task cancel` named the held task
     Requested,
+    /// A newer task with the same `coalesce` key and machine was accepted
+    Superseded {
+        /// The newer task
+        by: TaskId,
+    },
 }
 
 impl From<DependencyFailure> for HeldCancellation {
@@ -370,6 +375,7 @@ impl fmt::Display for HeldCancellation {
                 outcome,
             } => write!(f, "dependency {dependency} ended {outcome}"),
             Self::Requested => f.write_str("cancel was requested before launch"),
+            Self::Superseded { by } => write!(f, "superseded by task {by} before launch"),
         }
     }
 }
