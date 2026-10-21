@@ -1,6 +1,5 @@
 //! Resource queue commands, with stable identities for transport retries
 
-use std::io::{self, Read};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -239,15 +238,13 @@ async fn submit(
     spec_path: &str,
     allow_other_thread: bool,
 ) -> Result<(), AppError> {
-    let bytes = if spec_path == "-" {
-        let mut bytes = Vec::new();
-        io::stdin().read_to_end(&mut bytes)?;
-        bytes
-    } else {
-        std::fs::read(spec_path)?
-    };
-    let spec = JobSpec::parse_bytes(&bytes)?;
-    SubmitOrigin::capture(&ctx.home)?.check(spec.thread, allow_other_thread)?;
+    let origin = SubmitOrigin::capture(&ctx.home)?;
+    let mut value = crate::spec::read_spec_value(spec_path)?;
+    if let Some(thread) = origin.default_thread()? {
+        crate::spec::fill_missing_thread(&mut value, thread);
+    }
+    let spec = JobSpec::parse_value(&value)?;
+    origin.check(spec.thread, allow_other_thread)?;
     let body = json!({
         "job_id": job_id,
         "spec": spec,

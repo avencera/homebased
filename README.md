@@ -189,7 +189,7 @@ incoming traffic wakes the Mac to restore them. SSH still works during sleep
 because "Wake for network access" wakes the Mac for an incoming connection.
 Linux does not support this setting; the daemon logs a warning and ignores it.
 
-To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines.
+To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address, and a later install from a shell without the variable keeps it; set it to `off` to turn the listener off. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines.
 
 Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `systemctl` or `launchctl`.
 
@@ -289,7 +289,8 @@ event the command never confirmed goes through normal delivery after about 5
 seconds, possibly as a repeat. It reconnects silently across a daemon restart
 for up to 5 minutes. It is meant for a Claude Code `Monitor` in a T3 Code
 thread, which T3 shows as Waiting. A task of another thread or machine returns
-`wait_unavailable`, and so does a queue run, which has no callback route.
+`wait_unavailable`, and so do a task submitted without a thread and a queue
+run, which has no callback route.
 
 A Codex thread cannot run a `Monitor`. Submit with `--hold` (or `"hold": true`
 in the spec) from a T3 Code Codex thread, and the daemon keeps the thread in
@@ -408,18 +409,25 @@ Codex and Cursor read `~/.agents/skills/homebased`. For Claude Code, also instal
 
 ## Usage
 
-Submit a JSON spec to the local daemon. It can run the task on this machine or
-send it to a Fleet machine. The submitting machine owns the Codex thread and
-returns events to it. Tell the user the task id, and end the turn. Results
-arrive later as one line: `HOMEBASED_EVENT {...}`. Do not poll a running task.
+Run a command with `task run`, or submit a JSON spec for an agent or container
+workload. The local daemon can run the task on this machine or send it to a
+Fleet machine. The submitting machine owns the Codex thread and returns events
+to it. Tell the user the task id, and end the turn. Results arrive later as one
+line: `HOMEBASED_EVENT {...}`. Do not poll a running task.
 
 ```sh
 homebased --json daemon status                         # socket must be "up"
+homebased task run --name "release build" -- cargo build --release
 homebased --json task submit --spec "$spec" --dry-run  # validate, print child argv
 homebased --json task submit --spec "$spec"            # submit to the local machine
 ```
 
-Always pass `--json` on data commands. Every JSON object carries `api_version: 1`. Put task fields in the JSON spec. `--request-id` is an optional CLI flag for a stable retry identity; it is not a task field.
+`task run` builds a `task` spec from its flags: it runs the command after `--`
+in the current directory (`--cwd` overrides), names it after the command unless
+`--name` is given, and takes `--timeout`, `--machine`, `--after`,
+`--wait-for-machine`, `--hold`, `--dry-run`, and `--request-id`.
+
+Always pass `--json` on data commands. Every JSON object carries `api_version: 1`. `--request-id` is an optional CLI flag for a stable retry identity; it is not a task field.
 
 ### Workloads
 
@@ -439,7 +447,7 @@ OpenCode agent workloads use `opencode run --standalone` with JSON events and th
 
 ### Spec
 
-Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread or Claude Code session UUID that should receive events. A `task` or `container` workload without `hold` may omit `thread`: its events are recorded and shown by `task show` and the dashboard, but no session is woken. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
+Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread or Claude Code session UUID that should receive events. Submit fills in an omitted `thread`: a Homebased worker gets its parent task's thread, and anyone else gets the calling session from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`. Submitted from a plain terminal, or with `"thread": null`, a `task` or `container` workload without `hold` runs without a thread: its events are recorded and shown by `task show` and the dashboard, but no session is woken. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
 
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 
@@ -455,7 +463,6 @@ Agent example:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "implement file browser",
   "cwd": "/path/to/project",
   "timeout": "30m",
@@ -473,7 +480,6 @@ Task example:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "cargo release build",
   "cwd": "/path/to/project",
   "timeout": "2h",
@@ -490,7 +496,6 @@ spec. This example is a remote task spec:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "run cargo checks on code",
   "machine": "code",
   "cwd": "~/code/homebased",
@@ -527,7 +532,6 @@ dependency finishes.
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "phase b2: integrate",
   "cwd": "/path/to/project",
   "after": ["01a0b06f-306c-749e-aa9e-9e1a619ee915"],

@@ -9,8 +9,8 @@ use crate::config::CONFIG_ENV;
 use crate::error::AppError;
 use crate::home::Home;
 use crate::install::{
-    HostUnitState, agent_paths, binary_path, classify_configured_home, installer_path,
-    web_listen_env,
+    HostUnitState, WEB_LISTEN_ENV, agent_paths, binary_path, classify_configured_home,
+    installer_path, web_listen_env,
 };
 
 /// LaunchAgent label.
@@ -60,8 +60,26 @@ pub(crate) fn parse_plist_home(text: &str) -> Option<PathBuf> {
     home_from_program_arguments(&args)
 }
 
-/// Render the plist with an optional explicit config file.
+/// Render the plist with an optional explicit config file, keeping the
+/// dashboard bind of the installed plist
 pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
+    let installed = std::fs::read_to_string(plist_path()).unwrap_or_default();
+    // another home's plist is not this install's to inherit a dashboard from
+    let same_home =
+        classify_configured_home(home, parse_plist_home(&installed)) == HostUnitState::SelectedHome;
+    render_with(
+        home,
+        config,
+        parse_string_value(&installed, WEB_LISTEN_ENV).filter(|_| same_home),
+    )
+}
+
+/// Render the plist; `installed_listen` is the installed plist's dashboard bind
+fn render_with(
+    home: &Home,
+    config: Option<&Path>,
+    installed_listen: Option<String>,
+) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env = String::new();
@@ -76,7 +94,7 @@ pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
             xml_escape(&path.display().to_string())
         ));
     }
-    if let Some((key, value)) = web_listen_env()? {
+    if let Some((key, value)) = web_listen_env(installed_listen)? {
         env.push_str(&format!(
             "    <key>{}</key>\n    <string>{}</string>\n",
             xml_escape(key),
@@ -377,7 +395,7 @@ mod tests {
     #[test]
     fn plist_contains_required_fields() {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         assert!(text.contains("AbandonProcessGroup"), "{text}");
         assert!(text.contains("<true/>"), "{text}");
         assert!(text.contains("KeepAlive"), "{text}");
@@ -397,7 +415,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let config = Path::new("/tmp/config & <quoted\".toml>");
 
-        let text = render(&home, Some(config)).unwrap();
+        let text = render_with(&home, Some(config), None).unwrap();
 
         assert_eq!(
             parse_string_value(&text, CONFIG_ENV),
@@ -417,7 +435,7 @@ mod tests {
     fn plist_points_claude_at_a_config_dir() {
         // without it the daemon's claude reads a stale keychain login
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         let dir = parse_string_value(&text, CLAUDE_CONFIG_DIR_ENV);
         assert!(dir.is_some_and(|dir| !dir.is_empty()), "{text}");
     }
@@ -444,7 +462,7 @@ mod tests {
     fn plist_makes_a_relative_home_absolute() {
         let home = Home::resolve(Some(PathBuf::from("relative-state"))).unwrap();
         let expected = std::path::absolute(home.root()).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         assert!(
             text.contains(&format!("<string>{}</string>", expected.display())),
             "{text}"

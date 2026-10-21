@@ -556,6 +556,11 @@ pub enum WaitBlocker {
     /// The task reports to another thread
     #[error("the task reports to another thread")]
     NotOwner,
+    /// The task was submitted without a thread, so no session gets its events
+    #[error(
+        "the task was submitted without a thread, so no session can wait on it; cancel it and submit it again from this session, which records this session as its thread"
+    )]
+    Detached,
     /// The task reports to another machine
     #[error(
         "the task reports to another machine, and only tasks that report here can be waited on"

@@ -133,6 +133,30 @@ pub const THREAD_ENV_VARS: [&str; 3] = [
     "CLAUDE_CODE_SESSION_ID",
 ];
 
+/// The calling agent's own thread, from the first of [`THREAD_ENV_VARS`] that is set
+///
+/// # Errors
+///
+/// `usage` when that variable is not a UUID: a wrong id would send events to
+/// another session, so it is refused instead of skipped
+pub fn session_thread() -> Result<Option<ThreadId>, AppError> {
+    for key in THREAD_ENV_VARS {
+        let Some(value) = std::env::var_os(key) else {
+            continue;
+        };
+        let value = value.to_str().ok_or_else(|| AppError::Usage {
+            message: format!("{key} must be a UUID"),
+        })?;
+        return value
+            .parse()
+            .map(Some)
+            .map_err(|error: AppError| AppError::Usage {
+                message: format!("{key} must be a thread UUID: {error}"),
+            });
+    }
+    Ok(None)
+}
+
 /// Codex thread or Claude Code session that submitted the task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

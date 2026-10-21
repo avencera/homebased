@@ -81,14 +81,13 @@ done
 
 Omit `machine` to use the local machine. Set it to a Fleet name or full machine UUID to use that machine's queue. Paths and executables must exist there. Remote runs use that machine's environment. Omit `resource` to use any of its resources. Set it to a resource name or full UUID to pin the job.
 
-Get the receiving `thread` as described in [submit.md](submit.md). A worker must use its parent's thread. `--allow-other-thread` permits another known thread, but does not bypass the known-thread check. Save the job UUID before the first submit. Retry with the same UUID and unchanged spec after a lost reply. Do not create another job for the same request.
+Leave `thread` out: submit fills in the calling session, or a worker's parent thread, as described in [submit.md](submit.md#1-thread-and-machine). `--allow-other-thread` lets a worker name another known thread. Save the job UUID before the first submit. Retry with the same UUID and unchanged spec, from the same session, after a lost reply. Do not create another job for the same request.
 
-Save this example as `job.json`. Replace `thread` with your receiving thread UUID. `/tmp` must exist on the target machine.
+Save this example as `job.json`. `/tmp` must exist on the target machine.
 
 ```json
 {
   "api_version": 1,
-  "thread": "11111111-1111-4111-8111-111111111111",
   "name": "Checkpoint example",
   "cwd": "/tmp",
   "timeout": "1h",
@@ -105,7 +104,7 @@ Save this example as `job.json`. Replace `thread` with your receiving thread UUI
 | Spec field | Rule |
 | --- | --- |
 | `api_version` | Required. Must be 1. |
-| `thread`, `name`, `cwd` | Required. Thread UUID, non-blank label, existing host directory. One cwd for all steps. |
+| `thread`, `name`, `cwd` | `name` and `cwd` required: non-blank label, existing host directory, one cwd for all steps. `thread` is filled in by submit. |
 | `priority`, `preempt` | Required. Use the choices above. |
 | `timeout` | Output-inactivity notice per run. Default `1h`, minimum `30m`. Never stops work. |
 | `machine`, `resource` | Optional target selectors. |

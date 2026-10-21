@@ -268,18 +268,19 @@ fn model_label(selection: &Value) -> String {
     format!("{}/{}", field("instanceId"), field("model"))
 }
 
-/// A path under this machine's home as `~/...`, so the launching machine
+/// A path under this machine's home as `~/...`, so another machine
 /// resolves it under its own home
 ///
 /// The shell expands an unquoted `~/code/app` to this machine's home before
 /// homebased sees it, which names nothing on a machine with another home
-fn home_relative(value: String) -> String {
+pub(super) fn home_relative(value: String) -> String {
     let Some(home) = std::env::home_dir() else {
         return value;
     };
     let home = home.to_string_lossy();
     match value.strip_prefix(home.trim_end_matches('/')) {
         Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        Some("") => "~/".into(),
         _ => value,
     }
 }

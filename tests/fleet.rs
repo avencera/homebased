@@ -84,6 +84,10 @@ impl Daemon {
             .env("HOME", &self.user_home)
             .env_remove("CODEX_HOME")
             .env_remove("HOMEBASED_TASK_ID")
+            // submit fills an omitted thread from these, so the developer's own session must not leak in
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("HOMEBASED_WEB_LISTEN");
         if let Some(codex) = &self.codex_override {
             cmd.env("HOMEBASED_CODEX", codex);

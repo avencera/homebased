@@ -7,8 +7,8 @@ use crate::config::CONFIG_ENV;
 use crate::error::AppError;
 use crate::home::Home;
 use crate::install::{
-    HostUnitState, agent_paths, binary_path, classify_configured_home, installer_path,
-    web_listen_env,
+    HostUnitState, WEB_LISTEN_ENV, agent_paths, binary_path, classify_configured_home,
+    installer_path, web_listen_env,
 };
 
 /// Unit file path.
@@ -64,8 +64,34 @@ pub(crate) fn parse_unit_home(text: &str) -> Option<PathBuf> {
     }
 }
 
-/// Render the unit with an optional explicit config file.
+/// Render the unit with an optional explicit config file, keeping the
+/// dashboard bind of the installed unit
 pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
+    let installed = std::fs::read_to_string(unit_path()).unwrap_or_default();
+    // another home's unit is not this install's to inherit a dashboard from
+    let same_home =
+        classify_configured_home(home, parse_unit_home(&installed)) == HostUnitState::SelectedHome;
+    render_with(
+        home,
+        config,
+        installed_web_listen(&installed).filter(|_| same_home),
+    )
+}
+
+/// Dashboard bind from unit text, as [`render`] writes it
+fn installed_web_listen(text: &str) -> Option<String> {
+    let prefix = format!("Environment={WEB_LISTEN_ENV}=");
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
+}
+
+/// Render the unit; `installed_listen` is the installed unit's dashboard bind
+fn render_with(
+    home: &Home,
+    config: Option<&Path>,
+    installed_listen: Option<String>,
+) -> Result<String, AppError> {
     let bin = binary_path()?;
     let home = std::path::absolute(home.root())?;
     let mut env_lines = String::new();
@@ -79,7 +105,7 @@ pub fn render(home: &Home, config: Option<&Path>) -> Result<String, AppError> {
             quote_systemd_environment(key, &path.display().to_string())?
         ));
     }
-    if let Some((key, value)) = web_listen_env()? {
+    if let Some((key, value)) = web_listen_env(installed_listen)? {
         env_lines.push_str(&format!("Environment={key}={value}\n"));
     }
     if let Some(path) = config {
@@ -324,7 +350,7 @@ mod tests {
         );
         let path = PathBuf::from("/tmp/state with space");
         let home = Home::resolve(Some(path.clone())).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         assert_eq!(parse_unit_home(&text), Some(path));
         assert_eq!(
             parse_unit_home(&sample_unit(
@@ -337,10 +363,13 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use super::{inspect_host_unit_at, parse_unit_home, quote_systemd_environment, render};
+    use super::{
+        inspect_host_unit_at, installed_web_listen, parse_unit_home, quote_systemd_environment,
+        render_with,
+    };
     use crate::config::CONFIG_ENV;
     use crate::home::Home;
-    use crate::install::{HostUnitState, classify_configured_home};
+    use crate::install::{HostUnitState, WEB_LISTEN_ENV, classify_configured_home};
 
     fn sample_unit(bin: &str, home: &str) -> String {
         format!(
@@ -364,7 +393,7 @@ mod tests {
     #[test]
     fn unit_contains_required_fields() {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         assert!(text.contains("KillMode=process"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("ExecStop=")),
@@ -392,7 +421,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let config = Path::new("/tmp/config with \"quotes\" \\ and $value %specifier.toml");
 
-        let text = render(&home, Some(config)).unwrap();
+        let text = render_with(&home, Some(config), None).unwrap();
 
         assert!(
             text.lines().any(|line| line
@@ -414,7 +443,7 @@ mod tests {
     fn unit_makes_a_relative_home_absolute() {
         let home = Home::resolve(Some(PathBuf::from("relative-state"))).unwrap();
         let expected = std::path::absolute(home.root()).unwrap();
-        let text = render(&home, None).unwrap();
+        let text = render_with(&home, None, None).unwrap();
         assert!(
             text.contains(&format!("daemon serve --home \"{}\"", expected.display())),
             "{text}"
@@ -434,6 +463,26 @@ mod tests {
         assert_eq!(parse_unit_home(&a), parse_unit_home(&b));
         assert!(a.contains("HOMEBASED_WEB_LISTEN"));
         assert_eq!(parse_unit_home(&a), Some(PathBuf::from("/tmp/hb-state")));
+    }
+
+    #[test]
+    fn reinstall_keeps_the_installed_dashboard_bind() {
+        // the installing shell's variable wins, so this only holds without it
+        if std::env::var_os(WEB_LISTEN_ENV).is_some() {
+            return;
+        }
+        let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
+        let installed = sample_unit("/opt/homebased", "/tmp/hb-state");
+
+        let text = render_with(&home, None, installed_web_listen(&installed)).unwrap();
+
+        assert!(
+            text.lines()
+                .any(|line| line == "Environment=HOMEBASED_WEB_LISTEN=127.0.0.1:9"),
+            "{text}"
+        );
+        let text = render_with(&home, None, Some("not a bind".into())).unwrap();
+        assert!(!text.contains(WEB_LISTEN_ENV), "{text}");
     }
 
     #[test]

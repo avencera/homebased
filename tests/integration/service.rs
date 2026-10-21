@@ -460,7 +460,10 @@ fn serve_http_bytes(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
 fn install_dry_run_text() {
     let hb = assert_cmd::cargo::cargo_bin("homebased");
     let dir = TempDir::new().unwrap();
+    // a private home, so install finds no unit of the developer's to keep a bind from
+    let user_home = TempDir::new().unwrap();
     let out = Command::new(&hb)
+        .env("HOME", user_home.path())
         .env_remove("HOMEBASED_WEB_LISTEN")
         .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])
@@ -507,6 +510,7 @@ fn install_dry_run_text() {
     // the installing shell's bind is baked in, and a bad one fails install
     // unset means the dashboard stays off; the unit does not invent a bind
     let out = Command::new(&hb)
+        .env("HOME", user_home.path())
         .env("HOMEBASED_WEB_LISTEN", "0.0.0.0:7677")
         .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])
@@ -525,7 +529,31 @@ fn install_dry_run_text() {
             && text.contains("<string>0.0.0.0:7677</string>"),
         "{text}"
     );
+
+    // a reinstall from a shell without the variable keeps the installed bind
+    #[cfg(target_os = "linux")]
+    let unit = user_home
+        .path()
+        .join(".config/systemd/user/homebased.service");
+    #[cfg(target_os = "macos")]
+    let unit = user_home
+        .path()
+        .join("Library/LaunchAgents/dev.praveen.homebased.plist");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, text.as_bytes()).unwrap();
     let out = Command::new(&hb)
+        .env("HOME", user_home.path())
+        .env_remove("HOMEBASED_WEB_LISTEN")
+        .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
+        .args(["daemon", "install", "--dry-run", "--home"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let kept = String::from_utf8_lossy(&out.stdout);
+    assert!(kept.contains("0.0.0.0:7677"), "{kept}");
+
+    let out = Command::new(&hb)
+        .env("HOME", user_home.path())
         .env("HOMEBASED_WEB_LISTEN", "lan")
         .env("HOMEBASED_OPENCODE", fixture("fake-opencode"))
         .args(["daemon", "install", "--dry-run", "--home"])

@@ -118,6 +118,8 @@ async fn check_target(state: &AppState, thread: ThreadId, task: TaskId) -> Resul
     };
     let reason = if route.origin_machine != state.machine.identity.machine {
         WaitBlocker::Remote
+    } else if route.thread.is_detached() {
+        WaitBlocker::Detached
     } else if route.thread != thread {
         WaitBlocker::NotOwner
     } else {

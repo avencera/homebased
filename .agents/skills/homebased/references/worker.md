@@ -8,7 +8,7 @@ For a GPU queue run, `HOMEBASED_TASK_ID` identifies one attempt. Use [resource-q
 
 - Follow the prompt. Verify the work the way the prompt asks, or with the repository's normal checks if it says nothing.
 - Do not run `codex queue`. Do not submit new homebased tasks unless the prompt asks for it, or to run a long command you then wait on (see [Long commands](#long-commands-submit-and-wait)).
-- When you submit tasks, set the spec `thread` to your parent task's thread: `homebased --json task show "$HOMEBASED_TASK_ID"` prints it. Do not use `HOMEBASED_TASK_ID` itself. Another thread fails with `thread_mismatch` unless you pass `--allow-other-thread`. On a remote executor the parent's thread is not on this machine, so the submit fails with `unknown_thread`.
+- Leave `thread` out of the specs you submit: submit fills in your parent task's thread. Another thread fails with `thread_mismatch` unless you pass `--allow-other-thread`. On a remote executor the parent's thread is not on this machine, so a task you submit there runs without one, and you cannot park on it with `waiting`.
 - A Claude worker can receive a `HOMEBASED_MESSAGE` line between turns from `message send --worker`. Treat it as an update to the prompt from the orchestrator, and say in your report how you applied it.
 - Leave the working tree in the state the prompt asked for. Do not commit or push unless instructed.
 
@@ -18,7 +18,7 @@ Never wait in the foreground for a long command (a GPU run, a release build, a b
 
 Hand the command to homebased and park instead. You do not need permission in the prompt for this.
 
-1. Submit the command as a `task` workload (or the agent you need) with your parent task's `thread`, as above. Note the task id it returns. Submit as many as you need.
+1. Submit the command with `homebased --quiet task run --name "<goal>" -- <program> <args...>` (or a spec for an agent). Note the task id it prints. Submit as many as you need.
 2. Report `waiting` on those tasks with notes for the next run, then exit 0 at once:
 
 ```bash

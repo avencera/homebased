@@ -18,10 +18,10 @@ The dashboard is embedded in the binary at compile time, so `just web-build` mus
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install --dry-run
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install
 homebased --json daemon status        # {"socket": "up", "in_flight": 0, "home": "...", "web": "http://0.0.0.0:7677"}
-# without HOMEBASED_WEB_LISTEN, "web" is null and other machines cannot reach Fleet routes
+# a later install without the variable keeps this bind
 ```
 
-On Praveen's machines, always preserve `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` during install or reinstall. The `main:7677` dashboard depends on this LAN bind. Verify both `http://main:7677/` and `/v1/status` after installation.
+On Praveen's machines, the first install sets `HOMEBASED_WEB_LISTEN=0.0.0.0:7677`; the `main:7677` dashboard depends on this LAN bind. Never replace it with loopback. Verify both `http://main:7677/` and `/v1/status` after installation.
 
 The unit's `ExecStart` points at the binary that ran `install`, so run it as the installed `homebased`, not `target/debug/homebased`. Install is an idempotent apply. Run it from a shell where `codex`, `claude`, `grok`, `opencode`, and the project toolchains are on `PATH`: the installer bakes that `PATH` and the absolute agent paths (`HOMEBASED_CODEX`, `HOMEBASED_CLAUDE`, `HOMEBASED_GROK`, and `HOMEBASED_OPENCODE`) into the unit. Re-run it after `PATH` changes. An agent that is not on `PATH` at install time is silently left out of the unit; only the unit's `PATH` is left to find it later.
 
@@ -70,7 +70,7 @@ HOMEBASED_WEB_LISTEN=100.x.y.z:7677 homebased daemon install   # Tailscale bind
 HOMEBASED_WEB_LISTEN=0.0.0.0:7677 homebased daemon install   # bake a LAN bind into the host unit
 ```
 
-`daemon install` copies `HOMEBASED_WEB_LISTEN` from the installing shell into the unit, next to `PATH`, the agent paths, and an explicit `HOMEBASED_CONFIG` path. It rejects an invalid listener or config. If the listener is unset, the unit does not start an HTTP listener, so other machines cannot reach Fleet routes. Re-run `install` to change the listener.
+`daemon install` copies `HOMEBASED_WEB_LISTEN` from the installing shell into the unit, next to `PATH`, the agent paths, and an explicit `HOMEBASED_CONFIG` path. It rejects an invalid listener or config. When the shell does not set it, install keeps the listener the installed unit already has, so a reinstall does not turn the dashboard off. With neither, the unit starts no HTTP listener and other machines cannot reach Fleet routes. Re-run `install` with the variable to change the listener, or with `HOMEBASED_WEB_LISTEN=off` to turn it off.
 
 There is no application login or access token. Network reachability is the access boundary: any peer that can reach the dashboard can read task data and every regular file available to the daemon user through the device-wide file browser. A second content-origin port serves raw files (text, raster images, and fully active HTML inline; other types download). The dashboard and content origins do not grant CORS access to each other. Accepted `Host` values are `localhost`, single-label LAN names, mDNS names (`*.local`), numeric local and Tailscale addresses, the configured bind address, and Tailscale MagicDNS names (`*.ts.net`). Unexpected hosts are rejected.
 

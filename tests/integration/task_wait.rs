@@ -304,3 +304,56 @@ fn an_unconfirmed_event_goes_to_the_waiter_that_connected_next() {
     assert_eq!(h.normally_delivered(&task), Vec::<String>::new());
     drop(silent);
 }
+
+#[test]
+fn task_run_from_a_session_reports_to_it_and_its_waiter_gets_the_event() {
+    let h = Harness::new();
+    let gate = h.record.join("run");
+    let script = format!("while [ ! -f '{}' ]; do sleep 0.1; done", gate.display());
+    let out = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["--quiet", "task", "run", "--", "/bin/sh", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+    let shown = h.show(&task);
+    assert_eq!(shown["thread"], THREAD, "{shown}");
+    let name = shown["name"].as_str().unwrap();
+    assert!(name.starts_with("/bin/sh -c while [ ! -f"), "{name}");
+    assert!(name.chars().count() <= 60, "{name}");
+
+    let waiter = h.spawn_wait(THREAD, &[&task]);
+    h.release_gate("run");
+    let (code, lines) = waiter.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["event"], "TASK_SUCCEEDED");
+}
+
+#[test]
+fn waiter_names_a_task_submitted_without_a_thread() {
+    let h = Harness::new();
+    let mut spec = h.gated_target("detached", 0);
+    spec.as_object_mut().unwrap().remove("thread");
+    let task = h.submit(&spec);
+
+    let out = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["--json", "task", "wait", &task])
+        .output()
+        .unwrap();
+
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "wait_unavailable", "{error}");
+    assert_eq!(error["error"]["input"]["reason"], "detached", "{error}");
+    h.release_gate("detached");
+}

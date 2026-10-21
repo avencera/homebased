@@ -7,6 +7,7 @@ pub mod systemd;
 
 use std::path::{Path, PathBuf};
 
+use crate::daemon::web::WebListen;
 use crate::error::AppError;
 use crate::home::Home;
 
@@ -145,14 +146,24 @@ pub fn agent_paths() -> Vec<(&'static str, PathBuf)> {
     out
 }
 
-/// Dashboard bind baked into the unit, when the installing shell sets
-/// `HOMEBASED_WEB_LISTEN`. Unset leaves the dashboard off. Validated here so a
-/// typo fails `install`, not the unit at boot.
-pub fn web_listen_env() -> Result<Option<(&'static str, String)>, AppError> {
-    let Ok(raw) = std::env::var(WEB_LISTEN_ENV) else {
-        return Ok(None);
+/// Dashboard bind baked into the unit: `HOMEBASED_WEB_LISTEN` from the
+/// installing shell, else `installed`, the bind the current unit already has
+///
+/// Falling back to the installed bind keeps the dashboard on across a reinstall
+/// from a shell without the variable; `off` turns it off for good. Validated
+/// here so a typo fails `install`, not the unit at boot
+pub fn web_listen_env(
+    installed: Option<String>,
+) -> Result<Option<(&'static str, String)>, AppError> {
+    let raw = match std::env::var(WEB_LISTEN_ENV) {
+        Ok(raw) => raw,
+        // a hand-edited bind that no longer parses is dropped instead of failing the reinstall
+        Err(_) => match installed.filter(|value| value.parse::<WebListen>().is_ok()) {
+            Some(value) => value,
+            None => return Ok(None),
+        },
     };
-    let listen: crate::daemon::web::WebListen = raw.parse()?;
+    let listen: WebListen = raw.parse()?;
     Ok(Some((WEB_LISTEN_ENV, listen.to_string())))
 }
 

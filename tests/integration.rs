@@ -101,6 +101,10 @@ impl Harness {
             .env("HOME", &self.user_home)
             .env_remove("CODEX_HOME")
             .env_remove("HOMEBASED_TASK_ID")
+            // submit fills an omitted thread from these, so the developer's own session must not leak in
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .env("HARNESS_SUPERVISOR_LOG", &self.supervisor_log)
             .current_dir(std::env::temp_dir());
         if let Some(child) = &self.daemon {

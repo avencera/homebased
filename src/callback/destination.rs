@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::domain::{TaskId, ThreadId};
+use crate::domain::{TaskId, ThreadId, session_thread};
 use crate::error::AppError;
 use crate::home::Home;
 use crate::store::Store;
@@ -74,6 +74,8 @@ pub(crate) struct ParentTask {
     pub(crate) task: TaskId,
     /// Thread that receives the worker task's events
     pub(crate) thread: ThreadId,
+    /// This machine is the task's origin, so its thread can receive events here
+    pub(crate) origin_here: bool,
 }
 
 /// Session stores and worker context of the user who submits a spec
@@ -87,6 +89,8 @@ pub(crate) struct SubmitOrigin {
     tasks_dir: PathBuf,
     /// Parent task when the submitter is itself a Homebased worker
     parent: Option<ParentTask>,
+    /// `HOMEBASED_TASK_ID` is set, even when its task row is not on this machine
+    worker: bool,
 }
 
 impl SubmitOrigin {
@@ -103,19 +107,41 @@ impl SubmitOrigin {
         let codex_home = std::env::var_os("CODEX_HOME")
             .filter(|path| !path.is_empty())
             .map_or_else(|| user_home.join(".codex"), PathBuf::from);
-        let parent = parent_task(home, std::env::var_os(TASK_ID_ENV))?;
+        let task_env = std::env::var_os(TASK_ID_ENV).filter(|value| !value.is_empty());
+        let worker = task_env.is_some();
+        let parent = parent_task(home, task_env)?;
 
         Ok(Self {
             claude_dir: user_home.join(".claude"),
             codex_sessions: codex_home.join("sessions"),
             tasks_dir: home.tasks_dir(),
             parent,
+            worker,
         })
+    }
+
+    /// Thread for a spec that leaves `thread` out
+    ///
+    /// A worker reports to its parent task's thread. Its own session variables
+    /// name the worker session, which ends with the run, so a worker gets no
+    /// default when the parent has no thread or its thread lives on the origin
+    /// of a remote task. Anyone else gets the calling session from
+    /// [`session_thread`]; a plain terminal gets none
+    pub(crate) fn default_thread(&self) -> Result<Option<ThreadId>, AppError> {
+        if self.worker {
+            return Ok(self
+                .parent
+                .filter(|parent| parent.origin_here && !parent.thread.is_detached())
+                .map(|parent| parent.thread));
+        }
+        session_thread()
     }
 
     /// Check that `thread` can receive events from this machine
     ///
-    /// A worker must use its parent task's thread unless `allow_other_thread`
+    /// A worker must use its parent task's thread unless `allow_other_thread`.
+    /// On a remote task's executor that thread cannot receive events here, so
+    /// a worker there may submit without a thread instead
     pub(crate) fn check(
         &self,
         thread: ThreadId,
@@ -124,6 +150,7 @@ impl SubmitOrigin {
         if let Some(parent) = self.parent
             && parent.thread != thread
             && !allow_other_thread
+            && !(thread.is_detached() && !parent.origin_here)
         {
             return Err(AppError::ThreadMismatch {
                 thread,
@@ -223,9 +250,20 @@ fn parent_task(home: &Home, task_env: Option<OsString>) -> Result<Option<ParentT
     }
 
     let store = Store::open(&home.db_path())?;
-    Ok(store.get_task(task)?.map(|row| ParentTask {
+    let Some(row) = store.get_task(task)? else {
+        return Ok(None);
+    };
+    // an executor stores a remote task without the origin's route
+    let origin_here = store
+        .origin_route_by_task(task)
+        .map_err(|error| AppError::Internal {
+            message: format!("read the route of parent task {task}: {error}"),
+        })?
+        .is_some();
+    Ok(Some(ParentTask {
         task,
         thread: row.thread,
+        origin_here,
     }))
 }
 
@@ -392,6 +430,7 @@ mod tests {
             claude_dir: root.join(".claude"),
             codex_sessions: root.join(".codex/sessions"),
             tasks_dir: root.join("state/tasks"),
+            worker: parent.is_some(),
             parent,
         };
         (dir, origin)
@@ -480,6 +519,7 @@ mod tests {
     #[test]
     fn worker_must_use_its_parent_thread_unless_allowed() {
         let parent = ParentTask {
+            origin_here: true,
             task: TaskId(Uuid::now_v7()),
             thread: thread(CLAUDE),
         };
@@ -501,8 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn worker_on_a_remote_executor_defaults_to_no_thread() {
+        let parent = ParentTask {
+            origin_here: false,
+            task: TaskId(Uuid::now_v7()),
+            thread: thread(CLAUDE),
+        };
+        let (_dir, origin) = origin(Some(parent));
+
+        assert_eq!(origin.default_thread().unwrap(), None);
+        assert_eq!(
+            origin.check(ThreadId::DETACHED, false).unwrap(),
+            ThreadDestination::Detached
+        );
+        assert_eq!(
+            origin.check(thread(CODEX), false).unwrap_err().code(),
+            "thread_mismatch"
+        );
+    }
+
+    #[test]
     fn allowed_other_thread_must_still_exist() {
         let parent = ParentTask {
+            origin_here: true,
             task: TaskId(Uuid::now_v7()),
             thread: thread(CLAUDE),
         };
@@ -522,6 +583,7 @@ mod tests {
     fn worker_parent_thread_from_another_machine_is_unknown_here() {
         let remote = Uuid::parse_str("7c1e3a52-9f4d-4b6e-8a21-5d0f93c6b7e4").unwrap();
         let parent = ParentTask {
+            origin_here: true,
             task: TaskId(Uuid::now_v7()),
             thread: ThreadId(remote),
         };

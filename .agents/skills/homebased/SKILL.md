@@ -5,33 +5,26 @@ description: Run long, unattended agent CLIs and general task commands through t
 
 # Homebased
 
-`homebased` (invoke as `$homebased` or `$hbd`) is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages to the submitting Codex thread or Claude Code session. A task is either an `agent` workload (Codex, Claude, Grok, or OpenCode with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, send a check reminder when output stays idle for the timeout, cancel only on explicit request, and deliver events. The orchestrator submits a JSON spec, ends its turn, and acts when events arrive.
+`homebased` (invoke as `$homebased` or `$hbd`) is a user daemon that runs one detached child per supervised task and sends `HOMEBASED_EVENT` messages to the submitting Codex thread or Claude Code session. A task is either an `agent` workload (Codex, Claude, Grok, or OpenCode with a prompt and reporting trailer) or a `task` workload (arbitrary argv such as `cargo build --release` or `gh pr checks --watch`). The daemon owns the lifecycle end to end: queue, run, stream combined output to `output.log`, send a check reminder when output stays idle for the timeout, cancel only on explicit request, and deliver events. The orchestrator submits a task, ends its turn, and acts when events arrive.
 
 ## Rules that hold everywhere
 
 - Never run `codex queue` yourself, never write to a Claude Code messaging socket yourself, and never tell a worker to do either. Delivery belongs to `homebased`.
-- A Claude Code session is a root agent like a Codex thread. Its thread id is `$CLAUDE_CODE_SESSION_ID`. The daemon sends events for that id to the live session through its messaging socket, and sends events for any other id through `codex queue`.
+- Leave `thread` out. Submit fills it in: a worker's parent task thread, otherwise the calling Codex thread or Claude Code session (`CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`). A plain terminal submits a task whose events reach no session.
+- Run a command with `homebased task run --name "<goal>" -- <program> <args...>`. Write a JSON spec and `homebased task submit --spec <file|->` only for an `agent` or `container` workload, or for fields `task run` lacks.
 - Inside a T3 Code thread (the `t3-code` MCP tools are present), read [t3.md](references/t3.md) before submitting: T3 delivery, `delegate_task`, and `task wait`.
-- Submit through the daemon on the machine that owns the Codex thread. To run the child elsewhere, enable Fleet and set `machine` in the JSON spec. The submitting machine remains the origin and sends callbacks to the original thread; the selected Fleet machine executes the child. For a machine that is often asleep, set `wait_for_machine` so the origin holds the task until it answers; see [submit.md](references/submit.md#wait-for-an-offline-machine).
-- Send all GPU work through the resource queue. Read [resource-queue.md](references/resource-queue.md) for priority, checkpoints, job events, and cleanup.
-- Put task fields in the JSON spec and submit with `homebased task submit --spec <file|->`. Use `--request-id <uuid>` when a caller needs a stable retry identity.
-- Always set `name` to a short goal label. Do not name the task after the agent or the CLI.
-- Always pass `--json` on data commands and parse the result. Every JSON object carries `api_version: 1`.
+- Submit on the machine that owns the thread. To run the child elsewhere, pass `--machine` (or set `machine` in the spec); add `--wait-for-machine` for a machine that is often asleep. See [submit.md](references/submit.md#wait-for-an-offline-machine).
+- Send all GPU work through the resource queue. Read [resource-queue.md](references/resource-queue.md).
+- Set `name` to a short goal label, not the agent or the CLI.
+- Pass `--json` on data commands and parse the result.
 - Event delivery is at-least-once. Deduplicate by `(task, seq)`.
-- Use `homebased message send` for a direct message to a Claude Code session or Codex thread. Address a session by its id or by a task whose origin it is, never by its display name, which changes each time the session restarts. Read [messages.md](references/messages.md) for destination, source, and retry rules.
-- Use `homebased t3 launch --machine <name>` to start a new top-level T3 Code thread on another Fleet machine, such as `code`. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
-- `message send --task` targets the task's origin thread, not its worker. Use `message send --worker <task>` to give a running Claude worker new instructions; it reads them at its next turn boundary. Use `homebased task followup` to resume a terminal Codex worker, or a Claude worker submitted with `persist_session: true`, with new information. Run follow-up on the task's origin or execution machine. Only one follow-up can resume a thread at a time; wait for the active task's event after `resume_thread_busy`.
-- Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events. Inspect on demand only.
-- To start work only after other tasks succeed, submit it now with `after` in the spec. The daemon holds it, starts it when every dependency succeeds, and cancels it if one ends any other way. Do not wait for the events to submit the next phase.
-- An agent worker with a long command submits it as its own task, reports `waiting`, and exits; the daemon continues the work in a new run once those tasks end. On `TASK_WAITING`, do nothing, and leave the waited tasks' events to the continuation.
+- Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events.
+- To start work only after other tasks succeed, submit it now with `--after <id>` (or `after` in the spec). Do not wait for their events to submit the next phase.
+- An agent worker with a long command submits it as its own task, reports `waiting`, and exits. On `TASK_WAITING`, do nothing.
+- Prefer a `task` workload for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
+- Use `homebased message send` for a direct message to a session, `message send --worker <task>` to steer a running Claude worker, and `task followup` to resume a finished one. Read [messages.md](references/messages.md).
+- Use `homebased t3 launch --machine <name>` to start a top-level T3 Code thread on another Fleet machine. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
 - Use `homebased daemon stop` or `homebased daemon restart`, never raw `systemctl` or `launchctl`, so in-flight tasks are protected.
-- On Praveen's machines, every daemon install or reinstall must set `HOMEBASED_WEB_LISTEN=0.0.0.0:7677`. The dashboard is off unless this is set. Do not omit it, and do not replace the LAN bind with loopback.
-- Task ids are full UUIDs. Prefix matching does not exist.
-- Prefer `workload.type: "task"` for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
-- Set `timeout` to match the work (default 1h, min 30m). Quiet `output.log` for that long sends `TASK_CHECK_DUE`; it never kills the child.
-- Claude streams JSON output by default. Set `--output-format` in `extra_args` only when the task needs another format.
-- Claude workloads with model `haiku` or a `claude-haiku-*` model ID use `--autocompact 100k` by default. Set `--autocompact` in `extra_args` to use another window.
-- OpenCode runs in standalone mode with JSON output and receives the prompt on stdin. Its `model` may be a provider-qualified value such as `provider/model#variant`; its child-only full work permissions do not change persistent OpenCode configuration.
 
 ## Route
 
@@ -42,7 +35,7 @@ Pick the first row that matches, then read only that file.
 | `HOMEBASED_TASK_ID` is set in this session's environment | [worker.md](references/worker.md). You are the worker, not the orchestrator. |
 | A message starting with `HOMEBASED_EVENT ` arrived | [events.md](references/events.md) |
 | GPU work, resource queues, job specs, priority, preemption, or Attention | [resource-queue.md](references/resource-queue.md) |
-| Starting background work, following up a finished task, chaining work with `after`, writing a spec, choosing agent or task, timeout, or finding the thread id | [submit.md](references/submit.md) |
+| Writing a spec for an agent or container, following up a finished task, chaining work with `after`, or retrying a lost submit | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks, or finding the tokens workers spent | [inspect.md](references/inspect.md) |
 | Inside a T3 Code thread (the `t3-code` MCP tools are present) | [t3.md](references/t3.md) |
 | Starting a T3 Code thread on another machine | [t3.md](references/t3.md#launching-a-thread-on-another-machine) |
@@ -54,9 +47,10 @@ Pick the first row that matches, then read only that file.
 ## Minimal flow
 
 ```bash
-homebased --json daemon status                         # socket must be "up"
-homebased --json task submit --spec "$spec" --dry-run # validate; a remote spec checks its executor
-homebased --json task submit --spec "$spec"           # returns task and request UUIDs
+homebased task run --name "release build" --timeout 2h -- cargo build --release
+homebased task run --name "CI for #123" -- gh pr checks 123 --watch --interval 30
+homebased --json task submit --spec spec.json --dry-run   # agent or container: validate first
+homebased --json task submit --spec spec.json
 ```
 
-Then end the turn. Events arrive later as one line: `HOMEBASED_EVENT {...}`.
+Each prints the task id. Then end the turn. Events arrive later as one line: `HOMEBASED_EVENT {...}`.

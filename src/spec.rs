@@ -74,17 +74,11 @@ fn coalesce_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
 
 /// Rules between top-level fields, which the derived per-field schema cannot state
 ///
-/// Each mirrors a check in `validate_spec`, so the schema and the parser agree
+/// Each mirrors a check in `validate_spec`, so the schema and the parser agree.
+/// The schema describes the spec file, before submit fills in an omitted
+/// `thread`, so it states no rule that needs one
 fn cross_field_rules() -> Value {
     json!([
-        {
-            "if": { "properties": { "workload": { "properties": { "type": { "const": "agent" } } } } },
-            "then": { "required": ["thread"] }
-        },
-        {
-            "if": { "properties": { "hold": { "const": true } }, "required": ["hold"] },
-            "then": { "required": ["thread"] }
-        },
         {
             "if": { "properties": { "wait_for_machine": { "const": true } }, "required": ["wait_for_machine"] },
             "then": { "required": ["machine"] }
@@ -152,8 +146,9 @@ struct SubmitSpecWire {
     #[schemars(schema_with = "api_version_schema")]
     api_version: u32,
     /// Codex thread or Claude Code session that receives `HOMEBASED_EVENT`.
-    /// A `task` or `container` workload without `hold` may omit it: its events
-    /// are recorded and shown, but reach no session
+    /// Omit it: submit fills in the calling session, or a worker's parent task
+    /// thread. `null` submits a `task` or `container` without one, whose events
+    /// are recorded and shown but reach no session
     #[serde(default)]
     thread: Option<ThreadId>,
     /// Human-readable name. Non-unique
@@ -465,8 +460,8 @@ pub struct NormalizedSpec {
     pub workload: NormalizedWorkload,
 }
 
-/// Parse a spec from a file path or `-` for stdin
-pub fn load_spec(path: &str) -> Result<SubmitSpec, AppError> {
+/// Read a spec from a file path, or stdin for `-`, as JSON
+pub fn read_spec_value(path: &str) -> Result<Value, AppError> {
     let bytes = if path == "-" {
         let mut buf = Vec::new();
         io::stdin()
@@ -480,20 +475,35 @@ pub fn load_spec(path: &str) -> Result<SubmitSpec, AppError> {
             message: format!("failed to read spec {path}: {err}"),
         })?
     };
-    parse_spec_bytes(&bytes)
+    decode_spec_json(&bytes)
+}
+
+/// Set `thread` on a spec that leaves it out
+///
+/// The submitting CLI fills in the calling session, so agents do not have to
+/// look up their own thread id. An explicit `null` still means no thread
+pub fn fill_missing_thread(spec: &mut Value, thread: ThreadId) {
+    if let Some(object) = spec.as_object_mut()
+        && !object.contains_key("thread")
+    {
+        object.insert("thread".into(), json!(thread));
+    }
+}
+
+fn decode_spec_json(bytes: &[u8]) -> Result<Value, AppError> {
+    serde_json::from_slice(bytes).map_err(|err| AppError::InvalidSpec {
+        pointer: String::new(),
+        value: Value::Null,
+        message: format!("invalid JSON: {err}"),
+    })
 }
 
 /// Parse spec bytes, attaching a JSON pointer on failure
 pub fn parse_spec_bytes(bytes: &[u8]) -> Result<SubmitSpec, AppError> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|err| AppError::InvalidSpec {
-        pointer: String::new(),
-        value: Value::Null,
-        message: format!("invalid JSON: {err}"),
-    })?;
-    parse_spec_value(&value)
+    parse_spec_value(&decode_spec_json(bytes)?)
 }
 
-/// Parse an already-decoded JSON value
+/// Parse a decoded spec, attaching a JSON pointer on failure
 pub fn parse_spec_value(value: &Value) -> Result<SubmitSpec, AppError> {
     let wire: SubmitSpecWire =
         serde_path_to_error::deserialize(value).map_err(|err| invalid_spec_from_de(value, &err))?;

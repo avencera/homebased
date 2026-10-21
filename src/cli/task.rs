@@ -14,13 +14,12 @@ use crate::daemon::api::views::TaskFollowupSource;
 use crate::daemon::fleet_api::MachinesBody;
 use crate::dependency::TaskDependencies;
 use crate::domain::{
-    ProcessStatus, ReportKind, ReportOutcome, TASK_NAME_MAX_CHARS, THREAD_ENV_VARS, TaskId,
-    TaskStatus, ThreadId,
+    ProcessStatus, ReportKind, ReportOutcome, TASK_NAME_MAX_CHARS, TaskId, TaskStatus, ThreadId,
 };
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
-use crate::spec::{self, load_spec};
+use crate::spec;
 use crate::store::Store;
 use crate::submission::RequestId;
 use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
@@ -53,6 +52,49 @@ pub enum TaskCommand {
         /// Keep a T3 Code Codex thread in T3's Working shelf while the task, or the chain of runs it parks, is pending. Ignored for any other thread
         #[arg(long)]
         hold: bool,
+    },
+    /// Run a command as a `task` workload, without writing a spec.
+    ///
+    /// Runs in the current directory and reports to the calling Codex thread or
+    /// Claude Code session, or to the parent task's thread inside a worker.
+    /// Write a spec for an agent or container workload.
+    #[command(
+        after_help = "Example:\n  homebased task run --name \"release build\" -- cargo build --release"
+    )]
+    Run {
+        /// Short goal label for the dashboard and events. Defaults to the command line
+        #[arg(long)]
+        name: Option<String>,
+        /// Working directory. Defaults to the current one; with `--machine`, a path under home is sent as `~/...`
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Output-inactivity check, such as `2h`. Default 1h, minimum 30m
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Fleet machine that runs the command. Omit to run here
+        #[arg(long)]
+        machine: Option<String>,
+        /// Task that must succeed first. Repeat for each one
+        #[arg(long = "after", value_name = "TASK_ID")]
+        after: Vec<TaskId>,
+        /// Hold the task while `--machine` is unreachable instead of failing
+        #[arg(long, requires = "machine")]
+        wait_for_machine: bool,
+        /// Keep a T3 Code Codex thread in T3's Working shelf while the task is pending. Ignored for any other thread
+        #[arg(long)]
+        hold: bool,
+        /// Validate and print argv; spawn nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stable UUID for retry after a lost submission response
+        #[arg(long)]
+        request_id: Option<uuid::Uuid>,
+        /// Let a Homebased worker send events to a thread other than its parent task's thread
+        #[arg(long)]
+        allow_other_thread: bool,
+        /// Program and arguments, after `--`. No shell: use `-- sh -lc '...'` for shell syntax
+        #[arg(required = true, num_args = 1.., last = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Resume a finished Codex worker, or a Claude worker that saved its session.
     Followup {
@@ -184,7 +226,34 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             request_id,
             allow_other_thread,
             hold,
-        } => submit(ctx, &spec, dry_run, request_id, allow_other_thread, hold).await,
+        } => {
+            let value = spec::read_spec_value(&spec)?;
+            submit_value(ctx, value, hold, dry_run, request_id, allow_other_thread).await
+        }
+        TaskCommand::Run {
+            name,
+            cwd,
+            timeout,
+            machine,
+            after,
+            wait_for_machine,
+            hold,
+            dry_run,
+            request_id,
+            allow_other_thread,
+            command,
+        } => {
+            let value = run_spec(RunOptions {
+                name,
+                cwd,
+                timeout,
+                machine,
+                after,
+                wait_for_machine,
+                command,
+            })?;
+            submit_value(ctx, value, hold, dry_run, request_id, allow_other_thread).await
+        }
         TaskCommand::Followup {
             task,
             message,
@@ -238,15 +307,20 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
     }
 }
 
-async fn submit(
+/// Submit a decoded spec, filling in the calling session's thread when it has none
+async fn submit_value(
     ctx: &Ctx,
-    spec_path: &str,
+    mut value: Value,
+    hold: bool,
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
     allow_other_thread: bool,
-    hold: bool,
 ) -> Result<ExitCode, AppError> {
-    let spec = load_spec(spec_path)?;
+    let origin = SubmitOrigin::capture(&ctx.home)?;
+    if let Some(thread) = origin.default_thread()? {
+        spec::fill_missing_thread(&mut value, thread);
+    }
+    let spec = spec::parse_spec_value(&value)?;
     let normalized = spec::normalize(&spec)?;
     let submission = Submission {
         spec: normalized,
@@ -254,7 +328,96 @@ async fn submit(
         hold: hold || spec.hold,
         machine_wait: spec.machine_wait,
     };
-    submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
+    submit_normalized(
+        ctx,
+        &origin,
+        submission,
+        dry_run,
+        request_id,
+        allow_other_thread,
+    )
+    .await
+}
+
+/// `task run` flags that shape the spec
+struct RunOptions {
+    name: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    timeout: Option<String>,
+    machine: Option<String>,
+    after: Vec<TaskId>,
+    wait_for_machine: bool,
+    command: Vec<String>,
+}
+
+/// The submit spec `task run` stands for, validated by the same parser as a spec file
+fn run_spec(options: RunOptions) -> Result<Value, AppError> {
+    let RunOptions {
+        name,
+        cwd,
+        timeout,
+        machine,
+        after,
+        wait_for_machine,
+        command,
+    } = options;
+    let cwd = match cwd {
+        Some(cwd) => expand_home(cwd),
+        None => std::env::current_dir()?,
+    };
+    let cwd = std::path::absolute(cwd)?;
+    // the executor expands `~/` under its own home, which an absolute path from here would miss
+    let cwd = if machine.is_some() {
+        json!(super::t3::home_relative(cwd.to_string_lossy().into_owned()))
+    } else {
+        json!(cwd)
+    };
+    let mut spec = json!({
+        "api_version": crate::domain::API_VERSION,
+        "name": name.unwrap_or_else(|| command_name(&command)),
+        "cwd": cwd,
+        "workload": { "type": "task", "command": command },
+    });
+    if let Some(timeout) = timeout {
+        spec["timeout"] = json!(timeout);
+    }
+    if let Some(machine) = machine {
+        spec["machine"] = json!(machine);
+    }
+    if !after.is_empty() {
+        spec["after"] = json!(after);
+    }
+    if wait_for_machine {
+        spec["wait_for_machine"] = json!(true);
+    }
+    Ok(spec)
+}
+
+/// A quoted `~/path` under this machine's home, as the shell would have expanded it
+fn expand_home(path: std::path::PathBuf) -> std::path::PathBuf {
+    match (path.strip_prefix("~"), std::env::home_dir()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path,
+    }
+}
+
+/// Default `task run` name: the command line on one line, cut to a label
+fn command_name(command: &[String]) -> String {
+    const LABEL_CHARS: usize = 60;
+
+    let line = command
+        .iter()
+        .flat_map(|arg| arg.split(|c: char| c.is_whitespace() || c.is_control()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.chars().count() <= LABEL_CHARS {
+        return line;
+    }
+
+    let mut label: String = line.chars().take(LABEL_CHARS - 1).collect();
+    label.push('…');
+    label
 }
 
 /// One submit request: the normalized spec and the origin-only fields beside it
@@ -267,6 +430,7 @@ struct Submission {
 
 async fn submit_normalized(
     ctx: &Ctx,
+    origin: &SubmitOrigin,
     submission: Submission,
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
@@ -288,7 +452,7 @@ async fn submit_normalized(
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
     }
-    SubmitOrigin::capture(&ctx.home)?.check(normalized.thread, allow_other_thread)?;
+    origin.check(normalized.thread, allow_other_thread)?;
     let env = crate::domain::TaskEnv::capture();
     let callback_cwd = std::env::current_dir()?;
     let remote = normalized.machine.is_some();
@@ -394,7 +558,9 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         .and_then(|value| value.parse::<ThreadId>().ok())
         .ok_or_else(|| followup_unavailable(task, crate::error::FollowupBlocker::NoWorkerThread))?;
 
-    let thread = select_followup_thread(thread)?;
+    let origin = SubmitOrigin::capture(&ctx.home)?;
+    // inside a worker its own session variables name the worker, not the thread to report to
+    let thread = select_thread(thread, origin.default_thread()?)?;
     let name = name.unwrap_or_else(|| followup_name(detail.get("name")));
     let prompt = read_followup_message(message, message_file)?;
     let cwd = detail
@@ -446,29 +612,27 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         hold: false,
         machine_wait: None,
     };
-    submit_normalized(ctx, submission, dry_run, request_id, allow_other_thread).await
+    submit_normalized(
+        ctx,
+        &origin,
+        submission,
+        dry_run,
+        request_id,
+        allow_other_thread,
+    )
+    .await
 }
 
 fn followup_unavailable(task: TaskId, reason: crate::error::FollowupBlocker) -> AppError {
     AppError::FollowupUnavailable { task, reason }
 }
 
-fn select_followup_thread(explicit: Option<ThreadId>) -> Result<ThreadId, AppError> {
-    if let Some(thread) = explicit {
-        return Ok(thread);
-    }
-    for key in THREAD_ENV_VARS {
-        let Some(value) = std::env::var_os(key) else {
-            continue;
-        };
-        let value = value.to_str().ok_or_else(|| AppError::Usage {
-            message: format!("{key} must be a UUID"),
-        })?;
-        return value.parse().map_err(|error: AppError| AppError::Usage {
-            message: format!("{key} must be a thread UUID: {error}"),
-        });
-    }
-    Err(AppError::Usage {
+/// `explicit`, else `default`, which the caller picks for its context
+fn select_thread(
+    explicit: Option<ThreadId>,
+    default: Option<ThreadId>,
+) -> Result<ThreadId, AppError> {
+    explicit.or(default).ok_or_else(|| AppError::Usage {
         message:
             "pass --thread or set CODEX_THREAD_ID, CODEX_SESSION_ID, or CLAUDE_CODE_SESSION_ID"
                 .into(),

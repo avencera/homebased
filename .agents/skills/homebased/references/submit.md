@@ -2,26 +2,30 @@
 
 For GPU work, use [resource-queue.md](resource-queue.md) instead of `task submit`. Run task UUIDs from jobs cannot be used in `after`. Job dependencies are not supported.
 
-## 1. Find the thread id
+## 1. Thread and machine
 
-The spec needs the UUID of the Codex thread or Claude Code session that should receive the event. `homebased` accepts only a UUID, not a session name. Submit through the daemon on the machine that owns this thread. Set the spec's `machine` field to choose another Fleet machine to execute the child. Do not submit from the execution machine unless it also owns the thread.
+Leave `thread` out of the spec. `task submit`, `task run`, and `resource job submit` fill it in:
 
-In Claude Code, use `$CLAUDE_CODE_SESSION_ID`. A live session gets each event at once. When the session has no live process, a T3 Code thread that owns it gets the event as a new turn. Otherwise the event waits and is sent when a process for the session starts again; after 3 days it is marked failed and written to `callback-fallback.log`. To chain work without depending on this, submit the next phase now with `after`; see [Start after other tasks](#start-after-other-tasks).
+- In a worker (`HOMEBASED_TASK_ID` is set), the parent task's thread. A worker whose parent lives on another machine gets none.
+- Otherwise the calling Codex thread or Claude Code session, from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`.
+- In a plain terminal, none: a `task` or `container` then runs without a thread, and `task wait` cannot follow it. An `agent` or `hold` needs a thread.
 
-In Codex:
+Set `thread` only to send events to a different session, as a UUID copied from the user or the harness, or to `null` to submit a `task` or `container` without one. An unknown id fails with `unknown_thread`, which suggests a likely typo match; see [errors.md](errors.md).
 
-1. Use the thread id if the user or the harness already gave one.
-2. Otherwise take the newest session file whose `cwd` matches this workspace and read `session_id` from its first line:
+When the session has no live process, a T3 Code thread that owns it gets the event as a new turn. Otherwise the event waits until a process for the session starts again; after 3 days it is marked failed and written to `callback-fallback.log`. To chain work without depending on this, submit the next phase now with `after`; see [Start after other tasks](#start-after-other-tasks).
+
+Submit through the daemon on the machine that owns the thread. Set `machine` (or `task run --machine`) to execute the child on another Fleet machine.
+
+## Run a command
+
+For a `task` workload, skip the spec:
 
 ```bash
-for f in $(ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl | head -20); do
-  head -c 600 "$f" | grep -q "\"cwd\":\"$PWD\"" && { head -c 600 "$f" | grep -o '"session_id":"[^"]*"'; echo " $f"; break; }
-done
+homebased task run --name "release build" --timeout 2h -- cargo build --release
+homebased task run --name "eval on code" --machine code --cwd ~/code/project -- just eval
 ```
 
-Several sessions can share one cwd. Tell the user which id you chose. If you cannot find one, ask for it instead of guessing.
-
-Copy the id; do not retype it. Submit checks the id against the Claude Code session registry and transcripts and the Codex session files on this machine. An unknown id fails with `unknown_thread`, and the error suggests a known id that differs by a likely typo. A Homebased task id is not a thread id. See [errors.md](errors.md).
+It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--hold`, `--dry-run`, and `--request-id` work as for `task submit`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
 
 ## 2. Choose the workload
 
@@ -65,7 +69,6 @@ Agent example:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "implement file browser",
   "cwd": "/home/praveen/code/project",
   "timeout": "1h",
@@ -83,7 +86,6 @@ Task example:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "cargo release build",
   "cwd": "/home/praveen/code/project",
   "timeout": "2h",
@@ -99,7 +101,6 @@ Container example:
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "evaluate checkpoint 12",
   "cwd": "/home/praveen/code/project",
   "timeout": "2h",
@@ -131,7 +132,7 @@ GitHub CI watcher as a normal task:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `api_version` | yes | Always `1`. |
-| `thread` | yes, except below | Codex thread or Claude Code session UUID from step 1. It must exist on the submitting machine (`unknown_thread`). A `task` or `container` workload without `hold` may omit it, for work started from a plain terminal: its events are recorded and shown by `task show`, but no session gets them. The nil UUID is refused. |
+| `thread` | no | Filled in by submit; see [Thread and machine](#1-thread-and-machine). Set it only to send events to another session, or to `null` for no thread. The nil UUID is refused. |
 | `name` | yes | Short goal label for the dashboard and events. Name the work, not the agent or the CLI. Trimmed. Rejects blank names, line breaks, control characters, and names longer than 120 Unicode scalar values. Non-unique; task id remains the identity. |
 | `cwd` | yes | A host directory that already exists and is accessible on the machine that runs the task. For local tasks, a directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. For a `container`, `cwd` is still a host path, never a path inside the container: use a mount `source` or another host directory, and set `workdir` for the directory inside the container. A missing `cwd` fails the submit with `invalid_cwd`. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
@@ -153,6 +154,8 @@ Agent-only fields under `workload`:
 | `report_trailer` | no | Default `true`. Set `false` only when the worker must not be told to report. With the trailer, an agent that exits 0 without reporting ends `TASK_FAILED` with `reason: "no_report"`; without it, exit 0 alone is success. |
 | `resume_thread` | no | A non-null value is valid only for `codex` and `claude`. Null is treated as absent for any agent. Codex resumes this thread and gets the prompt on stdin; only one follow-up can resume a Codex thread at a time. Claude forks this saved session into the new task's session id, so the source transcript is unchanged and several follow-ups can branch from it. Use `task followup` for a terminal worker. |
 | `persist_session` | no | Claude-only, default `false`. `true` saves the worker's session under `~/.claude/projects` so `task followup` can resume it after it ends. It also lists the session in `claude --resume` for that `cwd`. Without it, the session is discarded at exit. |
+
+Claude streams JSON output by default; set `--output-format` in `extra_args` only when the task needs another format. Claude with model `haiku` or a `claude-haiku-*` id uses `--autocompact 100k` unless `extra_args` sets `--autocompact`. OpenCode runs standalone with JSON output, gets the prompt on stdin, and its child-only full permissions do not change persistent OpenCode configuration.
 
 Task-only fields under `workload`:
 
@@ -220,7 +223,6 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 ```json
 {
   "api_version": 1,
-  "thread": "01a0ab97-a7aa-7463-a5b0-8d500e40e431",
   "name": "phase b2: integrate",
   "cwd": "/home/praveen/code/project",
   "after": ["01a0b06f-306c-749e-aa9e-9e1a619ee915"],

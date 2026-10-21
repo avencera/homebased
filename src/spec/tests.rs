@@ -813,19 +813,28 @@ fn hold_is_off_unless_the_spec_asks_for_it() {
 }
 
 #[test]
-fn only_a_command_without_hold_may_omit_its_thread() {
+fn only_a_command_without_hold_parses_without_a_thread() {
     let mut task = valid_task();
     task.as_object_mut().unwrap().remove("thread");
     assert_verdict(&task, true, "a task without a thread");
     assert!(parse_spec_value(&task).unwrap().thread.is_detached());
 
+    // the schema describes the file, which may leave `thread` for submit to
+    // fill in; the parser sees the spec after that, so it still needs one
     let mut held = task.clone();
     held["hold"] = json!(true);
-    assert_verdict(&held, false, "a held task without a thread");
+    assert!(validator().is_valid(&held), "{held}");
+    assert!(parse_spec_value(&held).is_err());
 
     let mut agent = valid_agent();
     agent.as_object_mut().unwrap().remove("thread");
-    assert_verdict(&agent, false, "an agent without a thread");
+    assert!(validator().is_valid(&agent), "{agent}");
+    assert!(parse_spec_value(&agent).is_err());
+
+    let mut null = valid_task();
+    null["thread"] = Value::Null;
+    assert_verdict(&null, true, "a task with a null thread");
+    assert!(parse_spec_value(&null).unwrap().thread.is_detached());
 
     // the nil UUID is how a detached thread travels, so a spec cannot name it
     let mut nil = valid_task();

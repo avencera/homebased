@@ -13,7 +13,7 @@ use crate::error::AppError;
 use crate::task_wait::{WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitSet, WaiterId};
 use crate::waiting::{MAX_WAIT_TARGETS, WaitTargets, WaitTargetsError};
 
-use super::select_followup_thread;
+use super::select_thread;
 
 // a daemon update restarts the socket within seconds; a longer outage is a failure
 const RECONNECT_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -46,7 +46,7 @@ pub(super) async fn wait(
     thread: Option<ThreadId>,
 ) -> Result<ExitCode, AppError> {
     let targets = WaitTargets::new(tasks).map_err(usage_error)?;
-    let thread = select_followup_thread(thread)?;
+    let thread = select_thread(thread, crate::domain::session_thread()?)?;
     let client = Client::new(ctx.home.sock_path());
     let mut set = WaitSet::new(&targets);
     let mut outage: Option<Instant> = None;

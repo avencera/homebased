@@ -601,3 +601,57 @@ fn worker_submit_to_another_thread_needs_the_override_flag() {
         String::from_utf8_lossy(&same.stderr)
     );
 }
+
+#[test]
+fn worker_spec_without_a_thread_reports_to_the_parent_thread() {
+    let h = Harness::new();
+    let parent = h.submit(&h.gated_target("parent", 0));
+    let mut spec = Harness::task_spec(&["true"]);
+    spec.as_object_mut().unwrap().remove("thread");
+    let spec_path = h.home.join("worker-spec.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+
+    // the worker's own session id names a session that ends with the run
+    let out = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &parent)
+        .env(
+            "CLAUDE_CODE_SESSION_ID",
+            "01a0ab97-a7aa-7463-a5b0-8d500e40e499",
+        )
+        .args(["--quiet", "task", "submit", "--spec"])
+        .arg(&spec_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let child = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert_eq!(h.show(&child)["thread"], THREAD);
+    h.release_gate("parent");
+}
+
+#[test]
+fn worker_under_a_task_without_a_thread_submits_without_one() {
+    let h = Harness::new();
+    let mut spec = h.gated_target("threadless-parent", 0);
+    spec.as_object_mut().unwrap().remove("thread");
+    let parent = h.submit(&spec);
+
+    let out = h
+        .cmd()
+        .env("HOMEBASED_TASK_ID", &parent)
+        .args(["--quiet", "task", "run", "--", "true"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.release_gate("threadless-parent");
+}

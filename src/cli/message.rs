@@ -7,7 +7,7 @@ use clap::Subcommand;
 use uuid::Uuid;
 
 use crate::client::Client;
-use crate::domain::{API_VERSION, THREAD_ENV_VARS, TaskId, ThreadId};
+use crate::domain::{API_VERSION, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::message::{
@@ -213,16 +213,7 @@ fn source(
         return Ok(MessageSourceSelector::Task { task });
     }
 
-    for key in THREAD_ENV_VARS {
-        let Some(value) = std::env::var_os(key) else {
-            continue;
-        };
-        let value = value.to_str().ok_or_else(|| AppError::Usage {
-            message: format!("{key} must be a UUID"),
-        })?;
-        let thread = value.parse().map_err(|error: AppError| AppError::Usage {
-            message: format!("{key} must be a thread UUID: {error}"),
-        })?;
+    if let Some(thread) = crate::domain::session_thread()? {
         return Ok(MessageSourceSelector::Thread { thread });
     }
 
