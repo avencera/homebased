@@ -4,6 +4,17 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="text-scale" content="scale" />
+		<!-- added to a home screen it opens full screen under its own name and icon -->
+		<link rel="manifest" href="%sveltekit.assets%/manifest.webmanifest" />
+		<link rel="apple-touch-icon" href="%sveltekit.assets%/icon-180.png" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-title" content="Homebased" />
+		<!-- Safari's share sheet draws the touch icon small on a white tile unless the page has an
+		     og:image, which it fills its thumbnail with -->
+		<meta property="og:title" content="Homebased" />
+		<meta property="og:image" content="%sveltekit.assets%/icon-512.png" />
+		<meta property="og:image:width" content="512" />
+		<meta property="og:image:height" content="512" />
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

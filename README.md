@@ -131,6 +131,10 @@ Open `https://<machine>.<tailnet>.ts.net:7678/`. A page served over HTTPS
 loads previews from `https://<machine>.<tailnet>.ts.net:7680/`; a page served
 over plain HTTP keeps using `content_port` directly.
 
+**Add to Home Screen** on an iPhone gives the dashboard a checklist icon named
+"Homebased" that opens full screen, from `web/static/manifest.webmanifest` and
+the `web/static/icon-*.png` files beside it.
+
 `content_https_port` must differ from `content_port`. With
 `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` the daemon holds its ports on every
 interface, so the proxy cannot listen on the same port number on the
