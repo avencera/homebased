@@ -116,8 +116,38 @@ impl Drop for SystemSleepAssertion {
     }
 }
 
+/// Whether the host is fully awake rather than in a dark wake, or `None`
+/// when IOKit does not say
+///
+/// A full wake has graphics; a dark wake runs with CPU, network, and disk
+/// only. `IOPMConnectionGetSystemCapabilities` is exported by IOKit but left
+/// out of the public headers, so it is looked up at run time: a macOS that
+/// drops it then leaves this unknown instead of stopping the daemon from loading
+pub(super) fn fully_awake() -> Option<bool> {
+    // `kIOPMCapabilityVideo` in Apple's PowerManagement sources
+    const CAPABILITY_VIDEO: u32 = 0x2;
+    // SAFETY: the name is NUL-terminated, and RTLD_DEFAULT searches the
+    // images already loaded, which include IOKit
+    let symbol = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"IOPMConnectionGetSystemCapabilities".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: the symbol is IOKit's `IOPMCapabilityBits
+    // IOPMConnectionGetSystemCapabilities(void)`, a 32-bit mask
+    let capabilities =
+        unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> u32>(symbol)() };
+    Some(capabilities & CAPABILITY_VIDEO != 0)
+}
+
 /// Whether someone is using the host now, from the system-wide `UserIsActive`
 /// assertion that `pmset -g assertions` lists. `None` when IOKit does not say
+///
+/// The assertion can outlast the display, so a caller also checks [`fully_awake`]
 pub(super) fn user_is_active() -> Option<bool> {
     let key = CfString::new(USER_IS_ACTIVE)?;
     let mut status: *const c_void = std::ptr::null();
@@ -201,6 +231,8 @@ mod tests {
     #[test]
     fn user_activity_is_readable() {
         assert!(super::user_is_active().is_some());
+        // tests run on a host that is awake
+        assert_eq!(super::fully_awake(), Some(true));
     }
 
     #[test]

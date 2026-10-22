@@ -148,9 +148,13 @@ impl Presence {
     }
 }
 
+/// Someone is using the host and it is fully awake. A dark wake can still
+/// report a `UserIsActive` assertion raised before the lid closed, so the
+/// wake state decides when it is known
 #[cfg(target_os = "macos")]
 fn user_is_active() -> Option<bool> {
-    super::macos::user_is_active()
+    let active = super::macos::user_is_active()?;
+    Some(active && super::macos::fully_awake().unwrap_or(true))
 }
 
 #[cfg(not(target_os = "macos"))]
