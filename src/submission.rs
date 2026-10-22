@@ -219,6 +219,8 @@ pub struct DependentRoute {
     /// Which endings of `after` release it: success for a submitted `after`,
     /// any ending for a continuation
     pub rule: ReleaseRule,
+    /// Submitted with `wait_for_machine`, so its executor is asked before the send
+    pub waits_for_machine: bool,
 }
 
 /// Exact identity and origin-owned context used to create a held route

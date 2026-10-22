@@ -11,6 +11,9 @@ use tracing::warn;
 
 #[cfg(target_os = "macos")]
 mod macos;
+mod presence;
+
+pub use presence::{IN_USE_FOR, Presence, Readiness, WaitingTasks};
 
 /// Whether the daemon keeps the host awake while it runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]

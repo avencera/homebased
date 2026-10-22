@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::warn;
@@ -10,12 +11,14 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::{DryRunResponse, SubmitBody};
 use super::cluster::{
-    AbandonExecution, IdentityBody, PreviewBody, PreviewExecution, SubmitExecution,
+    AbandonExecution, IdentityBody, PreviewBody, PreviewExecution, READINESS_PATH, ReadinessBody,
+    ReadinessQuery, SubmitExecution,
 };
 use crate::domain::{API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
+use crate::fleet::probe::VerifiedDestination;
 use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
 use crate::invocation::resolve_agent_binary;
 use crate::machine::{MachineId, MachineName};
@@ -222,14 +225,25 @@ fn execution_wire(
 ///
 /// The route stays waiting until the executor is reachable, then becomes
 /// launching before the send. A lost reply leaves it launching, and the next
-/// attempt resends the same task UUID, which the executor accepts once
-pub(super) async fn release(state: &AppState, route: OriginRoute) -> Result<(), AppError> {
+/// attempt resends the same task UUID, which the executor accepts once.
+/// A route that waits for its machine is offered first, and keeps waiting
+/// while the executor declines it
+pub(super) async fn release(
+    state: &AppState,
+    route: OriginRoute,
+    waits_for_machine: bool,
+) -> Result<(), AppError> {
     let _request_guard = state.locks.origin_submissions.lock(route.request).await;
     let fleet = state
         .fleet
         .handle()
         .ok_or_else(|| unknown(&route, "fleet is disabled"))?;
     let destination = fleet.connect(route.execution_machine).await?;
+    // a launching route asks too: if its first send never arrived, the resend
+    // starts the task, and a task that did arrive only reports a little later
+    if waits_for_machine {
+        offer(&destination, &route).await?;
+    }
     let route = call(&state.store, |reply| StoreMsg::BeginHeldLaunch {
         id: route.task,
         reply,
@@ -260,6 +274,51 @@ pub(super) async fn release(state: &AppState, route: OriginRoute) -> Result<(), 
         Err(error) if is_definite_rejection(&error) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Ask the executor whether it takes a task that waited for it now
+///
+/// A decline, or no clear answer, keeps the route waiting as an unreachable
+/// machine would, and the release loop offers it again
+async fn offer(destination: &VerifiedDestination, route: &OriginRoute) -> Result<(), AppError> {
+    let declined = |message: String| AppError::MachineUnavailable {
+        machine: route.execution_machine,
+        message,
+    };
+    let query = ReadinessQuery {
+        api_version: API_VERSION,
+        protocol_version: destination.protocol.0,
+        destination_machine: route.execution_machine,
+        origin_machine: route.origin_machine,
+    };
+    let response = ClusterClient::default()
+        .post_json(&destination.address, READINESS_PATH, &query)
+        .await
+        .map_err(|error| declined(error.to_string()))?;
+    readiness_answer(&response).map_err(declined)
+}
+
+/// `Ok` when the executor takes the task, or why it does not
+///
+/// An executor from before readiness has no such route and takes the task, as it always did
+fn readiness_answer(response: &ClusterResponse) -> Result<(), String> {
+    let body: Value = serde_json::from_slice(&response.body)
+        .map_err(|error| format!("invalid readiness answer: {error}"))?;
+    if response.status == StatusCode::NOT_FOUND
+        && body.pointer("/error/code").and_then(Value::as_str) == Some("not_found")
+    {
+        return Ok(());
+    }
+    if !response.status.is_success() {
+        return Err(format!("readiness check returned HTTP {}", response.status));
+    }
+    let body: ReadinessBody = serde_json::from_value(body)
+        .map_err(|error| format!("invalid readiness answer: {error}"))?;
+    if body.ready {
+        return Ok(());
+    }
+    let reason = body.reason.as_deref().unwrap_or("no reason given");
+    Err(format!("not ready: {reason}"))
 }
 
 /// Whether recovery ended in the executor's saved refusal rather than a failure
@@ -579,7 +638,7 @@ fn local_dry_run(
 mod tests {
     use std::path::Path;
 
-    use super::{decode_identity, decode_preview};
+    use super::{decode_identity, decode_preview, readiness_answer};
     use crate::daemon::cluster::PreviewBody;
     use crate::domain::{API_VERSION, TaskEnv, TaskId};
     use crate::error::AppError;
@@ -681,5 +740,47 @@ mod tests {
             decode_preview(mismatched, selected),
             Err(AppError::RemoteSubmissionUnavailable { .. })
         ));
+    }
+
+    fn response(status: StatusCode, body: serde_json::Value) -> ClusterResponse {
+        ClusterResponse {
+            status,
+            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_waiting_task_is_sent_only_when_the_executor_takes_it() {
+        let answer = |ready: bool, reason: Option<&str>| {
+            response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "api_version": API_VERSION,
+                    "protocol_version": CLUSTER_PROTOCOL_VERSION.0,
+                    "ready": ready,
+                    "reason": reason,
+                }),
+            )
+        };
+        assert_eq!(readiness_answer(&answer(true, None)), Ok(()));
+        assert_eq!(
+            readiness_answer(&answer(false, Some("no one is using it"))),
+            Err("not ready: no one is using it".into())
+        );
+
+        // an executor from before readiness has no route for it and takes the task
+        let missing_route = serde_json::json!({
+            "api_version": API_VERSION,
+            "error": { "code": "not_found", "message": "no such route", "retryable": false, "input": {} }
+        });
+        assert_eq!(
+            readiness_answer(&response(StatusCode::NOT_FOUND, missing_route)),
+            Ok(())
+        );
+        let other_failure = serde_json::json!({
+            "api_version": API_VERSION,
+            "error": { "code": "machine_identity_mismatch", "message": "wrong machine", "retryable": false, "input": {} }
+        });
+        assert!(readiness_answer(&response(StatusCode::CONFLICT, other_failure)).is_err());
     }
 }

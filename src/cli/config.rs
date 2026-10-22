@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::config::{ConfigLocation, Fleet};
 use crate::error::AppError;
-use crate::power::SleepPolicy;
+use crate::power::{IN_USE_FOR, SleepPolicy, WaitingTasks};
 
 use super::{Ctx, OutputMode};
 
@@ -46,6 +46,7 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
             "machine_name_source": name_source,
             "fleet": config.fleet,
             "sleep": config.sleep,
+            "waiting_tasks": WaitingTasks::effective(config.waiting_tasks),
             "dashboard": config.dashboard,
         }))?,
         OutputMode::Quiet => println!("{}", location.path().display()),
@@ -65,6 +66,11 @@ fn validate(ctx: &Ctx) -> Result<ExitCode, AppError> {
                 SleepPolicy::Prevent => "blocked on AC power (power.keep_awake)",
             };
             println!("sleep: {sleep}");
+            let waiting = match WaitingTasks::effective(config.waiting_tasks) {
+                WaitingTasks::WhenInUse => format!("taken after {}s of use", IN_USE_FOR.as_secs()),
+                WaitingTasks::Always => "taken at once".into(),
+            };
+            println!("waiting tasks: {waiting}");
         }
     }
     Ok(ExitCode::SUCCESS)

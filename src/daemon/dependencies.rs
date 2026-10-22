@@ -12,10 +12,11 @@
 //! route waits on the worker's targets under [`ReleaseRule::Ended`], so it
 //! launches once every target ended, however each one ended
 //!
-//! It also sends a remote task submitted with `wait_for_machine` while its
-//! machine was unreachable. That route has no dependencies, so it is ready at
-//! once, and each launch attempt waits for the machine to answer. Its
-//! `coalesce` key cancels the older routes it replaces here too
+//! It also sends a remote task submitted with `wait_for_machine`. That route
+//! has no dependencies, so it is ready at once, and each launch attempt waits
+//! for the machine to answer and then to accept the offer: a laptop declines
+//! until someone uses it. Its `coalesce` key cancels the older routes it
+//! replaces here too
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -110,7 +111,7 @@ async fn hold_and_send(
     })
     .await?
     .ok_or(AppError::RouteNotFound { task })?;
-    match origin_submit::release(state, route).await {
+    match origin_submit::release(state, route, true).await {
         Ok(()) | Err(AppError::MachineUnavailable { .. }) => {}
         // the release loop retries it
         Err(error) => debug!(%task, "first send of a task that waits for its machine: {error}"),
@@ -372,21 +373,27 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
         let mut cancelled = false;
         // a sleeping machine costs a probe timeout per attempt, so one pass asks it once
         let mut unreachable = HashSet::new();
-        for DependentRoute { route, after, rule } in routes {
+        for DependentRoute {
+            route,
+            after,
+            rule,
+            waits_for_machine,
+        } in routes
+        {
             match &route.submission {
                 SubmissionState::Held {
                     phase: HeldPhase::Waiting,
                 } => {}
                 // the executor may hold the task, so only a resend can resolve it
                 _ => {
-                    retry_release(state, retries, &mut unreachable, route).await;
+                    retry_release(state, retries, &mut unreachable, route, waits_for_machine).await;
                     continue;
                 }
             }
             match decide(known_states(state, after.as_ref()).await?, rule) {
                 HeldDecision::Wait => {}
                 HeldDecision::Release => {
-                    retry_release(state, retries, &mut unreachable, route).await;
+                    retry_release(state, retries, &mut unreachable, route, waits_for_machine).await;
                 }
                 HeldDecision::Cancel(failure) => {
                     let _request_guard = state.locks.origin_submissions.lock(route.request).await;
@@ -403,12 +410,14 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
 
 /// Launch one ready route unless its last attempt failed too recently
 ///
-/// A route for a machine that did not answer earlier in this pass waits for the next pass
+/// A route for a machine that did not answer, or declined a waiting task,
+/// earlier in this pass waits for the next pass
 async fn retry_release(
     state: &AppState,
     retries: &mut HashMap<TaskId, Retry>,
     unreachable: &mut HashSet<MachineId>,
     route: OriginRoute,
+    waits_for_machine: bool,
 ) {
     let task = route.task;
     let machine = route.execution_machine;
@@ -418,7 +427,7 @@ async fn retry_release(
     let released = if route.origin_machine == machine {
         local_submit::release(state, route).await
     } else {
-        origin_submit::release(state, route).await
+        origin_submit::release(state, route, waits_for_machine).await
     };
     if matches!(released, Err(AppError::MachineUnavailable { .. })) {
         unreachable.insert(machine);

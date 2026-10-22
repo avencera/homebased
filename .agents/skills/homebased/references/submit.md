@@ -138,7 +138,7 @@ GitHub CI watcher as a normal task:
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
-| `wait_for_machine` | no | `true` holds a remote task on this daemon while `machine` is unreachable, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
+| `wait_for_machine` | no | `true` holds a remote task on this daemon until `machine` answers and takes it, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
 | `coalesce` | no | With `wait_for_machine`: a key of 1 to 64 ASCII letters, digits, `.`, `_`, `-`, or `:`. Once this task is accepted, older tasks with the same key and machine that still wait on this daemon are cancelled. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
@@ -240,7 +240,7 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 
 ### Wait for an offline machine
 
-Set `wait_for_machine: true` with `machine` for a machine that is often asleep, such as a laptop. While it does not answer, the submit returns `"status": "held"` and this daemon keeps the task. The daemon sends it once the machine answers, usually within a minute of it waking. When the machine is up, the task starts at once, as without the field.
+Set `wait_for_machine: true` with `machine` for a machine that is often asleep, such as a laptop. Before each send, this daemon asks the machine whether it takes the task now. The submit returns `"status": "queued"` when it does, and `"held"` otherwise; this daemon keeps a held task, asks again each time the machine answers, and sends it once the machine says yes. A Mac with a battery says yes only after someone has used it for two minutes without a break, so a dark wake never starts the task; a Mac without a battery, or Linux, says yes at once. `power.waiting_tasks` (`"always"` or `"when_in_use"`) in the executor's config overrides that.
 
 Add `coalesce` when only the newest request matters, such as an update. Once a submit with a key is accepted, every older task with the same key and machine that still waits here is cancelled with `cancel_reason` `{"type":"superseded","by":"<newer task>"}`. A task whose launch already began is left alone.
 

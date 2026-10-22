@@ -307,7 +307,7 @@ impl Store {
     /// Routes that may be held: those with dependencies, and those that wait for their machine
     fn dependent_routes(&self, filter: &str) -> Result<Vec<DependentRoute>, AppError> {
         let sql = format!(
-            "SELECT task_id,route_json,after_json,after_rule FROM origin_routes
+            "SELECT task_id,route_json,after_json,after_rule,wait_for_machine FROM origin_routes
              WHERE (after_json IS NOT NULL OR wait_for_machine = 1)
                AND json_valid(route_json) AND {filter}
              ORDER BY task_id"
@@ -320,11 +320,12 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(task, route_json, after_json, rule)| {
+            .map(|(task, route_json, after_json, rule, waits_for_machine)| {
                 let route = decode_route(&route_json)?;
                 if route.task.to_string() != task {
                     return Err(AppError::ClusterTaskConflict { task: route.task });
@@ -333,7 +334,12 @@ impl Store {
                 let rule = ReleaseRule::from_storage(&rule).ok_or_else(|| AppError::Internal {
                     message: format!("unknown release rule {rule} for {task}"),
                 })?;
-                Ok(DependentRoute { route, after, rule })
+                Ok(DependentRoute {
+                    route,
+                    after,
+                    rule,
+                    waits_for_machine,
+                })
             })
             .collect()
     }

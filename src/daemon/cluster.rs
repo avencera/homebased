@@ -127,6 +127,38 @@ pub struct PreviewExecution {
     pub spec: serde_json::Value,
 }
 
+/// Path where an origin asks whether this executor takes a waiting task now
+pub const READINESS_PATH: &str = "/v1/cluster/readiness";
+
+/// Origin offering a task that waited for this executor
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessQuery {
+    /// Public API schema version
+    pub api_version: u32,
+    /// Cluster protocol version
+    pub protocol_version: u32,
+    /// Executor asked
+    pub destination_machine: MachineId,
+    /// Origin holding the task
+    pub origin_machine: MachineId,
+}
+
+/// Whether the executor takes the waiting task now
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessBody {
+    /// Public API schema version
+    pub api_version: u32,
+    /// Cluster protocol version
+    pub protocol_version: u32,
+    /// `true` when the origin should send it now
+    pub ready: bool,
+    /// Why the executor declines
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Executor-selected invocation for a remote dry-run
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -301,6 +333,7 @@ pub fn routes(fleet: FleetHandle) -> Router<AppState> {
         .route("/v1/cluster/identities/{id}", get(identity_summary))
         .route("/v1/cluster/executions", post(submit_execution))
         .route("/v1/cluster/executions/preview", post(preview_execution))
+        .route(READINESS_PATH, post(readiness))
         .route("/v1/cluster/executions/{id}", get(executor_identity))
         .route("/v1/cluster/executions/abandon", post(abandon_execution))
         .route("/v1/cluster/executions/cancel", post(cancel_execution))
@@ -427,6 +460,26 @@ async fn identity_summary(
                 reason: record.reason,
             },
         }),
+    }))
+}
+
+/// Tell an origin whether to send a task that waited for this machine now
+async fn readiness(
+    State(state): State<AppState>,
+    Json(body): Json<ReadinessQuery>,
+) -> Result<Json<ReadinessBody>, AppError> {
+    state
+        .machine
+        .identity
+        .check_destination(body.destination_machine)?;
+    check_api_version(body.api_version)?;
+    check_protocol(body.protocol_version, body.origin_machine)?;
+    let reason = state.presence.readiness().reason();
+    Ok(Json(ReadinessBody {
+        api_version: API_VERSION,
+        protocol_version: body.protocol_version,
+        ready: reason.is_none(),
+        reason,
     }))
 }
 

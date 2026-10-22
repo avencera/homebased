@@ -18,7 +18,7 @@ use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
 use crate::machine::{MachineName, host_machine_name};
 use crate::notify::{Notify, NtfyConfig, NtfyTopic};
-use crate::power::SleepPolicy;
+use crate::power::{SleepPolicy, WaitingTasks};
 
 /// Environment variable that selects the config file
 pub const CONFIG_ENV: &str = "HOMEBASED_CONFIG";
@@ -110,6 +110,9 @@ pub struct Config {
     pub notify: Notify,
     /// Whether the daemon keeps the host awake, from `power.keep_awake`
     pub sleep: SleepPolicy,
+    /// When this host takes a task that waited for it, from
+    /// `power.waiting_tasks`; `None` leaves it to [`WaitingTasks::effective`]
+    pub waiting_tasks: Option<WaitingTasks>,
     /// Notice thresholds for the local resource queue
     pub resource: ResourceConfig,
     /// Dashboard content-origin ports
@@ -326,10 +329,12 @@ impl RawResource {
 struct RawPower {
     #[serde(default)]
     keep_awake: bool,
+    #[serde(default)]
+    waiting_tasks: Option<WaitingTasks>,
 }
 
 impl RawPower {
-    fn policy(self) -> SleepPolicy {
+    fn policy(&self) -> SleepPolicy {
         if self.keep_awake {
             return SleepPolicy::Prevent;
         }
@@ -422,6 +427,7 @@ impl RawConfig {
         } = self.fleet;
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
+        let waiting_tasks = self.power.waiting_tasks;
         let resource = self.resource.validate()?;
         let dashboard = self.dashboard.validate()?;
         let discovery = discovery.validate()?;
@@ -449,6 +455,7 @@ impl RawConfig {
             fleet,
             notify,
             sleep,
+            waiting_tasks,
             resource,
             dashboard,
         })

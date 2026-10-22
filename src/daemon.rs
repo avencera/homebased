@@ -57,6 +57,7 @@ use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
 use crate::home::{Home, LockMode, chmod_600, flock_exclusive};
 use crate::machine::LocalIdentity;
 use crate::notify::Notifier;
+use crate::power::Presence;
 use crate::submission::RequestId;
 use crate::thread_title::TitleSources;
 
@@ -83,6 +84,8 @@ pub struct AppState {
     pub machine: LocalMachine,
     /// Fleet runtime handle when `fleet.enabled` is true
     pub fleet: FleetState,
+    /// Whether this host takes a task that waited for it now
+    pub presence: Presence,
     /// Daemon-owned serializer for direct-message queue attempts
     pub(crate) message_receiver: message_receiver::MessageReceiver,
     /// Per-key locks that serialize idempotent daemon sections
@@ -175,6 +178,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         stream_slots: StreamSlots::new(),
         machine,
         fleet,
+        presence: Presence::start(config.waiting_tasks),
         message_receiver: message_receiver::MessageReceiver::default(),
         locks: DaemonLocks::default(),
         thread_titles: TitleSources::from_env(),

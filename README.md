@@ -548,9 +548,28 @@ task before it starts. Tasks held on a cancelled task are cancelled too.
 
 A remote submit fails with `machine_unavailable` when its machine does not
 answer. Set `wait_for_machine: true` to hold the task on the submitting daemon
-instead, for a laptop that sleeps. The submit returns `held`, and the daemon
-sends the task once the machine answers, usually within a minute of it waking.
-When the machine is already up, the task starts at once.
+instead, for a laptop that sleeps. Before each send, the daemon asks the
+machine whether it takes the task now. The submit returns `queued` when the
+machine takes it at once, and `held` otherwise; the daemon then asks again
+each time the machine answers, and sends the task once it says yes.
+
+A Mac with a battery says yes only after someone has used it for two minutes
+without a break. A laptop also answers during a dark wake, a few seconds of
+network with the lid closed, and would sleep again while the task ran; in a
+dark wake, or with the display asleep from idleness, no one is using it, so
+the task keeps waiting. Once someone uses the machine, the task starts within
+about three minutes. A Mac without a battery, and any Linux host, takes the
+task as soon as it answers. Set `power.waiting_tasks` to `"always"` or
+`"when_in_use"` in the machine's config to choose; `homebased config
+validate` shows the result:
+
+```toml
+[power]
+waiting_tasks = "always"
+```
+
+An executor from a release without this question takes the task as soon as
+it answers.
 
 Set `coalesce` with `wait_for_machine` for work where only the newest request
 matters, such as an update. Once a submit with a `coalesce` key is accepted,

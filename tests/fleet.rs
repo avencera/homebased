@@ -70,8 +70,9 @@ impl Daemon {
     }
 
     fn write_config(&self, name: &str, fleet: bool) {
+        // a macOS host would otherwise take waiting tasks only while someone uses it
         let text = format!(
-            "[fleet]\nenabled = {fleet}\nmachine_name = \"{name}\"\n\n[fleet.discovery]\nmdns = {}\n",
+            "[fleet]\nenabled = {fleet}\nmachine_name = \"{name}\"\n\n[fleet.discovery]\nmdns = {}\n\n[power]\nwaiting_tasks = \"always\"\n",
             self.mdns
         );
         fs::write(&self.config, text).unwrap();
