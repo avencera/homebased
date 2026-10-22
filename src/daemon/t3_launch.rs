@@ -4,7 +4,7 @@
 //! machine, then launches in its own T3 or forwards the request to
 //! `/v1/cluster/t3/launch` on the peer, whose daemon launches in that
 //! machine's T3. Each daemon reaches only its own T3 server, as with message
-//! delivery. Project listings take the same two hops
+//! delivery. Project listings and project adds take the same two hops
 //!
 //! The routes need no protocol change: a peer that predates them answers 404,
 //! which is reported as an outdated homebased
@@ -26,14 +26,19 @@ use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse, DEFAULT_MAX_BODY};
 use crate::machine::{MachineId, MachineName};
 use crate::t3::{
-    LaunchError, LaunchSpec, LaunchedThread, T3Env, T3Project, launch_thread, projects,
+    AddedProject, LaunchError, LaunchSpec, LaunchedThread, ProjectSpec, T3Env, T3Project,
+    add_project, launch_thread, projects,
 };
 
 const CLUSTER_LAUNCH_PATH: &str = "/v1/cluster/t3/launch";
 const CLUSTER_PROJECTS_PATH: &str = "/v1/cluster/t3/projects";
+// its own path, so a peer without it answers 404 rather than the 405 of the listing route
+const CLUSTER_PROJECT_ADD_PATH: &str = "/v1/cluster/t3/projects/add";
 // the peer issues a token, waits up to 30 seconds for T3, and revokes the token
 const LAUNCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const PROJECTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// the peer runs `t3 project add`, which has its own 10 second deadline
+const PROJECT_ADD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `POST /v1/t3/launch` body
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +92,32 @@ pub struct T3ProjectsBody {
     pub projects: Vec<T3Project>,
 }
 
+/// `POST /v1/t3/projects/add` body
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct T3ProjectAddRequest {
+    /// Public API version
+    pub api_version: u32,
+    /// Machine name or UUID; this machine when omitted
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// What to add
+    pub project: ProjectSpec,
+}
+
+/// `POST /v1/t3/projects/add` answer
+#[derive(Debug, Serialize, Deserialize)]
+pub struct T3ProjectAddResponse {
+    /// Public API version
+    pub api_version: u32,
+    /// Machine whose T3 has the project
+    pub machine: MachineId,
+    /// Name of that machine
+    pub machine_name: MachineName,
+    /// The project added, or the one already there
+    pub project: AddedProject,
+}
+
 /// Launch request from the origin daemon to the launching peer
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,11 +137,30 @@ struct ClusterLaunchBody {
     thread: LaunchedThread,
 }
 
+/// Project add request from the origin daemon to the adding peer
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterProjectAdd {
+    api_version: u32,
+    protocol_version: u32,
+    destination_machine: MachineId,
+    origin_machine: MachineId,
+    project: ProjectSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClusterProjectAddBody {
+    api_version: u32,
+    machine: MachineId,
+    project: AddedProject,
+}
+
 /// Local-only routes; a launch starts an agent, so it stays off the TCP listener
 pub fn socket_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/t3/launch", post(launch))
         .route("/v1/t3/projects", post(list_projects))
+        .route("/v1/t3/projects/add", post(add))
 }
 
 /// Peer routes for an enabled fleet, inside its trusted network boundary
@@ -118,6 +168,7 @@ pub fn cluster_routes() -> Router<AppState> {
     Router::new()
         .route(CLUSTER_LAUNCH_PATH, post(cluster_launch))
         .route(CLUSTER_PROJECTS_PATH, get(cluster_projects))
+        .route(CLUSTER_PROJECT_ADD_PATH, post(cluster_add))
 }
 
 async fn launch(
@@ -233,6 +284,50 @@ async fn cluster_projects(
     }))
 }
 
+async fn add(
+    State(state): State<AppState>,
+    Json(body): Json<T3ProjectAddRequest>,
+) -> Result<Json<T3ProjectAddResponse>, AppError> {
+    check_api_version(body.api_version)?;
+    body.project
+        .validate()
+        .map_err(|message| AppError::T3ProjectRefused { message })?;
+    let destination = destination(&state, body.machine.as_deref()).await?;
+
+    let (project, machine_name) = if destination == state.machine.identity.machine {
+        (add_here(body.project).await?, state.machine.name.clone())
+    } else {
+        forward_add(&state, destination, body.project).await?
+    };
+    Ok(Json(T3ProjectAddResponse {
+        api_version: API_VERSION,
+        machine: destination,
+        machine_name,
+        project,
+    }))
+}
+
+async fn cluster_add(
+    State(state): State<AppState>,
+    Json(body): Json<ClusterProjectAdd>,
+) -> Result<Json<ClusterProjectAddBody>, AppError> {
+    state
+        .machine
+        .identity
+        .check_destination(body.destination_machine)?;
+    check_api_version(body.api_version)?;
+    check_protocol(body.protocol_version, body.origin_machine)?;
+    body.project
+        .validate()
+        .map_err(|message| AppError::T3ProjectRefused { message })?;
+
+    Ok(Json(ClusterProjectAddBody {
+        api_version: API_VERSION,
+        machine: state.machine.identity.machine,
+        project: add_here(body.project).await?,
+    }))
+}
+
 async fn destination(state: &AppState, machine: Option<&str>) -> Result<MachineId, AppError> {
     match machine {
         Some(machine) => resolve_machine(state, machine).await,
@@ -265,6 +360,51 @@ async fn projects_here() -> Result<Vec<T3Project>, AppError> {
         })?
         // reading projects sends nothing to T3, so its outcome is never unknown
         .map_err(|error| t3_error(error, |message| AppError::T3Unavailable { message }))
+}
+
+async fn add_here(spec: ProjectSpec) -> Result<AddedProject, AppError> {
+    tokio::task::spawn_blocking(move || add_project(&T3Env::from_env(), &spec))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("T3 project worker failed: {error}"),
+        })?
+        .map_err(|error| match error {
+            LaunchError::Refused(message) => AppError::T3ProjectRefused { message },
+            // an add that may have happened shows up as existing on retry
+            error => t3_error(error, |message| AppError::T3Unavailable { message }),
+        })
+}
+
+async fn forward_add(
+    state: &AppState,
+    destination: MachineId,
+    project: ProjectSpec,
+) -> Result<(AddedProject, MachineName), AppError> {
+    let fleet = state
+        .fleet
+        .handle()
+        .ok_or_else(|| AppError::MachineNotFound {
+            machine: destination.to_string(),
+        })?;
+    let verified = fleet.connect(destination).await?;
+    let wire = ClusterProjectAdd {
+        api_version: API_VERSION,
+        protocol_version: verified.protocol.0,
+        destination_machine: destination,
+        origin_machine: state.machine.identity.machine,
+        project,
+    };
+
+    // a retry after a lost reply finds the project as existing, so it adds nothing twice
+    let response = ClusterClient::new(PROJECT_ADD_REQUEST_TIMEOUT, DEFAULT_MAX_BODY)
+        .post_json(&verified.address, CLUSTER_PROJECT_ADD_PATH, &wire)
+        .await
+        .map_err(|error| AppError::MachineUnavailable {
+            machine: destination,
+            message: error.to_string(),
+        })?;
+    let body: ClusterProjectAddBody = peer_body(destination, &response)?;
+    Ok((body.project, verified.advertisement.name))
 }
 
 async fn forward_launch(
@@ -332,7 +472,7 @@ fn peer_body<T: DeserializeOwned + PeerBody>(
         if route_missing {
             return Err(AppError::T3Incompatible {
                 message: format!(
-                    "machine {machine} runs a homebased without T3 launch; run `homebased update` there"
+                    "machine {machine} runs a homebased without this T3 command; run `homebased update` there"
                 ),
             });
         }
@@ -363,6 +503,16 @@ trait PeerBody {
 }
 
 impl PeerBody for ClusterLaunchBody {
+    fn api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    fn machine(&self) -> MachineId {
+        self.machine
+    }
+}
+
+impl PeerBody for ClusterProjectAddBody {
     fn api_version(&self) -> u32 {
         self.api_version
     }

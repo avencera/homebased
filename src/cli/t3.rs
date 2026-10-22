@@ -10,13 +10,14 @@ use uuid::Uuid;
 
 use crate::client::Client;
 use crate::daemon::t3_launch::{
-    T3LaunchRequest, T3LaunchResponse, T3ProjectsBody, T3ProjectsRequest,
+    T3LaunchRequest, T3LaunchResponse, T3ProjectAddRequest, T3ProjectAddResponse, T3ProjectsBody,
+    T3ProjectsRequest,
 };
 use crate::domain::{API_VERSION, THREAD_ENV_VARS, ThreadId};
 use crate::error::AppError;
 use crate::t3::{
     InteractionMode, LaunchSpec, ModelChoice, ModelOption, OptionValue, ProbeReport, ProbeStatus,
-    RuntimeMode, T3Env, Workspace, probe,
+    ProjectSpec, RuntimeMode, T3Env, Workspace, probe,
 };
 
 use super::{Ctx, OutputMode};
@@ -35,6 +36,29 @@ pub enum T3Command {
     Launch(Box<LaunchArgs>),
     /// List the T3 Code projects on this or another Fleet machine
     Projects {
+        /// Machine name or UUID; this machine when omitted
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// Manage the T3 Code projects on this or another Fleet machine
+    #[command(subcommand)]
+    Project(ProjectCommand),
+}
+
+/// `homebased t3 project` commands
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Add an existing directory as a T3 Code project
+    ///
+    /// A directory that already is a project reports that project instead
+    Add {
+        /// Directory on that machine: absolute, starting with `~/`, or
+        /// relative to the current directory, which names the same place
+        /// under that machine's home
+        path: String,
+        /// Project title; the directory name when omitted
+        #[arg(long)]
+        title: Option<String>,
         /// Machine name or UUID; this machine when omitted
         #[arg(long)]
         machine: Option<String>,
@@ -106,6 +130,11 @@ pub async fn run(ctx: &Ctx, command: T3Command) -> Result<ExitCode, AppError> {
         T3Command::Check => check(ctx).await,
         T3Command::Launch(args) => launch(ctx, *args).await,
         T3Command::Projects { machine } => list_projects(ctx, machine).await,
+        T3Command::Project(ProjectCommand::Add {
+            path,
+            title,
+            machine,
+        }) => add_project(ctx, path, title, machine).await,
     }
 }
 
@@ -257,6 +286,52 @@ async fn list_projects(ctx: &Ctx, machine: Option<String>) -> Result<ExitCode, A
                     project.title, project.workspace_root, project.id
                 );
             }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn add_project(
+    ctx: &Ctx,
+    path: String,
+    title: Option<String>,
+    machine: Option<String>,
+) -> Result<ExitCode, AppError> {
+    let path = if path.starts_with('/') || path.starts_with("~/") {
+        path
+    } else {
+        std::path::absolute(&path)?.to_string_lossy().into_owned()
+    };
+    let request = T3ProjectAddRequest {
+        api_version: API_VERSION,
+        machine,
+        project: ProjectSpec {
+            path: home_relative(path),
+            title,
+        },
+    };
+    request
+        .project
+        .validate()
+        .map_err(|message| AppError::Usage { message })?;
+
+    let response: T3ProjectAddResponse = Client::new(ctx.home.sock_path())
+        .post_json("/v1/t3/projects/add", &request)
+        .await?;
+    let project = &response.project.project;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(to_value(&response)?)?,
+        OutputMode::Quiet => println!("{}", project.id),
+        OutputMode::Human => {
+            let verb = if response.project.existed {
+                "already a project"
+            } else {
+                "added project"
+            };
+            println!(
+                "{verb}: {} on {} ({}, {})",
+                project.title, response.machine_name, project.workspace_root, project.id
+            );
         }
     }
     Ok(ExitCode::SUCCESS)

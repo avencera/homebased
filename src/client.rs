@@ -464,6 +464,9 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         "t3_launch_refused" => AppError::T3LaunchRefused {
             message: decode_field(input, "message").unwrap_or(message),
         },
+        "t3_project_refused" => AppError::T3ProjectRefused {
+            message: decode_field(input, "message").unwrap_or(message),
+        },
         "t3_unavailable" => AppError::T3Unavailable {
             message: decode_field(input, "message").unwrap_or(message),
         },

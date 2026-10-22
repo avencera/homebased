@@ -460,6 +460,12 @@ pub enum AppError {
         /// Why the launch did not happen
         message: String,
     },
+    /// The project cannot be added as requested, or T3 Code refused it
+    #[error("T3 project add refused: {message}")]
+    T3ProjectRefused {
+        /// Why the project was not added
+        message: String,
+    },
     /// T3 Code is not installed, not running, or speaks another API
     #[error("T3 unavailable: {message}")]
     T3Unavailable {
@@ -653,6 +659,7 @@ impl AppError {
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
             Self::T3ProjectNotFound { .. } => "t3_project_not_found",
             Self::T3LaunchRefused { .. } => "t3_launch_refused",
+            Self::T3ProjectRefused { .. } => "t3_project_refused",
             Self::T3Unavailable { .. } => "t3_unavailable",
             Self::T3LaunchOutcomeUnknown { .. } => "t3_launch_outcome_unknown",
             Self::T3Incompatible { .. } => "t3_incompatible",
@@ -730,7 +737,9 @@ impl AppError {
             | Self::MessageUnavailable { .. } => 1,
             Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => 1,
             Self::T3ProjectNotFound { .. } => 3,
-            Self::T3LaunchRefused { .. } | Self::T3Incompatible { .. } => 5,
+            Self::T3LaunchRefused { .. }
+            | Self::T3ProjectRefused { .. }
+            | Self::T3Incompatible { .. } => 5,
             Self::Queue(error) => error.exit_code(),
             Self::Waiting(WaitingRejection::UnknownTarget { .. }) => 3,
             Self::Waiting(_) => 5,
@@ -764,9 +773,9 @@ impl AppError {
             Self::AgentThreadNotFound { .. } | Self::T3ProjectNotFound { .. } => {
                 http::StatusCode::NOT_FOUND
             }
-            Self::T3LaunchRefused { .. } | Self::T3Incompatible { .. } => {
-                http::StatusCode::CONFLICT
-            }
+            Self::T3LaunchRefused { .. }
+            | Self::T3ProjectRefused { .. }
+            | Self::T3Incompatible { .. } => http::StatusCode::CONFLICT,
             Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => {
                 http::StatusCode::SERVICE_UNAVAILABLE
             }
@@ -891,6 +900,7 @@ impl AppError {
                 json!({ "selector": selector, "projects": projects })
             }
             Self::T3LaunchRefused { message }
+            | Self::T3ProjectRefused { message }
             | Self::T3Unavailable { message }
             | Self::T3Incompatible { message } => json!({ "message": message }),
             Self::T3LaunchOutcomeUnknown {

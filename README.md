@@ -299,6 +299,7 @@ T3 shows the thread as idle between events.
 
 ```sh
 homebased t3 projects --machine code
+homebased t3 project add ~/code/app --machine code [--title app]
 homebased t3 launch --machine code --project ~/code/app \
   --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
   [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high]
@@ -314,6 +315,12 @@ the project setup script, and starts the first message.
 - `--project` takes a T3 project id, the project's workspace root on that
   machine (absolute or `~/`), or its exact title. `t3 projects` lists them with
   the model a launch uses by default.
+- `t3 project add <path>` adds an existing directory on that machine as a T3
+  project, through that machine's own `t3 project add`, so the running T3 shows
+  it at once. A relative path resolves against the current directory, then
+  under that machine's home like a `~/` path. A directory that already is a
+  project reports that project, so repeating the command is safe. It refuses
+  with `t3_project_refused` when the directory does not exist there.
 - Without `--provider` and `--model`, the thread runs the default model from
   that machine's T3 settings. When neither the settings nor the project name
   one, the launch fails and asks for both.
@@ -331,7 +338,7 @@ the project setup script, and starts the first message.
 - A workspace that cannot be prepared, such as a base branch that does not
   exist, fails the run inside the new thread rather than the command.
 
-A machine whose homebased predates this command answers `t3_incompatible` and
+A machine whose homebased predates these commands answers `t3_incompatible` and
 needs `homebased update`. A `~/` path, quoted or expanded by the shell,
 resolves under the home of the machine that launches the thread.
 

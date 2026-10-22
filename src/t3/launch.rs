@@ -16,6 +16,11 @@
 //!   `projectSettingsOverrides`, then the project's
 //!   `default_model_selection_json`, then `defaultModelSelection`. That order is
 //!   homebased's choice; T3 documents none
+//! - `t3 project add` creates a project through the running server's
+//!   `orchestration.dispatch` HTTP route, or in the state database when no
+//!   server answers (`apps/server/src/cli/project.ts`). It refuses a root that
+//!   already is a project and prints only a human summary, so homebased checks
+//!   for an existing project first and reads the new one back from the table
 //! - `environment-id` in the user data names this T3 environment, which the
 //!   `t3code://threads/<environment>/<thread>` link needs to open a thread on
 //!   another machine
@@ -262,6 +267,43 @@ pub struct T3Project {
     pub default_model: Option<Value>,
 }
 
+/// A checkout to add as a T3 project, independent of the machine that adds it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSpec {
+    /// Existing directory: absolute, or starting with `~/` on the adding machine
+    pub path: String,
+    /// Project title; T3 uses the directory name when omitted
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl ProjectSpec {
+    /// Check the fields that do not depend on the adding machine
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.path.starts_with('/') || self.path.starts_with("~/")) {
+            return Err("project path must be absolute or start with ~/".into());
+        }
+        if self
+            .title
+            .as_deref()
+            .is_some_and(|title| title.trim().is_empty())
+        {
+            return Err("title must not be blank".into());
+        }
+        Ok(())
+    }
+}
+
+/// A project that [`add_project`] added, or found already there
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedProject {
+    /// The project as T3 stores it
+    pub project: T3Project,
+    /// Whether the directory already was a project, which T3 kept as it was
+    pub existed: bool,
+}
+
 /// Why a launch did not happen, or may have happened
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchError {
@@ -337,6 +379,66 @@ pub fn projects(env: &T3Env) -> Result<Vec<T3Project>, LaunchError> {
             }
         })
         .collect())
+}
+
+/// Add a directory on this machine as a T3 project
+///
+/// A directory that already is a project returns that project, so a retry
+/// after a lost reply adds nothing twice
+pub fn add_project(env: &T3Env, spec: &ProjectSpec) -> Result<AddedProject, LaunchError> {
+    spec.validate().map_err(LaunchError::Refused)?;
+    let root = expand_home(&spec.path, &env.home);
+    if !root.is_dir() {
+        return Err(LaunchError::Refused(format!(
+            "{} is not a directory on this machine",
+            root.display()
+        )));
+    }
+    let wanted = comparable(&root);
+    let at_root = |projects: Vec<T3Project>| {
+        projects
+            .into_iter()
+            .find(|project| comparable(Path::new(&project.workspace_root)) == wanted)
+    };
+    if let Some(project) = at_root(projects(env)?) {
+        return Ok(AddedProject {
+            project,
+            existed: true,
+        });
+    }
+
+    let server = connect(&env.userdata())?;
+    let cli = T3Cli::resolve(env, server.pid).map_err(LaunchError::Unavailable)?;
+    let root_arg = root.to_string_lossy();
+    // `--title=` and `--` keep a title or root that starts with a dash from
+    // reading as a flag
+    let title_arg = spec
+        .title
+        .as_deref()
+        .map(|title| format!("--title={}", title.trim()));
+    let mut args = vec!["project", "add"];
+    args.extend(title_arg.as_deref());
+    args.extend(["--", &root_arg]);
+    let output = cli
+        .run("t3 project add", &args)
+        .map_err(LaunchError::Unavailable)?;
+    if !output.success {
+        return Err(LaunchError::Refused(format!(
+            "t3 project add failed for {}; run it on that machine to see why",
+            root.display()
+        )));
+    }
+
+    let project = at_root(projects(env)?).ok_or_else(|| {
+        LaunchError::Changed(format!(
+            "t3 project add succeeded, but T3 lists no project at {}",
+            root.display()
+        ))
+    })?;
+    Ok(AddedProject {
+        project,
+        existed: false,
+    })
 }
 
 /// Launch a thread in T3 on this machine
@@ -681,7 +783,7 @@ mod tests {
     };
     use super::{
         InteractionMode, LaunchError, LaunchIds, LaunchSpec, ModelChoice, ModelOption, OptionValue,
-        RuntimeMode, Workspace, launch_thread, projects,
+        ProjectSpec, RuntimeMode, Workspace, add_project, launch_thread, projects,
     };
 
     fn curl_available() -> bool {
@@ -925,6 +1027,54 @@ mod tests {
                 ("plain".into(), Some(model("global"))),
                 ("broken".into(), Some(model("global"))),
             ]
+        );
+    }
+
+    #[test]
+    fn adding_a_project_runs_t3_once_and_a_repeat_reports_the_existing_one() {
+        let Ok(sqlite) = which::which("sqlite3") else {
+            return;
+        };
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(2), Vec::new());
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        let state = fixture.userdata().join("statev2.sqlite");
+        fixture.v2_state();
+        fs::create_dir_all(fixture.dir.path().join("code/app")).unwrap();
+        // stands in for `t3 project add`, which writes the project row
+        let log = fixture.dir.path().join("t3.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1 $2 $4\" = 'project add --' ] || exit 3\n'{}' '{}' \"INSERT INTO projection_projects (project_id, title, workspace_root) VALUES ('project-new', 'App', '$5')\"\n",
+            log.display(),
+            sqlite.display(),
+            state.display()
+        );
+        fs::write(fixture.dir.path().join("bin/t3"), script).unwrap();
+        let spec = |path: &str| ProjectSpec {
+            path: path.into(),
+            title: Some(" App ".into()),
+        };
+
+        let missing = add_project(&fixture.env, &spec("~/code/missing"));
+        let added = add_project(&fixture.env, &spec("~/code/app")).unwrap();
+        let repeated = add_project(&fixture.env, &spec("~/code/app/")).unwrap();
+
+        assert!(
+            matches!(&missing, Err(LaunchError::Refused(detail)) if detail.contains("not a directory")),
+            "{missing:?}"
+        );
+        let root = fixture.dir.path().join("code/app");
+        assert!(!added.existed);
+        assert_eq!(added.project.id, "project-new");
+        assert_eq!(added.project.workspace_root, root.to_string_lossy());
+        assert!(repeated.existed);
+        assert_eq!(repeated.project, added.project);
+        // only the first add reaches t3, with the title trimmed and the home expanded
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("project add --title=App -- {}\n", root.display())
         );
     }
 }
