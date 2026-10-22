@@ -253,8 +253,6 @@ pub(crate) enum TurnStart {
     /// The message waits for the active run, which may be a compaction that
     /// T3 refuses to steer into
     AfterActive,
-    /// The message becomes a run that T3 never starts, which holds the thread
-    Defer,
 }
 
 /// Start a T3 turn for the thread that owns this provider session
@@ -291,47 +289,38 @@ pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOu
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
 }
 
-pub(crate) use hold::{HOLD_MARKER, ThreadActivity, ThreadView};
-
-/// Activity of the T3 thread that owns a Codex session
+/// End the placeholder runs that `--hold` left in T3, and return how many ended
 ///
-/// Reads the state database on disk, so the server need not run. `None` means
-/// no T3 thread owns the session
-pub(crate) fn hold_view(env: &T3Env, thread: ThreadId) -> Result<Option<ThreadView>, String> {
+/// A T3 that is not running needs nothing: its restart cancels them. See [`hold`]
+pub(crate) fn end_leftover_holds(env: &T3Env) -> Result<usize, String> {
     let userdata = env.userdata();
-    let Some(t3_thread) = find_thread(&userdata, ProviderThread::Codex(thread))? else {
-        return Ok(None);
-    };
-    hold::view(&state_path(&userdata), &t3_thread).map(Some)
-}
+    let state = state_path(&userdata);
+    if !state.is_file() {
+        return Ok(0);
+    }
+    let holds = hold::leftover(&state)?;
+    if holds.is_empty() {
+        return Ok(0);
+    }
 
-/// Hold the idle T3 thread that owns a Codex session with a placeholder run
-///
-/// The thread is read again right before the dispatch, so one that started a
-/// run since the caller looked is refused instead of getting a queued message
-pub(crate) fn hold_thread(env: &T3Env, thread: ThreadId, text: &str) -> WakeOutcome {
-    with_owner(env, ProviderThread::Codex(thread), |owner| {
-        let view = hold::view(owner.state, owner.thread).map_err(ApiFailure::Unavailable)?;
-        if view.activity != ThreadActivity::Idle {
-            return Err(ApiFailure::Refused("thread is not idle".into()));
+    let server = connect(&userdata).map_err(|failure| failure.detail())?;
+    let token = T3Cli::resolve(env, server.pid)?
+        .issue_token()
+        .map_err(|(IssueError::Unavailable(detail) | IssueError::Changed(detail))| detail)?;
+    let mut failures = Vec::new();
+    for leftover in &holds {
+        if let Err(failure) = hold::end(&server.origin, &token.value, leftover) {
+            failures.push(failure.detail());
         }
-        hold::start(owner.origin, owner.token, owner.thread, text, &view.key)
-    })
-    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
-}
-
-/// End the placeholder run `run`, so a message queued behind it runs
-pub(crate) fn release_hold(env: &T3Env, thread: ThreadId, run: &str) -> WakeOutcome {
-    with_owner(env, ProviderThread::Codex(thread), |owner| {
-        hold::interrupt(
-            owner.origin,
-            owner.token,
-            owner.thread,
-            run,
-            "homebased hold ended",
-        )
-    })
-    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+    }
+    if let Some(first) = failures.first() {
+        return Err(format!(
+            "{} of {} placeholders did not end: {first}",
+            failures.len(),
+            holds.len()
+        ));
+    }
+    Ok(holds.len())
 }
 
 /// Open T3 thread that owns a Claude session

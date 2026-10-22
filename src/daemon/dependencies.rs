@@ -295,7 +295,6 @@ async fn hold(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatus)
         request,
         callback_cwd,
         after: _,
-        hold: _,
         machine_wait: _,
     } = body;
     let (execution_machine, callback) = match &spec.machine {

@@ -349,7 +349,6 @@ fn relative_prompt_file_resolves_against_cwd() {
         cwd: dir.path().to_path_buf(),
         timeout: default_timeout(),
         after: None,
-        hold: false,
         machine_wait: None,
         workload: SubmitWorkloadValidated::Agent(SubmitAgent {
             agent: AgentKind::Claude,
@@ -801,19 +800,7 @@ fn bugfix_missing_task_command_has_its_own_pointer() {
 }
 
 #[test]
-fn hold_is_off_unless_the_spec_asks_for_it() {
-    assert!(!parse_spec_value(&example_agent_json()).unwrap().hold);
-
-    let mut held = example_agent_json();
-    held["hold"] = json!(true);
-    assert!(parse_spec_value(&held).unwrap().hold);
-
-    held["hold"] = json!("yes");
-    assert!(parse_spec_value(&held).is_err());
-}
-
-#[test]
-fn only_a_command_without_hold_parses_without_a_thread() {
+fn only_a_command_parses_without_a_thread() {
     let mut task = valid_task();
     task.as_object_mut().unwrap().remove("thread");
     assert_verdict(&task, true, "a task without a thread");
@@ -821,11 +808,6 @@ fn only_a_command_without_hold_parses_without_a_thread() {
 
     // the schema describes the file, which may leave `thread` for submit to
     // fill in; the parser sees the spec after that, so it still needs one
-    let mut held = task.clone();
-    held["hold"] = json!(true);
-    assert!(validator().is_valid(&held), "{held}");
-    assert!(parse_spec_value(&held).is_err());
-
     let mut agent = valid_agent();
     agent.as_object_mut().unwrap().remove("thread");
     assert!(validator().is_valid(&agent), "{agent}");

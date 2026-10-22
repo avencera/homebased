@@ -23,7 +23,6 @@ pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
 pub mod queue_api;
-mod t3_hold;
 pub mod t3_launch;
 mod t3_watch;
 mod thread_titles;
@@ -40,7 +39,7 @@ use ractor::{Actor, ActorRef};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::daemon::actors::{
@@ -194,7 +193,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
-    let t3_holder = tokio::spawn(t3_hold::run(state.clone()));
+    let hold_sweep = tokio::spawn(end_leftover_holds());
     // a blocking task cannot be aborted, so shutdown sets this flag instead
     let usage_backfill_stop = Arc::new(AtomicBool::new(false));
     tokio::task::spawn_blocking({
@@ -248,7 +247,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     cancellation.abort();
     t3_watcher.abort();
     idle_compactor.abort();
-    t3_holder.abort();
+    hold_sweep.abort();
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {
         supervisor.stop(None);
@@ -273,6 +272,39 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
 /// Start fleet discovery in the background when the config enables it. A
 /// fleet failure never stops the daemon: local tasks keep working and the
 /// cluster routes stay absent
+/// End the T3 placeholders that releases with `--hold` left, retrying until it works
+///
+/// A placeholder blocks the events and messages queued behind it. Each try
+/// reads T3's state again, so the loop also ends once a T3 restart cancels them
+async fn end_leftover_holds() {
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut warned = false;
+    loop {
+        let ended = tokio::task::spawn_blocking(|| {
+            crate::t3::end_leftover_holds(&crate::t3::T3Env::from_env())
+        })
+        .await;
+        match ended {
+            Ok(Ok(0)) => return,
+            Ok(Ok(ended)) => {
+                info!(ended, "ended leftover T3 hold placeholders");
+                return;
+            }
+            // one warning is enough while T3 stays unreachable
+            Ok(Err(err)) if warned => debug!("end leftover T3 hold placeholders: {err}"),
+            Ok(Err(err)) => {
+                warn!("end leftover T3 hold placeholders, retrying: {err}");
+                warned = true;
+            }
+            Err(err) => {
+                warn!("end leftover T3 hold placeholders join: {err}");
+                return;
+            }
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
 fn start_fleet(
     home: &Home,
     config: &Config,

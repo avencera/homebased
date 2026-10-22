@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,12 +19,13 @@ pub const SCHEMA_VERSION: i64 = 6;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
     add_t3_holds,
     add_machine_waits,
+    drop_t3_holds,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -60,6 +61,14 @@ fn add_t3_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(T3_HOLD_TABLE)
 }
 
+/// Version 7: drop the `--hold` tasks of version 5
+///
+/// T3 replayed each placeholder run that a hold made into the thread's next
+/// Codex turn, so holds cost input tokens and were removed
+fn drop_t3_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("DROP TABLE t3_hold_tasks;")
+}
+
 /// Version 6: remote routes that wait for their machine, and their coalesce keys
 fn add_machine_waits(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&format!(
@@ -84,10 +93,7 @@ CREATE INDEX origin_routes_coalesce ON origin_routes (coalesce_key)
     WHERE coalesce_key IS NOT NULL;
 ";
 
-/// Tasks submitted with `--hold`. The flag lives beside the route, like its
-/// dependencies, so it stays on the origin and never reaches an executor. A row
-/// says only that the task asked for a hold; the daemon works out from the
-/// route and chain whether it still waits
+/// Tasks submitted with `--hold`, which version 7 drops
 const T3_HOLD_TABLE: &str = "
 CREATE TABLE t3_hold_tasks (
     task_id TEXT PRIMARY KEY
@@ -191,12 +197,11 @@ fn schema() -> String {
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
         .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
-        .replace("{T3_HOLD_TABLE}", T3_HOLD_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
 /// [`add_waiting_handoff`], [`add_job_route_created_at`],
-/// [`add_task_usage`], [`add_t3_holds`], and [`add_machine_waits`] as placeholders
+/// [`add_task_usage`], and [`add_machine_waits`] as placeholders
 ///
 /// `timeout_secs` is decimal TEXT, not INTEGER: the inactivity timer has no
 /// product maximum, and a `Duration` above `i64::MAX` seconds cannot be stored
@@ -524,8 +529,7 @@ CREATE TABLE resource_job_delivery (
     acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
 );
 {CHAIN_TABLES}
-{TASK_USAGE_TABLE}
-{T3_HOLD_TABLE}";
+{TASK_USAGE_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -632,7 +636,6 @@ mod tests {
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
             .replace(super::CHAIN_TABLES, "")
             .replace(super::TASK_USAGE_TABLE, "")
-            .replace(super::T3_HOLD_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -659,7 +662,6 @@ mod tests {
             "chain_runs",
             "resource_job_routes",
             "task_usage",
-            "t3_hold_tasks",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }

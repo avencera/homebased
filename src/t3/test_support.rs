@@ -379,6 +379,18 @@ impl V2State {
     /// Run `ordinal` of `thread_id` in `status`, started by the user message `text`
     pub(crate) fn run(self, thread_id: &str, ordinal: i64, status: &str, text: &str) -> Self {
         let message_id = format!("message-{thread_id}-{ordinal}");
+        self.run_with_message(thread_id, ordinal, status, text, &message_id)
+    }
+
+    /// Like [`Self::run`], with the user message's id
+    pub(crate) fn run_with_message(
+        self,
+        thread_id: &str,
+        ordinal: i64,
+        status: &str,
+        text: &str,
+        message_id: &str,
+    ) -> Self {
         self.0
             .execute(
                 "INSERT INTO orchestration_v2_projection_messages (message_id, thread_id, payload_json)

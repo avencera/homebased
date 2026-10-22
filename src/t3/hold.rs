@@ -1,360 +1,162 @@
-//! Keep a T3 Codex thread in T3's Working shelf with a placeholder run
+//! Placeholder runs that `--hold` left in T3
 //!
-//! T3 counts a thread with an active run as working, and Codex reports no
-//! background work that would park an idle one. A `message.dispatch` with
-//! `defer_start` on an idle thread creates a run in `preparing` that T3 never
-//! starts by itself, so the thread stays working until something ends it. The
-//! placeholder is that run's user message, and its text starts with
-//! [`HOLD_MARKER`], which is how a later look at T3's state recognises it
-//! without anything remembered in the daemon
+//! Releases up to 0.23.0 kept an idle Codex thread in T3's Working shelf with a
+//! `message.dispatch` in `defer_start` mode: a run in `preparing` that T3 never
+//! starts, whose text starts with [`HOLD_MARKER`] and whose message id
+//! [`is_hold_message`] accepts. T3 replays a run that ended
+//! before its provider started into the thread's next Codex turn, so every hold
+//! cost input tokens, and holds were removed
 //!
-//! - Sending a `defer_start` message while a run is active would queue it, and
-//!   it would later run as a real turn, so a hold is only ever sent to an idle thread
-//! - An event for a held thread is dispatched with `queue_after_active` and
-//!   the hold is then interrupted without `holdQueue`; the interrupt drains the
-//!   queue, so the event runs as an ordinary turn
-//! - A message the user types meanwhile queues behind the hold. Releasing the
-//!   hold the same way runs it
-//! - The Stop button interrupts the run and holds the queue. The thread's
-//!   latest run is then an interrupted placeholder, which [`ThreadActivity::Stopped`]
-//!   reports, so a Stop is not undone
-//! - A T3 restart cancels `preparing` runs, which leaves the thread idle
+//! A placeholder still in place when the daemon updated keeps its thread
+//! working, and an event or a message the user types queues behind it until
+//! someone presses Stop, so each daemon start ends the ones that remain
 //!
-//! Runs are read from `statev2.sqlite` rather than through
-//! `orchestration.getThreadProjection`, which returns the whole transcript and
-//! would be polled every few seconds. The tables are those that
+//! Runs are read from `statev2.sqlite`; the tables are those that
 //! `055_OrchestrationV2.ts` creates: `orchestration_v2_projection_runs`, whose
 //! `payload_json` holds the run, and `orchestration_v2_projection_messages`
 
 use std::path::Path;
 
 use rusqlite::params;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use super::v2::{dispatch, dispatch_payload, is_archived};
-use super::{ApiFailure, TurnStart, deterministic_id, state_connection};
+use super::v2::dispatch;
+use super::{ApiFailure, deterministic_id, state_connection};
 
 /// Start of the placeholder message that marks a run as a homebased hold
-pub(crate) const HOLD_MARKER: &str = "Waiting on homebased";
+const HOLD_MARKER: &str = "Waiting on homebased";
 
-// runs T3 treats as active; a thread with one is working, and a message sent
-// to it starts nothing now
-const ACTIVE_RUNS_SQL: &str = "
-    SELECT r.run_id, r.status,
-           COALESCE(substr(json_extract(m.payload_json, '$.text'), 1, length(?2)) = ?2, 0)
+// placeholders that T3 has not ended; only `preparing` runs are ones it never started
+const LEFTOVER_SQL: &str = "
+    SELECT r.thread_id, r.run_id, r.ordinal, m.message_id
     FROM orchestration_v2_projection_runs r
-    LEFT JOIN orchestration_v2_projection_messages m
+    JOIN orchestration_v2_projection_messages m
       ON m.message_id = json_extract(r.payload_json, '$.userMessageId')
-    WHERE r.thread_id = ?1
-      AND r.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
-    ORDER BY r.ordinal";
-const LATEST_RUN_SQL: &str = "
-    SELECT r.ordinal, r.status,
-           COALESCE(substr(json_extract(m.payload_json, '$.text'), 1, length(?2)) = ?2, 0)
-    FROM orchestration_v2_projection_runs r
-    LEFT JOIN orchestration_v2_projection_messages m
-      ON m.message_id = json_extract(r.payload_json, '$.userMessageId')
-    WHERE r.thread_id = ?1
-    ORDER BY r.ordinal DESC
-    LIMIT 1";
+    WHERE r.status = 'preparing'
+      AND substr(json_extract(m.payload_json, '$.text'), 1, length(?1)) = ?1
+    ORDER BY r.thread_id, r.ordinal";
 
-/// What a T3 thread is doing, as far as holding it matters
+/// A placeholder run that a hold left in a T3 thread
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ThreadActivity {
-    /// No run is active, so a hold may start
-    Idle,
-    /// A homebased placeholder is the active run
-    Held {
-        /// The placeholder run
-        run: String,
-        /// Another run waits behind it, for example a message the user typed
-        queued_behind: bool,
-    },
-    /// Another run is active
-    Busy,
-    /// The user pressed Stop on the placeholder, and nothing has run since
-    Stopped,
-    /// Nothing may run in an archived thread where the user would see it
-    Archived,
+pub(super) struct LeftoverHold {
+    thread: String,
+    run: String,
 }
 
-/// A T3 thread's activity and the number of its latest run
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ThreadView {
-    /// What the thread is doing now
-    pub(crate) activity: ThreadActivity,
-    /// Names this idle period, so a retried hold repeats its ids and a later one differs
-    pub(crate) key: String,
+/// Id that a hold keyed by the ordinal `key` gave its placeholder message
+fn hold_message_id(thread: &str, key: i64) -> String {
+    deterministic_id("homebased-t3-hold-message", thread, &key.to_string())
 }
 
-/// Read a thread's runs from the state database
-pub(super) fn view(state: &Path, thread_id: &str) -> Result<ThreadView, String> {
+/// Whether `message` is the id a hold gave the placeholder that became run `ordinal`
+///
+/// A hold was keyed by the ordinal of the thread's latest run when it looked,
+/// usually the run just before. A run that started between that look and the
+/// dispatch pushes the placeholder further, so any earlier key counts. The
+/// match keeps the sweep off a real message that starts with [`HOLD_MARKER`]
+fn is_hold_message(thread: &str, ordinal: i64, message: &str) -> bool {
+    (0..ordinal)
+        .rev()
+        .any(|key| hold_message_id(thread, key) == message)
+}
+
+/// Placeholder runs still waiting in T3's state database
+pub(super) fn leftover(state: &Path) -> Result<Vec<LeftoverHold>, String> {
     let db = state_connection(state).map_err(|_| "T3 state cannot be read".to_string())?;
-    let read = |_| "T3 run query failed".to_string();
-    let latest = db
-        .query_row(LATEST_RUN_SQL, params![thread_id, HOLD_MARKER], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
-        .ok();
-    let mut statement = db.prepare(ACTIVE_RUNS_SQL).map_err(read)?;
-    let active = statement
-        .query_map(params![thread_id, HOLD_MARKER], |row| {
+    let mut statement = db
+        .prepare(LEFTOVER_SQL)
+        .map_err(|_| "T3 run query failed".to_string())?;
+    let candidates = statement
+        .query_map(params![HOLD_MARKER], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-        .map_err(read)?;
-
-    let key = latest
-        .as_ref()
-        .map_or_else(|| "0".to_string(), |(ordinal, ..)| ordinal.to_string());
-    let activity = if is_archived(state, thread_id) {
-        ThreadActivity::Archived
-    } else if let Some((run, _, _)) = active
-        .iter()
-        .find(|(_, status, is_hold)| *is_hold && status == "preparing")
-    {
-        ThreadActivity::Held {
-            run: run.clone(),
-            queued_behind: active.iter().any(|(other, ..)| other != run),
-        }
-    } else if !active.is_empty() {
-        ThreadActivity::Busy
-    } else if latest
-        .as_ref()
-        .is_some_and(|(_, status, is_hold)| *is_hold && status == "interrupted")
-    {
-        ThreadActivity::Stopped
-    } else {
-        ThreadActivity::Idle
-    };
-    Ok(ThreadView { activity, key })
+        .map_err(|_| "T3 run query failed".to_string())?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(thread, _, ordinal, message)| is_hold_message(thread, *ordinal, message))
+        .map(|(thread, run, ..)| LeftoverHold { thread, run })
+        .collect())
 }
 
-/// The placeholder run holding `thread_id`, if one does
-///
-/// Any doubt reads as no hold, so an unreadable state never changes how an
-/// event is delivered
-pub(super) fn active_hold(state: &Path, thread_id: &str) -> Option<String> {
-    match view(state, thread_id).ok()?.activity {
-        ThreadActivity::Held { run, .. } => Some(run),
-        _ => None,
-    }
-}
-
-/// Create the placeholder run that holds an idle thread
-///
-/// `key` names the idle period, so a repeated request creates no second hold
-pub(super) fn start(
-    origin: &str,
-    token: &str,
-    thread_id: &str,
-    text: &str,
-    key: &str,
-) -> Result<(), ApiFailure> {
-    let command_id = deterministic_id("homebased-t3-hold-command", thread_id, key);
-    let message_id = deterministic_id("homebased-t3-hold-message", thread_id, key);
-    let payload = dispatch_payload(thread_id, &command_id, &message_id, text, TurnStart::Defer);
-    dispatch(origin, token, &payload, None)
-}
-
-/// End the placeholder run `run`, so whatever waits behind it runs
-pub(super) fn interrupt(
-    origin: &str,
-    token: &str,
-    thread_id: &str,
-    run: &str,
-    reason: &str,
-) -> Result<(), ApiFailure> {
+/// End a placeholder run, so whatever queued behind it runs
+pub(super) fn end(origin: &str, token: &str, hold: &LeftoverHold) -> Result<(), ApiFailure> {
     // no `holdQueue`: that is the Stop button, and it would keep the queue from running
-    let payload: Value = json!({
+    let payload = json!({
         "type": "run.interrupt",
-        "commandId": deterministic_id("homebased-t3-hold-interrupt", thread_id, run),
-        "threadId": thread_id,
-        "runId": run,
-        "reason": reason,
+        "commandId": deterministic_id("homebased-t3-hold-interrupt", &hold.thread, &hold.run),
+        "threadId": hold.thread,
+        "runId": hold.run,
+        "reason": "homebased hold ended",
     });
     dispatch(origin, token, &payload, None)
 }
 
-/// Deliver `text` to a held thread: queue it behind the placeholder, then end the placeholder
-///
-/// Only the dispatch decides the outcome. If the interrupt fails the event
-/// stays queued and the daemon's next look at the thread sees it waiting
-/// behind the hold and ends the hold
-pub(super) fn deliver_through(
-    origin: &str,
-    token: &str,
-    thread_id: &str,
-    run: &str,
-    text: &str,
-    before_send: Option<&crate::callback::send_check::SendCheck>,
-) -> Result<(), ApiFailure> {
-    let command_id = deterministic_id("homebased-t3-command", thread_id, text);
-    let message_id = deterministic_id("homebased-t3-message", thread_id, text);
-    let payload = dispatch_payload(
-        thread_id,
-        &command_id,
-        &message_id,
-        text,
-        TurnStart::AfterActive,
-    );
-    dispatch(origin, token, &payload, before_send)?;
-    let _ = interrupt(origin, token, thread_id, run, "homebased event delivered");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
-    use super::{HOLD_MARKER, ThreadActivity, view};
-    use crate::domain::ThreadId;
+    use super::{HOLD_MARKER, hold_message_id};
+    use crate::t3::end_leftover_holds;
     use crate::t3::test_support::{
-        FakeT3Server, Fixture, SESSION_ID, T3_THREAD_ID, V2State, dispatched, live_pid, ticket,
+        FakeT3Server, Fixture, SESSION_ID, T3_THREAD_ID, dispatched, live_pid, ticket,
     };
-    use crate::t3::{ProviderThread, TurnStart, WakeOutcome, wake_thread_checked};
-
-    fn hold_text() -> String {
-        format!("{HOLD_MARKER}: build")
-    }
-
-    fn thread() -> ThreadId {
-        ThreadId(SESSION_ID.parse().unwrap())
-    }
-
-    fn activity(runs: impl FnOnce(V2State) -> V2State, archived: bool) -> ThreadActivity {
-        let fixture = Fixture::empty(None, live_pid());
-        runs(
-            fixture
-                .v2_state()
-                .thread(T3_THREAD_ID, "Thread", archived)
-                .native("codex", SESSION_ID, T3_THREAD_ID),
-        );
-        view(&fixture.userdata().join("statev2.sqlite"), T3_THREAD_ID)
-            .unwrap()
-            .activity
-    }
 
     #[test]
-    fn thread_activity_follows_its_runs() {
-        assert_eq!(activity(|state| state, false), ThreadActivity::Idle);
-        assert_eq!(
-            activity(
-                |state| state.run(T3_THREAD_ID, 1, "completed", "work"),
-                false
-            ),
-            ThreadActivity::Idle
-        );
-        assert_eq!(
-            activity(|state| state.run(T3_THREAD_ID, 1, "running", "work"), false),
-            ThreadActivity::Busy
-        );
-        // only a run that never started is a placeholder
-        assert_eq!(
-            activity(
-                |state| state.run(T3_THREAD_ID, 1, "running", &hold_text()),
-                false
-            ),
-            ThreadActivity::Busy
-        );
-        assert_eq!(
-            activity(
-                |state| state.run(T3_THREAD_ID, 1, "preparing", &hold_text()).run(
-                    T3_THREAD_ID,
-                    2,
-                    "queued",
-                    "hello"
-                ),
-                false
-            ),
-            ThreadActivity::Held {
-                run: format!("run-{T3_THREAD_ID}-1"),
-                queued_behind: true
-            }
-        );
-        assert_eq!(
-            activity(
-                |state| state.run(T3_THREAD_ID, 1, "interrupted", &hold_text()),
-                false
-            ),
-            ThreadActivity::Stopped
-        );
-        // an interrupted ordinary run is only a stopped turn, not a Stop on a hold
-        assert_eq!(
-            activity(
-                |state| state.run(T3_THREAD_ID, 1, "interrupted", "work"),
-                false
-            ),
-            ThreadActivity::Idle
-        );
-        assert_eq!(activity(|state| state, true), ThreadActivity::Archived);
-    }
-
-    fn deliver(
-        runs: impl FnOnce(V2State) -> V2State,
-    ) -> (WakeOutcome, Vec<Value>, FakeT3Server, Fixture) {
+    fn a_start_ends_only_the_placeholders_t3_never_started() {
+        let hold = format!("{HOLD_MARKER}: build");
         let responses = (0..4).flat_map(|_| [ticket(), dispatched()]).collect();
         let server = FakeT3Server::start(Some(2), responses);
         let fixture = Fixture::empty(Some(&server), live_pid());
-        runs(
-            fixture
-                .v2_state()
-                .thread(T3_THREAD_ID, "Thread", false)
-                .native("codex", SESSION_ID, T3_THREAD_ID),
-        );
-        let outcome = wake_thread_checked(
-            &fixture.env,
-            ProviderThread::Codex(thread()),
-            "task finished",
-            None,
-            TurnStart::Auto,
-        )
-        .unwrap();
-        let sent = server
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Thread", false)
+            .native("codex", SESSION_ID, T3_THREAD_ID)
+            // a Stop already ended this one
+            .run(T3_THREAD_ID, 1, "interrupted", &hold)
+            .run(T3_THREAD_ID, 2, "completed", "work")
+            .run_with_message(
+                T3_THREAD_ID,
+                3,
+                "preparing",
+                &hold,
+                &hold_message_id(T3_THREAD_ID, 2),
+            )
+            // a first request in a new thread is `preparing` while its workspace is set up
+            .run(T3_THREAD_ID, 4, "preparing", &hold)
+            // run 5 started after the hold read key 4, so its placeholder became run 6
+            .run(T3_THREAD_ID, 5, "failed", "work")
+            .run_with_message(
+                T3_THREAD_ID,
+                6,
+                "preparing",
+                &hold,
+                &hold_message_id(T3_THREAD_ID, 4),
+            );
+
+        assert_eq!(end_leftover_holds(&fixture.env), Ok(2));
+
+        let sent: Vec<Value> = server
             .requests()
             .iter()
             .filter(|request| request.method == "WS")
             .map(|request| serde_json::from_str::<Value>(&request.body).unwrap()["payload"].clone())
             .collect();
-        (outcome, sent, server, fixture)
-    }
-
-    #[test]
-    fn an_event_for_a_held_thread_is_queued_and_the_hold_interrupted() {
-        let (outcome, sent, ..) =
-            deliver(|state| state.run(T3_THREAD_ID, 1, "preparing", &hold_text()));
-
-        assert!(matches!(outcome, WakeOutcome::Woken { .. }), "{outcome:?}");
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0]["type"], "message.dispatch");
-        assert_eq!(sent[0]["text"], "task finished");
+        let ended: Vec<&Value> = sent.iter().map(|command| &command["runId"]).collect();
         assert_eq!(
-            sent[0]["dispatchMode"],
-            json!({ "type": "queue_after_active" })
+            ended,
+            [
+                &Value::from(format!("run-{T3_THREAD_ID}-3")),
+                &Value::from(format!("run-{T3_THREAD_ID}-6")),
+            ]
         );
-        assert_eq!(sent[1]["type"], "run.interrupt");
-        assert_eq!(sent[1]["runId"], format!("run-{T3_THREAD_ID}-1"));
-        assert!(sent[1].get("holdQueue").is_none());
-    }
-
-    #[test]
-    fn an_event_for_an_unheld_thread_is_delivered_as_before() {
-        let (outcome, sent, ..) = deliver(|state| state.run(T3_THREAD_ID, 1, "completed", "work"));
-
-        assert!(matches!(outcome, WakeOutcome::Woken { .. }), "{outcome:?}");
-        assert_eq!(sent.len(), 1);
-        assert_eq!(
-            sent[0]["dispatchMode"],
-            json!({ "type": "start_immediately" })
-        );
-        assert_eq!(sent[0]["deliveryIntent"], "auto");
+        assert!(sent.iter().all(
+            |command| command["type"] == "run.interrupt" && command.get("holdQueue").is_none()
+        ));
     }
 }

@@ -36,29 +36,6 @@ fn submit_then_fake_codex_receives_event() {
 }
 
 #[test]
-fn a_held_task_is_saved_and_its_event_still_reaches_a_thread_t3_does_not_own() {
-    let h = Harness::new();
-    h.set_control("report", "succeeded\nDid the work.");
-    let mut spec = Harness::spec("claude", "do the work");
-    spec["hold"] = json!(true);
-    let held = h.submit(&spec);
-    let unheld = h.submit(&Harness::spec("claude", "do other work"));
-
-    h.wait_status(&held, "succeeded");
-    h.wait_for_event(&held, "TASK_SUCCEEDED");
-    h.wait_status(&unheld, "succeeded");
-    let conn = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
-    let saved: Vec<String> = conn
-        .prepare("SELECT task_id FROM t3_hold_tasks")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(saved, vec![held]);
-}
-
-#[test]
 fn running_claude_worker_exposes_its_session_as_worker_thread() {
     let h = Harness::new();
     h.set_control("sleep", "30");

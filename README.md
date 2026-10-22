@@ -292,12 +292,8 @@ thread, which T3 shows as Waiting. A task of another thread or machine returns
 `wait_unavailable`, and so do a task submitted without a thread and a queue
 run, which has no callback route.
 
-A Codex thread cannot run a `Monitor`. Submit with `--hold` (or `"hold": true`
-in the spec) from a T3 Code Codex thread, and the daemon keeps the thread in
-T3's Working shelf while the task is pending. It adds a placeholder message
-that T3 never starts once the thread is idle, and interrupts it to deliver
-each event as a normal turn or to let a message the user sent run. The flag
-does nothing for other threads.
+A Codex thread cannot run a `Monitor`, so each event starts a new turn, and
+T3 shows the thread as idle between events.
 
 ### Launch a T3 thread on any machine
 
@@ -425,7 +421,7 @@ homebased --json task submit --spec "$spec"            # submit to the local mac
 `task run` builds a `task` spec from its flags: it runs the command after `--`
 in the current directory (`--cwd` overrides), names it after the command unless
 `--name` is given, and takes `--timeout`, `--machine`, `--after`,
-`--wait-for-machine`, `--hold`, `--dry-run`, and `--request-id`.
+`--wait-for-machine`, `--dry-run`, and `--request-id`.
 
 Always pass `--json` on data commands. Every JSON object carries `api_version: 1`. `--request-id` is an optional CLI flag for a stable retry identity; it is not a task field.
 
@@ -447,7 +443,7 @@ OpenCode agent workloads use `opencode run --standalone` with JSON events and th
 
 ### Spec
 
-Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread or Claude Code session UUID that should receive events. Submit fills in an omitted `thread`: a Homebased worker gets its parent task's thread, and anyone else gets the calling session from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`. Submitted from a plain terminal, or with `"thread": null`, a `task` or `container` workload without `hold` runs without a thread: its events are recorded and shown by `task show` and the dashboard, but no session is woken. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
+Submit specs use `api_version: 1` and a `workload` object. The required top-level `name` is a short goal label for the dashboard and events. Name the work, not the agent or the CLI. `thread` is the Codex thread or Claude Code session UUID that should receive events. Submit fills in an omitted `thread`: a Homebased worker gets its parent task's thread, and anyone else gets the calling session from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`. Submitted from a plain terminal, or with `"thread": null`, a `task` or `container` workload runs without a thread: its events are recorded and shown by `task show` and the dashboard, but no session is woken. `cwd` is the host directory the child runs in, and it must already exist on the machine that runs the task; for a `container` it is a host path, not a path inside the container. Omit `machine` to run on the local machine. Set `machine` to a Fleet machine name to run there. The remote machine checks `cwd` on its own file system. For remote agent work, `prompt_file` must be an absolute path on the submitting machine; the CLI reads the file and sends its text.
 
 `timeout` is an output-inactivity timer (default `1h`, minimum `30m`). Homebased resets it when `output.log` receives bytes. If the live child produces no output for the full timeout, Homebased sends `TASK_CHECK_DUE` and leaves the child running. Only explicit cancel, a signal, or process exit stops the child.
 

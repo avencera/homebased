@@ -170,10 +170,6 @@ struct SubmitSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "after_schema")]
     after: Option<Value>,
-    /// Keep the submitting T3 Code Codex thread in T3's Working shelf while this
-    /// task, or the chain of runs it parks, is pending. Ignored for any other thread
-    #[serde(default)]
-    hold: bool,
     /// While `machine` is unreachable, hold the task on this daemon and send
     /// it once the machine answers, instead of failing the submit
     #[serde(default)]
@@ -380,10 +376,6 @@ pub struct SubmitSpec {
     /// Origin-only: it travels beside the normalized spec, never inside it, so
     /// an executor cannot receive it
     pub after: Option<TaskDependencies>,
-    /// Keep the submitting T3 Codex thread in T3's Working shelf while the task is pending
-    ///
-    /// Origin-only, like `after`: it travels beside the normalized spec
-    pub hold: bool,
     /// Hold the task on its origin while its machine is unreachable
     ///
     /// Origin-only, like `after`: it travels beside the normalized spec
@@ -679,7 +671,7 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
     let after = wire.after.as_ref().map(parse_after).transpose()?;
     let workload = parse_submit_workload(&wire.workload)?;
     let agent = matches!(workload, SubmitWorkloadValidated::Agent(_));
-    let thread = submit_thread(wire.thread, agent, wire.hold)?;
+    let thread = submit_thread(wire.thread, agent)?;
     let machine_wait =
         parse_machine_wait(wire.wait_for_machine, wire.coalesce, wire.machine.is_some())?;
     Ok(SubmitSpec {
@@ -690,7 +682,6 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         machine: wire.machine,
         timeout: wire.timeout,
         after,
-        hold: wire.hold,
         machine_wait,
         workload,
     })
@@ -698,10 +689,9 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
 
 /// The spec thread, or [`ThreadId::DETACHED`] for a task submitted without one
 ///
-/// An agent must report to a session, and a T3 hold needs a thread to hold,
-/// so both need a thread. The nil UUID is the detached spelling, so a spec may
-/// not name it
-fn submit_thread(thread: Option<ThreadId>, agent: bool, hold: bool) -> Result<ThreadId, AppError> {
+/// An agent must report to a session, so it needs a thread. The nil UUID is
+/// the detached spelling, so a spec may not name it
+fn submit_thread(thread: Option<ThreadId>, agent: bool) -> Result<ThreadId, AppError> {
     match thread {
         Some(thread) if thread.is_detached() => Err(AppError::InvalidSpec {
             pointer: "/thread".into(),
@@ -713,11 +703,6 @@ fn submit_thread(thread: Option<ThreadId>, agent: bool, hold: bool) -> Result<Th
             pointer: "/thread".into(),
             value: Value::Null,
             message: "an agent workload needs a thread to report to".into(),
-        }),
-        None if hold => Err(AppError::InvalidSpec {
-            pointer: "/hold".into(),
-            value: json!(true),
-            message: "hold needs a thread to hold".into(),
         }),
         None => Ok(ThreadId::DETACHED),
     }

@@ -49,9 +49,6 @@ pub enum TaskCommand {
         /// Let a Homebased worker send events to a thread other than its parent task's thread
         #[arg(long)]
         allow_other_thread: bool,
-        /// Keep a T3 Code Codex thread in T3's Working shelf while the task, or the chain of runs it parks, is pending. Ignored for any other thread
-        #[arg(long)]
-        hold: bool,
     },
     /// Run a command as a `task` workload, without writing a spec.
     ///
@@ -80,9 +77,6 @@ pub enum TaskCommand {
         /// Hold the task while `--machine` is unreachable instead of failing
         #[arg(long, requires = "machine")]
         wait_for_machine: bool,
-        /// Keep a T3 Code Codex thread in T3's Working shelf while the task is pending. Ignored for any other thread
-        #[arg(long)]
-        hold: bool,
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
@@ -225,10 +219,9 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             dry_run,
             request_id,
             allow_other_thread,
-            hold,
         } => {
             let value = spec::read_spec_value(&spec)?;
-            submit_value(ctx, value, hold, dry_run, request_id, allow_other_thread).await
+            submit_value(ctx, value, dry_run, request_id, allow_other_thread).await
         }
         TaskCommand::Run {
             name,
@@ -237,7 +230,6 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             machine,
             after,
             wait_for_machine,
-            hold,
             dry_run,
             request_id,
             allow_other_thread,
@@ -252,7 +244,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
                 wait_for_machine,
                 command,
             })?;
-            submit_value(ctx, value, hold, dry_run, request_id, allow_other_thread).await
+            submit_value(ctx, value, dry_run, request_id, allow_other_thread).await
         }
         TaskCommand::Followup {
             task,
@@ -311,7 +303,6 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
 async fn submit_value(
     ctx: &Ctx,
     mut value: Value,
-    hold: bool,
     dry_run: bool,
     request_id: Option<uuid::Uuid>,
     allow_other_thread: bool,
@@ -325,7 +316,6 @@ async fn submit_value(
     let submission = Submission {
         spec: normalized,
         after: spec.after,
-        hold: hold || spec.hold,
         machine_wait: spec.machine_wait,
     };
     submit_normalized(
@@ -424,7 +414,6 @@ fn command_name(command: &[String]) -> String {
 struct Submission {
     spec: crate::spec::NormalizedSpec,
     after: Option<TaskDependencies>,
-    hold: bool,
     machine_wait: Option<MachineWait>,
 }
 
@@ -439,16 +428,8 @@ async fn submit_normalized(
     let Submission {
         spec: normalized,
         after,
-        hold,
         machine_wait,
     } = submission;
-    if hold && normalized.thread.is_detached() {
-        return Err(AppError::InvalidSpec {
-            pointer: "/hold".into(),
-            value: json!(true),
-            message: "hold needs a thread to hold".into(),
-        });
-    }
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
     }
@@ -465,9 +446,6 @@ async fn submit_normalized(
     });
     if let Some(after) = after {
         body["after"] = json!(after);
-    }
-    if hold {
-        body["hold"] = json!(true);
     }
     if let Some(wait) = machine_wait {
         body["wait_for_machine"] = json!(true);
@@ -609,7 +587,6 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
     let submission = Submission {
         spec: spec::normalize(&parsed)?,
         after: None,
-        hold: false,
         machine_wait: None,
     };
     submit_normalized(

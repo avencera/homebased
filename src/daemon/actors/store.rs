@@ -30,7 +30,7 @@ use crate::message::{
 };
 use crate::spec::NormalizedSpec;
 use crate::store::{
-    CancelResult, HeldCancel, IdentityError, LocalAdmission, PendingHold, Store, TaskPresentation,
+    CancelResult, HeldCancel, IdentityError, LocalAdmission, Store, TaskPresentation,
     UnlaunchedTask,
 };
 use crate::submission::{
@@ -549,19 +549,6 @@ pub(crate) enum StoreMsg {
         worker_thread: Option<crate::domain::ThreadId>,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
-    /// Remember that a task asked to keep its T3 thread in the Working shelf
-    MarkT3Hold {
-        id: TaskId,
-        reply: RpcReplyPort<Result<(), AppError>>,
-    },
-    /// Read held tasks that still keep their T3 thread waiting
-    PendingT3Holds {
-        reply: RpcReplyPort<Result<Vec<PendingHold>, AppError>>,
-    },
-    /// Read the threads of every held task, finished or not
-    HeldT3Threads {
-        reply: RpcReplyPort<Result<Vec<ThreadId>, AppError>>,
-    },
     /// Save a task's token usage
     RecordUsage {
         id: TaskId,
@@ -1064,9 +1051,6 @@ impl Actor for StoreActor {
                 reply,
                 state.cas_exit_with_evidence(id, from, &reason, evidence, worker_thread),
             ),
-            StoreMsg::MarkT3Hold { id, reply } => send_reply(reply, state.mark_t3_hold(id)),
-            StoreMsg::PendingT3Holds { reply } => send_reply(reply, state.pending_t3_holds()),
-            StoreMsg::HeldT3Threads { reply } => send_reply(reply, state.t3_hold_threads()),
             StoreMsg::RecordUsage { id, usage, reply } => {
                 send_reply(reply, state.record_task_usage(id, &usage));
             }

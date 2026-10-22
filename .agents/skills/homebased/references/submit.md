@@ -8,7 +8,7 @@ Leave `thread` out of the spec. `task submit`, `task run`, and `resource job sub
 
 - In a worker (`HOMEBASED_TASK_ID` is set), the parent task's thread. A worker whose parent lives on another machine gets none.
 - Otherwise the calling Codex thread or Claude Code session, from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`.
-- In a plain terminal, none: a `task` or `container` then runs without a thread, and `task wait` cannot follow it. An `agent` or `hold` needs a thread.
+- In a plain terminal, none: a `task` or `container` then runs without a thread, and `task wait` cannot follow it. An `agent` needs a thread.
 
 Set `thread` only to send events to a different session, as a UUID copied from the user or the harness, or to `null` to submit a `task` or `container` without one. An unknown id fails with `unknown_thread`, which suggests a likely typo match; see [errors.md](errors.md).
 
@@ -25,7 +25,7 @@ homebased task run --name "release build" --timeout 2h -- cargo build --release
 homebased task run --name "eval on code" --machine code --cwd ~/code/project -- just eval
 ```
 
-It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--hold`, `--dry-run`, and `--request-id` work as for `task submit`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
+It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--dry-run`, and `--request-id` work as for `task submit`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
 
 ## 2. Choose the workload
 
@@ -138,7 +138,6 @@ GitHub CI watcher as a normal task:
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
 | `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
-| `hold` | no | `true` keeps a T3 Code Codex thread in T3's Working shelf while the task is pending. Same as `task submit --hold`. No effect elsewhere. See [t3.md](t3.md). |
 | `wait_for_machine` | no | `true` holds a remote task on this daemon while `machine` is unreachable, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
 | `coalesce` | no | With `wait_for_machine`: a key of 1 to 64 ASCII letters, digits, `.`, `_`, `-`, or `:`. Once this task is accepted, older tasks with the same key and machine that still wait on this daemon are cancelled. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |

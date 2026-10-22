@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
@@ -192,8 +192,6 @@ pub(super) struct SubmitBody {
     pub(super) callback_cwd: Option<PathBuf>,
     /// Origin-only dependencies, kept beside the spec so no executor receives them
     pub(super) after: Option<TaskDependencies>,
-    /// Origin-only request to keep a T3 Codex thread in the Working shelf
-    pub(super) hold: bool,
     /// Origin-only request to hold the task while its machine is unreachable
     pub(super) machine_wait: Option<MachineWait>,
 }
@@ -224,8 +222,6 @@ struct SubmitEnvelope {
     callback_cwd: Option<PathBuf>,
     #[serde(default)]
     after: Option<Value>,
-    #[serde(default)]
-    hold: bool,
     #[serde(default)]
     wait_for_machine: bool,
     #[serde(default)]
@@ -259,13 +255,6 @@ where
             envelope.coalesce,
             spec.machine.is_some(),
         )?;
-        if envelope.hold && spec.thread.is_detached() {
-            return Err(AppError::InvalidSpec {
-                pointer: "/hold".into(),
-                value: json!(true),
-                message: "hold needs a thread to hold".into(),
-            });
-        }
         // a caller without its own request UUID gets a fresh one, so every task has a retry identity
         let request = envelope.request_id.unwrap_or_default();
         Ok(Self(SubmitBody {
@@ -274,7 +263,6 @@ where
             request,
             callback_cwd: envelope.callback_cwd,
             after,
-            hold: envelope.hold,
             machine_wait,
         }))
     }
@@ -349,13 +337,7 @@ async fn submit(
     SpecBody(body): SpecBody,
 ) -> Result<(StatusCode, Json<SubmitResponse>), AppError> {
     let request_id = body.request;
-    let hold = body.hold;
     let (id, status) = crate::daemon::dependencies::submit(&state, body).await?;
-    // a lost mark only drops the hold, and delivery then runs as it always did
-    if hold && let Err(error) = call(&state.store, |reply| StoreMsg::MarkT3Hold { id, reply }).await
-    {
-        tracing::warn!(%id, "save task hold: {error}");
-    }
     Ok((
         StatusCode::OK,
         Json(SubmitResponse {
