@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { JobRecord, Priority } from './api.ts';
+import type { JobRecord, Priority, ResourceRecord } from './api.ts';
 import {
+	busyQueues,
 	dropPlacement,
 	groupByLevel,
 	newOperationId,
@@ -149,5 +150,53 @@ test('step progress follows the job and stops at a failed run', () => {
 	assert.deepEqual(
 		[0, 1, 2].map((index) => stepProgress(cancelled, index, null)),
 		['done', 'done', 'skipped']
+	);
+});
+
+function resource(machine: string, name: string, job: string | null): ResourceRecord {
+	return {
+		machine,
+		resource: { id: `${machine}-${name}`, name, device: 0 },
+		run: job
+			? {
+					resource: `${machine}-${name}`,
+					job,
+					task: `${job}-run`,
+					run_number: 1,
+					step: 0,
+					resume: false,
+					phase: { phase: 'executing', started_at: '2026-10-03T00:00:00Z' }
+				}
+			: null
+	};
+}
+
+test('busy queues drop idle resources and machines with nothing to show', () => {
+	const busy = busyQueues([
+		{ machine: 'idle', resources: [resource('idle', 'gpu0', null)], jobs: [] },
+		{
+			machine: 'code',
+			resources: [resource('code', 'gpu0', 'run'), resource('code', 'gpu1', null)],
+			jobs: [
+				job('run', 'high', 1, { state: { state: 'active', resource: 'code-gpu0' } }),
+				job('next', 'low', 1)
+			]
+		},
+		{
+			machine: 'waiting',
+			resources: [resource('waiting', 'gpu0', null)],
+			jobs: [job('w', 'low', 1)]
+		}
+	]);
+	assert.deepEqual(
+		busy.map((queue) => [
+			queue.machine,
+			queue.held.map((record) => record.resource.name),
+			queue.waiting.map((entry) => entry.id)
+		]),
+		[
+			['code', ['gpu0'], ['next']],
+			['waiting', [], ['w']]
+		]
 	);
 });

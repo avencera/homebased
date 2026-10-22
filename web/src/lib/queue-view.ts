@@ -6,6 +6,7 @@ import type {
 	CleanupResult,
 	JobRecord,
 	JobTarget,
+	MachineQueue,
 	Placement,
 	Preemption,
 	Priority,
@@ -64,6 +65,27 @@ export function queueHasWork(
 	jobs: readonly JobRecord[]
 ): boolean {
 	return resources.some((record) => record.run !== null) || jobs.length > 0;
+}
+
+/** One machine's queue as the dashboard panel shows it: held resources and waiting jobs. */
+export interface BusyQueue {
+	machine: string;
+	/** Resources with a run, by name. */
+	held: readonly ResourceRecord[];
+	/** Jobs waiting for a resource, in serving order. */
+	waiting: readonly JobRecord[];
+}
+
+/**
+ * Machine queues that hold a resource or have a job waiting, in the order given. Idle resources
+ * are dropped so the panel spends its space on queues with work.
+ */
+export function busyQueues(queues: readonly MachineQueue[]): BusyQueue[] {
+	return queues.flatMap((queue) => {
+		const held = queue.resources.filter((record) => record.run !== null);
+		const waiting = waitingJobs(queue.jobs);
+		return held.length > 0 || waiting.length > 0 ? [{ machine: queue.machine, held, waiting }] : [];
+	});
 }
 
 /** Start of the span a phase has lasted, for an elapsed timer; null when it has none. */
