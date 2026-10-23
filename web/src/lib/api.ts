@@ -338,15 +338,54 @@ const TaskDetailSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
 	...TaskSummarySchema.fields,
 	reports: Schema.Array(TaskReportSchema),
-	/** Combined stdout and stderr of the child. */
-	output_log: Schema.String,
-	/** Task directory. */
-	evidence: Schema.String,
+	/** Combined stdout and stderr of the child. Absent until the task launches. */
+	output_log: Schema.optional(Schema.String),
+	/** Task directory. Absent until the task launches. */
+	evidence: Schema.optional(Schema.String),
 	last_event: Schema.NullOr(TaskEventSchema),
 	/** Container and its witness. Present only for container tasks. */
 	container: Schema.optional(ContainerDetailSchema)
 });
 export type TaskDetail = typeof TaskDetailSchema.Type;
+
+/**
+ * `GET /v1/tasks/{id}` for a task this machine knows only by its route, such
+ * as one another machine holds until this one accepts it. Detail and log stay
+ * on the machine that has them.
+ */
+const TaskRouteSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	id: Schema.String,
+	/** Null when the route cannot vouch for one, such as a rejected submit. */
+	status: Schema.NullOr(ProcessStatusSchema),
+	availability: Schema.Literal('detail_unavailable', 'executor_unavailable', 'rejected'),
+	origin_machine: Schema.optional(Schema.String),
+	execution_machine: Schema.optional(Schema.String),
+	/** Machine whose record answered. */
+	found_on: Schema.optional(Schema.String),
+	last_update: Schema.optional(Schema.String),
+	submission: Schema.optional(Schema.Struct({ type: Schema.String })),
+	/** Why the executor rejected the task, when it did. */
+	reason: Schema.optional(Schema.String)
+});
+export type TaskRoute = typeof TaskRouteSchema.Type;
+
+/**
+ * Whether the executor rejected the task. A machine that knows only the
+ * rejected identity reports `detail_unavailable`, so the submission decides.
+ */
+export function isRejectedRoute(route: TaskRoute): boolean {
+	return route.availability === 'rejected' || route.submission?.type === 'rejected';
+}
+
+/** Either answer of `GET /v1/tasks/{id}`. */
+const TaskRecordSchema = Schema.Union(TaskDetailSchema, TaskRouteSchema);
+export type TaskRecord = typeof TaskRecordSchema.Type;
+
+/** Whether the record carries the task's own fields rather than only its route. */
+export function isTaskDetail(record: TaskRecord): record is TaskDetail {
+	return 'name' in record;
+}
 
 /** `GET /v1/tasks/{id}/log`. */
 const LogTailSchema = Schema.Struct({
@@ -989,8 +1028,8 @@ export async function fetchThreadTitles(
 }
 
 /** `GET /v1/tasks/{id}`. */
-export function fetchTask(id: string): Promise<TaskDetail> {
-	return getJson(`/tasks/${encodeURIComponent(id)}`, TaskDetailSchema);
+export function fetchTask(id: string): Promise<TaskRecord> {
+	return getJson(`/tasks/${encodeURIComponent(id)}`, TaskRecordSchema);
 }
 
 /** `GET /v1/tasks/{id}/log?tail=N`. */

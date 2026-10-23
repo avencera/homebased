@@ -21,7 +21,15 @@
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-	import { asApiError, cancelTask, isInFlight, type ApiError } from '$lib/api';
+	import {
+		asApiError,
+		cancelTask,
+		isInFlight,
+		isRejectedRoute,
+		isTaskDetail,
+		type ApiError,
+		type TaskRoute
+	} from '$lib/api';
 	import CallbackBadge from '$lib/components/CallbackBadge.svelte';
 	import CommandArgv from '$lib/components/CommandArgv.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -46,7 +54,18 @@
 	} from '$lib/format';
 
 	const store = new TaskStore(() => page.params.id ?? '');
-	const task = $derived(store.task);
+	const record = $derived(store.task);
+	// a machine that knows the task only by its route has none of its own fields to show
+	const task = $derived(record && isTaskDetail(record) ? record : null);
+	const route = $derived(record && !isTaskDetail(record) ? record : null);
+
+	const routeNotes: Record<TaskRoute['availability'], string> = {
+		detail_unavailable:
+			'This machine knows only where the task is routed. Its details and log are on the machine that holds or runs it.',
+		executor_unavailable:
+			'The machine that runs this task is not answering, so only its route is shown.',
+		rejected: 'The machine chosen to run this task rejected it.'
+	};
 	const live = $derived(task !== null && isInFlight(task.status));
 	// a task without an origin machine was submitted on this machine
 	const threadRef = $derived(task ? { machine: task.origin_machine, thread: task.thread } : null);
@@ -128,6 +147,9 @@
 			{/if}
 		{:else}
 			<CopyPath value={page.params.id ?? ''} label={shortId(page.params.id ?? '', 13)} />
+			{#if route?.status}
+				<StatusBadge status={route.status} />
+			{/if}
 		{/if}
 		<span class="ml-auto text-muted-foreground">
 			{#if store.lastFetched}
@@ -160,6 +182,38 @@
 				&mdash; {store.error.message}
 			</span>
 		</p>
+	{/if}
+
+	{#if route}
+		<div class="mt-3 rounded border border-border bg-card px-3 py-2">
+			<p>
+				{routeNotes[isRejectedRoute(route) ? 'rejected' : route.availability]}
+				{#if route.reason}
+					<span class="font-mono text-muted-foreground">{route.reason}</span>
+				{/if}
+			</p>
+			<dl class="mt-2 grid grid-cols-[7rem_minmax(0,1fr)] gap-x-3 gap-y-1">
+				{#if route.origin_machine}
+					<dt class="text-muted-foreground">origin</dt>
+					<dd>
+						<CopyPath value={route.origin_machine} label={shortId(route.origin_machine, 13)} />
+					</dd>
+				{/if}
+				{#if route.execution_machine}
+					<dt class="text-muted-foreground">runs on</dt>
+					<dd>
+						<CopyPath
+							value={route.execution_machine}
+							label={shortId(route.execution_machine, 13)}
+						/>
+					</dd>
+				{/if}
+				{#if route.last_update}
+					<dt class="text-muted-foreground">updated</dt>
+					<dd>{formatTimestamp(route.last_update)}</dd>
+				{/if}
+			</dl>
+		</div>
 	{/if}
 
 	{#if task}
@@ -265,31 +319,35 @@
 			<dt class="text-muted-foreground">callback</dt>
 			<dd><CallbackBadge callback={task.callback} /></dd>
 
-			<dt class="text-muted-foreground">evidence</dt>
-			<dd class="flex min-w-0 items-center gap-1">
-				<a
-					href={resolve(`/files?path=${encodeURIComponent(task.evidence)}`)}
-					class="truncate font-mono text-primary hover:underline"
-					title={task.evidence}
-				>
-					{shortenHome(task.evidence)}
-				</a>
-				<CopyPath value={task.evidence} iconOnly class="relative z-10" />
-			</dd>
+			{#if task.evidence}
+				<dt class="text-muted-foreground">evidence</dt>
+				<dd class="flex min-w-0 items-center gap-1">
+					<a
+						href={resolve(`/files?path=${encodeURIComponent(task.evidence)}`)}
+						class="truncate font-mono text-primary hover:underline"
+						title={task.evidence}
+					>
+						{shortenHome(task.evidence)}
+					</a>
+					<CopyPath value={task.evidence} iconOnly class="relative z-10" />
+				</dd>
+			{/if}
 
-			<dt class="text-muted-foreground">output log</dt>
-			<dd class="flex min-w-0 items-center gap-1 sm:col-span-3">
-				<a
-					href={resolve(`/files?path=${encodeURIComponent(task.output_log)}`)}
-					target="_blank"
-					rel="noopener noreferrer"
-					class="truncate font-mono text-primary hover:underline"
-					title={task.output_log}
-				>
-					{shortenHome(task.output_log)}
-				</a>
-				<CopyPath value={task.output_log} iconOnly class="relative z-10" />
-			</dd>
+			{#if task.output_log}
+				<dt class="text-muted-foreground">output log</dt>
+				<dd class="flex min-w-0 items-center gap-1 sm:col-span-3">
+					<a
+						href={resolve(`/files?path=${encodeURIComponent(task.output_log)}`)}
+						target="_blank"
+						rel="noopener noreferrer"
+						class="truncate font-mono text-primary hover:underline"
+						title={task.output_log}
+					>
+						{shortenHome(task.output_log)}
+					</a>
+					<CopyPath value={task.output_log} iconOnly class="relative z-10" />
+				</dd>
+			{/if}
 		</dl>
 
 		<section class="mt-4">

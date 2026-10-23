@@ -14,6 +14,8 @@ import {
 	fetchStatus,
 	fetchTask,
 	isInFlight,
+	isRejectedRoute,
+	isTaskDetail,
 	type ApiError,
 	type DaemonStatus,
 	type FleetMachine,
@@ -22,8 +24,8 @@ import {
 	type LogTail,
 	type MachineQueue,
 	type ResourceRecord,
-	type TaskDetail,
-	type TaskQuery
+	type TaskQuery,
+	type TaskRecord
 } from './api';
 import { newOperationId } from './queue-view';
 
@@ -127,7 +129,7 @@ export class DaemonStore {
 /** Detail page: one task plus the tail of its output log. */
 export class TaskStore {
 	/** Last successful `GET /v1/tasks/{id}`. */
-	task = $state<TaskDetail | null>(null);
+	task = $state<TaskRecord | null>(null);
 	/** Last successful log tail. */
 	logTail = $state<LogTail | null>(null);
 	/** Error from the last attempt, cleared by the next success. */
@@ -141,7 +143,13 @@ export class TaskStore {
 	/** Plain field: reading it must not make the fetch depend on its own result. */
 	#loadedId = '';
 	/** A terminal task cannot change again, so the timer stops. */
-	#pollable = $derived(this.task === null || isInFlight(this.task.status));
+	#pollable = $derived(
+		this.task === null ||
+			(isTaskDetail(this.task)
+				? isInFlight(this.task.status)
+				: !isRejectedRoute(this.task) &&
+					(this.task.status === null || isInFlight(this.task.status)))
+	);
 
 	constructor(id: () => string) {
 		this.#id = id;
@@ -166,10 +174,21 @@ export class TaskStore {
 			this.logTail = null;
 		}
 		try {
-			const [task, logTail] = await Promise.all([fetchTask(id), fetchLogTail(id, LOG_TAIL_LINES)]);
+			// both start together; a task that has not launched has no log to miss
+			const log = fetchLogTail(id, LOG_TAIL_LINES).then(
+				(tail) => ({ ok: true as const, tail }),
+				(cause: unknown) => ({ ok: false as const, cause })
+			);
+			const task = await fetchTask(id);
+			const launched = isTaskDetail(task) && task.output_log !== undefined;
+			const result = await log;
+			// the log request can lose a race with the launch; the next poll reads it
+			if (launched && !result.ok && asApiError(result.cause).code !== 'task_not_started') {
+				throw result.cause;
+			}
 			if (generation !== this.#generation) return;
 			this.task = task;
-			this.logTail = logTail;
+			this.logTail = result.ok ? result.tail : null;
 			this.error = null;
 			this.#loadedId = id;
 		} catch (cause) {
