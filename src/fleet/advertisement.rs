@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{API_VERSION, AgentKind};
-use crate::fleet::address::MachineAddress;
+use crate::fleet::address::{DashboardUrl, MachineAddress, lenient_dashboard_url};
 use crate::fleet::protocol::{ClusterProtocolVersion, Compatibility, ProtocolRange};
 use crate::machine::{BootId, MachineId, MachineName};
 
@@ -109,6 +109,14 @@ pub struct MachineAdvertisement {
     /// Base URLs where the machine expects to be reachable. Hints only: a
     /// caller trusts an address after its own probe confirms the identity
     pub addresses: Vec<MachineAddress>,
+    /// HTTPS URL of the machine's dashboard, from `dashboard.https_url`.
+    /// Older daemons omit it
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_dashboard_url"
+    )]
+    pub dashboard_url: Option<DashboardUrl>,
 }
 
 impl MachineAdvertisement {

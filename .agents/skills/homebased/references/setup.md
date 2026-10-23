@@ -80,6 +80,7 @@ To serve the dashboard over HTTPS with `tailscale serve`, pin the content origin
 
 ```toml
 [dashboard]
+https_url = "https://<machine>.<tailnet>.ts.net:7678"   # proxied dashboard; peers link here from https pages
 content_port = 7679         # plain-HTTP content origin; omitted keeps an OS-chosen port
 content_https_port = 7680   # port the proxy serves content_port on
 ```
@@ -91,7 +92,7 @@ homebased --json config validate
 homebased daemon restart
 ```
 
-`content_port` must not be `0`; `content_https_port` requires `content_port` and must differ from it. A busy `content_port` is a warning that leaves file previews off; the daemon does not pick another port. `GET /v1/files/origin` reports `port` and `https_port` (`null` when unset); an `https:` page uses `https_port`.
+Set `https_url` on every Fleet machine with the proxy: an `https:` dashboard links a peer's tasks and queue at the peer's advertised `https_url`, and falls back to its plain-HTTP Fleet address, which browsers upgrade or block from a secure page. `content_port` must not be `0`; `content_https_port` requires `content_port` and must differ from it. A busy `content_port` is a warning that leaves file previews off; the daemon does not pick another port. `GET /v1/files/origin` reports `port` and `https_port` (`null` when unset); an `https:` page uses `https_port`.
 
 ## Upgrade
 

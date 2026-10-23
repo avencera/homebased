@@ -208,8 +208,15 @@ export function isParked(task: TaskSummary): boolean {
 /** Where a browser opens one machine's dashboard. */
 const MachineLocationSchema = Schema.Union(
 	Schema.Struct({ type: Schema.Literal('local') }),
-	/** A peer at its best-ranked address, when the daemon knows one. */
-	Schema.Struct({ type: Schema.Literal('peer'), address: Schema.NullOr(Schema.String) })
+	/**
+	 * A peer at its best-ranked address, when the daemon knows one, and the
+	 * HTTPS URL of its dashboard when it sets `dashboard.https_url`.
+	 */
+	Schema.Struct({
+		type: Schema.Literal('peer'),
+		address: Schema.NullOr(Schema.String),
+		dashboard_url: Schema.NullOr(Schema.String)
+	})
 );
 export type MachineLocation = typeof MachineLocationSchema.Type;
 
@@ -926,14 +933,28 @@ export function fetchFleetTasks(query: TaskQuery = {}): Promise<FleetTaskList> {
  * executor, so the link opens the peer's own dashboard.
  */
 export function peerTaskHref(machine: FleetMachine | undefined, id: string): string | null {
-	if (machine?.location.type !== 'peer' || !machine.location.address) return null;
-	return `${machine.location.address.replace(/\/+$/, '')}/tasks/${encodeURIComponent(id)}`;
+	const base = machine && peerDashboardBase(machine);
+	return base ? `${base}/tasks/${encodeURIComponent(id)}` : null;
 }
 
 /** Queue page on a peer's own dashboard, or null for this machine or a peer without an address. */
 export function peerQueueHref(machine: FleetMachine): string | null {
-	if (machine.location.type !== 'peer' || !machine.location.address) return null;
-	return `${machine.location.address.replace(/\/+$/, '')}/queue`;
+	const base = peerDashboardBase(machine);
+	return base ? `${base}/queue` : null;
+}
+
+/**
+ * Origin of a peer's dashboard. An https page links the peer's HTTPS proxy,
+ * because browsers upgrade or block a plain-HTTP link from a secure page and
+ * the daemon itself never speaks TLS.
+ */
+function peerDashboardBase(machine: FleetMachine): string | null {
+	const { location } = machine;
+	if (location.type !== 'peer') return null;
+	const secure = window.location.protocol === 'https:';
+	const base =
+		(secure ? location.dashboard_url : null) ?? location.address ?? location.dashboard_url;
+	return base ? base.replace(/\/+$/, '') : null;
 }
 
 /** One thread and the machine that runs it. */

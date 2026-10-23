@@ -113,6 +113,8 @@ proxy cannot be set up for ahead of time. Pin it in
 
 ```toml
 [dashboard]
+# where the proxy serves this dashboard; Fleet peers link here from https pages
+https_url = "https://<machine>.<tailnet>.ts.net:7678"
 # plain-HTTP port of the content origin; omitted keeps an OS-chosen port
 content_port = 7679
 # port where an HTTPS proxy such as tailscale serve fronts content_port
@@ -130,6 +132,13 @@ homebased daemon restart
 Open `https://<machine>.<tailnet>.ts.net:7678/`. A page served over HTTPS
 loads previews from `https://<machine>.<tailnet>.ts.net:7680/`; a page served
 over plain HTTP keeps using `content_port` directly.
+
+A machine shares its `https_url` with its Fleet peers. A dashboard opened over
+HTTPS links each peer's tasks and queue at that peer's `https_url`, because
+browsers upgrade or block a plain-HTTP link from a secure page. A peer without
+`https_url` is linked at its plain-HTTP Fleet address, which only works from a
+page opened over plain HTTP. `https_url` must be an `https://` base URL with no
+path.
 
 **Add to Home Screen** on an iPhone gives the dashboard a checklist icon named
 "Homebased" that opens full screen, from `web/static/manifest.webmanifest` and

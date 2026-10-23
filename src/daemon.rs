@@ -325,6 +325,7 @@ fn start_fleet(
         settings: settings.clone(),
         listener,
         peers_path: home.fleet_peers_path(),
+        dashboard_url: config.dashboard.https_url.clone(),
         timings: RuntimeTimings::default(),
     };
     FleetRuntime::start(start)

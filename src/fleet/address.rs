@@ -56,11 +56,7 @@ impl MachineAddress {
     /// `host:port` for the HTTP `Host` header and for connecting.
     #[must_use]
     pub fn authority(&self) -> String {
-        match &self.host {
-            AddressHost::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", self.port),
-            AddressHost::Ip(IpAddr::V4(v4)) => format!("{v4}:{}", self.port),
-            AddressHost::Name(name) => format!("{name}:{}", self.port),
-        }
+        authority_of(&self.host, self.port)
     }
 
     /// Full URL for a request path that starts with `/`.
@@ -112,17 +108,21 @@ pub enum MachineAddressError {
         /// Parser message.
         reason: String,
     },
-    /// Scheme other than `http`.
-    #[error("address {raw:?} must use http://")]
+    /// Scheme other than the one the address kind requires.
+    #[error("address {raw:?} must use {expected}://")]
     Scheme {
         /// Input text.
         raw: String,
+        /// Required scheme.
+        expected: &'static str,
     },
     /// Has a path, query, or user information.
-    #[error("address {raw:?} must be a base URL such as http://code:7677")]
+    #[error("address {raw:?} must be a base URL such as {expected}://code:7677")]
     NotBase {
         /// Input text.
         raw: String,
+        /// Required scheme.
+        expected: &'static str,
     },
 }
 
@@ -132,45 +132,65 @@ impl FromStr for MachineAddress {
     /// Parse `http://host[:port][/]`. The port defaults to the usual
     /// Homebased listener port.
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let malformed = |reason: String| MachineAddressError::Malformed {
-            raw: raw.to_string(),
-            reason,
-        };
-        let uri: Uri = raw
-            .trim()
-            .parse()
-            .map_err(|err| malformed(format!("{err}")))?;
-        if uri.scheme_str() != Some("http") {
-            return Err(MachineAddressError::Scheme {
-                raw: raw.to_string(),
-            });
-        }
-        let authority = uri
-            .authority()
-            .ok_or_else(|| malformed("missing host".into()))?;
-        let has_path = !matches!(uri.path(), "" | "/");
-        if has_path || uri.query().is_some() || authority.as_str().contains('@') {
-            return Err(MachineAddressError::NotBase {
-                raw: raw.to_string(),
-            });
-        }
-        let host = parse_host(authority.host()).ok_or_else(|| malformed("invalid host".into()))?;
-        let suffix = authority
-            .as_str()
-            .strip_prefix(authority.host())
-            .ok_or_else(|| malformed("invalid authority".into()))?;
-        let port = if suffix.is_empty() {
-            DEFAULT_PORT
-        } else {
-            let raw_port = suffix
-                .strip_prefix(':')
-                .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-                .ok_or_else(|| malformed("invalid port".into()))?;
-            raw_port
-                .parse::<u16>()
-                .map_err(|_| malformed("invalid port".into()))?
-        };
+        let (host, port) = parse_base_url(raw, "http", DEFAULT_PORT)?;
         Ok(Self { host, port })
+    }
+}
+
+/// Split a base URL with the given scheme into its host and port
+fn parse_base_url(
+    raw: &str,
+    scheme: &'static str,
+    default_port: u16,
+) -> Result<(AddressHost, u16), MachineAddressError> {
+    let malformed = |reason: String| MachineAddressError::Malformed {
+        raw: raw.to_string(),
+        reason,
+    };
+    let uri: Uri = raw
+        .trim()
+        .parse()
+        .map_err(|err| malformed(format!("{err}")))?;
+    if uri.scheme_str() != Some(scheme) {
+        return Err(MachineAddressError::Scheme {
+            raw: raw.to_string(),
+            expected: scheme,
+        });
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| malformed("missing host".into()))?;
+    let has_path = !matches!(uri.path(), "" | "/");
+    if has_path || uri.query().is_some() || authority.as_str().contains('@') {
+        return Err(MachineAddressError::NotBase {
+            raw: raw.to_string(),
+            expected: scheme,
+        });
+    }
+    let host = parse_host(authority.host()).ok_or_else(|| malformed("invalid host".into()))?;
+    let suffix = authority
+        .as_str()
+        .strip_prefix(authority.host())
+        .ok_or_else(|| malformed("invalid authority".into()))?;
+    let port = if suffix.is_empty() {
+        default_port
+    } else {
+        let raw_port = suffix
+            .strip_prefix(':')
+            .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| malformed("invalid port".into()))?;
+        raw_port
+            .parse::<u16>()
+            .map_err(|_| malformed("invalid port".into()))?
+    };
+    Ok((host, port))
+}
+
+fn authority_of(host: &AddressHost, port: u16) -> String {
+    match host {
+        AddressHost::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{port}"),
+        AddressHost::Ip(IpAddr::V4(v4)) => format!("{v4}:{port}"),
+        AddressHost::Name(name) => format!("{name}:{port}"),
     }
 }
 
@@ -207,6 +227,67 @@ impl<'de> Deserialize<'de> for MachineAddress {
         let raw = String::deserialize(deserializer)?;
         raw.parse().map_err(serde::de::Error::custom)
     }
+}
+
+/// HTTPS base URL where browsers open a machine's dashboard, such as
+/// `https://code.tail1234.ts.net:7678`
+///
+/// The daemon speaks only plain HTTP, so this names a proxy in front of it,
+/// such as `tailscale serve`. A dashboard served over HTTPS links peers here
+/// instead of their [`MachineAddress`], because browsers upgrade or block a
+/// plain-HTTP link from a secure page. The port defaults to 443
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DashboardUrl {
+    host: AddressHost,
+    port: u16,
+}
+
+impl fmt::Display for DashboardUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let authority = authority_of(&self.host, self.port);
+        // the default port reads as noise in a link the dashboard shows
+        let authority = if self.port == 443 {
+            authority.trim_end_matches(":443")
+        } else {
+            &authority
+        };
+        write!(f, "https://{authority}")
+    }
+}
+
+impl FromStr for DashboardUrl {
+    type Err = MachineAddressError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (host, port) = parse_base_url(raw, "https", 443)?;
+        Ok(Self { host, port })
+    }
+}
+
+impl Serialize for DashboardUrl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for DashboardUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Decode an optional [`DashboardUrl`] that another build wrote, dropping a
+/// value this build cannot parse
+///
+/// A peer's advertisement and the saved peer directory carry the URL as a hint
+/// for links only, so a newer peer with a looser format must not make the whole
+/// record unreadable
+pub fn lenient_dashboard_url<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DashboardUrl>, D::Error> {
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Where the peer directory learned an address, in preference order.
@@ -310,6 +391,29 @@ mod tests {
         assert!(matches!(
             "http://bad_host:7677".parse::<MachineAddress>(),
             Err(MachineAddressError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn dashboard_urls_are_https_base_urls() {
+        let parse = |raw: &str| raw.parse::<DashboardUrl>();
+        assert_eq!(
+            parse("https://Mba.Tail1234.ts.net:7678/")
+                .unwrap()
+                .to_string(),
+            "https://mba.tail1234.ts.net:7678"
+        );
+        assert_eq!(
+            parse("https://mba.tail1234.ts.net").unwrap().to_string(),
+            "https://mba.tail1234.ts.net"
+        );
+        assert!(matches!(
+            parse("http://mba:7677"),
+            Err(MachineAddressError::Scheme { .. })
+        ));
+        assert!(matches!(
+            parse("https://mba:7678/tasks"),
+            Err(MachineAddressError::NotBase { .. })
         ));
     }
 

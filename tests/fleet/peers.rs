@@ -51,6 +51,7 @@ impl Observer {
             },
             listener: None,
             peers_path: dir.path().join("fleet-peers.json"),
+            dashboard_url: None,
             timings: RuntimeTimings {
                 round_interval: Duration::from_secs(3600),
                 recheck_delay: Duration::from_millis(300),
@@ -435,4 +436,45 @@ async fn local_duplicate_identity_recovers_after_the_clone_goes_offline() {
         let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(inventory["local"]["identity"]["state"], expected);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_view_links_peers_at_their_https_dashboard() {
+    let alpha = Daemon::start("alpha", true);
+    let mut beta = Daemon::start("beta", true);
+    let mut config = fs::read_to_string(&beta.config).unwrap();
+    config.push_str("\n[dashboard]\nhttps_url = \"https://Beta.tail1234.ts.net:7678/\"\n");
+    fs::write(&beta.config, config).unwrap();
+    beta.restart();
+    wait_for_probe(&alpha.address()).await;
+    wait_for_probe(&beta.address()).await;
+
+    let output = alpha
+        .cmd()
+        .args(["--json", "fleet", "add", &beta.address().to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let response = ClusterClient::default()
+        .get(&alpha.address(), "/v1/fleet/tasks")
+        .await
+        .unwrap();
+    assert_eq!(response.status.as_u16(), 200);
+    let view: Value = serde_json::from_slice(&response.body).unwrap();
+    let peer = view["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|machine| machine["machine"] == beta.machine_id().to_string())
+        .unwrap_or_else(|| panic!("beta listed: {view}"));
+    assert_eq!(peer["location"]["address"], beta.address().to_string());
+    assert_eq!(
+        peer["location"]["dashboard_url"], "https://beta.tail1234.ts.net:7678",
+        "{view}"
+    );
 }

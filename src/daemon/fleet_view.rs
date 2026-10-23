@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use super::AppState;
-use crate::fleet::address::MachineAddress;
+use crate::fleet::address::{DashboardUrl, MachineAddress};
 use crate::fleet::directory::{PeerView, Reachability};
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::{MachineId, MachineName};
@@ -42,6 +42,8 @@ pub enum MachineLocation {
     Peer {
         /// Base URL of the peer daemon
         address: Option<MachineAddress>,
+        /// HTTPS URL of the peer's dashboard, for links from an HTTPS page
+        dashboard_url: Option<DashboardUrl>,
     },
 }
 
@@ -102,6 +104,7 @@ where
             version: peer.version.clone(),
             location: MachineLocation::Peer {
                 address: peer.addresses.first().map(|ranked| ranked.address.clone()),
+                dashboard_url: peer.dashboard_url.clone(),
             },
             read,
         });

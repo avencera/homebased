@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::web::DEFAULT_PORT;
 use crate::error::AppError;
-use crate::fleet::address::MachineAddress;
+use crate::fleet::address::{DashboardUrl, MachineAddress};
 use crate::machine::{MachineName, host_machine_name};
 use crate::notify::{Notify, NtfyConfig, NtfyTopic};
 use crate::power::{SleepPolicy, WaitingTasks};
@@ -119,13 +119,17 @@ pub struct Config {
     pub dashboard: Dashboard,
 }
 
-/// Ports of the dashboard's separate content origin
+/// Dashboard settings: the HTTPS proxy in front of it and the ports of its
+/// separate content origin
 ///
 /// The content listener serves raw file bytes on its own port so previewed
 /// files cannot read the dashboard's origin. By default the OS picks that
 /// port, which an HTTPS proxy cannot be pointed at ahead of time
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Dashboard {
+    /// HTTPS URL where a proxy serves this dashboard. Peers advertise it so
+    /// an HTTPS dashboard can link to them without a plain-HTTP hop
+    pub https_url: Option<DashboardUrl>,
     /// Plain-HTTP port the daemon binds for the content origin. `None` keeps
     /// an OS-chosen port
     pub content_port: Option<u16>,
@@ -239,6 +243,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawDashboard {
     #[serde(default)]
+    https_url: Option<String>,
+    #[serde(default)]
     content_port: Option<u16>,
     #[serde(default)]
     content_https_port: Option<u16>,
@@ -247,9 +253,14 @@ struct RawDashboard {
 impl RawDashboard {
     fn validate(self) -> Result<Dashboard, String> {
         let Self {
+            https_url,
             content_port,
             content_https_port,
         } = self;
+        let https_url = https_url
+            .map(|raw| raw.parse::<DashboardUrl>())
+            .transpose()
+            .map_err(|err| format!("dashboard.https_url: {err}"))?;
         if content_port == Some(0) {
             return Err(
                 "dashboard.content_port must not be 0; omit it for an OS-chosen port".into(),
@@ -271,6 +282,7 @@ impl RawDashboard {
             );
         }
         Ok(Dashboard {
+            https_url,
             content_port,
             content_https_port,
         })
@@ -519,9 +531,17 @@ mod tests {
         assert_eq!(
             config.dashboard,
             Dashboard {
+                https_url: None,
                 content_port: Some(7679),
                 content_https_port: Some(7680),
             }
+        );
+        let config =
+            Config::parse("[dashboard]\nhttps_url = \"https://mba.tail1234.ts.net:7678\"\n")
+                .unwrap();
+        assert_eq!(
+            config.dashboard.https_url.unwrap().to_string(),
+            "https://mba.tail1234.ts.net:7678"
         );
         let config = Config::parse("[dashboard]\ncontent_port = 7679\n").unwrap();
         assert_eq!(config.dashboard.content_https_port, None);
@@ -534,6 +554,10 @@ mod tests {
             (
                 "[dashboard]\ncontent_port = 7679\ncontent_https_port = 0\n",
                 "content_https_port must not be 0",
+            ),
+            (
+                "[dashboard]\nhttps_url = \"http://mba:7677\"\n",
+                "dashboard.https_url",
             ),
             (
                 "[dashboard]\ncontent_https_port = 7680\n",

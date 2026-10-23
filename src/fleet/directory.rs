@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::error::AppError;
-use crate::fleet::address::{AddressPreference, AddressSource, MachineAddress};
+use crate::fleet::address::{
+    AddressPreference, AddressSource, DashboardUrl, MachineAddress, lenient_dashboard_url,
+};
 use crate::fleet::advertisement::{Capabilities, MachineHeader, ProbedMachine};
 use crate::fleet::identity::{IdentityStatus, IdentityVerdict};
 use crate::fleet::protocol::{Compatibility, ProtocolRange};
@@ -125,6 +127,13 @@ struct MachineRecord {
     header: MachineHeader,
     capabilities: Option<Capabilities>,
     advertised: Vec<MachineAddress>,
+    // records saved before the field existed load without it
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_dashboard_url"
+    )]
+    dashboard_url: Option<DashboardUrl>,
     last_seen: DateTime<Utc>,
     identity: IdentityStatus,
 }
@@ -191,6 +200,10 @@ pub struct PeerView {
     pub capabilities: Option<Capabilities>,
     /// Addresses the peer advertised for itself.
     pub advertised: Vec<MachineAddress>,
+    /// HTTPS dashboard URL the peer advertised, if any. Omitted when unset,
+    /// because older daemons and CLIs decode this view strictly
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_url: Option<DashboardUrl>,
     /// Reachability now.
     pub reachability: Reachability,
     /// Identity status.
@@ -433,12 +446,13 @@ impl PeerDirectory {
             // it, the runtime reports the conflict from its probe rounds
             return;
         }
-        let (capabilities, advertised) = match probed {
+        let (capabilities, advertised, dashboard_url) = match probed {
             ProbedMachine::Compatible { advertisement, .. } => (
                 Some(advertisement.capabilities.clone()),
                 advertisement.addresses.clone(),
+                advertisement.dashboard_url.clone(),
             ),
-            ProbedMachine::Incompatible { .. } => (None, Vec::new()),
+            ProbedMachine::Incompatible { .. } => (None, Vec::new(), None),
         };
         let identity = self
             .machines
@@ -450,6 +464,7 @@ impl PeerDirectory {
                 header,
                 capabilities,
                 advertised,
+                dashboard_url,
                 last_seen: now,
                 identity,
             },
@@ -671,6 +686,7 @@ impl PeerDirectory {
             compatibility: self.local.protocol.negotiate(&record.header.protocol),
             capabilities: record.capabilities.clone(),
             advertised: record.advertised.clone(),
+            dashboard_url: record.dashboard_url.clone(),
             reachability,
             identity: record.identity.clone(),
             name_conflict,
@@ -890,6 +906,7 @@ mod tests {
                     agents: Vec::new(),
                 },
                 addresses: Vec::new(),
+                dashboard_url: None,
             },
             version: CLUSTER_PROTOCOL_VERSION,
         }

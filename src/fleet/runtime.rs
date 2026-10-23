@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Discovery, FleetSettings};
 use crate::error::AppError;
-use crate::fleet::address::MachineAddress;
+use crate::fleet::address::{DashboardUrl, MachineAddress};
 use crate::fleet::advertisement::{Capabilities, MachineAdvertisement, ProbedMachine};
 use crate::fleet::directory::{
     LocalMachine, NameTarget, PeerDirectory, PeerView, UnresolvedAddress,
@@ -88,6 +88,8 @@ pub struct FleetStart {
     pub listener: Option<SocketAddr>,
     /// `fleet-peers.json` path
     pub peers_path: PathBuf,
+    /// `dashboard.https_url`, advertised to peers
+    pub dashboard_url: Option<DashboardUrl>,
     /// Timing
     pub timings: RuntimeTimings,
 }
@@ -131,6 +133,7 @@ impl FleetRuntime {
             settings,
             listener,
             peers_path,
+            dashboard_url,
             timings,
         } = start;
         let mut directory = PeerDirectory::load(local.clone(), &peers_path)?;
@@ -144,6 +147,7 @@ impl FleetRuntime {
             protocol: local.protocol,
             capabilities: Capabilities::detect_for_daemon(),
             addresses: listener.map(advertised_addresses).unwrap_or_default(),
+            dashboard_url,
         };
         let shared = Arc::new(Shared {
             local,
@@ -696,6 +700,7 @@ mod tests {
                 agents: Vec::new(),
             },
             addresses: Vec::new(),
+            dashboard_url: None,
         };
         FleetHandle {
             shared: Arc::new(Shared {
