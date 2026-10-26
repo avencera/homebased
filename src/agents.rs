@@ -133,7 +133,7 @@ fn build_standard_agent_invocation(
         }
         AgentKind::OpenCode => unreachable!("OpenCode uses its managed invocation builder"),
     };
-    append_extra_args(&mut args, inputs.extra_args, inputs.kind);
+    append_extra_args(&mut args, inputs);
     if inputs.kind == AgentKind::Codex
         && let Some(thread) = inputs.resume_thread
     {
@@ -190,7 +190,7 @@ fn build_opencode_invocation_with_config(
         args.push("--model".into());
         args.push(model.to_string());
     }
-    append_extra_args(&mut args, inputs.extra_args, inputs.kind);
+    append_extra_args(&mut args, inputs);
 
     let config_content = config.serialized();
     let environment = ChildEnvironment::from_pairs(vec![
@@ -217,9 +217,22 @@ fn build_opencode_invocation_with_config(
     }
 }
 
-fn append_extra_args(args: &mut Vec<String>, extra_args: &[String], kind: AgentKind) {
-    let managed_flags = managed_standalone_flags(kind);
-    for extra_arg in extra_args {
+fn append_extra_args(args: &mut Vec<String>, inputs: AgentArgvInputs<'_>) {
+    let managed_flags = managed_standalone_flags(inputs.kind);
+    let managed_value_flags = managed_value_flags(inputs.kind, inputs.model.is_some());
+    let mut extra_args = inputs.extra_args.iter();
+    while let Some(extra_arg) = extra_args.next() {
+        if managed_value_flags.contains(&extra_arg.as_str()) {
+            extra_args.next();
+            continue;
+        }
+        if managed_value_flags
+            .iter()
+            .any(|flag| is_inline_value_form(extra_arg, flag))
+        {
+            continue;
+        }
+
         let is_managed = managed_flags.contains(&extra_arg.as_str());
         if is_managed && args.iter().any(|arg| arg == extra_arg) {
             continue;
@@ -240,6 +253,35 @@ fn managed_standalone_flags(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Grok => &["--always-approve", "--verbatim"],
         AgentKind::OpenCode => &["--standalone", "--auto"],
     }
+}
+
+/// Options that Homebased sets with a value and drops, with their value, from
+/// extra arguments. Codex and Grok reject a repeated option, so a caller's
+/// copy is ignored instead of failing the launch: the task's `cwd` and
+/// `model` win, and Codex workers always run with full access. Without a
+/// task model the caller's model option is kept. Claude accepts repeats,
+/// and OpenCode rejects these options when the task is submitted
+fn managed_value_flags(kind: AgentKind, has_model: bool) -> Vec<&'static str> {
+    let (always, model): (&[&str], &[&str]) = match kind {
+        AgentKind::Codex => (&["-C", "--cd", "-s", "--sandbox"], &["-m", "--model"]),
+        AgentKind::Grok => (&["--cwd"], &["-m", "--model"]),
+        AgentKind::Claude | AgentKind::OpenCode => (&[], &[]),
+    };
+    let mut flags = always.to_vec();
+    if has_model {
+        flags.extend(model);
+    }
+    flags
+}
+
+/// Whether `arg` carries the value of `flag` in the same token: `--flag=VALUE`,
+/// or `-fVALUE` and `-f=VALUE` for a short flag
+fn is_inline_value_form(arg: &str, flag: &str) -> bool {
+    let Some(rest) = arg.strip_prefix(flag) else {
+        return false;
+    };
+    let is_short = !flag.starts_with("--");
+    rest.starts_with('=') || (is_short && !rest.is_empty())
 }
 
 /// Validate agent extra arguments before a task row is created.
@@ -841,8 +883,6 @@ mod tests {
         let expected_extra: Vec<String> = [
             "--custom-before",
             "one",
-            "--cwd",
-            "/extra-cwd",
             "--model",
             "extra-model",
             "-m",
@@ -1010,6 +1050,93 @@ mod tests {
         assert!(v.contains(&"/work".to_string()));
         assert!(!v.iter().any(|a| a.contains("prompt.feed")));
         assert_eq!(argv.stdin, StdinPolicy::PromptFeed);
+    }
+
+    fn extra_argv(kind: AgentKind, model: Option<&str>, extra: &[&str]) -> Vec<String> {
+        let extra: Vec<String> = extra.iter().map(|arg| arg.to_string()).collect();
+        build_with_extra(
+            kind,
+            model,
+            Path::new("/state/tasks/id/prompt.feed.txt"),
+            &extra,
+        )
+        .to_vec()
+    }
+
+    #[test]
+    fn codex_drops_caller_copies_of_managed_value_options() {
+        let extra = [
+            "--sandbox",
+            "workspace-write",
+            "-C",
+            "/elsewhere",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "-s",
+            "read-only",
+            "--sandbox=danger-full-access",
+            "-s=read-only",
+            "-sread-only",
+            "--cd=/elsewhere",
+            "-m",
+            "gpt-other",
+            "--model=gpt-other",
+            "--skip-git-repo-check",
+            "--sandbox",
+        ];
+
+        assert_eq!(
+            extra_argv(AgentKind::Codex, Some("gpt-6-luna"), &extra),
+            vec![
+                "/bin/agent",
+                "exec",
+                "-C",
+                "/work",
+                "-s",
+                "danger-full-access",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "gpt-6-luna",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "--skip-git-repo-check",
+            ]
+        );
+    }
+
+    #[test]
+    fn caller_model_option_is_kept_without_a_task_model() {
+        for kind in [AgentKind::Codex, AgentKind::Grok] {
+            let args = extra_argv(kind, None, &["-m", "chosen", "--model=other"]);
+            assert!(args.ends_with(&["-m".into(), "chosen".into(), "--model=other".into()]));
+        }
+    }
+
+    #[test]
+    fn grok_drops_caller_copies_of_managed_value_options() {
+        let args = extra_argv(
+            AgentKind::Grok,
+            Some("grok-5"),
+            &[
+                "--cwd",
+                "/elsewhere",
+                "--model",
+                "other",
+                "--cwd=/x",
+                "-mother",
+                "--effort",
+                "high",
+            ],
+        );
+
+        assert_eq!(count_arg(&args, "--cwd"), 1);
+        assert_eq!(count_arg(&args, "-m"), 1);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("other") || arg.contains("elsewhere"))
+        );
+        assert!(args.ends_with(&["--effort".into(), "high".into()]));
     }
 
     #[test]
