@@ -142,7 +142,11 @@ path.
 
 **Add to Home Screen** on an iPhone gives the dashboard a checklist icon named
 "Homebased" that opens full screen, from `web/static/manifest.webmanifest` and
-the `web/static/icon-*.png` files beside it.
+the `web/static/icon-*.png` files beside it. The browser tab shows the same
+checklist from `web/static/favicon.svg`. Link previews in Messages, Slack, and
+other apps show the `web/static/og.png` card. Once the page loads, it points its
+`og:image` tags at the square icon, so Safari's share sheet shows the checklist
+rather than a cropped card.
 
 `content_https_port` must differ from `content_port`. With
 `HOMEBASED_WEB_LISTEN=0.0.0.0:7677` the daemon holds its ports on every

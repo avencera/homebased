@@ -9,12 +9,34 @@
 		<link rel="apple-touch-icon" href="%sveltekit.assets%/icon-180.png" />
 		<meta name="apple-mobile-web-app-capable" content="yes" />
 		<meta name="apple-mobile-web-app-title" content="Homebased" />
-		<!-- Safari's share sheet draws the touch icon small on a white tile unless the page has an
-		     og:image, which it fills its thumbnail with -->
+		<link rel="icon" href="%sveltekit.assets%/favicon-32.png" sizes="32x32" />
+		<link rel="icon" href="%sveltekit.assets%/favicon.svg" type="image/svg+xml" />
+		<meta property="og:type" content="website" />
 		<meta property="og:title" content="Homebased" />
-		<meta property="og:image" content="%sveltekit.assets%/icon-512.png" />
-		<meta property="og:image:width" content="512" />
-		<meta property="og:image:height" content="512" />
+		<meta property="og:description" content="Agent tasks from every machine, with the GPU queue" />
+		<meta property="og:image" content="%sveltekit.assets%/og.png" />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:image:alt" content="Homebased, with a list of agent tasks across machines" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<script>
+			// link previews read the card above before any script runs, but Safari's share sheet
+			// reads og:image from the live page and fills its thumbnail with it, so pointing it at the
+			// square icon shows the checklist edge to edge instead of a cropped card
+			addEventListener('load', () => {
+				const image = document.querySelector('meta[property="og:image"]');
+				if (!image) return;
+				// resolved beside the card, since a deep link such as /tasks/<id> has its own base
+				const card = new URL(image.content, document.baseURI);
+				image.content = new URL('icon-512.png', card).href;
+				const icon = { ':width': '512', ':height': '512', ':alt': 'Homebased' };
+				for (const [suffix, content] of Object.entries(icon)) {
+					document
+						.querySelector(`meta[property="og:image${suffix}"]`)
+						?.setAttribute('content', content);
+				}
+			});
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
