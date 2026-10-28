@@ -37,6 +37,7 @@ use super::rpc::{self, Exit};
 use super::{
     ApiFailure, IssueError, T3Cli, T3Env, connect, deterministic_id, state_connection, state_path,
 };
+use crate::curl::{self, CurlMethod, CurlRequest};
 
 const LAUNCH_METHOD: &str = "orchestration.launchThread";
 const LAUNCH_ERROR: &str = "OrchestrationV2ThreadLaunchError";
@@ -52,6 +53,10 @@ const PROJECTS_SQL: &str = "
     ORDER BY title, project_id";
 // projects listed in a not-found error, enough to spot the intended one
 const LISTED_PROJECTS: usize = 50;
+const PROJECT_MUTATE_PATH: &str = "/api/projects/mutate";
+const PROJECT_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+// enough of T3's schema error to name the bad field
+const REFUSAL_DETAIL_CHARS: usize = 500;
 
 /// Where a launched thread works
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +281,13 @@ pub struct ProjectSpec {
     /// Project title; T3 uses the directory name when omitted
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Icon to set or clear on the project, whether added now or already there.
+    /// Skipped when absent, so a peer that predates icons still takes plain adds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<IconChange>,
+    /// Refuse a directory that is not a project yet instead of adding it
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub existing_only: bool,
 }
 
 impl ProjectSpec {
@@ -291,8 +303,102 @@ impl ProjectSpec {
         {
             return Err("title must not be blank".into());
         }
-        Ok(())
+        if self.existing_only && self.icon.is_none() {
+            return Err("an existing project needs an icon to set or clear".into());
+        }
+        match &self.icon {
+            Some(IconChange::Set(icon)) => icon.validate(),
+            Some(IconChange::Clear) | None => Ok(()),
+        }
     }
+}
+
+/// Tile color of a Lucide or monogram project icon, as T3 names it
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum IconColor {
+    Gray,
+    Red,
+    Orange,
+    Amber,
+    Yellow,
+    Lime,
+    Green,
+    Emerald,
+    Teal,
+    Cyan,
+    Sky,
+    Blue,
+    Indigo,
+    Violet,
+    Purple,
+    Fuchsia,
+    Pink,
+    Rose,
+}
+
+/// Icon T3 shows for a project in place of its favicon, in T3's own JSON shape
+/// (`ProjectIcon` in `packages/contracts/src/orchestration.ts`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ProjectIcon {
+    /// Lucide icon by its kebab-case name, such as `audio-waveform`
+    Lucide { name: String, color: IconColor },
+    /// One emoji
+    Emoji { emoji: String },
+    /// Letters on a colored tile
+    Monogram { text: String, color: IconColor },
+}
+
+impl ProjectIcon {
+    /// Check the limits T3 enforces, so a typo fails before a token is issued.
+    /// T3 checks a Lucide name's shape but not that the icon exists
+    fn validate(&self) -> Result<(), String> {
+        // T3 counts JavaScript string length, which is UTF-16 code units
+        let within = |text: &str, max: usize| {
+            let trimmed = text.trim();
+            !trimmed.is_empty() && trimmed == text && text.encode_utf16().count() <= max
+        };
+        match self {
+            Self::Lucide { name, .. } => {
+                let kebab = name.split('-').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
+                });
+                if within(name, 64) && kebab {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Lucide icon name {name:?} must be kebab-case, such as audio-waveform"
+                    ))
+                }
+            }
+            Self::Emoji { emoji } if within(emoji, 32) => Ok(()),
+            Self::Emoji { .. } => {
+                Err("emoji must be 1 to 32 characters without spaces around it".into())
+            }
+            Self::Monogram { text, .. }
+                if within(text, 32) && text.chars().next().is_some_and(char::is_alphanumeric) =>
+            {
+                Ok(())
+            }
+            Self::Monogram { .. } => Err(
+                "monogram must start with a letter or digit and be at most 32 characters".into(),
+            ),
+        }
+    }
+}
+
+/// What to do with a project's icon
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IconChange {
+    /// Show this icon
+    Set(ProjectIcon),
+    /// Remove the icon, so T3 shows the project's favicon again
+    Clear,
 }
 
 /// A project that [`add_project`] added, or found already there
@@ -323,6 +429,15 @@ pub enum LaunchError {
     Uncertain(String),
     /// A T3 response did not match the pinned contract
     Changed(String),
+}
+
+impl From<IssueError> for LaunchError {
+    fn from(error: IssueError) -> Self {
+        match error {
+            IssueError::Unavailable(detail) => Self::Unavailable(detail),
+            IssueError::Changed(detail) => Self::Changed(detail),
+        }
+    }
 }
 
 impl From<ApiFailure> for LaunchError {
@@ -381,10 +496,11 @@ pub fn projects(env: &T3Env) -> Result<Vec<T3Project>, LaunchError> {
         .collect())
 }
 
-/// Add a directory on this machine as a T3 project
+/// Add a directory on this machine as a T3 project, then apply the spec's icon
 ///
 /// A directory that already is a project returns that project, so a retry
-/// after a lost reply adds nothing twice
+/// after a lost reply adds nothing twice. The icon applies either way, which
+/// makes a retry after a failed icon change finish the job
 pub fn add_project(env: &T3Env, spec: &ProjectSpec) -> Result<AddedProject, LaunchError> {
     spec.validate().map_err(LaunchError::Refused)?;
     let root = expand_home(&spec.path, &env.home);
@@ -401,10 +517,19 @@ pub fn add_project(env: &T3Env, spec: &ProjectSpec) -> Result<AddedProject, Laun
             .find(|project| comparable(Path::new(&project.workspace_root)) == wanted)
     };
     if let Some(project) = at_root(projects(env)?) {
+        if let Some(change) = &spec.icon {
+            set_icon(env, &project.id, change)?;
+        }
         return Ok(AddedProject {
             project,
             existed: true,
         });
+    }
+    if spec.existing_only {
+        return Err(LaunchError::Refused(format!(
+            "{} is not a T3 project; add it with `homebased t3 project add`",
+            root.display()
+        )));
     }
 
     let server = connect(&env.userdata())?;
@@ -435,10 +560,65 @@ pub fn add_project(env: &T3Env, spec: &ProjectSpec) -> Result<AddedProject, Laun
             root.display()
         ))
     })?;
+    if let Some(change) = &spec.icon {
+        set_icon(env, &project.id, change)?;
+    }
     Ok(AddedProject {
         project,
         existed: false,
     })
+}
+
+/// Set or clear a project's icon through `POST /api/projects/mutate`, the route
+/// T3's web client uses, since the `t3` CLI has no icon command. The bearer
+/// token is revoked on return
+fn set_icon(env: &T3Env, project_id: &str, change: &IconChange) -> Result<(), LaunchError> {
+    let server = connect(&env.userdata())?;
+    let cli = T3Cli::resolve(env, server.pid).map_err(LaunchError::Unavailable)?;
+    let token = cli.issue_token()?;
+
+    // `null` clears the icon; T3 leaves an absent field unchanged
+    let icon = match change {
+        IconChange::Set(icon) => json!(icon),
+        IconChange::Clear => Value::Null,
+    };
+    let update = json!({
+        "type": "project.update",
+        "commandId": Uuid::now_v7().to_string(),
+        "projectId": project_id,
+        "projectIcon": icon,
+    });
+    let response = curl::send(&CurlRequest {
+        method: CurlMethod::Post,
+        url: &format!("{}{PROJECT_MUTATE_PATH}", server.origin),
+        bearer: Some(&token.value),
+        json_body: Some(&update),
+        timeout: PROJECT_UPDATE_TIMEOUT,
+    })
+    .map_err(LaunchError::Unavailable)?;
+
+    match response.status {
+        200..=299 => Ok(()),
+        status @ (400 | 422) => {
+            // T3 answers a schema failure with an empty body
+            let detail: String = response.body.chars().take(REFUSAL_DETAIL_CHARS).collect();
+            let detail = if detail.trim().is_empty() {
+                format!("HTTP {status}")
+            } else {
+                detail
+            };
+            Err(LaunchError::Refused(format!(
+                "T3 refused the icon: {detail}"
+            )))
+        }
+        401 | 403 | 404 => Err(LaunchError::Changed(format!(
+            "T3 project update returned HTTP {} with a fresh session token",
+            response.status
+        ))),
+        status => Err(LaunchError::Unavailable(format!(
+            "T3 project update returned HTTP {status}"
+        ))),
+    }
 }
 
 /// Launch a thread in T3 on this machine
@@ -454,10 +634,7 @@ pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, L
     let userdata = env.userdata();
     let server = connect(&userdata)?;
     let cli = T3Cli::resolve(env, server.pid).map_err(LaunchError::Unavailable)?;
-    let token = cli.issue_token().map_err(|error| match error {
-        IssueError::Unavailable(detail) => LaunchError::Unavailable(detail),
-        IssueError::Changed(detail) => LaunchError::Changed(detail),
-    })?;
+    let token = cli.issue_token()?;
 
     let ids = LaunchIds::new(spec.request_id);
     let payload = launch_payload(spec, project, &model, &ids, &env.home);
@@ -779,11 +956,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::test_support::{
-        FakeResponse, FakeT3Server, Fixture, live_pid, rpc_exit, ticket,
+        FakeResponse, FakeT3Server, Fixture, TOKEN, live_pid, rpc_exit, ticket,
     };
     use super::{
-        InteractionMode, LaunchError, LaunchIds, LaunchSpec, ModelChoice, ModelOption, OptionValue,
-        ProjectSpec, RuntimeMode, Workspace, add_project, launch_thread, projects,
+        IconChange, IconColor, InteractionMode, LaunchError, LaunchIds, LaunchSpec, ModelChoice,
+        ModelOption, OptionValue, ProjectIcon, ProjectSpec, RuntimeMode, Workspace, add_project,
+        launch_thread, projects,
     };
 
     fn curl_available() -> bool {
@@ -1055,6 +1233,8 @@ mod tests {
         let spec = |path: &str| ProjectSpec {
             path: path.into(),
             title: Some(" App ".into()),
+            icon: None,
+            existing_only: false,
         };
 
         let missing = add_project(&fixture.env, &spec("~/code/missing"));
@@ -1076,5 +1256,122 @@ mod tests {
             fs::read_to_string(&log).unwrap(),
             format!("project add --title=App -- {}\n", root.display())
         );
+    }
+
+    #[test]
+    fn an_icon_change_reaches_t3_only_for_an_existing_project_and_reports_a_refusal() {
+        if !curl_available() {
+            return;
+        }
+        let server = FakeT3Server::start(
+            Some(2),
+            vec![
+                FakeResponse::http(200, &json!({ "id": "project" })),
+                FakeResponse::http(400, &json!({ "message": "Expected a project icon" })),
+            ],
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        let root = fixture.dir.path().join("code/app");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(fixture.dir.path().join("code/other")).unwrap();
+        fixture.v2_state().project("App", &root.to_string_lossy());
+        let lucide = IconChange::Set(ProjectIcon::Lucide {
+            name: "captions".into(),
+            color: IconColor::Sky,
+        });
+        let spec = |path: &str, icon: IconChange| ProjectSpec {
+            path: path.into(),
+            title: None,
+            icon: Some(icon),
+            existing_only: true,
+        };
+
+        let set = add_project(&fixture.env, &spec("~/code/app", lucide.clone())).unwrap();
+        let refused = add_project(&fixture.env, &spec("~/code/app", IconChange::Clear));
+        let not_project = add_project(&fixture.env, &spec("~/code/other", lucide));
+
+        assert!(set.existed);
+        assert!(
+            matches!(&refused, Err(LaunchError::Refused(detail)) if detail.contains("Expected a project icon")),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(&not_project, Err(LaunchError::Refused(detail)) if detail.contains("not a T3 project")),
+            "{not_project:?}"
+        );
+        // the directory that is not a project reaches T3 neither as an add nor an update
+        let updates = server.requests();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        let bodies: Vec<Value> = updates
+            .iter()
+            .map(|request| {
+                assert_eq!(request.path, "/api/projects/mutate");
+                assert!(request.headers.contains(&format!("Bearer {TOKEN}")));
+                serde_json::from_str(&request.body).unwrap()
+            })
+            .collect();
+        assert_eq!(bodies[0]["type"], "project.update");
+        assert_eq!(bodies[0]["projectId"], "project");
+        assert_eq!(
+            bodies[0]["projectIcon"],
+            json!({ "kind": "lucide", "name": "captions", "color": "sky" })
+        );
+        assert_eq!(bodies[1]["projectIcon"], Value::Null);
+        assert_eq!(fixture.revocations().len(), 2);
+    }
+
+    #[test]
+    fn icon_validation_matches_the_limits_t3_enforces() {
+        let check = |icon: ProjectIcon| {
+            ProjectSpec {
+                path: "~/code/app".into(),
+                title: None,
+                icon: Some(IconChange::Set(icon)),
+                existing_only: true,
+            }
+            .validate()
+        };
+        let lucide = |name: &str| ProjectIcon::Lucide {
+            name: name.into(),
+            color: IconColor::Violet,
+        };
+
+        assert!(check(lucide("audio-waveform")).is_ok());
+        assert!(check(lucide("Audio")).is_err());
+        assert!(check(lucide("audio--waveform")).is_err());
+        assert!(check(lucide("-audio")).is_err());
+        assert!(
+            check(ProjectIcon::Emoji {
+                emoji: "🎙️".into()
+            })
+            .is_ok()
+        );
+        assert!(
+            check(ProjectIcon::Emoji {
+                emoji: " 🎙️".into()
+            })
+            .is_err()
+        );
+        assert!(
+            check(ProjectIcon::Monogram {
+                text: "SR".into(),
+                color: IconColor::Teal
+            })
+            .is_ok()
+        );
+        assert!(
+            check(ProjectIcon::Monogram {
+                text: "-S".into(),
+                color: IconColor::Teal
+            })
+            .is_err()
+        );
+        let no_icon = ProjectSpec {
+            path: "~/code/app".into(),
+            title: None,
+            icon: None,
+            existing_only: true,
+        };
+        assert!(no_icon.validate().is_err());
     }
 }

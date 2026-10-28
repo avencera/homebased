@@ -16,8 +16,8 @@ use crate::daemon::t3_launch::{
 use crate::domain::{API_VERSION, THREAD_ENV_VARS, ThreadId};
 use crate::error::AppError;
 use crate::t3::{
-    InteractionMode, LaunchSpec, ModelChoice, ModelOption, OptionValue, ProbeReport, ProbeStatus,
-    ProjectSpec, RuntimeMode, T3Env, Workspace, probe,
+    IconChange, IconColor, InteractionMode, LaunchSpec, ModelChoice, ModelOption, OptionValue,
+    ProbeReport, ProbeStatus, ProjectIcon, ProjectSpec, RuntimeMode, T3Env, Workspace, probe,
 };
 
 use super::{Ctx, OutputMode};
@@ -50,7 +50,8 @@ pub enum T3Command {
 pub enum ProjectCommand {
     /// Add an existing directory as a T3 Code project
     ///
-    /// A directory that already is a project reports that project instead
+    /// A directory that already is a project reports that project instead,
+    /// with the icon flags applied to it
     Add {
         /// Directory on that machine: absolute, starting with `~/`, or
         /// relative to the current directory, which names the same place
@@ -59,10 +60,68 @@ pub enum ProjectCommand {
         /// Project title; the directory name when omitted
         #[arg(long)]
         title: Option<String>,
+        #[command(flatten)]
+        icon: IconArgs,
         /// Machine name or UUID; this machine when omitted
         #[arg(long)]
         machine: Option<String>,
     },
+    /// Set or clear the icon of an existing T3 Code project
+    Icon {
+        /// Project directory on that machine, as for `add`
+        path: String,
+        #[command(flatten)]
+        icon: IconArgs,
+        /// Machine name or UUID; this machine when omitted
+        #[arg(long)]
+        machine: Option<String>,
+    },
+}
+
+/// Project icon flags: `--lucide` or `--monogram` with `--color`, `--emoji`, or
+/// `--clear-icon`
+#[derive(Debug, Args)]
+pub struct IconArgs {
+    /// Lucide icon name, such as `audio-waveform`; see https://lucide.dev/icons
+    #[arg(long, value_name = "NAME")]
+    lucide: Option<String>,
+    /// Emoji icon
+    #[arg(long)]
+    emoji: Option<String>,
+    /// Letters on a colored tile
+    #[arg(long, value_name = "TEXT")]
+    monogram: Option<String>,
+    /// Tile color of a Lucide or monogram icon
+    #[arg(long, value_enum)]
+    color: Option<IconColor>,
+    /// Remove the icon, so T3 shows the project's favicon again
+    #[arg(long)]
+    clear_icon: bool,
+}
+
+impl IconArgs {
+    /// The icon change these flags ask for; `None` when they name none
+    fn change(self) -> Result<Option<IconChange>, AppError> {
+        let icon = match (
+            self.lucide,
+            self.emoji,
+            self.monogram,
+            self.color,
+            self.clear_icon,
+        ) {
+            (None, None, None, None, false) => return Ok(None),
+            (None, None, None, None, true) => return Ok(Some(IconChange::Clear)),
+            (Some(name), None, None, Some(color), false) => ProjectIcon::Lucide { name, color },
+            (None, Some(emoji), None, None, false) => ProjectIcon::Emoji { emoji },
+            (None, None, Some(text), Some(color), false) => ProjectIcon::Monogram { text, color },
+            _ => {
+                return Err(AppError::Usage {
+                    message: "give one icon: --lucide or --monogram with --color, --emoji, or --clear-icon".into(),
+                });
+            }
+        };
+        Ok(Some(IconChange::Set(icon)))
+    }
 }
 
 /// `homebased t3 launch` flags
@@ -133,8 +192,30 @@ pub async fn run(ctx: &Ctx, command: T3Command) -> Result<ExitCode, AppError> {
         T3Command::Project(ProjectCommand::Add {
             path,
             title,
+            icon,
             machine,
-        }) => add_project(ctx, path, title, machine).await,
+        }) => {
+            let spec = ProjectSpec {
+                path: project_path(path)?,
+                title,
+                icon: icon.change()?,
+                existing_only: false,
+            };
+            add_project(ctx, spec, machine).await
+        }
+        T3Command::Project(ProjectCommand::Icon {
+            path,
+            icon,
+            machine,
+        }) => {
+            let spec = ProjectSpec {
+                path: project_path(path)?,
+                title: None,
+                icon: icon.change()?,
+                existing_only: true,
+            };
+            add_project(ctx, spec, machine).await
+        }
     }
 }
 
@@ -291,24 +372,26 @@ async fn list_projects(ctx: &Ctx, machine: Option<String>) -> Result<ExitCode, A
     Ok(ExitCode::SUCCESS)
 }
 
-async fn add_project(
-    ctx: &Ctx,
-    path: String,
-    title: Option<String>,
-    machine: Option<String>,
-) -> Result<ExitCode, AppError> {
+/// A project path as the target machine reads it: absolute or under `~/`
+fn project_path(path: String) -> Result<String, AppError> {
     let path = if path.starts_with('/') || path.starts_with("~/") {
         path
     } else {
         std::path::absolute(&path)?.to_string_lossy().into_owned()
     };
+    Ok(home_relative(path))
+}
+
+/// Add a project or change an existing one's icon, as `spec` says
+async fn add_project(
+    ctx: &Ctx,
+    spec: ProjectSpec,
+    machine: Option<String>,
+) -> Result<ExitCode, AppError> {
     let request = T3ProjectAddRequest {
         api_version: API_VERSION,
         machine,
-        project: ProjectSpec {
-            path: home_relative(path),
-            title,
-        },
+        project: spec,
     };
     request
         .project
@@ -323,13 +406,18 @@ async fn add_project(
         OutputMode::Json => ctx.print_json(to_value(&response)?)?,
         OutputMode::Quiet => println!("{}", project.id),
         OutputMode::Human => {
-            let verb = if response.project.existed {
-                "already a project"
-            } else {
-                "added project"
+            let verb = match (request.project.existing_only, response.project.existed) {
+                (true, _) => "project",
+                (false, true) => "already a project",
+                (false, false) => "added project",
+            };
+            let icon = match &request.project.icon {
+                Some(IconChange::Set(_)) => ", icon set",
+                Some(IconChange::Clear) => ", icon cleared",
+                None => "",
             };
             println!(
-                "{verb}: {} on {} ({}, {})",
+                "{verb}: {} on {} ({}, {}){icon}",
                 project.title, response.machine_name, project.workspace_root, project.id
             );
         }

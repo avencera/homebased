@@ -23,7 +23,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - An agent worker with a long command submits it as its own task, reports `waiting`, and exits. On `TASK_WAITING`, do nothing.
 - Prefer a `task` workload for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
 - Use `homebased message send` for a direct message to a session, `message send --worker <task>` to steer a running Claude worker, and `task followup` to resume a finished one. Read [messages.md](references/messages.md).
-- Use `homebased t3 launch --machine <name>` to start a top-level T3 Code thread on another Fleet machine, and `homebased t3 project add <path> --machine <name>` to add a project there first. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
+- Use `homebased t3 launch --machine <name>` to start a top-level T3 Code thread on another Fleet machine, `homebased t3 project add <path> --machine <name>` to add a project there first, and `homebased t3 project icon <path> --machine <name>` to set a project's icon. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
 - Use `homebased daemon stop` or `homebased daemon restart`, never raw `systemctl` or `launchctl`, so in-flight tasks are protected.
 
 ## Route

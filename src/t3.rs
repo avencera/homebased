@@ -43,9 +43,10 @@ mod rpc;
 mod v2;
 
 pub use launch::{
-    AddedProject, InteractionMode, LaunchError, LaunchSpec, LaunchedThread,
+    AddedProject, IconChange, IconColor, InteractionMode, LaunchError, LaunchSpec, LaunchedThread,
     MESSAGE_MAX_BYTES as LAUNCH_MESSAGE_MAX_BYTES, ModelChoice, ModelOption, OptionValue,
-    ProjectSpec, RuntimeMode, T3Project, Workspace, add_project, launch_thread, projects,
+    ProjectIcon, ProjectSpec, RuntimeMode, T3Project, Workspace, add_project, launch_thread,
+    projects,
 };
 
 use std::ffi::OsString;

@@ -316,7 +316,9 @@ T3 shows the thread as idle between events.
 
 ```sh
 homebased t3 projects --machine code
-homebased t3 project add ~/code/app --machine code [--title app]
+homebased t3 project add ~/code/app --machine code [--title app] \
+  [--lucide audio-waveform --color violet | --emoji 🎙️ | --monogram AP --color teal]
+homebased t3 project icon ~/code/app --machine code --lucide captions --color sky
 homebased t3 launch --machine code --project ~/code/app \
   --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
   [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high]
@@ -338,6 +340,14 @@ the project setup script, and starts the first message.
   under that machine's home like a `~/` path. A directory that already is a
   project reports that project, so repeating the command is safe. It refuses
   with `t3_project_refused` when the directory does not exist there.
+- The icon flags set the icon T3 shows for the project in place of its
+  favicon, on a project just added or one already there: `--lucide <name>` (a
+  [Lucide](https://lucide.dev/icons) name) or `--monogram <text>`, each with
+  `--color`, or `--emoji`. `--clear-icon` removes it. `t3 project icon <path>`
+  changes only the icon and refuses a directory that is not a project yet. T3
+  checks that a Lucide name is kebab-case but not that the icon exists, so an
+  unknown name shows a blank icon. A machine whose homebased predates icons
+  refuses the request instead of ignoring the icon.
 - Without `--provider` and `--model`, the thread runs the default model from
   that machine's T3 settings. When neither the settings nor the project name
   one, the launch fails and asks for both.
