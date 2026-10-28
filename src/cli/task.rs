@@ -22,6 +22,7 @@ use crate::machine_wait::MachineWait;
 use crate::spec;
 use crate::store::Store;
 use crate::submission::RequestId;
+use crate::t3::{ProviderThread, T3Env};
 use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 
 use super::Ctx;
@@ -434,6 +435,7 @@ async fn submit_normalized(
         spec::check_spec_host(&normalized)?;
     }
     origin.check(normalized.thread, allow_other_thread)?;
+    let thread = normalized.thread;
     let env = crate::domain::TaskEnv::capture();
     let callback_cwd = std::env::current_dir()?;
     let remote = normalized.machine.is_some();
@@ -479,7 +481,40 @@ async fn submit_normalized(
         .unwrap_or_default()
         .to_string();
     ctx.print_id(&id, &format!("submitted {id}"), value)?;
+
+    // stderr keeps `--json` and `--quiet` output parseable
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let worker = std::env::var_os("HOMEBASED_TASK_ID").is_some();
+    if let Some(hint) = t3_wait_hint(&T3Env::from_env(), &id, thread, session, worker) {
+        eprintln!("{hint}");
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// How a Claude session that a T3 thread owns waits on a task it submitted
+///
+/// T3 lists the thread under Waiting only while a Monitor on `task wait` is
+/// registered with `t3_background_wait`, and agents kept skipping that step. A
+/// worker parks with `waiting` instead, and only the submitting session can wait
+/// on the task
+fn t3_wait_hint(
+    env: &T3Env,
+    task: &str,
+    thread: ThreadId,
+    session: Option<ThreadId>,
+    worker: bool,
+) -> Option<String> {
+    if worker || session != Some(thread) {
+        return None;
+    }
+    if crate::t3::owner(env, ProviderThread::Claude(thread)) != Ok(true) {
+        return None;
+    }
+    Some(format!(
+        "T3: arm Monitor on `homebased task wait {task}`, pass the Monitor's task id to t3_background_wait, and end the turn"
+    ))
 }
 
 async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<ExitCode, AppError> {
@@ -1095,9 +1130,39 @@ fn workload_label(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::retries_local_submit;
-    use crate::domain::TaskId;
+    use super::{retries_local_submit, t3_wait_hint};
+    use crate::domain::{TaskId, ThreadId};
     use crate::error::AppError;
+    use crate::t3::test_support::{FakeT3Server, Fixture, SESSION_ID, live_pid};
+
+    #[test]
+    fn t3_wait_hint_names_the_task_only_for_the_owning_claude_session() {
+        if which::which("curl").is_err() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(2), vec![]);
+        let fixture = Fixture::mapped(Some(&server), live_pid());
+        let session: ThreadId = SESSION_ID.parse().unwrap();
+        let other = ThreadId(uuid::Uuid::now_v7());
+
+        let hint = t3_wait_hint(&fixture.env, "task-1", session, Some(session), false).unwrap();
+        assert!(hint.contains("homebased task wait task-1"));
+        assert!(hint.contains("t3_background_wait"));
+
+        // a worker parks with `waiting`, and another session cannot wait on the task
+        assert_eq!(
+            t3_wait_hint(&fixture.env, "task-1", session, Some(session), true),
+            None
+        );
+        assert_eq!(
+            t3_wait_hint(&fixture.env, "task-1", session, Some(other), false),
+            None
+        );
+        assert_eq!(
+            t3_wait_hint(&fixture.env, "task-1", other, Some(other), false),
+            None
+        );
+    }
 
     #[test]
     fn local_submit_retries_only_unknown_outcomes() {
