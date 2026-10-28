@@ -247,7 +247,9 @@ const FleetTaskListSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
 	machines: Schema.Array(FleetMachineSchema),
 	/** Newest first. */
-	tasks: Schema.Array(FleetTaskSchema)
+	tasks: Schema.Array(FleetTaskSchema),
+	/** Whether the `limit` left out older tasks that pass the filter. */
+	has_more: Schema.Boolean
 });
 export type FleetTaskList = typeof FleetTaskListSchema.Type;
 
@@ -956,6 +958,8 @@ export function compactClaudeThread(session: string): Promise<CompactResult> {
 export interface TaskQuery {
 	statuses?: readonly ProcessStatus[];
 	thread?: string | null;
+	/** Keep only the newest this many tasks. */
+	limit?: number;
 }
 
 /** `GET /v1/fleet/tasks`: tasks from this machine and every reachable peer. */
@@ -963,6 +967,7 @@ export function fetchFleetTasks(query: TaskQuery = {}): Promise<FleetTaskList> {
 	const params = new URLSearchParams();
 	if (query.statuses?.length) params.set('status', query.statuses.join(','));
 	if (query.thread) params.set('thread', query.thread);
+	if (query.limit !== undefined) params.set('limit', String(query.limit));
 	const search = params.size > 0 ? `?${params}` : '';
 	return getJson(`/fleet/tasks${search}`, FleetTaskListSchema);
 }

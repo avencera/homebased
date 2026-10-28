@@ -30,7 +30,21 @@
 	const showFinished = $derived(statuses.some((status) => !isInFlight(status)));
 	const inFlightOnly = $derived(!showFinished && statuses.length === IN_FLIGHT_STATUSES.length);
 
-	const store = new DaemonStore(() => ({ statuses, thread }));
+	/** Tasks each scroll to the end adds to a list that includes finished tasks. */
+	const PAGE_SIZE = 100;
+
+	// grows as the reader scrolls; the in-flight list is short, so it reads every task
+	let limit = $derived.by(() => {
+		// any filter change starts again from one page
+		void currentFilters;
+		return PAGE_SIZE;
+	});
+
+	const store = new DaemonStore(() => ({
+		statuses,
+		thread,
+		limit: showFinished ? limit : undefined
+	}));
 	const queue = new QueueStore();
 	const showQueue = $derived(queueHasWork(queue.resources, queue.jobs));
 
@@ -100,6 +114,11 @@
 			? statuses.filter((current) => current !== status)
 			: [...statuses, status];
 		applyStatuses(next);
+	}
+
+	function loadMore() {
+		// one page at a time: wait until the current limit has been read
+		if (store.loadedLimit === limit) limit += PAGE_SIZE;
 	}
 
 	function toggleFinished() {
@@ -258,6 +277,8 @@
 			onThread={(next) => navigate({ ...currentFilters, thread: next })}
 			onProject={(next) => navigate({ ...currentFilters, project: next })}
 			threadTitle={threadTitles.title}
+			hasMore={store.hasMore}
+			onMore={loadMore}
 			class="min-h-0"
 		>
 			{#snippet empty()}

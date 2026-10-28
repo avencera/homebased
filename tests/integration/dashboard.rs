@@ -115,6 +115,44 @@ fn web_listener_serves_read_only_api() {
 }
 
 #[test]
+fn fleet_task_list_pages_from_the_newest_task() {
+    let h = Harness::with_dashboard();
+    let ids: Vec<String> = (0..3)
+        .map(|index| {
+            let id = h.submit(&Harness::spec("claude", &format!("page {index}")));
+            h.wait_status(&id, "succeeded");
+            id
+        })
+        .collect();
+    let addr = dashboard_addr(&h);
+    let page = |query: &str| -> Value {
+        let response = http_get(&addr, &format!("/v1/fleet/tasks?status=succeeded{query}"));
+        assert_eq!(response.status, 200, "{response:?}");
+        serde_json::from_str(&response.body).unwrap()
+    };
+    let listed = |body: &Value| -> Vec<String> {
+        body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["task"]["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let first = page("&limit=2");
+    assert_eq!(listed(&first), [ids[2].clone(), ids[1].clone()], "{first}");
+    assert_eq!(first["has_more"], true, "{first}");
+
+    let whole = page("&limit=3");
+    assert_eq!(listed(&whole).len(), 3, "{whole}");
+    assert_eq!(whole["has_more"], false, "{whole}");
+
+    let unlimited = page("");
+    assert_eq!(listed(&unlimited).len(), 3, "{unlimited}");
+    assert_eq!(unlimited["has_more"], false, "{unlimited}");
+}
+
+#[test]
 fn dashboard_cancels_a_running_task_from_the_same_origin_only() {
     use std::io::{Read, Write};
     use std::net::TcpStream;

@@ -843,6 +843,7 @@ async fn tasks(
     let rows = call(&state.store, |reply| StoreMsg::ListTasks {
         statuses: Vec::new(),
         thread: None,
+        limit: None,
         reply,
     })
     .await?;

@@ -35,6 +35,10 @@
 		threadTitle: (ref: ThreadRef) => string | null;
 		/** Rendered in place of rows when the list is empty. */
 		empty: Snippet;
+		/** Whether older tasks are left to load below the last row. */
+		hasMore?: boolean;
+		/** Called while the end of the list is in reach and `hasMore` holds, on scroll and after each new list. */
+		onMore?: () => void;
 		class?: string;
 	}
 
@@ -47,8 +51,29 @@
 		onProject,
 		threadTitle,
 		empty,
+		hasMore = false,
+		onMore,
 		class: className
 	}: Props = $props();
+
+	/** Distance from the end of the list at which the next page starts loading. */
+	const END_MARGIN_PX = 600;
+
+	let list = $state<HTMLElement>();
+
+	// measured rather than observed: an intersection observer still reports the end in view
+	// for a frame after new rows land, which would ask for a second page
+	function checkEnd() {
+		if (!list || !hasMore) return;
+		if (list.scrollHeight - list.scrollTop - list.clientHeight < END_MARGIN_PX) onMore?.();
+	}
+
+	$effect(() => {
+		// effects run after the DOM updates, so each new list is measured as drawn; one that
+		// still ends in view, as when a client-side filter hides most rows, asks again
+		void tasks;
+		checkEnd();
+	});
 
 	const machineById = $derived(new Map(machines.map((machine) => [machine.machine, machine])));
 
@@ -75,10 +100,12 @@
 		<span class="[grid-area:callback]">Callback</span>
 	</div>
 
-	{#if tasks.length === 0}
+	{#if tasks.length === 0 && !hasMore}
 		{@render empty()}
 	{:else}
 		<ul
+			bind:this={list}
+			onscroll={checkEnd}
 			class="scrollbar-none min-h-0 flex-1 divide-y divide-border/70 overflow-y-auto"
 			aria-label="Tasks"
 		>
@@ -191,6 +218,9 @@
 					/>
 				</li>
 			{/each}
+			{#if hasMore}
+				<li class="px-3 py-3 text-center text-muted-foreground">Loading older tasks</li>
+			{/if}
 		</ul>
 	{/if}
 </div>

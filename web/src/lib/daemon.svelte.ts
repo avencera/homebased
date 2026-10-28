@@ -80,6 +80,10 @@ export class DaemonStore {
 	machines = $state<readonly FleetMachine[]>([]);
 	/** Filtered tasks from every machine that answered, newest first. */
 	tasks = $state<readonly FleetTask[]>([]);
+	/** Whether the query's `limit` left out older tasks. */
+	hasMore = $state(false);
+	/** The `limit` that `tasks` was read with, so a reader asks for more only once it lands. */
+	loadedLimit = $state<number | undefined>(undefined);
 	/** Queued and running tasks on every machine that answered, whatever the filter. */
 	inFlight = $state<readonly FleetTask[]>([]);
 	/** Error from the last attempt, cleared by the next success. */
@@ -121,6 +125,8 @@ export class DaemonStore {
 			this.status = status;
 			this.machines = fleet.machines;
 			this.tasks = fleet.tasks;
+			this.hasMore = fleet.has_more;
+			this.loadedLimit = query.limit;
 			this.inFlight = (inFlight ?? fleet).tasks;
 			this.error = null;
 		} catch (cause) {
@@ -400,5 +406,5 @@ export class QueueControl {
 }
 
 function queryKey(query: TaskQuery): string {
-	return `${query.statuses?.join(',') ?? ''}|${query.thread ?? ''}`;
+	return `${query.statuses?.join(',') ?? ''}|${query.thread ?? ''}|${query.limit ?? ''}`;
 }

@@ -482,9 +482,21 @@ impl TaskFilter {
 ///
 /// Tasks held here, or ended here before launch, have no task row; their
 /// origin route is the only record, so they are listed from it
+/// Fleet list order: newest `created_at` first, then the larger ID
+pub(super) fn newest_first(left: &TaskSummary, right: &TaskSummary) -> std::cmp::Ordering {
+    right
+        .created_at
+        .cmp(&left.created_at)
+        .then_with(|| right.id.0.cmp(&left.id.0))
+}
+
+/// This machine's tasks that pass the filter, in ID order
+///
+/// With a `limit`, only the newest `limit` in [`newest_first`] order
 pub(super) async fn local_task_summaries(
     state: &AppState,
     filter: TaskFilter,
+    limit: Option<usize>,
 ) -> Result<Vec<TaskSummary>, AppError> {
     let processes: Vec<ProcessStatus> = filter
         .statuses
@@ -496,6 +508,7 @@ pub(super) async fn local_task_summaries(
         call(&state.store, |reply| StoreMsg::ListTasks {
             statuses: processes,
             thread: filter.thread,
+            limit,
             reply,
         })
         .await?
@@ -518,6 +531,11 @@ pub(super) async fn local_task_summaries(
             tasks.push(summary);
         }
     }
+    // unlaunched tasks have no rows, so the row limit alone can keep too many
+    if let Some(limit) = limit {
+        tasks.sort_by(newest_first);
+        tasks.truncate(limit);
+    }
     tasks.sort_by_key(|task| task.id.0);
     Ok(tasks)
 }
@@ -526,7 +544,7 @@ async fn list(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<TaskList>, AppError> {
-    let tasks = local_task_summaries(&state, TaskFilter::parse(query)?).await?;
+    let tasks = local_task_summaries(&state, TaskFilter::parse(query)?, None).await?;
     Ok(Json(TaskList {
         api_version: API_VERSION,
         tasks,

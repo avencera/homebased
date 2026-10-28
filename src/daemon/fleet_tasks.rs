@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::api::views::TaskSummary;
-use super::api::{ListQuery, TaskFilter, local_task_summaries};
+use super::api::{ListQuery, TaskFilter, local_task_summaries, newest_first};
 use super::cluster::check_api_version;
 use super::fleet_view::{FleetMachine, read_fleet};
 use super::peer_read::read_peer;
@@ -32,6 +32,8 @@ pub struct FleetTaskList {
     pub machines: Vec<FleetMachine>,
     /// One entry per task UUID, newest first
     pub tasks: Vec<FleetTask>,
+    /// Whether a `limit` left out older tasks that pass the filter
+    pub has_more: bool,
 }
 
 /// One logical task and the machine that runs it
@@ -52,6 +54,18 @@ struct ClusterTaskList {
     tasks: Vec<TaskSummary>,
 }
 
+/// `GET /v1/fleet/tasks` query: the shared filter plus a page size
+#[derive(Debug, Deserialize)]
+struct FleetTaskListQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    thread: Option<String>,
+    /// Keep only the newest `limit` tasks
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClusterTaskListQuery {
@@ -61,6 +75,8 @@ struct ClusterTaskListQuery {
     status: Option<String>,
     #[serde(default)]
     thread: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// Public read route, safe on the TCP listener
@@ -75,11 +91,20 @@ pub fn cluster_routes() -> Router<AppState> {
 
 async fn fleet_tasks(
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<FleetTaskListQuery>,
 ) -> Result<Json<FleetTaskList>, AppError> {
-    let filter = TaskFilter::parse(query)?;
-    let local_tasks = local_task_summaries(&state, filter.clone()).await?;
-    let prefix = filter.query_prefix();
+    let filter = TaskFilter::parse(ListQuery {
+        status: query.status,
+        thread: query.thread,
+    })?;
+    // one past the page from each machine, so a full page that hides older tasks
+    // still merges to more than the page
+    let machine_limit = query.limit.map(|limit| limit.saturating_add(1));
+    let local_tasks = local_task_summaries(&state, filter.clone(), machine_limit).await?;
+    let mut prefix = filter.query_prefix();
+    if let Some(limit) = machine_limit {
+        prefix.push_str(&format!("limit={limit}&"));
+    }
     let read = read_fleet(&state, local_tasks, |fleet, machine| {
         let fleet = fleet.clone();
         let path = format!(
@@ -96,10 +121,17 @@ async fn fleet_tasks(
     })
     .await;
 
+    let mut tasks = merge_records(read.answers);
+    let has_more = query.limit.is_some_and(|limit| tasks.len() > limit);
+    if let Some(limit) = query.limit {
+        tasks.truncate(limit);
+    }
+
     Ok(Json(FleetTaskList {
         api_version: API_VERSION,
         machines: read.machines,
-        tasks: merge_records(read.answers),
+        tasks,
+        has_more,
     }))
 }
 
@@ -119,7 +151,7 @@ async fn cluster_task_list(
     Ok(Json(ClusterTaskList {
         api_version: API_VERSION,
         machine: state.machine.identity.machine,
-        tasks: local_task_summaries(&state, filter).await?,
+        tasks: local_task_summaries(&state, filter, query.limit).await?,
     }))
 }
 
@@ -143,13 +175,7 @@ fn merge_records(records: Vec<(MachineId, Vec<TaskSummary>)>) -> Vec<FleetTask> 
         }
     }
     let mut tasks: Vec<FleetTask> = by_id.into_values().map(|(_, task)| task).collect();
-    tasks.sort_by(|left, right| {
-        right
-            .task
-            .created_at
-            .cmp(&left.task.created_at)
-            .then_with(|| right.task.id.0.cmp(&left.task.id.0))
-    });
+    tasks.sort_by(|left, right| newest_first(&left.task, &right.task));
     tasks
 }
 

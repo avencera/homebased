@@ -511,10 +511,11 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Option<TaskRow>, AppError>>,
     },
-    /// List with optional filters
+    /// List with optional filters, only the newest `limit` when set
     ListTasks {
         statuses: Vec<ProcessStatus>,
         thread: Option<ThreadId>,
+        limit: Option<usize>,
         reply: RpcReplyPort<Result<Vec<TaskRow>, AppError>>,
     },
     /// Read dashboard metadata for a set of task rows
@@ -1023,8 +1024,15 @@ impl Actor for StoreActor {
             StoreMsg::ListTasks {
                 statuses,
                 thread,
+                limit,
                 reply,
-            } => send_reply(reply, state.list_tasks(&statuses, thread)),
+            } => send_reply(
+                reply,
+                match limit {
+                    Some(limit) => state.list_newest_tasks(&statuses, thread, limit),
+                    None => state.list_tasks(&statuses, thread),
+                },
+            ),
             StoreMsg::TaskPresentations { ids, reply } => {
                 send_reply(reply, state.task_presentations(&ids));
             }

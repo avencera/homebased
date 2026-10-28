@@ -130,6 +130,31 @@ impl Store {
         statuses: &[ProcessStatus],
         thread: Option<ThreadId>,
     ) -> Result<Vec<TaskRow>, AppError> {
+        self.select_tasks(statuses, thread, " ORDER BY id")
+    }
+
+    /// The `limit` newest tasks that pass the filter, newest first
+    ///
+    /// Orders by `created_at` then `id`, the fleet list's order, so each machine's
+    /// page holds every one of its tasks that belongs on the merged page.
+    /// `created_at` is always written as millisecond RFC 3339 in UTC, so text order
+    /// is time order
+    pub fn list_newest_tasks(
+        &self,
+        statuses: &[ProcessStatus],
+        thread: Option<ThreadId>,
+        limit: usize,
+    ) -> Result<Vec<TaskRow>, AppError> {
+        let order = format!(" ORDER BY created_at DESC, id DESC LIMIT {limit}");
+        self.select_tasks(statuses, thread, &order)
+    }
+
+    fn select_tasks(
+        &self,
+        statuses: &[ProcessStatus],
+        thread: Option<ThreadId>,
+        order: &str,
+    ) -> Result<Vec<TaskRow>, AppError> {
         let mut sql = format!("{TASK_SELECT} WHERE 1=1");
         if !statuses.is_empty() {
             let statuses = statuses
@@ -142,7 +167,7 @@ impl Store {
         if thread.is_some() {
             sql.push_str(" AND thread_id = ?1");
         }
-        sql.push_str(" ORDER BY id");
+        sql.push_str(order);
         let mut stmt = self.conn.prepare(&sql)?;
         let thread = thread.map(|thread| thread.to_string());
         let rows = stmt
