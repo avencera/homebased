@@ -428,6 +428,34 @@ fn one_waiter_prints_task_and_job_events_and_settles_them() {
 }
 
 #[test]
+fn next_waiter_exits_after_the_first_event_and_leaves_the_rest_to_normal_delivery() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let task = h.gated("next-task");
+    let job = h.gated_job(&mut jobs, "next-job");
+    let waiter = h.spawn_wait(THREAD, &["--next", &job.to_string(), &task]);
+
+    h.release_gate("next-job");
+    let (code, lines) = waiter.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["event"], "JOB_SUCCEEDED");
+    assert_eq!(lines[0]["job"], job.to_string());
+    assert!(
+        wait_until(Duration::from_secs(10), || h.job_settled(job) == 1),
+        "the printed job event was not settled"
+    );
+
+    // nothing waits on the task any more, so its event goes out normally
+    h.release_gate("next-task");
+    assert!(wait_until(Duration::from_secs(20), || {
+        h.normally_delivered(&task).len() == 1
+    }));
+    assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+}
+
+#[test]
 fn job_waiter_on_a_delivered_job_exits_without_output() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);

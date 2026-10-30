@@ -33,6 +33,10 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(3);
 // a stream that stayed up this long was healthy, so a later outage starts a fresh budget
 const HEALTHY_AFTER: Duration = Duration::from_secs(10);
 
+// with `--next`, events the daemon already holds arrive back to back, so a
+// short pause after the first one gathers them into one wake of the agent
+const NEXT_GATHER: Duration = Duration::from_secs(1);
+
 /// Arguments of `homebased wait`
 #[derive(Debug, Args)]
 pub struct WaitArgs {
@@ -42,6 +46,10 @@ pub struct WaitArgs {
     /// Thread that submitted the tasks and jobs. Defaults to the session environment.
     #[arg(long)]
     thread: Option<ThreadId>,
+    /// Exit 0 once the next events are printed, for a background command that
+    /// reports only when it exits
+    #[arg(long)]
+    next: bool,
 }
 
 /// What the wait follows
@@ -121,10 +129,16 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
         let started = Instant::now();
         let mut printed = false;
         let end = match open(&client, &targets.request(thread)).await {
-            Ok(mut stream) => follow(&client, &mut stream, &mut targets, &mut printed).await?,
+            Ok(mut stream) => {
+                follow(&client, &mut stream, &mut targets, &mut printed, args.next).await?
+            }
             Err(error) if is_outage(&error) => StreamEnd::Lost(error.to_string()),
             Err(error) => return Err(error),
         };
+        // the agent has events to read, and reconnecting would only delay them
+        if args.next && printed {
+            return Ok(ExitCode::SUCCESS);
+        }
         let reason = match end {
             StreamEnd::Done => return Ok(ExitCode::SUCCESS),
             StreamEnd::Restart => "the daemon is restarting".to_owned(),
@@ -180,16 +194,23 @@ async fn open(client: &Client, request: &WaitRequest) -> Result<LineStream, AppE
 ///
 /// Only event lines reach stdout, because every line wakes the agent that
 /// armed the monitor. Each line is confirmed to the daemon once it is flushed,
-/// which is what lets the daemon count the event as delivered
+/// which is what lets the daemon count the event as delivered. With `next`,
+/// the stream ends shortly after the first event
 async fn follow(
     client: &Client,
     stream: &mut LineStream,
     targets: &mut Targets,
     printed: &mut bool,
+    next: bool,
 ) -> Result<StreamEnd, AppError> {
     let mut waiter = None;
+    let mut gather_until: Option<Instant> = None;
     loop {
-        let line = match tokio::time::timeout(IDLE_LIMIT, stream.next_line()).await {
+        let limit = gather_until.map_or(IDLE_LIMIT, |until| {
+            until.saturating_duration_since(Instant::now())
+        });
+        let line = match tokio::time::timeout(limit, stream.next_line()).await {
+            Err(_) if gather_until.is_some() => return Ok(StreamEnd::Done),
             Err(_) => return Ok(StreamEnd::Lost("the daemon went quiet".into())),
             Ok(Err(error)) if is_outage(&error) => return Ok(StreamEnd::Lost(error.to_string())),
             Ok(Err(error)) => return Err(error),
@@ -243,6 +264,9 @@ async fn follow(
         }
         if matches!(targets, Targets::Resolved(set) if set.is_done()) {
             return Ok(StreamEnd::Done);
+        }
+        if next && *printed && gather_until.is_none() {
+            gather_until = Some(Instant::now() + NEXT_GATHER);
         }
     }
 }

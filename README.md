@@ -294,7 +294,7 @@ After 3 days the event is marked failed and is written to
 ### Wait for tasks and jobs in a T3 thread
 
 ```sh
-homebased wait <id> [<id> ...]
+homebased wait [--next] <id> [<id> ...]
 ```
 
 `homebased wait` takes task ids and GPU queue job ids alike and works out which
@@ -307,15 +307,19 @@ daemon gives those events to it in place of normal delivery. It counts an
 event delivered only once the command confirms it printed the line, so an
 event the command never confirmed goes through normal delivery after about 5
 seconds, possibly as a repeat. It reconnects silently across a daemon restart
-for up to 5 minutes. It is meant for a Claude Code `Monitor` in a T3 Code
-thread, which T3 shows as Waiting. A task of another thread or machine and a
+for up to 5 minutes. With `--next`, it exits 0 about a second after it prints
+the first event, together with any that arrived in that second. It is meant
+for a background Bash command with `--next` in a Claude Code session in a T3
+Code thread, which T3 shows as Waiting. A Claude Code `Monitor` is killed
+after at most 30 minutes and wakes the thread each time, while a background
+command runs for up to 2 hours and wakes it only when it exits. A task of another thread or machine and a
 job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran
 here, which has no callback route. An id that is not a task or job submitted
 from this machine returns `wait_target_not_found`.
 
-A Codex thread cannot run a `Monitor`, so each event starts a new turn, and
+A Codex thread cannot run a background command that wakes it, so each event starts a new turn, and
 T3 shows the thread as idle between events.
 
 ### Launch a T3 thread on any machine

@@ -491,10 +491,12 @@ pub(super) fn print_t3_wait_hint(id: &str, thread: ThreadId) {
 
 /// How a Claude session that a T3 thread owns waits on a task or job it submitted
 ///
-/// T3 lists the thread under Waiting only while a Monitor on `homebased wait` is
-/// registered with `t3_background_wait`, and agents kept skipping that step. A
-/// worker parks with `waiting` instead, and only the submitting session can wait
-/// on the work
+/// T3 lists the thread under Waiting only while a background `homebased wait`
+/// is registered with `t3_background_wait`, and agents kept skipping that step.
+/// A background command rather than a Monitor, because a Monitor expires after
+/// 30 minutes and wakes the thread each time, which a queued GPU job turns into
+/// hours of empty turns. A worker parks with `waiting` instead, and only the
+/// submitting session can wait on the work
 fn t3_wait_hint(
     env: &T3Env,
     id: &str,
@@ -509,7 +511,7 @@ fn t3_wait_hint(
         return None;
     }
     Some(format!(
-        "T3: arm Monitor on `homebased wait {id}`, pass the Monitor's task id to t3_background_wait, and end the turn"
+        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn; when it exits, handle its events and start it again until the final event"
     ))
 }
 
@@ -1142,7 +1144,7 @@ mod tests {
         let other = ThreadId(uuid::Uuid::now_v7());
 
         let hint = t3_wait_hint(&fixture.env, "task-1", session, Some(session), false).unwrap();
-        assert!(hint.contains("`homebased wait task-1`"), "{hint}");
+        assert!(hint.contains("`homebased wait --next task-1`"), "{hint}");
         assert!(hint.contains("t3_background_wait"));
 
         // a worker parks with `waiting`, and another session cannot wait on the task

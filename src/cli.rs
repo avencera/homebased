@@ -119,9 +119,10 @@ pub enum Command {
     /// and `resource job submit` print, 1 to 16 in total. Each must have been
     /// submitted from this session on this machine.
     ///
-    /// Arm this with Claude Code's Monitor tool in a T3 Code thread. While it runs,
-    /// the events of these tasks and jobs reach the agent through this command's
-    /// stdout instead of starting a new turn, and T3 shows the thread as waiting.
+    /// Run this with `--next` as a background Bash command of Claude Code in a T3
+    /// Code thread. While it runs, the events of these tasks and jobs reach the
+    /// agent through this command's stdout instead of starting a new turn, and T3
+    /// shows the thread as waiting.
     /// Each event is one `HOMEBASED_EVENT` line, the same line normal delivery
     /// sends, and nothing else is printed to stdout. An event counts as delivered
     /// once its line is printed; one that is not printed goes through normal
@@ -130,7 +131,8 @@ pub enum Command {
     /// A task's wait follows `TASK_WAITING` to its continuation run. A job's wait
     /// ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events
     /// are printed and the wait goes on. Rides out a daemon restart and exits 0
-    /// once every task and job has ended.
+    /// once every task and job has ended, or with `--next` about a second after
+    /// the first event it prints.
     Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),

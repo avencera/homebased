@@ -146,7 +146,7 @@ homebased --json resource job cancel "$job" --operation-id "$cancel"
 
 ## Job events
 
-Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callbacks. In a Claude Code session in a T3 Code thread, arm a Monitor with `homebased wait "$job"` right after submit to receive them in the live session ([t3.md](t3.md#waiting-in-a-claude-thread)). Deduplicate by `(job, seq)`, never by the run task UUID or event name. The sequence starts at 1. Delivery is at-least-once and ordered per job. Failed delivery stays pending and retries. Intermediate successful steps do not send callbacks. Run tasks have no ordinary task callback route.
+Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callbacks. In a Claude Code session in a T3 Code thread, start `homebased wait --next "$job"` as a background Bash command right after submit to receive them in the live session ([t3.md](t3.md#waiting-in-a-claude-thread)). Deduplicate by `(job, seq)`, never by the run task UUID or event name. The sequence starts at 1. Delivery is at-least-once and ordered per job. Failed delivery stays pending and retries. Intermediate successful steps do not send callbacks. Run tasks have no ordinary task callback route.
 
 | Event | Action |
 | --- | --- |
