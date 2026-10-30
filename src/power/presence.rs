@@ -47,6 +47,8 @@ impl WaitingTasks {
 pub const IN_USE_FOR: Duration = Duration::from_secs(120);
 
 /// How often the daemon samples user activity
+// only the macOS sampler and the tests read it; other hosts never sample
+#[cfg(any(target_os = "macos", test))]
 const SAMPLE_EVERY: Duration = Duration::from_secs(10);
 
 /// A longer gap between samples means the host slept, so use starts over
