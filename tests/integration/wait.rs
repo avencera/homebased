@@ -1,8 +1,9 @@
-//! `task wait` streams callback events to a Monitor in place of normal delivery
+//! `homebased wait` streams callback events to a Monitor in place of normal delivery
 
 use super::resource_jobs::{Jobs, callbacks, spec, wait_callbacks};
 use super::{Harness, THREAD, event_json, wait_until};
 use homebased::client::{Client, LineStream};
+use homebased::domain::TaskId;
 use homebased::queue::JobId;
 use homebased::store::Store;
 use homebased::task_wait::WAIT_ROUTE;
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 const OTHER_THREAD: &str = "01a0ab97-a7aa-7463-a5b0-8d500e40e432";
 
-/// A running `homebased task wait` and the stdout lines it has printed
+/// A running `homebased wait` and the stdout lines it has printed
 struct Waiter {
     child: Child,
     lines: Receiver<String>,
@@ -64,17 +65,21 @@ struct SilentWaiter {
 }
 
 impl SilentWaiter {
+    fn frame(&mut self) -> Value {
+        let line = self
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(20), self.stream.next_line()).await
+            })
+            .expect("no frame arrived")
+            .unwrap()
+            .expect("the stream ended");
+        serde_json::from_slice(&line).unwrap()
+    }
+
     fn event(&mut self) -> Value {
         loop {
-            let line = self
-                .runtime
-                .block_on(async {
-                    tokio::time::timeout(Duration::from_secs(20), self.stream.next_line()).await
-                })
-                .expect("no frame arrived")
-                .unwrap()
-                .expect("the stream ended");
-            let frame: Value = serde_json::from_slice(&line).unwrap();
+            let frame = self.frame();
             if frame["type"] == "event" {
                 return frame;
             }
@@ -83,24 +88,33 @@ impl SilentWaiter {
 }
 
 impl Harness {
-    fn open_silent_wait(&self, task: &str) -> SilentWaiter {
+    /// Post a raw wait request body, as any client version would
+    fn open_raw_wait(&self, body: &Value) -> SilentWaiter {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let client = Client::new(self.home.join("homebased.sock"));
-        let body = json!({ "thread": THREAD, "tasks": [task] });
         let stream = runtime
-            .block_on(client.post_lines(WAIT_ROUTE, &body))
+            .block_on(client.post_lines(WAIT_ROUTE, body))
             .unwrap();
         SilentWaiter { runtime, stream }
     }
 
+    /// A wait in the `{thread, tasks}` shape older clients send
+    fn open_silent_wait(&self, task: &str) -> SilentWaiter {
+        self.open_raw_wait(&json!({ "thread": THREAD, "tasks": [task] }))
+    }
+
     fn spawn_wait(&self, thread: &str, args: &[&str]) -> Waiter {
+        self.spawn_waiter(thread, &["wait"], args)
+    }
+
+    fn spawn_waiter(&self, thread: &str, command: &[&str], args: &[&str]) -> Waiter {
         let mut child = self
             .cmd()
             .env("CODEX_THREAD_ID", thread)
-            .args(["task", "wait"])
+            .args(command)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -216,25 +230,25 @@ fn waiter_on_a_task_that_ended_and_was_delivered_exits_without_output() {
 }
 
 #[test]
-fn waiter_is_refused_for_a_task_of_another_thread_or_an_unknown_task() {
+fn waiter_is_refused_for_a_task_of_another_thread_or_an_unknown_id() {
     let h = Harness::new();
     let task = h.gated("refused");
-    let unknown = homebased::domain::TaskId::new().to_string();
+    let unknown = TaskId::new().to_string();
 
-    for (thread, id, code) in [
-        (OTHER_THREAD, &task, "wait_unavailable"),
-        (THREAD, &unknown, "task_not_found"),
+    for (thread, id, code, exit) in [
+        (OTHER_THREAD, &task, "wait_unavailable", 5),
+        (THREAD, &unknown, "wait_target_not_found", 3),
     ] {
         let out = h
             .cmd()
             .env("CODEX_THREAD_ID", thread)
-            .args(["--json", "task", "wait", id])
+            .args(["--json", "wait", id])
             .output()
             .unwrap();
         assert!(out.stdout.is_empty());
         let error: Value = serde_json::from_slice(&out.stderr).unwrap();
         assert_eq!(error["error"]["code"], code, "{error}");
-        assert_ne!(out.status.code(), Some(0));
+        assert_eq!(out.status.code(), Some(exit), "{error}");
     }
     h.release_gate("refused");
     h.wait_for_event(&task, "TASK_SUCCEEDED");
@@ -370,7 +384,7 @@ fn waiter_names_a_task_submitted_without_a_thread() {
     let out = h
         .cmd()
         .env("CODEX_THREAD_ID", THREAD)
-        .args(["--json", "task", "wait", &task])
+        .args(["--json", "wait", &task])
         .output()
         .unwrap();
 
@@ -386,7 +400,8 @@ fn one_waiter_prints_task_and_job_events_and_settles_them() {
     let mut jobs = Jobs::new(&h);
     let task = h.gated("mixed-task");
     let job = h.gated_job(&mut jobs, "mixed-job");
-    let waiter = h.spawn_wait(THREAD, &[&task, "--job", &job.to_string()]);
+    // the daemon works out which id is the task and which the job
+    let waiter = h.spawn_wait(THREAD, &[&job.to_string(), &task]);
 
     h.release_gate("mixed-job");
     let line = waiter.next_line();
@@ -419,38 +434,82 @@ fn job_waiter_on_a_delivered_job_exits_without_output() {
     let job = jobs.submit(&spec(&h, "medium", "wait", "exit 0"));
     assert_eq!(wait_callbacks(&h, job, 1)[0]["event"], "JOB_SUCCEEDED");
 
-    let (code, lines) = h.spawn_wait(THREAD, &["--job", &job.to_string()]).finish();
+    let (code, lines) = h.spawn_wait(THREAD, &[&job.to_string()]).finish();
 
     assert_eq!(code, 0);
     assert!(lines.is_empty(), "{lines:?}");
 }
 
 #[test]
-fn waiter_names_a_job_given_as_a_task_and_refuses_an_unknown_job() {
+fn the_old_task_wait_name_still_waits_on_tasks_and_jobs() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let job = h.gated_job(&mut jobs, "job-as-task").to_string();
-    let unknown = JobId::new().to_string();
+    let task = h.gated("alias-task");
+    let job = h.gated_job(&mut jobs, "alias-job");
+    let waiter = h.spawn_waiter(THREAD, &["task", "wait"], &[&task, &job.to_string()]);
 
-    for (args, code) in [
-        (vec![job.as_str()], "wait_target_is_job"),
-        (vec!["--job", unknown.as_str()], "job_not_found"),
-    ] {
-        let out = h
-            .cmd()
-            .env("CODEX_THREAD_ID", THREAD)
-            .args(["--json", "task", "wait"])
-            .args(&args)
-            .output()
-            .unwrap();
-        assert!(out.stdout.is_empty());
-        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(error["error"]["code"], code, "{error}");
-        assert_ne!(out.status.code(), Some(0));
-        if code == "wait_target_is_job" {
-            let message = error["error"]["message"].as_str().unwrap();
-            assert!(message.contains(&format!("--job {job}")), "{message}");
-        }
-    }
-    h.release_gate("job-as-task");
+    h.release_gate("alias-job");
+    assert_eq!(waiter.next_line()["event"], "JOB_SUCCEEDED");
+    h.release_gate("alias-task");
+    let (code, rest) = waiter.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert_eq!(rest[0]["task"], task);
+}
+
+#[test]
+fn an_old_style_task_request_keeps_its_frames_and_a_bare_id_request_learns_the_kinds() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let task = h.gated("shapes-task");
+    let job = h.gated_job(&mut jobs, "shapes-job");
+
+    // clients that predate bare ids read every frame with `deny_unknown_fields`
+    let mut old = h.open_silent_wait(&task);
+    let open = old.frame();
+    assert_eq!(open["type"], "open", "{open}");
+    let mut fields: Vec<&String> = open.as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["type", "waiter"], "{open}");
+    drop(old);
+
+    let mut new = h.open_raw_wait(&json!({ "thread": THREAD, "ids": [job, task] }));
+    let open = new.frame();
+    assert_eq!(
+        open["targets"],
+        json!([{ "job": job }, { "task": task }]),
+        "{open}"
+    );
+    drop(new);
+
+    h.release_gate("shapes-task");
+    h.release_gate("shapes-job");
+    h.wait_for_event(&task, "TASK_SUCCEEDED");
+}
+
+#[test]
+fn an_id_that_names_both_a_task_and_a_job_is_refused() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let task = h.gated("both-task");
+    // job ids are chosen by the submitter, so one can reuse a task's id
+    let job = jobs.submit_as(
+        JobId::from_uuid(task.parse().unwrap()),
+        &spec(&h, "medium", "wait", "exit 0"),
+    );
+    assert_eq!(job.to_string(), task);
+
+    let out = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["--json", "wait", &task])
+        .output()
+        .unwrap();
+
+    assert!(out.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "wait_target_ambiguous", "{error}");
+    assert_eq!(error["error"]["input"]["id"], task, "{error}");
+    h.release_gate("both-task");
 }

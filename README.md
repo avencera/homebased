@@ -294,10 +294,11 @@ After 3 days the event is marked failed and is written to
 ### Wait for tasks and jobs in a T3 thread
 
 ```sh
-homebased task wait <task-id> [<task-id> ...] [--job <job-id> ...]
+homebased wait <id> [<id> ...]
 ```
 
-`task wait` streams the `HOMEBASED_EVENT` line of each callback event for 1 to
+`homebased wait` takes task ids and GPU queue job ids alike and works out which
+is which. It streams the `HOMEBASED_EVENT` line of each callback event for 1 to
 16 of this thread's tasks and GPU queue jobs to stdout and exits 0 once every
 target has its final outcome. A task follows `TASK_WAITING` to the continuation
 run. A job ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other
@@ -311,8 +312,8 @@ thread, which T3 shows as Waiting. A task of another thread or machine and a
 job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran
-here, which has no callback route. A job id passed as a task returns
-`wait_target_is_job`.
+here, which has no callback route. An id that is not a task or job submitted
+from this machine returns `wait_target_not_found`.
 
 A Codex thread cannot run a `Monitor`, so each event starts a new turn, and
 T3 shows the thread as idle between events.

@@ -19,7 +19,6 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
-use crate::queue::JobId;
 use crate::spec;
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -29,7 +28,6 @@ use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 use super::Ctx;
 
 mod usage;
-mod wait;
 
 pub use usage::UsageGrouping;
 
@@ -158,24 +156,10 @@ pub enum TaskCommand {
         #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
         by: UsageGrouping,
     },
-    /// Print each callback event of tasks and GPU queue jobs as it arrives, until all of them end.
-    ///
-    /// Arm this with Claude Code's Monitor tool in a T3 Code thread. Events of
-    /// these tasks and jobs then reach the agent through this command's stdout
-    /// instead of a new turn, and T3 shows the thread as waiting while it runs.
-    /// Follows waiting chains and rides out a daemon restart. A job's wait ends
-    /// on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events are
-    /// printed and the wait goes on. Name 1 to 16 tasks and jobs in total.
-    Wait {
-        /// Full task UUIDs.
-        tasks: Vec<TaskId>,
-        /// GPU queue job id from `resource job submit`. Repeat for more jobs.
-        #[arg(long = "job", value_name = "JOB_ID")]
-        jobs: Vec<JobId>,
-        /// Thread that submitted the tasks and jobs. Defaults to the session environment.
-        #[arg(long)]
-        thread: Option<ThreadId>,
-    },
+    /// Old name of `homebased wait`, kept for sessions that still use it.
+    /// Remove it once no running thread does (avencera/homebased#6).
+    #[command(hide = true)]
+    Wait(super::wait::WaitArgs),
     /// Cancel a task. Idempotent if already terminal.
     Cancel {
         /// Full task UUID.
@@ -282,11 +266,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::Show { id } => show(ctx, id).await,
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
-        TaskCommand::Wait {
-            tasks,
-            jobs,
-            thread,
-        } => wait::wait(ctx, tasks, jobs, thread).await,
+        TaskCommand::Wait(args) => super::wait::wait(ctx, args).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,
@@ -497,27 +477,27 @@ async fn submit_normalized(
 
 /// Print how to wait on work this session just submitted, when T3 owns it
 ///
-/// `target` is what follows `homebased task wait`: a task id, or `--job <id>`
-pub(super) fn print_t3_wait_hint(target: &str, thread: ThreadId) {
+/// `id` is the task or job id that follows `homebased wait`
+pub(super) fn print_t3_wait_hint(id: &str, thread: ThreadId) {
     let session = std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .and_then(|value| value.parse().ok());
     let worker = std::env::var_os("HOMEBASED_TASK_ID").is_some();
     // stderr keeps `--json` and `--quiet` output parseable
-    if let Some(hint) = t3_wait_hint(&T3Env::from_env(), target, thread, session, worker) {
+    if let Some(hint) = t3_wait_hint(&T3Env::from_env(), id, thread, session, worker) {
         eprintln!("{hint}");
     }
 }
 
 /// How a Claude session that a T3 thread owns waits on a task or job it submitted
 ///
-/// T3 lists the thread under Waiting only while a Monitor on `task wait` is
+/// T3 lists the thread under Waiting only while a Monitor on `homebased wait` is
 /// registered with `t3_background_wait`, and agents kept skipping that step. A
 /// worker parks with `waiting` instead, and only the submitting session can wait
 /// on the work
 fn t3_wait_hint(
     env: &T3Env,
-    target: &str,
+    id: &str,
     thread: ThreadId,
     session: Option<ThreadId>,
     worker: bool,
@@ -529,7 +509,7 @@ fn t3_wait_hint(
         return None;
     }
     Some(format!(
-        "T3: arm Monitor on `homebased task wait {target}`, pass the Monitor's task id to t3_background_wait, and end the turn"
+        "T3: arm Monitor on `homebased wait {id}`, pass the Monitor's task id to t3_background_wait, and end the turn"
     ))
 }
 
@@ -656,7 +636,7 @@ fn followup_unavailable(task: TaskId, reason: crate::error::FollowupBlocker) -> 
 }
 
 /// `explicit`, else `default`, which the caller picks for its context
-fn select_thread(
+pub(super) fn select_thread(
     explicit: Option<ThreadId>,
     default: Option<ThreadId>,
 ) -> Result<ThreadId, AppError> {
@@ -1162,7 +1142,7 @@ mod tests {
         let other = ThreadId(uuid::Uuid::now_v7());
 
         let hint = t3_wait_hint(&fixture.env, "task-1", session, Some(session), false).unwrap();
-        assert!(hint.contains("homebased task wait task-1"));
+        assert!(hint.contains("`homebased wait task-1`"), "{hint}");
         assert!(hint.contains("t3_background_wait"));
 
         // a worker parks with `waiting`, and another session cannot wait on the task

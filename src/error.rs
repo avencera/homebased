@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::callback::destination::ThreadSuggestion;
 use crate::dependency::DependencyOutcome;
@@ -77,7 +78,7 @@ pub enum AppError {
     /// A task's events cannot be streamed to this waiter
     #[error("cannot wait on task {task}: {reason}")]
     WaitUnavailable {
-        /// Task named by `task wait`
+        /// Task named by `wait`
         task: TaskId,
         /// Why this waiter cannot take its events
         reason: WaitBlocker,
@@ -85,16 +86,24 @@ pub enum AppError {
     /// A job's events cannot be streamed to this waiter
     #[error("cannot wait on job {job}: {reason}")]
     JobWaitUnavailable {
-        /// Job named by `task wait --job`
+        /// Job named by `wait`
         job: JobId,
         /// Why this waiter cannot take its events
         reason: JobWaitBlocker,
     },
-    /// `task wait` named a GPU queue job where a task belongs
-    #[error("{job} is a GPU queue job, not a task; pass it with --job {job}")]
-    WaitTargetIsJob {
-        /// Job named as a task
-        job: JobId,
+    /// `wait` named an id that is neither a task nor a GPU queue job known here
+    // its own code because `task_not_found` callers expect a task id in `input.id`
+    // and a message about tasks only
+    #[error("{id} is not a task or GPU queue job submitted from this machine")]
+    WaitTargetNotFound {
+        /// Id that matched neither
+        id: Uuid,
+    },
+    /// `wait` named an id that is both a task and a GPU queue job
+    #[error("{id} is both a task and a GPU queue job, so wait cannot tell which one to follow")]
+    WaitTargetAmbiguous {
+        /// Id that matched both
+        id: Uuid,
     },
     /// A task's worker cannot take a direct message
     #[error("the worker for task {task} cannot take a message: {reason}")]
@@ -567,7 +576,7 @@ pub enum FollowupBlocker {
     NoWorkerThread,
 }
 
-/// Why `task wait` cannot take a task's events
+/// Why `homebased wait` cannot take a task's events
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
 )]
@@ -593,7 +602,7 @@ pub enum WaitBlocker {
     NoCallbackRoute,
 }
 
-/// Why `task wait --job` cannot take a job's events
+/// Why `homebased wait` cannot take a job's events
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
 )]
@@ -648,7 +657,8 @@ impl AppError {
             Self::FollowupUnavailable { .. } => "followup_unavailable",
             // one code for both target kinds; `input` names a task or a job
             Self::WaitUnavailable { .. } | Self::JobWaitUnavailable { .. } => "wait_unavailable",
-            Self::WaitTargetIsJob { .. } => "wait_target_is_job",
+            Self::WaitTargetNotFound { .. } => "wait_target_not_found",
+            Self::WaitTargetAmbiguous { .. } => "wait_target_ambiguous",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
@@ -741,7 +751,7 @@ impl AppError {
             | Self::NotifyNotConfigured => 2,
             Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
-            | Self::WaitTargetIsJob { .. }
+            | Self::WaitTargetNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
             | Self::UnknownDependency { .. }
@@ -770,7 +780,8 @@ impl AppError {
             | Self::EventContentConflict { .. }
             | Self::DuplicateMachineIdentity { .. }
             | Self::DuplicateMachineName { .. }
-            | Self::ClusterProtocolIncompatible { .. } => 5,
+            | Self::ClusterProtocolIncompatible { .. }
+            | Self::WaitTargetAmbiguous { .. } => 5,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
             | Self::MessageConflict { .. } => 5,
@@ -806,7 +817,7 @@ impl AppError {
             Self::NotifyNotConfigured => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
-            | Self::WaitTargetIsJob { .. }
+            | Self::WaitTargetNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
             | Self::UnknownDependency { .. }
@@ -841,7 +852,8 @@ impl AppError {
             | Self::EventContentConflict { .. }
             | Self::DuplicateMachineIdentity { .. }
             | Self::DuplicateMachineName { .. }
-            | Self::ClusterProtocolIncompatible { .. } => http::StatusCode::CONFLICT,
+            | Self::ClusterProtocolIncompatible { .. }
+            | Self::WaitTargetAmbiguous { .. } => http::StatusCode::CONFLICT,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
             | Self::MessageConflict { .. } => http::StatusCode::CONFLICT,
@@ -898,7 +910,9 @@ impl AppError {
                 json!({ "task": task, "reason": reason })
             }
             Self::JobWaitUnavailable { job, reason } => json!({ "job": job, "reason": reason }),
-            Self::WaitTargetIsJob { job } => json!({ "job": job }),
+            Self::WaitTargetNotFound { id } | Self::WaitTargetAmbiguous { id } => {
+                json!({ "id": id })
+            }
             Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }

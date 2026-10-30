@@ -53,7 +53,7 @@ impl Client {
     /// POST JSON and read the response body as it arrives, line by line
     ///
     /// The stream has no overall timeout: a long-lived response such as
-    /// `task wait` ends when the daemon ends it. A non-success status is an
+    /// `homebased wait` ends when the daemon ends it. A non-success status is an
     /// error, as for `post`
     pub async fn post_lines(&self, path: &str, body: &Value) -> Result<LineStream, AppError> {
         let res = self.send("POST", path, Some(body)).await?;
@@ -285,9 +285,13 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
-        "wait_target_is_job" => decode_field(input, "job")
-            .map_or(AppError::Internal { message }, |job| {
-                AppError::WaitTargetIsJob { job }
+        "wait_target_not_found" => decode_field(input, "id")
+            .map_or(AppError::Internal { message }, |id| {
+                AppError::WaitTargetNotFound { id }
+            }),
+        "wait_target_ambiguous" => decode_field(input, "id")
+            .map_or(AppError::Internal { message }, |id| {
+                AppError::WaitTargetAmbiguous { id }
             }),
         "worker_message_unavailable" => {
             let task = decode_field(input, "task");
@@ -632,6 +636,12 @@ mod tests {
             },
             AppError::TaskNotFound {
                 id: crate::domain::TaskId::new(),
+            },
+            AppError::WaitTargetNotFound {
+                id: uuid::Uuid::now_v7(),
+            },
+            AppError::WaitTargetAmbiguous {
+                id: uuid::Uuid::now_v7(),
             },
             AppError::WorkerMessageUnavailable {
                 task: crate::domain::TaskId::new(),

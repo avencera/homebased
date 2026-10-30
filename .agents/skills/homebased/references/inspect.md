@@ -70,10 +70,10 @@ The local daemon reads `output.log` on the execution machine. For a remote task,
 ## Wait
 
 ```bash
-homebased task wait <task-id> [<task-id> ...] [--job <job-id> ...]    # 1-16 ids in total, no duplicates
+homebased wait <id> [<id> ...]    # task or job ids, 1-16 in total, no duplicates
 ```
 
-Streams one `HOMEBASED_EVENT {...}` line per callback event of tasks and GPU queue jobs this session submitted, follows `TASK_WAITING` to the continuation run, and exits 0 when every target has its final outcome. A job's final outcome is `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. It takes those events in place of normal delivery while it runs, and an event it did not print goes through normal delivery after about 5 seconds. It reconnects silently across a daemon restart for up to 5 minutes. A task of another thread or machine, a job of another thread, a queue run that ran on this machine, a task or job submitted without a thread, and a job the queue refused or has not confirmed return `wait_unavailable`. An unknown task returns `task_not_found`, a job not submitted from this machine returns `job_not_found`, a job id passed as a task returns `wait_target_is_job`, and a malformed id list is a usage error. It is meant for the `Monitor` tool of a Claude Code session in a T3 Code thread; [t3.md](t3.md) has the full contract.
+Takes task ids and GPU queue job ids alike; the daemon works out which is which. Streams one `HOMEBASED_EVENT {...}` line per callback event of tasks and GPU queue jobs this session submitted, follows `TASK_WAITING` to the continuation run, and exits 0 when every target has its final outcome. A job's final outcome is `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. It takes those events in place of normal delivery while it runs, and an event it did not print goes through normal delivery after about 5 seconds. It reconnects silently across a daemon restart for up to 5 minutes. A task of another thread or machine, a job of another thread, a queue run that ran on this machine, a task or job submitted without a thread, and a job the queue refused or has not confirmed return `wait_unavailable`. An id that is not a task or job submitted from this machine returns `wait_target_not_found`, and a malformed id list is a usage error. It is meant for the `Monitor` tool of a Claude Code session in a T3 Code thread; [t3.md](t3.md) has the full contract.
 
 ## Usage
 

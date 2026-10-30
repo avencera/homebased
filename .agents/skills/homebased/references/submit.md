@@ -8,7 +8,7 @@ Leave `thread` out of the spec. `task submit`, `task run`, and `resource job sub
 
 - In a worker (`HOMEBASED_TASK_ID` is set), the parent task's thread. A worker whose parent lives on another machine gets none.
 - Otherwise the calling Codex thread or Claude Code session, from `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or `CLAUDE_CODE_SESSION_ID`.
-- In a plain terminal, none: a `task` or `container` then runs without a thread, and `task wait` cannot follow it. An `agent` needs a thread.
+- In a plain terminal, none: a `task` or `container` then runs without a thread, and `homebased wait` cannot follow it. An `agent` needs a thread.
 
 Set `thread` only to send events to a different session, as a UUID copied from the user or the harness, or to `null` to submit a `task` or `container` without one. An unknown id fails with `unknown_thread`, which suggests a likely typo match; see [errors.md](errors.md).
 

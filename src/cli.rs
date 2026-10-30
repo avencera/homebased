@@ -9,6 +9,7 @@ pub mod resource;
 pub mod t3;
 pub mod task;
 pub mod update;
+pub mod wait;
 
 use crate::domain::API_VERSION;
 use std::io::{self, IsTerminal, Write};
@@ -112,6 +113,25 @@ pub enum Command {
         #[command(subcommand)]
         command: t3::T3Command,
     },
+    /// Print each callback event of tasks and GPU queue jobs as it arrives, until all of them end
+    ///
+    /// Takes task ids and job ids alike, such as the ids `task run`, `task submit`,
+    /// and `resource job submit` print, 1 to 16 in total. Each must have been
+    /// submitted from this session on this machine.
+    ///
+    /// Arm this with Claude Code's Monitor tool in a T3 Code thread. While it runs,
+    /// the events of these tasks and jobs reach the agent through this command's
+    /// stdout instead of starting a new turn, and T3 shows the thread as waiting.
+    /// Each event is one `HOMEBASED_EVENT` line, the same line normal delivery
+    /// sends, and nothing else is printed to stdout. An event counts as delivered
+    /// once its line is printed; one that is not printed goes through normal
+    /// delivery after a few seconds.
+    ///
+    /// A task's wait follows `TASK_WAITING` to its continuation run. A job's wait
+    /// ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events
+    /// are printed and the wait goes on. Rides out a daemon restart and exits 0
+    /// once every task and job has ended.
+    Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
     /// Print the version
@@ -273,6 +293,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
+        Command::Wait(args) => wait::wait(&ctx, args).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {
             version(&ctx)?;
