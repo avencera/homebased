@@ -75,8 +75,8 @@ export interface BusyQueue {
 	held: readonly ResourceRecord[];
 	/** Jobs waiting for a resource, in serving order. */
 	waiting: readonly JobRecord[];
-	/** The machine's only resource, idle or not, so the panel can name it once beside the machine. */
-	sole: ResourceRecord | null;
+	/** Every resource on the machine, idle or not; one alone needs no name in the panel. */
+	resourceCount: number;
 }
 
 /**
@@ -87,9 +87,8 @@ export function busyQueues(queues: readonly MachineQueue[]): BusyQueue[] {
 	return queues.flatMap((queue) => {
 		const held = queue.resources.filter((record) => record.run !== null);
 		const waiting = waitingJobs(queue.jobs);
-		const sole = queue.resources.length === 1 ? queue.resources[0] : null;
 		return held.length > 0 || waiting.length > 0
-			? [{ machine: queue.machine, held, waiting, sole }]
+			? [{ machine: queue.machine, held, waiting, resourceCount: queue.resources.length }]
 			: [];
 	});
 }

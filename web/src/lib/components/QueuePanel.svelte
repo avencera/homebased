@@ -57,9 +57,6 @@
 				<li class="flex flex-col gap-2 px-3 py-2.5" aria-label={`Queue on ${machine}`}>
 					<div class="flex items-center gap-2">
 						<Capsule hue={machineHue(machine)} dot title={`Queue on ${machine}`}>{machine}</Capsule>
-						{#if queue.sole}
-							<ResourceLabel record={queue.sole} class="font-medium" hideName />
-						{/if}
 						{#if queue.waiting.length > 0}
 							<span class="ml-auto text-[11px] text-muted-foreground"
 								>{queue.waiting.length} waiting</span
@@ -72,8 +69,8 @@
 						{@const since = run ? phaseSince(run.phase) : null}
 						<div class="flex flex-col gap-1">
 							<div class="flex items-center gap-2">
-								<!-- a machine with one resource names it beside the machine instead -->
-								{#if !queue.sole}
+								<!-- the machine name already identifies its only resource -->
+								{#if queue.resourceCount > 1}
 									<ResourceLabel {record} class="font-medium" hideName />
 								{/if}
 								<QueueBadge

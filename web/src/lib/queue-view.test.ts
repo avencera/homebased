@@ -193,11 +193,11 @@ test('busy queues drop idle resources and machines with nothing to show', () => 
 			queue.machine,
 			queue.held.map((record) => record.resource.name),
 			queue.waiting.map((entry) => entry.id),
-			queue.sole?.resource.name ?? null
+			queue.resourceCount
 		]),
 		[
-			['code', ['gpu0'], ['next'], null],
-			['waiting', [], ['w'], 'gpu0']
+			['code', ['gpu0'], ['next'], 2],
+			['waiting', [], ['w'], 1]
 		]
 	);
 });
