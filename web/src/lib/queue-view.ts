@@ -10,6 +10,7 @@ import type {
 	Placement,
 	Preemption,
 	Priority,
+	Resource,
 	ResourceRecord,
 	RunPhase,
 	StepView,
@@ -134,9 +135,14 @@ export function targetLabel(target: JobTarget, names: ReadonlyMap<string, string
 	return names.get(target.resource) ?? target.resource.slice(0, 8);
 }
 
-/** Resource names by ID. */
+/** What to call a resource: its nickname when it has one, otherwise its name. */
+export function resourceTitle(resource: Resource): string {
+	return resource.label ?? resource.name;
+}
+
+/** Resource titles by ID. */
 export function resourceNames(resources: readonly ResourceRecord[]): Map<string, string> {
-	return new Map(resources.map((record) => [record.resource.id, record.resource.name]));
+	return new Map(resources.map((record) => [record.resource.id, resourceTitle(record.resource)]));
 }
 
 /** Step progress: the step running or next to run, of all steps. */

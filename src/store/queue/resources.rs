@@ -8,7 +8,7 @@ use super::{ResourceOrigin, ResourceRecord};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::queue::gpu::DetectedResource;
-use crate::queue::{QueueError, ResourceId, ResourceName, ResourceSelector};
+use crate::queue::{QueueError, ResourceId, ResourceLabel, ResourceName, ResourceSelector};
 use crate::store::{Store, fmt_time};
 
 impl Store {
@@ -177,6 +177,25 @@ impl Store {
                     fmt_time(Utc::now()),
                     ResourceOrigin::Manual.as_str(),
                 ],
+            )?;
+            self.require_resource(id)
+        })
+    }
+
+    /// Set or clear the display label of a resource of `machine`
+    ///
+    /// Setting the label it already has is a no-op, so a retried request is safe
+    pub fn set_resource_label(
+        &self,
+        machine: MachineId,
+        selector: &ResourceSelector,
+        label: Option<&ResourceLabel>,
+    ) -> Result<ResourceRecord, AppError> {
+        self.immediate(|| {
+            let id = self.resolve_resource(machine, selector)?.resource.id;
+            self.conn.execute(
+                "UPDATE resources SET label = ?2 WHERE id = ?1",
+                params![id.to_string(), label.map(ResourceLabel::as_str)],
             )?;
             self.require_resource(id)
         })

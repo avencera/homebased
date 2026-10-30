@@ -10,7 +10,7 @@ use crate::machine::MachineId;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
-    ResourceId, ResourceName, StopCause,
+    ResourceId, ResourceLabel, ResourceName, ResourceSelector, StopCause,
 };
 use crate::store::Store;
 
@@ -44,6 +44,13 @@ pub enum QueueRequest {
         name: ResourceName,
         /// Optional GPU index
         device: Option<u32>,
+    },
+    /// Set or clear a resource's display label
+    Label {
+        /// Resource by name or id
+        resource: ResourceSelector,
+        /// New label; `None` clears it
+        label: Option<ResourceLabel>,
     },
     /// Idempotent job acceptance
     Submit {
@@ -192,6 +199,9 @@ impl Store {
             }
             QueueRequest::Register { name, device } => {
                 serde_json::to_value(self.register_resource(machine, name.clone(), *device)?)?
+            }
+            QueueRequest::Label { resource, label } => {
+                serde_json::to_value(self.set_resource_label(machine, resource, label.as_ref())?)?
             }
             QueueRequest::Submit { job, origin, spec } => {
                 serde_json::to_value(self.submit_job(&NewJob {

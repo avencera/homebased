@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,13 +19,14 @@ pub const SCHEMA_VERSION: i64 = 7;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
     add_t3_holds,
     add_machine_waits,
     drop_t3_holds,
+    add_resource_labels,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -68,6 +69,16 @@ fn add_t3_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn drop_t3_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("DROP TABLE t3_hold_tasks;")
 }
+
+/// Version 8: display nicknames of resources
+fn add_resource_labels(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE resources ADD COLUMN {RESOURCE_LABEL};"
+    ))
+}
+
+/// Display nickname of a resource; specs and commands keep using its name
+const RESOURCE_LABEL: &str = "label TEXT";
 
 /// Version 6: remote routes that wait for their machine, and their coalesce keys
 fn add_machine_waits(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -195,6 +206,7 @@ fn schema() -> String {
         .replace("{ROUTE_COALESCE_KEY}", ROUTE_COALESCE_KEY)
         .replace("{ROUTE_COALESCE_INDEX}", ROUTE_COALESCE_INDEX)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
+        .replace("{RESOURCE_LABEL}", RESOURCE_LABEL)
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
         .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
 }
@@ -413,6 +425,7 @@ CREATE TABLE resources (
     run_cleanup_attempt INTEGER CHECK (run_cleanup_attempt IS NULL OR run_cleanup_attempt >= 1),
     run_attention_id TEXT UNIQUE,
     run_attention_failure TEXT,
+    {RESOURCE_LABEL},
     UNIQUE (machine, name),
     UNIQUE (id, machine),
     FOREIGN KEY (run_job, machine) REFERENCES resource_jobs(id, machine),
@@ -636,6 +649,7 @@ mod tests {
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
             .replace(super::CHAIN_TABLES, "")
             .replace(super::TASK_USAGE_TABLE, "")
+            .replace(&format!(",\n    {}", super::RESOURCE_LABEL), "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -662,6 +676,7 @@ mod tests {
             "chain_runs",
             "resource_job_routes",
             "task_usage",
+            "resources",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }

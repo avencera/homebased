@@ -53,6 +53,7 @@
 		preemptionLabel,
 		resourceNames,
 		resourceState,
+		resourceTitle,
 		stepLabel,
 		targetLabel
 	} from '$lib/queue-view';
@@ -62,6 +63,7 @@
 	import LevelBadge, { levelRail, levelTint } from './LevelBadge.svelte';
 	import QueueBadge from './QueueBadge.svelte';
 	import ReleaseButton from './ReleaseButton.svelte';
+	import ResourceLabel from './ResourceLabel.svelte';
 
 	interface Props {
 		machine: FleetMachine;
@@ -169,7 +171,7 @@
 						aria-hidden="true"
 					></span>
 					<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-						<span class="font-mono font-medium">{record.resource.name}</span>
+						<ResourceLabel {record} {control} class="font-medium" />
 						{#if record.resource.device !== null}
 							<span class="font-mono text-[11px] text-muted-foreground">
 								device {record.resource.device}
@@ -191,7 +193,7 @@
 								<ReleaseButton
 									attention={run.phase.id}
 									machine={record.machine}
-									resourceName={record.resource.name}
+									resourceName={resourceTitle(record.resource)}
 									{control}
 								/>
 							{:else if job}
@@ -250,7 +252,7 @@
 			<p class="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-muted-foreground">
 				{#each idle as record (record.resource.id)}
 					<span class="inline-flex items-center gap-1.5">
-						<span class="font-mono">{record.resource.name}</span>
+						<ResourceLabel {record} {control} />
 						<QueueBadge state="idle" />
 					</span>
 				{/each}
