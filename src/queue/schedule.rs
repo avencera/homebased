@@ -57,7 +57,9 @@ pub struct JobView {
 pub struct NoticeThresholds {
     /// Wait behind a run asked to yield
     pub after_yield: Duration,
-    /// Wait behind anything else, including `wait` runs and `Attention`
+    /// Wait behind anything else that holds the head up: a lower run that is
+    /// not yielding, or `Attention`. Runs of the head's level or higher never
+    /// fall due
     pub after_wait: Duration,
 }
 
@@ -153,7 +155,8 @@ pub struct BlockedHead {
     pub new_episode: bool,
     /// Threshold in force: shorter when a run was asked to yield for it
     pub threshold: Duration,
-    /// When the notice falls due
+    /// When the notice falls due; never while the head only waits behind
+    /// runs of its own level or higher
     pub due_at: DateTime<Utc>,
     /// Whether the notice is due now and was not yet sent
     pub send_now: bool,
@@ -280,6 +283,7 @@ fn preempt_for(snapshot: &Snapshot, waiting: &JobView) -> Option<Preempt> {
 
 fn blocked_head(snapshot: &Snapshot, head: &JobView, preemption: Option<&Preempt>) -> BlockedHead {
     let mut blockers = Vec::new();
+    let mut held_up = false;
     let mut asked_to_yield = preemption
         .is_some_and(|stop| stop.cause == StopCause::Yield && head.target.allows(stop.resource));
     for resource in snapshot
@@ -291,6 +295,7 @@ fn blocked_head(snapshot: &Snapshot, head: &JobView, preemption: Option<&Preempt
             continue;
         };
         if let RunPhase::Attention { id, .. } = &run.phase {
+            held_up = true;
             blockers.push(Blocker::Attention {
                 resource: resource.id,
                 attention: *id,
@@ -304,6 +309,11 @@ fn blocked_head(snapshot: &Snapshot, head: &JobView, preemption: Option<&Preempt
                 ..
             }
         );
+        // a run whose job is gone is only cleaning up, which ends on its own or in `Attention`
+        held_up |= snapshot
+            .queue
+            .iter()
+            .any(|job| job.id == run.job && job.priority < head.priority);
         blockers.push(Blocker::Run {
             resource: resource.id,
             job: run.job,
@@ -318,8 +328,11 @@ fn blocked_head(snapshot: &Snapshot, head: &JobView, preemption: Option<&Preempt
     } else {
         snapshot.thresholds.after_wait
     };
+    // behind runs of its own level or higher the head just waits its turn, which is
+    // expected and not worth a notice; only a lower run or `Attention` holding it up is
     let due_at = chrono::Duration::from_std(threshold)
         .ok()
+        .filter(|_| held_up)
         .and_then(|threshold| blocked_since.checked_add_signed(threshold))
         .unwrap_or(DateTime::<Utc>::MAX_UTC);
     BlockedHead {

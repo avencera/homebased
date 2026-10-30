@@ -657,6 +657,47 @@ fn blocked_notice_timing_follows_the_stored_episode() {
 }
 
 #[test]
+fn waiting_behind_an_equal_or_higher_run_never_falls_due() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let (running, task) = machine.running("gpu0", Priority::Medium, WAIT, executing(t0()));
+    machine.set_run(
+        machine.resource("gpu1"),
+        JobId::new(),
+        TaskId::new(),
+        RunPhase::Cleaning { attempt: 1 },
+    );
+    let head = machine.queued(Priority::Medium, Target::Any, YIELD);
+    machine.episode = Some(StoredEpisode {
+        id: 1,
+        job: head,
+        blocked_since: at(0),
+        notified: false,
+    });
+    let waiting = decide(&machine.snapshot(at(24 * 60 * 60))).blocked.unwrap();
+    assert_eq!(waiting.job, head);
+    assert_eq!(waiting.due_at, DateTime::<Utc>::MAX_UTC);
+    assert!(!waiting.send_now);
+
+    // the same episode falls due once a person must step in
+    machine.set_run(
+        machine.resource("gpu0"),
+        running,
+        task,
+        RunPhase::Attention {
+            id: AttentionId::new(),
+            failure: CleanupFailure::Processes {
+                failure: ProcessCleanupFailure::EnumerationFailed {
+                    message: "denied".into(),
+                },
+            },
+        },
+    );
+    let stuck = decide(&machine.snapshot(at(24 * 60 * 60))).blocked.unwrap();
+    assert_eq!(stuck.due_at, at(30 * 60));
+    assert!(stuck.send_now);
+}
+
+#[test]
 fn a_new_yield_request_shortens_the_threshold() {
     let mut machine = Machine::new(&["gpu0"]);
     machine.running("gpu0", Priority::Low, YIELD, executing(t0()));

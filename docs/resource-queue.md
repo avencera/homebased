@@ -73,7 +73,7 @@ A stale UUID cannot release a newer Attention. If `attention_not_found` occurs, 
 
 ## Configure blocked notices
 
-The first blocked queued job gets one `JOB_BLOCKED` notice per blocking episode. The default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including `wait` and Attention. The notice goes to the blocked job's thread. It never stops a run.
+The first blocked queued job gets one `JOB_BLOCKED` notice per blocking episode, but only when a run of a lower level or an Attention holds it up. Waiting behind runs of its own level or higher is normal queue order and sends nothing. The default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention, counted from the start of the episode. The notice goes to the blocked job's thread. It never stops a run.
 
 Put this table in `~/.config/homebased/config.toml`, or the file selected by `--config` or `HOMEBASED_CONFIG`. Values must be positive duration strings.
 

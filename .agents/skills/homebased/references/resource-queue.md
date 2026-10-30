@@ -155,7 +155,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `JOB_CANCELLED` | Cancellation took effect. Inspect cleanup if the resource remains held. |
 | `JOB_PREEMPTED` | The job is queued again. Let the queue resume it. Do not resubmit. |
 | `JOB_ATTENTION` | Cleanup could not finish safely. Check the machine and release the hold if nothing from the run remains. |
-| `JOB_BLOCKED` | Inspect the listed blockers. This is a notice, never a stop. |
+| `JOB_BLOCKED` | A lower-level run or an Attention has held the job up past the threshold. Inspect the listed blockers. This is a notice, never a stop. |
 | `JOB_CHECK_DUE` | Inspect the current run and its recent output. Inactivity does not stop it. |
 
 | Callback field | Meaning |
@@ -168,7 +168,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `attention` | Optional exact Attention UUID for release. |
 | `blocked` | Only on blocked notices: `episode`, `blocked_since`, and `blockers`. |
 
-Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including `wait` and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.
+Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.
 
 ## Attention and cleanup limits
 
