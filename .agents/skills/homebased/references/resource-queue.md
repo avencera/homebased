@@ -119,7 +119,8 @@ Use `homebased --json` before each command and parse the result. All results car
 | Command after `homebased --json` | Flags and purpose |
 | --- | --- |
 | `resource register --name <name>` | Optional `--device <index>`. Register on the local machine. Do not create two lanes for one physical GPU. |
-| `resource list` | Optional `--machine <name-or-uuid>`. Resources and active run phases. |
+| `resource label <resource> <label>` | Or `--clear` instead of a label. Optional `--machine <name-or-uuid>`. Set a display nickname of 1 to 40 characters. Specs and pins keep using the name. |
+| `resource list` | Optional `--machine <name-or-uuid>`. Resources, active run phases, and labels. |
 | `resource jobs` | Optional `--machine <name-or-uuid>`. Non-terminal jobs in serving order. |
 | `resource schema` | Print JobSpec JSON Schema. No daemon needed. |
 | `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`. Machine comes from the spec. No dry-run flag. |

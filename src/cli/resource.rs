@@ -14,8 +14,8 @@ use crate::domain::TaskEnv;
 use crate::error::AppError;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
-    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, ResourceName,
-    RunPhase, StopCause, Target,
+    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, ResourceLabel,
+    ResourceName, ResourceSelector, RunPhase, StopCause, Target,
 };
 use crate::store::queue::ResourceRecord;
 use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
@@ -32,6 +32,22 @@ pub enum ResourceCommand {
         /// GPU index exported to runs
         #[arg(long)]
         device: Option<u32>,
+    },
+    /// Set or clear the nickname dashboards and lists show for a resource
+    ///
+    /// Specs, pins, and commands keep using the resource's name
+    Label {
+        /// Resource name or UUID
+        resource: ResourceSelector,
+        /// Nickname of 1 to 40 characters, such as "RTX 5090"
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        label: Option<ResourceLabel>,
+        /// Remove the nickname
+        #[arg(long)]
+        clear: bool,
+        /// Machine whose resource to label
+        #[command(flatten)]
+        machine: MachineArgs,
     },
     /// Show resources and their held run phases
     List(MachineArgs),
@@ -149,6 +165,27 @@ pub async fn run(ctx: &Ctx, command: ResourceCommand) -> Result<ExitCode, AppErr
                 "registered",
                 &registered.resource.id.to_string(),
             )?;
+        }
+        ResourceCommand::Label {
+            resource,
+            label,
+            clear: _,
+            machine,
+        } => {
+            // setting a label is idempotent, so a lost reply can be retried as is
+            let value = post_retry(
+                &client,
+                &path("/v1/resource/label", &machine),
+                &json!({ "resource": resource, "label": label }),
+            )
+            .await?;
+            let labeled: ResourceRecord = decode(value.clone())?;
+            let action = if labeled.resource.label.is_some() {
+                "labeled"
+            } else {
+                "unlabeled"
+            };
+            print_result(ctx, &value, action, &labeled.resource.id.to_string())?;
         }
         ResourceCommand::List(machine) => {
             let value = client.get(&path("/v1/resources", &machine)).await?;
@@ -303,7 +340,7 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     let list: ResourceList = decode(value)?;
     if ctx.output == OutputMode::Human {
         println!(
-            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE"
+            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE                            LABEL"
         );
     }
     for record in &list.resources {
@@ -327,7 +364,9 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             ),
             _ => String::new(),
         };
-        println!("{id} {name:<16} {device:<6} {state:<12} {task}{age}");
+        let label = resource.label.as_ref().map_or("-", ResourceLabel::as_str);
+        let run = format!("{task}{age}");
+        println!("{id} {name:<16} {device:<6} {state:<12} {run:<42} {label}");
     }
     Ok(())
 }

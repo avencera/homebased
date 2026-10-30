@@ -50,6 +50,14 @@ pub enum QueueError {
         /// Rule it breaks
         reason: &'static str,
     },
+    /// A resource label breaks the labeling rules
+    #[error("invalid resource label {value:?}: it {reason}")]
+    InvalidResourceLabel {
+        /// Refused label
+        value: String,
+        /// Rule it breaks
+        reason: &'static str,
+    },
     /// A job with no steps or more than 32
     #[error("a job has 1 to 32 steps, got {count}")]
     InvalidStepCount {
@@ -186,6 +194,7 @@ impl QueueError {
             | Self::InvalidPriority { .. }
             | Self::InvalidRestartWindow { .. }
             | Self::InvalidResourceName { .. }
+            | Self::InvalidResourceLabel { .. }
             | Self::InvalidStepCount { .. } => Some(QueueCode::InvalidQueueInput),
             Self::JobNotFound { .. } => Some(QueueCode::JobNotFound),
             Self::JobTerminal { .. } => Some(QueueCode::JobTerminal),
@@ -242,7 +251,9 @@ impl QueueError {
             Self::InvalidRestartWindow { window } => {
                 json!({ "value": humantime::format_duration(*window).to_string() })
             }
-            Self::InvalidResourceName { value, .. } => json!({ "value": value }),
+            Self::InvalidResourceName { value, .. } | Self::InvalidResourceLabel { value, .. } => {
+                json!({ "value": value })
+            }
             Self::InvalidStepCount { count } => json!({ "count": count }),
             Self::JobNotFound { job } | Self::JobConflict { job } => json!({ "job": job }),
             Self::JobTerminal { job, state } => json!({ "job": job, "state": state }),

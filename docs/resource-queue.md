@@ -17,6 +17,7 @@ Use human output for a quick view. Use `--json` for scripts and Attention IDs.
 | --- | --- |
 | Resource `ID`, `NAME`, `DEVICE` | Resource UUID, machine-local name, optional CUDA device index. |
 | Resource `STATE`, `RUN / YIELD AGE` | Active run phase, task UUID, and elapsed seconds since a yield request. No run means idle. |
+| Resource `LABEL` | Optional nickname, or `-`. |
 | Job `PRIORITY`, `POSITION` | Level and slot within that level. High serves before medium, then low. |
 | Job `STATE`, `TARGET / NAME` | Job state, pinned resource or `any`, and submitted label. |
 
@@ -29,6 +30,17 @@ homebased --json resource register --name auxiliary
 ```
 
 For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUDA_VISIBLE_DEVICES` for host steps. For containers, Docker selects that host device with `--gpus device=<index>` and `CUDA_VISIBLE_DEVICES=0` selects the one exposed GPU inside the container. An unindexed resource removes that variable. Registration does not test the physical device.
+
+## Give a resource a nickname
+
+A label is a display nickname, such as `RTX 5090` for `gpu0`. The dashboard and `resource list` show it next to the name. Specs, pins, and commands keep using the name, so relabeling never touches queued or running work. A label has 1 to 40 characters with no control characters. Surrounding spaces are trimmed. Labels need not be unique.
+
+```sh
+homebased resource label gpu0 "RTX 5090"
+homebased resource label gpu0 --clear
+```
+
+Name the resource by name or UUID. Add `--machine <Fleet-name-or-UUID>` to label a resource on another machine. A peer on an older release refuses the request. In the dashboard, hover a resource name on the queue page and click the pencil. Press Enter to save or Escape to cancel. Saving an empty field clears the label.
 
 ## Inspect, move, or cancel
 

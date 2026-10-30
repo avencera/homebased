@@ -187,6 +187,25 @@ async fn fleet_cli_submit_keeps_events_at_origin_and_deduplicates() {
         remote_resources["machine"],
         executor.machine_id().to_string()
     );
+
+    // a label set from the origin is stored by the machine that owns the resource
+    let name = remote_resources["resources"][0]["resource"]["name"]
+        .as_str()
+        .unwrap();
+    let labeled = cli(
+        &origin,
+        &[
+            "resource",
+            "label",
+            name,
+            "Peer GPU",
+            "--machine",
+            "remote-executor",
+        ],
+    );
+    assert_eq!(labeled["resource"]["label"], "Peer GPU");
+    let owned = cli(&executor, &["resource", "list"]);
+    assert_eq!(owned["resources"][0]["resource"]["label"], "Peer GPU");
 }
 
 #[tokio::test(flavor = "multi_thread")]

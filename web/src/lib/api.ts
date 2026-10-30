@@ -493,7 +493,9 @@ const ResourceSchema = Schema.Struct({
 	id: Schema.String,
 	name: Schema.String,
 	/** GPU index exported to runs, if any. */
-	device: Schema.NullOr(Schema.Finite)
+	device: Schema.NullOr(Schema.Finite),
+	/** Display nickname; specs and commands keep using `name`. Absent from older peers. */
+	label: Schema.optional(Schema.NullOr(Schema.String))
 });
 export type Resource = typeof ResourceSchema.Type;
 
@@ -674,6 +676,13 @@ const ReleaseResultSchema = Schema.Struct({
 	attention: Schema.String
 });
 export type ReleaseResult = typeof ReleaseResultSchema.Type;
+
+/** `POST /v1/resource/label`: the relabeled resource. */
+const LabelResultSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	...ResourceRecordSchema.fields
+});
+export type LabelResult = typeof LabelResultSchema.Type;
 
 const ThreadPullRequestSchema = Schema.Struct({
 	number: Schema.Number,
@@ -918,6 +927,19 @@ export function releaseAttention(
 		`/resource/release${machineQuery(machine)}`,
 		{ operation_id: operationId, attention },
 		ReleaseResultSchema
+	);
+}
+
+/** `POST /v1/resource/label`: set a resource's nickname, or clear it with null. */
+export function setResourceLabel(
+	resource: string,
+	machine: string,
+	label: string | null
+): Promise<LabelResult> {
+	return postJson(
+		`/resource/label${machineQuery(machine)}`,
+		{ resource, label },
+		LabelResultSchema
 	);
 }
 

@@ -1755,6 +1755,53 @@ fn register_refuses_a_taken_name_or_device() {
 }
 
 #[test]
+fn a_label_survives_detection_and_leaves_the_name_alone() {
+    use super::interface::QueueRequest;
+
+    let fixture = Fixture::new();
+    let env = TaskEnv {
+        path: "/bin".into(),
+        home: "/tmp".into(),
+    };
+    // requests arrive as JSON from the CLI, the dashboard, or a Fleet peer
+    let label = |label: Value| {
+        let request: QueueRequest = serde_json::from_value(
+            json!({ "command": "label", "resource": "gpu0", "label": label }),
+        )
+        .unwrap();
+        fixture.store.queue_request(fixture.machine, &request, &env)
+    };
+    let labeled = label(json!("  RTX 5090 ")).unwrap();
+    assert_eq!(labeled["resource"]["label"], "RTX 5090");
+    assert_eq!(labeled["resource"]["name"], "gpu0");
+
+    fixture.detect(&["gpu0", "gpu1"]);
+    let gpu0 = fixture.resource("gpu0");
+    let record = fixture.store.require_resource(gpu0).unwrap();
+    assert_eq!(record.resource.label.unwrap().as_str(), "RTX 5090");
+
+    let cleared = label(Value::Null).unwrap();
+    assert_eq!(cleared["resource"]["label"], Value::Null);
+
+    for bad in ["", "   ", "a\nb", &"x".repeat(41)] {
+        let request = json!({ "command": "label", "resource": "gpu0", "label": bad });
+        assert!(
+            serde_json::from_value::<QueueRequest>(request).is_err(),
+            "{bad:?}"
+        );
+    }
+    let missing = fixture.store.set_resource_label(
+        fixture.machine,
+        &crate::queue::ResourceSelector::Name(ResourceName::parse("gpu9").unwrap()),
+        None,
+    );
+    assert!(matches!(
+        missing,
+        Err(AppError::Queue(QueueError::ResourceNotFound { .. }))
+    ));
+}
+
+#[test]
 fn blocked_episodes_start_end_and_send_one_notice() {
     let fixture = Fixture::new();
     let running = fixture.submit(Priority::Low);

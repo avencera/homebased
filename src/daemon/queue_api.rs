@@ -21,7 +21,10 @@ use crate::fleet::http::ClusterClient;
 use crate::machine::MachineId;
 use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
-use crate::queue::{AttentionId, JobId, OperationId, Placement, QueueError, ResourceName};
+use crate::queue::{
+    AttentionId, JobId, OperationId, Placement, QueueError, ResourceLabel, ResourceName,
+    ResourceSelector,
+};
 use crate::store::queue::JobAccepted;
 use crate::store::queue::interface::QueueRequest;
 use crate::submission::CallbackContext;
@@ -63,13 +66,14 @@ pub fn submit_routes() -> Router<AppState> {
         .route("/v1/resource/jobs", post(submit))
 }
 
-/// Writes that only reorder, stop, or release accepted work; the web router
-/// adds browser write protection
+/// Writes that only reorder, stop, or release accepted work, or relabel a
+/// resource; the web router adds browser write protection
 pub fn control_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/resource/jobs/{job}/move", post(move_job))
         .route("/v1/resource/jobs/{job}/cancel", post(cancel))
         .route("/v1/resource/release", post(release))
+        .route("/v1/resource/label", post(label))
 }
 
 /// Identity-checked transport for queue commands and job events
@@ -120,6 +124,14 @@ struct OperationBody {
 struct ReleaseBody {
     operation_id: OperationId,
     attention: AttentionId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabelBody {
+    resource: ResourceSelector,
+    /// Null clears the label
+    label: Option<ResourceLabel>,
 }
 
 /// Destination-bound request carried over the existing Fleet HTTP transport
@@ -356,6 +368,24 @@ async fn release(
         QueueRequest::Release {
             operation: body.operation_id,
             attention: body.attention,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+async fn label(
+    State(state): State<AppState>,
+    Query(query): Query<MachineQuery>,
+    QueueJson(body): QueueJson<LabelBody>,
+) -> Result<Json<Value>, AppError> {
+    let machine = resolve_machine(&state, query.machine.as_ref()).await?;
+    forward(
+        &state,
+        machine,
+        QueueRequest::Label {
+            resource: body.resource,
+            label: body.label,
         },
     )
     .await

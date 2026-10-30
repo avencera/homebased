@@ -7,6 +7,7 @@
 	import Elapsed from '$lib/components/Elapsed.svelte';
 	import MachineQueue from '$lib/components/MachineQueue.svelte';
 	import QueueBadge from '$lib/components/QueueBadge.svelte';
+	import ResourceLabel from '$lib/components/ResourceLabel.svelte';
 	import { peerQueueHref } from '$lib/api';
 	import { machineHue } from '$lib/colors';
 	import { QueueControl, QueueStore } from '$lib/daemon.svelte';
@@ -87,7 +88,7 @@
 							{#if queue}
 								{#each queue.resources as record (record.resource.id)}
 									<span class="inline-flex items-center gap-1.5">
-										<span class="font-mono text-muted-foreground">{record.resource.name}</span>
+										<ResourceLabel {record} {control} class="text-muted-foreground" />
 										<QueueBadge state="idle" />
 									</span>
 								{:else}

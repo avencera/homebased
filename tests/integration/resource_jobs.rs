@@ -569,6 +569,24 @@ fn web_serves_only_guarded_queue_controls() {
 
     let resources = super::http_get(&addr, "/v1/resources");
     assert_eq!(resources.status, 200);
+
+    // the dashboard relabels a resource, and the CLI lists the same label
+    let label = r#"{"resource":"gpu0","label":"RTX 5090"}"#;
+    let foreign = request("/v1/resource/label", "http://other.example", label);
+    assert!(foreign.starts_with("HTTP/1.1 403"), "{foreign}");
+    let labeled = request("/v1/resource/label", &same, label);
+    assert!(labeled.starts_with("HTTP/1.1 200"), "{labeled}");
+    let listed = cli(&h, &["resource", "list"]);
+    let gpu0 = listed["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["resource"]["name"] == "gpu0")
+        .unwrap();
+    assert_eq!(gpu0["resource"]["label"], "RTX 5090");
+    let cleared = cli(&h, &["resource", "label", "gpu0", "--clear"]);
+    assert_eq!(cleared["resource"]["label"], Value::Null);
+
     let schema = cli(&h, &["resource", "schema"]);
     assert!(schema["properties"].is_object());
 }

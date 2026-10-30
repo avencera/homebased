@@ -9,6 +9,7 @@
 	import Elapsed from './Elapsed.svelte';
 	import LevelBadge from './LevelBadge.svelte';
 	import QueueBadge from './QueueBadge.svelte';
+	import ResourceLabel from './ResourceLabel.svelte';
 
 	interface Props {
 		/** This machine first, then every known peer. */
@@ -68,7 +69,7 @@
 						{@const since = run ? phaseSince(run.phase) : null}
 						<div class="flex flex-col gap-1">
 							<div class="flex items-center gap-2">
-								<span class="font-mono font-medium">{record.resource.name}</span>
+								<ResourceLabel {record} class="font-medium" />
 								<QueueBadge
 									state={resourceState(record)}
 									label={run ? phaseLabel(run.phase) : undefined}

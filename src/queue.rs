@@ -430,6 +430,63 @@ impl<'de> Deserialize<'de> for ResourceName {
     }
 }
 
+/// Display nickname of a resource, such as `RTX 5090`
+///
+/// Only dashboards and listings show it. Specs, pins, and commands keep using
+/// the [`ResourceName`], so a label can change at any time without touching
+/// queued work. Surrounding whitespace is trimmed
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ResourceLabel(String);
+
+impl ResourceLabel {
+    /// Longest accepted label, in characters
+    pub const MAX_CHARS: usize = 40;
+
+    /// Validate a label after trimming surrounding whitespace
+    pub fn parse(raw: &str) -> Result<Self, QueueError> {
+        let invalid = |reason: &'static str| QueueError::InvalidResourceLabel {
+            value: raw.to_owned(),
+            reason,
+        };
+        let label = raw.trim();
+        if label.is_empty() || label.chars().count() > Self::MAX_CHARS {
+            return Err(invalid("must be 1 to 40 characters"));
+        }
+        if label.chars().any(char::is_control) {
+            return Err(invalid("must not contain control characters"));
+        }
+        Ok(Self(label.to_owned()))
+    }
+
+    /// Validated label
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ResourceLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ResourceLabel {
+    type Err = QueueError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceLabel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// One exclusive lane; `device` is the GPU index exported to runs, if any
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resource {
@@ -439,6 +496,10 @@ pub struct Resource {
     pub name: ResourceName,
     /// GPU index exported as `CUDA_VISIBLE_DEVICES`, if any
     pub device: Option<u32>,
+    /// Display nickname, if one was set
+    // a peer on an older release sends no label
+    #[serde(default)]
+    pub label: Option<ResourceLabel>,
 }
 
 /// A resource named in a job spec or command, by UUID or by name

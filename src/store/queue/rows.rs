@@ -10,7 +10,7 @@ use crate::machine::MachineId;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, JobId, JobState, Priority, QueueError, Resource, ResourceId,
-    ResourceName, RunNumber, RunPhase, StepIndex, StopCause, Target,
+    ResourceLabel, ResourceName, RunNumber, RunPhase, StepIndex, StopCause, Target,
 };
 use crate::store::parse_time;
 
@@ -18,7 +18,7 @@ pub(super) const RESOURCE_SELECT: &str =
     "SELECT id, machine, name, device, run_job, run_task, run_number,
     run_step, run_phase, run_reserved_at, run_started_at, run_stop_cause,
     run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin,
-    run_resume
+    run_resume, label
  FROM resources";
 
 pub(super) const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest,
@@ -56,6 +56,7 @@ pub(super) struct RawResource {
     attention_failure: Option<String>,
     origin: String,
     run_resume: Option<bool>,
+    label: Option<String>,
 }
 
 impl RawResource {
@@ -79,6 +80,7 @@ impl RawResource {
             attention_failure: row.get(15)?,
             origin: row.get(16)?,
             run_resume: row.get(17)?,
+            label: row.get(18)?,
         })
     }
 
@@ -130,6 +132,11 @@ impl RawResource {
             id,
             name: ResourceName::parse(&self.name)?,
             device: opt_u32(self.device, "device")?,
+            label: self
+                .label
+                .as_deref()
+                .map(ResourceLabel::parse)
+                .transpose()?,
         };
         let machine: MachineId = self.machine.parse()?;
         let run = match (
