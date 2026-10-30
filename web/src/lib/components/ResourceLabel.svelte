@@ -10,9 +10,11 @@
 		control?: QueueControl;
 		/** Classes of the title, so each list keeps its own weight and tone. */
 		class?: string;
+		/** Hides the machine-local name beside a nickname, for compact read-only lists. */
+		hideName?: boolean;
 	}
 
-	let { record, control, class: className }: Props = $props();
+	let { record, control, class: className, hideName = false }: Props = $props();
 
 	/** Same limit the daemon enforces, so a long nickname is cut here instead of refused. */
 	const MAX_CHARS = 40;
@@ -67,8 +69,10 @@
 {:else}
 	<span class="group inline-flex items-center gap-1.5">
 		{#if label}
-			<span class={className}>{label}</span>
-			<span class="font-mono text-[11px] text-muted-foreground">{resource.name}</span>
+			<span class={className} title={hideName ? resource.name : undefined}>{label}</span>
+			{#if !hideName}
+				<span class="font-mono text-[11px] text-muted-foreground">{resource.name}</span>
+			{/if}
 		{:else}
 			<span class={cn('font-mono', className)}>{resource.name}</span>
 		{/if}

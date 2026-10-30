@@ -33,7 +33,7 @@ For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUD
 
 ## Give a resource a nickname
 
-A label is a display nickname, such as `RTX 5090` for `gpu0`. The dashboard and `resource list` show it next to the name. Specs, pins, and commands keep using the name, so relabeling never touches queued or running work. A label has 1 to 40 characters with no control characters. Surrounding spaces are trimmed. Labels need not be unique.
+A label is a display nickname, such as `RTX 5090` for `gpu0`. `resource list` and the queue page show it next to the name, and the dashboard's GPU queues panel shows only the label. Specs, pins, and commands keep using the name, so relabeling never touches queued or running work. A label has 1 to 40 characters with no control characters. Surrounding spaces are trimmed. Labels need not be unique.
 
 ```sh
 homebased resource label gpu0 "RTX 5090"

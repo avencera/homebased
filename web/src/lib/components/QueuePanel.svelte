@@ -69,7 +69,7 @@
 						{@const since = run ? phaseSince(run.phase) : null}
 						<div class="flex flex-col gap-1">
 							<div class="flex items-center gap-2">
-								<ResourceLabel {record} class="font-medium" />
+								<ResourceLabel {record} class="font-medium" hideName />
 								<QueueBadge
 									state={resourceState(record)}
 									label={run ? phaseLabel(run.phase) : undefined}
