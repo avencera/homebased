@@ -1,5 +1,6 @@
-//! `WaiterActor` owns the connected `task wait` streams that take a task's
-//! callback events in place of the origin thread's normal delivery
+//! `WaiterActor` owns the connected `task wait` streams that take the callback
+//! events of a task or GPU queue job in place of the origin thread's normal
+//! delivery
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,7 +13,8 @@ use crate::daemon::actors::{call, send_reply};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{EventPayload, TaskEvent};
-use crate::task_wait::WaiterId;
+use crate::queue::{JobEvent, JobEventKind, JobId};
+use crate::task_wait::{WaitKey, WaiterId};
 
 // the client confirms an event only after its line reached stdout; without that
 // confirmation the event falls through to normal delivery, so a client that died
@@ -23,17 +25,51 @@ const ACK_WINDOW: Duration = Duration::from_secs(5);
 const WAITER_QUEUE: usize = 16;
 
 /// Content of a callback event offered to a waiter
-pub struct HandoffEvent {
-    /// Task the event belongs to
-    pub task: TaskId,
-    /// Per-task event sequence
-    pub seq: u64,
-    /// What the event reports
-    pub kind: EventKind,
-    /// Continuation run, on `TASK_WAITING`
-    pub continuation: Option<TaskId>,
-    /// The `HOMEBASED_EVENT` line normal delivery would have sent
-    pub line: String,
+#[derive(Clone)]
+pub enum HandoffEvent {
+    /// A task event
+    Task {
+        /// Task the event belongs to
+        task: TaskId,
+        /// Per-task event sequence
+        seq: u64,
+        /// What the event reports
+        kind: EventKind,
+        /// Continuation run, on `TASK_WAITING`
+        continuation: Option<TaskId>,
+        /// The `HOMEBASED_EVENT` line normal delivery would have sent
+        line: String,
+    },
+    /// A GPU queue job event
+    Job {
+        /// Job the event belongs to
+        job: JobId,
+        /// Per-job event sequence
+        seq: u64,
+        /// What the event reports
+        kind: JobEventKind,
+        /// The `HOMEBASED_EVENT` line normal delivery would have sent
+        line: String,
+    },
+}
+
+impl HandoffEvent {
+    /// Target the event belongs to
+    #[must_use]
+    pub fn key(&self) -> WaitKey {
+        match self {
+            Self::Task { task, .. } => WaitKey::Task(*task),
+            Self::Job { job, .. } => WaitKey::Job(*job),
+        }
+    }
+
+    /// Sequence of the event within its target
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Task { seq, .. } | Self::Job { seq, .. } => *seq,
+        }
+    }
 }
 
 /// A waiter a hand-off can go to
@@ -57,31 +93,31 @@ pub enum WaiterMsg {
         /// The waiter's id and event queue
         reply: RpcReplyPort<Result<Opened, AppError>>,
     },
-    /// Start sending the callback events of `task` to `waiter`
+    /// Start sending the callback events of `key` to `waiter`
     Watch {
         /// Waiter that takes the events
         waiter: WaiterId,
-        /// Task to watch
-        task: TaskId,
+        /// Target to watch
+        key: WaitKey,
     },
-    /// Stop sending the callback events of `task` to `waiter`
+    /// Stop sending the callback events of `key` to `waiter`
     Unwatch {
         /// Waiter that no longer takes the events
         waiter: WaiterId,
-        /// Task to stop watching
-        task: TaskId,
+        /// Target to stop watching
+        key: WaitKey,
     },
-    /// Remove a waiter and every task it watches
+    /// Remove a waiter and every target it watches
     Close {
         /// Waiter to remove
         waiter: WaiterId,
     },
-    /// The most recently registered live waiter for `task` that belongs to `thread`
+    /// The most recently registered live waiter for `key` that belongs to `thread`
     Candidate {
-        /// Origin thread of the task
+        /// Origin thread of the target
         thread: ThreadId,
-        /// Task whose event is handed off
-        task: TaskId,
+        /// Target whose event is handed off
+        key: WaitKey,
         /// Waiters that already failed to take the event
         exclude: Vec<WaiterId>,
         /// The waiter to offer the event to, if any
@@ -91,8 +127,8 @@ pub enum WaiterMsg {
     Expect {
         /// Waiter the event goes to
         waiter: WaiterId,
-        /// Task of the event
-        task: TaskId,
+        /// Target of the event
+        key: WaitKey,
         /// Sequence of the event
         seq: u64,
         /// Completed when the client confirms the event
@@ -102,8 +138,8 @@ pub enum WaiterMsg {
     Forget {
         /// Waiter the event went to
         waiter: WaiterId,
-        /// Task of the event
-        task: TaskId,
+        /// Target of the event
+        key: WaitKey,
         /// Sequence of the event
         seq: u64,
     },
@@ -111,8 +147,8 @@ pub enum WaiterMsg {
     Confirm {
         /// Waiter the event went to
         waiter: WaiterId,
-        /// Task of the event
-        task: TaskId,
+        /// Target of the event
+        key: WaitKey,
         /// Sequence of the event
         seq: u64,
     },
@@ -126,7 +162,7 @@ struct Waiter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PendingKey {
     waiter: WaiterId,
-    task: TaskId,
+    key: WaitKey,
     seq: u64,
 }
 
@@ -135,16 +171,16 @@ struct PendingKey {
 pub struct WaiterState {
     waiters: HashMap<WaiterId, Waiter>,
     // oldest registration first, so the last entry is the most recent waiter
-    tasks: HashMap<TaskId, Vec<WaiterId>>,
+    watched: HashMap<WaitKey, Vec<WaiterId>>,
     // kept after a waiter closes: the client's confirmation of its last event
     // can arrive just after the stream ended
     pending: HashMap<PendingKey, oneshot::Sender<()>>,
 }
 
 impl WaiterState {
-    fn candidate(&self, thread: ThreadId, task: TaskId, exclude: &[WaiterId]) -> Option<Candidate> {
-        self.tasks
-            .get(&task)?
+    fn candidate(&self, thread: ThreadId, key: WaitKey, exclude: &[WaiterId]) -> Option<Candidate> {
+        self.watched
+            .get(&key)?
             .iter()
             .rev()
             .filter(|waiter| !exclude.contains(waiter))
@@ -157,35 +193,35 @@ impl WaiterState {
             })
     }
 
-    fn watch(&mut self, waiter: WaiterId, task: TaskId) {
+    fn watch(&mut self, waiter: WaiterId, key: WaitKey) {
         if !self.waiters.contains_key(&waiter) {
             return;
         }
-        let watchers = self.tasks.entry(task).or_default();
+        let watchers = self.watched.entry(key).or_default();
         if !watchers.contains(&waiter) {
             watchers.push(waiter);
         }
     }
 
-    fn unwatch(&mut self, waiter: WaiterId, task: TaskId) {
-        if let Some(watchers) = self.tasks.get_mut(&task) {
+    fn unwatch(&mut self, waiter: WaiterId, key: WaitKey) {
+        if let Some(watchers) = self.watched.get_mut(&key) {
             watchers.retain(|watcher| *watcher != waiter);
             if watchers.is_empty() {
-                self.tasks.remove(&task);
+                self.watched.remove(&key);
             }
         }
     }
 
     fn close(&mut self, waiter: WaiterId) {
         self.waiters.remove(&waiter);
-        self.tasks.retain(|_, watchers| {
+        self.watched.retain(|_, watchers| {
             watchers.retain(|watcher| *watcher != waiter);
             !watchers.is_empty()
         });
     }
 }
 
-/// Owns which `task wait` stream takes which task's events
+/// Owns which `task wait` stream takes which target's events
 pub struct WaiterActor;
 
 impl Actor for WaiterActor {
@@ -214,30 +250,30 @@ impl Actor for WaiterActor {
                 state.waiters.insert(waiter, Waiter { thread, queue });
                 send_reply(reply, Ok(Opened { waiter, events }));
             }
-            WaiterMsg::Watch { waiter, task } => state.watch(waiter, task),
-            WaiterMsg::Unwatch { waiter, task } => state.unwatch(waiter, task),
+            WaiterMsg::Watch { waiter, key } => state.watch(waiter, key),
+            WaiterMsg::Unwatch { waiter, key } => state.unwatch(waiter, key),
             WaiterMsg::Close { waiter } => state.close(waiter),
             WaiterMsg::Candidate {
                 thread,
-                task,
+                key,
                 exclude,
                 reply,
-            } => send_reply(reply, Ok(state.candidate(thread, task, &exclude))),
+            } => send_reply(reply, Ok(state.candidate(thread, key, &exclude))),
             WaiterMsg::Expect {
                 waiter,
-                task,
+                key,
                 seq,
                 confirmed,
             } => {
                 state
                     .pending
-                    .insert(PendingKey { waiter, task, seq }, confirmed);
+                    .insert(PendingKey { waiter, key, seq }, confirmed);
             }
-            WaiterMsg::Forget { waiter, task, seq } => {
-                state.pending.remove(&PendingKey { waiter, task, seq });
+            WaiterMsg::Forget { waiter, key, seq } => {
+                state.pending.remove(&PendingKey { waiter, key, seq });
             }
-            WaiterMsg::Confirm { waiter, task, seq } => {
-                if let Some(confirmed) = state.pending.remove(&PendingKey { waiter, task, seq }) {
+            WaiterMsg::Confirm { waiter, key, seq } => {
+                if let Some(confirmed) = state.pending.remove(&PendingKey { waiter, key, seq }) {
                     let _ = confirmed.send(());
                 }
             }
@@ -278,13 +314,13 @@ impl WaiterRegistry {
         Ok((session, events))
     }
 
-    /// Record that the client of `waiter` printed event `seq` of `task`
-    pub fn confirm(&self, waiter: WaiterId, task: TaskId, seq: u64) {
+    /// Record that the client of `waiter` printed event `seq` of `key`
+    pub fn confirm(&self, waiter: WaiterId, key: WaitKey, seq: u64) {
         // a dead actor means the hand-off already fell back to normal delivery
-        let _ = self.0.cast(WaiterMsg::Confirm { waiter, task, seq });
+        let _ = self.0.cast(WaiterMsg::Confirm { waiter, key, seq });
     }
 
-    /// Offer one event to the waiters of `event.task` that belong to `thread`
+    /// Offer one task event to the waiters of `event.task` that belong to `thread`
     ///
     /// Tries the most recently registered waiter first. Returns whether a client
     /// printed the event and confirmed it; the caller delivers it normally
@@ -296,32 +332,81 @@ impl WaiterRegistry {
         else {
             return false;
         };
+        let offer = HandoffEvent::Task {
+            task: event.task,
+            seq: event.seq.get(),
+            kind: callback.event,
+            continuation: callback.continuation,
+            line: line.to_owned(),
+        };
+        matches!(
+            self.hand_off_event(thread, offer, || std::future::ready(Some(true)))
+                .await,
+            JobHandoff::Printed
+        )
+    }
+
+    /// Offer one job event to the waiters of `event.job` that belong to `thread`
+    ///
+    /// Same contract as [`Self::hand_off`]. `current` runs before each offer:
+    /// `Some(false)` stops with [`JobHandoff::Obsolete`], and `None`, when
+    /// currency cannot be told, stops with [`JobHandoff::Declined`] so normal
+    /// delivery decides
+    pub async fn hand_off_job<F>(
+        &self,
+        thread: ThreadId,
+        event: &JobEvent,
+        line: &str,
+        current: impl Fn() -> F,
+    ) -> JobHandoff
+    where
+        F: Future<Output = Option<bool>>,
+    {
+        let offer = HandoffEvent::Job {
+            job: event.job,
+            seq: event.seq,
+            kind: event.event,
+            line: line.to_owned(),
+        };
+        self.hand_off_event(thread, offer, current).await
+    }
+
+    async fn hand_off_event<F>(
+        &self,
+        thread: ThreadId,
+        offer: HandoffEvent,
+        current: impl Fn() -> F,
+    ) -> JobHandoff
+    where
+        F: Future<Output = Option<bool>>,
+    {
+        let key = offer.key();
         let mut tried = Vec::new();
         while let Ok(Some(candidate)) = call(&self.0, |reply| WaiterMsg::Candidate {
             thread,
-            task: event.task,
+            key,
             exclude: tried.clone(),
             reply,
         })
         .await
         {
+            // a waiter that let the ack window pass can take seconds, and a
+            // blocked notice may stop being current meanwhile
+            match current().await {
+                Some(true) => {}
+                Some(false) => return JobHandoff::Obsolete,
+                None => return JobHandoff::Declined,
+            }
             tried.push(candidate.waiter);
-            let offer = HandoffEvent {
-                task: event.task,
-                seq: event.seq.get(),
-                kind: callback.event,
-                continuation: callback.continuation,
-                line: line.to_owned(),
-            };
-            if self.offer(candidate, offer).await {
-                return true;
+            if self.offer(candidate, offer.clone()).await {
+                return JobHandoff::Printed;
             }
         }
-        false
+        JobHandoff::Declined
     }
 
     async fn offer(&self, candidate: Candidate, event: HandoffEvent) -> bool {
-        let (waiter, task, seq) = (candidate.waiter, event.task, event.seq);
+        let (waiter, key, seq) = (candidate.waiter, event.key(), event.seq());
         let (confirmed, printed) = oneshot::channel();
         // registered before the event is sent so a quick confirmation cannot
         // arrive first
@@ -329,7 +414,7 @@ impl WaiterRegistry {
             .0
             .cast(WaiterMsg::Expect {
                 waiter,
-                task,
+                key,
                 seq,
                 confirmed,
             })
@@ -346,13 +431,24 @@ impl WaiterRegistry {
             Ok(Some(()))
         );
         if !delivered {
-            let _ = self.0.cast(WaiterMsg::Forget { waiter, task, seq });
+            let _ = self.0.cast(WaiterMsg::Forget { waiter, key, seq });
         }
         delivered
     }
 }
 
-/// One connected wait request; dropping it removes every task it watches
+/// How a hand-off ended
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobHandoff {
+    /// A waiter printed the event and confirmed it
+    Printed,
+    /// No waiter took it; deliver it normally
+    Declined,
+    /// The event stopped being current before a waiter took it
+    Obsolete,
+}
+
+/// One connected wait request; dropping it removes every target it watches
 pub struct WaiterSession {
     actor: ActorRef<WaiterMsg>,
     waiter: WaiterId,
@@ -365,27 +461,27 @@ impl WaiterSession {
         self.waiter
     }
 
-    /// Start receiving the callback events of `task`
-    pub fn watch(&self, task: TaskId) {
+    /// Start receiving the callback events of `key`
+    pub fn watch(&self, key: WaitKey) {
         let _ = self.actor.cast(WaiterMsg::Watch {
             waiter: self.waiter,
-            task,
+            key,
         });
     }
 
-    /// Stop receiving the callback events of `task`
-    pub fn unwatch(&self, task: TaskId) {
+    /// Stop receiving the callback events of `key`
+    pub fn unwatch(&self, key: WaitKey) {
         let _ = self.actor.cast(WaiterMsg::Unwatch {
             waiter: self.waiter,
-            task,
+            key,
         });
     }
 
     /// The stream could not print an event it took, so its hand-off fails at once
-    pub fn reject(&self, task: TaskId, seq: u64) {
+    pub fn reject(&self, key: WaitKey, seq: u64) {
         let _ = self.actor.cast(WaiterMsg::Forget {
             waiter: self.waiter,
-            task,
+            key,
             seq,
         });
     }

@@ -7,7 +7,7 @@ use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
 use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
-use crate::queue::{JobEventKind, JobId, QueueError, Target};
+use crate::queue::{JobEvent, JobEventKind, JobId, QueueError, Target};
 use crate::store::Store;
 
 /// Sequence cursors of one job's origin inbox
@@ -274,6 +274,24 @@ impl Store {
                     .ok_or(QueueError::JobNotFound { job })?;
                 Ok((route, serde_json::from_str(&json)?))
             })
+            .collect()
+    }
+
+    /// Events of one job's origin inbox that were delivered or suppressed, in sequence order
+    ///
+    /// A `task wait --job` stream replays these to catch up without printing
+    /// them again; the events after them are still owed to the thread
+    pub fn settled_job_events(&self, job: JobId) -> Result<Vec<JobEvent>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT i.event_json FROM resource_job_inbox i
+            JOIN resource_job_routes r ON r.job_id=i.job_id
+            WHERE i.job_id=?1 AND i.seq<=r.settled_seq ORDER BY i.seq",
+        )?;
+        let rows = statement
+            .query_map([job.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| Ok(serde_json::from_str::<RoutedJobEvent>(&json)?.event))
             .collect()
     }
 

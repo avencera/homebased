@@ -24,6 +24,7 @@ use crate::machine::MachineId;
 use crate::store::Store;
 use crate::submission::{CallbackContext, OriginRoute, RequestId, SubmissionState};
 use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
+use crate::task_wait::WaitKey;
 
 const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
 
@@ -1696,15 +1697,15 @@ async fn waiter_takes_pending_events_in_order_instead_of_normal_delivery() {
     drop(store);
     let waiters = WaiterRegistry::spawn(None).await.unwrap();
     let (session, mut events) = waiters.open(route.thread).await.unwrap();
-    session.watch(route.task);
+    session.watch(WaitKey::Task(route.task));
     let reader = tokio::spawn({
         let (waiters, waiter) = (waiters.clone(), session.id());
         async move {
             let mut seqs = Vec::new();
             while seqs.len() < 2 {
                 let event = events.recv().await.unwrap();
-                seqs.push(event.seq);
-                waiters.confirm(waiter, event.task, event.seq);
+                seqs.push(event.seq());
+                waiters.confirm(waiter, event.key(), event.seq());
             }
             seqs
         }
@@ -1741,7 +1742,7 @@ async fn event_falls_back_to_normal_delivery_when_its_waiter_is_gone() {
     drop(store);
     let waiters = WaiterRegistry::spawn(None).await.unwrap();
     let (session, events) = waiters.open(route.thread).await.unwrap();
-    session.watch(route.task);
+    session.watch(WaitKey::Task(route.task));
     drop(events);
 
     dispatch_with(&home, route.task, waiters).await;
@@ -1761,15 +1762,15 @@ async fn event_goes_to_the_most_recently_registered_waiter() {
     drop(store);
     let waiters = WaiterRegistry::spawn(None).await.unwrap();
     let (older, mut older_events) = waiters.open(route.thread).await.unwrap();
-    older.watch(route.task);
+    older.watch(WaitKey::Task(route.task));
     let (newer, mut newer_events) = waiters.open(route.thread).await.unwrap();
-    newer.watch(route.task);
+    newer.watch(WaitKey::Task(route.task));
     let reader = tokio::spawn({
         let (waiters, waiter) = (waiters.clone(), newer.id());
         async move {
             let event = newer_events.recv().await.unwrap();
-            waiters.confirm(waiter, event.task, event.seq);
-            event.seq
+            waiters.confirm(waiter, event.key(), event.seq());
+            event.seq()
         }
     });
 

@@ -576,6 +576,30 @@ struct CallbackPaths {
     delivery_lock: PathBuf,
 }
 
+/// The `HOMEBASED_EVENT` line of one job event, as its origin thread receives it
+///
+/// Normal delivery and a `task wait --job` stream both send this line, so an
+/// agent reads the same event whichever path carried it
+pub(crate) fn job_event_line(
+    route: &crate::queue::delivery::JobRoute,
+    event: &crate::queue::JobEvent,
+) -> Result<String, AppError> {
+    let mut payload = serde_json::to_value(event)?;
+    payload["api_version"] = serde_json::json!(crate::domain::API_VERSION);
+    payload["thread"] = serde_json::json!(route.thread);
+    payload["name"] = serde_json::json!(route.spec.name);
+    payload["machine"] = serde_json::json!(route.authority);
+    // blocked and never-started jobs have no run; explicit nulls keep the envelope stable
+    payload["resource"] = serde_json::json!(event.run.map(|run| run.resource));
+    payload["task"] = serde_json::json!(event.run.map(|run| run.task));
+    payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
+    payload["step"] = serde_json::json!(event.run.map(|run| run.step));
+    Ok(format!(
+        "HOMEBASED_EVENT {}",
+        serde_json::to_string(&payload)?
+    ))
+}
+
 /// Deliver one job event through the same Claude, Codex, and T3 routing as task events
 ///
 /// Returns `None` only when a blocked notice ended before the callback write
@@ -592,20 +616,10 @@ pub(crate) async fn deliver_job_event(
         .join(route.job.to_string())
         .join("delivery");
     std::fs::create_dir_all(&dir)?;
-    let mut payload = serde_json::to_value(event)?;
-    payload["api_version"] = serde_json::json!(crate::domain::API_VERSION);
-    payload["thread"] = serde_json::json!(route.thread);
-    payload["name"] = serde_json::json!(route.spec.name);
-    payload["machine"] = serde_json::json!(route.authority);
-    // blocked and never-started jobs have no run; explicit nulls keep the envelope stable
-    payload["resource"] = serde_json::json!(event.run.map(|run| run.resource));
-    payload["task"] = serde_json::json!(event.run.map(|run| run.task));
-    payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
-    payload["step"] = serde_json::json!(event.run.map(|run| run.step));
     let attempt = OriginAttempt {
         context: route.callback.clone(),
         thread: route.thread,
-        line: format!("HOMEBASED_EVENT {}", serde_json::to_string(&payload)?),
+        line: job_event_line(route, event)?,
         paths: CallbackPaths {
             callback_log: dir.join("callback.log"),
             delivery_lock: dir.join("delivery.lock"),

@@ -273,6 +273,11 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "wait_unavailable" => {
+            if let (Some(job), Some(reason)) =
+                (decode_field(input, "job"), decode_field(input, "reason"))
+            {
+                return AppError::JobWaitUnavailable { job, reason };
+            }
             let task = decode_field(input, "task");
             let reason = decode_field(input, "reason");
             match (task, reason) {
@@ -280,6 +285,10 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
+        "wait_target_is_job" => decode_field(input, "job")
+            .map_or(AppError::Internal { message }, |job| {
+                AppError::WaitTargetIsJob { job }
+            }),
         "worker_message_unavailable" => {
             let task = decode_field(input, "task");
             let reason = decode_field(input, "reason");

@@ -19,6 +19,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
+use crate::queue::JobId;
 use crate::spec;
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -157,17 +158,21 @@ pub enum TaskCommand {
         #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
         by: UsageGrouping,
     },
-    /// Print each callback event of tasks as it arrives, until all of them end.
+    /// Print each callback event of tasks and GPU queue jobs as it arrives, until all of them end.
     ///
     /// Arm this with Claude Code's Monitor tool in a T3 Code thread. Events of
-    /// these tasks then reach the agent through this command's stdout instead of a
-    /// new turn, and T3 shows the thread as waiting while it runs. Follows waiting
-    /// chains and rides out a daemon restart.
+    /// these tasks and jobs then reach the agent through this command's stdout
+    /// instead of a new turn, and T3 shows the thread as waiting while it runs.
+    /// Follows waiting chains and rides out a daemon restart. A job's wait ends
+    /// on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events are
+    /// printed and the wait goes on. Name 1 to 16 tasks and jobs in total.
     Wait {
-        /// Full task UUIDs, 1 to 16 of them.
-        #[arg(required = true, num_args = 1..)]
+        /// Full task UUIDs.
         tasks: Vec<TaskId>,
-        /// Thread that submitted the tasks. Defaults to the session environment.
+        /// GPU queue job id from `resource job submit`. Repeat for more jobs.
+        #[arg(long = "job", value_name = "JOB_ID")]
+        jobs: Vec<JobId>,
+        /// Thread that submitted the tasks and jobs. Defaults to the session environment.
         #[arg(long)]
         thread: Option<ThreadId>,
     },
@@ -277,7 +282,11 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::Show { id } => show(ctx, id).await,
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
-        TaskCommand::Wait { tasks, thread } => wait::wait(ctx, tasks, thread).await,
+        TaskCommand::Wait {
+            tasks,
+            jobs,
+            thread,
+        } => wait::wait(ctx, tasks, jobs, thread).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,

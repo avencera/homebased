@@ -10,20 +10,20 @@ use homebased::store::Store;
 use homebased::store::queue::NewJob;
 use serde_json::{Value, json};
 
-struct Jobs<'a> {
+pub(super) struct Jobs<'a> {
     harness: &'a Harness,
     ids: Vec<JobId>,
 }
 
 impl<'a> Jobs<'a> {
-    fn new(harness: &'a Harness) -> Self {
+    pub(super) fn new(harness: &'a Harness) -> Self {
         Self {
             harness,
             ids: Vec::new(),
         }
     }
 
-    fn submit(&mut self, spec: &Value) -> JobId {
+    pub(super) fn submit(&mut self, spec: &Value) -> JobId {
         let job = JobId::new();
         self.ids.push(job);
         let path = self.harness.home.join(format!("job-{job}.json"));
@@ -92,7 +92,7 @@ impl Drop for Jobs<'_> {
 /// Report readiness, then run until the test creates `finish`, for at most 15 seconds
 const WAIT_FOR_FINISH: &str = "echo ready > ready; n=0; while [ ! -f finish ] && [ $n -lt 150 ]; do sleep 0.1; n=$((n+1)); done; exit 0";
 
-fn spec(h: &Harness, priority: &str, mode: &str, script: &str) -> Value {
+pub(super) fn spec(h: &Harness, priority: &str, mode: &str, script: &str) -> Value {
     json!({ "api_version": 1, "thread": THREAD, "name": "CLI queue test", "cwd": h.home,
         "priority": priority, "preempt": { "mode": mode }, "resource": "gpu0",
         "workload": { "type": "task", "command": ["/bin/sh", "-c", script] } })
@@ -126,7 +126,7 @@ fn wait_state(h: &Harness, job: JobId, state: &str) -> Value {
     show(h, job)
 }
 
-fn callbacks(h: &Harness, job: JobId) -> Vec<Value> {
+pub(super) fn callbacks(h: &Harness, job: JobId) -> Vec<Value> {
     h.queue_messages()
         .iter()
         .map(|line| event_json(line))
@@ -134,7 +134,7 @@ fn callbacks(h: &Harness, job: JobId) -> Vec<Value> {
         .collect()
 }
 
-fn wait_callbacks(h: &Harness, job: JobId, count: usize) -> Vec<Value> {
+pub(super) fn wait_callbacks(h: &Harness, job: JobId, count: usize) -> Vec<Value> {
     assert!(
         wait_until(Duration::from_secs(15), || {
             Store::open(&h.home.join(homebased::home::DB_NAME))

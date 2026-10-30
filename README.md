@@ -291,23 +291,28 @@ lists each waiting event with its reason and the time delivery gives up.
 After 3 days the event is marked failed and is written to
 `callback-fallback.log`.
 
-### Wait for tasks in a T3 thread
+### Wait for tasks and jobs in a T3 thread
 
 ```sh
-homebased task wait <id> [<id> ...]
+homebased task wait <task-id> [<task-id> ...] [--job <job-id> ...]
 ```
 
 `task wait` streams the `HOMEBASED_EVENT` line of each callback event for 1 to
-16 of this thread's tasks to stdout and exits 0 once every task has its final
-outcome, following `TASK_WAITING` to the continuation run. While it runs, the
+16 of this thread's tasks and GPU queue jobs to stdout and exits 0 once every
+target has its final outcome. A task follows `TASK_WAITING` to the continuation
+run. A job ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other
+events are printed and the wait goes on. While it runs, the
 daemon gives those events to it in place of normal delivery. It counts an
 event delivered only once the command confirms it printed the line, so an
 event the command never confirmed goes through normal delivery after about 5
 seconds, possibly as a repeat. It reconnects silently across a daemon restart
 for up to 5 minutes. It is meant for a Claude Code `Monitor` in a T3 Code
-thread, which T3 shows as Waiting. A task of another thread or machine returns
-`wait_unavailable`, and so do a task submitted without a thread and a queue
-run, which has no callback route.
+thread, which T3 shows as Waiting. A task of another thread or machine and a
+job of another thread return `wait_unavailable`, and so do a task or job
+submitted without a thread, a job the queue refused or has not confirmed, and a
+queue run that ran
+here, which has no callback route. A job id passed as a task returns
+`wait_target_is_job`.
 
 A Codex thread cannot run a `Monitor`, so each event starts a new turn, and
 T3 shows the thread as idle between events.

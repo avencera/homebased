@@ -14,7 +14,8 @@ use tracing::warn;
 use super::Retry;
 use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::daemon::AppState;
-use crate::daemon::actors::callback::deliver_job_event;
+use crate::daemon::actors::callback::{CallbackMsg, deliver_job_event, job_event_line};
+use crate::daemon::actors::waiter::JobHandoff;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::queue_api::{ClusterJobEvent, forward};
 use crate::domain::API_VERSION;
@@ -239,6 +240,38 @@ async fn deliver_origin(
         reply,
     })
     .await?;
+    // a connected `task wait --job` stream prints the line for the agent that
+    // armed it; waking the thread as well would wake the agent twice
+    let line = job_event_line(&route, &event.event)?;
+    let blocked = event.event.event == JobEventKind::JobBlocked;
+    let seq = event.event.seq;
+    // an unanswered check leaves the notice to normal delivery, whose own
+    // check settles it
+    let route_ref = &route;
+    let current = || async move {
+        if blocked {
+            notice_current(state, route_ref, seq).await.ok()
+        } else {
+            Some(true)
+        }
+    };
+    match state
+        .waiters
+        .hand_off_job(route.thread, &event.event, &line, current)
+        .await
+    {
+        JobHandoff::Printed => {
+            let _ = callback.cast(CallbackMsg::Delivered {
+                thread: route.thread,
+            });
+            let delivered = Some(DeliveryOutcome::Delivered);
+            return settle_callback(&state.store, route.job, seq, delivered).await;
+        }
+        JobHandoff::Obsolete if blocked => {
+            return settle_callback(&state.store, route.job, seq, None).await;
+        }
+        JobHandoff::Obsolete | JobHandoff::Declined => {}
+    }
     let outcome =
         deliver_job_event(&state.home, &route, &event.event, &callback, before_send).await?;
     settle_callback(&state.store, route.job, event.event.seq, outcome).await

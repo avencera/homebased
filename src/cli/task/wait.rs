@@ -4,14 +4,15 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-
 use crate::cli::Ctx;
 use crate::client::{Client, LineStream};
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
-use crate::task_wait::{WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitSet, WaiterId};
-use crate::waiting::{MAX_WAIT_TARGETS, WaitTargets, WaitTargetsError};
+use crate::queue::JobId;
+use crate::task_wait::{
+    WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitKey, WaitKeys, WaitRequest, WaitSet,
+    WaiterId,
+};
 
 use super::select_thread;
 
@@ -43,9 +44,12 @@ enum StreamEnd {
 pub(super) async fn wait(
     ctx: &Ctx,
     tasks: Vec<TaskId>,
+    jobs: Vec<JobId>,
     thread: Option<ThreadId>,
 ) -> Result<ExitCode, AppError> {
-    let targets = WaitTargets::new(tasks).map_err(usage_error)?;
+    let targets = WaitKeys::new(tasks, jobs).map_err(|error| AppError::Usage {
+        message: error.to_string(),
+    })?;
     let thread = select_thread(thread, crate::domain::session_thread()?)?;
     let client = Client::new(ctx.home.sock_path());
     let mut set = WaitSet::new(&targets);
@@ -83,18 +87,6 @@ pub(super) async fn wait(
     }
 }
 
-fn usage_error(error: WaitTargetsError) -> AppError {
-    AppError::Usage {
-        message: match error {
-            WaitTargetsError::Empty => "name at least one task to wait on".into(),
-            WaitTargetsError::Duplicate { task } => format!("task {task} is named more than once"),
-            WaitTargetsError::TooMany { count } => {
-                format!("{count} tasks named; the limit is {MAX_WAIT_TARGETS}")
-            }
-        },
-    }
-}
-
 fn is_outage(error: &AppError) -> bool {
     matches!(
         error,
@@ -103,8 +95,21 @@ fn is_outage(error: &AppError) -> bool {
 }
 
 async fn open(client: &Client, thread: ThreadId, set: &WaitSet) -> Result<LineStream, AppError> {
-    let body = json!({ "thread": thread, "tasks": set.pending() });
-    client.post_lines(WAIT_ROUTE, &body).await
+    let body = serde_json::to_value(WaitRequest::new(thread, set))?;
+    match client.post_lines(WAIT_ROUTE, &body).await {
+        // a daemon that predates job waits refuses the request body before
+        // any handler runs, which axum answers with a plain-text 422
+        Err(AppError::Internal { message })
+            if set.has_jobs() && message.starts_with("http 422 ") =>
+        {
+            Err(AppError::Usage {
+                message: format!(
+                    "the running daemon cannot wait on jobs; restart it with `homebased daemon restart` so it runs this binary ({message})"
+                ),
+            })
+        }
+        result => result,
+    }
 }
 
 /// Print each event line as it arrives until the stream ends
@@ -143,29 +148,46 @@ async fn follow(
                 continuation,
                 line,
             } => {
-                let mut stdout = std::io::stdout().lock();
-                writeln!(stdout, "{line}")?;
-                stdout.flush()?;
-                drop(stdout);
+                print_line(&line)?;
                 *printed = true;
                 if let Some(waiter) = waiter {
-                    confirm(client, waiter, task, seq).await;
+                    confirm(client, waiter, WaitKey::Task(task), seq).await;
                 }
                 set.apply(task, kind, continuation);
-                if set.is_done() {
-                    return Ok(StreamEnd::Done);
+            }
+            WaitFrame::JobEvent {
+                job,
+                seq,
+                kind,
+                line,
+            } => {
+                print_line(&line)?;
+                *printed = true;
+                if let Some(waiter) = waiter {
+                    confirm(client, waiter, WaitKey::Job(job), seq).await;
                 }
+                set.apply_job(job, kind);
             }
         }
+        if set.is_done() {
+            return Ok(StreamEnd::Done);
+        }
     }
+}
+
+fn print_line(line: &str) -> Result<(), AppError> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Tell the daemon the event reached stdout
 ///
 /// A failed ack is not an error: the daemon times out and delivers the event
-/// normally, which agents already dedupe by `(task, seq)`
-async fn confirm(client: &Client, waiter: WaiterId, task: TaskId, seq: u64) {
-    let ack = WaitAck { waiter, task, seq };
+/// normally, which agents already dedupe by `(task, seq)` or `(job, seq)`
+async fn confirm(client: &Client, waiter: WaiterId, key: WaitKey, seq: u64) {
+    let ack = WaitAck::new(waiter, key, seq);
     let Ok(body) = serde_json::to_value(&ack) else {
         return;
     };

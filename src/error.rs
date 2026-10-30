@@ -12,7 +12,7 @@ use crate::dependency::DependencyOutcome;
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
-use crate::queue::QueueError;
+use crate::queue::{JobId, QueueError};
 use crate::spec::CwdProblem;
 use crate::submission::RequestId;
 use crate::waiting::WaitingRejection;
@@ -81,6 +81,20 @@ pub enum AppError {
         task: TaskId,
         /// Why this waiter cannot take its events
         reason: WaitBlocker,
+    },
+    /// A job's events cannot be streamed to this waiter
+    #[error("cannot wait on job {job}: {reason}")]
+    JobWaitUnavailable {
+        /// Job named by `task wait --job`
+        job: JobId,
+        /// Why this waiter cannot take its events
+        reason: JobWaitBlocker,
+    },
+    /// `task wait` named a GPU queue job where a task belongs
+    #[error("{job} is a GPU queue job, not a task; pass it with --job {job}")]
+    WaitTargetIsJob {
+        /// Job named as a task
+        job: JobId,
     },
     /// A task's worker cannot take a direct message
     #[error("the worker for task {task} cannot take a message: {reason}")]
@@ -579,6 +593,30 @@ pub enum WaitBlocker {
     NoCallbackRoute,
 }
 
+/// Why `task wait --job` cannot take a job's events
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum JobWaitBlocker {
+    /// The job reports to another thread
+    #[error("the job reports to another thread")]
+    NotOwner,
+    /// The job was submitted without a thread, so no session gets its events
+    #[error("the job was submitted without a thread, so no session can wait on it")]
+    Detached,
+    /// The queue refused the submission, so the job never produces events
+    #[error("the queue refused the job when it was submitted, so it has no events")]
+    Rejected,
+    /// The submission's outcome is unknown, so the job may never exist
+    // a later retry can still be refused, and a refused job sends no event that
+    // would end the wait
+    #[error(
+        "the queue has not confirmed the submission; retry `resource job submit` with the same --job-id until it succeeds, then wait"
+    )]
+    Unconfirmed,
+}
+
 /// Why a task's worker cannot take a direct message
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
@@ -608,7 +646,9 @@ impl AppError {
             Self::TaskUnavailable { .. } => "task_unavailable",
             Self::TaskNotStarted { .. } => "task_not_started",
             Self::FollowupUnavailable { .. } => "followup_unavailable",
-            Self::WaitUnavailable { .. } => "wait_unavailable",
+            // one code for both target kinds; `input` names a task or a job
+            Self::WaitUnavailable { .. } | Self::JobWaitUnavailable { .. } => "wait_unavailable",
+            Self::WaitTargetIsJob { .. } => "wait_target_is_job",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
@@ -701,6 +741,7 @@ impl AppError {
             | Self::NotifyNotConfigured => 2,
             Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
+            | Self::WaitTargetIsJob { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
             | Self::UnknownDependency { .. }
@@ -716,6 +757,7 @@ impl AppError {
             | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
             | Self::WaitUnavailable { .. }
+            | Self::JobWaitUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
@@ -764,6 +806,7 @@ impl AppError {
             Self::NotifyNotConfigured => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::TaskNotFound { .. }
+            | Self::WaitTargetIsJob { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
             | Self::UnknownDependency { .. }
@@ -785,6 +828,7 @@ impl AppError {
             | Self::DependencyFailed { .. }
             | Self::FollowupUnavailable { .. }
             | Self::WaitUnavailable { .. }
+            | Self::JobWaitUnavailable { .. }
             | Self::WorkerMessageUnavailable { .. }
             | Self::ResumeThreadBusy { .. }
             | Self::DaemonAlreadyRunning
@@ -853,6 +897,8 @@ impl AppError {
             Self::WaitUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }
+            Self::JobWaitUnavailable { job, reason } => json!({ "job": job, "reason": reason }),
+            Self::WaitTargetIsJob { job } => json!({ "job": job }),
             Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }

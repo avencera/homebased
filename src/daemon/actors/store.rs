@@ -124,6 +124,11 @@ pub(crate) enum StoreMsg {
         seq: u64,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Read the delivered or suppressed events of one job's origin inbox
+    SettledJobEvents {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobEvent>, AppError>>,
+    },
     /// Advance only after callback delivery succeeds
     SettleJobEvent {
         job: crate::queue::JobId,
@@ -695,6 +700,9 @@ impl Actor for StoreActor {
             StoreMsg::PendingJobInbox { reply } => send_reply(reply, state.pending_job_inbox()),
             StoreMsg::SuppressJobNotice { job, seq, reply } => {
                 send_reply(reply, state.suppress_job_notice(job, seq))
+            }
+            StoreMsg::SettledJobEvents { job, reply } => {
+                send_reply(reply, state.settled_job_events(job))
             }
             StoreMsg::SettleJobEvent { job, seq, reply } => {
                 send_reply(reply, state.settle_job_event(job, seq))

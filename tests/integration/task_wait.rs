@@ -1,7 +1,10 @@
 //! `task wait` streams callback events to a Monitor in place of normal delivery
 
+use super::resource_jobs::{Jobs, callbacks, spec, wait_callbacks};
 use super::{Harness, THREAD, event_json, wait_until};
 use homebased::client::{Client, LineStream};
+use homebased::queue::JobId;
+use homebased::store::Store;
 use homebased::task_wait::WAIT_ROUTE;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
@@ -93,12 +96,12 @@ impl Harness {
         SilentWaiter { runtime, stream }
     }
 
-    fn spawn_wait(&self, thread: &str, tasks: &[&str]) -> Waiter {
+    fn spawn_wait(&self, thread: &str, args: &[&str]) -> Waiter {
         let mut child = self
             .cmd()
             .env("CODEX_THREAD_ID", thread)
             .args(["task", "wait"])
-            .args(tasks)
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -120,6 +123,25 @@ impl Harness {
     /// A target that runs until its gate opens and exits 0
     fn gated(&self, gate: &str) -> String {
         self.submit(&self.gated_target(gate, 0))
+    }
+
+    /// A queue job that runs until its gate opens and exits 0
+    fn gated_job(&self, jobs: &mut Jobs<'_>, gate: &str) -> JobId {
+        let gate = self.record.join(gate);
+        let script = format!(
+            "n=0; while [ ! -f '{}' ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done; exit 0",
+            gate.display()
+        );
+        jobs.submit(&spec(self, "medium", "wait", &script))
+    }
+
+    /// Last job event settled in the origin inbox
+    fn job_settled(&self, job: JobId) -> u64 {
+        Store::open(&self.home.join(homebased::home::DB_NAME))
+            .unwrap()
+            .job_route_cursors(job)
+            .unwrap()
+            .map_or(0, |cursors| cursors.settled)
     }
 
     /// Callbacks that normal delivery sent for `id`
@@ -356,4 +378,79 @@ fn waiter_names_a_task_submitted_without_a_thread() {
     assert_eq!(error["error"]["code"], "wait_unavailable", "{error}");
     assert_eq!(error["error"]["input"]["reason"], "detached", "{error}");
     h.release_gate("detached");
+}
+
+#[test]
+fn one_waiter_prints_task_and_job_events_and_settles_them() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let task = h.gated("mixed-task");
+    let job = h.gated_job(&mut jobs, "mixed-job");
+    let waiter = h.spawn_wait(THREAD, &[&task, "--job", &job.to_string()]);
+
+    h.release_gate("mixed-job");
+    let line = waiter.next_line();
+    assert_eq!(line["event"], "JOB_SUCCEEDED", "{line}");
+    assert_eq!(line["job"], job.to_string());
+    assert_eq!(line["thread"], THREAD);
+    assert!(
+        wait_until(Duration::from_secs(10), || h.job_settled(job) == 1),
+        "the printed job event was not settled"
+    );
+
+    h.release_gate("mixed-task");
+    let (code, rest) = waiter.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert_eq!(rest[0]["event"], "TASK_SUCCEEDED");
+    assert_eq!(rest[0]["task"], task);
+    // the job sender rescans its inbox several times a second, so a repeat
+    // would show up well within this pause
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+    assert_eq!(h.normally_delivered(&task), Vec::<String>::new());
+}
+
+#[test]
+fn job_waiter_on_a_delivered_job_exits_without_output() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let job = jobs.submit(&spec(&h, "medium", "wait", "exit 0"));
+    assert_eq!(wait_callbacks(&h, job, 1)[0]["event"], "JOB_SUCCEEDED");
+
+    let (code, lines) = h.spawn_wait(THREAD, &["--job", &job.to_string()]).finish();
+
+    assert_eq!(code, 0);
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+#[test]
+fn waiter_names_a_job_given_as_a_task_and_refuses_an_unknown_job() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let job = h.gated_job(&mut jobs, "job-as-task").to_string();
+    let unknown = JobId::new().to_string();
+
+    for (args, code) in [
+        (vec![job.as_str()], "wait_target_is_job"),
+        (vec!["--job", unknown.as_str()], "job_not_found"),
+    ] {
+        let out = h
+            .cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["--json", "task", "wait"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(error["error"]["code"], code, "{error}");
+        assert_ne!(out.status.code(), Some(0));
+        if code == "wait_target_is_job" {
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains(&format!("--job {job}")), "{message}");
+        }
+    }
+    h.release_gate("job-as-task");
 }
