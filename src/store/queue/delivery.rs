@@ -279,7 +279,7 @@ impl Store {
 
     /// Events of one job's origin inbox that were delivered or suppressed, in sequence order
     ///
-    /// A `task wait --job` stream replays these to catch up without printing
+    /// A `homebased wait` stream replays these to catch up without printing
     /// them again; the events after them are still owed to the thread
     pub fn settled_job_events(&self, job: JobId) -> Result<Vec<JobEvent>, AppError> {
         let mut statement = self.conn.prepare(

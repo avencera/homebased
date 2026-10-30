@@ -1,4 +1,4 @@
-//! `WaiterActor` owns the connected `task wait` streams that take the callback
+//! `WaiterActor` owns the connected `homebased wait` streams that take the callback
 //! events of a task or GPU queue job in place of the origin thread's normal
 //! delivery
 
@@ -221,7 +221,7 @@ impl WaiterState {
     }
 }
 
-/// Owns which `task wait` stream takes which target's events
+/// Owns which `homebased wait` stream takes which target's events
 pub struct WaiterActor;
 
 impl Actor for WaiterActor {

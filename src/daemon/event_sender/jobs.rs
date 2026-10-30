@@ -240,7 +240,7 @@ async fn deliver_origin(
         reply,
     })
     .await?;
-    // a connected `task wait --job` stream prints the line for the agent that
+    // a connected `homebased wait` stream prints the line for the agent that
     // armed it; waking the thread as well would wake the agent twice
     let line = job_event_line(&route, &event.event)?;
     let blocked = event.event.event == JobEventKind::JobBlocked;

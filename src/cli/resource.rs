@@ -253,7 +253,7 @@ async fn submit(
     });
     let value = post_retry(client, "/v1/resource/jobs", &body).await?;
     print_result(ctx, &value, "submitted", &job_id.to_string())?;
-    super::task::print_t3_wait_hint(&format!("--job {job_id}"), spec.thread);
+    super::task::print_t3_wait_hint(&job_id.to_string(), spec.thread);
     Ok(())
 }
 

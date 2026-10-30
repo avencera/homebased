@@ -24,7 +24,11 @@ impl<'a> Jobs<'a> {
     }
 
     pub(super) fn submit(&mut self, spec: &Value) -> JobId {
-        let job = JobId::new();
+        self.submit_as(JobId::new(), spec)
+    }
+
+    /// Submit with a chosen job id
+    pub(super) fn submit_as(&mut self, job: JobId, spec: &Value) -> JobId {
         self.ids.push(job);
         let path = self.harness.home.join(format!("job-{job}.json"));
         fs::write(&path, serde_json::to_vec(spec).unwrap()).unwrap();

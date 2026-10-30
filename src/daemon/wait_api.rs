@@ -1,4 +1,4 @@
-//! `POST /v1/tasks/wait`: stream callback events to a `task wait` client
+//! `POST /v1/tasks/wait`: stream callback events to a `homebased wait` client
 //!
 //! The origin inbox stays the single source of truth. A connected waiter only
 //! changes where a target's events go: the callback actor for task events, and
@@ -8,6 +8,10 @@
 //! to the origin thread's normal delivery. Because only a printed event settles,
 //! the handler can replay the inbox: a settled event advances the wait without
 //! being printed again, and an unsettled one is still owed to someone
+//!
+//! A request that names bare ids has each one resolved to a task or a job
+//! here, and the `Open` frame reports the result so the client's reconnects
+//! name typed targets and never resolve again
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -24,6 +28,7 @@ use axum::routing::post;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::callback::EventKind;
 use crate::daemon::AppState;
@@ -35,7 +40,8 @@ use crate::events::EventPayload;
 use crate::queue::delivery::JobSubmission;
 use crate::queue::{JobEventKind, JobId, QueueError};
 use crate::task_wait::{
-    WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitKey, WaitRequest, WaitSet,
+    RequestedTargets, WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys,
+    WaitRequest, WaitSet,
 };
 
 // keeps the stream observable: a dead client fails the write, and the client
@@ -73,9 +79,13 @@ async fn wait(
     State(state): State<AppState>,
     Json(request): Json<WaitRequest>,
 ) -> Result<Response, AppError> {
-    let targets = request.targets().map_err(|error| AppError::Usage {
+    let requested = request.targets().map_err(|error| AppError::Usage {
         message: error.to_string(),
     })?;
+    let (targets, announce) = match requested {
+        RequestedTargets::Keys(keys) => (keys, false),
+        RequestedTargets::Ids(ids) => (resolve(&state, &ids).await?, true),
+    };
     for key in targets.keys() {
         match *key {
             WaitKey::Task(task) => check_target(&state, request.thread, task).await?,
@@ -93,11 +103,12 @@ async fn wait(
         frames,
         floor: HashMap::new(),
         fresh: Vec::new(),
+        announce,
     };
     tokio::spawn(async move {
         if let Err(error) = pump.serve().await {
             // dropping the stream makes the client reconnect
-            warn!("task wait stream: {error}");
+            warn!("wait stream: {error}");
         }
     });
 
@@ -113,6 +124,44 @@ async fn wait(
         })
 }
 
+/// Tell which of `ids` are tasks and which are jobs, in order
+///
+/// Task and job ids live in separate tables, so one UUID could in principle
+/// name both; that is refused rather than guessed at
+async fn resolve(state: &AppState, ids: &WaitIds) -> Result<WaitKeys, AppError> {
+    let mut keys = Vec::with_capacity(ids.ids().len());
+    for id in ids.ids() {
+        keys.push(resolve_one(state, *id).await?);
+    }
+    WaitKeys::new(keys).map_err(|error| AppError::Internal {
+        message: format!("resolved wait targets: {error}"),
+    })
+}
+
+async fn resolve_one(state: &AppState, id: Uuid) -> Result<WaitKey, AppError> {
+    let (task, job) = (TaskId(id), JobId::from_uuid(id));
+    // a task without an origin route, such as a queue run, still counts as a
+    // task so `check_target` can say why it cannot be followed
+    let routed = call(&state.store, |reply| StoreMsg::OriginRoute {
+        id: task,
+        reply,
+    })
+    .await?;
+    let is_task = routed.is_some()
+        || call(&state.store, |reply| StoreMsg::GetTask { id: task, reply })
+            .await?
+            .is_some();
+    let is_job = call(&state.store, |reply| StoreMsg::JobRoute { job, reply })
+        .await?
+        .is_some();
+    match (is_task, is_job) {
+        (true, true) => Err(AppError::WaitTargetAmbiguous { id }),
+        (true, false) => Ok(WaitKey::Task(task)),
+        (false, true) => Ok(WaitKey::Job(job)),
+        (false, false) => Err(AppError::WaitTargetNotFound { id }),
+    }
+}
+
 /// Refuse a task whose events cannot go to a waiter of `thread`
 async fn check_target(state: &AppState, thread: ThreadId, task: TaskId) -> Result<(), AppError> {
     let Some(route) = call(&state.store, |reply| StoreMsg::OriginRoute {
@@ -124,20 +173,11 @@ async fn check_target(state: &AppState, thread: ThreadId, task: TaskId) -> Resul
         let known = call(&state.store, |reply| StoreMsg::GetTask { id: task, reply })
             .await?
             .is_some();
-        if known {
-            return Err(AppError::WaitUnavailable {
+        return Err(if known {
+            AppError::WaitUnavailable {
                 task,
                 reason: WaitBlocker::NoCallbackRoute,
-            });
-        }
-        // agents mix up the two ids, since a job submit prints an id that
-        // looks like any task id
-        let job = JobId::from_uuid(task.0);
-        let is_job = call(&state.store, |reply| StoreMsg::JobRoute { job, reply })
-            .await?
-            .is_some();
-        return Err(if is_job {
-            AppError::WaitTargetIsJob { job }
+            }
         } else {
             AppError::TaskNotFound { id: task }
         });
@@ -208,6 +248,8 @@ struct Pump {
     floor: HashMap<WaitKey, u64>,
     /// Targets that joined the wait and still need their inbox read
     fresh: Vec<WaitKey>,
+    /// Whether the request named bare ids, so the `Open` frame must say what they resolved to
+    announce: bool,
 }
 
 impl Pump {
@@ -217,9 +259,10 @@ impl Pump {
         for key in &keys {
             self.session.watch(*key);
         }
-        self.fresh = keys;
+        self.fresh.clone_from(&keys);
         let open = WaitFrame::Open {
             waiter: self.session.id(),
+            targets: self.announce.then_some(keys),
         };
         if !self.push(&open).await {
             return Ok(());

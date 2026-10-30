@@ -1,4 +1,4 @@
-//! Wire types and chain bookkeeping for `homebased task wait`
+//! Wire types and chain bookkeeping for `homebased wait`
 //!
 //! A waiter holds one request on the daemon socket and receives the callback
 //! lines of its tasks and GPU queue jobs as newline-delimited JSON frames, in
@@ -10,10 +10,13 @@
 //! separate request, that it printed the line. A client that dies between
 //! receiving and printing never confirms, so the event is delivered normally
 //!
-//! Job support was added after task waits shipped. Task-only requests, frames,
-//! and acks keep their original shape, so clients and daemons from either side
-//! of that change still understand each other while `homebased update`
-//! restarts the daemon under a connected waiter
+//! The first request of a wait names bare ids, and the daemon answers in the
+//! `Open` frame whether each one is a task or a job. Reconnects then name the
+//! typed targets, so an id is resolved once and never again. Typed requests are
+//! also the shape older clients send: task-only requests, frames, and acks keep
+//! their original shape, and job frames go only to requests that named jobs, so
+//! clients and daemons from either side of a change still understand each other
+//! while `homebased update` restarts the daemon under a connected waiter
 
 use std::fmt;
 
@@ -43,12 +46,26 @@ impl Default for WaiterId {
 }
 
 /// One target of a wait, whose events arrive in its own sequence
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// On the wire it reads `{"task": id}` or `{"job": id}`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WaitKey {
     /// A task and its waiting chain, reported through `TASK_*` events
     Task(TaskId),
     /// A GPU queue job, reported through `JOB_*` events
     Job(JobId),
+}
+
+impl WaitKey {
+    /// The id the target was named by
+    #[must_use]
+    pub fn uuid(self) -> Uuid {
+        match self {
+            Self::Task(task) => task.0,
+            Self::Job(job) => job.as_uuid(),
+        }
+    }
 }
 
 impl fmt::Display for WaitKey {
@@ -60,30 +77,73 @@ impl fmt::Display for WaitKey {
     }
 }
 
-/// Targets of one wait: 1 to [`MAX_WAIT_TARGETS`] tasks and jobs in total,
-/// without duplicates, tasks first in the order they were named
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitKeys(Vec<WaitKey>);
-
 /// Why the targets of a wait are invalid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WaitKeysError {
     /// No target was named
-    #[error("name at least one task, or a job with --job, to wait on")]
+    #[error("name at least one task or job id to wait on")]
     Empty,
-    /// The same target appears twice
-    #[error("{key} is named more than once")]
+    /// The same id appears twice
+    #[error("{id} is named more than once")]
     Duplicate {
-        /// Repeated target
-        key: WaitKey,
+        /// Repeated id
+        id: Uuid,
     },
     /// More than [`MAX_WAIT_TARGETS`] targets
-    #[error("{count} tasks and jobs named; the limit is {MAX_WAIT_TARGETS}")]
+    #[error("{count} ids named; the limit is {MAX_WAIT_TARGETS}")]
     TooMany {
         /// Number of named targets
         count: usize,
     },
+    /// A request named bare ids and typed targets together
+    #[error("a wait request names either ids or tasks and jobs, not both")]
+    Mixed,
 }
+
+/// Refuse no ids, a repeated id, and more than [`MAX_WAIT_TARGETS`] ids
+/// Refuse an empty or oversized list, or one that names an item twice
+fn check_targets<T: PartialEq>(items: &[T], id: impl Fn(&T) -> Uuid) -> Result<(), WaitKeysError> {
+    if items.is_empty() {
+        return Err(WaitKeysError::Empty);
+    }
+    if items.len() > MAX_WAIT_TARGETS {
+        return Err(WaitKeysError::TooMany { count: items.len() });
+    }
+    for (index, item) in items.iter().enumerate() {
+        if items[..index].contains(item) {
+            return Err(WaitKeysError::Duplicate { id: id(item) });
+        }
+    }
+    Ok(())
+}
+
+/// Ids one wait names before the daemon says which are tasks and which are
+/// jobs: 1 to [`MAX_WAIT_TARGETS`] of them, without duplicates, in order
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitIds(Vec<Uuid>);
+
+impl WaitIds {
+    /// Validate the ids one wait names
+    ///
+    /// # Errors
+    ///
+    /// Refuses no ids, a repeated id, and more than [`MAX_WAIT_TARGETS`] ids
+    pub fn new(ids: Vec<Uuid>) -> Result<Self, WaitKeysError> {
+        check_targets(&ids, |id| *id)?;
+        Ok(Self(ids))
+    }
+
+    /// Ids in order
+    #[must_use]
+    pub fn ids(&self) -> &[Uuid] {
+        &self.0
+    }
+}
+
+/// Typed targets of one wait: 1 to [`MAX_WAIT_TARGETS`] tasks and jobs in
+/// total, without a repeated target, in order
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitKeys(Vec<WaitKey>);
 
 impl WaitKeys {
     /// Validate the tasks and jobs one wait names
@@ -92,23 +152,10 @@ impl WaitKeys {
     ///
     /// Refuses no targets, a repeated target, and more than [`MAX_WAIT_TARGETS`]
     /// tasks and jobs together
-    pub fn new(tasks: Vec<TaskId>, jobs: Vec<JobId>) -> Result<Self, WaitKeysError> {
-        let keys: Vec<WaitKey> = tasks
-            .into_iter()
-            .map(WaitKey::Task)
-            .chain(jobs.into_iter().map(WaitKey::Job))
-            .collect();
-        if keys.is_empty() {
-            return Err(WaitKeysError::Empty);
-        }
-        if keys.len() > MAX_WAIT_TARGETS {
-            return Err(WaitKeysError::TooMany { count: keys.len() });
-        }
-        for (index, key) in keys.iter().enumerate() {
-            if keys[..index].contains(key) {
-                return Err(WaitKeysError::Duplicate { key: *key });
-            }
-        }
+    pub fn new(keys: Vec<WaitKey>) -> Result<Self, WaitKeysError> {
+        // a task and a job can share a UUID, since a job's id is chosen at
+        // submit, and a client from before `homebased wait` may wait on both
+        check_targets(&keys, |key| key.uuid())?;
         Ok(Self(keys))
     }
 
@@ -119,23 +166,50 @@ impl WaitKeys {
     }
 }
 
+/// What a wait request names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestedTargets {
+    /// Bare ids the daemon resolves and reports back in the `Open` frame
+    Ids(WaitIds),
+    /// Targets whose kind the client already knows
+    Keys(WaitKeys),
+}
+
 /// Body of a wait request
+///
+/// Names either bare `ids` or typed `tasks` and `jobs`. Clients from before
+/// `homebased wait` send only the typed shape
+// empty lists are omitted so a typed task-only request reads `{thread, tasks}`,
+// the shape every daemon with waits accepts, and a request with `ids` fails
+// fast on a daemon that predates them
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitRequest {
     /// Thread of the waiting session; it must be the origin thread of every target
     pub thread: ThreadId,
+    /// Task or job ids for the daemon to resolve
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<Uuid>,
     /// Tasks to wait on
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<TaskId>,
     /// GPU queue jobs to wait on
-    // omitted when empty so a task-only request reads the same to a daemon
-    // that predates job waits
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobId>,
 }
 
 impl WaitRequest {
+    /// Request that asks the daemon to resolve `ids`
+    #[must_use]
+    pub fn resolve(thread: ThreadId, ids: &WaitIds) -> Self {
+        Self {
+            thread,
+            ids: ids.ids().to_vec(),
+            tasks: Vec::new(),
+            jobs: Vec::new(),
+        }
+    }
+
     /// Request for every target still pending in `set`
     #[must_use]
     pub fn new(thread: ThreadId, set: &WaitSet) -> Self {
@@ -148,6 +222,7 @@ impl WaitRequest {
         }
         Self {
             thread,
+            ids: Vec::new(),
             tasks,
             jobs,
         }
@@ -157,9 +232,23 @@ impl WaitRequest {
     ///
     /// # Errors
     ///
-    /// Refuses the targets [`WaitKeys::new`] refuses
-    pub fn targets(&self) -> Result<WaitKeys, WaitKeysError> {
-        WaitKeys::new(self.tasks.clone(), self.jobs.clone())
+    /// Refuses `ids` mixed with `tasks` or `jobs`, and the targets
+    /// [`WaitIds::new`] and [`WaitKeys::new`] refuse
+    pub fn targets(&self) -> Result<RequestedTargets, WaitKeysError> {
+        if self.ids.is_empty() {
+            let keys = self
+                .tasks
+                .iter()
+                .copied()
+                .map(WaitKey::Task)
+                .chain(self.jobs.iter().copied().map(WaitKey::Job))
+                .collect();
+            return WaitKeys::new(keys).map(RequestedTargets::Keys);
+        }
+        if !self.tasks.is_empty() || !self.jobs.is_empty() {
+            return Err(WaitKeysError::Mixed);
+        }
+        WaitIds::new(self.ids.clone()).map(RequestedTargets::Ids)
     }
 }
 
@@ -217,6 +306,11 @@ pub enum WaitFrame {
     Open {
         /// Id to send with each ack
         waiter: WaiterId,
+        /// What each requested id resolved to, in request order
+        // sent only to a request that named bare ids, so clients that predate
+        // them, which read this frame with `deny_unknown_fields`, never see it
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<Vec<WaitKey>>,
     },
     /// A callback event for a pending task
     Event {
@@ -312,14 +406,6 @@ impl WaitSet {
         &self.pending
     }
 
-    /// Whether any pending target is a job
-    #[must_use]
-    pub fn has_jobs(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|key| matches!(key, WaitKey::Job(_)))
-    }
-
     /// Whether every target reached its final outcome
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -373,14 +459,17 @@ impl WaitSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{WaitAck, WaitKey, WaitKeys, WaitKeysError, WaitRequest, WaitSet, WaiterId};
+    use super::{
+        RequestedTargets, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys, WaitKeysError,
+        WaitRequest, WaitSet, WaiterId,
+    };
     use crate::callback::EventKind;
     use crate::domain::{TaskId, ThreadId};
     use crate::queue::JobId;
     use crate::waiting::MAX_WAIT_TARGETS;
 
     fn set(tasks: &[TaskId]) -> WaitSet {
-        WaitSet::new(&WaitKeys::new(tasks.to_vec(), Vec::new()).unwrap())
+        WaitSet::new(&WaitKeys::new(keys(tasks)).unwrap())
     }
 
     fn keys(tasks: &[TaskId]) -> Vec<WaitKey> {
@@ -423,22 +512,92 @@ mod tests {
     fn targets_count_tasks_and_jobs_together() {
         let job = JobId::new();
         assert_eq!(
-            WaitKeys::new(Vec::new(), vec![job, job]),
-            Err(WaitKeysError::Duplicate {
-                key: WaitKey::Job(job)
-            })
+            WaitKeys::new(vec![WaitKey::Job(job), WaitKey::Job(job)]),
+            Err(WaitKeysError::Duplicate { id: job.as_uuid() })
         );
-        let tasks = (0..MAX_WAIT_TARGETS).map(|_| TaskId::new()).collect();
+        let mut targets = keys(
+            &(0..MAX_WAIT_TARGETS)
+                .map(|_| TaskId::new())
+                .collect::<Vec<_>>(),
+        );
+        targets.push(WaitKey::Job(job));
         assert_eq!(
-            WaitKeys::new(tasks, vec![job]),
+            WaitKeys::new(targets),
             Err(WaitKeysError::TooMany {
                 count: MAX_WAIT_TARGETS + 1
             })
         );
+        assert_eq!(WaitKeys::new(Vec::new()), Err(WaitKeysError::Empty));
+    }
+
+    #[test]
+    fn requests_from_older_clients_still_parse_as_typed_targets() {
+        let (thread, task, job) = (ThreadId::DETACHED, TaskId::new(), JobId::new());
+        let parse = |wire: serde_json::Value| {
+            serde_json::from_value::<WaitRequest>(wire)
+                .unwrap()
+                .targets()
+        };
+
         assert_eq!(
-            WaitKeys::new(Vec::new(), Vec::new()),
-            Err(WaitKeysError::Empty)
+            parse(serde_json::json!({ "thread": thread, "tasks": [task] })),
+            Ok(RequestedTargets::Keys(
+                WaitKeys::new(vec![WaitKey::Task(task)]).unwrap()
+            ))
         );
+        assert_eq!(
+            parse(serde_json::json!({ "thread": thread, "tasks": [task], "jobs": [job] })),
+            Ok(RequestedTargets::Keys(
+                WaitKeys::new(vec![WaitKey::Task(task), WaitKey::Job(job)]).unwrap()
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "thread": thread, "ids": [task.0, job.as_uuid()] })),
+            Ok(RequestedTargets::Ids(
+                WaitIds::new(vec![task.0, job.as_uuid()]).unwrap()
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "thread": thread, "ids": [task.0], "jobs": [job] })),
+            Err(WaitKeysError::Mixed)
+        );
+
+        // a v0.23.12 client may wait on a task and a job that share a UUID, and
+        // reconnects with both typed
+        let shared = JobId::from_uuid(task.0);
+        assert_eq!(
+            parse(serde_json::json!({ "thread": thread, "tasks": [task], "jobs": [shared] })),
+            Ok(RequestedTargets::Keys(
+                WaitKeys::new(vec![WaitKey::Task(task), WaitKey::Job(shared)]).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_open_frame_names_resolved_targets_only_when_asked() {
+        let waiter = WaiterId::default();
+        let (task, job) = (TaskId::new(), JobId::new());
+
+        // clients that predate bare ids read this frame with `deny_unknown_fields`
+        let typed = WaitFrame::Open {
+            waiter,
+            targets: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap(),
+            serde_json::json!({ "type": "open", "waiter": waiter })
+        );
+
+        let resolved = WaitFrame::Open {
+            waiter,
+            targets: Some(vec![WaitKey::Task(task), WaitKey::Job(job)]),
+        };
+        let wire = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(
+            wire["targets"],
+            serde_json::json!([{ "task": task }, { "job": job }])
+        );
+        assert_eq!(serde_json::from_value::<WaitFrame>(wire).unwrap(), resolved);
     }
 
     #[test]

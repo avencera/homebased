@@ -92,7 +92,7 @@ pub struct AppState {
     pub(crate) locks: DaemonLocks,
     /// Agent stores that name the threads on this machine, when `HOME` is known
     pub thread_titles: Option<TitleSources>,
-    /// Connected `task wait` streams, shared with the callback actor
+    /// Connected `homebased wait` streams, shared with the callback actor
     pub(crate) waiters: WaiterRegistry,
     /// Flips to `true` when the daemon starts shutting down; open streams end then
     pub(crate) shutdown: watch::Receiver<bool>,
@@ -166,7 +166,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
             FleetState::Enabled(runtime.handle())
         });
     compaction_log::set_default(home.compaction_log_path());
-    // listeners and open `task wait` streams share one shutdown
+    // listeners and open `homebased wait` streams share one shutdown
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = AppState {
         home: home.clone(),

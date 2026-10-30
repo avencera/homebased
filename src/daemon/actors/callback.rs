@@ -111,7 +111,7 @@ pub struct CallbackArgs {
     /// A new or changed entry retries waiting events at once instead of at the
     /// next periodic scan
     pub claude_sessions: Option<PathBuf>,
-    /// Connected `task wait` streams that take events in place of normal delivery
+    /// Connected `homebased wait` streams that take events in place of normal delivery
     pub waiters: WaiterRegistry,
 }
 
@@ -480,7 +480,7 @@ pub(crate) async fn dispatch_inbox(
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
-            // a connected `task wait` stream prints the line for the agent that
+            // a connected `homebased wait` stream prints the line for the agent that
             // armed it; waking the thread as well would wake the agent twice
             if waiters.hand_off(route.thread, &entry.event, &line).await {
                 AttemptOutcome::Settle(DeliveryOutcome::Delivered)
@@ -578,7 +578,7 @@ struct CallbackPaths {
 
 /// The `HOMEBASED_EVENT` line of one job event, as its origin thread receives it
 ///
-/// Normal delivery and a `task wait --job` stream both send this line, so an
+/// Normal delivery and a `homebased wait` stream both send this line, so an
 /// agent reads the same event whichever path carried it
 pub(crate) fn job_event_line(
     route: &crate::queue::delivery::JobRoute,

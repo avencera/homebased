@@ -52,7 +52,7 @@ pub(crate) enum SupervisorMsg {
     GetStore {
         reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
     },
-    /// Registry of `task wait` streams for `AppState`
+    /// Registry of `homebased wait` streams for `AppState`
     GetWaiters {
         reply: RpcReplyPort<Result<WaiterRegistry, AppError>>,
     },
