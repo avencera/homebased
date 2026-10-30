@@ -252,7 +252,9 @@ async fn submit(
         "callback_cwd": std::env::current_dir()?,
     });
     let value = post_retry(client, "/v1/resource/jobs", &body).await?;
-    print_result(ctx, &value, "submitted", &job_id.to_string())
+    print_result(ctx, &value, "submitted", &job_id.to_string())?;
+    super::task::print_t3_wait_hint(&format!("--job {job_id}"), spec.thread);
+    Ok(())
 }
 
 fn path(base: &str, machine: &MachineArgs) -> String {

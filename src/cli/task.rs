@@ -491,26 +491,33 @@ async fn submit_normalized(
         .to_string();
     ctx.print_id(&id, &format!("submitted {id}"), value)?;
 
-    // stderr keeps `--json` and `--quiet` output parseable
+    print_t3_wait_hint(&id, thread);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print how to wait on work this session just submitted, when T3 owns it
+///
+/// `target` is what follows `homebased task wait`: a task id, or `--job <id>`
+pub(super) fn print_t3_wait_hint(target: &str, thread: ThreadId) {
     let session = std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .and_then(|value| value.parse().ok());
     let worker = std::env::var_os("HOMEBASED_TASK_ID").is_some();
-    if let Some(hint) = t3_wait_hint(&T3Env::from_env(), &id, thread, session, worker) {
+    // stderr keeps `--json` and `--quiet` output parseable
+    if let Some(hint) = t3_wait_hint(&T3Env::from_env(), target, thread, session, worker) {
         eprintln!("{hint}");
     }
-    Ok(ExitCode::SUCCESS)
 }
 
-/// How a Claude session that a T3 thread owns waits on a task it submitted
+/// How a Claude session that a T3 thread owns waits on a task or job it submitted
 ///
 /// T3 lists the thread under Waiting only while a Monitor on `task wait` is
 /// registered with `t3_background_wait`, and agents kept skipping that step. A
 /// worker parks with `waiting` instead, and only the submitting session can wait
-/// on the task
+/// on the work
 fn t3_wait_hint(
     env: &T3Env,
-    task: &str,
+    target: &str,
     thread: ThreadId,
     session: Option<ThreadId>,
     worker: bool,
@@ -522,7 +529,7 @@ fn t3_wait_hint(
         return None;
     }
     Some(format!(
-        "T3: arm Monitor on `homebased task wait {task}`, pass the Monitor's task id to t3_background_wait, and end the turn"
+        "T3: arm Monitor on `homebased task wait {target}`, pass the Monitor's task id to t3_background_wait, and end the turn"
     ))
 }
 
