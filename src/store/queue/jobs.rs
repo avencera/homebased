@@ -521,11 +521,17 @@ impl Store {
             [job.to_string()],
             |row| row.get(0),
         )?;
+        let resource = match run {
+            Some(run) => self.resource(run.resource)?.map(|record| record.resource),
+            None => None,
+        };
         let event = JobEvent {
             job,
             seq: u64::try_from(seq).map_err(|_| corrupt("negative event sequence"))?,
             event,
             run,
+            resource_name: resource.as_ref().map(|resource| resource.name.clone()),
+            resource_label: resource.and_then(|resource| resource.label),
             process,
             attention,
             at: Utc::now(),

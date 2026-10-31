@@ -14,8 +14,8 @@ use crate::domain::TaskEnv;
 use crate::error::AppError;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
-    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, ResourceLabel,
-    ResourceName, ResourceSelector, RunPhase, StopCause, Target,
+    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
+    ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase, StopCause, Target,
 };
 use crate::store::queue::ResourceRecord;
 use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
@@ -371,10 +371,23 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     Ok(())
 }
 
-fn target_label(target: Target) -> String {
+fn target_label(target: Target, known: &[Resource]) -> String {
     match target {
         Target::Any => "any".into(),
-        Target::Pinned(resource) => resource.to_string(),
+        Target::Pinned(resource) => resource_label(resource, known),
+    }
+}
+
+/// `gpu0 (RTX 5090)` for a known resource, else its UUID
+fn resource_label(id: ResourceId, known: &[Resource]) -> String {
+    match known.iter().find(|resource| resource.id == id) {
+        Some(Resource {
+            name,
+            label: Some(label),
+            ..
+        }) => format!("{name} ({label})"),
+        Some(resource) => resource.name.to_string(),
+        None => id.to_string(),
     }
 }
 
@@ -395,7 +408,7 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let priority = job.priority.as_str();
         let position = job.position.unwrap_or(0);
         let state = job.state.as_str();
-        let target = target_label(job.target);
+        let target = target_label(job.target, &[]);
         let name = &job.spec.name;
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
     }
@@ -416,7 +429,7 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     let name = &job.spec.name;
     let state = job.state.as_str();
     let priority = job.priority.as_str();
-    let target = target_label(job.target);
+    let target = target_label(job.target, &detail.resources);
     println!("{id}  {name}\nstate: {state}\npriority: {priority}\ntarget: {target}");
     let last_stop = detail.last_stop_cause.map_or("-", StopCause::as_str);
     println!("step: {}\nlast stop: {last_stop}", job.step);
@@ -426,8 +439,11 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             Some(Ok(())) => "clean".to_owned(),
             Some(Err(failure)) => format!("failed: {failure}"),
         };
+        let on = run.resource.map_or_else(String::new, |resource| {
+            format!(" on {}", resource_label(resource, &detail.resources))
+        });
         println!(
-            "run {} step {}: {} {}; cleanup: {cleanup}",
+            "run {} step {}: {} {}{on}; cleanup: {cleanup}",
             run.run_number, run.step, run.task, run.status
         );
     }

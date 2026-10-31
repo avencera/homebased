@@ -591,6 +591,8 @@ pub(crate) fn job_event_line(
     payload["machine"] = serde_json::json!(route.authority);
     // blocked and never-started jobs have no run; explicit nulls keep the envelope stable
     payload["resource"] = serde_json::json!(event.run.map(|run| run.resource));
+    payload["resource_name"] = serde_json::json!(event.resource_name);
+    payload["resource_label"] = serde_json::json!(event.resource_label);
     payload["task"] = serde_json::json!(event.run.map(|run| run.task));
     payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
     payload["step"] = serde_json::json!(event.run.map(|run| run.step));

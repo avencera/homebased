@@ -156,6 +156,7 @@ pub(super) fn wait_callbacks(h: &Harness, job: JobId, count: usize) -> Vec<Value
 #[test]
 fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     let h = Harness::new();
+    cli(&h, &["resource", "label", "gpu0", "RTX 5090"]);
     let mut jobs = Jobs::new(&h);
     let mut steps = spec(&h, "medium", "wait", "exit 0");
     steps.as_object_mut().unwrap().remove("workload");
@@ -199,6 +200,13 @@ fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     assert_eq!(events[0]["thread"], THREAD);
     assert_eq!(events[0]["seq"], 1);
     assert_eq!(events[0]["task"], show(&h, job)["runs"][1]["task"]);
+    // agents name the GPU from the event and job detail without a lookup
+    assert_eq!(events[0]["resource_name"], "gpu0");
+    assert_eq!(events[0]["resource_label"], "RTX 5090");
+    let resources = &show(&h, job)["resources"];
+    assert_eq!(resources.as_array().unwrap().len(), 1);
+    assert_eq!(resources[0]["id"], events[0]["resource"]);
+    assert_eq!(resources[0]["label"], "RTX 5090");
     assert!(wait_until(
         Duration::from_secs(10),
         || show(&h, job)["runs"][1]["cleanup"]["Ok"].is_null()

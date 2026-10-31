@@ -1085,6 +1085,14 @@ pub struct JobEvent {
     /// The run it happened to, if any
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<EventRun>,
+    /// Name of the run's resource when the event was recorded, such as `gpu0`
+    // stamped by the authority, since the origin that delivers the event may
+    // not know the resource; events from older peers carry none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_name: Option<ResourceName>,
+    /// Display label of the run's resource when the event was recorded
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_label: Option<ResourceLabel>,
     /// How the run's process ended, if it ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<crate::domain::ExitReason>,

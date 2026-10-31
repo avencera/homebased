@@ -10,7 +10,7 @@ use crate::machine::MachineId;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
-    ResourceId, ResourceLabel, ResourceName, ResourceSelector, StopCause,
+    Resource, ResourceId, ResourceLabel, ResourceName, ResourceSelector, StopCause, Target,
 };
 use crate::store::Store;
 
@@ -128,6 +128,10 @@ pub struct JobDetail {
     pub last_stop_cause: Option<StopCause>,
     /// Job events in sequence order
     pub events: Vec<JobEvent>,
+    /// The pinned resource and each resource a run held, with names and labels
+    // an older peer sends none
+    #[serde(default)]
+    pub resources: Vec<Resource>,
 }
 
 /// One historical attempt, including cleanup and the last committed stop cause
@@ -185,12 +189,34 @@ impl Store {
                     .find(|run| run.job == *job);
                 let runs = self.job_runs(*job)?;
                 let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
+                let pinned = match record.target {
+                    Target::Pinned(resource) => Some(resource),
+                    Target::Any => None,
+                };
+                let mut ids = Vec::new();
+                let held = runs.iter().filter_map(|run| run.resource);
+                for id in pinned
+                    .into_iter()
+                    .chain(active_run.as_ref().map(|run| run.resource))
+                    .chain(held)
+                {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                let mut resources = Vec::new();
+                for id in ids {
+                    if let Some(record) = self.resource(id)? {
+                        resources.push(record.resource);
+                    }
+                }
                 serde_json::to_value(JobDetail {
                     job: record,
                     active_run,
                     runs,
                     last_stop_cause,
                     events: self.job_events(*job)?,
+                    resources,
                 })?
             }
             QueueRequest::NoticeCurrent { job, seq } => {

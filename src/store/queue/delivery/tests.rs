@@ -51,6 +51,8 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             seq,
             event: JobEventKind::JobCancelled,
             run: None,
+            resource_name: None,
+            resource_label: None,
             process: None,
             attention: None,
             at: Utc::now(),

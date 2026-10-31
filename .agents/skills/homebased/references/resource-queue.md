@@ -79,7 +79,7 @@ done
 
 ## Target and submit a job
 
-Omit `machine` to use the local machine. Set it to a Fleet name or full machine UUID to use that machine's queue. Paths and executables must exist there. Remote runs use that machine's environment. Omit `resource` to use any of its resources. Set it to a resource name or full UUID to pin the job.
+Omit `machine` to use the local machine. Set it to a Fleet name or full machine UUID to use that machine's queue. Paths and executables must exist there. Remote runs use that machine's environment. Omit `resource` to use any of its resources. Set it to a resource name or full UUID to pin the job only when the machine has several GPUs and the work needs a particular one.
 
 Leave `thread` out: submit fills in the calling session, or a worker's parent thread, as described in [submit.md](submit.md#1-thread-and-machine). `--allow-other-thread` lets a worker name another known thread. Save the job UUID before the first submit. Retry with the same UUID and unchanged spec, from the same session, after a lost reply. Do not create another job for the same request.
 
@@ -93,7 +93,6 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
   "timeout": "1h",
   "priority": "low",
   "preempt": {"mode": "wait", "restart_within": "1m"},
-  "resource": "gpu0",
   "steps": [
     {"type": "task", "command": ["sh", "-c", "printf 'first\\n' > \"$HOMEBASED_JOB_DIR/result\""]},
     {"type": "task", "command": ["sh", "-c", "cat \"$HOMEBASED_JOB_DIR/result\""]}
@@ -124,7 +123,7 @@ Use `homebased --json` before each command and parse the result. All results car
 | `resource jobs` | Optional `--machine <name-or-uuid>`. Non-terminal jobs in serving order. |
 | `resource schema` | Print JobSpec JSON Schema. No daemon needed. |
 | `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`. Machine comes from the spec. No dry-run flag. |
-| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, and run history. |
+| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history, and `resources`: the pinned resource and each one a run held, with names and labels. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
 | `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |
@@ -147,6 +146,8 @@ homebased --json resource job cancel "$job" --operation-id "$cancel"
 
 ## Job events
 
+When telling the user where a job runs, call the GPU by its label, or just name the machine when it has one GPU. Resource names such as `gpu0` belong in specs and commands.
+
 Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callbacks. In a Claude Code session in a T3 Code thread, start `homebased wait --next "$job"` as a background Bash command right after submit to receive them in the live session ([t3.md](t3.md#waiting-in-a-claude-thread)). Deduplicate by `(job, seq)`, never by the run task UUID or event name. The sequence starts at 1. Delivery is at-least-once and ordered per job. Failed delivery stays pending and retries. Intermediate successful steps do not send callbacks. Run tasks have no ordinary task callback route.
 
 | Event | Action |
@@ -164,6 +165,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `api_version`, `event`, `job`, `seq`, `at` | Version 1, event name, job UUID, per-job sequence, recorded timestamp. |
 | `thread`, `name`, `machine` | Receiving thread, job label, authority machine UUID. |
 | `resource`, `task`, `run_number`, `step` | Resource UUID, task UUID for logs, attempt count, zero-based step. Each is explicitly `null` when no run exists, including blocked notices and never-started cancels. |
+| `resource_name`, `resource_label` | Name and display label of the run's resource, such as `gpu0` and `RTX 5090`. `null` when no run exists, the resource has no label, or an older authority sent the event. |
 | `run` | Optional object with `resource`, `task`, `run_number`, `step`. Absent when no run exists. |
 | `process` | Optional tagged exit result. Uses the task exit forms in [events.md](events.md). |
 | `attention` | Optional exact Attention UUID for release. |
