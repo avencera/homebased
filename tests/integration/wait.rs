@@ -107,14 +107,10 @@ impl Harness {
     }
 
     fn spawn_wait(&self, thread: &str, args: &[&str]) -> Waiter {
-        self.spawn_waiter(thread, &["wait"], args)
-    }
-
-    fn spawn_waiter(&self, thread: &str, command: &[&str], args: &[&str]) -> Waiter {
         let mut child = self
             .cmd()
             .env("CODEX_THREAD_ID", thread)
-            .args(command)
+            .arg("wait")
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -466,24 +462,6 @@ fn job_waiter_on_a_delivered_job_exits_without_output() {
 
     assert_eq!(code, 0);
     assert!(lines.is_empty(), "{lines:?}");
-}
-
-#[test]
-fn the_old_task_wait_name_still_waits_on_tasks_and_jobs() {
-    let h = Harness::new();
-    let mut jobs = Jobs::new(&h);
-    let task = h.gated("alias-task");
-    let job = h.gated_job(&mut jobs, "alias-job");
-    let waiter = h.spawn_waiter(THREAD, &["task", "wait"], &[&task, &job.to_string()]);
-
-    h.release_gate("alias-job");
-    assert_eq!(waiter.next_line()["event"], "JOB_SUCCEEDED");
-    h.release_gate("alias-task");
-    let (code, rest) = waiter.finish();
-
-    assert_eq!(code, 0);
-    assert_eq!(rest.len(), 1, "{rest:?}");
-    assert_eq!(rest[0]["task"], task);
 }
 
 #[test]
