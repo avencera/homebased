@@ -459,6 +459,18 @@ async fn fleet_view_links_peers_at_their_https_dashboard() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // add only wakes the background probe loop, so run a round now before the
+    // fleet view is read
+    let output = alpha
+        .cmd()
+        .args(["--json", "fleet", "discover"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let response = ClusterClient::default()
         .get(&alpha.address(), "/v1/fleet/tasks")
