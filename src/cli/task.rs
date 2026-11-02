@@ -156,10 +156,6 @@ pub enum TaskCommand {
         #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
         by: UsageGrouping,
     },
-    /// Old name of `homebased wait`, kept for sessions that still use it.
-    /// Remove it once no running thread does (avencera/homebased#6).
-    #[command(hide = true)]
-    Wait(super::wait::WaitArgs),
     /// Cancel a task. Idempotent if already terminal.
     Cancel {
         /// Full task UUID.
@@ -266,7 +262,6 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::Show { id } => show(ctx, id).await,
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
-        TaskCommand::Wait(args) => super::wait::wait(ctx, args).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
         TaskCommand::Report {
             id,
