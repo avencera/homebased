@@ -51,6 +51,14 @@ pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
 /// misses when tool output after it fills the suffix, and then nothing compacts
 const TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
+/// First transcript suffix read, grown fourfold up to [`TAIL_SCAN_BYTES`]
+/// until it holds the last request
+///
+/// The dashboard reads every open thread's transcript on each refresh. On 462
+/// open threads the last request sat within 159 KiB of the end, and half within
+/// 7 KiB, so a full suffix for each read about 1 GB where this reads tens of MB
+const FIRST_TAIL_BYTES: u64 = 64 * 1024;
+
 /// Context the system prompt and tool definitions add to the conversation
 /// size a compaction records
 ///
@@ -75,7 +83,30 @@ impl ContextUse {
     /// `None` when there is no transcript or its tail has no request
     pub(crate) fn read(home: &Path, thread: ThreadId) -> Option<Self> {
         let path = transcript_path(&home.join(".claude/projects"), thread)?;
-        Self::from_tail(&read_tail(&path)?)
+        Self::from_file(&path)
+    }
+
+    /// Scan growing suffixes of the transcript at `path` for the last request
+    ///
+    /// A smaller suffix finds the same line as a larger one, since both scan
+    /// back from the end and only the first, possibly cut, line differs
+    fn from_file(path: &Path) -> Option<Self> {
+        let mut file = File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut window = FIRST_TAIL_BYTES;
+        loop {
+            let start = len.saturating_sub(window);
+            file.seek(SeekFrom::Start(start)).ok()?;
+            let mut tail = Vec::new();
+            file.read_to_end(&mut tail).ok()?;
+            if let Some(found) = Self::from_tail(&tail) {
+                return Some(found);
+            }
+            if start == 0 || window >= TAIL_SCAN_BYTES {
+                return None;
+            }
+            window = (window * 4).min(TAIL_SCAN_BYTES);
+        }
     }
 
     /// How a T3 thread takes a message for this session at `now`
@@ -222,16 +253,6 @@ struct CompactMetadata {
     post_tokens: Option<u64>,
 }
 
-fn read_tail(path: &Path) -> Option<Vec<u8>> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_SCAN_BYTES)))
-        .ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    Some(tail)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -307,6 +328,19 @@ mod tests {
         }])
         .unwrap();
         assert!(sidechain.idle_compaction_due(now()));
+    }
+
+    #[test]
+    fn tool_output_past_the_first_read_grows_the_scan() {
+        // a single tool result larger than the first suffix, after the last request
+        let output = json!({
+            "type": "user",
+            "timestamp": at(56),
+            "isSidechain": true,
+            "message": { "content": "x".repeat(3 * FIRST_TAIL_BYTES as usize) }
+        });
+        let found = context(&[assistant(56, 250_000), output]).unwrap();
+        assert_eq!(found.tokens(), 251_302);
     }
 
     #[test]
