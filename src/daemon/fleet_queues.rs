@@ -6,14 +6,14 @@
 //! Answers pass through as JSON, as the per-machine queue reads do, so a peer
 //! on a newer release with extra job fields still shows during a rollout
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::AppState;
-use super::fleet_view::{FleetMachine, read_fleet};
+use super::fleet_view::{FleetMachine, Scope, read_fleet};
 use super::queue_api::forward;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
@@ -25,7 +25,7 @@ use crate::store::queue::interface::QueueRequest;
 pub struct FleetQueues {
     /// Public API version
     pub api_version: u32,
-    /// This machine first, then every known peer and how its read went
+    /// The machines the read covered, this machine first, and how each read went
     pub machines: Vec<FleetMachine>,
     /// One [`QueueOverview`](crate::store::queue::interface::QueueOverview) per machine that answered, in `machines` order
     pub queues: Vec<Value>,
@@ -36,10 +36,21 @@ pub fn read_routes() -> Router<AppState> {
     Router::new().route("/v1/fleet/queues", get(fleet_queues))
 }
 
-async fn fleet_queues(State(state): State<AppState>) -> Result<Json<FleetQueues>, AppError> {
-    let local = state.machine.identity.machine;
-    let local_queue = overview(&state, local).await?;
-    let read = read_fleet(&state, local_queue, |_, machine| {
+/// `GET /v1/fleet/queues` query
+#[derive(Debug, Deserialize)]
+struct FleetQueuesQuery {
+    /// Read only this machine instead of the whole fleet
+    #[serde(default)]
+    machine: Option<MachineId>,
+}
+
+async fn fleet_queues(
+    State(state): State<AppState>,
+    Query(query): Query<FleetQueuesQuery>,
+) -> Result<Json<FleetQueues>, AppError> {
+    let local_queue = overview(&state, state.machine.identity.machine);
+    let scope = Scope::from_query(query.machine);
+    let read = read_fleet(&state, scope, local_queue, |_, machine| {
         let state = state.clone();
         async move {
             overview(&state, machine)
@@ -47,7 +58,7 @@ async fn fleet_queues(State(state): State<AppState>) -> Result<Json<FleetQueues>
                 .map_err(|error| error.to_string())
         }
     })
-    .await;
+    .await?;
 
     Ok(Json(FleetQueues {
         api_version: API_VERSION,

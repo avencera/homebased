@@ -292,3 +292,69 @@ async fn task_log_never_reads_a_guessed_directory_without_the_socket() {
     assert!(!ok);
     assert_eq!(response["error"]["code"], "daemon_unavailable");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_reads_each_fleet_machine_on_its_own() {
+    let alpha = Daemon::start("view-alpha", true);
+    let beta = Daemon::start("view-beta", true);
+    wait_for_probe(&alpha.address()).await;
+    wait_for_probe(&beta.address()).await;
+    add_peer(&alpha, &beta);
+    let alpha_task = TaskId::new();
+    seed_inspection_row(&alpha, alpha_task);
+    let beta_task = TaskId::new();
+    seed_inspection_row(&beta, beta_task);
+    let read = async |path: String| -> (u16, Value) {
+        let response = ClusterClient::default()
+            .get(&alpha.address(), &path)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&response.body).unwrap();
+        (response.status.as_u16(), body)
+    };
+    let ids = |list: &Value, field: &str| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry[field].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (alpha_id, beta_id) = (
+        alpha.machine_id().to_string(),
+        beta.machine_id().to_string(),
+    );
+
+    // the roster names every machine without reading any of them
+    let (status, roster) = read("/v1/fleet/roster".into()).await;
+    assert_eq!(status, 200, "{roster}");
+    assert_eq!(
+        ids(&roster["machines"], "machine"),
+        [alpha_id.as_str(), beta_id.as_str()]
+    );
+    assert!(roster["machines"][0].get("read").is_none(), "{roster}");
+
+    for (machine, task) in [(&beta_id, beta_task), (&alpha_id, alpha_task)] {
+        let (status, view) = read(format!("/v1/fleet/tasks?machine={machine}")).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(ids(&view["machines"], "machine"), [machine.as_str()]);
+        assert_eq!(view["machines"][0]["read"]["state"], "online", "{view}");
+        let tasks: Vec<String> = view["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["task"]["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(tasks, [task.to_string()], "{view}");
+        assert_eq!(view["tasks"][0]["machine"], machine.as_str(), "{view}");
+    }
+
+    let (status, queues) = read(format!("/v1/fleet/queues?machine={beta_id}")).await;
+    assert_eq!(status, 200, "{queues}");
+    assert_eq!(ids(&queues["machines"], "machine"), [beta_id.as_str()]);
+    assert_eq!(ids(&queues["queues"], "machine"), [beta_id.as_str()]);
+
+    let stranger = homebased::machine::MachineId::new();
+    let (status, missing) = read(format!("/v1/fleet/tasks?machine={stranger}")).await;
+    assert_eq!(status, 404, "{missing}");
+    assert_eq!(missing["error"]["code"], "machine_not_found", "{missing}");
+}

@@ -94,6 +94,8 @@
 								{:else}
 									<span class="text-muted-foreground">no resources</span>
 								{/each}
+							{:else if machine.read.state === 'loading'}
+								<span class="animate-pulse text-muted-foreground">loading</span>
 							{:else if machine.read.state === 'unavailable'}
 								<span class="text-amber-700 dark:text-amber-300">unavailable</span>
 								<span class="min-w-0 truncate text-muted-foreground" title={machine.read.message}>

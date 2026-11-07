@@ -227,22 +227,37 @@ const MachineReadSchema = Schema.Union(
 );
 export type MachineRead = typeof MachineReadSchema.Type;
 
-/** One machine of `GET /v1/fleet/tasks` or `GET /v1/fleet/queues`. */
-const FleetMachineSchema = Schema.Struct({
+/** One machine of `GET /v1/fleet/roster`, before any read. */
+const ViewMachineSchema = Schema.Struct({
 	machine: Schema.String,
 	name: Schema.String,
 	/** Homebased version of the daemon, from the last probe for a peer. */
 	version: Schema.String,
-	location: MachineLocationSchema,
-	read: MachineReadSchema
+	location: MachineLocationSchema
 });
-export type FleetMachine = typeof FleetMachineSchema.Type;
+export type ViewMachine = typeof ViewMachineSchema.Type;
+
+/** One machine of `GET /v1/fleet/tasks` or `GET /v1/fleet/queues` and how its read went. */
+const FleetMachineSchema = Schema.Struct({ ...ViewMachineSchema.fields, read: MachineReadSchema });
+
+/** A machine's read as the page shows it: `loading` until the machine first answers. */
+export type MachineReadState = MachineRead | { readonly state: 'loading' };
+
+/** One machine of a fleet view as the dashboard lists it. */
+export type FleetMachine = ViewMachine & { readonly read: MachineReadState };
+
+/** `GET /v1/fleet/roster`. The serving machine comes first. */
+const RosterSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	machines: Schema.Array(ViewMachineSchema)
+});
+export type Roster = typeof RosterSchema.Type;
 
 /** One task of `GET /v1/fleet/tasks` and the machine that runs it. */
 const FleetTaskSchema = Schema.Struct({ machine: Schema.String, task: TaskSummarySchema });
 export type FleetTask = typeof FleetTaskSchema.Type;
 
-/** `GET /v1/fleet/tasks`. The serving machine comes first. */
+/** `GET /v1/fleet/tasks`. The serving machine comes first, and a `machine` query lists that one only. */
 const FleetTaskListSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
 	machines: Schema.Array(FleetMachineSchema),
@@ -572,7 +587,7 @@ const MachineQueueSchema = Schema.Struct({
 });
 export type MachineQueue = typeof MachineQueueSchema.Type;
 
-/** `GET /v1/fleet/queues`. The serving machine comes first. */
+/** `GET /v1/fleet/queues`. The serving machine comes first, and a `machine` query lists that one only. */
 const FleetQueuesSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
 	machines: Schema.Array(FleetMachineSchema),
@@ -870,9 +885,14 @@ export function fetchResources(machine?: string | null): Promise<ResourceList> {
 	return getJson(`/resources${machineQuery(machine)}`, ResourceListSchema);
 }
 
-/** `GET /v1/fleet/queues`: every machine's resources and queue. */
-export function fetchFleetQueues(): Promise<FleetQueues> {
-	return getJson('/fleet/queues', FleetQueuesSchema);
+/** `GET /v1/fleet/roster`: this machine and every known peer, without reading any of them. */
+export function fetchRoster(): Promise<Roster> {
+	return getJson('/fleet/roster', RosterSchema);
+}
+
+/** `GET /v1/fleet/queues?machine=`: one machine's resources and queue. */
+export function fetchFleetQueues(machine: string): Promise<FleetQueues> {
+	return getJson(`/fleet/queues?machine=${encodeURIComponent(machine)}`, FleetQueuesSchema);
 }
 
 /** `GET /v1/resource/jobs/{job}`, from the job's saved authority unless a machine is given. */
@@ -984,14 +1004,16 @@ export interface TaskQuery {
 	limit?: number;
 }
 
-/** `GET /v1/fleet/tasks`: tasks from this machine and every reachable peer. */
-export function fetchFleetTasks(query: TaskQuery = {}): Promise<FleetTaskList> {
-	const params = new URLSearchParams();
+/**
+ * `GET /v1/fleet/tasks?machine=`: the tasks one machine holds, including the origin records of
+ * tasks it sent to a peer.
+ */
+export function fetchFleetTasks(machine: string, query: TaskQuery = {}): Promise<FleetTaskList> {
+	const params = new URLSearchParams({ machine });
 	if (query.statuses?.length) params.set('status', query.statuses.join(','));
 	if (query.thread) params.set('thread', query.thread);
 	if (query.limit !== undefined) params.set('limit', String(query.limit));
-	const search = params.size > 0 ? `?${params}` : '';
-	return getJson(`/fleet/tasks${search}`, FleetTaskListSchema);
+	return getJson(`/fleet/tasks?${params}`, FleetTaskListSchema);
 }
 
 /**

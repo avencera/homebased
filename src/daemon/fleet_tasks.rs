@@ -14,7 +14,7 @@ use super::AppState;
 use super::api::views::TaskSummary;
 use super::api::{ListQuery, TaskFilter, local_task_summaries, newest_first};
 use super::cluster::check_api_version;
-use super::fleet_view::{FleetMachine, read_fleet};
+use super::fleet_view::{FleetMachine, Scope, read_fleet};
 use super::peer_read::read_peer;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
@@ -28,7 +28,7 @@ const CLUSTER_TASK_LIST_PATH: &str = "/v1/cluster/task-list";
 pub struct FleetTaskList {
     /// Public API version
     pub api_version: u32,
-    /// This machine first, then every known peer and how its read went
+    /// The machines the read covered, this machine first, and how each read went
     pub machines: Vec<FleetMachine>,
     /// One entry per task UUID, newest first
     pub tasks: Vec<FleetTask>,
@@ -54,9 +54,12 @@ struct ClusterTaskList {
     tasks: Vec<TaskSummary>,
 }
 
-/// `GET /v1/fleet/tasks` query: the shared filter plus a page size
+/// `GET /v1/fleet/tasks` query: the shared filter, a page size, and the machine to read
 #[derive(Debug, Deserialize)]
 struct FleetTaskListQuery {
+    /// Read only this machine instead of the whole fleet
+    #[serde(default)]
+    machine: Option<MachineId>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -100,12 +103,13 @@ async fn fleet_tasks(
     // one past the page from each machine, so a full page that hides older tasks
     // still merges to more than the page
     let machine_limit = query.limit.map(|limit| limit.saturating_add(1));
-    let local_tasks = local_task_summaries(&state, filter.clone(), machine_limit).await?;
+    let local_tasks = local_task_summaries(&state, filter.clone(), machine_limit);
     let mut prefix = filter.query_prefix();
     if let Some(limit) = machine_limit {
         prefix.push_str(&format!("limit={limit}&"));
     }
-    let read = read_fleet(&state, local_tasks, |fleet, machine| {
+    let scope = Scope::from_query(query.machine);
+    let read = read_fleet(&state, scope, local_tasks, |fleet, machine| {
         let fleet = fleet.clone();
         let path = format!(
             "{CLUSTER_TASK_LIST_PATH}?{prefix}api_version={API_VERSION}&destination_machine={machine}"
@@ -119,7 +123,7 @@ async fn fleet_tasks(
             }
         }
     })
-    .await;
+    .await?;
 
     let mut tasks = merge_records(read.answers);
     let has_more = query.limit.is_some_and(|limit| tasks.len() > limit);

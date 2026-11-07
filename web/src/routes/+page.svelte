@@ -160,12 +160,23 @@
 			>
 				{#each store.machines as machine (machine.machine)}
 					{@const offline = machine.read.state === 'unavailable'}
+					{@const loading = machine.read.state === 'loading'}
 					{@const mismatch = store.status !== null && machine.version !== store.status.version}
-					<span class={cn('inline-flex items-center gap-1', offline && 'opacity-50')}>
+					<span
+						class={cn(
+							'inline-flex items-center gap-1',
+							offline && 'opacity-50',
+							loading && 'animate-pulse opacity-60'
+						)}
+					>
 						<Capsule
 							hue={machineHue(machine.name)}
 							dot
-							title={offline ? `${machine.name} is offline` : machine.name}
+							title={offline
+								? `${machine.name} is offline`
+								: loading
+									? `Reading ${machine.name}`
+									: machine.name}
 						>
 							{machine.name}
 						</Capsule>
@@ -283,7 +294,7 @@
 		>
 			{#snippet empty()}
 				<p class="px-3 py-6 text-center text-muted-foreground">
-					{#if store.lastFetched === null}
+					{#if !store.settled}
 						{EM_DASH}
 					{:else if inFlightOnly && !project}
 						No workers in flight

@@ -1,6 +1,7 @@
 // Polling stores for the dashboard. Both must be constructed during component
 // initialisation: they own `$effect`s and runed utilities.
 
+import { untrack } from 'svelte';
 import { IsDocumentVisible, useInterval } from 'runed';
 import { SvelteMap } from 'svelte/reactivity';
 import {
@@ -11,6 +12,7 @@ import {
 	fetchLogTail,
 	fetchFleetTasks,
 	fetchResources,
+	fetchRoster,
 	fetchStatus,
 	fetchTask,
 	isInFlight,
@@ -23,10 +25,13 @@ import {
 	type JobDetail,
 	type LogTail,
 	type MachineQueue,
+	type MachineRead,
 	type ResourceRecord,
 	type TaskQuery,
-	type TaskRecord
+	type TaskRecord,
+	type ViewMachine
 } from './api';
+import { mergeFleetTasks, type MachineTasks } from './fleet-merge';
 import { newOperationId } from './queue-view';
 
 /** Whether the task has launched, so it has an output log to read. */
@@ -48,22 +53,34 @@ interface PollingOptions {
 	key: () => string;
 	/** Whether the timer should keep running. */
 	active: () => boolean;
-	/** One refresh. Must not read state it writes, or the key effect loops. */
-	run: () => void;
+	/** One refresh, run untracked. */
+	run: () => Promise<void>;
 }
 
 function startPolling(options: PollingOptions): void {
+	let running: Promise<void> | null = null;
+	const start = () => {
+		// a run started from an effect must not subscribe it to what the run reads or writes
+		const run = untrack(options.run);
+		running = run;
+		void run.finally(() => {
+			if (running === run) running = null;
+		});
+	};
 	const poll = useInterval(() => POLL_INTERVAL_MS, {
 		immediate: false,
 		// so a tab that regains focus shows fresh data without waiting a tick
 		immediateCallback: true,
-		callback: options.run
+		// a tick during a slow read waits for it; starting another would drop its answer
+		callback: () => {
+			if (running === null) start();
+		}
 	});
 	let started = false;
 	$effect(() => {
 		options.key();
-		// the first fetch comes from the initial `resume` below
-		if (started) options.run();
+		// the first fetch comes from the initial `resume` below; a new key reads at once
+		if (started) start();
 		started = true;
 	});
 	$effect(() => {
@@ -72,35 +89,166 @@ function startPolling(options: PollingOptions): void {
 	});
 }
 
+/** One machine's settled read: how it went, and its answer when it answered. */
+interface MachineResult<T> {
+	read: MachineRead;
+	answer: T | null;
+}
+
+/**
+ * Per-machine reads of one fleet-wide view.
+ *
+ * Each machine is read with its own request and lands when it answers, so a slow peer holds only
+ * its own rows. A machine keeps at most one read in flight: a refresh while one is out skips that
+ * machine instead of starting a second read that would race the first.
+ */
+class FleetReads<T> {
+	/** Machines of the last refresh, this machine first. */
+	roster = $state<readonly ViewMachine[]>([]);
+	#answers = new SvelteMap<string, MachineResult<T>>();
+	/** Whether a roster has arrived, so an empty roster is not mistaken for every machine settled. */
+	#rostered = $state(false);
+	/** Generation each in-flight read started in, by machine. */
+	#pending = new Map<string, number>();
+	#generation = 0;
+
+	/** Every roster machine with how its read stands, `loading` until its first answer. */
+	machines = $derived<readonly FleetMachine[]>(
+		this.roster.map((machine) => ({
+			...machine,
+			read: this.#answers.get(machine.machine)?.read ?? { state: 'loading' }
+		}))
+	);
+
+	/** Answers of the machines that answered, in roster order. */
+	answers = $derived<readonly T[]>(
+		this.roster.flatMap(({ machine }) => {
+			const answer = this.#answers.get(machine)?.answer;
+			return answer === null || answer === undefined ? [] : [answer];
+		})
+	);
+
+	/** Whether every roster machine has settled a read since the last reset. */
+	settled = $derived(
+		this.#rostered && this.roster.every(({ machine }) => this.#answers.has(machine))
+	);
+
+	/** Forget every answer, for a query whose old answers no longer apply. */
+	reset(): void {
+		this.#generation += 1;
+		this.#answers.clear();
+		this.#pending.clear();
+	}
+
+	/** Start `read` for each machine of `roster` that has no read in flight. */
+	refresh(
+		roster: readonly ViewMachine[],
+		read: (machine: string) => Promise<MachineResult<T>>
+	): void {
+		this.roster = roster;
+		this.#rostered = true;
+		for (const machine of [...this.#answers.keys()]) {
+			if (!roster.some((entry) => entry.machine === machine)) this.#answers.delete(machine);
+		}
+		const generation = this.#generation;
+		for (const { machine } of roster) {
+			if (this.#pending.has(machine)) continue;
+			this.#pending.set(machine, generation);
+			void read(machine)
+				// a failed request marks only this machine: the browser gives up on a peer that does not
+				// answer before the daemon does, and that must not read as this daemon being down
+				.catch((cause: unknown): MachineResult<T> => {
+					const error = asApiError(cause);
+					const message = error.reachable ? error.message : 'no answer in time';
+					return { read: { state: 'unavailable', message }, answer: null };
+				})
+				.then((settled) => {
+					if (this.#pending.get(machine) === generation) this.#pending.delete(machine);
+					if (generation === this.#generation) this.#answers.set(machine, settled);
+				});
+		}
+	}
+}
+
+/** How the daemon reports `machine` in a one-machine view, or unavailable when it left it out. */
+function readOf(
+	machines: readonly { machine: string; read: MachineRead }[],
+	machine: string
+): MachineRead {
+	return (
+		machines.find((entry) => entry.machine === machine)?.read ?? {
+			state: 'unavailable',
+			message: 'the daemon did not list this machine'
+		}
+	);
+}
+
+/** One machine's task read, tagged with the `limit` it was read with. */
+interface TaskPage extends MachineTasks {
+	limit: number | undefined;
+}
+
+/** Read one machine's tasks through the serving daemon. */
+async function readTasks(machine: string, query: TaskQuery): Promise<MachineResult<TaskPage>> {
+	const list = await fetchFleetTasks(machine, query);
+	const read = readOf(list.machines, machine);
+	const answer =
+		read.state === 'online'
+			? { machine, tasks: list.tasks, hasMore: list.has_more, limit: query.limit }
+			: null;
+	return { read, answer };
+}
+
 /** Dashboard list: daemon status plus the filtered fleet task table. */
 export class DaemonStore {
 	/** Last successful `GET /v1/status`. */
 	status = $state<DaemonStatus | null>(null);
-	/** This machine first, then every known peer and whether it answered. */
-	machines = $state<readonly FleetMachine[]>([]);
-	/** Filtered tasks from every machine that answered, newest first. */
-	tasks = $state<readonly FleetTask[]>([]);
-	/** Whether the query's `limit` left out older tasks. */
-	hasMore = $state(false);
-	/** The `limit` that `tasks` was read with, so a reader asks for more only once it lands. */
-	loadedLimit = $state<number | undefined>(undefined);
-	/** Queued and running tasks on every machine that answered, whatever the filter. */
-	inFlight = $state<readonly FleetTask[]>([]);
-	/** Error from the last attempt, cleared by the next success. */
-	error = $state<ApiError | null>(null);
 	/** Epoch milliseconds of the last settled attempt. */
 	lastFetched = $state<number | null>(null);
 
 	#query: () => TaskQuery;
 	#visible = new IsDocumentVisible();
 	#generation = 0;
+	#statusError = $state<ApiError | null>(null);
+	#rosterError = $state<ApiError | null>(null);
+	#tasks = new FleetReads<TaskPage>();
+	#inFlight = new FleetReads<TaskPage>();
+	/** Status and thread filter the task answers were read with; the limit only pages. */
+	#filter = '';
+	#limit = $state<number | undefined>(undefined);
+	#listsInFlight = $state(true);
+	#merged = $derived(mergeFleetTasks(this.#tasks.answers, this.#limit));
+
+	/** This machine first, then every known peer and how its read stands. */
+	machines = $derived.by(() => this.#tasks.machines);
+	/** Filtered tasks from every machine that answered, newest first. */
+	tasks = $derived.by((): readonly FleetTask[] => this.#merged.tasks);
+	/** Whether the query's `limit` left out older tasks. */
+	hasMore = $derived.by(() => this.#merged.hasMore);
+	/** Whether every machine has answered the current filter. */
+	settled = $derived.by(() => this.#tasks.settled);
+	/**
+	 * The `limit` every machine's tasks were read with, so a reader asks for more only once it
+	 * lands. Undefined while any machine is still reading.
+	 */
+	loadedLimit = $derived.by(() =>
+		this.#tasks.settled && this.#tasks.answers.every((answer) => answer.limit === this.#limit)
+			? this.#limit
+			: undefined
+	);
+	/** Queued and running tasks on every machine that answered, whatever the filter. */
+	inFlight = $derived.by((): readonly FleetTask[] =>
+		this.#listsInFlight ? this.#merged.tasks : mergeFleetTasks(this.#inFlight.answers).tasks
+	);
+	/** This daemon's error from the last attempt, cleared by the next success. */
+	error = $derived.by(() => this.#statusError ?? this.#rosterError);
 
 	constructor(query: () => TaskQuery = () => ({})) {
 		this.#query = query;
 		startPolling({
 			key: () => queryKey(query()),
 			active: () => this.#visible.current,
-			run: () => void this.refresh()
+			run: () => this.refresh()
 		});
 	}
 
@@ -109,30 +257,49 @@ export class DaemonStore {
 		return this.error === null ? this.status !== null : this.error.reachable;
 	}
 
-	/** Fetch status and tasks together so the header and table agree. */
+	/**
+	 * Read status, then each machine's tasks on its own. Resolves once status and the roster
+	 * settle; each machine's tasks land when that machine answers.
+	 */
 	async refresh(): Promise<void> {
 		const generation = ++this.#generation;
 		const query = this.#query();
+		const filter = filterKey(query);
+		if (filter !== this.#filter) {
+			this.#filter = filter;
+			this.#tasks.reset();
+		}
+		this.#limit = query.limit;
 		// the default view is the in-flight list, so it needs no second fleet read
 		const listsInFlight = queryKey(query) === queryKey(IN_FLIGHT_QUERY);
-		try {
-			const [status, fleet, inFlight] = await Promise.all([
-				fetchStatus(),
-				fetchFleetTasks(query),
-				listsInFlight ? null : fetchFleetTasks(IN_FLIGHT_QUERY)
-			]);
-			if (generation !== this.#generation) return;
-			this.status = status;
-			this.machines = fleet.machines;
-			this.tasks = fleet.tasks;
-			this.hasMore = fleet.has_more;
-			this.loadedLimit = query.limit;
-			this.inFlight = (inFlight ?? fleet).tasks;
-			this.error = null;
-		} catch (cause) {
-			if (generation !== this.#generation) return;
-			this.error = asApiError(cause);
-		}
+		// answers from before the default view took over are stale once the second read resumes
+		if (listsInFlight && !this.#listsInFlight) this.#inFlight.reset();
+		this.#listsInFlight = listsInFlight;
+
+		const status = fetchStatus().then(
+			(status) => {
+				this.status = status;
+				this.#statusError = null;
+			},
+			(cause: unknown) => {
+				this.#statusError = asApiError(cause);
+			}
+		);
+		const reads = fetchRoster().then(
+			(roster) => {
+				// a newer refresh with another query owns the reads now
+				if (generation !== this.#generation) return;
+				this.#rosterError = null;
+				this.#tasks.refresh(roster.machines, (machine) => readTasks(machine, query));
+				if (!listsInFlight) {
+					this.#inFlight.refresh(roster.machines, (machine) => readTasks(machine, IN_FLIGHT_QUERY));
+				}
+			},
+			(cause: unknown) => {
+				if (generation === this.#generation) this.#rosterError = asApiError(cause);
+			}
+		);
+		await Promise.all([status, reads]);
 		this.lastFetched = Date.now();
 	}
 }
@@ -167,7 +334,7 @@ export class TaskStore {
 		startPolling({
 			key: id,
 			active: () => this.#visible.current && this.#pollable,
-			run: () => void this.refresh()
+			run: () => this.refresh()
 		});
 	}
 
@@ -218,10 +385,10 @@ export class TaskStore {
 
 /** Queue page and panel: every machine's resources and queue. */
 export class QueueStore {
-	/** This machine first, then every known peer and whether it answered. */
-	machines = $state<readonly FleetMachine[]>([]);
+	/** This machine first, then every known peer and how its read stands. */
+	machines = $derived.by(() => this.#reads.machines);
 	/** One per machine that answered, in `machines` order. */
-	queues = $state<readonly MachineQueue[]>([]);
+	queues = $derived.by((): readonly MachineQueue[] => this.#reads.answers);
 	/** Every machine's resources. */
 	resources = $derived(this.queues.flatMap((queue) => queue.resources));
 	/** Every machine's jobs, each machine's in serving order. */
@@ -232,33 +399,36 @@ export class QueueStore {
 	 */
 	endedJobNames = new SvelteMap<string, string>();
 	/** Error from the last attempt, cleared by the next success. */
-	error = $state<ApiError | null>(null);
+	error = $derived.by(() => this.#rosterError);
 	/** Epoch milliseconds of the last settled attempt. */
 	lastFetched = $state<number | null>(null);
 
 	#visible = new IsDocumentVisible();
-	#generation = 0;
+	#reads = new FleetReads<MachineQueue>();
+	#rosterError = $state<ApiError | null>(null);
 
 	constructor() {
 		startPolling({
 			key: () => '',
 			active: () => this.#visible.current,
-			run: () => void this.refresh()
+			run: () => this.refresh()
 		});
 	}
 
+	/** Read the roster, then each machine's queue on its own, which lands when it answers. */
 	async refresh(): Promise<void> {
-		const generation = ++this.#generation;
 		try {
-			const fleet = await fetchFleetQueues();
-			if (generation !== this.#generation) return;
-			this.machines = fleet.machines;
-			this.queues = fleet.queues;
-			this.error = null;
+			const roster = await fetchRoster();
+			this.#rosterError = null;
+			this.#reads.refresh(roster.machines, async (machine) => {
+				const fleet = await fetchFleetQueues(machine);
+				const read = readOf(fleet.machines, machine);
+				const answer = fleet.queues.find((queue) => queue.machine === machine) ?? null;
+				return { read, answer };
+			});
 			void this.#loadEndedJobNames();
 		} catch (cause) {
-			if (generation !== this.#generation) return;
-			this.error = asApiError(cause);
+			this.#rosterError = asApiError(cause);
 		}
 		this.lastFetched = Date.now();
 	}
@@ -319,7 +489,7 @@ export class JobStore {
 		startPolling({
 			key: () => `${id()}|${machine() ?? ''}`,
 			active: () => this.#visible.current && this.#pollable,
-			run: () => void this.refresh()
+			run: () => this.refresh()
 		});
 	}
 
@@ -406,5 +576,10 @@ export class QueueControl {
 }
 
 function queryKey(query: TaskQuery): string {
-	return `${query.statuses?.join(',') ?? ''}|${query.thread ?? ''}|${query.limit ?? ''}`;
+	return `${filterKey(query)}|${query.limit ?? ''}`;
+}
+
+/** The part of a query that decides which tasks match, without the page size. */
+function filterKey(query: TaskQuery): string {
+	return `${query.statuses?.join(',') ?? ''}|${query.thread ?? ''}`;
 }
