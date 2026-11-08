@@ -1,6 +1,7 @@
 //! Thread watches: a stored condition on another thread's context that sends
 //! `THREAD_CONTEXT_OVER` to the thread that asked, and `THREAD_WATCH_ENDED`
-//! when the watch ends
+//! when the watch ends. A `--once` watch ends with the event that fires it,
+//! which says so in `watch_ended`, and sends no separate end event
 //!
 //! A watch lives on the machine of the thread that made it, which delivers its
 //! events like a GPU queue job's. The watched thread may run on any Fleet
@@ -25,7 +26,7 @@ use crate::thread_ref::{Caller, Provider, ThreadContext, ThreadSelector, short_t
 /// Event a watch sends when its thread's context is over the limit
 pub const CONTEXT_OVER_EVENT: &str = "THREAD_CONTEXT_OVER";
 
-/// Final event of every watch
+/// Final event of every watch but a `--once` watch that fired
 pub const WATCH_ENDED_EVENT: &str = "THREAD_WATCH_ENDED";
 
 /// A thread watch, chosen by the daemon
@@ -222,6 +223,12 @@ pub enum WatchEndReason {
     /// A percent watch reached a thread that runs Claude Code, which records
     /// no context window to take the percent of
     NoContextWindow,
+    /// The watched T3 thread stayed settled, or idle after its delegated task
+    /// ended, with no activity for an hour
+    Finished,
+    /// The T3 thread that receives the events was archived or deleted, or
+    /// stayed finished with no activity for an hour
+    CallerGone,
 }
 
 /// Kind of a watch event
@@ -235,6 +242,27 @@ pub enum WatchEventKind {
     Ended,
 }
 
+/// Whether a watch event with `payload` is its watch's last:
+/// `THREAD_WATCH_ENDED`, or the `THREAD_CONTEXT_OVER` that ends a `--once` watch
+#[must_use]
+pub fn ends_watch(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
+    kind == WatchEventKind::Ended
+        || payload
+            .get("watch_ended")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+/// [`ends_watch`] for a `HOMEBASED_EVENT` line, as a wait stream carries it
+#[must_use]
+pub fn line_ends_watch(kind: WatchEventKind, line: &str) -> bool {
+    kind == WatchEventKind::Ended
+        || line
+            .strip_prefix("HOMEBASED_EVENT ")
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .is_some_and(|payload| ends_watch(kind, &payload))
+}
+
 /// A stored watch
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +271,11 @@ pub struct ThreadWatch {
     pub id: WatchId,
     /// Thread that receives the events
     pub caller: ThreadId,
+    /// The caller's T3 thread on this machine, when it runs in one, so the
+    /// scan can tell when it is archived or deleted; watches from before the
+    /// field look it up by the caller's session instead
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_t3: Option<String>,
     /// Origin-only environment of the caller, for event delivery
     pub callback: CallbackContext,
     /// Followed thread
@@ -346,6 +379,8 @@ fn end_reason_str(reason: WatchEndReason) -> &'static str {
         WatchEndReason::Deleted => "deleted",
         WatchEndReason::SessionGone => "session_gone",
         WatchEndReason::NoContextWindow => "no_context_window",
+        WatchEndReason::Finished => "finished",
+        WatchEndReason::CallerGone => "caller_gone",
     }
 }
 
@@ -363,6 +398,12 @@ pub struct WatchEvent {
 }
 
 impl WatchEvent {
+    /// Whether this is the watch's last event, see [`ends_watch`]
+    #[must_use]
+    pub fn ends_watch(&self) -> bool {
+        ends_watch(self.kind, &self.payload)
+    }
+
     /// The line delivery sends
     #[must_use]
     pub fn line(&self) -> String {

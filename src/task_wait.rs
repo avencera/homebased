@@ -499,9 +499,10 @@ impl WaitSet {
         }
     }
 
-    /// Account for one watch event; `THREAD_WATCH_ENDED` ends the wait for its watch
-    pub fn apply_watch(&mut self, watch: WatchId, kind: WatchEventKind) {
-        if kind == WatchEventKind::Ended {
+    /// Account for one watch event; its last event, `THREAD_WATCH_ENDED` or
+    /// the firing of a `--once` watch, as `ends` says, ends the wait for its watch
+    pub fn apply_watch(&mut self, watch: WatchId, ends: bool) {
+        if ends {
             self.pending
                 .retain(|pending| *pending != WaitKey::Watch(watch));
         }

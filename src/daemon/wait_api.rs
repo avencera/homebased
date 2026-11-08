@@ -45,7 +45,7 @@ use crate::task_wait::{
     RequestedTargets, WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys,
     WaitRequest, WaitSet,
 };
-use crate::thread_watch::{WatchEventKind, WatchId};
+use crate::thread_watch::{WatchId, line_ends_watch};
 
 // keeps the stream observable: a dead client fails the write, and the client
 // reconnects when a stream goes quiet
@@ -415,15 +415,18 @@ impl Pump {
                 seq,
                 kind,
                 line,
-            } => (
-                WaitFrame::WatchEvent {
-                    watch,
-                    seq,
-                    kind,
-                    line,
-                },
-                Step::Watch { watch, kind },
-            ),
+            } => {
+                let ends = line_ends_watch(kind, &line);
+                (
+                    WaitFrame::WatchEvent {
+                        watch,
+                        seq,
+                        kind,
+                        line,
+                    },
+                    Step::Watch { watch, ends },
+                )
+            }
         };
         let flow = match self.send(&frame).await {
             Sent::Written => {
@@ -454,8 +457,8 @@ impl Pump {
                 self.set.apply_job(job, kind);
                 None
             }
-            Step::Watch { watch, kind } => {
-                self.set.apply_watch(watch, kind);
+            Step::Watch { watch, ends } => {
+                self.set.apply_watch(watch, ends);
                 None
             }
         };
@@ -599,7 +602,7 @@ impl Pump {
             }
             let step = Step::Watch {
                 watch,
-                kind: event.kind,
+                ends: event.ends_watch(),
             };
             self.account(event.seq, step);
         }
@@ -621,7 +624,8 @@ enum Step {
     },
     Watch {
         watch: WatchId,
-        kind: WatchEventKind,
+        /// Whether the event is the watch's last
+        ends: bool,
     },
 }
 

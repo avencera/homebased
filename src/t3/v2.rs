@@ -36,7 +36,7 @@
 //!   would steer into it, so the message after it uses `queue_after_active`
 //!   without `deliveryIntent`, like the web client's "compact first" send
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -141,6 +141,8 @@ const LEGACY_TABLE_SQL: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_session_runtime'";
 const ARCHIVED_SQL: &str =
     "SELECT archived_at IS NOT NULL FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
+const PUT_AWAY_SQL: &str = "SELECT archived_at IS NOT NULL OR deleted_at IS NOT NULL
+     FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
 const REQUIRED_STATE_SQL: &str = "
     SELECT p.thread_id, p.provider, p.driver, p.payload_json, p.updated_at,
            t.thread_id, t.title, t.archived_at, t.deleted_at
@@ -195,7 +197,9 @@ const THREAD_DETAILS_SELECT: &str = "
     WHERE t.deleted_at IS NULL AND json_valid(t.payload_json)";
 const OPEN_THREAD_DETAILS_FILTER: &str = " AND t.archived_at IS NULL";
 // statuses of a run that has not finished, as T3's own run recovery index
-// lists them; settled is the sidebar state T3 records with `settledAt`
+// lists them; any such run counts, so a newer follow-up that was cancelled
+// does not hide a turn still running. Settled is the sidebar state T3
+// records with `settledAt`
 const THREAD_ROWS_SQL: &str = "
     SELECT t.thread_id, t.title, t.archived_at IS NOT NULL,
            CASE WHEN json_valid(t.payload_json)
@@ -207,13 +211,25 @@ const THREAD_ROWS_SQL: &str = "
                THEN COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent')
                              = 'subagent', 0)
                ELSE 0 END,
-           COALESCE((SELECT r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
-                     FROM orchestration_v2_projection_runs r
-                     WHERE r.thread_id = t.thread_id
-                     ORDER BY r.ordinal DESC LIMIT 1), 0)
+           EXISTS (SELECT 1 FROM orchestration_v2_projection_runs r
+                   WHERE r.thread_id = t.thread_id
+                     AND r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting'))
     FROM orchestration_v2_projection_threads t
     WHERE t.deleted_at IS NULL
     ORDER BY t.created_at DESC";
+
+// T3 records each delegated task as a `subagent` node on the parent, and the
+// subagent row of the same id names the child; the node payload does not. A
+// message to a finished child starts a new node, so the newest one per child
+// counts. Node statuses T3 treats as ended, `rolled_back` included
+// a follow-up node can still wait to start, so its time falls back to the row's
+const TASK_STATES_SQL: &str = "
+    SELECT s.child_thread_id,
+           n.status IN ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back')
+    FROM orchestration_v2_projection_subagents s
+    JOIN orchestration_v2_projection_nodes n ON n.node_id = s.subagent_id
+    WHERE n.kind = 'subagent' AND s.child_thread_id IS NOT NULL
+    ORDER BY COALESCE(n.started_at, s.started_at, s.updated_at), n.node_id";
 
 /// One row of [`THREAD_ROWS_SQL`]
 pub(super) struct ThreadRow {
@@ -246,6 +262,50 @@ pub(super) fn thread_rows(path: &Path) -> Result<Vec<ThreadRow>, String> {
         })
         .and_then(Iterator::collect)
         .map_err(|error| format!("T3 thread query failed: {error}"))
+}
+
+/// Child threads whose newest delegated task ended, as T3's subagent nodes
+/// record it
+///
+/// Empty when the query does not fit the schema, so an older T3 without the
+/// node tables, or with changed ones, reads every child by its run and
+/// settled state alone, the way [`check_schema`] tells a schema apart
+///
+/// # Errors
+///
+/// Any other failed read, such as a locked state, so the index read fails as
+/// a failed thread query does
+pub(super) fn finished_tasks(path: &Path) -> Result<HashSet<String>, String> {
+    let failed = |error: rusqlite::Error| format!("T3 delegated task query failed: {error}");
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = match db.prepare(TASK_STATES_SQL) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            return Err("statev2.sqlite is locked".into());
+        }
+        Err(error) => {
+            debug!(%error, "T3 has no delegated task tables homebased reads");
+            return Ok(HashSet::new());
+        }
+    };
+    let mut newest: HashMap<String, bool> = HashMap::new();
+    // oldest first, so each child keeps its newest node
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(failed)?;
+    for row in rows {
+        let (child, ended): (String, bool) = row.map_err(failed)?;
+        newest.insert(child, ended);
+    }
+    Ok(newest
+        .into_iter()
+        .filter_map(|(child, ended)| ended.then_some(child))
+        .collect())
 }
 
 /// Claude sessions and Codex threads whose thread is neither archived nor
@@ -527,6 +587,16 @@ pub(super) fn dispatch(
         Err(error) if error.sent => Err(ApiFailure::Uncertain(error.failure.detail())),
         Err(error) => Err(error.failure),
     }
+}
+
+/// Whether `thread_id` is archived or deleted; a thread with no row counts as
+/// deleted
+pub(super) fn is_put_away(state: &Path, thread_id: &str) -> rusqlite::Result<bool> {
+    let db = state_connection(state)?;
+    let put_away = db
+        .query_row(PUT_AWAY_SQL, [thread_id], |row| row.get::<_, bool>(0))
+        .optional()?;
+    Ok(put_away.unwrap_or(true))
 }
 
 pub(super) fn is_archived(state: &Path, thread_id: &str) -> bool {

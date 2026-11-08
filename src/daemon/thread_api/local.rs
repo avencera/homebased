@@ -215,7 +215,7 @@ impl LocalIndex {
     }
 
     /// T3 threads here that `parent` started as subagents, newest first; with
-    /// `live`, only those not settled or archived
+    /// `live`, only those not settled, archived, or done with their task
     ///
     /// A fork names its source as its parent too, but it is no delegate, so it
     /// is left out: a `--children` compact watch must never reach it
@@ -225,7 +225,7 @@ impl LocalIndex {
             .enumerate()
             .filter(|(_, t3)| t3.delegate && t3.parent.as_deref() == Some(parent))
             .map(|(index, _)| self.context(Found::T3(index)))
-            .filter(|child| !live || !child.state.finished())
+            .filter(|child| !live || !child.put_away())
             .collect()
     }
 
@@ -245,8 +245,8 @@ impl LocalIndex {
             Found::Session(session) => (None, Some(session)),
         };
         let usage = session.and_then(|session| match session {
-            ProviderThread::Claude(id) => ContextUse::read_claude(self.home(), id),
-            ProviderThread::Codex(id) => self.rollouts().context(id),
+            ProviderThread::Claude(id) => ContextUse::read_claude_with_compaction(self.home(), id),
+            ProviderThread::Codex(id) => self.rollouts().context_with_compaction(id),
         });
         let session_id = session.map(ProviderThread::id);
         let worker = session_id.and_then(|id| self.worker(id));
@@ -314,6 +314,8 @@ impl LocalIndex {
                 .map(|(t3, environment)| t3_link(environment, &t3.id)),
             title,
             state,
+            task_finished: t3.is_some_and(|t3| t3.task_finished),
+            settled: t3.is_some_and(|t3| t3.settled),
             tokens,
             tokens_estimated: usage.as_ref().is_some_and(ContextUse::tokens_estimated),
             context_window,
@@ -380,6 +382,11 @@ mod tests {
     const F: &str = "mcp:launch:feed";
     // a fork of A, which T3 also records with A as its parent
     const G: &str = "mcp:launch:fork";
+    // delegates of A whose tasks ended: one done, one sent a new task since,
+    // and one whose run still finishes up after its task ended
+    const DONE: &str = "thread:delegated-task:done";
+    const RESENT: &str = "thread:delegated-task:resent";
+    const WRAPPING: &str = "thread:delegated-task:wrapping";
     const TERMINAL: &str = "0199eeee-2222-7000-8000-000000000006";
     const WORKER: &str = "0199ffff-2222-7000-8000-000000000007";
 
@@ -427,7 +434,38 @@ mod tests {
             .payload(
                 G,
                 &json!({ "lineage": { "parentThreadId": A, "relationshipToParent": "fork" } }),
-            );
+            )
+            .thread(DONE, "done child", false)
+            .payload(DONE, &child_of_a(false))
+            .task(A, DONE, "node:done", "completed", "2026-11-08T10:00:00Z")
+            .thread(RESENT, "resent child", false)
+            .payload(RESENT, &child_of_a(false))
+            .task(
+                A,
+                RESENT,
+                "node:resent-1",
+                "completed",
+                "2026-11-08T10:00:00Z",
+            )
+            .task(
+                A,
+                RESENT,
+                "node:resent-2",
+                "running",
+                "2026-11-08T11:00:00Z",
+            )
+            .thread(WRAPPING, "wrapping child", false)
+            .payload(WRAPPING, &child_of_a(false))
+            .task(
+                A,
+                WRAPPING,
+                "node:wrapping",
+                "failed",
+                "2026-11-08T10:00:00Z",
+            )
+            .run(WRAPPING, 1, "running", "go")
+            // a follow-up queued behind that run and cancelled hides nothing
+            .run(WRAPPING, 2, "cancelled", "more");
         rollout(home, SESSION_A, &[token_count(Utc::now(), 120_000, 0)]);
         transcript(home, SESSION_B, 1, 90_000);
         transcript(home, SESSION_C, 30, 10_000);
@@ -588,26 +626,132 @@ mod tests {
         let parent = index.caller_t3(&caller).unwrap();
         assert_eq!(parent, A);
 
-        let all: HashSet<(String, ThreadState)> = index
+        let all: HashSet<(String, ThreadState, bool)> = index
             .children(&parent, false)
             .iter()
-            .map(|child| (key(child), child.state))
+            .map(|child| (key(child), child.state, child.task_finished))
             .collect();
-        // the fork G is the user's own thread, never a delegate to watch or compact
+        // the fork G is the user's own thread, never a delegate to watch or
+        // compact; the ledger keeps finished children and tells them apart
         assert_eq!(
             all,
             HashSet::from([
-                (C.to_owned(), ThreadState::Settled),
-                (D.to_owned(), ThreadState::Archived),
-                (F.to_owned(), ThreadState::Idle),
+                (C.to_owned(), ThreadState::Settled, false),
+                (D.to_owned(), ThreadState::Archived, false),
+                (F.to_owned(), ThreadState::Idle, false),
+                (DONE.to_owned(), ThreadState::Idle, true),
+                (RESENT.to_owned(), ThreadState::Idle, false),
+                (WRAPPING.to_owned(), ThreadState::Running, false),
             ])
         );
-        let live = index.children(&parent, true);
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].t3_thread.as_deref(), Some(F));
+        let mut live = index.children(&parent, true);
+        live.sort_by_key(key);
+        let live_keys: Vec<String> = live.iter().map(key).collect();
+        // F has no task record, so its states alone decide, as before
+        assert_eq!(live_keys, [F, RESENT, WRAPPING]);
         assert_eq!(live[0].parent_t3_thread.as_deref(), Some(A));
         // a child T3 has not started yet has no session and no context
         assert_eq!((live[0].session, live[0].tokens), (None, None));
+        let done = index.find(&ThreadRef::parse(DONE).unwrap(), false);
+        assert!(
+            done[0].human_line().contains(", finished]"),
+            "{}",
+            done[0].human_line()
+        );
+    }
+
+    #[test]
+    fn a_done_child_that_homebased_work_still_owes_events_is_not_live() {
+        const FINISHED: &str = "thread:delegated-task:finished-waiting";
+        const SESSION_FINISHED: &str = "0199abcd-3333-7000-8000-000000000001";
+        const SETTLED: &str = "thread:delegated-task:settled-waiting";
+        const SESSION_SETTLED: &str = "0199abcd-3333-7000-8000-000000000002";
+        const WORKING: &str = "thread:delegated-task:working-waiting";
+        const SESSION_WORKING: &str = "0199abcd-3333-7000-8000-000000000003";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        let child = |settled: bool| {
+            let mut payload = json!({ "lineage": {
+                "parentThreadId": A, "relationshipToParent": "subagent"
+            }});
+            if settled {
+                payload["settledOverride"] = json!("settled");
+            }
+            payload
+        };
+        V2State::create(&state_path(home))
+            .thread(A, "root", false)
+            .native("codex", SESSION_A, A)
+            .thread(FINISHED, "finished", false)
+            .payload(FINISHED, &child(false))
+            .native("codex", SESSION_FINISHED, FINISHED)
+            .task(
+                A,
+                FINISHED,
+                "node:finished",
+                "completed",
+                "2026-11-08T10:00:00Z",
+            )
+            .thread(SETTLED, "settled", false)
+            .payload(SETTLED, &child(true))
+            .native("codex", SESSION_SETTLED, SETTLED)
+            .thread(WORKING, "working", false)
+            .payload(WORKING, &child(false))
+            .native("codex", SESSION_WORKING, WORKING);
+        // a homebased task owes each child events, so each shows as waiting
+        let mut sources = sources(home);
+        sources.waiting = [SESSION_FINISHED, SESSION_SETTLED, SESSION_WORKING]
+            .into_iter()
+            .map(|session| session.parse().unwrap())
+            .collect();
+        let index = LocalIndex::load(sources, Utc::now()).unwrap();
+
+        let all: HashSet<(String, ThreadState, bool)> = index
+            .children(A, false)
+            .iter()
+            .map(|child| (key(child), child.state, child.done()))
+            .collect();
+        assert_eq!(
+            all,
+            HashSet::from([
+                (FINISHED.to_owned(), ThreadState::Waiting, true),
+                (SETTLED.to_owned(), ThreadState::Waiting, true),
+                (WORKING.to_owned(), ThreadState::Waiting, false),
+            ])
+        );
+        let live: HashSet<String> = index.children(A, true).iter().map(key).collect();
+        assert_eq!(live, HashSet::from([WORKING.to_owned()]));
+    }
+
+    #[test]
+    fn a_t3_without_task_tables_reads_every_child_by_its_states() {
+        let home = tempfile::tempdir().unwrap();
+        drop(index(home.path()));
+        rusqlite::Connection::open(state_path(home.path()))
+            .unwrap()
+            .execute_batch("DROP TABLE orchestration_v2_projection_subagents")
+            .unwrap();
+        let index = LocalIndex::load(sources(home.path()), Utc::now()).unwrap();
+        let live: HashSet<String> = index.children(A, true).iter().map(key).collect();
+        assert!(live.contains(DONE), "{live:?}");
+    }
+
+    #[test]
+    fn a_task_table_that_cannot_be_read_fails_the_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        drop(index(home.path()));
+        // the tables are there, so this is a failed read, not an older T3; a
+        // blob keeps its type in a text column, and reads as no thread id
+        rusqlite::Connection::open(state_path(home.path()))
+            .unwrap()
+            .execute(
+                "UPDATE orchestration_v2_projection_subagents SET child_thread_id = X'2a'
+                 WHERE child_thread_id = ?1",
+                [DONE],
+            )
+            .unwrap();
+        assert!(LocalIndex::load(sources(home.path()), Utc::now()).is_err());
     }
 
     #[test]

@@ -42,10 +42,12 @@ pub enum ThreadCommand {
         #[arg(value_name = "REF")]
         refs: Vec<String>,
         /// List the calling thread's T3 subagents too, finished ones included,
-        /// to rebuild a list of delegates; forks are left out
+        /// to rebuild a list of delegates; forks are left out. A child whose
+        /// delegated task ended reads as `finished` while it is idle
         #[arg(long)]
         children: bool,
-        /// With --children, leave out settled and archived children
+        /// With --children, leave out archived children, and settled ones or
+        /// those whose delegated task ended, unless a turn runs
         #[arg(long, requires = "children")]
         live: bool,
         /// Look only on this machine name or UUID; with --children, list
@@ -66,7 +68,11 @@ pub enum ThreadCommand {
     /// events like task callbacks; `homebased wait --next <watch id>` takes
     /// them instead while it runs. The same watch again (thread, limit, and
     /// action) is the existing watch; another limit or action on the same
-    /// thread is a second watch.
+    /// thread is a second watch. A T3 thread that is settled, or finished with
+    /// its delegated task, and runs no turn never fires, even while it shows
+    /// `waiting`, and its watch ends after an
+    /// hour without activity, as do the watches of a calling T3 thread that
+    /// is archived, deleted, or done for as long.
     #[command(after_help = REFERENCE_HELP)]
     Watch {
         /// Thread references; the calling thread when none is given
@@ -79,10 +85,12 @@ pub enum ThreadCommand {
         /// What to do when the watch fires
         #[arg(long, value_enum, default_value_t = WatchAction::Notify)]
         action: WatchAction,
-        /// End the watch after it fires once
+        /// End the watch after it fires once; that `THREAD_CONTEXT_OVER` says
+        /// `watch_ended`, and no `THREAD_WATCH_ENDED` follows
         #[arg(long)]
         once: bool,
-        /// Watch the calling thread's live T3 subagents too, never its forks
+        /// Watch the calling thread's live T3 subagents too: those not
+        /// settled, archived, or done with their delegated task, never forks
         #[arg(long)]
         children: bool,
         /// Look only on this machine name or UUID; with --children, list

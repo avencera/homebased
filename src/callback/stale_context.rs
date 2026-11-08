@@ -150,7 +150,18 @@ impl ContextUse {
     /// Read the Claude session `thread` from its transcript under `home`
     pub(crate) fn read_claude(home: &Path, thread: ThreadId) -> Option<Self> {
         let path = transcript_path(&home.join(".claude/projects"), thread)?;
-        last_in_tail(&path, Self::from_tail)
+        last_in_tail(&path, Self::from_tail).map(|(found, _)| found)
+    }
+
+    /// [`Self::read_claude`], with the last compaction looked up as far back
+    /// as [`TAIL_SCAN_BYTES`]
+    ///
+    /// The tail read for the last request is often far shorter than the turns
+    /// since a compaction, which T3 runs in the same session
+    pub(crate) fn read_claude_with_compaction(home: &Path, thread: ThreadId) -> Option<Self> {
+        let path = transcript_path(&home.join(".claude/projects"), thread)?;
+        let found = last_in_tail(&path, Self::from_tail)?;
+        Some(look_back(&path, found, last_boundary))
     }
 
     /// How a T3 thread takes a message for this session at `now`
@@ -217,6 +228,9 @@ impl ContextUse {
     /// Last compaction, when the tail read for the last request shows one
     ///
     /// The tail ends at the last request, so an older compaction is unknown
+    /// unless the reading looked further back, as
+    /// [`Self::read_claude_with_compaction`] and
+    /// [`CodexRollouts::context_with_compaction`] do
     pub(crate) fn compacted_at(&self) -> Option<DateTime<Utc>> {
         self.compacted_at
     }
@@ -250,15 +264,7 @@ impl ContextUse {
                 });
             }
             if let Some(tokens) = line.request_tokens() {
-                // only lines that name a boundary are parsed, so the rest of
-                // the tail costs a byte scan
-                let compacted_at = lines
-                    .filter(|raw| contains(raw, b"compact_boundary"))
-                    .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
-                    .find(|line| {
-                        !line.is_sidechain && line.subtype.as_deref() == Some("compact_boundary")
-                    })
-                    .and_then(|line| line.timestamp);
+                let compacted_at = boundary_in(lines);
                 return Some(Self {
                     tokens,
                     estimated: false,
@@ -272,6 +278,54 @@ impl ContextUse {
     }
 }
 
+/// Time of the newest compaction boundary among `lines`, newest first
+///
+/// Only lines that name a boundary are parsed, so the rest costs a byte scan
+fn boundary_in<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Option<DateTime<Utc>> {
+    lines
+        .filter(|raw| contains(raw, b"compact_boundary"))
+        .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
+        .find(|line| !line.is_sidechain && line.subtype.as_deref() == Some("compact_boundary"))
+        .and_then(|line| line.timestamp)
+}
+
+/// Time of the newest compaction boundary in a transcript suffix
+fn last_boundary(tail: &[u8]) -> Option<DateTime<Utc>> {
+    boundary_in(tail.rsplit(|byte| *byte == b'\n'))
+}
+
+/// `found`, read from a suffix that began at `start`, with its last
+/// compaction looked up as far back as [`TAIL_SCAN_BYTES`] when that suffix
+/// showed none
+///
+/// Only the thread API pays for this: the dashboard reads every open thread
+/// and shows no compaction time
+fn look_back(
+    path: &Path,
+    (mut found, start): (ContextUse, u64),
+    last: impl Fn(&[u8]) -> Option<DateTime<Utc>>,
+) -> ContextUse {
+    if found.compacted_at.is_some() || start == 0 {
+        return found;
+    }
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        let from = len.saturating_sub(TAIL_SCAN_BYTES);
+        if from >= start {
+            return Ok(Vec::new());
+        }
+        file.seek(SeekFrom::Start(from))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        Ok(tail)
+    };
+    // the longer suffix holds the shorter one, so its newest marker is the
+    // newest the file shows
+    found.compacted_at = read().ok().and_then(|tail| last(&tail));
+    found
+}
+
 /// Whether `haystack` holds `needle`
 pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -280,11 +334,12 @@ pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Scan growing suffixes of the JSON lines file at `path` with `parse`, which
-/// looks back from the end for the last request
+/// looks back from the end for the last request, and return what it found
+/// with the offset its suffix began at
 ///
 /// A smaller suffix finds the same line as a larger one, since both scan back
 /// from the end and only the first, possibly cut, line differs
-fn last_in_tail<T>(path: &Path, parse: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+fn last_in_tail<T>(path: &Path, parse: impl Fn(&[u8]) -> Option<T>) -> Option<(T, u64)> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut window = FIRST_TAIL_BYTES;
@@ -294,7 +349,7 @@ fn last_in_tail<T>(path: &Path, parse: impl Fn(&[u8]) -> Option<T>) -> Option<T>
         let mut tail = Vec::new();
         file.read_to_end(&mut tail).ok()?;
         if let Some(found) = parse(&tail) {
-            return Some(found);
+            return Some((found, start));
         }
         if start == 0 || window >= TAIL_SCAN_BYTES {
             return None;
@@ -480,5 +535,76 @@ mod tests {
         let measured = context(&[assistant(200, 700_000), boundary, assistant(5, 40_000)]).unwrap();
         assert_eq!(measured.tokens(), 41_302);
         assert!(!measured.tokens_estimated());
+    }
+
+    #[test]
+    fn a_compaction_far_behind_the_last_request_still_reads_through_the_thread_api() {
+        // shaped like a T3 `/compact` in a Claude session: the boundary, its
+        // summary, then turns whose request logs and attachments fill far more
+        // than the first suffix before the last request
+        let boundary = json!({
+            "parentUuid": null,
+            "logicalParentUuid": "41c2748e-1dab-4730-80b4-218a0c91a505",
+            "isSidechain": false,
+            "type": "system",
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted",
+            "isMeta": false,
+            "timestamp": at(30),
+            "uuid": "190fac4b-b3b5-4a5a-adbf-a63b98cfc988",
+            "level": "info",
+            "compactMetadata": {
+                "trigger": "manual",
+                "preTokens": 203_010,
+                "durationMs": 56_280,
+                "preservedSegment": { "headUuid": "659a4049-0a8c-48e5-bec9-7fe416328dab" },
+                "postTokens": 15_859,
+                "cumulativeDroppedTokens": 187_151
+            },
+            "userType": "external",
+            "entrypoint": "t3-code",
+            "sessionId": THREAD,
+            "version": "2.1.319"
+        });
+        let summary = json!({
+            "parentUuid": "190fac4b-b3b5-4a5a-adbf-a63b98cfc988",
+            "isSidechain": false,
+            "type": "user",
+            "isVisibleInTranscriptOnly": true,
+            "isCompactSummary": true,
+            "timestamp": at(30),
+            "message": { "role": "user", "content": "This session is being continued" }
+        });
+        let request_log = json!({
+            "type": "api-request-blob",
+            "timestamp": at(20),
+            "blob": "x".repeat(2 * FIRST_TAIL_BYTES as usize)
+        });
+        let lines = [
+            assistant(40, 200_000),
+            boundary,
+            summary,
+            assistant(29, 50_000),
+            request_log.clone(),
+            request_log,
+            assistant(10, 52_000),
+        ];
+
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/-work-repo");
+        fs::create_dir_all(&project).unwrap();
+        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+        fs::write(project.join(format!("{THREAD}.jsonl")), body.join("\n")).unwrap();
+        let thread = ThreadId::from_str(THREAD).unwrap();
+
+        let found = ContextUse::read_claude_with_compaction(home.path(), thread).unwrap();
+        assert_eq!(found.tokens(), 53_302);
+        assert_eq!(
+            found.compacted_at(),
+            Some(DateTime::parse_from_rfc3339(&at(30)).unwrap().to_utc())
+        );
+        // the dashboard's read stops at the last request, which is cheaper
+        let quick = ContextUse::read_claude(home.path(), thread).unwrap();
+        assert_eq!((quick.tokens(), quick.compacted_at()), (53_302, None));
     }
 }

@@ -333,7 +333,8 @@ callback event for 1 to 16 of this thread's tasks, GPU queue jobs, and watches
 to stdout and exits 0 once every target has its final outcome. A task follows
 `TASK_WAITING` to the continuation run. A job ends on `JOB_SUCCEEDED`,
 `JOB_FAILED`, or `JOB_CANCELLED`; its other events are printed and the wait
-goes on. A watch ends on `THREAD_WATCH_ENDED`. While it runs, the
+goes on. A watch ends on `THREAD_WATCH_ENDED`, or on the
+`THREAD_CONTEXT_OVER` that ends a `--once` watch. While it runs, the
 daemon gives those events to it in place of normal delivery. It counts an
 event delivered only once the command confirms it printed the line, so an
 event the command never confirmed goes through normal delivery after about 5
@@ -408,10 +409,19 @@ pending.
 `thread context` prints each thread's host (`t3`, `worker`, or `terminal`),
 provider, session, T3 id and link, title, state, context tokens, context window
 and percent (Codex only), last activity in US Central, whether the prompt cache
-is warm, and the last compaction. `--children` adds every T3 thread the calling
-T3 thread started as a subagent, finished ones included unless `--live` is
-passed, with the parent link read from T3's thread lineage. Forks of the
-calling thread are not children. When a reachable Fleet machine does
+is warm, and the last compaction, looked up as far as 4 MiB back in the
+transcript or rollout. `--children` adds every T3 thread the calling
+T3 thread started as a subagent, with the parent link read from T3's thread
+lineage. Forks of the calling thread are not children. A child whose newest
+delegated task T3 records as ended, and that runs no turn, has
+`task_finished: true` and shows as `finished` while it is idle, and `settled`
+says whether T3 settled it. A child is done when it is settled or finished and
+runs no turn, even while a homebased task still owes it events and its state
+shows `waiting`; that work wakes it with a new turn when it reports. `--live`
+leaves out children that are archived or done; T3 records a new task when a
+finished child gets a message, so it counts as live again.
+A child T3 records no task for, such as one from an older T3, is judged by its
+settled and archived state alone. When a reachable Fleet machine does
 not answer, the result has `children_complete: false` and names it in
 `unanswered`, and human output warns on stderr; `thread watch --children` then
 fails with the retryable `thread_lookup_incomplete` and saves no watch.
@@ -430,15 +440,36 @@ only after a reading shows the context below the limit, so a missing reading
 never re-arms it. The same thread, limit, and action again is the existing
 watch; another limit or action on the same thread is a second watch, and each
 fires on its own. `--action compact` compacts the
-T3 thread first, with trigger `watch`, and puts the outcome in the event. The
-watch ends with `THREAD_WATCH_ENDED` when it fired with `--once`, is removed
-with `thread unwatch`, or its thread is archived, deleted, or gone; a watch of
-a session ends once the session's record is gone, even while T3 still names
-it, and a running task worker's session counts as live without one. A percent
-watch on a T3 thread that starts running Claude Code ends with reason
-`no_context_window`. A target on
+T3 thread first, with trigger `watch`, and puts the outcome in the event; the
+watch is read again just before, so one removed meanwhile compacts nothing. A
+watched T3 thread that is done, settled or finished with its delegated task
+and running no turn, even while it shows `waiting`, never fires or compacts, even over the limit, whether the watch names the
+thread or the session it runs; it re-arms silently when it drops below the
+limit, and once it is unsettled or takes a new task it fires as before. Every `THREAD_CONTEXT_OVER` carries
+`watch_ended`: a `--once` watch ends with the event that fires it, which says
+`watch_ended: true` and `end_reason: "once"`, and sends no
+`THREAD_WATCH_ENDED`. Any other end sends `THREAD_WATCH_ENDED`: the watch is
+removed with `thread unwatch`; its thread is archived (`archived`), or found
+gone on two scans in a row (`deleted`, `session_gone`), so one bad read ends
+nothing; or its T3 thread stayed done, settled or finished with its task, for an
+hour with no change in tokens or activity (`finished`), which also ends a
+watch of the session that thread runs. A watch of a session
+ends once the session's record is gone, even while T3 still names it, and a
+running task worker's session counts as live without one. A percent watch on a
+T3 thread that starts running Claude Code ends with reason
+`no_context_window`. The watches of a caller that runs in a T3 thread on this
+machine end with `caller_gone` once that thread is archived, is gone on two
+scans, or stays settled or finished for an hour without activity; that end
+event, and any earlier event of the watch still undelivered, reaches a running
+`homebased wait` but never wakes the caller. No watch event is delivered to a
+caller whose T3 thread is archived or deleted, whatever ended the watch, so a
+`--once` event still waiting to go out never unarchives it; the stored event
+and end reason stay as they were. A caller outside T3 is never ended this way, and a watch made before the caller's T3 thread was recorded saves it
+the first time a scan finds it. The counts and the hour live in the
+daemon's memory, so a restart only delays an end. A target on
 another machine is read through that machine on each check; while it does not
-answer, the watch is left as it was. Events are delivered like task events, in
+answer, the watch is left as it was, and so is a caller while this machine's
+T3 cannot be read. Events are delivered like task events, in
 order per watch. An event can arrive twice, for example when a lost
 acknowledgement after `homebased wait` printed it lets delivery send it again,
 so recipients deduplicate by `(watch, seq)`. An event whose saved
@@ -885,8 +916,8 @@ to ignore duplicates.
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |
 | `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started: a dependency ended, `task cancel` asked, or a newer task with the same `coalesce` key replaced it (`superseded`). |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
-| `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. |
-| `THREAD_WATCH_ENDED` | A watch's last event, with `reason`: `once`, `unwatched`, `archived`, `deleted`, `session_gone`, or `no_context_window` (a percent watch on a thread that runs Claude Code). |
+| `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. `watch_ended` is true, with `end_reason: "once"`, when it ends a `--once` watch, which then sends no `THREAD_WATCH_ENDED`. |
+| `THREAD_WATCH_ENDED` | A watch's last event, unless a `--once` watch fired, with `reason`: `unwatched`, `archived`, `deleted`, `session_gone`, `no_context_window` (a percent watch on a thread that runs Claude Code), `finished` (the T3 thread stayed done and quiet for an hour), or `caller_gone` (the caller's T3 thread was archived, deleted, or stayed done and quiet for an hour; only a running `homebased wait` gets this one). |
 
 ### Direct messages
 

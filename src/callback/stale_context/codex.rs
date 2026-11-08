@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{ContextUse, contains, last_in_tail};
+use super::{ContextUse, contains, last_in_tail, look_back};
 use crate::domain::ThreadId;
 
 /// Rollout files under one Codex sessions directory, by thread id
@@ -82,7 +82,15 @@ impl CodexRollouts {
     ///
     /// `None` when it has no rollout or the rollout's tail has no request
     pub(crate) fn context(&self, thread: ThreadId) -> Option<ContextUse> {
-        last_in_tail(self.0.get(&thread)?, from_tail)
+        last_in_tail(self.0.get(&thread)?, from_tail).map(|(found, _)| found)
+    }
+
+    /// [`Self::context`], with the last compaction looked up as far back as
+    /// the request scan reaches at most
+    pub(crate) fn context_with_compaction(&self, thread: ThreadId) -> Option<ContextUse> {
+        let path = self.0.get(&thread)?;
+        let found = last_in_tail(path, from_tail)?;
+        Some(look_back(path, found, last_compaction))
     }
 }
 
@@ -115,12 +123,7 @@ fn from_tail(tail: &[u8]) -> Option<ContextUse> {
             continue;
         }
         // the reading may itself follow the compaction, so the scan starts here
-        let compacted_at = std::iter::once(raw)
-            .chain(lines)
-            .filter(|raw| contains(raw, b"\"compacted\""))
-            .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
-            .find(|line| line.kind.as_deref() == Some("compacted"))
-            .and_then(|line| line.timestamp);
+        let compacted_at = compaction_in(std::iter::once(raw).chain(lines));
         return Some(ContextUse {
             tokens: usage.total_tokens,
             estimated: usage.input_tokens == 0 && usage.output_tokens == 0,
@@ -130,6 +133,20 @@ fn from_tail(tail: &[u8]) -> Option<ContextUse> {
         });
     }
     None
+}
+
+/// Time of the newest `compacted` line among `lines`, newest first
+fn compaction_in<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Option<DateTime<Utc>> {
+    lines
+        .filter(|raw| contains(raw, b"\"compacted\""))
+        .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
+        .find(|line| line.kind.as_deref() == Some("compacted"))
+        .and_then(|line| line.timestamp)
+}
+
+/// Time of the newest `compacted` line in a rollout suffix
+fn last_compaction(tail: &[u8]) -> Option<DateTime<Utc>> {
+    compaction_in(tail.rsplit(|byte| *byte == b'\n'))
 }
 
 /// Rollout line fields this module reads
@@ -328,6 +345,55 @@ mod tests {
         .unwrap();
         assert_eq!(measured.tokens(), 21_745);
         assert!(!measured.tokens_estimated());
+    }
+
+    #[test]
+    fn a_compaction_far_behind_the_last_request_still_reads_through_the_thread_api() {
+        // shaped like a real compaction: the marker, its estimate, then items
+        // that fill far more than the first suffix before the last request
+        let compacted = json!({
+            "timestamp": at(30).to_rfc3339(),
+            "ordinal": 812,
+            "type": "compacted",
+            "payload": {
+                "message": "",
+                "replacement_history": [],
+                "replacement_history_metadata": {},
+                "retained_context": [],
+                "window_number": 2
+            }
+        });
+        let estimate = {
+            let mut line = token_count(at(30), 0, 0);
+            line["payload"]["info"]["last_token_usage"]["total_tokens"] = json!(24_740);
+            line
+        };
+        let item = json!({
+            "timestamp": at(20).to_rfc3339(),
+            "type": "response_item",
+            "payload": { "type": "function_call_output", "output": "x".repeat(150_000) }
+        });
+        let home = tempfile::tempdir().unwrap();
+        rollout(
+            home.path(),
+            THREAD,
+            &[
+                token_count(at(70), 251_007, 5_683),
+                compacted,
+                estimate,
+                item.clone(),
+                item,
+                token_count(at(10), 40_000, 500),
+            ],
+        );
+        let rollouts = CodexRollouts::scan(home.path());
+        let thread = THREAD.parse().unwrap();
+
+        let found = rollouts.context_with_compaction(thread).unwrap();
+        assert_eq!(found.tokens(), 40_500);
+        assert_eq!(found.compacted_at(), Some(at(30)));
+        // the dashboard's read stops at the last request, which is cheaper
+        assert_eq!(rollouts.context(thread).unwrap().compacted_at(), None);
     }
 
     #[test]

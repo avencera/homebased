@@ -243,8 +243,11 @@ impl Harness {
 
     fn opencode_pid(&self, id: &str, kind: &str) -> i32 {
         let path = self.record.join(format!("opencode-{kind}-pid-{id}.txt"));
-        assert!(wait_until(Duration::from_secs(10), || path.exists()));
-        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        // the fake opencode creates the file before it writes the pid, so wait
+        // for a pid rather than for the file
+        let read = || fs::read_to_string(&path).ok()?.trim().parse().ok();
+        assert!(wait_until(Duration::from_secs(10), || read().is_some()));
+        read().unwrap()
     }
 
     fn store(&self) -> Store {

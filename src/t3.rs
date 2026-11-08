@@ -554,12 +554,29 @@ pub(crate) struct T3Thread {
     pub(crate) delegate: bool,
     /// Whether the newest run has not finished
     pub(crate) running: bool,
+    /// Whether T3 records the delegated task this thread runs as ended, and
+    /// no run is left; false for a thread T3 records no task for, such as one
+    /// from before T3 kept them
+    pub(crate) task_finished: bool,
     /// Claude session or Codex thread T3 runs the thread's next turn in, as
     /// [`next_session`] picks it; `None` before the first one and while a
     /// provider switch is pending
     pub(crate) session: Option<ProviderThread>,
     /// Project, branch, model, and other context T3 records for the thread
     pub(crate) details: ThreadDetails,
+}
+
+/// Whether this machine's T3 has archived or deleted `thread_id`
+///
+/// `None` when there is no T3 state or it cannot be read, which tells nothing
+pub(crate) fn thread_put_away(env: &T3Env, thread_id: &str) -> Option<bool> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return None;
+    }
+    v2::is_put_away(&state, thread_id)
+        .inspect_err(|error| tracing::debug!(%error, "T3 thread state cannot be read"))
+        .ok()
 }
 
 /// Every T3 thread that is not deleted, newest first
@@ -586,12 +603,15 @@ pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
         .filter_map(|active| Some((active.thread.clone(), resumed(active)?)))
         .collect();
     let details = v2::all_thread_details(&state);
+    let finished = v2::finished_tasks(&state)?;
 
     Ok(rows
         .into_iter()
         .map(|row| T3Thread {
             session: sessions.get(&row.id).copied(),
             details: details.get(&row.id).cloned().unwrap_or_default(),
+            // the node can end while the child's own run still finishes up
+            task_finished: !row.running && finished.contains(&row.id),
             id: row.id,
             title: row.title,
             archived: row.archived,

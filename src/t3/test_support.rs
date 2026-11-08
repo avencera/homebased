@@ -471,6 +471,20 @@ impl V2State {
         self
     }
 
+    /// A delegated task `node_id` that `parent` gave `child`, in `status`,
+    /// started at `started_at`, as T3 records it in a subagent node and row
+    pub(crate) fn task(
+        self,
+        parent: &str,
+        child: &str,
+        node_id: &str,
+        status: &str,
+        started_at: &str,
+    ) -> Self {
+        add_task(&self.0, parent, child, node_id, status, started_at);
+        self
+    }
+
     /// The copied session table that maps a thread imported from the previous
     /// orchestrator
     pub(crate) fn legacy(
@@ -504,6 +518,74 @@ impl V2State {
             .unwrap();
         self
     }
+}
+
+/// Record a delegated task in the node and subagent tables, creating them as
+/// T3's migration does when a state predates them
+pub(crate) fn add_task(
+    db: &Connection,
+    parent: &str,
+    child: &str,
+    node_id: &str,
+    status: &str,
+    started_at: &str,
+) {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orchestration_v2_projection_nodes (
+            node_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            run_id TEXT,
+            root_node_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider_thread_id TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            payload_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS orchestration_v2_projection_subagents (
+            subagent_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            parent_node_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            child_thread_id TEXT,
+            origin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT,
+            updated_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    let completed_at = (status != "running").then_some(started_at);
+    // the node payload names the parent only; the child is on the subagent row
+    let node = json!({
+        "id": node_id, "threadId": parent, "kind": "subagent", "status": status,
+        "providerThreadId": null, "startedAt": started_at, "completedAt": completed_at
+    });
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_nodes
+         (node_id, thread_id, root_node_id, kind, status, started_at, completed_at, payload_json)
+         VALUES (?1, ?2, 'root', 'subagent', ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            node_id,
+            parent,
+            status,
+            started_at,
+            completed_at,
+            node.to_string()
+        ],
+    )
+    .unwrap();
+    let row = json!({ "id": node_id, "threadId": parent, "childThreadId": child });
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_subagents
+         (subagent_id, thread_id, parent_node_id, provider, child_thread_id, origin, status,
+          started_at, updated_at, payload_json)
+         VALUES (?1, ?2, 'root', 'claudeAgent', ?3, 'app_owned', ?4, ?5, ?5, ?6)",
+        rusqlite::params![node_id, parent, child, status, started_at, row.to_string()],
+    )
+    .unwrap();
 }
 
 pub(crate) const SESSION_ID: &str = "d74100ef-c9c2-4d79-85f2-62712b391e88";

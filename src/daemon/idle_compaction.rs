@@ -12,13 +12,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, call};
 use super::compaction_log::{self, Trigger};
+use super::thread_api::watch_scan::{self, WatchMemory};
 use crate::callback::stale_context::ContextUse;
 use crate::domain::ThreadId;
 use crate::submission::CallbackContext;
@@ -26,14 +27,34 @@ use crate::t3::{T3Env, WakeOutcome, compact_thread};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Seconds between scans instead of [`SCAN_INTERVAL`], so integration tests
+/// see several watch scans without waiting minutes
+const SCAN_SECS_ENV: &str = "HOMEBASED_TEST_SCAN_SECS";
+
+/// Seconds a finished thread must stay quiet instead of
+/// [`watch_scan::QUIET_FINISHED`], for the same tests
+const WATCH_QUIET_SECS_ENV: &str = "HOMEBASED_TEST_WATCH_QUIET_SECS";
+
+/// `name` as a whole number of seconds, when the daemon's environment sets it
+fn seconds_from_env(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
 /// Idle period of each thread that already had a compaction attempt
 pub(crate) type Attempts = HashMap<ThreadId, DateTime<Utc>>;
 
 /// Check waiting threads for as long as the daemon runs
 pub(super) async fn run(state: AppState) {
     let mut attempts = Attempts::new();
+    let interval = seconds_from_env(SCAN_SECS_ENV)
+        .filter(|seconds| *seconds > 0)
+        .map_or(SCAN_INTERVAL, Duration::from_secs);
+    let quiet = seconds_from_env(WATCH_QUIET_SECS_ENV)
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .map_or(watch_scan::QUIET_FINISHED, TimeDelta::seconds);
+    let mut watches = WatchMemory::new(quiet);
     let log = state.home.compaction_log_path();
-    let mut tick = tokio::time::interval(SCAN_INTERVAL);
+    let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
@@ -56,7 +77,7 @@ pub(super) async fn run(state: AppState) {
                 }
             };
         // after the idle compactions, so a watch reads a size they already changed
-        super::thread_api::watch_scan::scan(&state).await;
+        watch_scan::scan(&state, &mut watches, Utc::now()).await;
     }
 }
 
