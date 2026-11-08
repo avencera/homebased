@@ -77,6 +77,21 @@ const LEGACY_THREAD_SQL: &str = "
           ELSE 0 END
     ORDER BY r.last_seen_at DESC
     LIMIT 1";
+// T3 runs the next turn, `/compact` included, in the active provider thread
+// while it is of the instance the thread selects; a switch picks its thread
+// only when the next message is dispatched
+// a row from before instances keeps only `provider` and `default_provider`
+const ACTIVE_THREAD_SQL: &str = "
+    SELECT COALESCE(p.driver, p.provider),
+           CASE WHEN json_valid(p.payload_json)
+                 AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
+               THEN json_extract(p.payload_json, '$.nativeThreadRef.nativeId') END,
+           COALESCE(p.provider_instance_id, p.provider)
+               IS COALESCE(t.provider_instance_id, t.default_provider)
+    FROM orchestration_v2_projection_threads t
+    JOIN orchestration_v2_projection_provider_threads p
+      ON p.provider_thread_id = t.active_provider_thread_id
+    WHERE t.thread_id = ?1";
 const LEGACY_TABLE_SQL: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_session_runtime'";
 const ARCHIVED_SQL: &str =
@@ -207,6 +222,20 @@ pub(super) fn find_thread(
     )
     .optional()
     .map_err(|_| "statev2.sqlite legacy thread lookup failed".to_string())
+}
+
+/// Active provider thread of T3 thread `t3_thread`: its driver, its native id
+/// once it has one, and whether it is of the instance the thread selects
+pub(super) fn active_thread(
+    path: &Path,
+    t3_thread: &str,
+) -> Result<Option<(String, Option<String>, bool)>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    db.query_row(ACTIVE_THREAD_SQL, [t3_thread], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .optional()
+    .map_err(|_| "statev2.sqlite active provider thread lookup failed".to_string())
 }
 
 fn has_legacy_table(db: &Connection) -> Result<bool, String> {

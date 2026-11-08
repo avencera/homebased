@@ -28,7 +28,8 @@ use crate::domain::{TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 use crate::t3::{
-    ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, owner, wake_thread_checked,
+    NextSession, ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, next_session,
+    owner, wake_thread_checked,
 };
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -599,6 +600,14 @@ fn turn_start(
     pending: &PendingT3Send<impl IntentIo>,
     gate: SendGate<'_>,
 ) -> Result<TurnStart, SendFailure> {
+    let env = t3_env(context);
+    // T3 may run the next turn in a newer session than the route names, as it
+    // does for an imported thread
+    let provider_thread = match next_session(&env, provider_thread) {
+        NextSession::Unowned => provider_thread,
+        NextSession::Resumes(next) => next,
+        NextSession::Other => return Ok(TurnStart::Auto),
+    };
     let Some(usage) = ContextUse::read(Path::new(&context.env.home), provider_thread) else {
         return Ok(TurnStart::Auto);
     };
@@ -620,7 +629,7 @@ fn turn_start(
         return Ok(usage.turn_start(now));
     }
 
-    let outcome = compact_thread(&t3_env(context), provider_thread, &usage.compaction_key());
+    let outcome = compact_thread(&env, provider_thread, &usage.compaction_key());
     if held_since.is_none() {
         compaction_log::record_default(Trigger::Callback, provider_thread, &usage, &outcome, now);
         callback_log(

@@ -220,7 +220,10 @@ process between turns, so an event for a live Claude session that a T3 thread
 owns also goes through T3, which shows it in the thread; the session socket is
 the fallback. An archived T3 thread is unarchived first, so the turn runs and
 you can see it. A thread that T3 imported from its older orchestrator continues
-in a new provider session with the earlier context handed over.
+in a new provider session with the earlier context handed over. homebased
+reads a T3 thread's context from the session T3 runs its next turn in, so an
+imported thread reads its new session, and a thread that switches provider or
+starts a new session at its next turn is not compacted first.
 
 Claude Code caches a conversation for an hour. After that, the next turn
 re-reads the whole context at full price, and every request in that turn

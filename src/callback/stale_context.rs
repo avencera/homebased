@@ -40,7 +40,7 @@ use serde::Deserialize;
 
 use super::claude_inbox::transcript_path;
 use crate::domain::ThreadId;
-use crate::t3::{ProviderThread, TurnStart};
+use crate::t3::{NextSession, ProviderThread, T3Env, TurnStart, next_session};
 
 /// Idle time after which the one-hour prompt cache has lapsed
 const CACHE_LIFETIME: TimeDelta = TimeDelta::hours(1);
@@ -116,6 +116,27 @@ impl ContextUse {
         }
         let usage = CodexRollouts::scan(home).context(thread)?;
         Some((ProviderThread::Codex(thread), usage))
+    }
+
+    /// Read the session where T3 runs the next turn of the T3 thread that owns
+    /// `thread`, whose provider is unknown, and name it
+    ///
+    /// T3's state resolves the thread before any record is read, so a thread
+    /// imported with `thread` reads its newer session even once the record of
+    /// `thread` is gone. `None` when T3 runs no session homebased can read
+    /// next. A session that no T3 thread owns is read as in [`Self::find`]
+    pub(crate) fn find_next(env: &T3Env, thread: ThreadId) -> Option<(ProviderThread, Self)> {
+        for candidate in [
+            ProviderThread::Claude(thread),
+            ProviderThread::Codex(thread),
+        ] {
+            match next_session(env, candidate) {
+                NextSession::Unowned => {}
+                NextSession::Resumes(next) => return Some((next, Self::read(&env.home, next)?)),
+                NextSession::Other => return None,
+            }
+        }
+        Self::find(&env.home, thread)
     }
 
     /// Read the Claude session `thread` from its transcript under `home`
