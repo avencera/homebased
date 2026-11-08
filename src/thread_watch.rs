@@ -253,6 +253,47 @@ pub fn ends_watch(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
             == Some(true)
 }
 
+/// Whether a watch event with `payload` gives its caller something to do, so
+/// delivery wakes the caller for it
+///
+/// A compaction the watch started on another thread, an unwatch, and the end
+/// of a watch on a thread that finished ask nothing of the caller, and waking
+/// it would spend a turn re-reading its whole context to learn that. A
+/// connected `homebased wait` still prints them, and the store keeps them for
+/// `thread watches`. A caller that watches itself still wakes for its own
+/// compaction: it ended its turn so T3 could compact it, and this event is
+/// what resumes it
+#[must_use]
+pub fn wakes_caller(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
+    match kind {
+        WatchEventKind::ContextOver => {
+            let outcome = payload
+                .pointer("/compaction/outcome")
+                .and_then(|outcome| CompactOutcome::deserialize(outcome).ok());
+            let caller = payload.get("thread").and_then(serde_json::Value::as_str);
+            let is_caller = |key: &str| {
+                caller.is_some()
+                    && payload
+                        .pointer(&format!("/target/{key}"))
+                        .and_then(serde_json::Value::as_str)
+                        == caller
+            };
+            outcome != Some(CompactOutcome::Started)
+                || is_caller("session")
+                || is_caller("t3_thread")
+        }
+        WatchEventKind::Ended => {
+            let reason = payload
+                .get("reason")
+                .and_then(|reason| WatchEndReason::deserialize(reason).ok());
+            !matches!(
+                reason,
+                Some(WatchEndReason::Unwatched | WatchEndReason::Finished)
+            )
+        }
+    }
+}
+
 /// [`ends_watch`] for a `HOMEBASED_EVENT` line, as a wait stream carries it
 #[must_use]
 pub fn line_ends_watch(kind: WatchEventKind, line: &str) -> bool {
@@ -404,6 +445,12 @@ impl WatchEvent {
         ends_watch(self.kind, &self.payload)
     }
 
+    /// Whether delivery wakes the caller for this event, see [`wakes_caller`]
+    #[must_use]
+    pub fn wakes_caller(&self) -> bool {
+        wakes_caller(self.kind, &self.payload)
+    }
+
     /// The line delivery sends
     #[must_use]
     pub fn line(&self) -> String {
@@ -513,7 +560,45 @@ pub struct CompactResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::Threshold;
+    use serde_json::json;
+
+    use super::{Threshold, WatchEventKind, wakes_caller};
+
+    #[test]
+    fn only_events_that_ask_something_of_the_caller_wake_it() {
+        let over_on = |target: &str, outcome: Option<&str>| {
+            let compaction = outcome.map(|outcome| json!({ "outcome": outcome, "detail": null }));
+            wakes_caller(
+                WatchEventKind::ContextOver,
+                &json!({
+                    "thread": "root-session",
+                    "target": { "session": target, "t3_thread": format!("{target}-t3") },
+                    "compaction": compaction,
+                    "reason": null,
+                }),
+            )
+        };
+        let over = |outcome| over_on("child-session", outcome);
+        assert!(over(None));
+        assert!(!over(Some("started")));
+        for outcome in ["refused", "unavailable", "not_found"] {
+            assert!(over(Some(outcome)), "{outcome}");
+        }
+        // a root that watches itself resumes on its own compaction
+        assert!(over_on("root-session", Some("started")));
+
+        let ended = |reason: &str| {
+            wakes_caller(
+                WatchEventKind::Ended,
+                &json!({ "reason": reason, "compaction": null }),
+            )
+        };
+        assert!(!ended("unwatched"));
+        assert!(!ended("finished"));
+        for reason in ["archived", "deleted", "session_gone", "no_context_window"] {
+            assert!(ended(reason), "{reason}");
+        }
+    }
 
     #[test]
     fn thresholds_read_tokens_thousands_millions_and_percents() {

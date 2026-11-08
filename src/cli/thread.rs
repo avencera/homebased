@@ -72,7 +72,9 @@ pub enum ThreadCommand {
     /// its delegated task, and runs no turn never fires, even while it shows
     /// `waiting`, and its watch ends after an
     /// hour without activity, as do the watches of a calling T3 thread that
-    /// is archived, deleted, or done for as long.
+    /// is archived, deleted, or done for as long. A started compaction of
+    /// another thread, an unwatch, and a finished thread's end wake no caller; only a running
+    /// `homebased wait` prints them.
     #[command(after_help = REFERENCE_HELP)]
     Watch {
         /// Thread references; the calling thread when none is given
@@ -116,7 +118,8 @@ pub enum ThreadCommand {
         #[arg(long, conflicts_with = "all")]
         thread: Option<ThreadId>,
     },
-    /// End a watch; it sends `THREAD_WATCH_ENDED` as its last event
+    /// End a watch; its last event, `THREAD_WATCH_ENDED`, reaches only a
+    /// running `homebased wait` and never wakes the caller
     Unwatch {
         /// Watch id that `thread watch` printed
         id: WatchId,

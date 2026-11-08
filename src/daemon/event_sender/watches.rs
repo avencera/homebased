@@ -5,7 +5,8 @@
 //! printed or delivered, and a refused delivery settles as failed so the
 //! events after it still go out. A route that can no longer run, such as a
 //! `codex queue` whose binary is gone, settles at once, and a retryable
-//! failure settles after [`MAX_ATTEMPTS`]. An event whose caller's T3 thread is
+//! failure settles after [`MAX_ATTEMPTS`]. An event that asks nothing of the
+//! caller (see [`WatchEvent::wakes_caller`]), or whose caller's T3 thread is
 //! archived or deleted, or whose watch ended as `caller_gone`, reaches only a
 //! connected wait, and settles as suppressed otherwise
 
@@ -215,7 +216,7 @@ async fn deliver(
         });
         return Ok(settle("printed").await?);
     }
-    if caller_put_away(state, watch).await? {
+    if !event.wakes_caller() || caller_put_away(state, watch).await? {
         return Ok(settle("suppressed").await?);
     }
     // the routes that run `codex queue` check the saved cwd and Codex binary

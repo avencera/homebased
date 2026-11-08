@@ -440,7 +440,9 @@ only after a reading shows the context below the limit, so a missing reading
 never re-arms it. The same thread, limit, and action again is the existing
 watch; another limit or action on the same thread is a second watch, and each
 fires on its own. `--action compact` compacts the
-T3 thread first, with trigger `watch`, and puts the outcome in the event; the
+T3 thread first, with trigger `watch`, and puts the outcome in the event, which
+wakes the caller only when the compaction did not start or the caller watches
+itself; the
 watch is read again just before, so one removed meanwhile compacts nothing. A
 watched T3 thread that is done, settled or finished with its delegated task
 and running no turn, even while it shows `waiting`, never fires or compacts, even over the limit, whether the watch names the
@@ -470,7 +472,9 @@ daemon's memory, so a restart only delays an end. A target on
 another machine is read through that machine on each check; while it does not
 answer, the watch is left as it was, and so is a caller while this machine's
 T3 cannot be read. Events are delivered like task events, in
-order per watch. An event can arrive twice, for example when a lost
+order per watch, except that a started compaction of another thread and the `unwatched` and
+`finished` ends, which ask nothing of the caller, reach only a running
+`homebased wait` and never wake it. An event can arrive twice, for example when a lost
 acknowledgement after `homebased wait` printed it lets delivery send it again,
 so recipients deduplicate by `(watch, seq)`. An event whose saved
 callback can no longer run, or that fails 3 times, is given up so later events
@@ -916,8 +920,8 @@ to ignore duplicates.
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |
 | `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started: a dependency ended, `task cancel` asked, or a newer task with the same `coalesce` key replaced it (`superseded`). |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
-| `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. `watch_ended` is true, with `end_reason: "once"`, when it ends a `--once` watch, which then sends no `THREAD_WATCH_ENDED`. |
-| `THREAD_WATCH_ENDED` | A watch's last event, unless a `--once` watch fired, with `reason`: `unwatched`, `archived`, `deleted`, `session_gone`, `no_context_window` (a percent watch on a thread that runs Claude Code), `finished` (the T3 thread stayed done and quiet for an hour), or `caller_gone` (the caller's T3 thread was archived, deleted, or stayed done and quiet for an hour; only a running `homebased wait` gets this one). |
+| `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. With `compaction.outcome: "started"` on a thread other than the caller, only a running `homebased wait` gets it. `watch_ended` is true, with `end_reason: "once"`, when it ends a `--once` watch, which then sends no `THREAD_WATCH_ENDED`. |
+| `THREAD_WATCH_ENDED` | A watch's last event, unless a `--once` watch fired, with `reason`: `unwatched`, `archived`, `deleted`, `session_gone`, `no_context_window` (a percent watch on a thread that runs Claude Code), `finished` (the T3 thread stayed done and quiet for an hour), or `caller_gone` (the caller's T3 thread was archived, deleted, or stayed done and quiet for an hour). Only a running `homebased wait` gets `unwatched`, `finished`, and `caller_gone`. |
 
 ### Direct messages
 

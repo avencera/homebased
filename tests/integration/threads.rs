@@ -389,6 +389,21 @@ fn a_watch_is_listed_reused_and_ends_through_wait() {
     let listed = ok(&h.thread_cmd(Some(THREAD), &["watches"]));
     assert_eq!(listed["watches"].as_array().unwrap().len(), 2, "{listed}");
     ok(&h.thread_cmd(Some(THREAD), &["unwatch", &higher]));
+    // the caller ran the unwatch itself, so its end is stored but wakes nobody
+    let settled = |watch: &str| {
+        let events = h.watch_events(watch);
+        (!events.is_empty() && events.iter().all(|(_, delivery)| delivery.is_some()))
+            .then_some(events)
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || settled(&higher).is_some()),
+        "{:?}",
+        h.watch_events(&higher)
+    );
+    let events = settled(&higher).unwrap();
+    assert_eq!(events[0].0["reason"], "unwatched");
+    assert_eq!(events[0].1.as_deref(), Some("suppressed"));
+    assert!(h.queue_messages().is_empty(), "{:?}", h.queue_messages());
     assert!(
         ok(&h.thread_cmd(Some(OTHER_THREAD), &["watches"]))["watches"]
             .as_array()
@@ -1031,6 +1046,25 @@ fn a_done_t3_target_never_fires_and_its_watch_ends_after_an_hour_of_quiet() {
     assert_eq!(ended["reason"], "finished", "{ended}");
     assert_eq!(ended["watch_ended"], true, "{ended}");
     assert_eq!(events.len(), 2, "{events:?}");
+    // the fired event woke the caller, but a finished thread's end asks nothing of it
+    assert!(
+        wait_until(Duration::from_secs(10), || h
+            .watch_events(&watch)
+            .iter()
+            .all(|(_, delivery)| delivery.is_some())),
+        "{:?}",
+        h.watch_events(&watch)
+    );
+    let deliveries: Vec<_> = h
+        .watch_events(&watch)
+        .into_iter()
+        .map(|(_, delivery)| delivery)
+        .collect();
+    assert_eq!(
+        deliveries,
+        [Some("delivered".to_owned()), Some("suppressed".to_owned())]
+    );
+    assert_eq!(h.queue_messages().len(), 1, "{:?}", h.queue_messages());
 }
 
 #[test]
