@@ -1780,10 +1780,10 @@ async fn event_goes_to_the_most_recently_registered_waiter() {
     assert!(older_events.try_recv().is_err());
 }
 
-/// Rollout of the Codex thread `route.thread`, whose last request read
-/// 250,000 tokens `minutes_ago`, and after it the estimate Codex writes when
-/// a compaction finishes
-fn write_rollout(route: &OriginRoute, minutes_ago: i64, compacted: bool) {
+/// Rollout of the Codex thread `thread`, whose last request read 250,000
+/// tokens `minutes_ago`, and after it the estimate Codex writes when a
+/// compaction finishes
+fn write_rollout(route: &OriginRoute, thread: &str, minutes_ago: i64, compacted: bool) {
     use crate::callback::stale_context::codex_rollout::{rollout, token_count};
 
     let now = chrono::Utc::now();
@@ -1798,7 +1798,7 @@ fn write_rollout(route: &OriginRoute, minutes_ago: i64, compacted: bool) {
         lines.push(estimate);
     }
     let home = PathBuf::from(&route.callback.env.home);
-    rollout(&home, &route.thread.to_string(), &lines);
+    rollout(&home, thread, &lines);
 }
 
 /// WebSocket payloads the fake T3 server received
@@ -1813,8 +1813,27 @@ fn dispatched_payloads(server: &FakeT3Server) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Native Codex thread that T3 resumes an imported thread in, after the
+/// thread it was imported with
+const RESUMED_CODEX_THREAD: &str = "01a1b8ed-bad7-79b0-a505-6a4fa4605789";
+
 #[tokio::test]
 async fn codex_thread_past_its_prompt_cache_waits_in_the_inbox_for_its_compaction() {
+    compaction_holds_the_event_until_it_lands(false).await;
+}
+
+#[tokio::test]
+async fn imported_codex_thread_waits_for_the_compaction_of_the_thread_t3_resumed() {
+    compaction_holds_the_event_until_it_lands(true).await;
+}
+
+/// Deliver an event to a T3 Codex thread past its prompt cache, which T3
+/// compacts first
+///
+/// An `imported` T3 thread maps the route's thread through the copied session
+/// table, and T3 runs it in [`RESUMED_CODEX_THREAD`], whose rollout is the one
+/// that shows the compaction; the imported rollout stays cold
+async fn compaction_holds_the_event_until_it_lands(imported: bool) {
     let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
     let dispatched = || {
         FakeResponse::WebSocket(vec![rpc_exit(
@@ -1827,12 +1846,24 @@ async fn codex_thread_past_its_prompt_cache_waits_in_the_inbox_for_its_compactio
     );
     let (_dir, home, mut route) =
         fixture("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/commands\"\nexit 0\n");
-    let commands = configure_t3_codex(
-        &mut route,
-        &server.origin,
-        i32::try_from(std::process::id()).unwrap(),
-    );
-    write_rollout(&route, 120, false);
+    let pid = i32::try_from(std::process::id()).unwrap();
+    let route_thread = route.thread.to_string();
+    let (commands, compacted_thread) = if imported {
+        let userdata = configure_t3(&mut route, &server.origin, pid);
+        V2State::create(&userdata.join("statev2.sqlite"))
+            .thread(T3_THREAD_ID, "Imported thread", false)
+            .legacy("codex", "threadId", &route_thread, T3_THREAD_ID)
+            .native("codex", RESUMED_CODEX_THREAD, T3_THREAD_ID);
+        write_rollout(&route, &route_thread, 300, false);
+        let commands = PathBuf::from(&route.callback.env.home).join("commands");
+        (commands, RESUMED_CODEX_THREAD.to_string())
+    } else {
+        (
+            configure_t3_codex(&mut route, &server.origin, pid),
+            route_thread,
+        )
+    };
+    write_rollout(&route, &compacted_thread, 120, false);
     let mut persisted = Store::open(&home.db_path()).unwrap();
     persisted.insert_origin_route(&route).unwrap();
     persisted
@@ -1885,7 +1916,7 @@ async fn codex_thread_past_its_prompt_cache_waits_in_the_inbox_for_its_compactio
         "{:?}",
         delivery()
     );
-    write_rollout(&route, 120, true);
+    write_rollout(&route, &compacted_thread, 120, true);
     run_inbox().await;
 
     assert!(matches!(delivery(), DeliveryState::Delivered { .. }));
@@ -1912,6 +1943,20 @@ async fn codex_thread_past_its_prompt_cache_waits_in_the_inbox_for_its_compactio
 
 #[test]
 fn idle_compaction_compacts_a_waiting_codex_thread_before_its_cache_lapses() {
+    idle_compaction_compacts(false);
+}
+
+#[test]
+fn idle_compaction_reads_the_thread_t3_resumed_once_the_imported_rollout_is_gone() {
+    idle_compaction_compacts(true);
+}
+
+/// Scan a waiting T3 Codex thread whose prompt cache is about to lapse, which
+/// T3 compacts
+///
+/// An `imported` T3 thread maps the route's thread through the copied session
+/// table, whose rollout no longer exists, and runs in [`RESUMED_CODEX_THREAD`]
+fn idle_compaction_compacts(imported: bool) {
     let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
     let dispatched = || {
         FakeResponse::WebSocket(vec![rpc_exit(
@@ -1920,12 +1965,19 @@ fn idle_compaction_compacts_a_waiting_codex_thread_before_its_cache_lapses() {
     };
     let server = FakeT3Server::start(Some(2), vec![ticket(), dispatched()]);
     let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
-    configure_t3_codex(
-        &mut route,
-        &server.origin,
-        i32::try_from(std::process::id()).unwrap(),
-    );
-    write_rollout(&route, 56, false);
+    let pid = i32::try_from(std::process::id()).unwrap();
+    let session = if imported {
+        let userdata = configure_t3(&mut route, &server.origin, pid);
+        V2State::create(&userdata.join("statev2.sqlite"))
+            .thread(T3_THREAD_ID, "Imported thread", false)
+            .legacy("codex", "threadId", &route.thread.to_string(), T3_THREAD_ID)
+            .native("codex", RESUMED_CODEX_THREAD, T3_THREAD_ID);
+        RESUMED_CODEX_THREAD.to_string()
+    } else {
+        configure_t3_codex(&mut route, &server.origin, pid);
+        route.thread.to_string()
+    };
+    write_rollout(&route, &session, 56, false);
     let mut store = Store::open(&home.db_path()).unwrap();
     store.insert_origin_route(&route).unwrap();
 
@@ -1944,7 +1996,7 @@ fn idle_compaction_compacts_a_waiting_codex_thread_before_its_cache_lapses() {
     let logged: serde_json::Value =
         serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
     assert_eq!(logged["provider"], "codex");
-    assert_eq!(logged["session"], route.thread.to_string());
+    assert_eq!(logged["session"], session);
     assert_eq!(logged["tokens"], 250_000);
     assert_eq!(logged["trigger"], "idle");
 }

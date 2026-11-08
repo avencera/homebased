@@ -69,9 +69,12 @@ pub(crate) fn scan(
 ) -> Attempts {
     attempts.retain(|thread, _| threads.iter().any(|(waiting, _)| waiting == thread));
     for (thread, context) in threads {
+        let env = T3Env::new(
+            PathBuf::from(&context.env.home),
+            context.env.path.clone().into(),
+        );
         // a waiting thread is only an id, so its provider is whichever record names it
-        let Some((provider_thread, usage)) = ContextUse::find(Path::new(&context.env.home), thread)
-        else {
+        let Some((provider_thread, usage)) = ContextUse::find_next(&env, thread) else {
             continue;
         };
         if !usage.idle_compaction_due(now) || attempts.get(&thread) == Some(&usage.last_active()) {
@@ -79,10 +82,6 @@ pub(crate) fn scan(
         }
 
         attempts.insert(thread, usage.last_active());
-        let env = T3Env::new(
-            PathBuf::from(&context.env.home),
-            context.env.path.clone().into(),
-        );
         let outcome = compact_thread(&env, provider_thread, &usage.compaction_key());
         compaction_log::record(log, Trigger::Idle, provider_thread, &usage, &outcome, now);
         match outcome {

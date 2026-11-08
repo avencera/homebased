@@ -305,6 +305,49 @@ pub(crate) fn wake_thread_checked(
     })
 }
 
+/// Where T3 runs the next turn of the T3 thread that owns a provider session
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NextSession {
+    /// No T3 thread owns the session, or T3's state cannot be read, so the
+    /// session's own record is all there is
+    Unowned,
+    /// T3 resumes this Claude session or Codex thread, which may be newer than
+    /// the one asked about, as for a thread imported from the previous
+    /// orchestrator
+    Resumes(ProviderThread),
+    /// T3 starts a session that has no context yet, switches provider at the
+    /// next turn, or runs a driver whose context homebased cannot read
+    Other,
+}
+
+/// Where T3 runs the next turn, `/compact` included, of the T3 thread that
+/// owns `thread`
+///
+/// That is the thread's active provider thread while it is of the instance
+/// the thread selects. After a provider switch T3 picks the thread only when
+/// the next message is dispatched, so a pending switch is [`NextSession::Other`]
+pub(crate) fn next_session(env: &T3Env, thread: ProviderThread) -> NextSession {
+    let userdata = env.userdata();
+    let next = || -> Result<NextSession, String> {
+        let Some(t3_thread) = find_thread(&userdata, thread)? else {
+            return Ok(NextSession::Unowned);
+        };
+        let Some((driver, native, selected)) =
+            v2::active_thread(&state_path(&userdata), &t3_thread)?
+        else {
+            return Ok(NextSession::Other);
+        };
+        let session = native
+            .filter(|_| selected)
+            .and_then(|native| ProviderThread::from_driver(&driver, native.parse().ok()?));
+        Ok(session.map_or(NextSession::Other, NextSession::Resumes))
+    };
+    next().unwrap_or_else(|detail| {
+        tracing::debug!(%detail, "next T3 session cannot be read");
+        NextSession::Unowned
+    })
+}
+
 /// Start a `/compact` turn in the T3 thread that owns a Claude session or
 /// Codex thread
 ///
@@ -1086,9 +1129,9 @@ mod tests {
         rpc_exit, ticket,
     };
     use super::{
-        ProbeStatus, ProviderThread, PullRequest, T3Cli, T3Env, ThreadDetails, TurnStart,
-        WakeOutcome, compact_thread, deterministic_id, load_runtime, open_threads, owner, probe,
-        wake_thread_checked,
+        NextSession, ProbeStatus, ProviderThread, PullRequest, T3Cli, T3Env, ThreadDetails,
+        TurnStart, WakeOutcome, compact_thread, deterministic_id, load_runtime, next_session,
+        open_threads, owner, probe, wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1372,6 +1415,35 @@ mod tests {
             .map(|thread| thread.session.id().to_string())
             .collect();
         assert_eq!(sessions, [SESSION_ID]);
+    }
+
+    #[test]
+    fn the_next_session_is_the_active_thread_of_the_selected_instance() {
+        let fixture = Fixture::empty(None, live_pid());
+        let first = "01a1b66a-67fb-7641-994a-c2b3d199eb4b";
+        let resumed = "01a1b8ed-bad7-79b0-a505-6a4fa4605789";
+        let codex = |id: &str| ProviderThread::Codex(id.parse().unwrap());
+        let next = |id: &str| next_session(&fixture.env, codex(id));
+        let state = fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Codex thread", false)
+            .native("codex", first, T3_THREAD_ID)
+            .native("codex", resumed, T3_THREAD_ID)
+            .thread("imported", "Imported thread", false)
+            .legacy("codex", "threadId", SESSION_ID, "imported");
+
+        // a session T3 left behind resolves to the one it runs now
+        assert_eq!(next(first), NextSession::Resumes(codex(resumed)));
+        assert_eq!(next(resumed), NextSession::Resumes(codex(resumed)));
+        // an imported thread before its first turn starts a new session
+        assert_eq!(next(SESSION_ID), NextSession::Other);
+        assert_eq!(next(T3_THREAD_ID), NextSession::Unowned);
+
+        // a switch picks its provider thread only at the next turn
+        let state = state.select("claudeAgent", T3_THREAD_ID);
+        assert_eq!(next(first), NextSession::Other);
+        state.native("opencode", "ses_opencode", T3_THREAD_ID);
+        assert_eq!(next(first), NextSession::Other);
     }
 
     #[test]

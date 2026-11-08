@@ -256,10 +256,10 @@ fn compact_session(
     session: ThreadId,
     log: &std::path::Path,
 ) -> (CompactOutcome, Option<String>) {
-    let Some((thread, usage)) = ContextUse::find(&env.home, session) else {
+    let Some((thread, usage)) = ContextUse::find_next(env, session) else {
         return (
             CompactOutcome::NotFound,
-            Some("no Claude transcript or Codex rollout for this session".into()),
+            Some("no Claude transcript or Codex rollout for the session T3 runs next".into()),
         );
     };
 

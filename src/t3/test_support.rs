@@ -276,6 +276,9 @@ impl V2State {
                 project_id TEXT NOT NULL DEFAULT 'project',
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT '2026-10-02T19:00:00Z',
+                default_provider TEXT NOT NULL DEFAULT 'codex',
+                active_provider_thread_id TEXT,
+                provider_instance_id TEXT,
                 archived_at TEXT,
                 deleted_at TEXT,
                 payload_json TEXT NOT NULL DEFAULT '{}'
@@ -293,7 +296,8 @@ impl V2State {
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                driver TEXT
+                driver TEXT,
+                provider_instance_id TEXT
              );
              CREATE TABLE orchestration_v2_projection_runs (
                 run_id TEXT PRIMARY KEY,
@@ -421,7 +425,9 @@ impl V2State {
         self.instance(driver, driver, native_id, thread_id)
     }
 
-    /// A provider thread of a configured provider `instance` of `driver`
+    /// A provider thread of a configured provider `instance` of `driver`,
+    /// which becomes the active one of its thread, of the instance the thread
+    /// selects, as T3 makes the thread a run starts in
     pub(crate) fn instance(
         self,
         instance: &str,
@@ -429,19 +435,37 @@ impl V2State {
         native_id: &str,
         thread_id: &str,
     ) -> Self {
+        let id = format!("provider-thread:{native_id}");
         let payload = json!({ "nativeThreadRef": { "driver": driver, "nativeId": native_id } });
         self.0
             .execute(
                 "INSERT INTO orchestration_v2_projection_provider_threads
-                 (provider_thread_id, thread_id, provider, driver, updated_at, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, '2026-10-02T20:00:00Z', ?5)",
-                rusqlite::params![
-                    format!("provider-thread:{native_id}"),
-                    thread_id,
-                    instance,
-                    driver,
-                    payload.to_string()
-                ],
+                 (provider_thread_id, thread_id, provider, driver, provider_instance_id,
+                  updated_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?3, '2026-10-02T20:00:00Z', ?5)",
+                rusqlite::params![id, thread_id, instance, driver, payload.to_string()],
+            )
+            .unwrap();
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_threads
+                 SET active_provider_thread_id = ?1, provider_instance_id = ?2
+                 WHERE thread_id = ?3",
+                rusqlite::params![id, instance, thread_id],
+            )
+            .unwrap();
+        self
+    }
+
+    /// Select provider `instance` for the next turn of thread `thread_id`,
+    /// which switches provider at that turn when its active provider thread
+    /// is of another instance
+    pub(crate) fn select(self, instance: &str, thread_id: &str) -> Self {
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_threads SET provider_instance_id = ?1
+                 WHERE thread_id = ?2",
+                rusqlite::params![instance, thread_id],
             )
             .unwrap();
         self
