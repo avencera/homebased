@@ -1179,7 +1179,12 @@ fn a_pending_event_never_reaches_a_caller_archived_after_its_watch_fired() {
         wait_until(Duration::from_secs(20), || settled(&h, &control).is_some()),
         "the control event never settled"
     );
-    assert_ne!(settled(&h, &control).as_deref(), Some("suppressed"));
+    assert_eq!(settled(&h, &control).as_deref(), Some("delivered"));
+    let reached = h
+        .queue_messages()
+        .iter()
+        .any(|message| event_json(message)["watch"] == control.as_str());
+    assert!(reached, "{:?}", h.queue_messages());
 
     // archived before its event goes out, the caller is never woken, and
     // the watch keeps the end it had. A watch from before `caller_t3` was

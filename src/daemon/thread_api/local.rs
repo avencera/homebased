@@ -463,7 +463,9 @@ mod tests {
                 "failed",
                 "2026-11-08T10:00:00Z",
             )
-            .run(WRAPPING, 1, "running", "go");
+            .run(WRAPPING, 1, "running", "go")
+            // a follow-up queued behind that run and cancelled hides nothing
+            .run(WRAPPING, 2, "cancelled", "more");
         rollout(home, SESSION_A, &[token_count(Utc::now(), 120_000, 0)]);
         transcript(home, SESSION_B, 1, 90_000);
         transcript(home, SESSION_C, 30, 10_000);
@@ -733,6 +735,23 @@ mod tests {
         let index = LocalIndex::load(sources(home.path()), Utc::now()).unwrap();
         let live: HashSet<String> = index.children(A, true).iter().map(key).collect();
         assert!(live.contains(DONE), "{live:?}");
+    }
+
+    #[test]
+    fn a_task_table_that_cannot_be_read_fails_the_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        drop(index(home.path()));
+        // the tables are there, so this is a failed read, not an older T3; a
+        // blob keeps its type in a text column, and reads as no thread id
+        rusqlite::Connection::open(state_path(home.path()))
+            .unwrap()
+            .execute(
+                "UPDATE orchestration_v2_projection_subagents SET child_thread_id = X'2a'
+                 WHERE child_thread_id = ?1",
+                [DONE],
+            )
+            .unwrap();
+        assert!(LocalIndex::load(sources(home.path()), Utc::now()).is_err());
     }
 
     #[test]

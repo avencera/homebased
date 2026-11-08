@@ -197,7 +197,9 @@ const THREAD_DETAILS_SELECT: &str = "
     WHERE t.deleted_at IS NULL AND json_valid(t.payload_json)";
 const OPEN_THREAD_DETAILS_FILTER: &str = " AND t.archived_at IS NULL";
 // statuses of a run that has not finished, as T3's own run recovery index
-// lists them; settled is the sidebar state T3 records with `settledAt`
+// lists them; any such run counts, so a newer follow-up that was cancelled
+// does not hide a turn still running. Settled is the sidebar state T3
+// records with `settledAt`
 const THREAD_ROWS_SQL: &str = "
     SELECT t.thread_id, t.title, t.archived_at IS NOT NULL,
            CASE WHEN json_valid(t.payload_json)
@@ -209,10 +211,9 @@ const THREAD_ROWS_SQL: &str = "
                THEN COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent')
                              = 'subagent', 0)
                ELSE 0 END,
-           COALESCE((SELECT r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
-                     FROM orchestration_v2_projection_runs r
-                     WHERE r.thread_id = t.thread_id
-                     ORDER BY r.ordinal DESC LIMIT 1), 0)
+           EXISTS (SELECT 1 FROM orchestration_v2_projection_runs r
+                   WHERE r.thread_id = t.thread_id
+                     AND r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting'))
     FROM orchestration_v2_projection_threads t
     WHERE t.deleted_at IS NULL
     ORDER BY t.created_at DESC";
@@ -266,27 +267,45 @@ pub(super) fn thread_rows(path: &Path) -> Result<Vec<ThreadRow>, String> {
 /// Child threads whose newest delegated task ended, as T3's subagent nodes
 /// record it
 ///
-/// Empty when the query fails, so a T3 without the node tables, or with
-/// changed ones, reads every child by its run and settled state alone
-pub(super) fn finished_tasks(path: &Path) -> HashSet<String> {
-    let read = || -> rusqlite::Result<HashSet<String>> {
-        let db = state_connection(path)?;
-        let mut statement = db.prepare(TASK_STATES_SQL)?;
-        let mut newest: HashMap<String, bool> = HashMap::new();
-        // oldest first, so each child keeps its newest node
-        for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
-            let (child, ended): (String, bool) = row?;
-            newest.insert(child, ended);
+/// Empty when the query does not fit the schema, so an older T3 without the
+/// node tables, or with changed ones, reads every child by its run and
+/// settled state alone, the way [`check_schema`] tells a schema apart
+///
+/// # Errors
+///
+/// Any other failed read, such as a locked state, so the index read fails as
+/// a failed thread query does
+pub(super) fn finished_tasks(path: &Path) -> Result<HashSet<String>, String> {
+    let failed = |error: rusqlite::Error| format!("T3 delegated task query failed: {error}");
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = match db.prepare(TASK_STATES_SQL) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            return Err("statev2.sqlite is locked".into());
         }
-        Ok(newest
-            .into_iter()
-            .filter_map(|(child, ended)| ended.then_some(child))
-            .collect())
+        Err(error) => {
+            debug!(%error, "T3 has no delegated task tables homebased reads");
+            return Ok(HashSet::new());
+        }
     };
-    read().unwrap_or_else(|error| {
-        debug!(%error, "T3 delegated task states cannot be read");
-        HashSet::new()
-    })
+    let mut newest: HashMap<String, bool> = HashMap::new();
+    // oldest first, so each child keeps its newest node
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(failed)?;
+    for row in rows {
+        let (child, ended): (String, bool) = row.map_err(failed)?;
+        newest.insert(child, ended);
+    }
+    Ok(newest
+        .into_iter()
+        .filter_map(|(child, ended)| ended.then_some(child))
+        .collect())
 }
 
 /// Claude sessions and Codex threads whose thread is neither archived nor

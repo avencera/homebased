@@ -603,7 +603,7 @@ pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
         .filter_map(|active| Some((active.thread.clone(), resumed(active)?)))
         .collect();
     let details = v2::all_thread_details(&state);
-    let finished = v2::finished_tasks(&state);
+    let finished = v2::finished_tasks(&state)?;
 
     Ok(rows
         .into_iter()

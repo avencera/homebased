@@ -66,6 +66,20 @@ impl WatchMemory {
         self.targets.retain(|id, _| live.contains(id));
         self.callers.retain(|id, _| live.contains(id));
     }
+
+    /// Note a scan that could not tell whether the watched thread of `id` is there
+    fn target_unanswered(&mut self, id: WatchId) {
+        if let Some(track) = self.targets.get_mut(&id) {
+            track.unanswered();
+        }
+    }
+
+    /// Note a scan that could not tell whether the caller of `id` is there
+    fn caller_unanswered(&mut self, id: WatchId) {
+        if let Some(track) = self.callers.get_mut(&id) {
+            track.unanswered();
+        }
+    }
 }
 
 /// What earlier scans saw of one thread
@@ -85,6 +99,12 @@ struct Quiet {
 }
 
 impl Track {
+    /// A scan that could not look breaks a run of scans that found the
+    /// thread gone, so the next one starts the count over
+    fn unanswered(&mut self) {
+        self.gone = 0;
+    }
+
     /// Count one scan that found the thread gone, and whether that makes enough
     fn gone(&mut self) -> bool {
         self.quiet = None;
@@ -353,7 +373,8 @@ fn decide<'a>(
 /// What this check changes about one watch, if anything
 ///
 /// `target` and `caller` are what the lookups found, `None` for a lookup
-/// that did not answer, which leaves that side as it was
+/// that did not answer. A target that did not answer leaves the watch as it
+/// was, and so does a caller, whose target is then not checked either
 async fn check(
     state: &AppState,
     memory: &mut WatchMemory,
@@ -364,23 +385,26 @@ async fn check(
 ) -> Option<WatchUpdate> {
     let local = state.machine.identity.machine;
     let id = record.watch.id;
-    let mut learned = None;
-    if let Some(matches) = caller {
-        let seen = caller_seen(&record.watch, matches);
-        if let CallerSeen::T3(thread) = seen
-            && record.watch.caller_t3.is_none()
-        {
-            learned.clone_from(&thread.t3_thread);
-        }
+    // a caller this machine cannot read may be archived already, and a remote
+    // target must not fire, compact, or end the watch before that is known
+    let Some(matches) = caller else {
+        memory.caller_unanswered(id);
+        memory.target_unanswered(id);
+        return None;
+    };
+    let seen = caller_seen(&record.watch, matches);
+    let learned = match seen {
+        CallerSeen::T3(thread) if record.watch.caller_t3.is_none() => thread.t3_thread.clone(),
+        _ => None,
+    };
 
-        let track = memory.callers.entry(id).or_default();
-        if caller_gone(seen, track, clock) {
-            let thread = match target {
-                Some([thread]) => Some(thread),
-                _ => None,
-            };
-            return Some(ended(local, record, WatchEndReason::CallerGone, thread));
-        }
+    let track = memory.callers.entry(id).or_default();
+    if caller_gone(seen, track, clock) {
+        let thread = match target {
+            Some([thread]) => Some(thread),
+            _ => None,
+        };
+        return Some(ended(local, record, WatchEndReason::CallerGone, thread));
     }
 
     let update = check_target(state, memory, record, target, clock).await;
@@ -411,7 +435,10 @@ async fn check_target(
 ) -> Option<WatchUpdate> {
     let local = state.machine.identity.machine;
     let id = record.watch.id;
-    let matches = target?;
+    let Some(matches) = target else {
+        memory.target_unanswered(id);
+        return None;
+    };
     let track = memory.targets.entry(id).or_default();
     match decide(record, matches, track, clock) {
         Decision::Unchanged => None,
@@ -656,8 +683,8 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
 
     use super::{
-        CallerSeen, Clock, Decision, QUIET_FINISHED, Track, caller_gone, caller_seen, decide,
-        ended, fired,
+        CallerSeen, Clock, Decision, QUIET_FINISHED, Track, WatchMemory, caller_gone, caller_seen,
+        decide, ended, fired,
     };
     use crate::domain::{TaskEnv, ThreadId};
     use crate::machine::MachineId;
@@ -918,6 +945,45 @@ mod tests {
                 .iter()
                 .all(|(watch, _)| watch.id != fresh.watch.id)
         );
+    }
+
+    #[test]
+    fn a_scan_that_cannot_look_breaks_a_run_of_missing_reads() {
+        let local = MachineId::new();
+        let caller = ThreadId(uuid::Uuid::now_v7());
+        let watched = record(watch(caller, t3_target(local), false), true);
+        let id = watched.watch.id;
+        let mut memory = WatchMemory::new(QUIET_FINISHED);
+        let target = |memory: &mut WatchMemory, minute| {
+            decide(
+                &watched,
+                &[],
+                memory.targets.entry(id).or_default(),
+                at(minute),
+            )
+        };
+
+        // gone, then a lookup that failed, then gone again is not two in a row
+        assert_eq!(target(&mut memory, 0), Decision::Unchanged);
+        memory.target_unanswered(id);
+        assert_eq!(target(&mut memory, 2), Decision::Unchanged);
+        assert_eq!(
+            target(&mut memory, 3),
+            Decision::End(WatchEndReason::Deleted, None)
+        );
+
+        // the same holds for a caller found gone around a failed lookup
+        let caller_scan = |memory: &mut WatchMemory, minute| {
+            caller_gone(
+                CallerSeen::Gone,
+                memory.callers.entry(id).or_default(),
+                at(minute),
+            )
+        };
+        assert!(!caller_scan(&mut memory, 0));
+        memory.caller_unanswered(id);
+        assert!(!caller_scan(&mut memory, 2));
+        assert!(caller_scan(&mut memory, 3));
     }
 
     #[test]
