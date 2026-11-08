@@ -29,7 +29,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 
 ## Job events
 
-For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, and `JOB_CHECK_DUE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
+For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, and `JOB_CHECK_DUE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
 
 ## Thread watch events
 
@@ -51,7 +51,7 @@ For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENT
 
 | `event` | What happened | Do this |
 | --- | --- | --- |
-| `THREAD_CONTEXT_OVER` | The context climbed over the limit while the thread was not running a turn. It fires again only after the context drops below the limit and climbs back. | With `compaction.outcome: "started"`, nothing. Otherwise compact a T3 thread with `homebased thread compact <target.exact_reference>`, or hand its work to a fresh thread. Ask a session outside T3 to run `/compact`. |
+| `THREAD_CONTEXT_OVER` | The context climbed over the limit while the thread was not running a turn. It fires again only after a reading shows the context below the limit and it climbs back. | With `compaction.outcome: "started"`, nothing. Otherwise compact a T3 thread with `homebased thread compact <target.exact_reference>`, or hand its work to a fresh thread. Ask a session outside T3 to run `/compact`. |
 | `THREAD_WATCH_ENDED` | The watch's last event. | Nothing, unless `reason` is `archived`, `deleted`, or `session_gone` and the thread still matters; then watch its replacement. |
 
 ## Event table

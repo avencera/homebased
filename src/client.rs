@@ -322,6 +322,10 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
+        "thread_lookup_incomplete" => decode_field(input, "unanswered")
+            .map_or(AppError::Internal { message }, |unanswered| {
+                AppError::ThreadLookupIncomplete { unanswered }
+            }),
         "watch_not_found" => decode_field(input, "watch")
             .map_or(AppError::Internal { message }, |watch| {
                 AppError::WatchNotFound { watch }
@@ -692,6 +696,9 @@ mod tests {
             AppError::ThreadNotFound {
                 reference: "thread_gone".into(),
                 detail: "; looked on code".into(),
+            },
+            AppError::ThreadLookupIncomplete {
+                unanswered: vec!["mini (connection refused)".into()],
             },
             AppError::CompactUnsupportedHost {
                 reference: "thread_x".into(),

@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::container::ContainerWorkload;
 use crate::domain::{TaskId, TaskWorkload, Workload};
 
+pub mod build_hint;
 pub mod checkpoint;
 pub mod classify;
 pub mod delivery;
@@ -1104,6 +1105,10 @@ pub struct JobEvent {
     /// Present only on a blocked notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedNotice>,
+    /// Why a job held for its `after` tasks ended before it joined the queue;
+    /// only the origin records such an event
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_ending: Option<delivery::HeldJobEnding>,
 }
 
 #[cfg(test)]

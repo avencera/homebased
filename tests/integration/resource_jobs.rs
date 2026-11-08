@@ -29,6 +29,18 @@ impl<'a> Jobs<'a> {
 
     /// Submit with a chosen job id
     pub(super) fn submit_as(&mut self, job: JobId, spec: &Value) -> JobId {
+        self.submit_with(job, spec, &[]);
+        job
+    }
+
+    /// Submit with extra `resource job submit` arguments, returning the
+    /// result and what the command printed to stderr
+    pub(super) fn submit_with(
+        &mut self,
+        job: JobId,
+        spec: &Value,
+        args: &[&str],
+    ) -> (Value, String) {
         self.ids.push(job);
         let path = self.harness.home.join(format!("job-{job}.json"));
         fs::write(&path, serde_json::to_vec(spec).unwrap()).unwrap();
@@ -45,17 +57,15 @@ impl<'a> Jobs<'a> {
                 "--spec",
             ])
             .arg(path)
+            .args(args)
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["job_id"], job.to_string());
         assert_eq!(value["api_version"], 1);
-        job
+        (value, stderr)
     }
 }
 
@@ -431,6 +441,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
         },
         target: None,
         submission: homebased::queue::delivery::JobSubmission::Unknown,
+        after: None,
     };
     store.insert_job_route(&route).unwrap();
     store
@@ -853,4 +864,143 @@ fn task_cancel_during_yield_commits_user_cancel_before_signalling() {
     drop(worker);
     wait_state(&h, job, "cancelled");
     assert_eq!(wait_callbacks(&h, job, 1)[0]["event"], "JOB_CANCELLED");
+}
+
+/// A `homebased wait --next` on `ids`, connected before it returns
+fn spawn_next_wait(h: &Harness, ids: &[&str]) -> std::process::Child {
+    let child = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["wait", "--next"])
+        .args(ids)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the daemon registers a waiter only while the client is connected
+    std::thread::sleep(Duration::from_millis(800));
+    child
+}
+
+/// The events a finished waiter printed
+fn waited_events(child: std::process::Child) -> Vec<Value> {
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(event_json)
+        .collect()
+}
+
+fn queued_on_authority(h: &Harness, job: JobId) -> bool {
+    Store::open(&h.home.join(homebased::home::DB_NAME))
+        .unwrap()
+        .job(job)
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn a_job_held_for_its_build_task_joins_the_queue_once_the_build_succeeds() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let build = h.submit(&h.gated_target("build-ok", 0));
+    let job = JobId::new();
+    let (held, _) = jobs.submit_with(
+        job,
+        &spec(&h, "medium", "wait", "exit 0"),
+        &["--after", &build],
+    );
+    assert_eq!(held["held"]["state"], "held", "{held}");
+
+    // the id is the job's from the start: show and wait both take it while it is held
+    let detail = show(&h, job);
+    assert_eq!(detail["held"]["after"][0]["task"], build, "{detail}");
+    assert_eq!(detail["held"]["after"][0]["state"], "pending");
+    let waiter = spawn_next_wait(&h, &[&job.to_string()]);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !queued_on_authority(&h, job),
+        "the job queued before its build ended"
+    );
+
+    h.release_gate("build-ok");
+    let events = waited_events(waiter);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "JOB_SUCCEEDED");
+    assert_eq!(events[0]["job"], job.to_string());
+    assert_eq!(
+        wait_state(&h, job, "succeeded")["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_job_held_for_a_build_that_fails_is_cancelled_before_it_queues() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let build = h.submit(&h.gated_target("build-fails", 1));
+    // `after` in the spec file holds the job the same way as the flag
+    let mut held_spec = spec(&h, "medium", "wait", "exit 0");
+    held_spec["after"] = json!([build]);
+    let job = JobId::new();
+    let (held, _) = jobs.submit_with(job, &held_spec, &[]);
+    assert_eq!(held["held"]["state"], "held", "{held}");
+    let waiter = spawn_next_wait(&h, &[&job.to_string()]);
+    // a held job is cancelled on its origin, and the build ending later leaves it so
+    let cancelled = JobId::new();
+    jobs.submit_with(
+        cancelled,
+        &spec(&h, "medium", "wait", "exit 0"),
+        &["--after", &build],
+    );
+    cli(&h, &["resource", "job", "cancel", &cancelled.to_string()]);
+    assert_eq!(show(&h, cancelled)["held"]["ending"]["reason"], "requested");
+
+    h.release_gate("build-fails");
+    let events = waited_events(waiter);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "JOB_CANCELLED");
+    assert_eq!(events[0]["held_ending"]["reason"], "dependency");
+    assert_eq!(events[0]["held_ending"]["task"], build);
+    assert_eq!(events[0]["held_ending"]["outcome"], "failed");
+
+    let detail = show(&h, job);
+    assert_eq!(detail["held"]["state"], "cancelled", "{detail}");
+    assert!(
+        detail["held"]["reason"].as_str().unwrap().contains(&build),
+        "{detail}"
+    );
+    // it never reached the queue, so no GPU time went to it
+    assert!(!queued_on_authority(&h, job));
+    assert_eq!(show(&h, cancelled)["held"]["ending"]["reason"], "requested");
+    assert!(!queued_on_authority(&h, cancelled));
+}
+
+#[test]
+fn a_build_step_warns_at_submit_and_is_still_submitted() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let job = JobId::new();
+    // the shell never reaches the build, so the run itself succeeds
+    let build_step = spec(&h, "medium", "wait", "true || cargo build --release");
+    let (submitted, stderr) = jobs.submit_with(job, &build_step, &[]);
+    assert!(
+        stderr.contains("warning: step 0 runs `cargo build`") && stderr.contains("--after"),
+        "{stderr}"
+    );
+    assert_eq!(
+        submitted["warnings"].as_array().unwrap().len(),
+        1,
+        "{submitted}"
+    );
+    wait_state(&h, job, "succeeded");
 }

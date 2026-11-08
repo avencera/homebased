@@ -131,6 +131,12 @@ pub enum AppError {
         /// Where the lookup looked, or why it could not, starting with `; `
         detail: String,
     },
+    /// Fleet machines that may run some of the threads asked for did not answer
+    #[error("thread lookup incomplete: no answer from {}", unanswered.join(", "))]
+    ThreadLookupIncomplete {
+        /// Each machine that did not answer, with why
+        unanswered: Vec<String>,
+    },
     /// The thread runs outside T3, which is the only host homebased can compact
     #[error("{reference} runs as a {} session, and only T3 Code threads can be compacted by homebased", host.as_str())]
     CompactUnsupportedHost {
@@ -739,6 +745,7 @@ impl AppError {
             Self::ThreadNotFound { .. } => "thread_not_found",
             Self::CompactUnsupportedHost { .. } => "compact_unsupported_host",
             Self::WatchNotFound { .. } => "watch_not_found",
+            Self::ThreadLookupIncomplete { .. } => "thread_lookup_incomplete",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
@@ -813,6 +820,7 @@ impl AppError {
             | Self::RemoteSubmissionUnavailable { .. }
             | Self::SubmissionOutcomeUnknown { .. }
             | Self::ClusterLookupIncomplete { .. }
+            | Self::ThreadLookupIncomplete { .. }
             | Self::TaskUnavailable { .. }
             | Self::NotifyFailed { .. }
             | Self::DaemonBusy
@@ -949,6 +957,7 @@ impl AppError {
             Self::MachineUnavailable { .. }
             | Self::RemoteSubmissionUnavailable { .. }
             | Self::ClusterLookupIncomplete { .. }
+            | Self::ThreadLookupIncomplete { .. }
             | Self::TaskUnavailable { .. }
             | Self::MessageDeliveryFailed { .. }
             | Self::MessageOutcomeUnknown { .. }
@@ -978,6 +987,7 @@ impl AppError {
                 | Self::RemoteSubmissionUnavailable { .. }
                 | Self::SubmissionOutcomeUnknown { .. }
                 | Self::ClusterLookupIncomplete { .. }
+                | Self::ThreadLookupIncomplete { .. }
                 | Self::TaskUnavailable { .. }
                 | Self::MessageDeliveryFailed { .. }
                 | Self::MessageOutcomeUnknown { .. }
@@ -1015,6 +1025,7 @@ impl AppError {
                 json!({ "reference": reference, "host": host })
             }
             Self::WatchNotFound { watch } => json!({ "watch": watch }),
+            Self::ThreadLookupIncomplete { unanswered } => json!({ "unanswered": unanswered }),
             Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }

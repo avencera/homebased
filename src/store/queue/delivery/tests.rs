@@ -38,6 +38,7 @@ fn route_for(thread: &str) -> JobRoute {
         },
         target: None,
         submission: JobSubmission::Unknown,
+        after: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             attention: None,
             at: Utc::now(),
             blocked: None,
+            held_ending: None,
         },
     }
 }

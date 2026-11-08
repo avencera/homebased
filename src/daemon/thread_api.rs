@@ -154,7 +154,10 @@ async fn find_here(
 ) -> Result<(Vec<Vec<ThreadContext>>, Vec<ThreadContext>, Option<String>), AppError> {
     let sources = local_sources(state).await?;
     run_blocking(move || {
-        let index = LocalIndex::load(sources, Utc::now());
+        let index =
+            LocalIndex::load(sources, Utc::now()).map_err(|message| AppError::T3Unavailable {
+                message: format!("T3's thread state cannot be read: {message}"),
+            })?;
         let results = references
             .iter()
             .map(|reference| index.find(reference, prefixes))
@@ -168,9 +171,9 @@ async fn find_here(
             .as_deref()
             .map(|parent| index.children(parent, live))
             .unwrap_or_default();
-        (results, children, parent)
+        Ok((results, children, parent))
     })
-    .await
+    .await?
 }
 
 /// Whose T3 children a lookup lists
@@ -200,16 +203,28 @@ struct Wanted {
     prefixes: bool,
 }
 
+/// What [`resolve`] found
+pub(crate) struct Resolved {
+    /// One thread per selector, in order
+    pub(crate) threads: Vec<ThreadContext>,
+    /// The T3 children asked for
+    pub(crate) children: Vec<ThreadContext>,
+    /// Fleet machines that were asked and did not answer, each with why, so
+    /// `children` can be missing some
+    pub(crate) unanswered: Vec<String>,
+}
+
 /// Threads `selectors` name, in order, and the T3 children `children_of` asks for
 ///
-/// Each selector must name exactly one thread
+/// Each selector must name exactly one thread. Machines the Fleet directory
+/// marks offline are not asked
 pub(crate) async fn resolve(
     state: &AppState,
     selectors: Vec<ThreadSelector>,
     machine: Option<&str>,
     prefixes: bool,
     children_of: Option<(Caller, bool)>,
-) -> Result<(Vec<ThreadContext>, Vec<ThreadContext>), AppError> {
+) -> Result<Resolved, AppError> {
     if selectors.len() > MAX_REFERENCES {
         return Err(AppError::Usage {
             message: format!("at most {MAX_REFERENCES} threads per lookup"),
@@ -231,7 +246,7 @@ pub(crate) async fn resolve(
         let text = selector.to_string();
         let (reference, machine, prefixes) = match selector {
             ThreadSelector::Reference { text } => {
-                let reference = ThreadRef::parse(&text)?;
+                let reference = chip_thread(ThreadRef::parse(&text)?, &text).await?;
                 let mut machine = only;
                 if machine.is_none()
                     && let ThreadRef::T3 {
@@ -408,7 +423,41 @@ pub(crate) async fn resolve(
     for (item, found) in wanted.into_iter().zip(matches) {
         threads.push(one_match(item, found, &searched, &missed)?);
     }
-    Ok((threads, children))
+    Ok(Resolved {
+        threads,
+        children,
+        unanswered: missed,
+    })
+}
+
+/// The thread a T3 chip names, from the context record T3 keeps for it in
+/// this machine's T3, or `reference` unchanged when it is no chip
+///
+/// A chip copied out of another machine's T3 has its record there, so only a
+/// `thread_<id>` ref, which holds the id itself, still reads back
+async fn chip_thread(reference: ThreadRef, text: &str) -> Result<ThreadRef, AppError> {
+    let ThreadRef::Chip { context } = &reference else {
+        return Ok(reference);
+    };
+    let context = context.clone();
+    let recorded = run_blocking(move || crate::t3::chip_thread(&T3Env::from_env(), &context))
+        .await?
+        .map_err(|message| AppError::T3Unavailable {
+            message: format!("T3's thread state cannot be read: {message}"),
+        })?;
+    if let Some((thread, environment)) = recorded {
+        return Ok(ThreadRef::T3 {
+            environment,
+            thread,
+        });
+    }
+    reference
+        .chip_fallback()
+        .ok_or_else(|| AppError::ThreadNotFound {
+            reference: text.to_owned(),
+            detail: "; chip ref is not a thread id; pass the threadId from the t3_context block"
+                .to_owned(),
+        })
 }
 
 fn peer_name(peers: &[crate::fleet::directory::PeerView], machine: MachineId) -> String {
@@ -456,6 +505,44 @@ fn one_match(
     }
 }
 
+/// The Claude Code session or Codex thread that `reference` names on `machine`,
+/// for a direct message
+///
+/// A UUID that no lookup finds, such as on a peer that predates thread
+/// lookups, goes as given and the receiver checks it, as before references
+pub(crate) async fn message_thread(
+    state: &AppState,
+    machine: MachineId,
+    reference: &str,
+) -> Result<ThreadId, AppError> {
+    let exact = ThreadRef::parse(reference)?.uuid().map(ThreadId);
+    let lookup = resolve(
+        state,
+        vec![ThreadSelector::Reference {
+            text: reference.to_owned(),
+        }],
+        Some(&machine.to_string()),
+        false,
+        None,
+    )
+    .await;
+    match (lookup, exact) {
+        (Ok(Resolved { mut threads, .. }), _) => {
+            let thread = threads.pop().ok_or_else(|| AppError::Internal {
+                message: "thread lookup returned no thread".into(),
+            })?;
+            thread.session.ok_or_else(|| AppError::Usage {
+                message: format!(
+                    "{reference} has not started a Claude Code session or Codex thread yet"
+                ),
+            })
+        }
+        (Err(error @ AppError::ThreadRefAmbiguous { .. }), _) => Err(error),
+        (Err(_), Some(exact)) => Ok(exact),
+        (Err(error), None) => Err(error),
+    }
+}
+
 /// Exact matches of `references` on `machine`, for the watch scan
 ///
 /// The error says why a peer did not answer
@@ -479,20 +566,25 @@ pub(crate) async fn find_on(
         .fleet
         .handle()
         .ok_or_else(|| "Fleet is off on this machine".to_owned())?;
-    let count = references.len();
-    let body = ClusterContext {
-        api_version: API_VERSION,
-        destination_machine: machine,
-        references,
-        prefixes: false,
-        children_of: None,
-        live: false,
-    };
-    let answer: ClusterContextBody = post_peer(fleet, machine, CLUSTER_CONTEXT_PATH, &body).await?;
-    if answer.machine != machine || answer.results.len() != count {
-        return Err("peer answered for another lookup".into());
+    // a peer takes at most `MAX_REFERENCES` per lookup
+    let mut results = Vec::with_capacity(references.len());
+    for batch in references.chunks(MAX_REFERENCES) {
+        let body = ClusterContext {
+            api_version: API_VERSION,
+            destination_machine: machine,
+            references: batch.to_vec(),
+            prefixes: false,
+            children_of: None,
+            live: false,
+        };
+        let answer: ClusterContextBody =
+            post_peer(fleet, machine, CLUSTER_CONTEXT_PATH, &body).await?;
+        if answer.machine != machine || answer.results.len() != batch.len() {
+            return Err("peer answered for another lookup".into());
+        }
+        results.extend(answer.results);
     }
-    Ok(answer.results)
+    Ok(results)
 }
 
 async fn context(
@@ -505,8 +597,9 @@ async fn context(
             message: "name a thread, or ask for the caller's children".into(),
         });
     }
+    let asks_children = body.children_of.is_some();
     let children_of = body.children_of.map(|caller| (caller, body.live));
-    let (threads, children) = resolve(
+    let resolved = resolve(
         &state,
         body.threads,
         body.machine.as_deref(),
@@ -516,8 +609,15 @@ async fn context(
     .await?;
     Ok(Json(ThreadContextResponse {
         api_version: API_VERSION,
-        threads,
-        children,
+        threads: resolved.threads,
+        children: resolved.children,
+        // a machine that did not answer may run children, so the list cannot be trusted whole
+        children_complete: asks_children.then_some(resolved.unanswered.is_empty()),
+        unanswered: if asks_children {
+            resolved.unanswered
+        } else {
+            Vec::new()
+        },
     }))
 }
 
@@ -557,7 +657,7 @@ async fn compact(
     Json(body): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
     check_api_version(body.api_version)?;
-    let (mut threads, _) = resolve(
+    let Resolved { mut threads, .. } = resolve(
         &state,
         vec![body.thread],
         body.machine.as_deref(),
@@ -569,6 +669,22 @@ async fn compact(
         message: "thread lookup returned no thread".into(),
     })?;
     let (outcome, detail) = compact_resolved(&state, &thread, Trigger::Manual).await?;
+    // an agent reads the exit code: no session to compact is a missing thread,
+    // while a refusal or an unreachable T3 is an answer about one that exists
+    if outcome == CompactOutcome::NotFound {
+        return Err(AppError::ThreadNotFound {
+            reference: thread
+                .reference
+                .clone()
+                .unwrap_or_else(|| thread.exact_reference()),
+            detail: format!(
+                "; {}",
+                detail
+                    .as_deref()
+                    .unwrap_or("no open T3 thread owns its session")
+            ),
+        });
+    }
     Ok(Json(CompactResponse {
         api_version: API_VERSION,
         outcome,
@@ -739,7 +855,11 @@ async fn watch(
     }
     crate::spec::check_cwd(&body.callback_cwd)?;
     let children_of = body.children.then(|| (body.caller_ids.clone(), true));
-    let (threads, children) = resolve(
+    let Resolved {
+        threads,
+        children,
+        unanswered,
+    } = resolve(
         &state,
         body.threads,
         body.machine.as_deref(),
@@ -747,6 +867,10 @@ async fn watch(
         children_of,
     )
     .await?;
+    // saving only the children that answered would leave the rest unwatched without a word
+    if body.children && !unanswered.is_empty() {
+        return Err(AppError::ThreadLookupIncomplete { unanswered });
+    }
 
     // every target is checked before any watch is saved, so a refusal saves none
     let mut targets = Vec::new();

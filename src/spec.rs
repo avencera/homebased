@@ -53,7 +53,7 @@ fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
-fn after_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+pub(crate) fn after_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "array",
         "items": { "type": "string", "format": "uuid" },

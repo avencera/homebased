@@ -388,7 +388,7 @@ impl Store {
         if self.job_run_link(task)?.is_some() {
             return Err(AppError::Usage {
                 message: format!(
-                    "run task {task} cannot be used in after; job dependencies are not supported"
+                    "run task {task} cannot be used in after; a run belongs to its job, so wait on the job instead"
                 ),
             });
         }

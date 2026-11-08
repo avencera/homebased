@@ -116,6 +116,11 @@ async fn resolve_target(
             let destination = resolve_machine(state, machine).await?;
             Ok((destination, recipient.clone()))
         }
+        MessageTarget::Reference { machine, reference } => {
+            let destination = resolve_machine(state, machine).await?;
+            let thread = super::thread_api::message_thread(state, destination, reference).await?;
+            Ok((destination, Recipient::Thread { thread }))
+        }
         MessageTarget::Task { task } => {
             let (machine, thread) = super::inspection::message_origin_route(state, *task).await?;
             Ok((machine, Recipient::Thread { thread }))

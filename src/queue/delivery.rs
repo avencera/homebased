@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::ThreadId;
+use crate::dependency::{DependencyOutcome, TaskDependencies};
+use crate::domain::{TaskId, ThreadId};
 use crate::machine::MachineId;
 use crate::submission::CallbackContext;
 
@@ -24,6 +25,55 @@ pub enum JobSubmission {
         /// HTTP status of the refusal
         status: u16,
     },
+    /// Saved on the origin until every task in the route's `after` succeeds;
+    /// the authority has not seen it
+    Held,
+    /// Ended on the origin before it joined the queue, with its terminal
+    /// event in the origin inbox
+    Ended {
+        /// Why it never ran
+        ending: HeldJobEnding,
+    },
+}
+
+/// Why a job held for its `after` tasks ended before it joined the queue
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeldJobEnding {
+    /// A task in `after` ended without succeeding, so the job was cancelled
+    Dependency {
+        /// The task that ended
+        task: TaskId,
+        /// How it ended
+        outcome: DependencyOutcome,
+    },
+    /// Someone cancelled the job while it was held
+    Requested,
+    /// The queue's machine refused the job once its tasks succeeded
+    Refused {
+        /// Error code of the refusal
+        code: String,
+        /// Error message of the refusal
+        message: String,
+    },
+}
+
+impl HeldJobEnding {
+    /// One line for people, such as `task 0199… ended failed`
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Dependency { task, outcome } => {
+                format!("after task {task} ended {outcome}, so the job never queued")
+            }
+            Self::Requested => "cancelled while it waited for its after tasks".to_owned(),
+            Self::Refused { code, message } => {
+                format!(
+                    "the queue refused the job once its after tasks succeeded: {code}: {message}"
+                )
+            }
+        }
+    }
 }
 
 /// One job's callback owner, saved before submitting locally or over Fleet
@@ -47,6 +97,9 @@ pub struct JobRoute {
     pub target: Option<Target>,
     /// Submission result separate from job state
     pub submission: JobSubmission,
+    /// Tasks on this origin that must each succeed before the job is sent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<TaskDependencies>,
 }
 
 /// Identity-bound event sent by the authority, with origin-side deduplication

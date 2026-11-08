@@ -528,5 +528,7 @@ mod resource_jobs;
 mod submission;
 #[path = "fleet/t3_launch.rs"]
 mod t3_launch;
+#[path = "fleet/threads.rs"]
+mod threads;
 #[path = "support/worker_cleanup.rs"]
 mod worker_cleanup;

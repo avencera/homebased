@@ -67,19 +67,19 @@ pub struct WatchUpdate {
 const WATCH_COLUMNS: &str = "watch_json, armed, event_seq, ended_at, end_reason";
 
 impl Store {
-    /// Save a watch, or update the live watch the same caller has on the same
-    /// target, and return it with whether it is new
+    /// Save a watch, or find the live watch the same caller has with the same
+    /// target, limit, and action, and return it with whether it is new
     ///
     /// An existing watch keeps its id, sequence, and armed state, and takes the
-    /// new limit, action, and `once`
+    /// new `once` and callback environment
     pub fn upsert_watch(&self, watch: &ThreadWatch) -> Result<(WatchRecord, bool), AppError> {
         self.immediate(|| {
-            let key = watch.target.key();
+            let key = watch.key();
             let existing: Option<String> = self
                 .conn
                 .query_row(
                     "SELECT id FROM thread_watches
-                     WHERE caller_thread = ?1 AND target_key = ?2 AND ended_at IS NULL",
+                     WHERE caller_thread = ?1 AND watch_key = ?2 AND ended_at IS NULL",
                     params![watch.caller.to_string(), key],
                     |row| row.get(0),
                 )
@@ -89,8 +89,6 @@ impl Store {
                 let mut record = self
                     .watch_record(id)?
                     .ok_or(AppError::WatchNotFound { watch: id })?;
-                record.watch.threshold = watch.threshold;
-                record.watch.action = watch.action;
                 record.watch.once = watch.once;
                 record.watch.callback = watch.callback.clone();
                 self.conn.execute(
@@ -101,7 +99,7 @@ impl Store {
             }
             self.conn.execute(
                 "INSERT INTO thread_watches
-                 (id, caller_thread, target_key, watch_json, armed, event_seq, created_at)
+                 (id, caller_thread, watch_key, watch_json, armed, event_seq, created_at)
                  VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)",
                 params![
                     watch.id.to_string(),

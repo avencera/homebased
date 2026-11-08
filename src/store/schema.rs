@@ -86,12 +86,13 @@ fn add_thread_watches(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// Thread watches of `homebased thread watch` and the events each one owes its
 /// caller, delivered like a job's
 ///
-/// One live watch per caller and target: the same request again is the same watch
+/// One live watch per caller, target, limit, and action: the same request again
+/// is the same watch, and another limit or action on that thread is another one
 const THREAD_WATCH_TABLES: &str = "
 CREATE TABLE thread_watches (
     id TEXT PRIMARY KEY,
     caller_thread TEXT NOT NULL,
-    target_key TEXT NOT NULL,
+    watch_key TEXT NOT NULL,
     watch_json TEXT NOT NULL,
     armed INTEGER NOT NULL CHECK (armed IN (0, 1)),
     event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
@@ -99,7 +100,7 @@ CREATE TABLE thread_watches (
     ended_at TEXT,
     end_reason TEXT CHECK ((ended_at IS NULL) = (end_reason IS NULL))
 );
-CREATE UNIQUE INDEX thread_watches_live ON thread_watches (caller_thread, target_key)
+CREATE UNIQUE INDEX thread_watches_live ON thread_watches (caller_thread, watch_key)
     WHERE ended_at IS NULL;
 
 CREATE TABLE thread_watch_events (

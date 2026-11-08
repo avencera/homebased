@@ -41,6 +41,16 @@ pub enum ThreadRef {
     },
     /// A bare id: a T3 thread id, or a Claude session or Codex thread UUID
     Id(String),
+    /// The `ref` of T3 chip text, which is the id of a context record in the
+    /// message that carried the chip, not a thread id
+    ///
+    /// T3 makes it `thread_<id>` for a thread id of plain characters, and
+    /// otherwise a slug and hash of the id, or a fresh UUID for a chip pasted
+    /// on mobile. Only the record maps it back to its thread
+    Chip {
+        /// The context record id after `ref=`
+        context: String,
+    },
 }
 
 impl ThreadRef {
@@ -56,19 +66,24 @@ impl ThreadRef {
             return Err(usage("a thread reference cannot be empty".into()));
         }
         // a title can hold anything, so the id is after the last marker
-        if let Some(start) = text.rfind("ref=thread_") {
-            let rest = &text[start + "ref=thread_".len()..];
+        if text.starts_with('[')
+            && let Some(start) = text.rfind("ref=")
+        {
+            let rest = &text[start + "ref=".len()..];
             let end = rest
                 .find(|c: char| c == ']' || c == ';' || c.is_whitespace())
                 .unwrap_or(rest.len());
-            let thread = &rest[..end];
-            if thread.is_empty() {
+            let context = &rest[..end];
+            if context.is_empty() {
                 return Err(usage(format!("thread chip {text:?} has no id after ref=")));
             }
-            return Ok(Self::T3 {
-                environment: None,
-                thread: thread.to_owned(),
+            return Ok(Self::Chip {
+                context: context.to_owned(),
             });
+        }
+        // the `threadId:` line of a `<t3_context>` block, copied with its label
+        if let Some(thread) = text.strip_prefix("threadId:").map(str::trim) {
+            return Self::parse(thread);
         }
         for prefix in [T3_LINK_PREFIX, T3_LAUNCH_LINK_PREFIX] {
             if let Some(rest) = text.strip_prefix(prefix) {
@@ -95,12 +110,29 @@ impl ThreadRef {
         Ok(Self::Id(text.to_owned()))
     }
 
+    /// The thread a chip names when T3 has no record of it: `thread_<id>` is
+    /// the thread id itself for ids of plain characters, while any other
+    /// `ref` cannot be read back
+    #[must_use]
+    pub fn chip_fallback(&self) -> Option<Self> {
+        let Self::Chip { context } = self else {
+            return None;
+        };
+        let thread = context
+            .strip_prefix("thread_")
+            .filter(|id| !id.is_empty())?;
+        Some(Self::T3 {
+            environment: None,
+            thread: thread.to_owned(),
+        })
+    }
+
     /// The full UUID a bare id is, if it is one
     #[must_use]
     pub fn uuid(&self) -> Option<Uuid> {
         match self {
             Self::Id(id) => Uuid::parse_str(id).ok(),
-            Self::T3 { .. } => None,
+            Self::T3 { .. } | Self::Chip { .. } => None,
         }
     }
 
@@ -128,6 +160,7 @@ impl fmt::Display for ThreadRef {
             } => write!(f, "{T3_LINK_PREFIX}{environment}/{thread}"),
             Self::T3 { thread, .. } => write!(f, "thread_{thread}"),
             Self::Id(id) => f.write_str(id),
+            Self::Chip { context } => write!(f, "[Thread: ; ref={context}]"),
         }
     }
 }
@@ -245,6 +278,13 @@ pub struct ThreadContextResponse {
     /// The caller's T3 children, newest first, when asked for
     #[serde(default)]
     pub children: Vec<ThreadContext>,
+    /// With children asked for: whether every Fleet machine asked answered,
+    /// so `children` is the whole list
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_complete: Option<bool>,
+    /// With children asked for: each machine that did not answer, with why
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<String>,
 }
 
 /// What hosts a thread, which decides what can be done to it
@@ -358,6 +398,10 @@ pub struct ThreadContext {
     pub provider: Option<Provider>,
     /// Claude Code session or Codex thread, once T3 started one
     pub session: Option<ThreadId>,
+    /// Whether `session` still has its transcript or rollout on disk; `None`
+    /// when there is no session, or from a peer that predates the field
+    #[serde(default)]
+    pub session_exists: Option<bool>,
     /// T3 thread id
     pub t3_thread: Option<String>,
     /// `t3-thread://v2/<environment>/<thread>`, when the machine's T3 names its environment
@@ -497,9 +541,23 @@ mod tests {
     #[test]
     fn reads_every_reference_form_as_given() {
         let delegated = "thread:delegated-task:command%3Amcp%3A08207a13%3Adelegate-task%3Ax";
+        let chip =
+            ThreadRef::parse(&format!("[Thread: Fix [the] bug; ref=thread_{delegated}]")).unwrap();
         assert_eq!(
-            ThreadRef::parse(&format!("[Thread: Fix [the] bug; ref=thread_{delegated}]")).unwrap(),
-            t3(delegated)
+            chip,
+            ThreadRef::Chip {
+                context: format!("thread_{delegated}")
+            }
+        );
+        // with no record of the chip, only the `thread_<id>` form reads back
+        assert_eq!(chip.chip_fallback(), Some(t3(delegated)));
+        let pasted =
+            ThreadRef::parse("[Thread: Decide; ref=910af7b5-c1a3-4b38-8ad3-95f52dca76f5]").unwrap();
+        assert_eq!(pasted.chip_fallback(), None);
+        assert_eq!(pasted.uuid(), None);
+        assert_eq!(
+            ThreadRef::parse("threadId: mcp:launch:a9edc0e1").unwrap(),
+            ThreadRef::Id("mcp:launch:a9edc0e1".into())
         );
         assert_eq!(
             ThreadRef::parse("thread_mcp:launch:8bd44cf5").unwrap(),

@@ -191,7 +191,7 @@ impl WatchTarget {
         }
     }
 
-    /// Key that makes a second watch of the same target by one caller the same watch
+    /// Key of the followed thread, part of [`ThreadWatch::key`]
     #[must_use]
     pub fn key(&self) -> String {
         match self {
@@ -254,6 +254,26 @@ pub struct ThreadWatch {
     pub once: bool,
     /// When the watch was made
     pub created_at: DateTime<Utc>,
+}
+
+impl ThreadWatch {
+    /// Key that makes a repeat of the same watch by one caller that watch
+    ///
+    /// Two limits or actions on one thread are two watches, so a caller can be
+    /// told at one size and have the thread compacted at a larger one; only a
+    /// retry of all four finds the existing watch
+    #[must_use]
+    pub fn key(&self) -> String {
+        let threshold = match self.threshold {
+            Threshold::Tokens(tokens) => format!("tokens:{tokens}"),
+            Threshold::Percent(percent) => format!("percent:{percent}"),
+        };
+        let action = match self.action {
+            WatchAction::Notify => "notify",
+            WatchAction::Compact => "compact",
+        };
+        format!("{}/{threshold}/{action}", self.target.key())
+    }
 }
 
 /// A watch and where it stands

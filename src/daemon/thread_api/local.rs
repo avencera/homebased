@@ -58,20 +58,20 @@ enum Found {
 impl LocalIndex {
     /// Read T3's thread index once
     ///
-    /// A T3 state that cannot be read leaves only the sessions outside T3
-    pub(crate) fn load(sources: LocalSources, now: DateTime<Utc>) -> Self {
-        let t3 = thread_index(&sources.env).unwrap_or_else(|message| {
-            tracing::warn!("thread lookup without T3 threads: {message}");
-            Vec::new()
-        });
-        Self {
+    /// # Errors
+    ///
+    /// When T3's state exists but cannot be read now. Without its threads a
+    /// lookup would report T3 threads as gone, which ends their watches
+    pub(crate) fn load(sources: LocalSources, now: DateTime<Utc>) -> Result<Self, String> {
+        let t3 = thread_index(&sources.env)?;
+        Ok(Self {
             environment: environment_id(&sources.env),
             sources,
             t3,
             rollouts: OnceLock::new(),
             claude: OnceLock::new(),
             now,
-        }
+        })
     }
 
     fn home(&self) -> &Path {
@@ -108,6 +108,8 @@ impl LocalIndex {
             }
         };
         match reference {
+            // the resolver maps a chip to its thread before asking any machine
+            ThreadRef::Chip { .. } => {}
             ThreadRef::T3 {
                 environment,
                 thread,
@@ -208,6 +210,15 @@ impl LocalIndex {
             ProviderThread::Codex(id) => self.rollouts().context(id),
         });
         let session_id = session.map(ProviderThread::id);
+        // usage needs a request in the tail, so it cannot tell a missing record apart
+        let session_exists = session.map(|session| match session {
+            ProviderThread::Claude(id) => {
+                usage.is_some() || ContextUse::claude_transcript_exists(self.home(), id)
+            }
+            ProviderThread::Codex(id) => {
+                usage.is_some() || self.rollouts().ids().any(|known| known == id)
+            }
+        });
         let worker = session_id.and_then(|id| {
             self.sources
                 .workers
@@ -254,6 +265,7 @@ impl LocalIndex {
             host,
             provider: session.map(Into::into),
             session: session_id,
+            session_exists,
             t3_thread: t3.map(|t3| t3.id.clone()),
             t3_link: t3
                 .zip(self.environment.as_deref())
@@ -352,7 +364,7 @@ mod tests {
             }
             payload
         };
-        V2State::create(&userdata.join("statev2.sqlite"))
+        V2State::create(&state_path(home))
             .thread(A, "uuid thread", false)
             .native("codex", SESSION_A, A)
             .thread(B, "launched", false)
@@ -376,7 +388,11 @@ mod tests {
             WORKER,
             &[token_count(Utc::now() - TimeDelta::hours(1), 5_000, 0)],
         );
-        let sources = LocalSources {
+        LocalIndex::load(sources(home), Utc::now()).unwrap()
+    }
+
+    fn sources(home: &Path) -> LocalSources {
+        LocalSources {
             env: T3Env::new(home.to_path_buf(), "/bin".into()),
             machine: MachineId::new(),
             machine_name: "here".into(),
@@ -387,8 +403,11 @@ mod tests {
             }],
             waiting: HashSet::from([SESSION_A.parse::<ThreadId>().unwrap()]),
             titles: None,
-        };
-        LocalIndex::load(sources, Utc::now())
+        }
+    }
+
+    fn state_path(home: &Path) -> std::path::PathBuf {
+        home.join(".t3/userdata/statev2.sqlite")
     }
 
     /// What a lookup found, as (T3 id or session, host, state)
@@ -398,6 +417,8 @@ mod tests {
         prefixes: bool,
     ) -> Vec<(String, ThreadHost, ThreadState)> {
         let reference = ThreadRef::parse(text).unwrap();
+        // the resolver maps a chip before the index sees it; with no record, by its `thread_` form
+        let reference = reference.chip_fallback().unwrap_or(reference);
         index
             .find(&reference, prefixes)
             .into_iter()
@@ -520,5 +541,89 @@ mod tests {
         assert_eq!(live[0].parent_t3_thread.as_deref(), Some(A));
         // a child T3 has not started yet has no session and no context
         assert_eq!((live[0].session, live[0].tokens), (None, None));
+    }
+
+    #[test]
+    fn a_t3_state_that_cannot_be_read_fails_the_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        drop(index(home.path()));
+        // the thread query reads the runs table, which the schema check does not
+        rusqlite::Connection::open(state_path(home.path()))
+            .unwrap()
+            .execute_batch("DROP TABLE orchestration_v2_projection_runs")
+            .unwrap();
+        // an empty index would report every T3 thread as deleted
+        assert!(LocalIndex::load(sources(home.path()), Utc::now()).is_err());
+
+        // without T3 at all, sessions outside it are still found
+        std::fs::remove_file(state_path(home.path())).unwrap();
+        let index = LocalIndex::load(sources(home.path()), Utc::now()).unwrap();
+        assert_eq!(found(&index, TERMINAL, false).len(), 1);
+    }
+
+    #[test]
+    fn a_t3_thread_reads_the_session_t3_runs_next() {
+        const SWITCHED: &str = "mcp:launch:switched";
+        const OLD: &str = "0199abab-2222-7000-8000-00000000000a";
+        const NEW: &str = "0199abab-2222-7000-8000-00000000000b";
+        const PENDING: &str = "mcp:launch:pending";
+        const PENDING_OLD: &str = "0199abab-2222-7000-8000-00000000000c";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        V2State::create(&state_path(home))
+            // switched from Claude to Codex, and has run in Codex since
+            .thread(SWITCHED, "switched", false)
+            .native("claudeAgent", OLD, SWITCHED)
+            .instance("codex", "codex", NEW, SWITCHED)
+            // switched too, but the next turn has not started its session yet
+            .thread(PENDING, "pending", false)
+            .native("claudeAgent", PENDING_OLD, PENDING)
+            .select("codex", PENDING);
+        transcript(home, OLD, 5, 300_000);
+        rollout(home, NEW, &[token_count(Utc::now(), 50_000, 0)]);
+        transcript(home, PENDING_OLD, 5, 300_000);
+        let index = LocalIndex::load(sources(home), Utc::now()).unwrap();
+
+        let switched = index.find(&ThreadRef::parse(SWITCHED).unwrap(), false);
+        assert_eq!(switched.len(), 1);
+        assert_eq!(switched[0].session, Some(NEW.parse().unwrap()));
+        assert_eq!(switched[0].provider, Some(Provider::Codex));
+        assert_eq!(switched[0].tokens, Some(50_000));
+
+        // the old session's size says nothing about the next turn, which starts fresh
+        let pending = index.find(&ThreadRef::parse(PENDING).unwrap(), false);
+        assert_eq!(pending[0].session, None);
+        assert_eq!(pending[0].tokens, None);
+
+        // the session T3 left behind is only a transcript now
+        assert_eq!(
+            found(&index, OLD, false),
+            vec![(OLD.to_owned(), ThreadHost::Terminal, ThreadState::Idle)]
+        );
+    }
+
+    #[test]
+    fn a_session_whose_record_is_removed_is_marked_gone_while_t3_still_names_it() {
+        let home = tempfile::tempdir().unwrap();
+        let index = index(home.path());
+        let lookup = |index: &LocalIndex| {
+            index
+                .find(&ThreadRef::parse(SESSION_B).unwrap(), false)
+                .into_iter()
+                .find(|thread| thread.t3_thread.as_deref() == Some(B))
+                .unwrap()
+        };
+        assert_eq!(lookup(&index).session_exists, Some(true));
+
+        fs::remove_file(
+            home.path()
+                .join(format!(".claude/projects/-work/{SESSION_B}.jsonl")),
+        )
+        .unwrap();
+        let index = LocalIndex::load(sources(home.path()), Utc::now()).unwrap();
+        let gone = lookup(&index);
+        assert_eq!(gone.session, Some(SESSION_B.parse().unwrap()));
+        assert_eq!(gone.session_exists, Some(false));
     }
 }

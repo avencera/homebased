@@ -14,7 +14,6 @@ use crate::message::{
     MessageId, MessageSendRequest, MessageSendResponse, MessageSourceSelector, MessageTarget,
     Recipient,
 };
-use crate::thread_ref::{ThreadContextRequest, ThreadContextResponse, ThreadRef, ThreadSelector};
 
 use super::{Ctx, OutputMode};
 
@@ -118,20 +117,16 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
 
 async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
     let client = Client::new(ctx.home.sock_path());
-    let thread = match (args.machine.as_deref(), args.thread) {
-        (Some(machine), Some(reference)) => {
-            Some(destination_thread(&client, machine, reference).await?)
-        }
-        (None, Some(_)) => {
-            return Err(AppError::Usage {
-                message: "--thread needs --machine, the machine that runs the thread".into(),
-            });
-        }
-        (_, None) => None,
-    };
+    // the daemon looks the reference up once it has checked the message UUID,
+    // so a retry keeps the thread the first attempt reached
+    if args.machine.is_none() && args.thread.is_some() {
+        return Err(AppError::Usage {
+            message: "--thread needs --machine, the machine that runs the thread".into(),
+        });
+    }
     let target = target(Destination {
         machine: args.machine,
-        thread,
+        thread: args.thread,
         cwd: args.cwd,
         task: args.task,
         worker: args.worker,
@@ -165,54 +160,11 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The Claude Code session or Codex thread that `reference` names on `machine`
-///
-/// A UUID that no lookup finds, or a daemon without thread lookups, keeps the
-/// old behavior: the UUID goes as given and the receiving machine checks it
-async fn destination_thread(
-    client: &Client,
-    machine: &str,
-    reference: String,
-) -> Result<ThreadId, AppError> {
-    let exact = ThreadRef::parse(&reference)?.uuid().map(ThreadId);
-    let request = ThreadContextRequest {
-        api_version: API_VERSION,
-        threads: vec![ThreadSelector::Reference {
-            text: reference.clone(),
-        }],
-        children_of: None,
-        live: false,
-        machine: Some(machine.to_owned()),
-        prefixes: false,
-    };
-    let lookup: Result<ThreadContextResponse, AppError> =
-        client.post_json("/v1/threads/context", &request).await;
-    match (lookup, exact) {
-        (Ok(response), _) => {
-            let thread = response
-                .threads
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal {
-                    message: "thread lookup returned no thread".into(),
-                })?;
-            thread.session.ok_or_else(|| AppError::Usage {
-                message: format!(
-                    "{reference} has not started a Claude Code session or Codex thread yet"
-                ),
-            })
-        }
-        (Err(error @ AppError::ThreadRefAmbiguous { .. }), _) => Err(error),
-        (Err(_), Some(exact)) => Ok(exact),
-        (Err(error), None) => Err(error),
-    }
-}
-
 /// Destination flags as the caller passed them
 #[derive(Default)]
 struct Destination {
     machine: Option<String>,
-    thread: Option<ThreadId>,
+    thread: Option<String>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
     worker: Option<TaskId>,
@@ -229,10 +181,9 @@ fn target(destination: Destination) -> Result<MessageTarget, AppError> {
     match (machine, thread, cwd, task, worker) {
         (None, None, None, Some(task), None) => Ok(MessageTarget::Task { task }),
         (None, None, None, None, Some(task)) => Ok(MessageTarget::Worker { task }),
-        (Some(machine), Some(thread), None, None, None) => Ok(MessageTarget::Machine {
-            machine,
-            recipient: Recipient::Thread { thread },
-        }),
+        (Some(machine), Some(reference), None, None, None) => {
+            Ok(MessageTarget::Reference { machine, reference })
+        }
         (Some(machine), None, Some(cwd), None, None) => Ok(MessageTarget::Machine {
             machine,
             recipient: Recipient::Cwd { cwd },
@@ -283,7 +234,9 @@ fn validate_response(
     response: &MessageSendResponse,
 ) -> Result<(), AppError> {
     let expected_machine = match &request.target {
-        MessageTarget::Machine { machine, .. } => machine.parse::<MachineId>().ok(),
+        MessageTarget::Machine { machine, .. } | MessageTarget::Reference { machine, .. } => {
+            machine.parse::<MachineId>().ok()
+        }
         MessageTarget::Task { .. } | MessageTarget::Worker { .. } => None,
     };
     let expected_thread = match &request.target {
@@ -377,7 +330,7 @@ mod tests {
         );
         assert!(
             target(Destination {
-                thread: Some(ThreadId(Uuid::now_v7())),
+                thread: Some(Uuid::now_v7().to_string()),
                 ..Destination::default()
             })
             .is_err()
@@ -385,7 +338,7 @@ mod tests {
         assert!(
             target(Destination {
                 machine: Some("code".into()),
-                thread: Some(ThreadId(Uuid::now_v7())),
+                thread: Some(Uuid::now_v7().to_string()),
                 cwd: Some(PathBuf::from("~/repo")),
                 ..Destination::default()
             })

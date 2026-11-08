@@ -63,8 +63,9 @@ pub enum ThreadCommand {
     /// Sends `THREAD_CONTEXT_OVER` once per climb over the limit, and again
     /// only after the context drops below it. The calling thread receives the
     /// events like task callbacks; `homebased wait --next <watch id>` takes
-    /// them instead while it runs. Watching the same thread again updates the
-    /// existing watch.
+    /// them instead while it runs. The same watch again (thread, limit, and
+    /// action) is the existing watch; another limit or action on the same
+    /// thread is a second watch.
     #[command(after_help = REFERENCE_HELP)]
     Watch {
         /// Thread references; the calling thread when none is given
@@ -277,6 +278,13 @@ fn selectors(
 }
 
 fn print_context(ctx: &Ctx, response: &ThreadContextResponse) -> Result<ExitCode, AppError> {
+    // JSON carries `children_complete` and `unanswered` instead
+    if response.children_complete == Some(false) && !matches!(ctx.output, OutputMode::Json) {
+        eprintln!(
+            "warning: the children list may be incomplete; no answer from {}",
+            response.unanswered.join(", ")
+        );
+    }
     match ctx.output {
         OutputMode::Json => ctx.print_json(serde_json::to_value(response)?)?,
         OutputMode::Quiet => {

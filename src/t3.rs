@@ -346,20 +346,22 @@ pub(crate) fn next_session(env: &T3Env, thread: ProviderThread) -> NextSession {
         let Some(t3_thread) = find_thread(&userdata, thread)? else {
             return Ok(NextSession::Unowned);
         };
-        let Some((driver, native, selected)) =
-            v2::active_thread(&state_path(&userdata), &t3_thread)?
-        else {
-            return Ok(NextSession::Other);
-        };
-        let session = native
-            .filter(|_| selected)
-            .and_then(|native| ProviderThread::from_driver(&driver, native.parse().ok()?));
+        let session = v2::active_thread(&state_path(&userdata), &t3_thread)?
+            .as_ref()
+            .and_then(resumed);
         Ok(session.map_or(NextSession::Other, NextSession::Resumes))
     };
     next().unwrap_or_else(|detail| {
         tracing::debug!(%detail, "next T3 session cannot be read");
         NextSession::Unowned
     })
+}
+
+/// The session T3 resumes from its active provider thread, if any: only one
+/// of the selected instance with a native id homebased can read
+fn resumed(active: &v2::ActiveThread) -> Option<ProviderThread> {
+    let native = active.native.as_deref().filter(|_| active.selected)?;
+    ProviderThread::from_driver(&active.driver, native.parse().ok()?)
 }
 
 /// Start a `/compact` turn in the T3 thread that owns a Claude session or
@@ -504,6 +506,21 @@ pub(crate) fn open_threads(env: &T3Env) -> Result<Vec<OpenThread>, String> {
     Ok(threads)
 }
 
+/// The T3 thread, and its environment when recorded, that the chip `ref`
+/// `context` names in this machine's T3
+///
+/// `None` when no message here carries the chip's record, or T3 is not installed
+pub(crate) fn chip_thread(
+    env: &T3Env,
+    context: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() || !v2::schema_readable(&state)? {
+        return Ok(None);
+    }
+    v2::chip_thread(&state, context)
+}
+
 /// One T3 thread that is not deleted, open or archived, for thread lookups
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct T3Thread {
@@ -519,7 +536,9 @@ pub(crate) struct T3Thread {
     pub(crate) parent: Option<String>,
     /// Whether the newest run has not finished
     pub(crate) running: bool,
-    /// Claude session or Codex thread the T3 thread resumes, once it has one
+    /// Claude session or Codex thread T3 runs the thread's next turn in, as
+    /// [`next_session`] picks it; `None` before the first one and while a
+    /// provider switch is pending
     pub(crate) session: Option<ProviderThread>,
     /// Project, branch, model, and other context T3 records for the thread
     pub(crate) details: ThreadDetails,
@@ -529,24 +548,23 @@ pub(crate) struct T3Thread {
 ///
 /// Reads the state database on disk, so the server need not run. Empty when
 /// T3 is not installed or its schema changed
+///
+/// # Errors
+///
+/// When the state exists but cannot be read now, such as while it is locked,
+/// so a caller never takes a failed read for threads that are gone
 pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
     let state = state_path(&env.userdata());
-    if !state.is_file() || !v2::schema_matches(&state) {
+    if !state.is_file() || !v2::schema_readable(&state)? {
         return Ok(Vec::new());
     }
     let rows = v2::thread_rows(&state)?;
-    let mut sessions: std::collections::HashMap<String, ProviderThread> =
-        std::collections::HashMap::new();
-    // rows come newest first, and a T3 thread resumes only its newest session
-    for (driver, native, t3_thread, _, _) in v2::provider_rows(&state)? {
-        if let Some(session) = native
-            .parse::<ThreadId>()
-            .ok()
-            .and_then(|native| ProviderThread::from_driver(&driver, native))
-        {
-            sessions.entry(t3_thread).or_insert(session);
-        }
-    }
+    // the session T3 runs the next turn in, by the rule of `next_session`, so a
+    // provider switch reads the new session, or none until it starts
+    let sessions: std::collections::HashMap<String, ProviderThread> = v2::active_threads(&state)?
+        .iter()
+        .filter_map(|active| Some((active.thread.clone(), resumed(active)?)))
+        .collect();
     let details = v2::all_thread_details(&state);
 
     Ok(rows

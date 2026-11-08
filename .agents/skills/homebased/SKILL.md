@@ -14,7 +14,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Run a command with `homebased task run --name "<goal>" -- <program> <args...>`. Write a JSON spec and `homebased task submit --spec <file|->` only for an `agent` or `container` workload, or for fields `task run` lacks.
 - Inside a T3 Code thread (the `t3-code` MCP tools are present), read [t3.md](references/t3.md) before submitting: T3 delivery, `delegate_task`, and `homebased wait` for tasks and GPU queue jobs. When a T3 thread owns the submitting Claude session, `task run`, `task submit`, and `resource job submit` print a `T3:` line on stderr that says how to wait on the new task or job; follow it.
 - Submit on the machine that owns the thread. To run the child elsewhere, pass `--machine` (or set `machine` in the spec); add `--wait-for-machine` for a machine that is often asleep. See [submit.md](references/submit.md#wait-for-an-offline-machine).
-- Send all GPU work through the resource queue, and never build inside a GPU lease: build as a CPU task first. Read [resource-queue.md](references/resource-queue.md).
+- Send all GPU work through the resource queue, and never build inside a GPU lease: build as a CPU task first, then `resource job submit --after "$build"`. Read [resource-queue.md](references/resource-queue.md).
 - Set `name` to a short goal label, not the agent or the CLI.
 - Pass `--json` on data commands and parse the result.
 - Event delivery is at-least-once. Deduplicate by `(task, seq)`, `(job, seq)`, or `(watch, seq)`.

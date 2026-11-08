@@ -10,8 +10,10 @@ use serde_json::{Value, json};
 use super::{Ctx, OutputMode};
 use crate::callback::destination::SubmitOrigin;
 use crate::client::Client;
-use crate::domain::TaskEnv;
+use crate::dependency::TaskDependencies;
+use crate::domain::{TaskEnv, TaskId};
 use crate::error::AppError;
+use crate::queue::build_hint::build_warnings;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
@@ -97,6 +99,11 @@ pub enum JobCommand {
         /// Let a worker send callbacks to a thread other than its parent's thread
         #[arg(long)]
         allow_other_thread: bool,
+        /// Task this machine submitted that must succeed before the job joins
+        /// the queue; repeat for more. The job is held under its id until then,
+        /// and cancelled without using the queue if one ends any other way
+        #[arg(long = "after", value_name = "TASK")]
+        after: Vec<TaskId>,
     },
     /// Show a job, its progress, and every run task for logs
     Show {
@@ -220,7 +227,8 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             job_id,
             spec,
             allow_other_thread,
-        } => submit(ctx, client, job_id, &spec, allow_other_thread).await,
+            after,
+        } => submit(ctx, client, job_id, &spec, allow_other_thread, after).await,
         JobCommand::Show { job, machine } => {
             let value = client
                 .get(&path(&format!("/v1/resource/jobs/{job}"), &machine))
@@ -274,24 +282,57 @@ async fn submit(
     job_id: JobId,
     spec_path: &str,
     allow_other_thread: bool,
+    after_flags: Vec<TaskId>,
 ) -> Result<(), AppError> {
     let origin = SubmitOrigin::capture(&ctx.home)?;
     let mut value = crate::spec::read_spec_value(spec_path)?;
     if let Some(thread) = origin.default_thread()? {
         crate::spec::fill_missing_thread(&mut value, thread);
     }
-    let spec = JobSpec::parse_value(&value)?;
+    let (spec, after) = JobSpec::parse_submission(&value)?;
+    let after = merge_after(after, after_flags)?;
     origin.check(spec.thread, allow_other_thread)?;
+    // a hint only: the job is submitted either way
+    let warnings = build_warnings(&spec);
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
     let body = json!({
         "job_id": job_id,
         "spec": spec,
         "env": TaskEnv::capture(),
         "callback_cwd": std::env::current_dir()?,
+        "after": after,
     });
-    let value = post_retry(client, "/v1/resource/jobs", &body).await?;
-    print_result(ctx, &value, "submitted", &job_id.to_string())?;
+    let mut value = post_retry(client, "/v1/resource/jobs", &body).await?;
+    if !warnings.is_empty() {
+        value["warnings"] = json!(warnings);
+    }
+    let action = match value["held"]["state"].as_str() {
+        Some("held") => "held until its after tasks succeed:",
+        Some(_) => "ended before it queued:",
+        None => "submitted",
+    };
+    print_result(ctx, &value, action, &job_id.to_string())?;
     super::task::print_t3_wait_hint(&job_id.to_string(), spec.thread);
     Ok(())
+}
+
+/// The spec's `after` and the `--after` flags as one list, each task once
+fn merge_after(
+    spec: Option<TaskDependencies>,
+    flags: Vec<TaskId>,
+) -> Result<Option<TaskDependencies>, AppError> {
+    let mut tasks: Vec<TaskId> = spec.map(Vec::from).unwrap_or_default();
+    for task in flags {
+        if !tasks.contains(&task) {
+            tasks.push(task);
+        }
+    }
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    crate::spec::parse_after(&json!(tasks)).map(Some)
 }
 
 fn path(base: &str, machine: &MachineArgs) -> String {
@@ -391,6 +432,34 @@ fn resource_label(id: ResourceId, known: &[Resource]) -> String {
     }
 }
 
+/// A job the origin holds for its `after` tasks, or ended before it queued
+fn print_held(ctx: &Ctx, held: &Value) -> Result<(), AppError> {
+    let text = |key: &str| held[key].as_str().unwrap_or("-").to_owned();
+    if ctx.output == OutputMode::Quiet {
+        println!("{}", text("job_id"));
+        return Ok(());
+    }
+    println!(
+        "{}  {}\nstate: {}\nqueue: {}",
+        text("job_id"),
+        text("name"),
+        text("state"),
+        text("machine")
+    );
+    for dependency in held["after"].as_array().into_iter().flatten() {
+        let task = dependency["task"].as_str().unwrap_or("-");
+        let state = match dependency["outcome"].as_str() {
+            Some(outcome) => format!("ended {outcome}"),
+            None => dependency["state"].as_str().unwrap_or("-").to_owned(),
+        };
+        println!("after {task}: {state}");
+    }
+    if let Some(reason) = held["reason"].as_str() {
+        println!("reason: {reason}");
+    }
+    Ok(())
+}
+
 fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
@@ -418,6 +487,9 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
 fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
+    }
+    if let Some(held) = value.get("held") {
+        return print_held(ctx, held);
     }
     let detail: JobDetail = decode(value)?;
     let job = &detail.job;

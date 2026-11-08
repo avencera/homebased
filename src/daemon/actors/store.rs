@@ -91,6 +91,21 @@ pub(crate) enum StoreMsg {
         target: Option<crate::queue::Target>,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Origin routes held for their `after` tasks or sent and unconfirmed
+    HeldJobRoutes {
+        reply: RpcReplyPort<Result<Vec<crate::queue::delivery::JobRoute>, AppError>>,
+    },
+    /// Mark a held route sent
+    ReleaseHeldJob {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
+    },
+    /// End a held job before it joins the queue, with its terminal event
+    EndHeldJob {
+        job: crate::queue::JobId,
+        ending: crate::queue::delivery::HeldJobEnding,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
     /// First unacknowledged event per authority job
     PendingJobOutbox {
         reply: RpcReplyPort<Result<Vec<crate::queue::delivery::RoutedJobEvent>, AppError>>,
@@ -731,6 +746,13 @@ impl Actor for StoreActor {
                 reply,
             } => send_reply(reply, state.queue_request(machine, &request, &env)),
             StoreMsg::JobRoute { job, reply } => send_reply(reply, state.job_route(job)),
+            StoreMsg::HeldJobRoutes { reply } => send_reply(reply, state.held_job_routes()),
+            StoreMsg::ReleaseHeldJob { job, reply } => {
+                send_reply(reply, state.release_held_job(job));
+            }
+            StoreMsg::EndHeldJob { job, ending, reply } => {
+                send_reply(reply, state.end_held_job(job, ending));
+            }
             StoreMsg::InsertJobRoute { route, reply } => {
                 send_reply(reply, state.insert_job_route(&route))
             }

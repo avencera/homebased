@@ -155,7 +155,11 @@ The CLI creates a message UUID unless you pass `--message-id <uuid>`. Choose
 the UUID before the first send if you may need to retry after a lost response.
 Retry with the same message UUID, destination, source, body, and other options.
 The receiver returns a saved receipt without another queue call when it has
-one. It uses the saved thread when it retries a `--cwd` destination. Reusing a
+one. It uses the saved thread when it retries a `--cwd` or `--thread`
+destination: the sender saves the reference as you passed it and looks it up
+only after it checks the saved binding, so a retry reaches the thread the
+first attempt chose even after that thread moved to a new session or was
+deleted. Reusing a
 message UUID with different request content returns `message_conflict`.
 If target resolution fails, the UUID stays reserved for that request. Retrying
 with the same content resolves again; changing the content returns

@@ -15,7 +15,7 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 ## GPU priority queue
 
-Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. Build in a CPU task first and submit the job with `--after` that task: the job is held under its id until the build succeeds, and cancelled without taking a GPU if the build fails. Submit warns when a step itself runs a build tool such as `cargo build` or `pip install`. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
 
 ## For agents
 
@@ -370,9 +370,14 @@ homebased thread watches [--all]
 homebased thread unwatch <watch-id>
 ```
 
-A thread reference is T3 chip text (`[Thread: <title>; ref=thread_<id>]`),
-`thread_<id>`, a `t3-thread://v2/<environment>/<id>` link, a bare T3 id, a
-Claude Code session id, or a Codex thread id. With none, the command uses the
+A thread reference is T3 chip text (`[Thread: <title>; ref=<ref>]`),
+`thread_<id>`, a `t3-thread://v2/<environment>/<id>` link, a bare T3 id (or the
+`threadId: <id>` line of a `<t3_context>` block), a Claude Code session id, or
+a Codex thread id. A chip's `ref` is the id of a context record in the message
+that carried the chip, not a thread id; homebased reads the thread from that
+record in this machine's T3. A chip with no record here works only in its
+`thread_<id>` form, and any other fails with `thread_not_found` and a hint to
+pass the `threadId` from the `<t3_context>` block. With none, the command uses the
 calling thread; `--task <id>` and `--worker <id>` name a task's origin thread
 or worker. Each command looks on this machine first, then asks every reachable
 Fleet machine about the references it did not find. Each daemon advertises its
@@ -382,25 +387,41 @@ least 4 characters. A reference that matches several threads fails with
 `thread_ref_ambiguous` (exit 5), and one that matches none with
 `thread_not_found` (exit 3).
 
+If T3's state exists but cannot be read, the lookup fails with
+`t3_unavailable` rather than reporting no T3 threads. A T3 thread's session is
+the one T3 runs its next turn in: the active provider thread of the selected
+provider instance, or none before the first turn or while a provider switch is
+pending.
+
 `thread context` prints each thread's host (`t3`, `worker`, or `terminal`),
 provider, session, T3 id and link, title, state, context tokens, context window
 and percent (Codex only), last activity in US Central, whether the prompt cache
 is warm, and the last compaction. `--children` adds every T3 thread the calling
 T3 thread started, finished ones included unless `--live` is passed, with the
-parent link read from T3's thread lineage.
+parent link read from T3's thread lineage. When a reachable Fleet machine does
+not answer, the result has `children_complete: false` and names it in
+`unanswered`, and human output warns on stderr; `thread watch --children` then
+fails with the retryable `thread_lookup_incomplete` and saves no watch.
+Machines that Fleet lists as offline are not asked.
 
 `thread compact` sends `/compact` to a T3 thread on whichever machine runs it,
 and records it in `compactions.jsonl` with trigger `manual`. A thread outside
-T3 fails with `compact_unsupported_host`.
+T3 fails with `compact_unsupported_host` (exit 5), and a T3 thread with no
+session to compact yet with `thread_not_found` (exit 3).
 
 `thread watch` keeps a watch on the calling machine and checks it every minute,
 right after the idle compaction scan, which keeps its 55-minute, 200,000-token
 rule. When the watched context climbs over the limit while the thread runs no
 turn, the caller gets one `THREAD_CONTEXT_OVER` event; the watch fires again
-only after the context drops below the limit. `--action compact` compacts the
+only after a reading shows the context below the limit, so a missing reading
+never re-arms it. The same thread, limit, and action again is the existing
+watch; another limit or action on the same thread is a second watch, and each
+fires on its own. `--action compact` compacts the
 T3 thread first, with trigger `watch`, and puts the outcome in the event. The
 watch ends with `THREAD_WATCH_ENDED` when it fired with `--once`, is removed
-with `thread unwatch`, or its thread is archived, deleted, or gone. A target on
+with `thread unwatch`, or its thread is archived, deleted, or gone; a watch of
+a session ends once the session's record is gone, even while T3 still names
+it. A target on
 another machine is read through that machine on each check; while it does not
 answer, the watch is left as it was. Events are delivered like task events and
 deduplicated by `(watch, seq)`. The skill's
@@ -851,7 +872,9 @@ to ignore duplicates.
 
 Send a message to a Claude Code session or Codex thread on a known machine.
 `--thread` takes any thread reference that `homebased thread` takes, looked up
-on that machine; a UUID the lookup cannot find is sent as given:
+on that machine; a UUID the lookup cannot find is sent as given. The daemon
+looks it up after it checks the message's saved binding, so a retry with the
+same `--message-id` reaches the thread the first attempt chose:
 
 ```sh
 homebased --json message send \

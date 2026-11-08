@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
-use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::delivery::{HeldJobEnding, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::{JobEvent, JobEventKind, JobId, QueueError, Target};
 use crate::store::Store;
 
@@ -71,7 +71,11 @@ impl Store {
     pub fn insert_job_route(&self, route: &JobRoute) -> Result<JobRoute, AppError> {
         if route.thread != route.spec.thread
             || route.digest != route.spec.digest()?
-            || !matches!(route.submission, JobSubmission::Unknown)
+            || !matches!(
+                route.submission,
+                JobSubmission::Unknown | JobSubmission::Held
+            )
+            || matches!(route.submission, JobSubmission::Held) && route.after.is_none()
             || route.target.is_some()
         {
             return Err(QueueError::Invariant {
@@ -85,6 +89,7 @@ impl Store {
                     || saved.authority != route.authority
                     || saved.origin != route.origin
                     || saved.thread != route.thread
+                    || saved.after != route.after
                 {
                     return Err(QueueError::JobConflict { job: route.job }.into());
                 }
@@ -99,6 +104,107 @@ impl Store {
                 ],
             )?;
             Ok(route.clone())
+        })
+    }
+
+    /// Routes the origin still owns sending: held for their `after` tasks, or
+    /// released and not yet confirmed by the authority
+    pub fn held_job_routes(&self) -> Result<Vec<JobRoute>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT job_id FROM resource_job_routes
+             WHERE json_extract(route_json,'$.after') IS NOT NULL
+               AND json_extract(route_json,'$.submission.state') IN ('held','unknown')
+             ORDER BY created_at",
+        )?;
+        let jobs = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        jobs.into_iter()
+            .filter_map(|job| match job.parse::<JobId>() {
+                Ok(job) => self.job_route(job).transpose(),
+                Err(error) => Some(Err(error.into())),
+            })
+            .collect()
+    }
+
+    /// Mark a held route sent, so a lost reply is resent under the same job
+    /// id; any other route is returned unchanged
+    pub fn release_held_job(&self, job: JobId) -> Result<JobRoute, AppError> {
+        self.immediate(|| {
+            let mut route = self
+                .job_route(job)?
+                .ok_or(QueueError::JobNotFound { job })?;
+            if matches!(route.submission, JobSubmission::Held) {
+                route.submission = JobSubmission::Unknown;
+                self.conn.execute(
+                    "UPDATE resource_job_routes SET route_json=?2 WHERE job_id=?1",
+                    params![job.to_string(), serde_json::to_string(&route)?],
+                )?;
+            }
+            Ok(route)
+        })
+    }
+
+    /// End a held job before it joins the queue, committing its terminal
+    /// event to the origin inbox in the same transaction
+    ///
+    /// A dependency ending applies only while the job is still held, since a
+    /// sent job may already be queued; a refusal applies to the sent route
+    /// that the authority refused. Anything else returns `false`
+    pub fn end_held_job(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
+        self.immediate(|| {
+            let mut route = self
+                .job_route(job)?
+                .ok_or(QueueError::JobNotFound { job })?;
+            let applies = match (&route.submission, &ending) {
+                (
+                    JobSubmission::Held,
+                    HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested,
+                ) => true,
+                (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.after.is_some(),
+                _ => false,
+            };
+            let accepted = self
+                .job_route_cursors(job)?
+                .ok_or(QueueError::JobNotFound { job })?
+                .accepted;
+            if !applies || accepted != 0 {
+                return Ok(false);
+            }
+            let kind = match ending {
+                HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested => {
+                    JobEventKind::JobCancelled
+                }
+                HeldJobEnding::Refused { .. } => JobEventKind::JobFailed,
+            };
+            let envelope = RoutedJobEvent {
+                origin: route.origin,
+                authority: route.authority,
+                digest: route.digest.clone(),
+                event: JobEvent {
+                    job,
+                    seq: 1,
+                    event: kind,
+                    run: None,
+                    resource_name: None,
+                    resource_label: None,
+                    process: None,
+                    attention: None,
+                    at: Utc::now(),
+                    blocked: None,
+                    held_ending: Some(ending.clone()),
+                },
+            };
+            route.submission = JobSubmission::Ended { ending };
+            self.conn.execute(
+                "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,1,?2)",
+                params![job.to_string(), serde_json::to_string(&envelope)?],
+            )?;
+            self.conn.execute(
+                "UPDATE resource_job_routes SET accepted_seq=1,route_json=?2 WHERE job_id=?1",
+                params![job.to_string(), serde_json::to_string(&route)?],
+            )?;
+            Ok(true)
         })
     }
 
@@ -118,8 +224,9 @@ impl Store {
             {
                 return Err(QueueError::JobConflict { job }.into());
             }
-            if matches!(route.submission, JobSubmission::Rejected { .. })
-                && route.submission != submission
+            if matches!(route.submission, JobSubmission::Ended { .. })
+                || matches!(route.submission, JobSubmission::Rejected { .. })
+                    && route.submission != submission
                 || route.target.is_some() && target.is_some() && route.target != target
             {
                 return Err(QueueError::JobConflict { job }.into());
@@ -218,7 +325,10 @@ impl Store {
             if route.origin != envelope.origin
                 || route.authority != envelope.authority
                 || route.digest != envelope.digest
-                || matches!(route.submission, JobSubmission::Rejected { .. })
+                || matches!(
+                    route.submission,
+                    JobSubmission::Rejected { .. } | JobSubmission::Ended { .. }
+                )
             {
                 return Err(QueueError::JobConflict { job: event.job }.into());
             }

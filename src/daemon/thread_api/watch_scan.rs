@@ -116,20 +116,28 @@ fn decide<'a>(record: &WatchRecord, matches: &'a [ThreadContext]) -> Decision<'a
             return Decision::Unchanged;
         }
     };
-    if matches!(watch.target, WatchTarget::T3 { .. }) && thread.state == ThreadState::Archived {
-        return Decision::End(WatchEndReason::Archived, Some(thread));
+    match watch.target {
+        WatchTarget::T3 { .. } if thread.state == ThreadState::Archived => {
+            return Decision::End(WatchEndReason::Archived, Some(thread));
+        }
+        // T3 can still name a session whose transcript or rollout is gone
+        WatchTarget::Session { .. } if thread.session_exists == Some(false) => {
+            return Decision::End(WatchEndReason::SessionGone, Some(thread));
+        }
+        _ => {}
     }
 
-    let limit = watch.threshold.limit(thread.context_window);
-    let over = thread
+    // only a known reading on one side of the limit moves the watch: a missing
+    // token count or window, or a reading right at the limit, changes nothing
+    let reading = thread
         .tokens
-        .zip(limit)
-        .is_some_and(|(tokens, limit)| tokens > limit);
-    match (over, record.armed) {
-        (false, false) => Decision::Rearm,
-        (false, true) | (true, false) => Decision::Unchanged,
-        (true, true) if thread.state.busy() => Decision::Unchanged,
-        (true, true) => Decision::Fire(thread),
+        .zip(watch.threshold.limit(thread.context_window));
+    let over = reading.is_some_and(|(tokens, limit)| tokens > limit);
+    let under = reading.is_some_and(|(tokens, limit)| tokens < limit);
+    match record.armed {
+        true if over && !thread.state.busy() => Decision::Fire(thread),
+        false if under => Decision::Rearm,
+        _ => Decision::Unchanged,
     }
 }
 
@@ -380,6 +388,7 @@ mod tests {
             host: ThreadHost::T3,
             provider: None,
             session: None,
+            session_exists: None,
             t3_thread: Some("mcp:launch:feed".into()),
             t3_link: None,
             title: Some("child".into()),
@@ -437,13 +446,12 @@ mod tests {
             .upsert_watch(&watch(caller, target.clone(), false))
             .unwrap();
         assert!(created);
-        // the same caller watching the same thread again changes the existing watch
-        let mut again = watch(caller, target.clone(), false);
-        again.threshold = Threshold::Tokens(120_000);
-        let (second, created) = store.upsert_watch(&again).unwrap();
+        // the same watch again is the existing one
+        let (second, created) = store
+            .upsert_watch(&watch(caller, target.clone(), false))
+            .unwrap();
         assert!(!created);
         assert_eq!(second.watch.id, first.watch.id);
-        assert_eq!(second.watch.threshold, Threshold::Tokens(120_000));
         let id = first.watch.id;
 
         let over = |state| [thread(local, 150_000, state)];
@@ -535,10 +543,127 @@ mod tests {
         );
         let archived = [thread(local, 10, ThreadState::Archived)];
         assert_eq!(
-            decide(&record(t3), &archived),
+            decide(&record(t3.clone()), &archived),
             Decision::End(WatchEndReason::Archived, Some(&archived[0]))
         );
         // a session watch follows the session, whatever its T3 thread does
-        assert_eq!(decide(&record(session), &archived), Decision::Unchanged);
+        assert_eq!(
+            decide(&record(session.clone()), &archived),
+            Decision::Unchanged
+        );
+
+        // T3 still names the session, but its transcript is gone
+        let mut removed = thread(local, 10, ThreadState::Idle);
+        removed.session_exists = Some(false);
+        let removed = [removed];
+        assert_eq!(
+            decide(&record(session.clone()), &removed),
+            Decision::End(WatchEndReason::SessionGone, Some(&removed[0]))
+        );
+        // a T3 watch moves on to the thread's next session instead
+        assert_eq!(decide(&record(t3), &removed), Decision::Unchanged);
+        // a peer that predates the field cannot say, so the watch goes on
+        let mut unknown = removed[0].clone();
+        unknown.session_exists = None;
+        assert_eq!(decide(&record(session), &[unknown]), Decision::Unchanged);
+    }
+
+    #[test]
+    fn a_fired_watch_rearms_only_on_a_known_reading_below_its_limit() {
+        let local = MachineId::new();
+        let caller = ThreadId(uuid::Uuid::now_v7());
+        let target = WatchTarget::T3 {
+            machine: local,
+            t3_thread: "mcp:launch:feed".into(),
+        };
+        let record = |threshold, armed| {
+            let mut watch = watch(caller, target.clone(), false);
+            watch.threshold = threshold;
+            WatchRecord {
+                watch,
+                armed,
+                seq: 1,
+                ended_at: None,
+                end_reason: None,
+            }
+        };
+        let reading = |tokens: Option<u64>, window: Option<u64>| {
+            let mut thread = thread(local, 0, ThreadState::Idle);
+            thread.tokens = tokens;
+            thread.context_window = window;
+            [thread]
+        };
+        let fired = record(Threshold::Tokens(100_000), false);
+
+        // a transcript with no request yet says nothing about the size
+        assert_eq!(decide(&fired, &reading(None, None)), Decision::Unchanged);
+        // right at the limit is neither over nor below it
+        assert_eq!(
+            decide(&fired, &reading(Some(100_000), None)),
+            Decision::Unchanged
+        );
+        assert_eq!(
+            decide(
+                &record(Threshold::Tokens(100_000), true),
+                &reading(Some(100_000), None)
+            ),
+            Decision::Unchanged
+        );
+        // a percent limit needs the window to compare against
+        let by_percent = record(Threshold::Percent(50), false);
+        assert_eq!(
+            decide(&by_percent, &reading(Some(10), None)),
+            Decision::Unchanged
+        );
+        assert_eq!(
+            decide(&by_percent, &reading(Some(10), Some(200_000))),
+            Decision::Rearm
+        );
+        assert_eq!(
+            decide(&fired, &reading(Some(99_999), None)),
+            Decision::Rearm
+        );
+    }
+
+    #[test]
+    fn a_notify_and_a_compact_watch_on_one_thread_fire_on_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let local = MachineId::new();
+        let caller = ThreadId(uuid::Uuid::now_v7());
+        let target = WatchTarget::T3 {
+            machine: local,
+            t3_thread: "mcp:launch:feed".into(),
+        };
+        let mut notify = watch(caller, target.clone(), false);
+        notify.threshold = Threshold::Tokens(200_000);
+        let mut compact = watch(caller, target, false);
+        compact.threshold = Threshold::Tokens(250_000);
+        compact.action = WatchAction::Compact;
+        let (notify, created) = store.upsert_watch(&notify).unwrap();
+        assert!(created);
+        let (compact, created) = store.upsert_watch(&compact).unwrap();
+        assert!(created, "another limit and action is another watch");
+        assert_ne!(notify.watch.id, compact.watch.id);
+        // a retry of either one is that watch
+        assert!(!store.upsert_watch(&notify.watch).unwrap().1);
+        assert!(!store.upsert_watch(&compact.watch).unwrap().1);
+
+        let at = |tokens| [thread(local, tokens, ThreadState::Idle)];
+        let both = |tokens| {
+            (
+                step(&store, local, notify.watch.id, &at(tokens)),
+                step(&store, local, compact.watch.id, &at(tokens)),
+            )
+        };
+        let over = vec![WatchEventKind::ContextOver];
+        // one climb past both limits fires each watch once
+        assert_eq!(both(260_000), (over.clone(), over.clone()));
+        assert_eq!(both(260_000), (vec![], vec![]));
+        // the compaction drops the context below both, which re-arms both
+        assert_eq!(both(30_000), (vec![], vec![]));
+        // the next climb past only the lower limit fires only the notify watch
+        assert_eq!(both(210_000), (over.clone(), vec![]));
+        assert_eq!(both(255_000), (vec![], over));
     }
 }
