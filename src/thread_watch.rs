@@ -259,28 +259,23 @@ pub fn ends_watch(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
 /// A compaction the watch started on another thread, an unwatch, and the end
 /// of a watch on a thread that finished ask nothing of the caller, and waking
 /// it would spend a turn re-reading its whole context to learn that. A
-/// connected `homebased wait` still prints them, and the store keeps them for
-/// `thread watches`. A caller that watches itself still wakes for its own
-/// compaction: it ended its turn so T3 could compact it, and this event is
-/// what resumes it
+/// connected `homebased wait` still prints them, and the store keeps them. A
+/// caller that watches itself still wakes for its own compaction: it ended its
+/// turn so T3 could compact it, and this event is what resumes it. `caller_t3` is the caller's T3 thread on the machine that
+/// keeps the watch; matching on it finds a T3 caller that now runs in another
+/// session than the one that made the watch, such as after a provider switch
 #[must_use]
-pub fn wakes_caller(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
+pub fn wakes_caller(
+    kind: WatchEventKind,
+    payload: &serde_json::Value,
+    caller_t3: Option<&str>,
+) -> bool {
     match kind {
         WatchEventKind::ContextOver => {
             let outcome = payload
                 .pointer("/compaction/outcome")
                 .and_then(|outcome| CompactOutcome::deserialize(outcome).ok());
-            let caller = payload.get("thread").and_then(serde_json::Value::as_str);
-            let is_caller = |key: &str| {
-                caller.is_some()
-                    && payload
-                        .pointer(&format!("/target/{key}"))
-                        .and_then(serde_json::Value::as_str)
-                        == caller
-            };
-            outcome != Some(CompactOutcome::Started)
-                || is_caller("session")
-                || is_caller("t3_thread")
+            outcome != Some(CompactOutcome::Started) || targets_caller(payload, caller_t3)
         }
         WatchEventKind::Ended => {
             let reason = payload
@@ -292,6 +287,20 @@ pub fn wakes_caller(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
             )
         }
     }
+}
+
+/// Whether the event's target is the thread that receives it
+fn targets_caller(payload: &serde_json::Value, caller_t3: Option<&str>) -> bool {
+    let text = |pointer: &str| payload.pointer(pointer).and_then(serde_json::Value::as_str);
+    let same_session =
+        text("/thread").is_some_and(|caller| text("/target/session") == Some(caller));
+    // a T3 id is unique only on its machine, and `caller_t3` is on the one that keeps the watch
+    let same_t3 = caller_t3.is_some_and(|caller| {
+        text("/target/t3_thread") == Some(caller)
+            && text("/target/machine").is_some()
+            && text("/target/machine") == text("/machine")
+    });
+    same_session || same_t3
 }
 
 /// [`ends_watch`] for a `HOMEBASED_EVENT` line, as a wait stream carries it
@@ -447,8 +456,8 @@ impl WatchEvent {
 
     /// Whether delivery wakes the caller for this event, see [`wakes_caller`]
     #[must_use]
-    pub fn wakes_caller(&self) -> bool {
-        wakes_caller(self.kind, &self.payload)
+    pub fn wakes_caller(&self, caller_t3: Option<&str>) -> bool {
+        wakes_caller(self.kind, &self.payload, caller_t3)
     }
 
     /// The line delivery sends
@@ -566,16 +575,34 @@ mod tests {
 
     #[test]
     fn only_events_that_ask_something_of_the_caller_wake_it() {
+        let started_on = |session: &str,
+                          t3_thread: &str,
+                          machine: &str,
+                          caller_t3: Option<&str>| {
+            wakes_caller(
+                WatchEventKind::ContextOver,
+                &json!({
+                    "thread": "root-session",
+                    "machine": "keeper",
+                    "target": { "session": session, "t3_thread": t3_thread, "machine": machine },
+                    "compaction": { "outcome": "started", "detail": null },
+                    "reason": null,
+                }),
+                caller_t3,
+            )
+        };
         let over_on = |target: &str, outcome: Option<&str>| {
             let compaction = outcome.map(|outcome| json!({ "outcome": outcome, "detail": null }));
             wakes_caller(
                 WatchEventKind::ContextOver,
                 &json!({
                     "thread": "root-session",
-                    "target": { "session": target, "t3_thread": format!("{target}-t3") },
+                    "machine": "keeper",
+                    "target": { "session": target, "t3_thread": format!("{target}-t3"), "machine": "keeper" },
                     "compaction": compaction,
                     "reason": null,
                 }),
+                Some("root-session-t3"),
             )
         };
         let over = |outcome| over_on("child-session", outcome);
@@ -584,13 +611,29 @@ mod tests {
         for outcome in ["refused", "unavailable", "not_found"] {
             assert!(over(Some(outcome)), "{outcome}");
         }
-        // a root that watches itself resumes on its own compaction
+        // a root that watches itself resumes on its own compaction, also once
+        // T3 runs it in another session than the one that made the watch
         assert!(over_on("root-session", Some("started")));
+        assert!(started_on(
+            "new-session",
+            "root-t3",
+            "keeper",
+            Some("root-t3")
+        ));
+        // the same T3 id on another machine is another thread
+        assert!(!started_on(
+            "new-session",
+            "root-t3",
+            "elsewhere",
+            Some("root-t3")
+        ));
+        assert!(!started_on("new-session", "root-t3", "keeper", None));
 
         let ended = |reason: &str| {
             wakes_caller(
                 WatchEventKind::Ended,
                 &json!({ "reason": reason, "compaction": null }),
+                None,
             )
         };
         assert!(!ended("unwatched"));

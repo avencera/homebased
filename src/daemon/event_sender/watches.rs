@@ -216,7 +216,7 @@ async fn deliver(
         });
         return Ok(settle("printed").await?);
     }
-    if !event.wakes_caller() || caller_put_away(state, watch).await? {
+    if !event.wakes_caller(watch.caller_t3.as_deref()) || caller_put_away(state, watch).await? {
         return Ok(settle("suppressed").await?);
     }
     // the routes that run `codex queue` check the saved cwd and Codex binary
