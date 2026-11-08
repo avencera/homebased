@@ -294,9 +294,6 @@ async fn submit(
     origin.check(spec.thread, allow_other_thread)?;
     // a hint only: the job is submitted either way
     let warnings = build_warnings(&spec);
-    for warning in &warnings {
-        eprintln!("warning: {warning}");
-    }
     let body = json!({
         "job_id": job_id,
         "spec": spec,
@@ -305,6 +302,11 @@ async fn submit(
         "after": after,
     });
     let mut value = post_retry(client, "/v1/resource/jobs", &body).await?;
+    // printed only once the submit succeeds, so a refusal's stderr stays the
+    // one structured error that `--json` promises
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
     if !warnings.is_empty() {
         value["warnings"] = json!(warnings);
     }

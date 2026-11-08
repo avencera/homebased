@@ -588,6 +588,16 @@ fn a_chip_ref_two_messages_reuse_reads_through_the_message_of_the_caller() {
     let body = ok(&out);
     assert_eq!(body["threads"][0]["t3_thread"], ALPHA, "{body}");
 
+    // newer repeats of one target never hide the older one that makes the ref ambiguous
+    for repeat in 0..70 {
+        message(
+            &format!("message-beta-{repeat}"),
+            "mcp:launch:elsewhere",
+            "2026-10-02T22:00:00Z",
+            BETA,
+        );
+    }
+
     // with no carrying message to go by, two targets are a question, not a guess
     let out = h.thread_cmd(None, &["context", &chip]);
     refused(&out, 5, "thread_ref_ambiguous");

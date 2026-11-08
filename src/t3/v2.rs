@@ -128,12 +128,14 @@ const CARRIED_CHIP_SQL: &str = chip_records_sql!(
      ORDER BY updated_at DESC, message_id DESC LIMIT 200",
     "ORDER BY m.updated_at DESC, m.message_id DESC LIMIT 1"
 );
-// with no carrier, every target the ref names in recent user messages; a
-// backward rowid scan stops after the newest ones, however long the history
+// with no carrier, every distinct target the ref names in any user message;
+// the scan is complete, since a capped one could miss the older target that
+// makes the ref ambiguous, and grouping comes before the limit so repeats of
+// one target never crowd out another
+// a full scan reads 7183 user messages (12 MB) in 30 ms
 const ANY_CHIP_SQL: &str = chip_records_sql!(
-    "SELECT payload_json FROM orchestration_v2_projection_messages
-     WHERE role = 'user' ORDER BY rowid DESC LIMIT 5000",
-    "LIMIT 64"
+    "SELECT payload_json FROM orchestration_v2_projection_messages WHERE role = 'user'",
+    "GROUP BY 1, 2 LIMIT 16"
 );
 const LEGACY_TABLE_SQL: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_session_runtime'";
@@ -383,8 +385,8 @@ fn has_legacy_table(db: &Connection) -> Result<bool, String> {
 /// `carrier`, the T3 thread whose message carried the chip, the result is the
 /// target of that thread's newest user message with the record. Otherwise,
 /// or when none of its recent messages has it, it is every distinct target
-/// the id names in recent user messages, for the caller to accept only when
-/// there is one
+/// the id names in any user message, for the caller to accept only when there
+/// is one
 pub(super) fn chip_targets(
     path: &Path,
     context: &str,
@@ -408,20 +410,10 @@ pub(super) fn chip_targets(
         return Ok(vec![carried]);
     }
     let mut statement = db.prepare(ANY_CHIP_SQL).map_err(failed)?;
-    let rows = statement
+    statement
         .query_map([context], target)
         .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-        .map_err(failed)?;
-    let mut targets: Vec<super::ChipTarget> = Vec::new();
-    for row in rows {
-        if !targets
-            .iter()
-            .any(|seen| seen.thread == row.thread && seen.environment == row.environment)
-        {
-            targets.push(row);
-        }
-    }
-    Ok(targets)
+        .map_err(failed)
 }
 
 /// Check that an existing state has the tables homebased reads

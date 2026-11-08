@@ -1021,3 +1021,29 @@ fn a_build_step_warns_at_submit_and_is_still_submitted() {
     );
     wait_state(&h, job, "succeeded");
 }
+
+#[test]
+fn a_refused_build_step_submit_leaves_only_the_json_error() {
+    let h = Harness::new();
+    let mut build_step = spec(&h, "medium", "wait", "cargo build --release");
+    build_step["resource"] = json!("no-such-gpu");
+    let path = h.home.join("refused-build.json");
+    fs::write(&path, serde_json::to_vec(&build_step).unwrap()).unwrap();
+    let output = h
+        .cmd()
+        .args(["--json", "resource", "job", "submit", "--job-id"])
+        .arg(JobId::new().to_string())
+        .arg("--spec")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    // the build warning comes only with a submitted job, never before an error
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|failure| {
+        panic!(
+            "stderr is not one JSON error ({failure}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(error["error"]["code"].is_string(), "{error}");
+}
