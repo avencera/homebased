@@ -286,6 +286,20 @@ pub(crate) async fn resolve(
                 (ThreadRef::Id(thread.to_string()), Some(machine), false)
             }
         };
+        // a task's thread is where its task says, so a `--machine` that names
+        // another machine can only be a mistake; a reference takes `only` as is
+        if let (Some(only), Some(found)) = (only, machine)
+            && only != found
+        {
+            let on = if found == local {
+                state.machine.name.to_string()
+            } else {
+                peer_name(&peers, found)
+            };
+            return Err(AppError::Usage {
+                message: format!("{text} is on {on}, not the machine --machine names"),
+            });
+        }
         wanted.push(Wanted {
             text,
             reference,
@@ -302,10 +316,12 @@ pub(crate) async fn resolve(
         })
         .collect();
     let asks_children = children_of.is_some();
+    // the caller's T3 thread is here whatever `--machine` names, so the parent
+    // is always read here; `--machine` only picks whose children are listed
     let children_here = children_of
         .clone()
-        .filter(|_| only.is_none_or(|machine| machine == local))
         .map(|(caller, live)| ChildrenOf::Caller(caller, live));
+    let children_local = only.is_none_or(|machine| machine == local);
     let mut matches: Vec<Vec<ThreadContext>> = vec![Vec::new(); wanted.len()];
     let mut children = Vec::new();
     let mut parent = children_of
@@ -335,7 +351,9 @@ pub(crate) async fn resolve(
         for (index, result) in indexes.into_iter().zip(results) {
             matches[index] = result;
         }
-        children.extend(found_children);
+        if children_local {
+            children.extend(found_children);
+        }
         parent = parent.or(found_parent);
     }
 

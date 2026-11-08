@@ -48,7 +48,8 @@ pub enum ThreadCommand {
         /// With --children, leave out settled and archived children
         #[arg(long, requires = "children")]
         live: bool,
-        /// Look only on this machine name or UUID
+        /// Look only on this machine name or UUID; with --children, list
+        /// only its children
         #[arg(long)]
         machine: Option<String>,
         /// The origin thread of this task
@@ -84,7 +85,8 @@ pub enum ThreadCommand {
         /// Watch the calling thread's live T3 subagents too, never its forks
         #[arg(long)]
         children: bool,
-        /// Look only on this machine name or UUID
+        /// Look only on this machine name or UUID; with --children, list
+        /// only its children
         #[arg(long)]
         machine: Option<String>,
         /// The origin thread of this task

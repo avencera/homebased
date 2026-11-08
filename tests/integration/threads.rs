@@ -192,7 +192,9 @@ fn a_terminal_session_is_found_by_id_or_prefix_but_never_compacted() {
     let h = Harness::new();
     h.terminal_session(TERMINAL, 300_000);
 
-    for reference in [TERMINAL, &TERMINAL[..8]] {
+    // a prefix matches a session id in either case, as a full id does
+    let upper = TERMINAL[..8].replace('e', "E");
+    for reference in [TERMINAL, &TERMINAL[..8], &upper] {
         let body = ok(&h.thread_cmd(None, &["context", reference]));
         let thread = &body["threads"][0];
         assert_eq!(thread["reference"], reference, "{body}");
@@ -408,11 +410,15 @@ fn a_message_retry_reaches_the_thread_its_first_attempt_bound() {
     let message_id = uuid::Uuid::now_v7().to_string();
     let send = || {
         h.cmd()
-            .env("CODEX_THREAD_ID", THREAD)
+            // with an explicit source, a send by thread reference reads no
+            // session variable, so a malformed one must not stop it
+            .env("CODEX_THREAD_ID", "not-a-thread")
             .args([
                 "--json",
                 "message",
                 "send",
+                "--source-thread",
+                THREAD,
                 "--machine",
                 &machine,
                 "--thread",
@@ -613,4 +619,111 @@ fn a_chip_ref_two_messages_reuse_reads_through_the_message_of_the_caller() {
         [format!("thread_{ALPHA}"), format!("thread_{BETA}")],
         "{error}"
     );
+}
+
+#[test]
+fn a_watch_whose_callback_can_no_longer_run_settles_each_event_as_failed() {
+    let mut h = Harness::new();
+    h.terminal_session(TERMINAL, 300_000);
+    let gone = h.user_home.join("gone");
+    fs::create_dir_all(&gone).unwrap();
+    let out = h
+        .cmd()
+        .current_dir(&gone)
+        .env("CODEX_THREAD_ID", THREAD)
+        .args([
+            "--json",
+            "thread",
+            "watch",
+            TERMINAL,
+            "--context-above",
+            "100k",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    let watch = ok(&out)["watches"][0]["watch"].as_str().unwrap().to_owned();
+    // the agent's directory is removed before any event reaches it
+    fs::remove_dir_all(&gone).unwrap();
+    // a fresh daemon scans its watches at once instead of a minute on
+    h.restart_daemon();
+
+    // the fired event settles as failed rather than retrying forever, so the
+    // end event queued behind it settles too
+    let db = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+    let settled = || -> Vec<(i64, Option<String>)> {
+        let mut statement = db
+            .prepare(
+                "SELECT seq, delivery FROM thread_watch_events
+                 WHERE watch_id = ?1 AND settled_at IS NOT NULL ORDER BY seq",
+            )
+            .unwrap();
+        statement
+            .query_map([&watch], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert!(
+        wait_until(Duration::from_secs(20), || settled().len() == 2),
+        "{:?}",
+        settled()
+    );
+    assert_eq!(
+        settled(),
+        vec![(1, Some("failed".into())), (2, Some("failed".into()))]
+    );
+    assert!(h.queue_messages().is_empty(), "{:?}", h.queue_messages());
+}
+
+#[test]
+fn a_codex_follow_up_reads_as_running_while_it_resumes_the_thread() {
+    const WORKER: &str = "01a0e487-b877-76e2-9dc2-806bff0bf6a1";
+    let h = Harness::new();
+    let cwd = h.user_home.join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    h.set_control("stdout", &format!("session id: {WORKER}\n"));
+    let first = h.submit(&Harness::spec_with_cwd("codex", "start", &cwd));
+    h.wait_status(&first, "succeeded");
+    // its rollout's last request was long enough ago to read as idle
+    h.codex_session(WORKER, &cwd, 50_000);
+    assert_eq!(
+        ok(&h.thread_cmd(None, &["context", WORKER]))["threads"][0]["state"],
+        "idle"
+    );
+
+    // the follow-up records the thread only when it exits, so until then
+    // only its resume target ties it to the thread
+    h.set_control("sleep", "30");
+    let out = h
+        .cmd()
+        .args(["--json", "task", "followup", &first, "--message", "more"])
+        .args(["--thread", THREAD])
+        .output()
+        .unwrap();
+    let followup = ok(&out)["id"].as_str().unwrap().to_owned();
+    h.wait_status(&followup, "running");
+    let thread = &ok(&h.thread_cmd(None, &["context", WORKER]))["threads"][0];
+    assert_eq!(thread["host"], "worker", "{thread}");
+    assert_eq!(thread["state"], "running", "{thread}");
+}
+
+#[test]
+fn a_running_claude_worker_without_a_transcript_is_found_and_live() {
+    let h = Harness::new();
+    // a worker saves no transcript unless the spec asks it to
+    h.set_control("sleep", "30");
+    let task = h.submit(&Harness::spec("claude", "work"));
+    h.wait_status(&task, "running");
+
+    for selector in [vec!["--worker", task.as_str()], vec![task.as_str()]] {
+        let mut args = vec!["context"];
+        args.extend(selector);
+        let thread = &ok(&h.thread_cmd(None, &args))["threads"][0];
+        assert_eq!(thread["host"], "worker", "{thread}");
+        assert_eq!(thread["provider"], "claude", "{thread}");
+        assert_eq!(thread["state"], "running", "{thread}");
+        // a watch on it must not end at once as session_gone
+        assert_eq!(thread["session_exists"], true, "{thread}");
+    }
 }

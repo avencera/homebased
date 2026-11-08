@@ -17,7 +17,7 @@ use crate::machine::MachineId;
 use crate::store::WorkerThread;
 use crate::t3::{ProviderThread, T3Env, T3Thread, environment_id, thread_index};
 use crate::thread_ref::{
-    ACTIVE_WITHOUT_T3, Caller, ThreadContext, ThreadHost, ThreadRef, ThreadState, t3_link,
+    ACTIVE_WITHOUT_T3, Caller, Provider, ThreadContext, ThreadHost, ThreadRef, ThreadState, t3_link,
 };
 use crate::thread_title::TitleSources;
 
@@ -147,26 +147,41 @@ impl LocalIndex {
                             add(Found::Session(ProviderThread::Claude(session)));
                         } else if self.rollouts().ids().any(|id| id == session) {
                             add(Found::Session(ProviderThread::Codex(session)));
+                        } else if let Some(worker) = self.worker(session) {
+                            // a Claude worker saves no transcript unless asked,
+                            // yet its task knows the session it runs
+                            add(Found::Session(match worker.provider {
+                                Provider::Claude => ProviderThread::Claude(session),
+                                Provider::Codex => ProviderThread::Codex(session),
+                            }));
                         }
                     }
                 } else if prefixes && let Some(prefix) = reference.uuid_prefix() {
+                    // a session id prints in lowercase, while a T3 id is opaque
+                    // and keeps its case
+                    let session_prefix = prefix.to_ascii_lowercase();
+                    let session_prefix = session_prefix.as_str();
                     let mut owned = HashSet::new();
                     for (index, t3) in self.t3.iter().enumerate() {
                         let session = t3.session.map(ProviderThread::id);
                         owned.extend(session);
                         let session_matches =
-                            session.is_some_and(|id| id.to_string().starts_with(prefix));
+                            session.is_some_and(|id| id.to_string().starts_with(session_prefix));
                         if t3.id.starts_with(prefix) || session_matches {
                             add(Found::T3(index));
                         }
                     }
                     for session in self.claude_sessions() {
-                        if !owned.contains(session) && session.to_string().starts_with(prefix) {
+                        if !owned.contains(session)
+                            && session.to_string().starts_with(session_prefix)
+                        {
                             add(Found::Session(ProviderThread::Claude(*session)));
                         }
                     }
                     for session in self.rollouts().ids() {
-                        if !owned.contains(&session) && session.to_string().starts_with(prefix) {
+                        if !owned.contains(&session)
+                            && session.to_string().starts_with(session_prefix)
+                        {
                             add(Found::Session(ProviderThread::Codex(session)));
                         }
                     }
@@ -203,6 +218,16 @@ impl LocalIndex {
             .collect()
     }
 
+    /// The task worker of `session`; follow-ups share a Codex thread, and the
+    /// one that runs is the one whose state counts
+    fn worker(&self, session: ThreadId) -> Option<&WorkerThread> {
+        self.sources
+            .workers
+            .iter()
+            .filter(|worker| worker.thread == session)
+            .max_by_key(|worker| worker.running)
+    }
+
     fn context(&self, found: Found) -> ThreadContext {
         let (t3, session) = match found {
             Found::T3(index) => (Some(&self.t3[index]), self.t3[index].session),
@@ -213,20 +238,19 @@ impl LocalIndex {
             ProviderThread::Codex(id) => self.rollouts().context(id),
         });
         let session_id = session.map(ProviderThread::id);
-        // usage needs a request in the tail, so it cannot tell a missing record apart
-        let session_exists = session.map(|session| match session {
-            ProviderThread::Claude(id) => {
-                usage.is_some() || ContextUse::claude_transcript_exists(self.home(), id)
-            }
-            ProviderThread::Codex(id) => {
-                usage.is_some() || self.rollouts().ids().any(|known| known == id)
-            }
-        });
-        let worker = session_id.and_then(|id| {
-            self.sources
-                .workers
-                .iter()
-                .find(|worker| worker.thread == id)
+        let worker = session_id.and_then(|id| self.worker(id));
+        // usage needs a request in the tail, so it cannot tell a missing record
+        // apart; a running worker's session is live with or without one
+        let session_exists = session.map(|session| {
+            worker.is_some_and(|worker| worker.running)
+                || match session {
+                    ProviderThread::Claude(id) => {
+                        usage.is_some() || ContextUse::claude_transcript_exists(self.home(), id)
+                    }
+                    ProviderThread::Codex(id) => {
+                        usage.is_some() || self.rollouts().ids().any(|known| known == id)
+                    }
+                }
         });
         let waiting = session_id.is_some_and(|id| self.sources.waiting.contains(&id));
         let host = match (t3, worker) {
@@ -410,6 +434,7 @@ mod tests {
                 thread: WORKER.parse().unwrap(),
                 task: TaskId::new(),
                 running: true,
+                provider: crate::thread_ref::Provider::Codex,
             }],
             waiting: HashSet::from([SESSION_A.parse::<ThreadId>().unwrap()]),
             titles: None,

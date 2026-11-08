@@ -60,7 +60,12 @@ impl ThreadRef {
     ///
     /// `usage` for empty text or a link without a thread
     pub fn parse(text: &str) -> Result<Self, AppError> {
-        let text = text.trim();
+        let mut text = text.trim();
+        // the `threadId:` line of a `<t3_context>` block, copied with its label;
+        // a loop, since a peer's reference can repeat the label without bound
+        while let Some(thread) = text.strip_prefix("threadId:") {
+            text = thread.trim();
+        }
         let usage = |message: String| AppError::Usage { message };
         if text.is_empty() {
             return Err(usage("a thread reference cannot be empty".into()));
@@ -80,10 +85,6 @@ impl ThreadRef {
             return Ok(Self::Chip {
                 context: context.to_owned(),
             });
-        }
-        // the `threadId:` line of a `<t3_context>` block, copied with its label
-        if let Some(thread) = text.strip_prefix("threadId:").map(str::trim) {
-            return Self::parse(thread);
         }
         for prefix in [T3_LINK_PREFIX, T3_LAUNCH_LINK_PREFIX] {
             if let Some(rest) = text.strip_prefix(prefix) {
@@ -225,12 +226,19 @@ impl Caller {
     /// `usage` when a session variable is set but is not a UUID
     pub fn from_env() -> Result<Self, AppError> {
         Ok(Self {
-            t3_thread: std::env::var(T3_THREAD_ENV)
-                .ok()
-                .map(|id| id.trim().to_owned())
-                .filter(|id| !id.is_empty()),
+            t3_thread: Self::t3_thread_from_env(),
             session: crate::domain::session_thread()?,
         })
+    }
+
+    /// Only the caller's T3 thread, for a command that must not fail on a
+    /// session variable it never needs
+    #[must_use]
+    pub fn t3_thread_from_env() -> Option<String> {
+        std::env::var(T3_THREAD_ENV)
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
     }
 
     /// The caller's own thread as a reference, for a command given none
@@ -593,6 +601,14 @@ mod tests {
         );
         assert!(ThreadRef::parse("t3-thread://v2/env-only").is_err());
         assert!(ThreadRef::parse("  ").is_err());
+        assert!(ThreadRef::parse("threadId: ").is_err());
+    }
+
+    #[test]
+    fn a_label_repeated_past_any_stack_depth_parses() {
+        // about the 2 MB a peer can send, which overflowed a recursive parse
+        let text = format!("{}thread_x", "threadId:".repeat(240_000));
+        assert_eq!(ThreadRef::parse(&text).unwrap(), t3("x"));
     }
 
     #[test]

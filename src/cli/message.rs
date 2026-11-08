@@ -185,7 +185,9 @@ fn target(destination: Destination) -> Result<MessageTarget, AppError> {
             Ok(MessageTarget::Reference {
                 machine,
                 reference,
-                carried_by: crate::thread_ref::Caller::from_env()?.t3_thread,
+                // a chip needs only the T3 thread, and a malformed session
+                // variable must not stop a send that never reads it
+                carried_by: crate::thread_ref::Caller::t3_thread_from_env(),
             })
         }
         (Some(machine), None, Some(cwd), None, None) => Ok(MessageTarget::Machine {

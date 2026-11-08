@@ -18,9 +18,10 @@ use crate::daemon::compaction_log::Trigger;
 use crate::domain::API_VERSION;
 use crate::machine::MachineId;
 use crate::store::{WatchRecord, WatchUpdate};
-use crate::thread_ref::{ThreadContext, ThreadHost, ThreadState};
+use crate::thread_ref::{Provider, ThreadContext, ThreadHost, ThreadState};
 use crate::thread_watch::{
-    CompactOutcome, ThreadWatch, WatchAction, WatchEndReason, WatchEventKind, WatchTarget,
+    CompactOutcome, ThreadWatch, Threshold, WatchAction, WatchEndReason, WatchEventKind,
+    WatchTarget,
 };
 
 /// Check every live watch once
@@ -125,6 +126,12 @@ fn decide<'a>(record: &WatchRecord, matches: &'a [ThreadContext]) -> Decision<'a
             return Decision::End(WatchEndReason::SessionGone, Some(thread));
         }
         _ => {}
+    }
+    // the watch refuses a percent limit on a Claude thread, but a T3 thread
+    // can start on Claude after the watch is made, and then it never fires
+    if matches!(watch.threshold, Threshold::Percent(_)) && thread.provider == Some(Provider::Claude)
+    {
+        return Decision::End(WatchEndReason::NoContextWindow, Some(thread));
     }
 
     // only a known reading on one side of the limit moves the watch: a missing
@@ -329,6 +336,10 @@ fn next_action(
         (WatchEventKind::Ended, Some(WatchEndReason::Unwatched)) => {
             "The watch was removed; nothing more will arrive for it".into()
         }
+        (WatchEventKind::Ended, Some(WatchEndReason::NoContextWindow)) => format!(
+            "The watch ended because the thread runs Claude Code, which records no context window for a percent limit. Watch {} again with a token count, such as `--context-above 150k`",
+            watch.reference
+        ),
         (WatchEventKind::Ended, reason) => {
             let why = match reason {
                 Some(WatchEndReason::Archived) => "the T3 thread was archived",
@@ -622,6 +633,52 @@ mod tests {
         assert_eq!(
             decide(&fired, &reading(Some(99_999), None)),
             Decision::Rearm
+        );
+    }
+
+    #[test]
+    fn a_percent_watch_ends_once_its_thread_runs_claude() {
+        let local = MachineId::new();
+        let mut watch = watch(
+            ThreadId(uuid::Uuid::now_v7()),
+            WatchTarget::T3 {
+                machine: local,
+                t3_thread: "mcp:launch:feed".into(),
+            },
+            false,
+        );
+        watch.threshold = Threshold::Percent(80);
+        let record = WatchRecord {
+            watch,
+            armed: true,
+            seq: 0,
+            ended_at: None,
+            end_reason: None,
+        };
+        // no session yet, so no provider: the watch waits for the first turn
+        let fresh = [thread(local, 0, ThreadState::Idle)];
+        assert_eq!(decide(&record, &fresh), Decision::Unchanged);
+        let mut claude = fresh[0].clone();
+        claude.provider = Some(crate::thread_ref::Provider::Claude);
+        let claude = [claude];
+        assert_eq!(
+            decide(&record, &claude),
+            Decision::End(WatchEndReason::NoContextWindow, Some(&claude[0]))
+        );
+        let update = ended(
+            local,
+            &record,
+            WatchEndReason::NoContextWindow,
+            Some(&claude[0]),
+        );
+        let payload = &update.events[0].1;
+        assert_eq!(payload["reason"], "no_context_window");
+        assert!(
+            payload["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("--context-above 150k"),
+            "{payload}"
         );
     }
 

@@ -1,8 +1,9 @@
 //! `homebased thread` across machines: watch scans and child lookups that a
 //! peer answers
 
-use super::{Daemon, add_peer, wait_until};
+use super::{Daemon, add_peer, remote_spec, submit_file, wait_until};
 use chrono::{Duration as ChronoDuration, Utc};
+use homebased::submission::RequestId;
 use serde_json::{Value, json};
 use std::fs;
 use std::process::Output;
@@ -141,6 +142,141 @@ fn a_children_lookup_names_the_machines_that_did_not_answer() {
     assert_eq!(error["error"]["retryable"], true);
     let listed = ok(&thread_cmd(&origin, &caller, &["watches"]));
     assert!(listed["watches"].as_array().unwrap().is_empty(), "{listed}");
+}
+
+/// T3's state on `daemon` with the tables homebased reads, empty
+fn t3_state(daemon: &Daemon) -> rusqlite::Connection {
+    let userdata = daemon.user_home.join(".t3/userdata");
+    fs::create_dir_all(&userdata).unwrap();
+    let db = rusqlite::Connection::open(userdata.join("statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orchestration_v2_projection_threads (
+            thread_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL DEFAULT 'project',
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '2026-10-02T19:00:00Z',
+            default_provider TEXT NOT NULL DEFAULT 'codex',
+            active_provider_thread_id TEXT,
+            provider_instance_id TEXT,
+            archived_at TEXT,
+            deleted_at TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE TABLE IF NOT EXISTS projection_projects (
+            project_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            workspace_root TEXT NOT NULL,
+            deleted_at TEXT,
+            default_model_selection_json TEXT
+         );
+         CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_threads (
+            provider_thread_id TEXT PRIMARY KEY,
+            thread_id TEXT,
+            provider TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            driver TEXT,
+            provider_instance_id TEXT
+         );
+         CREATE TABLE IF NOT EXISTS orchestration_v2_projection_runs (
+            run_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'codex',
+            status TEXT NOT NULL,
+            requested_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+            payload_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS orchestration_v2_projection_messages (
+            message_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+            updated_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+            payload_json TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn children_on_a_named_peer_are_found_for_a_caller_known_only_by_its_session() {
+    const PARENT: &str = "mcp:launch:orchestrator";
+    let (origin, peer) = pair("children-named-peer");
+    // the caller's T3 thread is on the origin, where T3 runs it in CALLER
+    let here = t3_state(&origin);
+    here.execute(
+        "INSERT INTO orchestration_v2_projection_threads
+         (thread_id, title, active_provider_thread_id, provider_instance_id)
+         VALUES (?1, 'orchestrator', 'provider-thread:caller', 'codex')",
+        [PARENT],
+    )
+    .unwrap();
+    here.execute(
+        "INSERT INTO orchestration_v2_projection_provider_threads
+         (provider_thread_id, thread_id, provider, driver, provider_instance_id, updated_at, payload_json)
+         VALUES ('provider-thread:caller', ?1, 'codex', 'codex', 'codex', '2026-10-02T20:00:00Z', ?2)",
+        rusqlite::params![
+            PARENT,
+            json!({ "nativeThreadRef": { "driver": "codex", "nativeId": CALLER } }).to_string()
+        ],
+    )
+    .unwrap();
+    // its subagent runs on the peer
+    t3_state(&peer)
+        .execute(
+            "INSERT INTO orchestration_v2_projection_threads (thread_id, title, payload_json)
+             VALUES ('mcp:launch:delegate', 'delegate', ?1)",
+            [json!({
+                "lineage": { "parentThreadId": PARENT, "relationshipToParent": "subagent" }
+            })
+            .to_string()],
+        )
+        .unwrap();
+
+    // no T3CODE_THREAD_ID, which an empty value stands for even when the test
+    // itself runs in T3: the parent comes from the caller's session here
+    let body = ok(&thread_cmd(
+        &origin,
+        &[("CODEX_THREAD_ID", CALLER), ("T3CODE_THREAD_ID", "")],
+        &[
+            "context",
+            "--children",
+            "--machine",
+            "children-named-peer-peer",
+        ],
+    ));
+    let children = body["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "{body}");
+    assert_eq!(children[0]["t3_thread"], "mcp:launch:delegate", "{body}");
+    assert_eq!(body["children_complete"], true, "{body}");
+}
+
+#[test]
+fn a_task_thread_on_another_machine_than_machine_names_is_refused() {
+    let (origin, _peer) = pair("task-machine");
+    // the task's thread is a Codex session on the origin, which submit registers
+    let submitted = submit_file(
+        &origin,
+        &remote_spec(&origin, vec!["true"]),
+        RequestId::new(),
+    );
+    let task = ok(&submitted)["id"].as_str().unwrap().to_owned();
+    let lookup = |machine: &str| {
+        thread_cmd(
+            &origin,
+            &[("T3CODE_THREAD_ID", "")],
+            &["context", "--task", &task, "--machine", machine],
+        )
+    };
+
+    let body = ok(&lookup("task-machine-origin"));
+    assert_eq!(body["threads"][0]["provider"], "codex", "{body}");
+    let out = lookup("task-machine-peer");
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{error}");
+    assert_eq!(error["error"]["code"], "usage", "{error}");
 }
 
 /// One raw HTTP/1.1 POST, as a browser page on the LAN would send it

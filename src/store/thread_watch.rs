@@ -281,14 +281,28 @@ pub struct WorkerThread {
     pub task: crate::domain::TaskId,
     /// Whether the task is queued or running
     pub running: bool,
+    /// Agent CLI of the worker, which only Claude and Codex workers record
+    pub provider: crate::thread_ref::Provider,
 }
 
 impl Store {
     /// Worker sessions of tasks on this machine
+    ///
+    /// Codex records its thread only at exit, but a follow-up resumes the
+    /// thread it names, so a running follow-up is that thread's worker from
+    /// the start. A Claude follow-up forks into its own session instead,
+    /// which it records at launch
     pub fn worker_threads(&self) -> Result<Vec<WorkerThread>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT worker_thread, id, status IN ('queued', 'running') FROM tasks
-             WHERE worker_thread IS NOT NULL",
+            "SELECT thread, id, running, claude FROM (
+                 SELECT COALESCE(worker_thread,
+                            CASE WHEN json_extract(workload_json, '$.type') = 'agent'
+                                  AND json_extract(workload_json, '$.agent') = 'codex'
+                                THEN json_extract(workload_json, '$.resume_thread') END) AS thread,
+                        id, status IN ('queued', 'running') AS running,
+                        COALESCE(json_extract(workload_json, '$.agent') = 'claude', 0) AS claude
+                 FROM tasks)
+             WHERE thread IS NOT NULL",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -296,17 +310,23 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         // a row whose ids do not parse names no session that can be looked up
         Ok(rows
             .into_iter()
-            .filter_map(|(thread, task, running)| {
+            .filter_map(|(thread, task, running, claude)| {
                 Some(WorkerThread {
                     thread: thread.parse().ok()?,
                     task: task.parse().ok()?,
                     running,
+                    provider: if claude {
+                        crate::thread_ref::Provider::Claude
+                    } else {
+                        crate::thread_ref::Provider::Codex
+                    },
                 })
             })
             .collect())

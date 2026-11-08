@@ -46,13 +46,13 @@ For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENT
 | `action` | `notify` or `compact`. |
 | `context` | `tokens`, `tokens_estimated`, `context_window`, `percent`, `state`, `last_active`, `cache_warm`, `compacted_at`, or `null` when the thread is gone. |
 | `compaction` | With `--action compact`: `outcome` (`started`, `not_found`, `refused`, `unavailable`) and `detail`. Otherwise `null`. |
-| `reason` | On `THREAD_WATCH_ENDED`: `once`, `unwatched`, `archived`, `deleted`, or `session_gone`. Otherwise `null`. |
+| `reason` | On `THREAD_WATCH_ENDED`: `once`, `unwatched`, `archived`, `deleted`, `session_gone`, or `no_context_window` (a percent watch whose thread runs Claude Code, which records no context window). Otherwise `null`. |
 | `next_action` | Suggested step, as a sentence. |
 
 | `event` | What happened | Do this |
 | --- | --- | --- |
 | `THREAD_CONTEXT_OVER` | The context climbed over the limit while the thread was not running a turn. It fires again only after a reading shows the context below the limit and it climbs back. | With `compaction.outcome: "started"`, nothing. Otherwise compact a T3 thread with `homebased thread compact <target.exact_reference>`, or hand its work to a fresh thread. Ask a session outside T3 to run `/compact`. |
-| `THREAD_WATCH_ENDED` | The watch's last event. | Nothing, unless `reason` is `archived`, `deleted`, or `session_gone` and the thread still matters; then watch its replacement. |
+| `THREAD_WATCH_ENDED` | The watch's last event. | Nothing, unless `reason` is `archived`, `deleted`, or `session_gone` and the thread still matters; then watch its replacement. For `no_context_window`, watch the thread again with a token count such as `--context-above 150k`. |
 
 ## Event table
 

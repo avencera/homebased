@@ -122,12 +122,14 @@ impl FromStr for Threshold {
             (text.as_str(), 1.0)
         };
         let value: f64 = number.trim().parse().map_err(|_| usage())?;
-        if !value.is_finite() || value <= 0.0 || value * scale > 1e12 {
+        let tokens = (value * scale).round();
+        // a fraction that rounds to no tokens would fire on any reading
+        if !tokens.is_finite() || tokens < 1.0 || tokens > 1e12 {
             return Err(usage());
         }
         // checked above to be a positive count well inside u64
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Ok(Self::Tokens((value * scale).round() as u64))
+        Ok(Self::Tokens(tokens as u64))
     }
 }
 
@@ -217,6 +219,9 @@ pub enum WatchEndReason {
     Deleted,
     /// The watched session has no transcript or rollout any more
     SessionGone,
+    /// A percent watch reached a thread that runs Claude Code, which records
+    /// no context window to take the percent of
+    NoContextWindow,
 }
 
 /// Kind of a watch event
@@ -340,6 +345,7 @@ fn end_reason_str(reason: WatchEndReason) -> &'static str {
         WatchEndReason::Archived => "archived",
         WatchEndReason::Deleted => "deleted",
         WatchEndReason::SessionGone => "session_gone",
+        WatchEndReason::NoContextWindow => "no_context_window",
     }
 }
 
@@ -475,7 +481,7 @@ mod tests {
         assert_eq!(parse("150k"), Some(Threshold::Tokens(150_000)));
         assert_eq!(parse("1.2M"), Some(Threshold::Tokens(1_200_000)));
         assert_eq!(parse("80%"), Some(Threshold::Percent(80)));
-        for bad in ["0", "-5k", "120%", "0%", "lots", ""] {
+        for bad in ["0", "0.1", "0.0004k", "-5k", "120%", "0%", "lots", ""] {
             assert_eq!(parse(bad), None, "{bad}");
         }
         assert_eq!(Threshold::Percent(80).limit(Some(258_400)), Some(206_720));

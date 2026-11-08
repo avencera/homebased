@@ -3,7 +3,9 @@
 //! A connected `homebased wait` on the watch takes each event first; otherwise
 //! it goes to the caller like a task callback. An event settles once it is
 //! printed or delivered, and a refused delivery settles as failed so the
-//! events after it still go out
+//! events after it still go out. Like a task's inbox, a saved callback that
+//! can no longer run settles at once, and a retryable failure settles after
+//! [`MAX_ATTEMPTS`]
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -14,6 +16,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
 use super::Retry;
+use crate::callback::check_saved_callback;
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
@@ -22,29 +25,58 @@ use crate::events::DeliveryOutcome;
 use crate::thread_watch::{ThreadWatch, WatchEvent, WatchId};
 
 const MAX_SENDERS: usize = 8;
+/// Retryable failures one event may have before it settles as failed, as in
+/// a task's inbox
+const MAX_ATTEMPTS: u32 = 3;
+
+/// How an attempt that did not settle its event ended
+enum Unsettled {
+    /// A failure that spends one of the event's attempts
+    Retryable(String),
+    /// The caller cannot take the event yet, or the daemon could not try
+    Later(String),
+}
+
+impl From<AppError> for Unsettled {
+    fn from(error: AppError) -> Self {
+        Self::Later(error.to_string())
+    }
+}
 
 /// Send committed watch events for as long as the daemon runs
 pub(crate) async fn run(state: AppState) {
     let mut active: HashSet<WatchId> = HashSet::new();
     let mut retries: HashMap<WatchId, Retry> = HashMap::new();
+    // retryable failures of the event each watch is on, by its seq; kept in
+    // memory, so a restart grants a fresh budget
+    let mut attempts: HashMap<WatchId, (u64, u32)> = HashMap::new();
     let mut workers = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if let Err(error) = schedule(&state, &mut active, &retries, &mut workers).await {
+                if let Err(error) = schedule(&state, &mut active, &retries, &attempts, &mut workers).await {
                     warn!("watch event scan: {error}");
                 }
             }
             result = workers.join_next(), if !workers.is_empty() => {
-                if let Some(Ok((watch, result))) = result {
+                if let Some(Ok((watch, seq, result))) = result {
                     active.remove(&watch);
                     match result {
                         Ok(()) => {
                             retries.remove(&watch);
+                            attempts.remove(&watch);
                         }
-                        Err(error) => {
+                        Err(unsettled) => {
+                            let error = match unsettled {
+                                Unsettled::Retryable(error) => {
+                                    let spent = spent(&attempts, watch, seq);
+                                    attempts.insert(watch, (seq, spent + 1));
+                                    error
+                                }
+                                Unsettled::Later(error) => error,
+                            };
                             warn!(%watch, "watch event delivery deferred: {error}");
                             let retry = Retry::after_failure(retries.get(&watch).copied(), Instant::now());
                             retries.insert(watch, retry);
@@ -56,11 +88,22 @@ pub(crate) async fn run(state: AppState) {
     }
 }
 
+/// Retryable failures the event `seq` of `watch` has had
+fn spent(attempts: &HashMap<WatchId, (u64, u32)>, watch: WatchId, seq: u64) -> u32 {
+    attempts
+        .get(&watch)
+        .filter(|(on, _)| *on == seq)
+        .map_or(0, |(_, spent)| *spent)
+}
+
+type Attempt = (WatchId, u64, Result<(), Unsettled>);
+
 async fn schedule(
     state: &AppState,
     active: &mut HashSet<WatchId>,
     retries: &HashMap<WatchId, Retry>,
-    workers: &mut JoinSet<(WatchId, Result<(), AppError>)>,
+    attempts: &HashMap<WatchId, (u64, u32)>,
+    workers: &mut JoinSet<Attempt>,
 ) -> Result<(), AppError> {
     let pending = call(&state.store, |reply| StoreMsg::PendingWatchEvents { reply }).await?;
     for (watch, event) in pending {
@@ -76,27 +119,26 @@ async fn schedule(
             continue;
         }
         active.insert(id);
+        let last = spent(attempts, id, event.seq) + 1 >= MAX_ATTEMPTS;
         let state = state.clone();
         workers.spawn(async move {
-            let result = std::panic::AssertUnwindSafe(deliver(&state, &watch, &event))
+            let result = std::panic::AssertUnwindSafe(deliver(&state, &watch, &event, last))
                 .catch_unwind()
                 .await
-                .unwrap_or_else(|_| {
-                    Err(AppError::Internal {
-                        message: "watch delivery worker panicked".into(),
-                    })
-                });
-            (id, result)
+                .unwrap_or_else(|_| Err(Unsettled::Later("watch delivery worker panicked".into())));
+            (id, event.seq, result)
         });
     }
     Ok(())
 }
 
+/// Try one event; with `last`, a retryable failure settles it as failed
 async fn deliver(
     state: &AppState,
     watch: &ThreadWatch,
     event: &WatchEvent,
-) -> Result<(), AppError> {
+    last: bool,
+) -> Result<(), Unsettled> {
     let callback = call(&state.supervisor, |reply| SupervisorMsg::GetCallback {
         reply,
     })
@@ -114,17 +156,26 @@ async fn deliver(
         let _ = callback.cast(CallbackMsg::Delivered {
             thread: watch.caller,
         });
-        return settle("printed").await;
+        return Ok(settle("printed").await?);
     }
-    match deliver_watch_event(&state.home, watch, event, &callback).await? {
-        Some(DeliveryOutcome::Delivered) => settle("delivered").await,
-        None => settle("suppressed").await,
+    // a deleted cwd or Codex binary never comes back by retrying, and an
+    // unsettled event holds back every later one of its watch
+    let outcome = match check_saved_callback(&watch.callback) {
+        Err(message) => Some(DeliveryOutcome::Permanent(message)),
+        Ok(()) => deliver_watch_event(&state.home, watch, event, &callback).await?,
+    };
+    match outcome {
+        Some(DeliveryOutcome::Delivered) => Ok(settle("delivered").await?),
+        None => Ok(settle("suppressed").await?),
         Some(DeliveryOutcome::Permanent(message)) => {
             warn!(watch = %watch.id, seq = event.seq, "watch event cannot be delivered: {message}");
-            settle("failed").await
+            Ok(settle("failed").await?)
         }
-        Some(DeliveryOutcome::Retryable(message) | DeliveryOutcome::Deferred(message)) => {
-            Err(AppError::Internal { message })
+        Some(DeliveryOutcome::Retryable(message)) if last => {
+            warn!(watch = %watch.id, seq = event.seq, "watch event not delivered after {MAX_ATTEMPTS} attempts: {message}");
+            Ok(settle("failed").await?)
         }
+        Some(DeliveryOutcome::Retryable(message)) => Err(Unsettled::Retryable(message)),
+        Some(DeliveryOutcome::Deferred(message)) => Err(Unsettled::Later(message)),
     }
 }

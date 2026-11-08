@@ -384,8 +384,11 @@ with no record here works only in its
 `thread_<id>` form, and any other fails with `thread_not_found` and a hint to
 pass the `threadId` from the `<t3_context>` block. With none, the command uses the
 calling thread; `--task <id>` and `--worker <id>` name a task's origin thread
-or worker. Each command looks on this machine first, then asks every reachable
-Fleet machine about the references it did not find. Each daemon advertises its
+or worker, and a `--machine` naming another machine than the task's fails with
+`usage`. Each command looks on this machine first, then asks every reachable
+Fleet machine about the references it did not find. With `--children`,
+`--machine` limits only which machine's children are listed; the calling thread
+is always read here. Each daemon advertises its
 T3 environment id to Fleet peers, so a `t3-thread://` link goes straight to
 the machine that runs it. Only `thread context` accepts a UUID prefix of at
 least 4 characters. A reference that matches several threads fails with
@@ -428,10 +431,14 @@ T3 thread first, with trigger `watch`, and puts the outcome in the event. The
 watch ends with `THREAD_WATCH_ENDED` when it fired with `--once`, is removed
 with `thread unwatch`, or its thread is archived, deleted, or gone; a watch of
 a session ends once the session's record is gone, even while T3 still names
-it. A target on
+it, and a running task worker's session counts as live without one. A percent
+watch on a T3 thread that starts running Claude Code ends with reason
+`no_context_window`. A target on
 another machine is read through that machine on each check; while it does not
-answer, the watch is left as it was. Events are delivered like task events and
-deduplicated by `(watch, seq)`. The skill's
+answer, the watch is left as it was. Events are delivered like task events, in
+order per watch, and deduplicated by `(watch, seq)`. An event whose saved
+callback can no longer run, or that fails 3 times, is given up so later events
+still go out. The skill's
 [threads.md](.agents/skills/homebased/references/threads.md) has the payload.
 
 On the socket, `POST /v1/threads/context` resolves references and
@@ -873,7 +880,7 @@ to ignore duplicates.
 | `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started: a dependency ended, `task cancel` asked, or a newer task with the same `coalesce` key replaced it (`superseded`). |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
 | `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. |
-| `THREAD_WATCH_ENDED` | A watch's last event, with `reason`: `once`, `unwatched`, `archived`, `deleted`, or `session_gone`. |
+| `THREAD_WATCH_ENDED` | A watch's last event, with `reason`: `once`, `unwatched`, `archived`, `deleted`, `session_gone`, or `no_context_window` (a percent watch on a thread that runs Claude Code). |
 
 ### Direct messages
 
