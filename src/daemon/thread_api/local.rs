@@ -185,6 +185,17 @@ impl LocalIndex {
                             add(Found::Session(ProviderThread::Codex(session)));
                         }
                     }
+                    // a worker with no transcript or rollout yet, as for a whole id
+                    for worker in &self.sources.workers {
+                        if !owned.contains(&worker.thread)
+                            && worker.thread.to_string().starts_with(session_prefix)
+                        {
+                            add(Found::Session(match worker.provider {
+                                Provider::Claude => ProviderThread::Claude(worker.thread),
+                                Provider::Codex => ProviderThread::Codex(worker.thread),
+                            }));
+                        }
+                    }
                 }
             }
         }

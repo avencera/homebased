@@ -3,9 +3,9 @@
 //! A connected `homebased wait` on the watch takes each event first; otherwise
 //! it goes to the caller like a task callback. An event settles once it is
 //! printed or delivered, and a refused delivery settles as failed so the
-//! events after it still go out. Like a task's inbox, a saved callback that
-//! can no longer run settles at once, and a retryable failure settles after
-//! [`MAX_ATTEMPTS`]
+//! events after it still go out. A route that can no longer run, such as a
+//! `codex queue` whose binary is gone, settles at once, and a retryable
+//! failure settles after [`MAX_ATTEMPTS`]
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -16,7 +16,6 @@ use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
 use super::Retry;
-use crate::callback::check_saved_callback;
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
@@ -158,13 +157,10 @@ async fn deliver(
         });
         return Ok(settle("printed").await?);
     }
-    // a deleted cwd or Codex binary never comes back by retrying, and an
-    // unsettled event holds back every later one of its watch
-    let outcome = match check_saved_callback(&watch.callback) {
-        Err(message) => Some(DeliveryOutcome::Permanent(message)),
-        Ok(()) => deliver_watch_event(&state.home, watch, event, &callback).await?,
-    };
-    match outcome {
+    // the routes that run `codex queue` check the saved cwd and Codex binary
+    // themselves and settle a missing one as permanent; a Claude or T3 route
+    // needs neither, so no check runs before the route is chosen
+    match deliver_watch_event(&state.home, watch, event, &callback).await? {
         Some(DeliveryOutcome::Delivered) => Ok(settle("delivered").await?),
         None => Ok(settle("suppressed").await?),
         Some(DeliveryOutcome::Permanent(message)) => {

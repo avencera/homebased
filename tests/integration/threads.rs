@@ -716,7 +716,12 @@ fn a_running_claude_worker_without_a_transcript_is_found_and_live() {
     let task = h.submit(&Harness::spec("claude", "work"));
     h.wait_status(&task, "running");
 
-    for selector in [vec!["--worker", task.as_str()], vec![task.as_str()]] {
+    // the worker's session id is its task id, whole or as a prefix
+    for selector in [
+        vec!["--worker", task.as_str()],
+        vec![task.as_str()],
+        vec![&task[..8]],
+    ] {
         let mut args = vec!["context"];
         args.extend(selector);
         let thread = &ok(&h.thread_cmd(None, &args))["threads"][0];
