@@ -26,6 +26,7 @@ mod schema;
 mod task;
 #[cfg(test)]
 mod tests;
+mod thread_watch;
 mod usage;
 
 pub use admission::LocalAdmission;
@@ -36,6 +37,7 @@ pub use identity::IdentityError;
 pub use lifecycle::CancelResult;
 pub use presentation::{TaskOwners, TaskPresentation};
 pub use task::{NewTask, new_queued_task};
+pub use thread_watch::{WatchRecord, WatchUpdate, WorkerThread};
 
 /// Open or create the database
 pub struct Store {

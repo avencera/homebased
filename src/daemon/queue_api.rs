@@ -14,12 +14,14 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
+use super::api::views::DependencyView;
+use crate::dependency::TaskDependencies;
 use crate::domain::{API_VERSION, TaskEnv};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
 use crate::machine::MachineId;
-use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, OperationId, Placement, QueueError, ResourceLabel, ResourceName,
@@ -104,6 +106,59 @@ struct SubmitBody {
     spec: JobSpec,
     env: TaskEnv,
     callback_cwd: PathBuf,
+    /// Tasks on this origin that must succeed before the job is sent
+    #[serde(default)]
+    after: Option<TaskDependencies>,
+}
+
+/// A job the origin holds for its `after` tasks, or ended before it queued
+///
+/// The authority has not seen it, so the origin answers for it
+#[derive(Debug, Serialize)]
+pub(super) struct HeldJobView {
+    job_id: JobId,
+    name: String,
+    /// Machine whose queue it joins
+    machine: MachineId,
+    /// `held` until it is sent, then `cancelled` or `failed` if it ended first
+    state: &'static str,
+    after: Vec<DependencyView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ending: Option<HeldJobEnding>,
+    /// The ending for people
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// The origin's view of a job that has not reached its queue, or `None`
+/// once it was sent
+pub(super) async fn held_view(
+    state: &AppState,
+    route: &JobRoute,
+) -> Result<Option<HeldJobView>, AppError> {
+    let (state_name, ending) = match &route.submission {
+        JobSubmission::Held => ("held", None),
+        JobSubmission::Ended { ending } => match ending {
+            HeldJobEnding::Refused { .. } => ("failed", Some(ending.clone())),
+            HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested => {
+                ("cancelled", Some(ending.clone()))
+            }
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(HeldJobView {
+        job_id: route.job,
+        name: route.spec.name.to_string(),
+        machine: route.authority,
+        state: state_name,
+        after: super::dependencies::views(state, route.after.as_ref()).await?,
+        reason: ending.as_ref().map(HeldJobEnding::describe),
+        ending,
+    }))
+}
+
+fn held_response(view: HeldJobView) -> Value {
+    json!({ "api_version": API_VERSION, "job_id": view.job_id, "held": view })
 }
 
 #[derive(Deserialize)]
@@ -183,10 +238,36 @@ async fn show(
     Path(job): Path<JobId>,
     Query(query): Query<MachineQuery>,
 ) -> Result<Json<Value>, AppError> {
+    if let Some(view) = local_held_view(&state, job, query.machine.as_ref()).await? {
+        return Ok(Json(held_response(view)));
+    }
     let machine = job_authority(&state, job, query.machine.as_ref()).await?;
     forward(&state, machine, QueueRequest::Show { job })
         .await
         .map(Json)
+}
+
+/// This origin's view of `job` while it holds it, or `None` when it holds
+/// no such job or `selector` names a machine that is neither this one nor
+/// the job's queue
+///
+/// The queue has never seen a held job, so naming this machine or that queue
+/// still means the job held here
+async fn local_held_view(
+    state: &AppState,
+    job: JobId,
+    selector: Option<&MachineSelector>,
+) -> Result<Option<HeldJobView>, AppError> {
+    let Some(route) = call(&state.store, |reply| StoreMsg::JobRoute { job, reply }).await? else {
+        return Ok(None);
+    };
+    if let Some(selector) = selector {
+        let named = resolve_machine(state, Some(selector)).await?;
+        if named != state.machine.identity.machine && named != route.authority {
+            return Ok(None);
+        }
+    }
+    held_view(state, &route).await
 }
 
 async fn register(
@@ -219,6 +300,7 @@ async fn submit(
         Some(route) => {
             if route.origin != state.machine.identity.machine
                 || route.digest != body.spec.digest()?
+                || route.after != body.after
             {
                 return Err(QueueError::JobConflict { job: body.job_id }.into());
             }
@@ -233,6 +315,11 @@ async fn submit(
                 reply,
             })
             .await?;
+            // unknown, failed, and run tasks are refused before anything is saved
+            let held = match &body.after {
+                Some(after) => super::dependencies::must_wait(&state, after).await?,
+                None => false,
+            };
             let route = JobRoute {
                 job: body.job_id,
                 origin: state.machine.identity.machine,
@@ -246,7 +333,13 @@ async fn submit(
                     codex,
                 },
                 target: None,
-                submission: JobSubmission::Unknown,
+                submission: if held {
+                    JobSubmission::Held
+                } else {
+                    JobSubmission::Unknown
+                },
+                after: body.after,
+                owes_final_event: held,
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),
@@ -255,6 +348,17 @@ async fn submit(
             .await?
         }
     };
+    if let Some(view) = held_view(&state, &route).await? {
+        return Ok(Json(held_response(view)));
+    }
+    send_job(&state, route).await.map(Json)
+}
+
+/// Send a saved route to its authority and record the answer
+///
+/// The caller holds the job's submission lock. Resending is safe: the
+/// authority answers a job id it already stored with that job
+pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value, AppError> {
     if let JobSubmission::Rejected { error, status } = &route.submission {
         return Err(crate::client::map_error(
             axum::http::StatusCode::from_u16(*status).map_err(|error| AppError::Internal {
@@ -269,9 +373,9 @@ async fn submit(
         spec: Box::new(route.spec.clone()),
     };
     let result = if route.authority == state.machine.identity.machine {
-        execute(&state, request, route.callback.env.clone()).await
+        execute(state, request, route.callback.env.clone()).await
     } else {
-        forward(&state, route.authority, request).await
+        forward(state, route.authority, request).await
     };
     match result {
         Ok(value) => {
@@ -286,17 +390,19 @@ async fn submit(
                 reply,
             })
             .await?;
-            Ok(Json(value))
+            Ok(value)
         }
         Err(error) => {
             if matches!(route.submission, JobSubmission::Unknown) && definite_refusal(&error) {
-                call(&state.store, |reply| StoreMsg::ResolveJobRoute {
+                let refusal = JobRefusal {
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                    error: error.to_json(),
+                    status: error.http_status().as_u16(),
+                };
+                call(&state.store, |reply| StoreMsg::RefuseJob {
                     job: route.job,
-                    submission: JobSubmission::Rejected {
-                        error: error.to_json(),
-                        status: error.http_status().as_u16(),
-                    },
-                    target: None,
+                    refusal,
                     reply,
                 })
                 .await?;
@@ -343,6 +449,25 @@ async fn cancel(
     Query(query): Query<MachineQuery>,
     QueueJson(body): QueueJson<OperationBody>,
 ) -> Result<Json<Value>, AppError> {
+    {
+        // a held job never reached its queue, so the origin ends it
+        let _guard = state.locks.job_submissions.lock(job).await;
+        let selector = query.machine.as_ref();
+        if let Some(view) = local_held_view(&state, job, selector).await? {
+            if view.state == "held" {
+                call(&state.store, |reply| StoreMsg::EndHeldJob {
+                    job,
+                    ending: HeldJobEnding::Requested,
+                    reply,
+                })
+                .await?;
+            }
+            let view = local_held_view(&state, job, selector)
+                .await?
+                .ok_or(QueueError::JobNotFound { job })?;
+            return Ok(Json(held_response(view)));
+        }
+    }
     let machine = job_authority(&state, job, query.machine.as_ref()).await?;
     forward(
         &state,

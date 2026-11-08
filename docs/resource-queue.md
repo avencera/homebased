@@ -57,6 +57,8 @@ Retry an action with the same operation UUID and unchanged arguments after a los
 
 Use `--front` or `--back` within a level. Add `--priority low`, `medium`, or `high` to change levels. Priority alone joins the new level's back. `--before <job>` and `--after <job>` take the target's level. Do not combine placement flags. Moving a job does not let equal-priority work preempt.
 
+A job submitted with `--after <task>`, or with `after` in its spec, waits on the machine that submitted it until each of those tasks succeeds. Only then does it reach the queue. Until then, `resource jobs` and the dashboard queue page do not list it. `resource job show` on the submitting machine reports it as `held`, with each task's state. If a task ends any other way, the job is cancelled with a `JOB_CANCELLED` event, and it never takes a resource. Cancelling a held job ends it on the submitting machine. Run `show` and `cancel` there; a `--machine` that names that machine or the job's queue machine still finds the held job.
+
 Cancellation stops queued work directly. For an active job, it requests a stop and cleanup. The response does not prove that cleanup has finished. Check job show and resource list.
 
 Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, and cancel use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.

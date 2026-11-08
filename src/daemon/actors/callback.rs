@@ -640,6 +640,43 @@ pub(crate) async fn deliver_job_event(
     Ok(Some(outcome))
 }
 
+/// Send one thread watch event to the watch's caller
+///
+/// `None` means a send check suppressed it, which a watch event never has
+pub(crate) async fn deliver_watch_event(
+    home: &Home,
+    watch: &crate::thread_watch::ThreadWatch,
+    event: &crate::thread_watch::WatchEvent,
+    callback: &ActorRef<CallbackMsg>,
+) -> Result<Option<DeliveryOutcome>, AppError> {
+    let dir = home
+        .root()
+        .join("watches")
+        .join(watch.id.to_string())
+        .join("delivery");
+    std::fs::create_dir_all(&dir)?;
+    let attempt = OriginAttempt {
+        context: watch.callback.clone(),
+        thread: watch.caller,
+        line: event.line(),
+        paths: CallbackPaths {
+            callback_log: dir.join("callback.log"),
+            delivery_lock: dir.join("delivery.lock"),
+        },
+        pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
+        before_send: None,
+    };
+    let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
+        return Ok(None);
+    };
+    if matches!(outcome, DeliveryOutcome::Delivered) {
+        let _ = callback.cast(CallbackMsg::Delivered {
+            thread: watch.caller,
+        });
+    }
+    Ok(Some(outcome))
+}
+
 /// One reserved attempt on a saved origin route
 struct OriginAttempt {
     context: CallbackContext,
@@ -733,6 +770,14 @@ impl OriginAttempt {
     }
 
     async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
+        // a gone cwd or Codex binary never comes back by retrying, unless T3,
+        // which needs neither, failed only for now
+        if let Err(error) = check_saved_callback(&self.context) {
+            return Ok(AttemptOutcome::Settle(match wake_failure {
+                Some(reason) => DeliveryOutcome::Retryable(format!("{reason}; {error}")),
+                None => DeliveryOutcome::Permanent(error),
+            }));
+        }
         let sent = run_blocking("origin callback", move || {
             send_codex_queue_attempt(
                 &self.context,

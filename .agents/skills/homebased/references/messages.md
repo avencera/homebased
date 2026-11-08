@@ -11,7 +11,7 @@ Use `--machine` with exactly one destination selector:
 ```bash
 homebased --json message send \
   --machine code \
-  --thread <thread-uuid> \
+  --thread <thread-ref> \
   --message "Please review the cluster design."
 ```
 
@@ -24,11 +24,18 @@ homebased --json message send \
   --message "Please review the cluster design."
 ```
 
-`--machine` accepts a known machine name or stable machine UUID. `--thread`
-must be an exact Claude Code session id (`$CLAUDE_CODE_SESSION_ID`) or Codex
-thread UUID. Do not use a Claude session display name such as `homebased-82`;
-it changes each time the session process restarts, but the session id does
-not. `--cwd` must be an absolute path or start with `~/`. The receiving daemon
+`--machine` accepts a known machine name or stable machine UUID, and stays
+required with `--thread`. `--thread` accepts any thread reference that
+[threads.md](threads.md#thread-references) lists: a Claude Code session id
+(`$CLAUDE_CODE_SESSION_ID`), a Codex thread UUID, T3 chip text, `thread_<id>`,
+or a `t3-thread://` link. The sender looks it up on that machine and sends to
+the thread's session; a T3 thread that has not started a session yet is a
+usage error, and a reference that names several threads fails with
+`thread_ref_ambiguous`. When the lookup finds nothing or cannot run, such as
+against a peer that predates it, a UUID is sent as given and the receiver
+decides, as before; any other reference fails with that lookup's error. Do not use a Claude session display
+name such as `homebased-82`; it changes each time the session process
+restarts, but the session id does not. `--cwd` must be an absolute path or start with `~/`. The receiving daemon
 expands `~/` with its own home directory and picks the most recently active
 Codex session with that exact working directory. `--cwd` never selects a
 Claude session, because headless Claude workers share their owner's directory;
@@ -148,7 +155,11 @@ The CLI creates a message UUID unless you pass `--message-id <uuid>`. Choose
 the UUID before the first send if you may need to retry after a lost response.
 Retry with the same message UUID, destination, source, body, and other options.
 The receiver returns a saved receipt without another queue call when it has
-one. It uses the saved thread when it retries a `--cwd` destination. Reusing a
+one. It uses the saved thread when it retries a `--cwd` or `--thread`
+destination: the sender saves the reference as you passed it and looks it up
+only after it checks the saved binding, so a retry reaches the thread the
+first attempt chose even after that thread moved to a new session or was
+deleted. Reusing a
 message UUID with different request content returns `message_conflict`.
 If target resolution fails, the UUID stays reserved for that request. Retrying
 with the same content resolves again; changing the content returns
@@ -159,7 +170,7 @@ returns `message_to_self` again.
 message_id="$(uuidgen)"
 homebased --json message send \
   --machine code \
-  --thread <thread-uuid> \
+  --thread <thread-ref> \
   --source-thread <source-thread-uuid> \
   --message "Please review the cluster design." \
   --message-id "$message_id"

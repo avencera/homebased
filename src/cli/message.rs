@@ -26,9 +26,11 @@ pub enum MessageCommand {
         /// Destination machine name or UUID. Required with `--thread` or `--cwd`.
         #[arg(long, conflicts_with_all = ["task", "worker"])]
         machine: Option<String>,
-        /// Exact destination Claude Code session or Codex thread UUID.
+        /// Destination thread on `--machine`: a Claude Code session or Codex
+        /// thread UUID, or any T3 reference (`thread_<id>`, chip text, a
+        /// `t3-thread://` link), which names the session T3 runs for it.
         #[arg(long, conflicts_with_all = ["cwd", "task", "worker"])]
-        thread: Option<ThreadId>,
+        thread: Option<String>,
         /// Destination working directory on the receiving machine. Selects Codex threads only.
         #[arg(long, conflicts_with_all = ["thread", "task", "worker"])]
         cwd: Option<PathBuf>,
@@ -64,7 +66,7 @@ pub enum MessageCommand {
 
 struct SendArgs {
     machine: Option<String>,
-    thread: Option<ThreadId>,
+    thread: Option<String>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
     worker: Option<TaskId>,
@@ -114,6 +116,14 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
 }
 
 async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
+    let client = Client::new(ctx.home.sock_path());
+    // the daemon looks the reference up once it has checked the message UUID,
+    // so a retry keeps the thread the first attempt reached
+    if args.machine.is_none() && args.thread.is_some() {
+        return Err(AppError::Usage {
+            message: "--thread needs --machine, the machine that runs the thread".into(),
+        });
+    }
     let target = target(Destination {
         machine: args.machine,
         thread: args.thread,
@@ -134,9 +144,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
     };
     request.validate()?;
 
-    let response: MessageSendResponse = Client::new(ctx.home.sock_path())
-        .post_json("/v1/messages/send", &request)
-        .await?;
+    let response: MessageSendResponse = client.post_json("/v1/messages/send", &request).await?;
     validate_response(&request, &response)?;
 
     let value = serde_json::to_value(&response)?;
@@ -156,7 +164,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
 #[derive(Default)]
 struct Destination {
     machine: Option<String>,
-    thread: Option<ThreadId>,
+    thread: Option<String>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
     worker: Option<TaskId>,
@@ -173,10 +181,15 @@ fn target(destination: Destination) -> Result<MessageTarget, AppError> {
     match (machine, thread, cwd, task, worker) {
         (None, None, None, Some(task), None) => Ok(MessageTarget::Task { task }),
         (None, None, None, None, Some(task)) => Ok(MessageTarget::Worker { task }),
-        (Some(machine), Some(thread), None, None, None) => Ok(MessageTarget::Machine {
-            machine,
-            recipient: Recipient::Thread { thread },
-        }),
+        (Some(machine), Some(reference), None, None, None) => {
+            Ok(MessageTarget::Reference {
+                machine,
+                reference,
+                // a chip needs only the T3 thread, and a malformed session
+                // variable must not stop a send that never reads it
+                carried_by: crate::thread_ref::Caller::t3_thread_from_env(),
+            })
+        }
         (Some(machine), None, Some(cwd), None, None) => Ok(MessageTarget::Machine {
             machine,
             recipient: Recipient::Cwd { cwd },
@@ -227,7 +240,9 @@ fn validate_response(
     response: &MessageSendResponse,
 ) -> Result<(), AppError> {
     let expected_machine = match &request.target {
-        MessageTarget::Machine { machine, .. } => machine.parse::<MachineId>().ok(),
+        MessageTarget::Machine { machine, .. } | MessageTarget::Reference { machine, .. } => {
+            machine.parse::<MachineId>().ok()
+        }
         MessageTarget::Task { .. } | MessageTarget::Worker { .. } => None,
     };
     let expected_thread = match &request.target {
@@ -321,7 +336,7 @@ mod tests {
         );
         assert!(
             target(Destination {
-                thread: Some(ThreadId(Uuid::now_v7())),
+                thread: Some(Uuid::now_v7().to_string()),
                 ..Destination::default()
             })
             .is_err()
@@ -329,7 +344,7 @@ mod tests {
         assert!(
             target(Destination {
                 machine: Some("code".into()),
-                thread: Some(ThreadId(Uuid::now_v7())),
+                thread: Some(Uuid::now_v7().to_string()),
                 cwd: Some(PathBuf::from("~/repo")),
                 ..Destination::default()
             })

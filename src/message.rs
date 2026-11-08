@@ -16,6 +16,9 @@ use crate::machine::MachineId;
 /// Maximum message body size in UTF-8 bytes
 pub const MESSAGE_BODY_MAX_BYTES: usize = 16 * 1024;
 
+/// Longest destination thread reference, which can be whole T3 chip text
+pub const MESSAGE_REFERENCE_MAX_BYTES: usize = 4096;
+
 /// Stable identity of one direct message and all its explicit retries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -154,6 +157,20 @@ pub enum MessageTarget {
         /// Exact thread or receiver-side working directory
         recipient: Recipient,
     },
+    /// Any thread reference on a machine, which the local daemon looks up
+    /// only while it binds the message, so a retry with the same message UUID
+    /// reaches the thread the first attempt reached even after T3 starts a new
+    /// session for it or deletes it
+    Reference {
+        /// Display name or stable machine UUID
+        machine: String,
+        /// Reference as `homebased thread` takes it: a session UUID, T3 chip
+        /// text, `thread_<id>`, or a T3 link
+        reference: String,
+        /// The sender's T3 thread, whose message a T3 chip in `reference` came in
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carried_by: Option<String>,
+    },
     /// The origin machine and thread for an existing task
     Task {
         /// Task whose origin route supplies the destination
@@ -231,6 +248,31 @@ impl MessageSendRequest {
                 {
                     return Err(AppError::MessageInvalid {
                         message: "destination thread UUID must not be nil".into(),
+                    });
+                }
+            }
+            MessageTarget::Reference {
+                machine,
+                reference,
+                carried_by,
+            } => {
+                if carried_by.as_ref().is_some_and(|thread| {
+                    thread.trim().is_empty() || thread.len() > MESSAGE_REFERENCE_MAX_BYTES
+                }) {
+                    return Err(AppError::MessageInvalid {
+                        message: "the sender's T3 thread must be a T3 thread id".into(),
+                    });
+                }
+                if machine.trim().is_empty() || reference.trim().is_empty() {
+                    return Err(AppError::MessageInvalid {
+                        message: "destination machine and thread must not be empty".into(),
+                    });
+                }
+                if reference.len() > MESSAGE_REFERENCE_MAX_BYTES {
+                    return Err(AppError::MessageInvalid {
+                        message: format!(
+                            "destination thread reference is over {MESSAGE_REFERENCE_MAX_BYTES} bytes"
+                        ),
                     });
                 }
             }
@@ -312,12 +354,17 @@ impl OutboundMessageBinding {
                 resolved,
             ) => requested == resolved,
             (
-                MessageTarget::Task { .. } | MessageTarget::Worker { .. },
+                MessageTarget::Reference { .. }
+                | MessageTarget::Task { .. }
+                | MessageTarget::Worker { .. },
                 Recipient::Thread { thread },
             ) => !thread.0.is_nil(),
-            (MessageTarget::Task { .. } | MessageTarget::Worker { .. }, Recipient::Cwd { .. }) => {
-                false
-            }
+            (
+                MessageTarget::Reference { .. }
+                | MessageTarget::Task { .. }
+                | MessageTarget::Worker { .. },
+                Recipient::Cwd { .. },
+            ) => false,
         };
         if !target_matches {
             return Err(AppError::MessageInvalid {

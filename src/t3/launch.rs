@@ -657,10 +657,7 @@ pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, L
             "thread launch replied for another thread".into(),
         ));
     }
-    let environment = fs::read_to_string(userdata.join("environment-id"))
-        .ok()
-        .map(|id| id.trim().to_owned())
-        .filter(|id| !id.is_empty());
+    let environment = super::read_environment_id(&userdata);
 
     // a retry with the same request id returns the first launch, whose project
     // and model may differ from this request's, so report what T3 holds

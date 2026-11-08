@@ -81,17 +81,62 @@ const LEGACY_THREAD_SQL: &str = "
 // while it is of the instance the thread selects; a switch picks its thread
 // only when the next message is dispatched
 // a row from before instances keeps only `provider` and `default_provider`
-const ACTIVE_THREAD_SQL: &str = "
-    SELECT COALESCE(p.driver, p.provider),
-           CASE WHEN json_valid(p.payload_json)
-                 AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
-               THEN json_extract(p.payload_json, '$.nativeThreadRef.nativeId') END,
-           COALESCE(p.provider_instance_id, p.provider)
-               IS COALESCE(t.provider_instance_id, t.default_provider)
-    FROM orchestration_v2_projection_threads t
-    JOIN orchestration_v2_projection_provider_threads p
-      ON p.provider_thread_id = t.active_provider_thread_id
-    WHERE t.thread_id = ?1";
+macro_rules! active_thread_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT COALESCE(p.driver, p.provider),
+                    CASE WHEN json_valid(p.payload_json)
+                          AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
+                        THEN json_extract(p.payload_json, '$.nativeThreadRef.nativeId') END,
+                    COALESCE(p.provider_instance_id, p.provider)
+                        IS COALESCE(t.provider_instance_id, t.default_provider),
+                    t.thread_id
+             FROM orchestration_v2_projection_threads t
+             JOIN orchestration_v2_projection_provider_threads p
+               ON p.provider_thread_id = t.active_provider_thread_id
+             WHERE ",
+            $filter
+        )
+    };
+}
+const ACTIVE_THREAD_SQL: &str = active_thread_sql!("t.thread_id = ?1");
+// the same rule for every thread at once, for thread lookups
+const ACTIVE_THREADS_SQL: &str = active_thread_sql!("t.deleted_at IS NULL");
+// T3's composer context records: `contextId` is the chip's `ref`, unique
+// only within the message that carried it
+macro_rules! chip_records_sql {
+    ($messages:literal, $tail:literal) => {
+        concat!(
+            "SELECT json_extract(r.value, '$.threadId'), json_extract(r.value, '$.environmentId'),
+                    json_extract(r.value, '$.title')
+             FROM (", $messages, ") m,
+                  json_each(CASE WHEN json_valid(m.payload_json) THEN m.payload_json ELSE '{}' END,
+                            '$.context.records') r
+             WHERE instr(m.payload_json, ?1) > 0
+               AND json_extract(r.value, '$.kind') = 'thread'
+               AND json_extract(r.value, '$.contextId') = ?1
+               AND json_type(r.value, '$.threadId') = 'text' ",
+            $tail
+        )
+    };
+}
+// the carrying thread's newest user message with the record carried the chip;
+// T3's latest-user index serves the inner query
+const CARRIED_CHIP_SQL: &str = chip_records_sql!(
+    "SELECT payload_json, updated_at, message_id FROM orchestration_v2_projection_messages
+     WHERE thread_id = ?2 AND role = 'user'
+     ORDER BY updated_at DESC, message_id DESC LIMIT 200",
+    "ORDER BY m.updated_at DESC, m.message_id DESC LIMIT 1"
+);
+// with no carrier, every distinct target the ref names in any user message;
+// the scan is complete, since a capped one could miss the older target that
+// makes the ref ambiguous, and grouping comes before the limit so repeats of
+// one target never crowd out another
+// a full scan reads 7183 user messages (12 MB) in 30 ms
+const ANY_CHIP_SQL: &str = chip_records_sql!(
+    "SELECT payload_json FROM orchestration_v2_projection_messages WHERE role = 'user'",
+    "GROUP BY 1, 2 LIMIT 16"
+);
 const LEGACY_TABLE_SQL: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_session_runtime'";
 const ARCHIVED_SQL: &str =
@@ -130,7 +175,7 @@ const OPEN_LEGACY_THREADS_SQL: &str = "
     ORDER BY r.last_seen_at DESC";
 // effort is one entry of the model options list, and the last linked pull
 // request is the newest
-const THREAD_DETAILS_SQL: &str = "
+const THREAD_DETAILS_SELECT: &str = "
     SELECT t.thread_id, pr.title,
            COALESCE(json_extract(t.payload_json, '$.worktreePath'), pr.workspace_root),
            json_extract(t.payload_json, '$.branch'),
@@ -147,7 +192,61 @@ const THREAD_DETAILS_SQL: &str = "
     LEFT JOIN projection_projects pr ON pr.project_id = t.project_id
     LEFT JOIN orchestration_v2_projection_threads parent
       ON parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
-    WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND json_valid(t.payload_json)";
+    WHERE t.deleted_at IS NULL AND json_valid(t.payload_json)";
+const OPEN_THREAD_DETAILS_FILTER: &str = " AND t.archived_at IS NULL";
+// statuses of a run that has not finished, as T3's own run recovery index
+// lists them; settled is the sidebar state T3 records with `settledAt`
+const THREAD_ROWS_SQL: &str = "
+    SELECT t.thread_id, t.title, t.archived_at IS NOT NULL,
+           CASE WHEN json_valid(t.payload_json)
+               THEN COALESCE(json_extract(t.payload_json, '$.settledOverride') = 'settled', 0)
+               ELSE 0 END,
+           CASE WHEN json_valid(t.payload_json)
+               THEN json_extract(t.payload_json, '$.lineage.parentThreadId') END,
+           CASE WHEN json_valid(t.payload_json)
+               THEN COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent')
+                             = 'subagent', 0)
+               ELSE 0 END,
+           COALESCE((SELECT r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                     FROM orchestration_v2_projection_runs r
+                     WHERE r.thread_id = t.thread_id
+                     ORDER BY r.ordinal DESC LIMIT 1), 0)
+    FROM orchestration_v2_projection_threads t
+    WHERE t.deleted_at IS NULL
+    ORDER BY t.created_at DESC";
+
+/// One row of [`THREAD_ROWS_SQL`]
+pub(super) struct ThreadRow {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) archived: bool,
+    pub(super) settled: bool,
+    pub(super) parent: Option<String>,
+    pub(super) delegate: bool,
+    pub(super) running: bool,
+}
+
+/// Every thread that is not deleted, newest first
+pub(super) fn thread_rows(path: &Path) -> Result<Vec<ThreadRow>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = db
+        .prepare(THREAD_ROWS_SQL)
+        .map_err(|error| format!("T3 thread query failed: {error}"))?;
+    statement
+        .query_map([], |row| {
+            Ok(ThreadRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                archived: row.get(2)?,
+                settled: row.get(3)?,
+                parent: row.get(4)?,
+                delegate: row.get(5)?,
+                running: row.get(6)?,
+            })
+        })
+        .and_then(Iterator::collect)
+        .map_err(|error| format!("T3 thread query failed: {error}"))
+}
 
 /// Claude sessions and Codex threads whose thread is neither archived nor
 /// deleted, newest first
@@ -165,9 +264,18 @@ pub(super) fn open_threads(path: &Path) -> Result<Vec<OpenThreadRow>, String> {
 /// Empty when the query fails, so a T3 change to these display-only fields
 /// hides them instead of breaking the thread list
 pub(super) fn thread_details(path: &Path) -> HashMap<String, ThreadDetails> {
+    details_where(path, OPEN_THREAD_DETAILS_FILTER)
+}
+
+/// Details of every thread that is not deleted, archived ones too
+pub(super) fn all_thread_details(path: &Path) -> HashMap<String, ThreadDetails> {
+    details_where(path, "")
+}
+
+fn details_where(path: &Path, filter: &str) -> HashMap<String, ThreadDetails> {
     let read = || -> rusqlite::Result<HashMap<String, ThreadDetails>> {
         let db = state_connection(path)?;
-        let mut statement = db.prepare(THREAD_DETAILS_SQL)?;
+        let mut statement = db.prepare(&format!("{THREAD_DETAILS_SELECT}{filter}"))?;
         statement
             .query_map([], |row| Ok((row.get(0)?, details_from_row(row)?)))?
             .collect()
@@ -226,16 +334,46 @@ pub(super) fn find_thread(
 
 /// Active provider thread of T3 thread `t3_thread`: its driver, its native id
 /// once it has one, and whether it is of the instance the thread selects
-pub(super) fn active_thread(
-    path: &Path,
-    t3_thread: &str,
-) -> Result<Option<(String, Option<String>, bool)>, String> {
+pub(super) fn active_thread(path: &Path, t3_thread: &str) -> Result<Option<ActiveThread>, String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
-    db.query_row(ACTIVE_THREAD_SQL, [t3_thread], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })
-    .optional()
-    .map_err(|_| "statev2.sqlite active provider thread lookup failed".to_string())
+    db.query_row(ACTIVE_THREAD_SQL, [t3_thread], ActiveThread::from_row)
+        .optional()
+        .map_err(|_| "statev2.sqlite active provider thread lookup failed".to_string())
+}
+
+/// Active provider thread of every thread that is not deleted, as in [`active_thread`]
+pub(super) fn active_threads(path: &Path) -> Result<Vec<ActiveThread>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = db
+        .prepare(ACTIVE_THREADS_SQL)
+        .map_err(|_| "statev2.sqlite active provider thread query failed".to_string())?;
+    statement
+        .query_map([], ActiveThread::from_row)
+        .and_then(Iterator::collect)
+        .map_err(|_| "statev2.sqlite active provider thread query failed".to_string())
+}
+
+/// One row of [`ACTIVE_THREAD_SQL`]: the provider thread a T3 thread runs next
+pub(super) struct ActiveThread {
+    /// T3 thread id
+    pub(super) thread: String,
+    /// Driver of the provider thread
+    pub(super) driver: String,
+    /// Its native id, once it has one
+    pub(super) native: Option<String>,
+    /// Whether it is of the instance the thread selects
+    pub(super) selected: bool,
+}
+
+impl ActiveThread {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            driver: row.get(0)?,
+            native: row.get(1)?,
+            selected: row.get(2)?,
+            thread: row.get(3)?,
+        })
+    }
 }
 
 fn has_legacy_table(db: &Connection) -> Result<bool, String> {
@@ -243,6 +381,66 @@ fn has_legacy_table(db: &Connection) -> Result<bool, String> {
         .optional()
         .map(|table| table.is_some())
         .map_err(|_| "statev2.sqlite table lookup failed".to_string())
+}
+
+/// The threads the thread context record `context`, the `ref` of a T3 chip,
+/// names
+///
+/// T3 keeps the chip's record in the message that carried it, at
+/// `$.context.records[]`, and the id is unique only in that message. With
+/// `carrier`, the T3 thread whose message carried the chip, the result is the
+/// target of that thread's newest user message with the record. Otherwise,
+/// or when none of its recent messages has it, it is every distinct target
+/// the id names in any user message, for the caller to accept only when there
+/// is one
+pub(super) fn chip_targets(
+    path: &Path,
+    context: &str,
+    carrier: Option<&str>,
+) -> Result<Vec<super::ChipTarget>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let failed = |_| "statev2.sqlite chip lookup failed".to_string();
+    let target = |row: &Row<'_>| {
+        Ok(super::ChipTarget {
+            thread: row.get(0)?,
+            environment: row.get(1)?,
+            title: row.get(2)?,
+        })
+    };
+    if let Some(carrier) = carrier
+        && let Some(carried) = db
+            .query_row(CARRIED_CHIP_SQL, [context, carrier], target)
+            .optional()
+            .map_err(failed)?
+    {
+        return Ok(vec![carried]);
+    }
+    let mut statement = db.prepare(ANY_CHIP_SQL).map_err(failed)?;
+    statement
+        .query_map([context], target)
+        .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+        .map_err(failed)
+}
+
+/// Check that an existing state has the tables homebased reads
+///
+/// Every failure is an error, whether the database is locked now or its
+/// schema is one homebased does not read, so a lookup that cannot read T3 is
+/// never taken for one that found no threads
+pub(super) fn check_schema(path: &Path) -> Result<(), String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    match db.prepare(REQUIRED_STATE_SQL) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Err("statev2.sqlite is locked".into())
+        }
+        Err(_) => Err("statev2.sqlite lacks the thread tables homebased reads".into()),
+    }
 }
 
 pub(super) fn schema_matches(path: &Path) -> bool {

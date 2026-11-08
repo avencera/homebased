@@ -5,6 +5,8 @@
 //! compaction starts inside the window that
 //! [`ContextUse::idle_compaction_due`] allows. The transcript or rollout
 //! records any activity since, so a thread that moved on is left alone
+//!
+//! The same loop then checks every `homebased thread watch`
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +55,8 @@ pub(super) async fn run(state: AppState) {
                     Attempts::new()
                 }
             };
+        // after the idle compactions, so a watch reads a size they already changed
+        super::thread_api::watch_scan::scan(&state).await;
     }
 }
 

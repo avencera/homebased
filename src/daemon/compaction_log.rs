@@ -20,13 +20,15 @@ use crate::domain::ThreadId;
 use crate::t3::{ProviderThread, WakeOutcome};
 
 /// What asked for a compaction
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
     /// The daemon's scan of idle threads that wait on a task
     Idle,
-    /// The dashboard's Compact button
+    /// The dashboard's Compact button, or `homebased thread compact`
     Manual,
+    /// A `homebased thread watch --action compact` that fired
+    Watch,
     /// A callback that arrived after the prompt cache lapsed
     Callback,
 }

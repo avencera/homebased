@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
+use crate::dependency::TaskDependencies;
 use crate::domain::{API_VERSION, MIN_TIMEOUT, TaskName, TaskWorkload, ThreadId};
 use crate::error::AppError;
 use crate::invocation::{CommandLine, resolve_executable};
@@ -134,13 +135,29 @@ impl JobSpec {
         Self::parse_value(&value)
     }
 
+    /// Parse a submitted spec file, whose `after` stays on the origin
+    ///
+    /// The origin holds the job until each task in `after` succeeds, and the
+    /// queue's machine never sees the list, so it is split off here rather
+    /// than kept in the spec
+    pub fn parse_submission(value: &Value) -> Result<(Self, Option<TaskDependencies>), AppError> {
+        let mut value = value.clone();
+        let after = value
+            .as_object_mut()
+            .and_then(|object| object.remove("after"))
+            .map(|after| crate::spec::parse_after(&after))
+            .transpose()?;
+        Ok((Self::parse_value(&value)?, after))
+    }
+
     /// Parse and check the schema and structure of a decoded spec
     pub fn parse_value(value: &Value) -> Result<Self, AppError> {
+        // the origin reads `after` with [`Self::parse_submission`] and never sends it on
         if let Some(after) = value.get("after") {
             return Err(invalid(
                 "/after",
                 after.clone(),
-                "job specs do not support after; submit the job once its inputs are ready",
+                "after belongs to the submitted spec file; the queued spec carries none",
             ));
         }
         let wire: JobSpecWire = deserialize_under(value, "")?;
@@ -382,6 +399,15 @@ fn steps_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// JSON Schema for the job spec, printed by `resource schema`
 pub fn schema_json() -> Result<Value, AppError> {
     let mut schema = serde_json::to_value(schemars::schema_for!(JobSpecWire))?;
+    let mut generator = schemars::SchemaGenerator::default();
+    let mut after = serde_json::to_value(crate::spec::after_schema(&mut generator))?;
+    after["description"] = json!(
+        "Task UUIDs this machine submitted that must each succeed before the job joins the queue. \
+         The job is held under its id until then, and cancelled if one ends any other way"
+    );
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("after".into(), after);
+    }
     if let Some(object) = schema.as_object_mut() {
         object.insert(
             "oneOf".into(),

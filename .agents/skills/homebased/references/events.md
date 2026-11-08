@@ -29,7 +29,30 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 
 ## Job events
 
-For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, and `JOB_CHECK_DUE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
+For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, and `JOB_CHECK_DUE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
+
+## Thread watch events
+
+`THREAD_CONTEXT_OVER` and `THREAD_WATCH_ENDED` come from `homebased thread watch` ([threads.md](threads.md)). They identify a watch, not a task. Deduplicate by `(watch, seq)`.
+
+| Key | Meaning |
+| --- | --- |
+| `watch` | Watch UUID. Use it for `thread unwatch`, `homebased wait --next`, and de-duplication. |
+| `seq` | Per-watch event sequence. |
+| `thread` | The thread the event was addressed to. |
+| `machine` | UUID of the machine that keeps the watch. |
+| `target` | The watched thread: `reference` as given, `exact_reference` for later commands, `machine`, `machine_name`, `host`, `t3_thread`, `t3_link`, `session`, `provider`, `title`. |
+| `condition` | `context_above` as given and `limit` in tokens. |
+| `action` | `notify` or `compact`. |
+| `context` | `tokens`, `tokens_estimated`, `context_window`, `percent`, `state`, `last_active`, `cache_warm`, `compacted_at`, or `null` when the thread is gone. |
+| `compaction` | With `--action compact`: `outcome` (`started`, `not_found`, `refused`, `unavailable`) and `detail`. Otherwise `null`. |
+| `reason` | On `THREAD_WATCH_ENDED`: `once`, `unwatched`, `archived`, `deleted`, `session_gone`, or `no_context_window` (a percent watch whose thread runs Claude Code, which records no context window). Otherwise `null`. |
+| `next_action` | Suggested step, as a sentence. |
+
+| `event` | What happened | Do this |
+| --- | --- | --- |
+| `THREAD_CONTEXT_OVER` | The context climbed over the limit while the thread was not running a turn. It fires again only after a reading shows the context below the limit and it climbs back. | With `compaction.outcome: "started"`, nothing. Otherwise compact a T3 thread with `homebased thread compact <target.exact_reference>`, or hand its work to a fresh thread. Ask a session outside T3 to run `/compact`. |
+| `THREAD_WATCH_ENDED` | The watch's last event. | Nothing, unless `reason` is `archived`, `deleted`, or `session_gone` and the thread still matters; then watch its replacement. For `no_context_window`, watch the thread again with a token count such as `--context-above 150k`. |
 
 ## Event table
 

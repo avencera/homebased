@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::domain::API_VERSION;
-use crate::fleet::http::ClusterClient;
+use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::fleet::runtime::FleetHandle;
 use crate::machine::MachineId;
 
@@ -36,6 +36,30 @@ pub(super) async fn read_peer<T: DeserializeOwned>(
         .get(&destination.address, path)
         .await
         .map_err(|error| error.to_string())?;
+    versioned_body(&response)
+}
+
+/// POST a read to one cluster route on `machine` and parse its versioned body
+///
+/// For reads whose query does not fit a URL. Same contract as [`read_peer`]
+pub(super) async fn post_peer<B: serde::Serialize, T: DeserializeOwned>(
+    fleet: &FleetHandle,
+    machine: MachineId,
+    path: &str,
+    body: &B,
+) -> Result<T, String> {
+    let destination = fleet
+        .connect(machine)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = ClusterClient::new(READ_TIMEOUT, READ_MAX_BODY)
+        .post_json(&destination.address, path, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    versioned_body(&response)
+}
+
+fn versioned_body<T: DeserializeOwned>(response: &ClusterResponse) -> Result<T, String> {
     if response.status != StatusCode::OK {
         return Err(format!("peer returned HTTP {}", response.status));
     }

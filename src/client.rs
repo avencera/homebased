@@ -273,6 +273,11 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "wait_unavailable" => {
+            if let (Some(watch), Some(reason)) =
+                (decode_field(input, "watch"), decode_field(input, "reason"))
+            {
+                return AppError::WatchWaitUnavailable { watch, reason };
+            }
             if let (Some(job), Some(reason)) =
                 (decode_field(input, "job"), decode_field(input, "reason"))
             {
@@ -288,6 +293,42 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         "wait_target_not_found" => decode_field(input, "id")
             .map_or(AppError::Internal { message }, |id| {
                 AppError::WaitTargetNotFound { id }
+            }),
+        "thread_ref_ambiguous" => {
+            let reference = decode_field(input, "reference");
+            let matches = decode_field(input, "matches");
+            match (reference, matches) {
+                (Some(reference), Some(matches)) => {
+                    AppError::ThreadRefAmbiguous { reference, matches }
+                }
+                _ => AppError::Internal { message },
+            }
+        }
+        "thread_not_found" => {
+            let reference = decode_field(input, "reference");
+            let detail = decode_field(input, "detail");
+            match (reference, detail) {
+                (Some(reference), Some(detail)) => AppError::ThreadNotFound { reference, detail },
+                _ => AppError::Internal { message },
+            }
+        }
+        "compact_unsupported_host" => {
+            let reference = decode_field(input, "reference");
+            let host = decode_field(input, "host");
+            match (reference, host) {
+                (Some(reference), Some(host)) => {
+                    AppError::CompactUnsupportedHost { reference, host }
+                }
+                _ => AppError::Internal { message },
+            }
+        }
+        "thread_lookup_incomplete" => decode_field(input, "unanswered")
+            .map_or(AppError::Internal { message }, |unanswered| {
+                AppError::ThreadLookupIncomplete { unanswered }
+            }),
+        "watch_not_found" => decode_field(input, "watch")
+            .map_or(AppError::Internal { message }, |watch| {
+                AppError::WatchNotFound { watch }
             }),
         "wait_target_ambiguous" => decode_field(input, "id")
             .map_or(AppError::Internal { message }, |id| {
@@ -642,6 +683,33 @@ mod tests {
             },
             AppError::WaitTargetAmbiguous {
                 id: uuid::Uuid::now_v7(),
+            },
+            AppError::ThreadRefAmbiguous {
+                reference: "6c8e".into(),
+                matches: vec![crate::error::ThreadMatch {
+                    machine: crate::machine::MachineId::new(),
+                    machine_name: "code".into(),
+                    reference: "thread_6c8e923e-f25a-4727-9f05-83cedd5d3fd8".into(),
+                    title: Some("Review".into()),
+                }],
+            },
+            AppError::ThreadNotFound {
+                reference: "thread_gone".into(),
+                detail: "; looked on code".into(),
+            },
+            AppError::ThreadLookupIncomplete {
+                unanswered: vec!["mini (connection refused)".into()],
+            },
+            AppError::CompactUnsupportedHost {
+                reference: "thread_x".into(),
+                host: crate::thread_ref::ThreadHost::Terminal,
+            },
+            AppError::WatchNotFound {
+                watch: crate::thread_watch::WatchId::new(),
+            },
+            AppError::WatchWaitUnavailable {
+                watch: crate::thread_watch::WatchId::new(),
+                reason: crate::error::WatchWaitBlocker::NotOwner,
             },
             AppError::WorkerMessageUnavailable {
                 task: crate::domain::TaskId::new(),

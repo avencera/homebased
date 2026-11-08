@@ -13,7 +13,7 @@ use crate::domain::ThreadId;
 use crate::error::AppError;
 use crate::task_wait::{
     WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys, WaitRequest,
-    WaitSet, WaiterId,
+    WaitSet, WaiterId, wakes_final_only,
 };
 
 use super::task::select_thread;
@@ -40,21 +40,48 @@ const NEXT_GATHER: Duration = Duration::from_secs(1);
 /// Arguments of `homebased wait`
 #[derive(Debug, Args)]
 pub struct WaitArgs {
-    /// Full task or GPU queue job UUIDs, 1 to 16
+    /// Full task, GPU queue job, or thread watch UUIDs, 1 to 16
     #[arg(value_name = "ID", required = true)]
     ids: Vec<Uuid>,
-    /// Thread that submitted the tasks and jobs. Defaults to the session environment.
+    /// Thread that submitted the tasks and jobs or made the watches. Defaults
+    /// to the session environment.
     #[arg(long)]
     thread: Option<ThreadId>,
     /// Exit 0 once the next events are printed, for a background command that
     /// reports only when it exits
     #[arg(long)]
     next: bool,
+    /// With --next, exit only on an event that ends a target, or any watch
+    /// event. Interim events are still printed and confirmed as they arrive
+    #[arg(long, requires = "next")]
+    final_only: bool,
+}
+
+/// When a `--next` wait exits
+#[derive(Debug, Clone, Copy)]
+enum Wake {
+    /// After any event
+    Any,
+    /// After an event that ends a target, or any watch event
+    FinalOnly,
+}
+
+impl Wake {
+    fn by(self, frame: &WaitFrame) -> bool {
+        match self {
+            // connection frames carry no event for the agent to read
+            Self::Any => matches!(
+                frame,
+                WaitFrame::Event { .. } | WaitFrame::JobEvent { .. } | WaitFrame::WatchEvent { .. }
+            ),
+            Self::FinalOnly => wakes_final_only(frame),
+        }
+    }
 }
 
 /// What the wait follows
 enum Targets {
-    /// Ids the daemon has not yet said are tasks or jobs
+    /// Ids the daemon has not yet said are tasks, jobs, or watches
     Named(WaitIds),
     /// Typed targets the daemon resolved, followed from then on
     Resolved(WaitSet),
@@ -78,9 +105,8 @@ impl Targets {
             return Ok(());
         };
         let internal = |message: String| AppError::Internal { message };
-        let keys = resolved.ok_or_else(|| {
-            internal("the daemon did not say which wait ids are tasks and which are jobs".into())
-        })?;
+        let keys = resolved
+            .ok_or_else(|| internal("the daemon did not say what each wait id names".into()))?;
         if !keys
             .iter()
             .map(|key| key.uuid())
@@ -123,20 +149,24 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
     let thread = select_thread(args.thread, crate::domain::session_thread()?)?;
     let client = Client::new(ctx.home.sock_path());
     let mut targets = Targets::Named(ids);
+    let next = args.next.then_some(if args.final_only {
+        Wake::FinalOnly
+    } else {
+        Wake::Any
+    });
     let mut outage: Option<Instant> = None;
     let mut backoff = BACKOFF_START;
     loop {
         let started = Instant::now();
-        let mut printed = false;
+        let mut seen = Seen::default();
         let end = match open(&client, &targets.request(thread)).await {
-            Ok(mut stream) => {
-                follow(&client, &mut stream, &mut targets, &mut printed, args.next).await?
-            }
+            Ok(mut stream) => follow(&client, &mut stream, &mut targets, &mut seen, next).await?,
             Err(error) if is_outage(&error) => StreamEnd::Lost(error.to_string()),
             Err(error) => return Err(error),
         };
+        let printed = seen.printed;
         // the agent has events to read, and reconnecting would only delay them
-        if args.next && printed {
+        if next.is_some() && seen.woke {
             return Ok(ExitCode::SUCCESS);
         }
         let reason = match end {
@@ -190,18 +220,27 @@ async fn open(client: &Client, request: &WaitRequest) -> Result<LineStream, AppE
     }
 }
 
+/// What one connection printed
+#[derive(Debug, Default)]
+struct Seen {
+    /// Any event line
+    printed: bool,
+    /// An event that ends a `--next` wait
+    woke: bool,
+}
+
 /// Print each event line as it arrives until the stream ends
 ///
 /// Only event lines reach stdout, because every line wakes the agent that
 /// armed the monitor. Each line is confirmed to the daemon once it is flushed,
 /// which is what lets the daemon count the event as delivered. With `next`,
-/// the stream ends shortly after the first event
+/// the stream ends shortly after the first event that wakes it
 async fn follow(
     client: &Client,
     stream: &mut LineStream,
     targets: &mut Targets,
-    printed: &mut bool,
-    next: bool,
+    seen: &mut Seen,
+    next: Option<Wake>,
 ) -> Result<StreamEnd, AppError> {
     let mut waiter = None;
     let mut gather_until: Option<Instant> = None;
@@ -221,6 +260,7 @@ async fn follow(
             serde_json::from_slice(&line).map_err(|error| AppError::Internal {
                 message: format!("invalid wait frame: {error}"),
             })?;
+        let wakes = next.is_some_and(|wake| wake.by(&frame));
         match frame {
             WaitFrame::Open {
                 waiter: id,
@@ -241,7 +281,7 @@ async fn follow(
             } => {
                 let set = targets.set()?;
                 print_line(&line)?;
-                *printed = true;
+                seen.printed = true;
                 if let Some(waiter) = waiter {
                     confirm(client, waiter, WaitKey::Task(task), seq).await;
                 }
@@ -255,17 +295,32 @@ async fn follow(
             } => {
                 let set = targets.set()?;
                 print_line(&line)?;
-                *printed = true;
+                seen.printed = true;
                 if let Some(waiter) = waiter {
                     confirm(client, waiter, WaitKey::Job(job), seq).await;
                 }
                 set.apply_job(job, kind);
             }
+            WaitFrame::WatchEvent {
+                watch,
+                seq,
+                kind,
+                line,
+            } => {
+                let set = targets.set()?;
+                print_line(&line)?;
+                seen.printed = true;
+                if let Some(waiter) = waiter {
+                    confirm(client, waiter, WaitKey::Watch(watch), seq).await;
+                }
+                set.apply_watch(watch, kind);
+            }
         }
+        seen.woke |= wakes;
         if matches!(targets, Targets::Resolved(set) if set.is_done()) {
             return Ok(StreamEnd::Done);
         }
-        if next && *printed && gather_until.is_none() {
+        if seen.woke && gather_until.is_none() {
             gather_until = Some(Instant::now() + NEXT_GATHER);
         }
     }
@@ -281,7 +336,8 @@ fn print_line(line: &str) -> Result<(), AppError> {
 /// Tell the daemon the event reached stdout
 ///
 /// A failed ack is not an error: the daemon times out and delivers the event
-/// normally, which agents already dedupe by `(task, seq)` or `(job, seq)`
+/// normally, which agents already dedupe by `(task, seq)`, `(job, seq)`, or
+/// `(watch, seq)`
 async fn confirm(client: &Client, waiter: WaiterId, key: WaitKey, seq: u64) {
     let ack = WaitAck::new(waiter, key, seq);
     let Ok(body) = serde_json::to_value(&ack) else {

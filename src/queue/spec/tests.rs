@@ -372,12 +372,21 @@ fn schema_accepts_a_two_step_spec_and_rejects_refused_shapes() {
     assert!(validator.is_valid(&two_step_example()));
     assert!(validator.is_valid(&single(task.clone())));
     assert!(validator.is_valid(&single(container(json!({})))));
+    let held = with(
+        single(task.clone()),
+        "after",
+        json!(["01a0ab97-a7aa-7463-a5b0-8d500e40e432"]),
+    );
+    assert!(validator.is_valid(&held));
+    let (_, after) = JobSpec::parse_submission(&held).unwrap();
+    assert_eq!(after.unwrap().tasks().len(), 1);
 
     let refused = [
         with(single(task.clone()), "steps", json!([task.clone()])),
         without(single(task.clone()), "workload"),
         without(single(task.clone()), "priority"),
         without(single(task.clone()), "preempt"),
+        // `after` names at least one task
         with(single(task.clone()), "after", json!([])),
         with(
             single(task.clone()),

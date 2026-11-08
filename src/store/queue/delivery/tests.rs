@@ -5,7 +5,7 @@ use super::Store;
 use crate::domain::TaskEnv;
 use crate::events::EventAcceptance;
 use crate::machine::MachineId;
-use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::JobSpec;
 use crate::queue::{JobEvent, JobEventKind, JobId, QueueError};
 use crate::submission::{CallbackContext, CallbackExecutable};
@@ -38,6 +38,8 @@ fn route_for(thread: &str) -> JobRoute {
         },
         target: None,
         submission: JobSubmission::Unknown,
+        after: None,
+        owes_final_event: false,
     }
 }
 
@@ -57,6 +59,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             attention: None,
             at: Utc::now(),
             blocked: None,
+            held_ending: None,
         },
     }
 }
@@ -218,5 +221,60 @@ fn a_job_thread_waits_until_an_ending_reaches_it() {
     assert_eq!(
         waiting,
         [queued.thread, ending_unsent.thread, notified.thread]
+    );
+}
+
+#[test]
+fn a_refused_held_job_ends_with_its_final_event_whichever_send_saw_the_refusal() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("homebased.db")).unwrap();
+    let after =
+        crate::dependency::TaskDependencies::new(vec![crate::domain::TaskId::new()]).unwrap();
+    let refusal = || JobRefusal {
+        code: "invalid_cwd".into(),
+        message: "cwd /gone does not exist".into(),
+        error: serde_json::json!({ "error": { "code": "invalid_cwd" } }),
+        status: 400,
+    };
+
+    // released after its build, and the reply to its send was lost
+    let mut held = route();
+    held.submission = JobSubmission::Held;
+    held.after = Some(after.clone());
+    held.owes_final_event = true;
+    let held = store.insert_job_route(&held).unwrap();
+    let released = store.release_held_job(held.job).unwrap();
+    assert_eq!(released.submission, JobSubmission::Unknown);
+    // a submit retry sends it again and is the one to see the refusal
+    store.refuse_job(held.job, refusal()).unwrap();
+    let ended = store.job_route(held.job).unwrap().unwrap();
+    assert!(
+        matches!(&ended.submission, JobSubmission::Ended { ending: HeldJobEnding::Refused { code, .. } } if code == "invalid_cwd"),
+        "{:?}",
+        ended.submission
+    );
+    let (_, final_event) = store
+        .pending_job_inbox()
+        .unwrap()
+        .into_iter()
+        .find(|(route, _)| route.job == held.job)
+        .expect("the held job's waiters get no final event");
+    assert_eq!(final_event.event.event, JobEventKind::JobFailed);
+
+    // a job that was never held is refused for its submitter to read, with no event
+    let mut ready = route();
+    ready.after = Some(after);
+    let ready = store.insert_job_route(&ready).unwrap();
+    store.refuse_job(ready.job, refusal()).unwrap();
+    assert!(matches!(
+        store.job_route(ready.job).unwrap().unwrap().submission,
+        JobSubmission::Rejected { status: 400, .. }
+    ));
+    assert!(
+        store
+            .pending_job_inbox()
+            .unwrap()
+            .iter()
+            .all(|(route, _)| route.job != ready.job)
     );
 }

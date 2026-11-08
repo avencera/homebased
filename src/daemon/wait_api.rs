@@ -9,8 +9,10 @@
 //! the handler can replay the inbox: a settled event advances the wait without
 //! being printed again, and an unsettled one is still owed to someone
 //!
-//! A request that names bare ids has each one resolved to a task or a job
-//! here, and the `Open` frame reports the result so the client's reconnects
+//! Thread watch events take the same path through the watch event sender
+//!
+//! A request that names bare ids has each one resolved to a task, a job, or a
+//! thread watch here, and the `Open` frame reports the result so the client's reconnects
 //! name typed targets and never resolve again
 
 use std::collections::HashMap;
@@ -35,7 +37,7 @@ use crate::daemon::AppState;
 use crate::daemon::actors::waiter::{HandoffEvent, WaiterSession};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::domain::{TaskId, ThreadId};
-use crate::error::{AppError, JobWaitBlocker, WaitBlocker};
+use crate::error::{AppError, JobWaitBlocker, WaitBlocker, WatchWaitBlocker};
 use crate::events::EventPayload;
 use crate::queue::delivery::JobSubmission;
 use crate::queue::{JobEventKind, JobId, QueueError};
@@ -43,6 +45,7 @@ use crate::task_wait::{
     RequestedTargets, WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys,
     WaitRequest, WaitSet,
 };
+use crate::thread_watch::{WatchEventKind, WatchId};
 
 // keeps the stream observable: a dead client fails the write, and the client
 // reconnects when a stream goes quiet
@@ -69,7 +72,7 @@ async fn ack(
     Json(ack): Json<WaitAck>,
 ) -> Result<StatusCode, AppError> {
     let key = ack.key().ok_or_else(|| AppError::Usage {
-        message: "a wait ack must name exactly one of task and job".into(),
+        message: "a wait ack must name exactly one of task, job, and watch".into(),
     })?;
     state.waiters.confirm(ack.waiter, key, ack.seq);
     Ok(StatusCode::NO_CONTENT)
@@ -90,6 +93,7 @@ async fn wait(
         match *key {
             WaitKey::Task(task) => check_target(&state, request.thread, task).await?,
             WaitKey::Job(job) => check_job(&state, request.thread, job).await?,
+            WaitKey::Watch(watch) => check_watch(&state, request.thread, watch).await?,
         }
     }
 
@@ -124,10 +128,10 @@ async fn wait(
         })
 }
 
-/// Tell which of `ids` are tasks and which are jobs, in order
+/// Tell which of `ids` are tasks, jobs, and watches, in order
 ///
-/// Task and job ids live in separate tables, so one UUID could in principle
-/// name both; that is refused rather than guessed at
+/// Each kind lives in its own table, so one UUID could in principle name two;
+/// that is refused rather than guessed at
 async fn resolve(state: &AppState, ids: &WaitIds) -> Result<WaitKeys, AppError> {
     let mut keys = Vec::with_capacity(ids.ids().len());
     for id in ids.ids() {
@@ -154,12 +158,39 @@ async fn resolve_one(state: &AppState, id: Uuid) -> Result<WaitKey, AppError> {
     let is_job = call(&state.store, |reply| StoreMsg::JobRoute { job, reply })
         .await?
         .is_some();
-    match (is_task, is_job) {
-        (true, true) => Err(AppError::WaitTargetAmbiguous { id }),
-        (true, false) => Ok(WaitKey::Task(task)),
-        (false, true) => Ok(WaitKey::Job(job)),
-        (false, false) => Err(AppError::WaitTargetNotFound { id }),
+    let watch = WatchId::from_uuid(id);
+    let is_watch = call(&state.store, |reply| StoreMsg::GetWatch {
+        id: watch,
+        reply,
+    })
+    .await?
+    .is_some();
+    match (is_task, is_job, is_watch) {
+        (true, false, false) => Ok(WaitKey::Task(task)),
+        (false, true, false) => Ok(WaitKey::Job(job)),
+        (false, false, true) => Ok(WaitKey::Watch(watch)),
+        (false, false, false) => Err(AppError::WaitTargetNotFound { id }),
+        _ => Err(AppError::WaitTargetAmbiguous { id }),
     }
+}
+
+/// Refuse a watch whose events go to another thread
+///
+/// Watches live on the caller's machine, so one made elsewhere is not found here
+async fn check_watch(state: &AppState, thread: ThreadId, watch: WatchId) -> Result<(), AppError> {
+    let record = call(&state.store, |reply| StoreMsg::GetWatch {
+        id: watch,
+        reply,
+    })
+    .await?
+    .ok_or(AppError::WatchNotFound { watch })?;
+    if record.watch.caller != thread {
+        return Err(AppError::WatchWaitUnavailable {
+            watch,
+            reason: WatchWaitBlocker::NotOwner,
+        });
+    }
+    Ok(())
 }
 
 /// Refuse a task whose events cannot go to a waiter of `thread`
@@ -204,7 +235,8 @@ async fn check_job(state: &AppState, thread: ThreadId, job: JobId) -> Result<(),
         .ok_or(QueueError::JobNotFound { job })?;
     let reason = if matches!(route.submission, JobSubmission::Rejected { .. }) {
         JobWaitBlocker::Rejected
-    } else if matches!(route.submission, JobSubmission::Unknown) {
+    } else if matches!(route.submission, JobSubmission::Unknown) && !route.owes_final_event {
+        // a held job is the origin's to send, and its final event is owed either way
         JobWaitBlocker::Unconfirmed
     } else if route.thread.is_detached() {
         JobWaitBlocker::Detached
@@ -378,6 +410,20 @@ impl Pump {
                 },
                 Step::Job { job, kind },
             ),
+            HandoffEvent::Watch {
+                watch,
+                seq,
+                kind,
+                line,
+            } => (
+                WaitFrame::WatchEvent {
+                    watch,
+                    seq,
+                    kind,
+                    line,
+                },
+                Step::Watch { watch, kind },
+            ),
         };
         let flow = match self.send(&frame).await {
             Sent::Written => {
@@ -406,6 +452,10 @@ impl Pump {
             } => self.set.apply(task, kind, continuation),
             Step::Job { job, kind } => {
                 self.set.apply_job(job, kind);
+                None
+            }
+            Step::Watch { watch, kind } => {
+                self.set.apply_watch(watch, kind);
                 None
             }
         };
@@ -439,6 +489,7 @@ impl Pump {
                 let flow = match key {
                     WaitKey::Task(task) => self.reconcile_task(task).await?,
                     WaitKey::Job(job) => self.reconcile_job(job).await?,
+                    WaitKey::Watch(watch) => self.reconcile_watch(watch).await?,
                 };
                 if !matches!(flow, Flow::Continue) {
                     return Ok(flow);
@@ -526,6 +577,36 @@ impl Pump {
     }
 }
 
+impl Pump {
+    /// Catch a watch up on its settled events
+    ///
+    /// The watch event sender rescans pending events several times a second,
+    /// so the unsettled ones reach this waiter without a wake
+    async fn reconcile_watch(&mut self, watch: WatchId) -> Result<Flow, AppError> {
+        let events = call(&self.state.store, |reply| StoreMsg::SettledWatchEvents {
+            id: watch,
+            reply,
+        })
+        .await?;
+        let flow = self.drain_live().await;
+        if !matches!(flow, Flow::Continue) {
+            return Ok(flow);
+        }
+        let key = WaitKey::Watch(watch);
+        for event in events {
+            if self.seen(key, event.seq) {
+                continue;
+            }
+            let step = Step::Watch {
+                watch,
+                kind: event.kind,
+            };
+            self.account(event.seq, step);
+        }
+        Ok(Flow::Continue)
+    }
+}
+
 /// What one event reports, as far as the wait is concerned
 #[derive(Clone, Copy)]
 enum Step {
@@ -538,6 +619,10 @@ enum Step {
         job: JobId,
         kind: JobEventKind,
     },
+    Watch {
+        watch: WatchId,
+        kind: WatchEventKind,
+    },
 }
 
 impl Step {
@@ -545,6 +630,7 @@ impl Step {
         match self {
             Self::Task { task, .. } => WaitKey::Task(task),
             Self::Job { job, .. } => WaitKey::Job(job),
+            Self::Watch { watch, .. } => WaitKey::Watch(watch),
         }
     }
 }

@@ -113,6 +113,20 @@ impl T3Env {
     }
 }
 
+/// Id of this T3 install's environment, which T3 links and Fleet machine
+/// advertisements name; `None` without T3
+#[must_use]
+pub fn environment_id(env: &T3Env) -> Option<String> {
+    read_environment_id(&env.userdata())
+}
+
+fn read_environment_id(userdata: &Path) -> Option<String> {
+    fs::read_to_string(userdata.join("environment-id"))
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
 /// Provider session that T3 can resume in its owning thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderThread {
@@ -332,20 +346,22 @@ pub(crate) fn next_session(env: &T3Env, thread: ProviderThread) -> NextSession {
         let Some(t3_thread) = find_thread(&userdata, thread)? else {
             return Ok(NextSession::Unowned);
         };
-        let Some((driver, native, selected)) =
-            v2::active_thread(&state_path(&userdata), &t3_thread)?
-        else {
-            return Ok(NextSession::Other);
-        };
-        let session = native
-            .filter(|_| selected)
-            .and_then(|native| ProviderThread::from_driver(&driver, native.parse().ok()?));
+        let session = v2::active_thread(&state_path(&userdata), &t3_thread)?
+            .as_ref()
+            .and_then(resumed);
         Ok(session.map_or(NextSession::Other, NextSession::Resumes))
     };
     next().unwrap_or_else(|detail| {
         tracing::debug!(%detail, "next T3 session cannot be read");
         NextSession::Unowned
     })
+}
+
+/// The session T3 resumes from its active provider thread, if any: only one
+/// of the selected instance with a native id homebased can read
+fn resumed(active: &v2::ActiveThread) -> Option<ProviderThread> {
+    let native = active.native.as_deref().filter(|_| active.selected)?;
+    ProviderThread::from_driver(&active.driver, native.parse().ok()?)
 }
 
 /// Start a `/compact` turn in the T3 thread that owns a Claude session or
@@ -414,7 +430,7 @@ pub(crate) struct OpenThread {
 ///
 /// Every field is optional: older threads lack some of them, and they come
 /// from T3 payloads that no protocol check covers
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadDetails {
     /// T3 project title
     pub project: Option<String>,
@@ -435,7 +451,7 @@ pub struct ThreadDetails {
 }
 
 /// Pull request linked to a T3 thread
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     /// Pull request number
     pub number: i64,
@@ -488,6 +504,103 @@ pub(crate) fn open_threads(env: &T3Env) -> Result<Vec<OpenThread>, String> {
         }
     }
     Ok(threads)
+}
+
+/// One thread a T3 chip's context record names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChipTarget {
+    /// T3 thread id
+    pub(crate) thread: String,
+    /// T3 environment of the thread, when recorded
+    pub(crate) environment: Option<String>,
+    /// Thread title when the chip was made
+    pub(crate) title: Option<String>,
+}
+
+/// The threads the chip `ref` `context` names in this machine's T3
+///
+/// With `carrier`, the T3 thread whose message carried the chip, that
+/// message decides. Otherwise every distinct target is returned, and the
+/// caller uses one only when it is alone. Empty when no message here carries
+/// the record, or T3 is not installed
+pub(crate) fn chip_targets(
+    env: &T3Env,
+    context: &str,
+    carrier: Option<&str>,
+) -> Result<Vec<ChipTarget>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Ok(Vec::new());
+    }
+    v2::check_schema(&state)?;
+    v2::chip_targets(&state, context, carrier)
+}
+
+/// One T3 thread that is not deleted, open or archived, for thread lookups
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct T3Thread {
+    /// T3 thread id
+    pub(crate) id: String,
+    /// T3 thread title
+    pub(crate) title: String,
+    /// Whether the thread is archived
+    pub(crate) archived: bool,
+    /// Whether T3 settled the thread in its sidebar
+    pub(crate) settled: bool,
+    /// T3 thread that started this one as a subagent
+    pub(crate) parent: Option<String>,
+    /// Whether `parent` started this thread as a subagent; T3 also records a
+    /// fork's source as its parent, and a fork is the user's own thread
+    pub(crate) delegate: bool,
+    /// Whether the newest run has not finished
+    pub(crate) running: bool,
+    /// Claude session or Codex thread T3 runs the thread's next turn in, as
+    /// [`next_session`] picks it; `None` before the first one and while a
+    /// provider switch is pending
+    pub(crate) session: Option<ProviderThread>,
+    /// Project, branch, model, and other context T3 records for the thread
+    pub(crate) details: ThreadDetails,
+}
+
+/// Every T3 thread that is not deleted, newest first
+///
+/// Reads the state database on disk, so the server need not run. Empty only
+/// when T3 is not installed or a read succeeded and found no threads
+///
+/// # Errors
+///
+/// When the state exists but cannot be read, such as while it is locked or
+/// when its schema lacks what homebased reads, so a caller never takes a
+/// failed read for threads that are gone
+pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Ok(Vec::new());
+    }
+    v2::check_schema(&state)?;
+    let rows = v2::thread_rows(&state)?;
+    // the session T3 runs the next turn in, by the rule of `next_session`, so a
+    // provider switch reads the new session, or none until it starts
+    let sessions: std::collections::HashMap<String, ProviderThread> = v2::active_threads(&state)?
+        .iter()
+        .filter_map(|active| Some((active.thread.clone(), resumed(active)?)))
+        .collect();
+    let details = v2::all_thread_details(&state);
+
+    Ok(rows
+        .into_iter()
+        .map(|row| T3Thread {
+            session: sessions.get(&row.id).copied(),
+            details: details.get(&row.id).cloned().unwrap_or_default(),
+            id: row.id,
+            title: row.title,
+            archived: row.archived,
+            settled: row.settled,
+            parent: row.parent,
+            delegate: row.delegate,
+            running: row.running,
+        })
+        .collect())
 }
 
 /// Every row of a query that selects a driver, native id, T3 thread id,

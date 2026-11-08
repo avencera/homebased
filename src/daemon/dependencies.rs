@@ -12,6 +12,12 @@
 //! route waits on the worker's targets under [`ReleaseRule::Ended`], so it
 //! launches once every target ended, however each one ended
 //!
+//! It also owns GPU queue jobs submitted with `after`. Such a job is saved
+//! on this origin as held, under the job id its submit returned, and sent to
+//! its queue once every task succeeded. Any other ending cancels it with a
+//! terminal job event before it uses its queue, and a send whose reply was
+//! lost is resent under the same id
+//!
 //! It also sends a remote task submitted with `wait_for_machine`. That route
 //! has no dependencies, so it is ready at once, and each launch attempt waits
 //! for the machine to answer and then to accept the offer: a laptop declines
@@ -19,6 +25,8 @@
 //! replaces here too
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use tokio::time::MissedTickBehavior;
@@ -30,6 +38,7 @@ use super::api::SubmitBody;
 use super::api::views::DependencyView;
 use super::cancel_delivery::CancelResponse;
 use super::event_sender::Retry;
+use super::queue_api;
 use super::{local_submit, origin_submit};
 use crate::dependency::{
     DependencyOutcome, DependencyState, HeldCancellation, HeldDecision, ReleaseRule,
@@ -40,6 +49,8 @@ use crate::error::AppError;
 use crate::invocation::resolve_workload_binary;
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
+use crate::queue::JobId;
+use crate::queue::delivery::{HeldJobEnding, JobSubmission};
 use crate::spec::{self, NormalizedSpec};
 use crate::store::HeldCancel;
 use crate::submission::{
@@ -158,6 +169,15 @@ async fn try_supersede(state: &AppState, key: &CoalesceKey, by: TaskId) -> Resul
     Ok(())
 }
 
+/// Whether a job with `after` must wait, after refusing unknown, failed,
+/// and run tasks the way a task submit does
+pub(super) async fn must_wait(
+    state: &AppState,
+    after: &TaskDependencies,
+) -> Result<bool, AppError> {
+    Ok(matches!(admit(state, after).await?, Admission::Pending))
+}
+
 /// Check the dependencies of a dry run the way a submit would, saving nothing
 pub(super) async fn preview(
     state: &AppState,
@@ -208,6 +228,7 @@ pub(super) async fn cancel(
 /// Watch held routes for as long as the daemon runs
 pub(super) async fn run(state: AppState) {
     let mut retries: HashMap<TaskId, Retry> = HashMap::new();
+    let mut job_retries: HashMap<JobId, Retry> = HashMap::new();
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -215,7 +236,69 @@ pub(super) async fn run(state: AppState) {
         if let Err(error) = settle(&state, &mut retries).await {
             warn!("task dependency release: {error}");
         }
+        // tasks settle first, so a job sees the endings this pass applied
+        if let Err(error) = settle_jobs(&state, &mut job_retries).await {
+            warn!("job dependency release: {error}");
+        }
     }
+}
+
+/// Send each held job whose tasks all succeeded, end each one whose task
+/// ended any other way, and resend each sent job its authority has not
+/// confirmed
+async fn settle_jobs(
+    state: &AppState,
+    retries: &mut HashMap<JobId, Retry>,
+) -> Result<(), AppError> {
+    let routes = call(&state.store, |reply| StoreMsg::HeldJobRoutes { reply }).await?;
+    retries.retain(|job, _| routes.iter().any(|route| route.job == *job));
+    for route in routes {
+        let job = route.job;
+        if backing_off(retries, job) {
+            continue;
+        }
+        let _guard = state.locks.job_submissions.lock(job).await;
+        // a submit retry or cancel may have moved it while the lock was taken
+        let Some(route) = call(&state.store, |reply| StoreMsg::JobRoute { job, reply }).await?
+        else {
+            continue;
+        };
+        let route = match route.submission {
+            JobSubmission::Held => {
+                match decide(
+                    known_states(state, route.after.as_ref()).await?,
+                    ReleaseRule::Succeeded,
+                ) {
+                    HeldDecision::Wait => continue,
+                    HeldDecision::Cancel(failure) => {
+                        let ending = HeldJobEnding::Dependency {
+                            task: failure.dependency,
+                            outcome: failure.outcome,
+                        };
+                        call(&state.store, |reply| StoreMsg::EndHeldJob {
+                            job,
+                            ending,
+                            reply,
+                        })
+                        .await?;
+                        continue;
+                    }
+                    HeldDecision::Release => {
+                        call(&state.store, |reply| StoreMsg::ReleaseHeldJob {
+                            job,
+                            reply,
+                        })
+                        .await?
+                    }
+                }
+            }
+            JobSubmission::Unknown => route,
+            _ => continue,
+        };
+        let sent = queue_api::send_job(state, route).await.map(|_| ());
+        record_attempt(retries, job, sent, "held job send deferred");
+    }
+    Ok(())
 }
 
 /// Whether a new submission may launch now
@@ -455,16 +538,16 @@ async fn retry_resume(state: &AppState, retries: &mut HashMap<TaskId, Retry>, ta
     );
 }
 
-fn backing_off(retries: &HashMap<TaskId, Retry>, task: TaskId) -> bool {
+fn backing_off<K: Eq + Hash>(retries: &HashMap<K, Retry>, task: K) -> bool {
     retries
         .get(&task)
         .is_some_and(|retry| !retry.ready(Instant::now()))
 }
 
 /// Forget a task's backoff after a successful attempt, or extend it after a failure
-fn record_attempt(
-    retries: &mut HashMap<TaskId, Retry>,
-    task: TaskId,
+fn record_attempt<K: Eq + Hash + Copy + fmt::Display>(
+    retries: &mut HashMap<K, Retry>,
+    task: K,
     result: Result<(), AppError>,
     deferred: &str,
 ) {

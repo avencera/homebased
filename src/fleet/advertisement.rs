@@ -117,6 +117,11 @@ pub struct MachineAdvertisement {
         deserialize_with = "lenient_dashboard_url"
     )]
     pub dashboard_url: Option<DashboardUrl>,
+    /// T3 Code environment id, from `~/.t3/userdata/environment-id`, so a
+    /// `t3-thread://v2/<environment>/<thread>` link names this machine. Older
+    /// daemons and machines without T3 omit it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_environment: Option<String>,
 }
 
 impl MachineAdvertisement {

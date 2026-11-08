@@ -93,6 +93,8 @@ pub(crate) struct ContextUse {
     /// Context window of the model, when the record names it
     window: Option<u64>,
     last_active: DateTime<Utc>,
+    /// Last compaction the scanned tail shows
+    compacted_at: Option<DateTime<Utc>>,
 }
 
 impl ContextUse {
@@ -137,6 +139,12 @@ impl ContextUse {
             }
         }
         Self::find(&env.home, thread)
+    }
+
+    /// Whether the Claude session `thread` has a transcript under `home`, with
+    /// or without a request
+    pub(crate) fn claude_transcript_exists(home: &Path, thread: ThreadId) -> bool {
+        transcript_path(&home.join(".claude/projects"), thread).is_some()
     }
 
     /// Read the Claude session `thread` from its transcript under `home`
@@ -206,9 +214,17 @@ impl ContextUse {
         self.last_active
     }
 
+    /// Last compaction, when the tail read for the last request shows one
+    ///
+    /// The tail ends at the last request, so an older compaction is unknown
+    pub(crate) fn compacted_at(&self) -> Option<DateTime<Utc>> {
+        self.compacted_at
+    }
+
     fn from_tail(tail: &[u8]) -> Option<Self> {
         let mut last_active = None;
-        for raw in tail.rsplit(|byte| *byte == b'\n') {
+        let mut lines = tail.rsplit(|byte| *byte == b'\n');
+        while let Some(raw) = lines.next() {
             // the first line of the tail may be cut off and does not parse
             let Ok(line) = serde_json::from_slice::<Line>(raw) else {
                 continue;
@@ -230,19 +246,37 @@ impl ContextUse {
                     estimated: true,
                     window: None,
                     last_active,
+                    compacted_at: Some(at),
                 });
             }
             if let Some(tokens) = line.request_tokens() {
+                // only lines that name a boundary are parsed, so the rest of
+                // the tail costs a byte scan
+                let compacted_at = lines
+                    .filter(|raw| contains(raw, b"compact_boundary"))
+                    .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
+                    .find(|line| {
+                        !line.is_sidechain && line.subtype.as_deref() == Some("compact_boundary")
+                    })
+                    .and_then(|line| line.timestamp);
                 return Some(Self {
                     tokens,
                     estimated: false,
                     window: None,
                     last_active,
+                    compacted_at,
                 });
             }
         }
         None
     }
+}
+
+/// Whether `haystack` holds `needle`
+pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Scan growing suffixes of the JSON lines file at `path` with `parse`, which

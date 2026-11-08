@@ -15,6 +15,7 @@ use crate::error::AppError;
 use crate::events::{EventPayload, TaskEvent};
 use crate::queue::{JobEvent, JobEventKind, JobId};
 use crate::task_wait::{WaitKey, WaiterId};
+use crate::thread_watch::{WatchEvent, WatchEventKind, WatchId};
 
 // the client confirms an event only after its line reached stdout; without that
 // confirmation the event falls through to normal delivery, so a client that died
@@ -51,6 +52,17 @@ pub enum HandoffEvent {
         /// The `HOMEBASED_EVENT` line normal delivery would have sent
         line: String,
     },
+    /// A thread watch event
+    Watch {
+        /// Watch the event belongs to
+        watch: WatchId,
+        /// Per-watch event sequence
+        seq: u64,
+        /// What the event reports
+        kind: WatchEventKind,
+        /// The `HOMEBASED_EVENT` line normal delivery would have sent
+        line: String,
+    },
 }
 
 impl HandoffEvent {
@@ -60,6 +72,7 @@ impl HandoffEvent {
         match self {
             Self::Task { task, .. } => WaitKey::Task(*task),
             Self::Job { job, .. } => WaitKey::Job(*job),
+            Self::Watch { watch, .. } => WaitKey::Watch(*watch),
         }
     }
 
@@ -67,7 +80,7 @@ impl HandoffEvent {
     #[must_use]
     pub fn seq(&self) -> u64 {
         match self {
-            Self::Task { seq, .. } | Self::Job { seq, .. } => *seq,
+            Self::Task { seq, .. } | Self::Job { seq, .. } | Self::Watch { seq, .. } => *seq,
         }
     }
 }
@@ -369,6 +382,23 @@ impl WaiterRegistry {
             line: line.to_owned(),
         };
         self.hand_off_event(thread, offer, current).await
+    }
+
+    /// Offer one watch event to the waiters of its watch that belong to `thread`
+    ///
+    /// Same contract as [`Self::hand_off`]
+    pub async fn hand_off_watch(&self, thread: ThreadId, event: &WatchEvent) -> bool {
+        let offer = HandoffEvent::Watch {
+            watch: event.watch,
+            seq: event.seq,
+            kind: event.kind,
+            line: event.line(),
+        };
+        matches!(
+            self.hand_off_event(thread, offer, || std::future::ready(Some(true)))
+                .await,
+            JobHandoff::Printed
+        )
     }
 
     async fn hand_off_event<F>(
