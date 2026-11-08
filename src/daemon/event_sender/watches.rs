@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use futures_util::FutureExt;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -20,7 +21,7 @@ use crate::daemon::AppState;
 use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::error::AppError;
-use crate::events::DeliveryOutcome;
+use crate::events::{DeliveryOutcome, THREAD_WAIT_LIMIT};
 use crate::thread_watch::{ThreadWatch, WatchEvent, WatchId};
 
 const MAX_SENDERS: usize = 8;
@@ -105,7 +106,7 @@ async fn schedule(
     workers: &mut JoinSet<Attempt>,
 ) -> Result<(), AppError> {
     let pending = call(&state.store, |reply| StoreMsg::PendingWatchEvents { reply }).await?;
-    for (watch, event) in pending {
+    for (watch, event, created) in pending {
         if active.len() >= MAX_SENDERS {
             break;
         }
@@ -119,24 +120,32 @@ async fn schedule(
         }
         active.insert(id);
         let last = spent(attempts, id, event.seq) + 1 >= MAX_ATTEMPTS;
+        // a caller that never comes back would hold its watch's later events
+        // forever, so a wait ends at the limit task callbacks have
+        let waited_out = Utc::now() - created >= THREAD_WAIT_LIMIT;
         let state = state.clone();
         workers.spawn(async move {
-            let result = std::panic::AssertUnwindSafe(deliver(&state, &watch, &event, last))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| Err(Unsettled::Later("watch delivery worker panicked".into())));
+            let result =
+                std::panic::AssertUnwindSafe(deliver(&state, &watch, &event, last, waited_out))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Unsettled::Later("watch delivery worker panicked".into()))
+                    });
             (id, event.seq, result)
         });
     }
     Ok(())
 }
 
-/// Try one event; with `last`, a retryable failure settles it as failed
+/// Try one event; with `last`, a retryable failure settles it as failed, and
+/// with `waited_out`, so does a wait for the caller
 async fn deliver(
     state: &AppState,
     watch: &ThreadWatch,
     event: &WatchEvent,
     last: bool,
+    waited_out: bool,
 ) -> Result<(), Unsettled> {
     let callback = call(&state.supervisor, |reply| SupervisorMsg::GetCallback {
         reply,
@@ -172,6 +181,10 @@ async fn deliver(
             Ok(settle("failed").await?)
         }
         Some(DeliveryOutcome::Retryable(message)) => Err(Unsettled::Retryable(message)),
+        Some(DeliveryOutcome::Deferred(message)) if waited_out => {
+            warn!(watch = %watch.id, seq = event.seq, "watch event not delivered after waiting {} days for the caller: {message}", THREAD_WAIT_LIMIT.num_days());
+            Ok(settle("failed").await?)
+        }
         Some(DeliveryOutcome::Deferred(message)) => Err(Unsettled::Later(message)),
     }
 }

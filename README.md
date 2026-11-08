@@ -438,8 +438,8 @@ another machine is read through that machine on each check; while it does not
 answer, the watch is left as it was. Events are delivered like task events, in
 order per watch, and deduplicated by `(watch, seq)`. An event whose saved
 callback can no longer run, or that fails 3 times, is given up so later events
-still go out. Events for a stopped Claude session wait until it runs again, as
-task callbacks do. The skill's
+still go out. Events for a stopped Claude session wait until it runs again, for
+up to 3 days as task callbacks do. The skill's
 [threads.md](.agents/skills/homebased/references/threads.md) has the payload.
 
 On the socket, `POST /v1/threads/context` resolves references and

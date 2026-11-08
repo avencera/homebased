@@ -770,9 +770,13 @@ impl OriginAttempt {
     }
 
     async fn send_codex(self, wake_failure: Option<String>) -> Result<AttemptOutcome, AppError> {
-        // a gone cwd or Codex binary never comes back by retrying
+        // a gone cwd or Codex binary never comes back by retrying, unless T3,
+        // which needs neither, failed only for now
         if let Err(error) = check_saved_callback(&self.context) {
-            return Ok(AttemptOutcome::Settle(DeliveryOutcome::Permanent(error)));
+            return Ok(AttemptOutcome::Settle(match wake_failure {
+                Some(reason) => DeliveryOutcome::Retryable(format!("{reason}; {error}")),
+                None => DeliveryOutcome::Permanent(error),
+            }));
         }
         let sent = run_blocking("origin callback", move || {
             send_codex_queue_attempt(
