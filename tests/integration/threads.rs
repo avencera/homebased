@@ -3,6 +3,7 @@
 use super::{Harness, THREAD, event_json, wait_until};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Output, Stdio};
@@ -122,6 +123,132 @@ impl Harness {
                 [thread],
             )
             .unwrap();
+    }
+
+    /// A T3 thread `parent` started as a subagent
+    fn t3_child(&self, child: &str, parent: &str, session: Option<&str>) {
+        let payload = json!({
+            "lineage": { "parentThreadId": parent, "relationshipToParent": "subagent" }
+        });
+        self.t3_state()
+            .execute(
+                "INSERT INTO orchestration_v2_projection_threads (thread_id, title, payload_json)
+                 VALUES (?1, ?1, ?2)",
+                rusqlite::params![child, payload.to_string()],
+            )
+            .unwrap();
+        if let Some(session) = session {
+            self.t3_session(child, session);
+        }
+    }
+
+    /// A delegated task `node` that `parent` gave `child`, as T3 records it in
+    /// a subagent node and the subagent row of the same id
+    fn t3_task(&self, parent: &str, child: &str, node: &str, status: &str, started_at: &str) {
+        let db = self.t3_state();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orchestration_v2_projection_nodes (
+                node_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                root_node_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                payload_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS orchestration_v2_projection_subagents (
+                subagent_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                child_thread_id TEXT,
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_nodes
+             (node_id, thread_id, root_node_id, kind, status, started_at, payload_json)
+             VALUES (?1, ?2, ?1, 'subagent', ?3, ?4, '{}')",
+            rusqlite::params![node, parent, status, started_at],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_subagents
+             (subagent_id, thread_id, child_thread_id, origin, status, started_at, updated_at,
+              payload_json)
+             VALUES (?1, ?2, ?3, 'app_owned', ?4, ?5, ?5, ?6)",
+            rusqlite::params![
+                node,
+                parent,
+                child,
+                status,
+                started_at,
+                json!({ "childThreadId": child }).to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Settle `thread` in T3's sidebar, or unsettle it
+    fn settle_t3_thread(&self, thread: &str, settled: bool) {
+        let state = if settled { "settled" } else { "unsettled" };
+        self.t3_state()
+            .execute(
+                "UPDATE orchestration_v2_projection_threads
+                 SET payload_json = json_set(payload_json, '$.settledOverride', ?2)
+                 WHERE thread_id = ?1",
+                rusqlite::params![thread, state],
+            )
+            .unwrap();
+    }
+
+    fn archive_t3_thread(&self, thread: &str) {
+        self.t3_state()
+            .execute(
+                "UPDATE orchestration_v2_projection_threads SET archived_at = '2026-10-03T00:00:00Z'
+                 WHERE thread_id = ?1",
+                [thread],
+            )
+            .unwrap();
+    }
+
+    /// Stored payloads of `watch`'s events, in order, with how each settled
+    fn watch_events(&self, watch: &str) -> Vec<(Value, Option<String>)> {
+        let db = rusqlite::Connection::open(self.home.join(homebased::home::DB_NAME)).unwrap();
+        let mut statement = db
+            .prepare(
+                "SELECT event_json, delivery FROM thread_watch_events WHERE watch_id = ?1
+                 ORDER BY seq",
+            )
+            .unwrap();
+        statement
+            .query_map([watch], |row| {
+                let event: String = row.get(0)?;
+                Ok((
+                    serde_json::from_str::<Value>(&event).unwrap()["payload"].clone(),
+                    row.get(1)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Why `watch` ended, or `None` while it is live
+    fn watch_end(&self, watch: &str) -> Option<String> {
+        let all = ok(&self.thread_cmd(None, &["watches", "--all"]));
+        let found = all["watches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|listed| listed["watch"] == watch)
+            .unwrap_or_else(|| panic!("{watch} is not listed: {all}"))
+            .clone();
+        found["end_reason"].as_str().map(str::to_owned)
     }
 
     /// A Codex rollout for `session` in `cwd`, whose last request carried `tokens`
@@ -543,9 +670,14 @@ fn a_watch_scan_that_cannot_read_t3_leaves_the_watch_as_it_was() {
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(live(&h), 1, "the watch ended while T3 could not be read");
 
-    // once T3 reads again, a deleted thread does end the watch
+    // once T3 reads again, one scan that misses the thread ends nothing
     h.delete_t3_thread(WATCHED);
     h.restart_daemon();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(live(&h), 1, "one missing read ended the watch");
+
+    // and the second scan in a row does
+    h.restart_daemon_with_env(&[("HOMEBASED_TEST_SCAN_SECS", "1")]);
     assert!(
         wait_until(Duration::from_secs(20), || live(&h) == 0),
         "the scan did not end the watch of a deleted thread"
@@ -648,8 +780,8 @@ fn a_watch_whose_callback_can_no_longer_run_settles_each_event_as_failed() {
     // a fresh daemon scans its watches at once instead of a minute on
     h.restart_daemon();
 
-    // the fired event settles as failed rather than retrying forever, so the
-    // end event queued behind it settles too
+    // the fired event settles as failed rather than retrying forever; it
+    // ends the watch itself, so no end event is queued behind it
     let db = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
     let settled = || -> Vec<(i64, Option<String>)> {
         let mut statement = db
@@ -665,14 +797,12 @@ fn a_watch_whose_callback_can_no_longer_run_settles_each_event_as_failed() {
             .unwrap()
     };
     assert!(
-        wait_until(Duration::from_secs(20), || settled().len() == 2),
+        wait_until(Duration::from_secs(20), || !settled().is_empty()),
         "{:?}",
         settled()
     );
-    assert_eq!(
-        settled(),
-        vec![(1, Some("failed".into())), (2, Some("failed".into()))]
-    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(settled(), vec![(1, Some("failed".into()))]);
     assert!(h.queue_messages().is_empty(), "{:?}", h.queue_messages());
 }
 
@@ -731,4 +861,351 @@ fn a_running_claude_worker_without_a_transcript_is_found_and_live() {
         // a watch on it must not end at once as session_gone
         assert_eq!(thread["session_exists"], true, "{thread}");
     }
+}
+
+#[test]
+fn a_once_watch_fires_one_event_that_ends_it() {
+    let mut h = Harness::new();
+    h.terminal_session(TERMINAL, 300_000);
+    let watched = ok(&h.thread_cmd(
+        Some(THREAD),
+        &["watch", TERMINAL, "--context-above", "100k", "--once"],
+    ));
+    let watch = watched["watches"][0]["watch"].as_str().unwrap().to_owned();
+    // a fresh daemon scans its watches at once
+    h.restart_daemon();
+
+    assert!(
+        wait_until(Duration::from_secs(20), || !h.queue_messages().is_empty()),
+        "the watch did not fire"
+    );
+    // time for an end event to follow, if one were sent
+    std::thread::sleep(Duration::from_secs(2));
+    let delivered = h.queue_messages();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let event = event_json(&delivered[0]);
+    assert_eq!(event["event"], "THREAD_CONTEXT_OVER", "{event}");
+    assert_eq!(event["watch_ended"], true, "{event}");
+    assert_eq!(event["end_reason"], "once", "{event}");
+    assert_eq!(h.watch_events(&watch).len(), 1);
+    assert_eq!(h.watch_end(&watch).as_deref(), Some("once"));
+}
+
+#[test]
+fn children_watches_and_live_context_leave_out_delegates_that_are_done() {
+    const ROOT: &str = "mcp:launch:children-root";
+    const SETTLED: &str = "mcp:launch:child-settled";
+    const ARCHIVED: &str = "mcp:launch:child-archived";
+    const DONE: &str = "mcp:launch:child-done";
+    const RESENT: &str = "mcp:launch:child-resent";
+    const WORKING: &str = "mcp:launch:child-working";
+    const UNTRACKED: &str = "mcp:launch:child-untracked";
+    let h = Harness::new();
+    h.t3_thread(ROOT, "root", Some(THREAD));
+    for child in [SETTLED, ARCHIVED, DONE, RESENT, WORKING, UNTRACKED] {
+        h.t3_child(child, ROOT, None);
+    }
+    h.settle_t3_thread(SETTLED, true);
+    h.archive_t3_thread(ARCHIVED);
+    h.t3_task(ROOT, DONE, "node-done", "completed", "2026-10-02T20:00:00Z");
+    // a message to a finished child starts a new task, so it works again
+    h.t3_task(
+        ROOT,
+        RESENT,
+        "node-resent-1",
+        "completed",
+        "2026-10-02T20:00:00Z",
+    );
+    h.t3_task(
+        ROOT,
+        RESENT,
+        "node-resent-2",
+        "running",
+        "2026-10-02T21:00:00Z",
+    );
+    h.t3_task(
+        ROOT,
+        WORKING,
+        "node-working",
+        "running",
+        "2026-10-02T20:00:00Z",
+    );
+    // a child with no task record, as an older T3 made it, reads by its state
+    let names = |threads: &Value| -> HashSet<String> {
+        threads
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|thread| thread["t3_thread"].as_str())
+            .filter(|thread| *thread != ROOT)
+            .map(str::to_owned)
+            .collect()
+    };
+    let live = HashSet::from([RESENT, WORKING, UNTRACKED].map(str::to_owned));
+
+    // the ledger keeps every child and marks the finished one
+    let ledger = ok(&h.thread_cmd(Some(THREAD), &["context", "--children"]));
+    assert_eq!(names(&ledger["children"]).len(), 6, "{ledger}");
+    for child in ledger["children"].as_array().unwrap() {
+        let finished = child["t3_thread"] == DONE;
+        assert_eq!(child["task_finished"], finished, "{child}");
+    }
+    let working = ok(&h.thread_cmd(Some(THREAD), &["context", "--children", "--live"]));
+    assert_eq!(names(&working["children"]), live, "{working}");
+
+    let watched = ok(&h.thread_cmd(
+        Some(THREAD),
+        &["watch", "--children", "--context-above", "100k"],
+    ));
+    let targets: Vec<Value> = watched["watches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|watch| watch["target"].clone())
+        .collect();
+    assert_eq!(names(&Value::Array(targets)), live, "{watched}");
+}
+
+#[test]
+fn a_done_t3_target_never_fires_and_its_watch_ends_after_an_hour_of_quiet() {
+    const PARENT: &str = "mcp:launch:quiet-parent";
+    const CHILD: &str = "mcp:launch:quiet-child";
+    const SESSION: &str = "0199eeee-4444-7000-8000-000000000001";
+    let mut h = Harness::new();
+    let cwd = h.user_home.clone();
+    h.t3_thread(PARENT, "parent", None);
+    h.t3_child(CHILD, PARENT, Some(SESSION));
+    h.codex_session(SESSION, &cwd, 150_000);
+    h.settle_t3_thread(CHILD, true);
+    let watched = ok(&h.thread_cmd(Some(THREAD), &["watch", CHILD, "--context-above", "100k"]));
+    let watch = watched["watches"][0]["watch"].as_str().unwrap().to_owned();
+    h.restart_daemon_with_env(&[("HOMEBASED_TEST_SCAN_SECS", "1")]);
+
+    // over the limit and idle, but settled: several scans fire nothing
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        h.watch_events(&watch).is_empty(),
+        "{:?}",
+        h.watch_events(&watch)
+    );
+
+    // unsettled, it is a working thread again
+    h.settle_t3_thread(CHILD, false);
+    assert!(
+        wait_until(Duration::from_secs(20), || !h
+            .watch_events(&watch)
+            .is_empty()),
+        "the unsettled thread did not fire"
+    );
+    let fired = &h.watch_events(&watch)[0].0;
+    assert_eq!(fired["event"], "THREAD_CONTEXT_OVER", "{fired}");
+    assert_eq!(fired["watch_ended"], false, "{fired}");
+
+    // its task ends; activity keeps the watch while the quiet hour, made 4
+    // seconds here, has not passed
+    h.t3_task(
+        PARENT,
+        CHILD,
+        "node-quiet",
+        "completed",
+        "2026-10-02T20:00:00Z",
+    );
+    h.restart_daemon_with_env(&[
+        ("HOMEBASED_TEST_SCAN_SECS", "1"),
+        ("HOMEBASED_TEST_WATCH_QUIET_SECS", "4"),
+    ]);
+    for step in 0..14 {
+        h.codex_session(SESSION, &cwd, 150_000 + step * 1_000);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(h.watch_end(&watch), None, "activity did not keep the watch");
+
+    assert!(
+        wait_until(Duration::from_secs(20), || h.watch_end(&watch).is_some()),
+        "the quiet finished thread kept its watch"
+    );
+    assert_eq!(h.watch_end(&watch).as_deref(), Some("finished"));
+    let events = h.watch_events(&watch);
+    let (ended, _) = events.last().unwrap();
+    assert_eq!(ended["event"], "THREAD_WATCH_ENDED", "{ended}");
+    assert_eq!(ended["reason"], "finished", "{ended}");
+    assert_eq!(ended["watch_ended"], true, "{ended}");
+    assert_eq!(events.len(), 2, "{events:?}");
+}
+
+#[test]
+fn a_watch_ends_without_waking_its_caller_once_the_caller_is_archived() {
+    const ROOT: &str = "mcp:launch:gone-caller";
+    let mut h = Harness::new();
+    let cwd = h.user_home.clone();
+    h.t3_thread(ROOT, "root", Some(THREAD));
+    h.codex_session(THREAD, &cwd, 20_000);
+    h.terminal_session(TERMINAL, 50_000);
+    let watched = ok(&h.thread_cmd(
+        Some(THREAD),
+        &["watch", TERMINAL, "--context-above", "100k"],
+    ));
+    let watch = watched["watches"][0]["watch"].as_str().unwrap().to_owned();
+    h.restart_daemon_with_env(&[("HOMEBASED_TEST_SCAN_SECS", "1")]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(h.watch_end(&watch), None);
+
+    h.archive_t3_thread(ROOT);
+    assert!(
+        wait_until(Duration::from_secs(20), || h.watch_end(&watch).is_some()),
+        "the watch of an archived caller kept running"
+    );
+    assert_eq!(h.watch_end(&watch).as_deref(), Some("caller_gone"));
+    // the end is kept, but delivering it would unarchive the caller
+    assert!(
+        wait_until(Duration::from_secs(10), || h
+            .watch_events(&watch)
+            .iter()
+            .all(|(_, delivery)| delivery.is_some())),
+        "{:?}",
+        h.watch_events(&watch)
+    );
+    let events = h.watch_events(&watch);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].0["reason"], "caller_gone");
+    assert_eq!(events[0].1.as_deref(), Some("suppressed"));
+    assert!(h.queue_messages().is_empty(), "{:?}", h.queue_messages());
+}
+
+#[test]
+fn a_watch_made_before_caller_threads_were_saved_learns_its_caller_and_follows_it() {
+    const ROOT: &str = "mcp:launch:learned-caller";
+    const MOVED: &str = "0199eeee-5555-7000-8000-000000000001";
+    let mut h = Harness::new();
+    let cwd = h.user_home.clone();
+    h.t3_thread(ROOT, "root", Some(THREAD));
+    h.codex_session(THREAD, &cwd, 20_000);
+    h.terminal_session(TERMINAL, 50_000);
+    let watched = ok(&h.thread_cmd(
+        Some(THREAD),
+        &["watch", TERMINAL, "--context-above", "100k"],
+    ));
+    let watch = watched["watches"][0]["watch"].as_str().unwrap().to_owned();
+
+    // v0.25.0 saved no caller T3 thread
+    h.stop_daemon();
+    let db = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+    let saved = || -> Value {
+        let json: String = db
+            .query_row(
+                "SELECT watch_json FROM thread_watches WHERE id = ?1",
+                [&watch],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&json).unwrap()["caller_t3"].clone()
+    };
+    assert_eq!(saved(), ROOT);
+    db.execute(
+        "UPDATE thread_watches SET watch_json = json_remove(watch_json, '$.caller_t3')
+         WHERE id = ?1",
+        [&watch],
+    )
+    .unwrap();
+    assert_eq!(saved(), Value::Null);
+
+    // the first scan finds the caller by its session and saves its thread
+    h.start_daemon_with_env(&[("HOMEBASED_TEST_SCAN_SECS", "1")]);
+    assert!(
+        wait_until(Duration::from_secs(20), || saved() == ROOT),
+        "the scan did not save the caller's T3 thread"
+    );
+
+    // once T3 moves the caller to another session, only the saved thread
+    // still finds it, and its deletion ends the watch
+    h.codex_session(MOVED, &cwd, 20_000);
+    h.t3_session(ROOT, MOVED);
+    h.delete_t3_thread(ROOT);
+    assert!(
+        wait_until(Duration::from_secs(20), || h.watch_end(&watch).is_some()),
+        "the watch of a deleted caller kept running"
+    );
+    assert_eq!(h.watch_end(&watch).as_deref(), Some("caller_gone"));
+}
+
+#[test]
+fn a_pending_event_never_reaches_a_caller_archived_after_its_watch_fired() {
+    const ROOT: &str = "mcp:launch:archived-after-fire";
+    let mut h = Harness::new();
+    let cwd = h.user_home.clone();
+    h.t3_thread(ROOT, "root", Some(THREAD));
+    h.codex_session(THREAD, &cwd, 20_000);
+    h.terminal_session(TERMINAL, 50_000);
+    let watch_at = |limit: &str| {
+        let out = h.thread_cmd(
+            Some(THREAD),
+            &["watch", TERMINAL, "--context-above", limit, "--once"],
+        );
+        ok(&out)["watches"][0]["watch"].as_str().unwrap().to_owned()
+    };
+    let control = watch_at("100k");
+    let late = watch_at("200k");
+    let legacy = watch_at("300k");
+    // a `--once` watch that fired and ended, while its event waits to go out
+    let fired = |h: &Harness, watch: &str| {
+        let db = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+        let payload = json!({
+            "api_version": 1, "event": "THREAD_CONTEXT_OVER", "watch": watch, "seq": 1,
+            "thread": THREAD, "watch_ended": true, "end_reason": "once"
+        });
+        let event = json!({
+            "watch": watch, "seq": 1, "kind": "THREAD_CONTEXT_OVER", "payload": payload
+        });
+        db.execute(
+            "UPDATE thread_watches SET armed = 0, event_seq = 1,
+             ended_at = '2026-10-02T20:00:00Z', end_reason = 'once' WHERE id = ?1",
+            [watch],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO thread_watch_events (watch_id, seq, event_json, created_at)
+             VALUES (?1, 1, ?2, '2026-10-02T20:00:00Z')",
+            rusqlite::params![watch, event.to_string()],
+        )
+        .unwrap();
+    };
+    let settled = |h: &Harness, watch: &str| h.watch_events(watch)[0].1.clone();
+
+    // while the caller is live, the event goes out as usual
+    h.stop_daemon();
+    fired(&h, &control);
+    h.start_daemon();
+    assert!(
+        wait_until(Duration::from_secs(20), || settled(&h, &control).is_some()),
+        "the control event never settled"
+    );
+    assert_ne!(settled(&h, &control).as_deref(), Some("suppressed"));
+
+    // archived before its event goes out, the caller is never woken, and
+    // the watch keeps the end it had. A watch from before `caller_t3` was
+    // saved finds its caller by the session, so its event is held back too
+    h.stop_daemon();
+    fired(&h, &late);
+    fired(&h, &legacy);
+    rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME))
+        .unwrap()
+        .execute(
+            "UPDATE thread_watches SET watch_json = json_remove(watch_json, '$.caller_t3')
+             WHERE id = ?1",
+            [&legacy],
+        )
+        .unwrap();
+    h.archive_t3_thread(ROOT);
+    let before = h.queue_messages();
+    h.start_daemon();
+    for watch in [&late, &legacy] {
+        assert!(
+            wait_until(Duration::from_secs(20), || settled(&h, watch).is_some()),
+            "the event of an archived caller never settled"
+        );
+        assert_eq!(settled(&h, watch).as_deref(), Some("suppressed"));
+        assert_eq!(h.watch_end(watch).as_deref(), Some("once"));
+        assert_eq!(h.watch_events(watch).len(), 1);
+    }
+    assert_eq!(h.queue_messages(), before);
 }

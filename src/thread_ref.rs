@@ -382,12 +382,6 @@ impl ThreadState {
     pub fn busy(self) -> bool {
         matches!(self, Self::Running | Self::Unknown)
     }
-
-    /// Whether the thread finished or was put away
-    #[must_use]
-    pub fn finished(self) -> bool {
-        matches!(self, Self::Settled | Self::Archived)
-    }
 }
 
 /// How long a session outside T3 counts as running after its last activity
@@ -421,6 +415,16 @@ pub struct ThreadContext {
     pub title: Option<String>,
     /// What the thread is doing
     pub state: ThreadState,
+    /// Whether T3 records the delegated task the thread runs as ended, with no
+    /// run left; false for a thread with no such record, and from a peer that
+    /// predates the field
+    #[serde(default)]
+    pub task_finished: bool,
+    /// Whether T3 settled the thread in its sidebar, which `state` does not
+    /// show while homebased work still owes the thread events; false outside
+    /// T3, and from a peer that predates the field
+    #[serde(default)]
+    pub settled: bool,
     /// Context tokens of the last request or compaction, once there was one
     pub tokens: Option<u64>,
     /// Whether `tokens` is an estimate after a compaction, until the next request
@@ -454,6 +458,37 @@ impl ThreadContext {
         }
     }
 
+    /// Whether T3 is done with the thread: settled, or its delegated task
+    /// ended, and no turn runs
+    ///
+    /// This reads T3's own records, not the shown state, which says `waiting`
+    /// while a homebased task owes the thread events. That work wakes the
+    /// thread with a new turn when it reports, which makes it live again, so
+    /// until then it counts as done. A running turn will grow it, so it never does
+    #[must_use]
+    pub fn done(&self) -> bool {
+        // a peer that predates `settled` shows a settled thread by its state
+        self.state == ThreadState::Settled
+            || (self.state != ThreadState::Running && (self.settled || self.task_finished))
+    }
+
+    /// Whether `--children --live` and a `--children` watch leave the thread out
+    #[must_use]
+    pub fn put_away(&self) -> bool {
+        self.state == ThreadState::Archived || self.done()
+    }
+
+    /// The state human output shows, which names an idle thread whose task
+    /// ended `finished`
+    #[must_use]
+    pub fn state_label(&self) -> &'static str {
+        if self.task_finished && self.state == ThreadState::Idle {
+            "finished"
+        } else {
+            self.state.as_str()
+        }
+    }
+
     /// One line for human output
     #[must_use]
     pub fn human_line(&self) -> String {
@@ -482,7 +517,7 @@ impl ThreadContext {
         format!(
             "{title} [{}{estimate}, {}{active}{cache}{model}] on {} {}",
             size,
-            self.state.as_str(),
+            self.state_label(),
             self.machine_name,
             self.exact_reference()
         )

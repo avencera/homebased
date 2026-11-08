@@ -15,6 +15,7 @@ use crate::task_wait::{
     WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys, WaitRequest,
     WaitSet, WaiterId, wakes_final_only,
 };
+use crate::thread_watch::line_ends_watch;
 
 use super::task::select_thread;
 
@@ -313,7 +314,7 @@ async fn follow(
                 if let Some(waiter) = waiter {
                     confirm(client, waiter, WaitKey::Watch(watch), seq).await;
                 }
-                set.apply_watch(watch, kind);
+                set.apply_watch(watch, line_ends_watch(kind, &line));
             }
         }
         seen.woke |= wakes;

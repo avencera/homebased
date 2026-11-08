@@ -62,6 +62,8 @@ pub struct WatchUpdate {
     pub events: Vec<(WatchEventKind, Value)>,
     /// End the watch for this reason
     pub end: Option<WatchEndReason>,
+    /// The caller's T3 thread a scan found, saved when the watch has none yet
+    pub caller_t3: Option<String>,
 }
 
 const WATCH_COLUMNS: &str = "watch_json, armed, event_seq, ended_at, end_reason";
@@ -71,7 +73,7 @@ impl Store {
     /// target, limit, and action, and return it with whether it is new
     ///
     /// An existing watch keeps its id, sequence, and armed state, and takes the
-    /// new `once` and callback environment
+    /// new `once`, callback environment, and caller T3 thread
     pub fn upsert_watch(&self, watch: &ThreadWatch) -> Result<(WatchRecord, bool), AppError> {
         self.immediate(|| {
             let key = watch.key();
@@ -91,6 +93,9 @@ impl Store {
                     .ok_or(AppError::WatchNotFound { watch: id })?;
                 record.watch.once = watch.once;
                 record.watch.callback = watch.callback.clone();
+                if watch.caller_t3.is_some() {
+                    record.watch.caller_t3.clone_from(&watch.caller_t3);
+                }
                 self.conn.execute(
                     "UPDATE thread_watches SET watch_json = ?2 WHERE id = ?1",
                     params![id.to_string(), serde_json::to_string(&record.watch)?],
@@ -202,6 +207,19 @@ impl Store {
                 .map(serde_json::to_value)
                 .transpose()?
                 .and_then(|value| value.as_str().map(str::to_owned));
+            // a watch from before `caller_t3` keeps the T3 thread its session
+            // named, so it still finds its caller after T3 moves the session
+            if let Some(thread) = update
+                .caller_t3
+                .filter(|_| record.watch.caller_t3.is_none())
+            {
+                let mut watch = record.watch.clone();
+                watch.caller_t3 = Some(thread);
+                self.conn.execute(
+                    "UPDATE thread_watches SET watch_json = ?2 WHERE id = ?1",
+                    params![id.to_string(), serde_json::to_string(&watch)?],
+                )?;
+            }
             self.conn.execute(
                 "UPDATE thread_watches
                  SET armed = ?2, event_seq = ?3,

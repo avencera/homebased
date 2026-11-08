@@ -5,7 +5,9 @@
 //! printed or delivered, and a refused delivery settles as failed so the
 //! events after it still go out. A route that can no longer run, such as a
 //! `codex queue` whose binary is gone, settles at once, and a retryable
-//! failure settles after [`MAX_ATTEMPTS`]
+//! failure settles after [`MAX_ATTEMPTS`]. An event whose caller's T3 thread is
+//! archived or deleted, or whose watch ended as `caller_gone`, reaches only a
+//! connected wait, and settles as suppressed otherwise
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -20,9 +22,10 @@ use super::Retry;
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
+use crate::daemon::thread_api::caller_t3_here;
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, THREAD_WAIT_LIMIT};
-use crate::thread_watch::{ThreadWatch, WatchEvent, WatchId};
+use crate::thread_watch::{ThreadWatch, WatchEndReason, WatchEvent, WatchId};
 
 const MAX_SENDERS: usize = 8;
 /// Retryable failures one event may have before it settles as failed, as in
@@ -95,6 +98,39 @@ pub(crate) async fn run(state: AppState) {
             }
         }
     }
+}
+
+/// Whether delivering an event of `watch` would reach a caller that is put away
+///
+/// Waking such a caller costs a turn for news nobody reads, and unarchives an
+/// archived T3 thread. Its T3 thread lives on this machine, so this reads it as
+/// it is now, which covers events that were pending when it was archived or
+/// deleted, whatever ended the watch. A watch the scan ended as `caller_gone`
+/// counts too, since a caller done and quiet for an hour is still neither. The
+/// events stay in the store, where `thread watches` reads them. A watch from
+/// before `caller_t3` finds its caller by the session, since an ended watch is
+/// never scanned again to learn it
+async fn caller_put_away(state: &AppState, watch: &ThreadWatch) -> Result<bool, AppError> {
+    let caller_t3 = match watch.caller_t3.clone() {
+        Some(thread) => Some(thread),
+        None => caller_t3_here(state, watch.caller).await,
+    };
+    if let Some(thread) = caller_t3 {
+        let put_away = tokio::task::spawn_blocking(move || {
+            crate::t3::thread_put_away(&crate::t3::T3Env::from_env(), &thread)
+        })
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("T3 caller lookup join: {error}"),
+        })?;
+        if put_away == Some(true) {
+            return Ok(true);
+        }
+    }
+
+    let id = watch.id;
+    let record = call(&state.store, |reply| StoreMsg::GetWatch { id, reply }).await?;
+    Ok(record.is_some_and(|record| record.end_reason == Some(WatchEndReason::CallerGone)))
 }
 
 /// Retryable failures the event `seq` of `watch` has had
@@ -178,6 +214,9 @@ async fn deliver(
             thread: watch.caller,
         });
         return Ok(settle("printed").await?);
+    }
+    if caller_put_away(state, watch).await? {
+        return Ok(settle("suppressed").await?);
     }
     // the routes that run `codex queue` check the saved cwd and Codex binary
     // themselves and settle a missing one as permanent; a Claude or T3 route

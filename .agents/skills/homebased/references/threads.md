@@ -5,6 +5,7 @@
 ```bash
 homebased --json thread context                      # this thread
 homebased --json thread context --children           # this thread's T3 children, finished ones too
+homebased --json thread context --children --live    # only children still working
 homebased --json thread context 'thread_3f2a…' 9c1e  # several references; 9c1e is a prefix
 homebased --json thread compact 'thread_3f2a…'
 homebased --json thread watch --children --context-above 150k
@@ -39,8 +40,11 @@ Each entry has `machine_name`, `host` (`t3`, `worker`, or `terminal`), `provider
 
 - `tokens`: context size of the last request or compaction. `tokens_estimated` is `true` right after a compaction, until the next request.
 - `context_window` and `percent`: Codex records the window; Claude does not, so both are `null` for Claude.
-- `last_active`, `cache_warm` (whether the one-hour prompt cache is still warm, so compacting is cheap), and `compacted_at`.
+- `last_active`, `cache_warm` (whether the one-hour prompt cache is still warm, so compacting is cheap), and `compacted_at`, the last compaction within the last 4 MiB of the transcript or rollout.
 - `state`: `running`, `idle`, `waiting` (a task still owes it events), `settled`, `archived`, or `unknown` (no usage recorded yet).
+- `task_finished`: `true` when T3 records the delegated task the thread runs as ended (completed, failed, cancelled, or interrupted) and no run is left. Human output shows such an idle thread as `finished`. A new message to the child starts a new task, so it reads `false` again. `false` for a thread T3 records no task for.
+- `settled`: whether T3 settled the thread in its sidebar. `state` shows `waiting` instead while a homebased task still owes the thread events, so read this flag, not `state`, to tell whether T3 is done with it.
+- A thread is done when it is `settled`, or has `task_finished: true`, and runs no turn. This holds while its `state` is `waiting`: the pending homebased work wakes it with a new turn when it reports, and that makes it live again.
 - `session_exists`: whether the session's own record (Claude transcript or Codex rollout) is still on disk; `null` when not checked.
 - `model`, `effort`, `project`, `branch`, `workspace`, `parent_title`, and `pull_request` when T3 records them.
 
@@ -48,7 +52,7 @@ Human output gives times in US Central.
 
 ### The children ledger
 
-`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Forks of this thread are not children, so `watch --children --action compact` never compacts one. Add `--live` to leave out settled and archived children. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
+`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Forks of this thread are not children, so `watch --children --action compact` never compacts one. Each child has `task_finished`, so the ledger tells finished delegates from working ones. Add `--live` to leave out children that are archived or done, including done children that show `waiting` because a homebased task still owes them events. A child T3 records no task for, such as one made by an older T3, is left out only when settled or archived. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
 
 The list can be incomplete. When a reachable Fleet machine does not answer, the result has `children_complete: false` and names each such machine with the reason in `unanswered`. Human output warns on stderr. Run the command again before you rely on the list. Machines that Fleet lists as offline are not asked and not listed.
 
@@ -70,13 +74,21 @@ homebased --json thread watch --children --context-above 70%
 ```
 
 - `--context-above` takes tokens (`150000`, `150k`, `1.2m`) or a percent of the context window (`80%`). A percent needs a known window, so it is refused for Claude threads; a percent watch on a T3 thread that starts running Claude later ends with `THREAD_WATCH_ENDED` reason `no_context_window`; watch again with a token count, keeping `--action compact` if it had it.
-- `--children` also watches the calling thread's live T3 children at the time you run it. Children started later need another `thread watch`. If a reachable machine does not answer the children lookup, it fails with `thread_lookup_incomplete` (exit 1, retryable) and saves no watch. Retry it.
-- The watch checks about once a minute. It sends `THREAD_CONTEXT_OVER` once when the context climbs over the limit while the thread is idle, waiting, or settled, never while a turn runs. It fires again only after a reading shows the context below the limit and it climbs over again. A missing reading, or one exactly at the limit, changes nothing.
-- `--action compact` compacts the T3 thread when it fires and still sends the event, with the outcome in `compaction`. It is refused for threads outside T3.
-- `--once` ends the watch after it fires.
+- `--children` also watches the calling thread's live T3 children at the time you run it: those not settled, not archived, and not finished with their delegated task. Children started later need another `thread watch`. If a reachable machine does not answer the children lookup, it fails with `thread_lookup_incomplete` (exit 1, retryable) and saves no watch. Retry it.
+- The watch checks about once a minute. It sends `THREAD_CONTEXT_OVER` once when the context climbs over the limit while the thread is idle or waiting, never while a turn runs. It fires again only after a reading shows the context below the limit and it climbs over again. A missing reading, or one exactly at the limit, changes nothing.
+- A watched T3 thread that is done (settled, or `task_finished`, with no turn running, even while it shows `waiting`) never fires and is never compacted, even over the limit, whether you watch it by T3 id or by the session it runs. Dropping below the limit while done re-arms the watch silently, so once it is unsettled or gets a new task, it fires as before.
+- `--action compact` compacts the T3 thread when it fires and still sends the event, with the outcome in `compaction`. It is refused for threads outside T3. A watch removed while the check runs compacts nothing.
+- `--once` ends the watch with the event that fires it: that `THREAD_CONTEXT_OVER` has `watch_ended: true` and `end_reason: "once"`, and no `THREAD_WATCH_ENDED` follows. Every other `THREAD_CONTEXT_OVER` has `watch_ended: false`.
 - A watch is its caller, thread, limit, and action. The same four again update the existing watch's `--once` and callback (`created: false`). Another limit or action on the same thread adds a second watch, and each fires once per crossing of its own limit.
-- The watch ends with `THREAD_WATCH_ENDED` when it is removed, fired with `--once`, or its thread is archived or deleted. A watch of a plain session ends when the session's record is gone, even while T3 still names it. A running task worker's session counts as live without a transcript, since Claude workers save none unless asked.
-- The watch lives on the calling machine. A target on another machine is checked through that machine; while it does not answer, the watch waits.
+- Every other end sends `THREAD_WATCH_ENDED`, with `reason`:
+  - `unwatched`: `thread unwatch` removed it.
+  - `archived`: its T3 thread was archived. This ends it at once.
+  - `deleted` or `session_gone`: two checks in a row found the T3 thread, or a plain session's record, gone, even while T3 still names the session. One bad read ends nothing. A running task worker's session counts as live without a transcript, since Claude workers save none unless asked.
+  - `finished`: its T3 thread stayed done for an hour with no change in tokens or `last_active`. Any activity, or new work, starts the hour over.
+  - `caller_gone`: the T3 thread that receives the events, on this machine, was archived, was gone on two checks, or stayed done for an hour without activity. This event, and any earlier event of the watch not yet delivered, goes only to a running `homebased wait` and never wakes the caller. A caller outside T3 never ends its watches this way.
+- No watch event is delivered to a caller whose T3 thread is archived or deleted, whatever ended the watch, such as a `--once` event still waiting to go out when the caller was archived. Only a running `homebased wait` gets it, the stored event and end reason stay as they were, and an archived caller stays archived.
+- The checks and the hour are counted in the daemon's memory, so a daemon restart starts them over and only delays an end.
+- The watch lives on the calling machine. A target on another machine is checked through that machine; while it does not answer, the watch waits. While this machine's T3 cannot be read, nothing ends.
 
 Events go to the calling thread like task callbacks, in order per watch. An event whose callback can no longer run (a `codex queue` delivery whose saved directory or Codex binary is gone), or that fails 3 times, is given up so the later ones still go out. Events for a stopped Claude session wait until it runs again, and hold back that watch's later events meanwhile; after 3 days of waiting, counted from its first deferral since the daemon last started, the event is given up, as task callbacks are; [events.md](events.md#thread-watch-events) lists their keys. In a Claude thread inside T3, `homebased wait --next <watch-id>` takes them instead, as for tasks ([t3.md](t3.md#waiting-in-a-claude-thread)).
 
@@ -87,6 +99,6 @@ Events go to the calling thread like task callbacks, in order per watch. An even
 A T3 root that delegates long work:
 
 1. Start children with `delegate_task`.
-2. Watch the children twice: `homebased --json thread watch --children --context-above 200k` tells you when a child grows large, and `homebased --json thread watch --children --context-above 250k --action compact` compacts it while it is idle if it keeps growing. After the compaction drops the context, both watches re-arm, and the 200k one tells you again on the next climb.
-3. After your own compaction, run `homebased --json thread context --children` to rebuild the list of delegates, their links, and their states.
-4. When a child is done, `thread unwatch` its watch, or let archiving the child end it.
+2. Watch the children twice: `homebased --json thread watch --children --context-above 200k` tells you when a child grows large, and `homebased --json thread watch --children --context-above 250k --action compact` compacts it while it is idle if it keeps growing. After the compaction drops the context, both watches re-arm, and the 200k one tells you again on the next climb. `--children` skips delegates that are already done, so run it again after each batch of `delegate_task` calls; the existing watches are reused (`created: false`).
+3. After your own compaction, run `homebased --json thread context --children` to rebuild the list of delegates, their links, and their states; `task_finished` marks the ones whose task ended. `--children --live` lists only those still working.
+4. A done child never fires, and its watches end with `finished` after an hour without activity, so there is nothing to unwatch. Archiving a child ends its watches at once, and settling or archiving the root ends the root's watches with `caller_gone`.

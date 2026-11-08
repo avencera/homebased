@@ -984,12 +984,14 @@ async fn watch(
         cwd: body.callback_cwd,
         codex,
     };
+    let caller_t3 = caller_t3_here(&state, body.caller).await;
     let now = Utc::now();
     let mut watches = Vec::with_capacity(targets.len());
     for (target, thread) in targets {
         let watch = ThreadWatch {
             id: WatchId::new(),
             caller: body.caller,
+            caller_t3: caller_t3.clone(),
             callback: callback.clone(),
             target,
             reference: thread
@@ -1013,6 +1015,26 @@ async fn watch(
         api_version: API_VERSION,
         watches,
     }))
+}
+
+/// The T3 thread here that runs the session `caller`, so the watch scan can
+/// tell when it is archived or deleted
+///
+/// Found by the session rather than `T3CODE_THREAD_ID`, which a process the
+/// caller started can inherit. `None` when T3 runs no such session here or
+/// cannot be read now; the scan then looks it up by the session each time,
+/// and event delivery does too for a watch that never saved it
+pub(in crate::daemon) async fn caller_t3_here(
+    state: &AppState,
+    caller: ThreadId,
+) -> Option<String> {
+    let reference = ThreadRef::parse(&caller.to_string()).ok()?;
+    let (mut results, _, _) = find_here(state, vec![reference], false, None).await.ok()?;
+    results
+        .pop()?
+        .into_iter()
+        .find(|thread| thread.host == ThreadHost::T3)?
+        .t3_thread
 }
 
 /// `GET /v1/threads/watches` query
