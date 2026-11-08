@@ -41,8 +41,8 @@ pub enum ThreadCommand {
         /// Thread references; the calling thread when none is given
         #[arg(value_name = "REF")]
         refs: Vec<String>,
-        /// List the calling thread's T3 children too, finished ones included,
-        /// to rebuild a list of delegates
+        /// List the calling thread's T3 subagents too, finished ones included,
+        /// to rebuild a list of delegates; forks are left out
         #[arg(long)]
         children: bool,
         /// With --children, leave out settled and archived children
@@ -81,7 +81,7 @@ pub enum ThreadCommand {
         /// End the watch after it fires once
         #[arg(long)]
         once: bool,
-        /// Watch the calling thread's live T3 children too
+        /// Watch the calling thread's live T3 subagents too, never its forks
         #[arg(long)]
         children: bool,
         /// Look only on this machine name or UUID

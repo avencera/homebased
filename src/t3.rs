@@ -549,6 +549,9 @@ pub(crate) struct T3Thread {
     pub(crate) settled: bool,
     /// T3 thread that started this one as a subagent
     pub(crate) parent: Option<String>,
+    /// Whether `parent` started this thread as a subagent; T3 also records a
+    /// fork's source as its parent, and a fork is the user's own thread
+    pub(crate) delegate: bool,
     /// Whether the newest run has not finished
     pub(crate) running: bool,
     /// Claude session or Codex thread T3 runs the thread's next turn in, as
@@ -594,6 +597,7 @@ pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
             archived: row.archived,
             settled: row.settled,
             parent: row.parent,
+            delegate: row.delegate,
             running: row.running,
         })
         .collect())

@@ -203,6 +203,10 @@ const THREAD_ROWS_SQL: &str = "
                ELSE 0 END,
            CASE WHEN json_valid(t.payload_json)
                THEN json_extract(t.payload_json, '$.lineage.parentThreadId') END,
+           CASE WHEN json_valid(t.payload_json)
+               THEN COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent')
+                             = 'subagent', 0)
+               ELSE 0 END,
            COALESCE((SELECT r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
                      FROM orchestration_v2_projection_runs r
                      WHERE r.thread_id = t.thread_id
@@ -218,6 +222,7 @@ pub(super) struct ThreadRow {
     pub(super) archived: bool,
     pub(super) settled: bool,
     pub(super) parent: Option<String>,
+    pub(super) delegate: bool,
     pub(super) running: bool,
 }
 
@@ -235,7 +240,8 @@ pub(super) fn thread_rows(path: &Path) -> Result<Vec<ThreadRow>, String> {
                 archived: row.get(2)?,
                 settled: row.get(3)?,
                 parent: row.get(4)?,
-                running: row.get(5)?,
+                delegate: row.get(5)?,
+                running: row.get(6)?,
             })
         })
         .and_then(Iterator::collect)

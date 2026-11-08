@@ -48,7 +48,7 @@ Human output gives times in US Central.
 
 ### The children ledger
 
-`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Add `--live` to leave out settled and archived children. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
+`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Forks of this thread are not children, so `watch --children --action compact` never compacts one. Add `--live` to leave out settled and archived children. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
 
 The list can be incomplete. When a reachable Fleet machine does not answer, the result has `children_complete: false` and names each such machine with the reason in `unanswered`. Human output warns on stderr. Run the command again before you rely on the list. Machines that Fleet lists as offline are not asked and not listed.
 

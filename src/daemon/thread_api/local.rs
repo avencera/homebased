@@ -188,13 +188,16 @@ impl LocalIndex {
             .map(|t3| t3.id.clone())
     }
 
-    /// T3 threads here that `parent` started, newest first; with `live`,
-    /// only those not settled or archived
+    /// T3 threads here that `parent` started as subagents, newest first; with
+    /// `live`, only those not settled or archived
+    ///
+    /// A fork names its source as its parent too, but it is no delegate, so it
+    /// is left out: a `--children` compact watch must never reach it
     pub(crate) fn children(&self, parent: &str, live: bool) -> Vec<ThreadContext> {
         self.t3
             .iter()
             .enumerate()
-            .filter(|(_, t3)| t3.parent.as_deref() == Some(parent))
+            .filter(|(_, t3)| t3.delegate && t3.parent.as_deref() == Some(parent))
             .map(|(index, _)| self.context(Found::T3(index)))
             .filter(|child| !live || !child.state.finished())
             .collect()
@@ -336,6 +339,8 @@ mod tests {
     const SESSION_C: &str = "0199cccc-2222-7000-8000-000000000004";
     const D: &str = "mcp:0199dddd-1111-7000-8000-000000000005";
     const F: &str = "mcp:launch:feed";
+    // a fork of A, which T3 also records with A as its parent
+    const G: &str = "mcp:launch:fork";
     const TERMINAL: &str = "0199eeee-2222-7000-8000-000000000006";
     const WORKER: &str = "0199ffff-2222-7000-8000-000000000007";
 
@@ -378,7 +383,12 @@ mod tests {
             // a T3 id that is also another thread's session, which a bare UUID cannot tell apart
             .thread(SESSION_B, "lookalike", false)
             .thread(F, "fresh child", false)
-            .payload(F, &child_of_a(false));
+            .payload(F, &child_of_a(false))
+            .thread(G, "fork of A", false)
+            .payload(
+                G,
+                &json!({ "lineage": { "parentThreadId": A, "relationshipToParent": "fork" } }),
+            );
         rollout(home, SESSION_A, &[token_count(Utc::now(), 120_000, 0)]);
         transcript(home, SESSION_B, 1, 90_000);
         transcript(home, SESSION_C, 30, 10_000);
@@ -512,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn children_of_a_caller_include_finished_ones_unless_live() {
+    fn children_of_a_caller_are_its_delegates_finished_too_unless_live() {
         let home = tempfile::tempdir().unwrap();
         let index = index(home.path());
         let caller = Caller {
@@ -527,6 +537,7 @@ mod tests {
             .iter()
             .map(|child| (key(child), child.state))
             .collect();
+        // the fork G is the user's own thread, never a delegate to watch or compact
         assert_eq!(
             all,
             HashSet::from([

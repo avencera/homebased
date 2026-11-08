@@ -403,8 +403,9 @@ pending.
 provider, session, T3 id and link, title, state, context tokens, context window
 and percent (Codex only), last activity in US Central, whether the prompt cache
 is warm, and the last compaction. `--children` adds every T3 thread the calling
-T3 thread started, finished ones included unless `--live` is passed, with the
-parent link read from T3's thread lineage. When a reachable Fleet machine does
+T3 thread started as a subagent, finished ones included unless `--live` is
+passed, with the parent link read from T3's thread lineage. Forks of the
+calling thread are not children. When a reachable Fleet machine does
 not answer, the result has `children_complete: false` and names it in
 `unanswered`, and human output warns on stderr; `thread watch --children` then
 fails with the retryable `thread_lookup_incomplete` and saves no watch.
