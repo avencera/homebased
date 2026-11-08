@@ -266,6 +266,9 @@ pub struct ThreadContextRequest {
     /// Let UUID-shaped text match as a prefix
     #[serde(default)]
     pub prefixes: bool,
+    /// The caller's T3 thread, whose message any T3 chip in `threads` came in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_by: Option<String>,
 }
 
 /// `POST /v1/threads/context` answer

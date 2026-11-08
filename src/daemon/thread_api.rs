@@ -74,10 +74,18 @@ pub fn write_routes() -> Router<AppState> {
 }
 
 /// Peer routes for an enabled fleet
+///
+/// They share the dashboard's TCP listener, so the compaction, which acts on
+/// a thread, refuses browser writes from another origin like the queue's
+/// cluster routes; the context lookup only reads
 pub fn cluster_routes() -> Router<AppState> {
     Router::new()
         .route(CLUSTER_CONTEXT_PATH, post(cluster_context))
-        .route(CLUSTER_COMPACT_PATH, post(cluster_compact))
+        .merge(
+            Router::new()
+                .route(CLUSTER_COMPACT_PATH, post(cluster_compact))
+                .layer(axum::middleware::from_fn(super::web::browser_write_guard)),
+        )
 }
 
 /// `POST /v1/cluster/threads/context` body
@@ -217,13 +225,15 @@ pub(crate) struct Resolved {
 /// Threads `selectors` name, in order, and the T3 children `children_of` asks for
 ///
 /// Each selector must name exactly one thread. Machines the Fleet directory
-/// marks offline are not asked
+/// marks offline are not asked. `carried_by` is the caller's T3 thread, whose
+/// message a T3 chip came in
 pub(crate) async fn resolve(
     state: &AppState,
     selectors: Vec<ThreadSelector>,
     machine: Option<&str>,
     prefixes: bool,
     children_of: Option<(Caller, bool)>,
+    carried_by: Option<&str>,
 ) -> Result<Resolved, AppError> {
     if selectors.len() > MAX_REFERENCES {
         return Err(AppError::Usage {
@@ -246,7 +256,8 @@ pub(crate) async fn resolve(
         let text = selector.to_string();
         let (reference, machine, prefixes) = match selector {
             ThreadSelector::Reference { text } => {
-                let reference = chip_thread(ThreadRef::parse(&text)?, &text).await?;
+                let reference =
+                    chip_thread(state, ThreadRef::parse(&text)?, &text, carried_by).await?;
                 let mut machine = only;
                 if machine.is_none()
                     && let ThreadRef::T3 {
@@ -435,20 +446,44 @@ pub(crate) async fn resolve(
 ///
 /// A chip copied out of another machine's T3 has its record there, so only a
 /// `thread_<id>` ref, which holds the id itself, still reads back
-async fn chip_thread(reference: ThreadRef, text: &str) -> Result<ThreadRef, AppError> {
+async fn chip_thread(
+    state: &AppState,
+    reference: ThreadRef,
+    text: &str,
+    carrier: Option<&str>,
+) -> Result<ThreadRef, AppError> {
     let ThreadRef::Chip { context } = &reference else {
         return Ok(reference);
     };
     let context = context.clone();
-    let recorded = run_blocking(move || crate::t3::chip_thread(&T3Env::from_env(), &context))
-        .await?
-        .map_err(|message| AppError::T3Unavailable {
-            message: format!("T3's thread state cannot be read: {message}"),
-        })?;
-    if let Some((thread, environment)) = recorded {
+    let carrier = carrier.map(str::to_owned);
+    let mut targets = run_blocking(move || {
+        crate::t3::chip_targets(&T3Env::from_env(), &context, carrier.as_deref())
+    })
+    .await?
+    .map_err(|message| AppError::T3Unavailable {
+        message: format!("T3's thread state cannot be read: {message}"),
+    })?;
+    // the ref is unique only in its message, so another message's record is
+    // taken only when no other target competes with it
+    if targets.len() > 1 {
+        return Err(AppError::ThreadRefAmbiguous {
+            reference: text.to_owned(),
+            matches: targets
+                .into_iter()
+                .map(|target| ThreadMatch {
+                    machine: state.machine.identity.machine,
+                    machine_name: state.machine.name.to_string(),
+                    reference: format!("thread_{}", target.thread),
+                    title: target.title,
+                })
+                .collect(),
+        });
+    }
+    if let Some(target) = targets.pop() {
         return Ok(ThreadRef::T3 {
-            environment,
-            thread,
+            environment: target.environment,
+            thread: target.thread,
         });
     }
     reference
@@ -514,6 +549,7 @@ pub(crate) async fn message_thread(
     state: &AppState,
     machine: MachineId,
     reference: &str,
+    carried_by: Option<&str>,
 ) -> Result<ThreadId, AppError> {
     let exact = ThreadRef::parse(reference)?.uuid().map(ThreadId);
     let lookup = resolve(
@@ -524,6 +560,7 @@ pub(crate) async fn message_thread(
         Some(&machine.to_string()),
         false,
         None,
+        carried_by,
     )
     .await;
     match (lookup, exact) {
@@ -605,6 +642,7 @@ async fn context(
         body.machine.as_deref(),
         body.prefixes,
         children_of,
+        body.carried_by.as_deref(),
     )
     .await?;
     Ok(Json(ThreadContextResponse {
@@ -663,6 +701,7 @@ async fn compact(
         body.machine.as_deref(),
         false,
         None,
+        body.carried_by.as_deref(),
     )
     .await?;
     let thread = threads.pop().ok_or_else(|| AppError::Internal {
@@ -865,6 +904,7 @@ async fn watch(
         body.machine.as_deref(),
         false,
         children_of,
+        body.caller_ids.t3_thread.as_deref(),
     )
     .await?;
     // saving only the children that answered would leave the rest unwatched without a word

@@ -167,6 +167,9 @@ pub enum MessageTarget {
         /// Reference as `homebased thread` takes it: a session UUID, T3 chip
         /// text, `thread_<id>`, or a T3 link
         reference: String,
+        /// The sender's T3 thread, whose message a T3 chip in `reference` came in
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carried_by: Option<String>,
     },
     /// The origin machine and thread for an existing task
     Task {
@@ -248,7 +251,18 @@ impl MessageSendRequest {
                     });
                 }
             }
-            MessageTarget::Reference { machine, reference } => {
+            MessageTarget::Reference {
+                machine,
+                reference,
+                carried_by,
+            } => {
+                if carried_by.as_ref().is_some_and(|thread| {
+                    thread.trim().is_empty() || thread.len() > MESSAGE_REFERENCE_MAX_BYTES
+                }) {
+                    return Err(AppError::MessageInvalid {
+                        message: "the sender's T3 thread must be a T3 thread id".into(),
+                    });
+                }
                 if machine.trim().is_empty() || reference.trim().is_empty() {
                     return Err(AppError::MessageInvalid {
                         message: "destination machine and thread must not be empty".into(),

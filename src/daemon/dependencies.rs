@@ -38,7 +38,7 @@ use super::api::SubmitBody;
 use super::api::views::DependencyView;
 use super::cancel_delivery::CancelResponse;
 use super::event_sender::Retry;
-use super::queue_api::{self, Refusal};
+use super::queue_api;
 use super::{local_submit, origin_submit};
 use crate::dependency::{
     DependencyOutcome, DependencyState, HeldCancellation, HeldDecision, ReleaseRule,
@@ -295,9 +295,7 @@ async fn settle_jobs(
             JobSubmission::Unknown => route,
             _ => continue,
         };
-        let sent = queue_api::send_job(state, route, Refusal::End)
-            .await
-            .map(|_| ());
+        let sent = queue_api::send_job(state, route).await.map(|_| ());
         record_attempt(retries, job, sent, "held job send deferred");
     }
     Ok(())

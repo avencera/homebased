@@ -73,6 +73,7 @@ impl Harness {
                 thread_id TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'user',
                 created_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+                updated_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
                 payload_json TEXT NOT NULL
              );",
         )
@@ -542,5 +543,64 @@ fn a_watch_scan_that_cannot_read_t3_leaves_the_watch_as_it_was() {
     assert!(
         wait_until(Duration::from_secs(20), || live(&h) == 0),
         "the scan did not end the watch of a deleted thread"
+    );
+}
+
+#[test]
+fn a_chip_ref_two_messages_reuse_reads_through_the_message_of_the_caller() {
+    const CARRIER: &str = "mcp:launch:chip-carrier";
+    const ALPHA: &str = "mcp:launch:chip-alpha";
+    const BETA: &str = "mcp:launch:chip-beta";
+    // a mobile paste mints a ref per message, so two messages can reuse one for different threads
+    const REUSED: &str = "5d1e0c3a-8b7f-4e21-9a6d-2f4c8e1b7a90";
+    let h = Harness::new();
+    h.t3_thread(ALPHA, "Alpha", None);
+    h.t3_thread(BETA, "Beta", None);
+    let message = |id: &str, thread: &str, at: &str, target: &str| {
+        let payload = json!({ "context": { "records": [
+            { "contextId": REUSED, "kind": "thread", "threadId": target, "title": target }
+        ] } });
+        h.t3_state()
+            .execute(
+                "INSERT INTO orchestration_v2_projection_messages
+                 (message_id, thread_id, created_at, updated_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![id, thread, at, payload.to_string()],
+            )
+            .unwrap();
+    };
+    // the caller's chip is the older one, so the newest record names the wrong thread
+    message("message-alpha", CARRIER, "2026-10-02T20:00:00Z", ALPHA);
+    message(
+        "message-beta",
+        "mcp:launch:elsewhere",
+        "2026-10-02T21:00:00Z",
+        BETA,
+    );
+    let chip = format!("[Thread: Alpha; ref={REUSED}]");
+
+    let out = h
+        .cmd()
+        .env("T3CODE_THREAD_ID", CARRIER)
+        .args(["--json", "thread", "context", &chip])
+        .output()
+        .unwrap();
+    let body = ok(&out);
+    assert_eq!(body["threads"][0]["t3_thread"], ALPHA, "{body}");
+
+    // with no carrying message to go by, two targets are a question, not a guess
+    let out = h.thread_cmd(None, &["context", &chip]);
+    refused(&out, 5, "thread_ref_ambiguous");
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    let matches = error["error"]["input"]["matches"].as_array().unwrap();
+    let mut named: Vec<&str> = matches
+        .iter()
+        .map(|found| found["reference"].as_str().unwrap())
+        .collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        [format!("thread_{ALPHA}"), format!("thread_{BETA}")],
+        "{error}"
     );
 }

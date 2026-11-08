@@ -352,10 +352,11 @@ command runs for up to 2 hours and wakes it only when it exits. A task of anothe
 job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran
-here, which has no callback route. An id that is not a task or job submitted
-from this machine returns `wait_target_not_found`. A watch of another caller
-returns `wait_unavailable`, and a watch id that does not exist here returns
-`watch_not_found`.
+here, which has no callback route. An id that is not a task, job, or thread
+watch of this machine, including a watch id that does not exist here, returns
+`wait_target_not_found`. A watch of another caller returns `wait_unavailable`.
+Commands that name a watch, such as `thread unwatch`, return `watch_not_found`
+for one that does not exist.
 
 A Codex thread cannot run a background command that wakes it, so each event starts a new turn, and
 T3 shows the thread as idle between events.
@@ -374,8 +375,12 @@ A thread reference is T3 chip text (`[Thread: <title>; ref=<ref>]`),
 `thread_<id>`, a `t3-thread://v2/<environment>/<id>` link, a bare T3 id (or the
 `threadId: <id>` line of a `<t3_context>` block), a Claude Code session id, or
 a Codex thread id. A chip's `ref` is the id of a context record in the message
-that carried the chip, not a thread id; homebased reads the thread from that
-record in this machine's T3. A chip with no record here works only in its
+that carried the chip, not a thread id, and is unique only within that
+message. Run from a T3 thread, homebased reads the record in the newest of that
+thread's last 200 user messages that carries the ref; otherwise, or when none
+does, it reads the newest records with that ref across this machine's T3, and
+fails with `thread_ref_ambiguous` when they name different threads. A chip
+with no record here works only in its
 `thread_<id>` form, and any other fails with `thread_not_found` and a hint to
 pass the `threadId` from the `<t3_context>` block. With none, the command uses the
 calling thread; `--task <id>` and `--worker <id>` name a task's origin thread
@@ -387,8 +392,9 @@ least 4 characters. A reference that matches several threads fails with
 `thread_ref_ambiguous` (exit 5), and one that matches none with
 `thread_not_found` (exit 3).
 
-If T3's state exists but cannot be read, the lookup fails with
-`t3_unavailable` rather than reporting no T3 threads. A T3 thread's session is
+If T3's state exists but cannot be read, or lacks the thread tables homebased
+reads, the lookup fails with `t3_unavailable` rather than reporting no T3
+threads. A T3 thread's session is
 the one T3 runs its next turn in: the active provider thread of the selected
 provider instance, or none before the first turn or while a provider switch is
 pending.

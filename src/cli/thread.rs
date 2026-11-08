@@ -150,6 +150,7 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
             } else {
                 selectors(refs, task, worker, &caller)?
             };
+            let carried_by = caller.t3_thread.clone();
             let request = ThreadContextRequest {
                 api_version: API_VERSION,
                 threads,
@@ -157,6 +158,7 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 live,
                 machine,
                 prefixes: true,
+                carried_by,
             };
             let response: ThreadContextResponse =
                 client.post_json("/v1/threads/context", &request).await?;
@@ -228,6 +230,7 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 api_version: API_VERSION,
                 thread: threads.remove(0),
                 machine,
+                carried_by: caller.t3_thread,
             };
             let response: CompactResponse =
                 client.post_json("/v1/threads/compact", &request).await?;

@@ -100,6 +100,12 @@ pub(crate) enum StoreMsg {
         job: crate::queue::JobId,
         reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
     },
+    /// Record the authority's definite refusal of a sent route
+    RefuseJob {
+        job: crate::queue::JobId,
+        refusal: crate::queue::delivery::JobRefusal,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// End a held job before it joins the queue, with its terminal event
     EndHeldJob {
         job: crate::queue::JobId,
@@ -750,6 +756,11 @@ impl Actor for StoreActor {
             StoreMsg::ReleaseHeldJob { job, reply } => {
                 send_reply(reply, state.release_held_job(job));
             }
+            StoreMsg::RefuseJob {
+                job,
+                refusal,
+                reply,
+            } => send_reply(reply, state.refuse_job(job, refusal)),
             StoreMsg::EndHeldJob { job, ending, reply } => {
                 send_reply(reply, state.end_held_job(job, ending));
             }

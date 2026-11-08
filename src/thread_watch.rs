@@ -415,6 +415,9 @@ pub struct CompactRequest {
     pub api_version: u32,
     /// Thread to compact; it must resolve to exactly one
     pub thread: ThreadSelector,
+    /// The caller's T3 thread, whose message any T3 chip in `thread` came in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_by: Option<String>,
     /// Look only on this machine, by name or UUID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,

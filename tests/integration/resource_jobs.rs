@@ -442,6 +442,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
         target: None,
         submission: homebased::queue::delivery::JobSubmission::Unknown,
         after: None,
+        owes_final_event: false,
     };
     store.insert_job_route(&route).unwrap();
     store
@@ -962,8 +963,24 @@ fn a_job_held_for_a_build_that_fails_is_cancelled_before_it_queues() {
         &spec(&h, "medium", "wait", "exit 0"),
         &["--after", &build],
     );
-    cli(&h, &["resource", "job", "cancel", &cancelled.to_string()]);
-    assert_eq!(show(&h, cancelled)["held"]["ending"]["reason"], "requested");
+    // naming this machine still means the job held here, which its queue never saw
+    let here = machine(&h).to_string();
+    let named = |command: &str| {
+        cli(
+            &h,
+            &[
+                "resource",
+                "job",
+                command,
+                &cancelled.to_string(),
+                "--machine",
+                &here,
+            ],
+        )
+    };
+    assert_eq!(named("show")["held"]["state"], "held");
+    named("cancel");
+    assert_eq!(named("show")["held"]["ending"]["reason"], "requested");
 
     h.release_gate("build-fails");
     let events = waited_events(waiter);

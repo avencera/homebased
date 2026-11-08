@@ -555,6 +555,15 @@ mod tests {
         // an empty index would report every T3 thread as deleted
         assert!(LocalIndex::load(sources(home.path()), Utc::now()).is_err());
 
+        // a schema without the provider-thread table fails the schema check itself
+        std::fs::remove_file(state_path(home.path())).unwrap();
+        drop(index(home.path()));
+        rusqlite::Connection::open(state_path(home.path()))
+            .unwrap()
+            .execute_batch("DROP TABLE orchestration_v2_projection_provider_threads")
+            .unwrap();
+        assert!(LocalIndex::load(sources(home.path()), Utc::now()).is_err());
+
         // without T3 at all, sessions outside it are still found
         std::fs::remove_file(state_path(home.path())).unwrap();
         let index = LocalIndex::load(sources(home.path()), Utc::now()).unwrap();

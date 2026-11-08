@@ -47,6 +47,23 @@ impl Waiter {
             .collect();
         (code.unwrap(), rest)
     }
+
+    /// How many sockets the waiter holds, once the count holds still
+    ///
+    /// Its runtime keeps a socket pair for signals, so only a count above the
+    /// one it has while backing off means it holds a stream to the daemon
+    fn sockets(&self) -> usize {
+        let pid = self.child.id();
+        let mut last = socket_count(pid);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = socket_count(pid);
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+    }
 }
 
 impl Drop for Waiter {
@@ -54,6 +71,33 @@ impl Drop for Waiter {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, |fds| {
+        fds.filter_map(Result::ok)
+            .filter(|fd| {
+                std::fs::read_link(fd.path())
+                    .is_ok_and(|link| link.to_string_lossy().starts_with("socket:"))
+            })
+            .count()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_count(pid: u32) -> usize {
+    // with -F f, lsof prints one `f<fd>` line per unix socket of the process
+    std::process::Command::new("lsof")
+        .args(["-a", "-U", "-p", &pid.to_string(), "-F", "f"])
+        .stderr(Stdio::null())
+        .output()
+        .map_or(0, |out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| line.starts_with('f'))
+                .count()
+        })
 }
 
 /// A wait stream that reads frames but never confirms a print
@@ -283,8 +327,17 @@ fn daemon_shutdown_ends_the_stream_promptly_and_the_waiter_reconnects() {
             .is_some()),
         "the daemon did not stop with a waiter connected"
     );
+    let backing_off = waiter.sockets();
     h.start_daemon();
 
+    // the waiter backs off for up to 5s between attempts, and a task that ends
+    // before it reconnects goes to normal delivery instead of to its stream
+    assert!(
+        wait_until(Duration::from_secs(20), || waiter.sockets() > backing_off),
+        "the waiter did not reconnect"
+    );
+    // the daemon registers the waiter just after it accepts the stream
+    std::thread::sleep(Duration::from_millis(800));
     h.release_gate("restart");
     let (code, lines) = waiter.finish();
 

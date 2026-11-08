@@ -182,7 +182,11 @@ fn target(destination: Destination) -> Result<MessageTarget, AppError> {
         (None, None, None, Some(task), None) => Ok(MessageTarget::Task { task }),
         (None, None, None, None, Some(task)) => Ok(MessageTarget::Worker { task }),
         (Some(machine), Some(reference), None, None, None) => {
-            Ok(MessageTarget::Reference { machine, reference })
+            Ok(MessageTarget::Reference {
+                machine,
+                reference,
+                carried_by: crate::thread_ref::Caller::from_env()?.t3_thread,
+            })
         }
         (Some(machine), None, Some(cwd), None, None) => Ok(MessageTarget::Machine {
             machine,

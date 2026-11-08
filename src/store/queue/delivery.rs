@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
-use crate::queue::delivery::{HeldJobEnding, JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::{JobEvent, JobEventKind, JobId, QueueError, Target};
 use crate::store::Store;
 
@@ -75,7 +75,8 @@ impl Store {
                 route.submission,
                 JobSubmission::Unknown | JobSubmission::Held
             )
-            || matches!(route.submission, JobSubmission::Held) && route.after.is_none()
+            || matches!(route.submission, JobSubmission::Held)
+                && (route.after.is_none() || !route.owes_final_event)
             || route.target.is_some()
         {
             return Err(QueueError::Invariant {
@@ -112,7 +113,7 @@ impl Store {
     pub fn held_job_routes(&self) -> Result<Vec<JobRoute>, AppError> {
         let mut statement = self.conn.prepare(
             "SELECT job_id FROM resource_job_routes
-             WHERE json_extract(route_json,'$.after') IS NOT NULL
+             WHERE json_extract(route_json,'$.owes_final_event') = 1
                AND json_extract(route_json,'$.submission.state') IN ('held','unknown')
              ORDER BY created_at",
         )?;
@@ -152,7 +153,46 @@ impl Store {
     /// sent job may already be queued; a refusal applies to the sent route
     /// that the authority refused. Anything else returns `false`
     pub fn end_held_job(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
+        self.immediate(|| self.end_held_job_inner(job, ending))
+    }
+
+    /// Record the authority's definite refusal of a sent route
+    ///
+    /// The route's saved state decides, whichever path sent it: a job that
+    /// was held owes its waiters a final event, so it ends with `JOB_FAILED`,
+    /// while any other refusal is kept for identical submit retries. A route
+    /// the authority confirmed meanwhile, or one that already ended, is left
+    pub fn refuse_job(&self, job: JobId, refusal: JobRefusal) -> Result<(), AppError> {
         self.immediate(|| {
+            let route = self
+                .job_route(job)?
+                .ok_or(QueueError::JobNotFound { job })?;
+            if !matches!(route.submission, JobSubmission::Unknown) {
+                return Ok(());
+            }
+            if route.owes_final_event {
+                let ending = HeldJobEnding::Refused {
+                    code: refusal.code,
+                    message: refusal.message,
+                };
+                return self.end_held_job_inner(job, ending).map(drop);
+            }
+            let rejected = JobSubmission::Rejected {
+                error: refusal.error,
+                status: refusal.status,
+            };
+            let mut route = route;
+            route.submission = rejected;
+            self.conn.execute(
+                "UPDATE resource_job_routes SET route_json=?2 WHERE job_id=?1",
+                params![job.to_string(), serde_json::to_string(&route)?],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn end_held_job_inner(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
+        {
             let mut route = self
                 .job_route(job)?
                 .ok_or(QueueError::JobNotFound { job })?;
@@ -161,7 +201,7 @@ impl Store {
                     JobSubmission::Held,
                     HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested,
                 ) => true,
-                (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.after.is_some(),
+                (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.owes_final_event,
                 _ => false,
             };
             let accepted = self
@@ -205,7 +245,7 @@ impl Store {
                 params![job.to_string(), serde_json::to_string(&route)?],
             )?;
             Ok(true)
-        })
+        }
     }
 
     /// Resolve submission without regressing acceptance proved by an incoming event

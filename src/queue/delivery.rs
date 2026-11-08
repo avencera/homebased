@@ -100,6 +100,24 @@ pub struct JobRoute {
     /// Tasks on this origin that must each succeed before the job is sent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<TaskDependencies>,
+    /// Whether the job was held, so the origin owns sending it and owes its
+    /// thread a final event even when the queue refuses it; set once, when
+    /// the route is saved, and kept by every later send
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owes_final_event: bool,
+}
+
+/// The authority's definite refusal of a submit
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRefusal {
+    /// Error code
+    pub code: String,
+    /// Error message
+    pub message: String,
+    /// Structured error response kept for identical retries
+    pub error: serde_json::Value,
+    /// HTTP status of the refusal
+    pub status: u16,
 }
 
 /// Identity-bound event sent by the authority, with origin-side deduplication

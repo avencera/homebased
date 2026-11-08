@@ -2228,6 +2228,7 @@ async fn notice_ends_during_callback_preparation() {
         target: None,
         submission: JobSubmission::Unknown,
         after: None,
+        owes_final_event: false,
     };
     f.store.insert_job_route(&route).unwrap();
     let notice = RoutedJobEvent {

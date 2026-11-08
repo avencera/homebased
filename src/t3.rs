@@ -506,19 +506,34 @@ pub(crate) fn open_threads(env: &T3Env) -> Result<Vec<OpenThread>, String> {
     Ok(threads)
 }
 
-/// The T3 thread, and its environment when recorded, that the chip `ref`
-/// `context` names in this machine's T3
+/// One thread a T3 chip's context record names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChipTarget {
+    /// T3 thread id
+    pub(crate) thread: String,
+    /// T3 environment of the thread, when recorded
+    pub(crate) environment: Option<String>,
+    /// Thread title when the chip was made
+    pub(crate) title: Option<String>,
+}
+
+/// The threads the chip `ref` `context` names in this machine's T3
 ///
-/// `None` when no message here carries the chip's record, or T3 is not installed
-pub(crate) fn chip_thread(
+/// With `carrier`, the T3 thread whose message carried the chip, that
+/// message decides. Otherwise every distinct target is returned, and the
+/// caller uses one only when it is alone. Empty when no message here carries
+/// the record, or T3 is not installed
+pub(crate) fn chip_targets(
     env: &T3Env,
     context: &str,
-) -> Result<Option<(String, Option<String>)>, String> {
+    carrier: Option<&str>,
+) -> Result<Vec<ChipTarget>, String> {
     let state = state_path(&env.userdata());
-    if !state.is_file() || !v2::schema_readable(&state)? {
-        return Ok(None);
+    if !state.is_file() {
+        return Ok(Vec::new());
     }
-    v2::chip_thread(&state, context)
+    v2::check_schema(&state)?;
+    v2::chip_targets(&state, context, carrier)
 }
 
 /// One T3 thread that is not deleted, open or archived, for thread lookups
@@ -546,18 +561,20 @@ pub(crate) struct T3Thread {
 
 /// Every T3 thread that is not deleted, newest first
 ///
-/// Reads the state database on disk, so the server need not run. Empty when
-/// T3 is not installed or its schema changed
+/// Reads the state database on disk, so the server need not run. Empty only
+/// when T3 is not installed or a read succeeded and found no threads
 ///
 /// # Errors
 ///
-/// When the state exists but cannot be read now, such as while it is locked,
-/// so a caller never takes a failed read for threads that are gone
+/// When the state exists but cannot be read, such as while it is locked or
+/// when its schema lacks what homebased reads, so a caller never takes a
+/// failed read for threads that are gone
 pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
     let state = state_path(&env.userdata());
-    if !state.is_file() || !v2::schema_readable(&state)? {
+    if !state.is_file() {
         return Ok(Vec::new());
     }
+    v2::check_schema(&state)?;
     let rows = v2::thread_rows(&state)?;
     // the session T3 runs the next turn in, by the rule of `next_session`, so a
     // provider switch reads the new session, or none until it starts

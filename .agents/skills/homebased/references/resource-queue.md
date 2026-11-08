@@ -123,7 +123,7 @@ homebased --json resource job submit --job-id "$job" --after "$build" --spec job
 ```
 
 - The job gets its id at once. Your origin machine holds it out of the queue until every `--after` task succeeds. `resource job show "$job"` reports `held` with each task's state, and `homebased wait --next "$job"` works right away.
-- If an `--after` task fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task, and it uses no GPU time. `resource job cancel` ends a held job the same way.
+- If an `--after` task fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task, and it uses no GPU time. `resource job cancel` ends a held job the same way. `show` and `cancel` find a held job on its origin machine, so a `--machine` that names this machine or the job's queue machine still reaches it.
 - Keep the job's steps to work that needs the GPU: no `cargo build`, `nvcc`, `make`, `pip install`, or first-run kernel compilation that a CPU task could do ahead of time. Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted.
 
 ## Command reference

@@ -102,18 +102,39 @@ macro_rules! active_thread_sql {
 const ACTIVE_THREAD_SQL: &str = active_thread_sql!("t.thread_id = ?1");
 // the same rule for every thread at once, for thread lookups
 const ACTIVE_THREADS_SQL: &str = active_thread_sql!("t.deleted_at IS NULL");
-// T3's composer context records: `contextId` is the chip's `ref`
-const CHIP_THREAD_SQL: &str = "
-    SELECT json_extract(r.value, '$.threadId'), json_extract(r.value, '$.environmentId')
-    FROM orchestration_v2_projection_messages m,
-         json_each(CASE WHEN json_valid(m.payload_json) THEN m.payload_json ELSE '{}' END,
-                   '$.context.records') r
-    WHERE instr(m.payload_json, ?1) > 0
-      AND json_extract(r.value, '$.kind') = 'thread'
-      AND json_extract(r.value, '$.contextId') = ?1
-      AND json_type(r.value, '$.threadId') = 'text'
-    ORDER BY m.created_at DESC
-    LIMIT 1";
+// T3's composer context records: `contextId` is the chip's `ref`, unique
+// only within the message that carried it
+macro_rules! chip_records_sql {
+    ($messages:literal, $tail:literal) => {
+        concat!(
+            "SELECT json_extract(r.value, '$.threadId'), json_extract(r.value, '$.environmentId'),
+                    json_extract(r.value, '$.title')
+             FROM (", $messages, ") m,
+                  json_each(CASE WHEN json_valid(m.payload_json) THEN m.payload_json ELSE '{}' END,
+                            '$.context.records') r
+             WHERE instr(m.payload_json, ?1) > 0
+               AND json_extract(r.value, '$.kind') = 'thread'
+               AND json_extract(r.value, '$.contextId') = ?1
+               AND json_type(r.value, '$.threadId') = 'text' ",
+            $tail
+        )
+    };
+}
+// the carrying thread's newest user message with the record carried the chip;
+// T3's latest-user index serves the inner query
+const CARRIED_CHIP_SQL: &str = chip_records_sql!(
+    "SELECT payload_json, updated_at, message_id FROM orchestration_v2_projection_messages
+     WHERE thread_id = ?2 AND role = 'user'
+     ORDER BY updated_at DESC, message_id DESC LIMIT 200",
+    "ORDER BY m.updated_at DESC, m.message_id DESC LIMIT 1"
+);
+// with no carrier, every target the ref names in recent user messages; a
+// backward rowid scan stops after the newest ones, however long the history
+const ANY_CHIP_SQL: &str = chip_records_sql!(
+    "SELECT payload_json FROM orchestration_v2_projection_messages
+     WHERE role = 'user' ORDER BY rowid DESC LIMIT 5000",
+    "LIMIT 64"
+);
 const LEGACY_TABLE_SQL: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_session_runtime'";
 const ARCHIVED_SQL: &str =
@@ -354,32 +375,64 @@ fn has_legacy_table(db: &Connection) -> Result<bool, String> {
         .map_err(|_| "statev2.sqlite table lookup failed".to_string())
 }
 
-/// Thread and environment of the newest thread context record `context`,
-/// the `ref` of a T3 chip
+/// The threads the thread context record `context`, the `ref` of a T3 chip,
+/// names
 ///
 /// T3 keeps the chip's record in the message that carried it, at
-/// `$.context.records[]`, so the chip maps back only on the machine that has
-/// that message. The text match skips parsing messages that cannot hold it
-pub(super) fn chip_thread(
+/// `$.context.records[]`, and the id is unique only in that message. With
+/// `carrier`, the T3 thread whose message carried the chip, the result is the
+/// target of that thread's newest user message with the record. Otherwise,
+/// or when none of its recent messages has it, it is every distinct target
+/// the id names in recent user messages, for the caller to accept only when
+/// there is one
+pub(super) fn chip_targets(
     path: &Path,
     context: &str,
-) -> Result<Option<(String, Option<String>)>, String> {
+    carrier: Option<&str>,
+) -> Result<Vec<super::ChipTarget>, String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
-    db.query_row(CHIP_THREAD_SQL, [context], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })
-    .optional()
-    .map_err(|_| "statev2.sqlite chip lookup failed".to_string())
+    let failed = |_| "statev2.sqlite chip lookup failed".to_string();
+    let target = |row: &Row<'_>| {
+        Ok(super::ChipTarget {
+            thread: row.get(0)?,
+            environment: row.get(1)?,
+            title: row.get(2)?,
+        })
+    };
+    if let Some(carrier) = carrier
+        && let Some(carried) = db
+            .query_row(CARRIED_CHIP_SQL, [context, carrier], target)
+            .optional()
+            .map_err(failed)?
+    {
+        return Ok(vec![carried]);
+    }
+    let mut statement = db.prepare(ANY_CHIP_SQL).map_err(failed)?;
+    let rows = statement
+        .query_map([context], target)
+        .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+        .map_err(failed)?;
+    let mut targets: Vec<super::ChipTarget> = Vec::new();
+    for row in rows {
+        if !targets
+            .iter()
+            .any(|seen| seen.thread == row.thread && seen.environment == row.environment)
+        {
+            targets.push(row);
+        }
+    }
+    Ok(targets)
 }
 
-/// Whether the state has the tables homebased reads, or why it cannot tell
+/// Check that an existing state has the tables homebased reads
 ///
-/// A busy or locked database is an error rather than a schema change, so a
-/// lookup that cannot read T3 now is not taken for one that found nothing
-pub(super) fn schema_readable(path: &Path) -> Result<bool, String> {
+/// Every failure is an error, whether the database is locked now or its
+/// schema is one homebased does not read, so a lookup that cannot read T3 is
+/// never taken for one that found no threads
+pub(super) fn check_schema(path: &Path) -> Result<(), String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
     match db.prepare(REQUIRED_STATE_SQL) {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(failure, _))
             if matches!(
                 failure.code,
@@ -388,7 +441,7 @@ pub(super) fn schema_readable(path: &Path) -> Result<bool, String> {
         {
             Err("statev2.sqlite is locked".into())
         }
-        Err(_) => Ok(false),
+        Err(_) => Err("statev2.sqlite lacks the thread tables homebased reads".into()),
     }
 }
 

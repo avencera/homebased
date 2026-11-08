@@ -235,8 +235,8 @@ async fn check_job(state: &AppState, thread: ThreadId, job: JobId) -> Result<(),
         .ok_or(QueueError::JobNotFound { job })?;
     let reason = if matches!(route.submission, JobSubmission::Rejected { .. }) {
         JobWaitBlocker::Rejected
-    } else if matches!(route.submission, JobSubmission::Unknown) && route.after.is_none() {
-        // a job with `after` is the origin's to send, so its events will come
+    } else if matches!(route.submission, JobSubmission::Unknown) && !route.owes_final_event {
+        // a held job is the origin's to send, and its final event is owed either way
         JobWaitBlocker::Unconfirmed
     } else if route.thread.is_detached() {
         JobWaitBlocker::Detached

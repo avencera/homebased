@@ -142,3 +142,56 @@ fn a_children_lookup_names_the_machines_that_did_not_answer() {
     let listed = ok(&thread_cmd(&origin, &caller, &["watches"]));
     assert!(listed["watches"].as_array().unwrap().is_empty(), "{listed}");
 }
+
+/// One raw HTTP/1.1 POST, as a browser page on the LAN would send it
+fn raw_post(daemon: &Daemon, path: &str, origin: Option<&str>, body: &str) -> String {
+    use std::io::{Read, Write};
+
+    let address = daemon.address().to_string();
+    let host = address.trim_start_matches("http://").trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(host).unwrap();
+    let origin = origin.map_or_else(String::new, |origin| format!("Origin: {origin}\r\n"));
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Content-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn a_browser_page_cannot_compact_a_thread_through_the_fleet_listener() {
+    let daemon = Daemon::start("compact-guard", true);
+    let body = json!({
+        "api_version": 1,
+        "protocol_version": 1,
+        "destination_machine": daemon.machine_id(),
+        "thread": "mcp:launch:anything",
+    })
+    .to_string();
+
+    let browser = raw_post(
+        &daemon,
+        "/v1/cluster/threads/compact",
+        Some("http://page.example"),
+        &body,
+    );
+    assert!(browser.starts_with("HTTP/1.1 403"), "{browser}");
+    assert!(browser.contains("\"permission\""), "{browser}");
+
+    // a Fleet peer sends no Origin and still reaches the route
+    let peer = raw_post(&daemon, "/v1/cluster/threads/compact", None, &body);
+    assert!(!peer.starts_with("HTTP/1.1 403"), "{peer}");
+    // the context lookup only reads, and keeps answering whoever asks
+    let lookup = raw_post(
+        &daemon,
+        "/v1/cluster/threads/context",
+        Some("http://page.example"),
+        &body,
+    );
+    assert!(!lookup.starts_with("HTTP/1.1 403"), "{lookup}");
+}
