@@ -337,8 +337,12 @@ fn next_action(
             "The watch was removed; nothing more will arrive for it".into()
         }
         (WatchEventKind::Ended, Some(WatchEndReason::NoContextWindow)) => format!(
-            "The watch ended because the thread runs Claude Code, which records no context window for a percent limit. Watch {} again with a token count, such as `--context-above 150k`",
-            watch.reference
+            "The watch ended because the thread runs Claude Code, which records no context window for a percent limit. Watch {} again with a token count, such as `--context-above 150k`{}",
+            watch.reference,
+            match watch.action {
+                WatchAction::Compact => ", and keep `--action compact`",
+                WatchAction::Notify => "",
+            }
         ),
         (WatchEventKind::Ended, reason) => {
             let why = match reason {

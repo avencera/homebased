@@ -378,15 +378,18 @@ a Codex thread id. A chip's `ref` is the id of a context record in the message
 that carried the chip, not a thread id, and is unique only within that
 message. Run from a T3 thread, homebased reads the record in the newest of that
 thread's last 200 user messages that carries the ref; otherwise, or when none
-does, it reads the newest records with that ref across this machine's T3, and
-fails with `thread_ref_ambiguous` when they name different threads. A chip
+does, it reads the records with that ref in every user message in this
+machine's T3, and fails with `thread_ref_ambiguous` when they name different
+threads. A chip
 with no record here works only in its
 `thread_<id>` form, and any other fails with `thread_not_found` and a hint to
 pass the `threadId` from the `<t3_context>` block. With none, the command uses the
-calling thread; `--task <id>` and `--worker <id>` name a task's origin thread
-or worker, and a `--machine` naming another machine than the task's fails with
-`usage`. Each command looks on this machine first, then asks every reachable
-Fleet machine about the references it did not find. With `--children`,
+calling thread; `--task <id>` names a task's origin thread, on the machine it
+was submitted from, and `--worker <id>` its worker, on the machine that runs
+it; a `--machine` naming another machine fails with `usage`. Each command looks
+on this machine first, then asks every reachable Fleet machine about the
+references it did not find; `--machine <name>` looks only there, so a
+reference found only elsewhere fails with `thread_not_found`. With `--children`,
 `--machine` limits only which machine's children are listed; the calling thread
 is always read here. Each daemon advertises its
 T3 environment id to Fleet peers, so a `t3-thread://` link goes straight to
@@ -436,7 +439,9 @@ watch on a T3 thread that starts running Claude Code ends with reason
 `no_context_window`. A target on
 another machine is read through that machine on each check; while it does not
 answer, the watch is left as it was. Events are delivered like task events, in
-order per watch, and deduplicated by `(watch, seq)`. An event whose saved
+order per watch. An event can arrive twice, for example when a lost
+acknowledgement after `homebased wait` printed it lets delivery send it again,
+so recipients deduplicate by `(watch, seq)`. An event whose saved
 callback can no longer run, or that fails 3 times, is given up so later events
 still go out. Events for a stopped Claude session wait until it runs again, for
 up to 3 days as task callbacks do. The skill's

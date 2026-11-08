@@ -932,6 +932,18 @@ async fn watch(
 
     // every target is checked before any watch is saved, so a refusal saves none
     let mut targets = Vec::new();
+    // the CLI parses only valid limits, but the socket takes any JSON, and a
+    // zero limit fires on every reading and never re-arms
+    if matches!(body.threshold, Threshold::Tokens(0))
+        || matches!(body.threshold, Threshold::Percent(percent) if percent == 0 || percent > 100)
+    {
+        return Err(AppError::Usage {
+            message: format!(
+                "--context-above {} is not a limit a watch can use",
+                body.threshold
+            ),
+        });
+    }
     for thread in threads.iter().chain(&children) {
         if body.action == WatchAction::Compact && thread.host != ThreadHost::T3 {
             return Err(AppError::CompactUnsupportedHost {

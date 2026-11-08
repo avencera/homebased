@@ -271,7 +271,11 @@ impl LocalIndex {
         };
         let state = match (t3, &usage) {
             (Some(t3), _) if t3.archived => ThreadState::Archived,
-            (Some(t3), _) if t3.running => ThreadState::Running,
+            // a homebased task can resume a T3 thread's session, and runs it
+            // while T3 records no run
+            (Some(t3), _) if t3.running || worker.is_some_and(|worker| worker.running) => {
+                ThreadState::Running
+            }
             (Some(_), _) if waiting => ThreadState::Waiting,
             (Some(t3), _) if t3.settled => ThreadState::Settled,
             (Some(_), _) => ThreadState::Idle,
@@ -482,6 +486,22 @@ mod tests {
 
     fn t3(id: &str, state: ThreadState) -> Vec<(String, ThreadHost, ThreadState)> {
         vec![(id.to_owned(), ThreadHost::T3, state)]
+    }
+
+    #[test]
+    fn a_t3_session_a_running_task_resumes_reads_as_running() {
+        let home = tempfile::tempdir().unwrap();
+        drop(index(home.path()));
+        // T3 records no run for a session a homebased task resumed
+        let mut sources = sources(home.path());
+        sources.workers.push(WorkerThread {
+            thread: SESSION_A.parse().unwrap(),
+            task: TaskId::new(),
+            running: true,
+            provider: crate::thread_ref::Provider::Codex,
+        });
+        let index = LocalIndex::load(sources, Utc::now()).unwrap();
+        assert_eq!(found(&index, A, false), t3(A, ThreadState::Running));
     }
 
     #[test]
