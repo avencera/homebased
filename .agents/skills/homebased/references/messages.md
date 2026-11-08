@@ -120,7 +120,7 @@ and a retry with the same `--message-id` goes only through T3, which drops the
 repeat. With T3 unreachable, that retry keeps failing instead of sending a
 second copy another way.
 
-A Claude session that a T3 thread owns may be compacted while it waits.
+A Claude session or Codex thread that a T3 thread owns may be compacted while it waits.
 When a task or queue job for it is still running, the daemon sends `/compact` to that
 thread after 55 idle minutes if the context has at least 200,000 tokens, while
 the prompt cache is still warm. A message for such a session whose cache

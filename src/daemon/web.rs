@@ -101,7 +101,7 @@ pub fn router(state: AppState, bind: SocketAddr) -> Router {
         .merge(
             api::control_routes()
                 .merge(super::queue_api::control_routes())
-                .merge(super::claude_threads::control_routes())
+                .merge(super::context_threads::control_routes())
                 .layer(middleware::from_fn(browser_write_guard)),
         )
         .fallback(asset)

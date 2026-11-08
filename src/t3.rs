@@ -131,6 +131,32 @@ impl ProviderThread {
             Self::Codex(thread) => ("codex", "$.threadId", thread),
         }
     }
+
+    /// The session or thread of T3 driver `driver` with native id `native`
+    fn from_driver(driver: &str, native: ThreadId) -> Option<Self> {
+        match driver {
+            "claudeAgent" => Some(Self::Claude(native)),
+            "codex" => Some(Self::Codex(native)),
+            _ => None,
+        }
+    }
+
+    /// Claude session id or Codex thread id
+    #[must_use]
+    pub fn id(self) -> ThreadId {
+        match self {
+            Self::Claude(thread) | Self::Codex(thread) => thread,
+        }
+    }
+
+    /// `claude` or `codex`
+    #[must_use]
+    pub fn provider(self) -> &'static str {
+        match self {
+            Self::Claude(_) => "claude",
+            Self::Codex(_) => "codex",
+        }
+    }
 }
 
 /// Result of asking T3 Code to start a turn in a provider session's owning thread
@@ -279,12 +305,14 @@ pub(crate) fn wake_thread_checked(
     })
 }
 
-/// Start a `/compact` turn in the T3 thread that owns a Claude session
+/// Start a `/compact` turn in the T3 thread that owns a Claude session or
+/// Codex thread
 ///
 /// `key` names the idle period being compacted, so T3 drops a repeated
-/// request for it. T3 refuses it while a turn runs
-pub(crate) fn compact_thread(env: &T3Env, thread: ThreadId, key: &str) -> WakeOutcome {
-    with_owner(env, ProviderThread::Claude(thread), |owner| {
+/// request for it. T3 refuses it while a turn runs. T3 compacts a Codex thread
+/// through Codex's own `thread/compact/start`
+pub(crate) fn compact_thread(env: &T3Env, thread: ProviderThread, key: &str) -> WakeOutcome {
+    with_owner(env, thread, |owner| {
         v2::compact(owner.origin, owner.thread, key, owner.token, None)
     })
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
@@ -324,11 +352,11 @@ pub(crate) fn end_leftover_holds(env: &T3Env) -> Result<usize, String> {
     Ok(holds.len())
 }
 
-/// Open T3 thread that owns a Claude session
+/// Open T3 thread that owns a Claude session or Codex thread
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OpenClaudeThread {
-    /// Claude Code session id
-    pub(crate) session: ThreadId,
+pub(crate) struct OpenThread {
+    /// Claude session or Codex thread the T3 thread resumes
+    pub(crate) session: ProviderThread,
     /// T3 thread id
     pub(crate) t3_thread: String,
     /// T3 thread title
@@ -374,34 +402,40 @@ pub struct PullRequest {
     pub state: Option<String>,
 }
 
-/// Session id, T3 thread id, title, and settled flag of one row in a state database
-type ClaudeThreadRow = (String, String, String, bool);
+/// Driver, native id, T3 thread id, title, and settled flag of one row in a
+/// state database
+type OpenThreadRow = (String, String, String, String, bool);
 
-/// Claude sessions whose T3 thread is neither archived nor deleted, newest first
+/// Claude sessions and Codex threads whose T3 thread is neither archived nor
+/// deleted, newest first
 ///
 /// Reads the state database on disk, so the server need not run
-pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, String> {
+pub(crate) fn open_threads(env: &T3Env) -> Result<Vec<OpenThread>, String> {
     let state = state_path(&env.userdata());
     if !state.is_file() || !v2::schema_matches(&state) {
         return Ok(Vec::new());
     }
-    let rows = v2::open_claude_threads(&state)?;
+    let rows = v2::open_threads(&state)?;
     let details = v2::thread_details(&state);
 
-    let mut threads: Vec<OpenClaudeThread> = Vec::new();
-    for (session, t3_thread, title, settled) in rows {
-        // a session id that is not a UUID cannot be a Claude Code session
-        let Ok(session) = session.parse::<ThreadId>() else {
+    let mut threads: Vec<OpenThread> = Vec::new();
+    for (driver, native, t3_thread, title, settled) in rows {
+        // a native id that is not a UUID is neither a Claude session nor a Codex thread
+        let Some(session) = native
+            .parse::<ThreadId>()
+            .ok()
+            .and_then(|native| ProviderThread::from_driver(&driver, native))
+        else {
             continue;
         };
         // rows come newest first, and a T3 thread resumes only its newest
         // session, so an older session of a listed thread is left out
         let listed = threads
             .iter()
-            .any(|thread| thread.session == session || thread.t3_thread == t3_thread);
+            .any(|thread| thread.session.id() == session.id() || thread.t3_thread == t3_thread);
         if !listed {
             let details = details.get(&t3_thread).cloned().unwrap_or_default();
-            threads.push(OpenClaudeThread {
+            threads.push(OpenThread {
                 session,
                 t3_thread,
                 title,
@@ -413,16 +447,22 @@ pub(crate) fn open_claude_threads(env: &T3Env) -> Result<Vec<OpenClaudeThread>, 
     Ok(threads)
 }
 
-/// Every row of a query that selects a session id, T3 thread id, title, and
-/// settled flag
-fn claude_thread_rows(path: &Path, sql: &str) -> Result<Vec<ClaudeThreadRow>, String> {
+/// Every row of a query that selects a driver, native id, T3 thread id,
+/// title, and settled flag
+fn open_thread_rows(path: &Path, sql: &str) -> Result<Vec<OpenThreadRow>, String> {
     let db = state_connection(path).map_err(|_| "T3 state cannot be read".to_string())?;
     let mut statement = db
         .prepare(sql)
         .map_err(|_| "T3 thread list query failed".to_string())?;
     statement
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .and_then(Iterator::collect)
         .map_err(|_| "T3 thread list query failed".to_string())
@@ -1047,8 +1087,8 @@ mod tests {
     };
     use super::{
         ProbeStatus, ProviderThread, PullRequest, T3Cli, T3Env, ThreadDetails, TurnStart,
-        WakeOutcome, compact_thread, deterministic_id, load_runtime, open_claude_threads, owner,
-        probe, wake_thread_checked,
+        WakeOutcome, compact_thread, deterministic_id, load_runtime, open_threads, owner, probe,
+        wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1185,7 +1225,7 @@ mod tests {
             t3_thread: T3_THREAD_ID.into(),
         };
         for key in ["idle since 1", "idle since 1", "idle since 2"] {
-            assert_eq!(compact_thread(&fixture.env, thread_id(), key), woken);
+            assert_eq!(compact_thread(&fixture.env, claude_thread(), key), woken);
         }
         let dispatches: Vec<Value> = server
             .requests()
@@ -1281,7 +1321,7 @@ mod tests {
             )
             .native("claudeAgent", SESSION_ID, T3_THREAD_ID);
 
-        let open = open_claude_threads(&fixture.env).unwrap();
+        let open = open_threads(&fixture.env).unwrap();
         let details = |t3_thread: &str| {
             let thread = open.iter().find(|thread| thread.t3_thread == t3_thread);
             thread.unwrap().details.clone()
@@ -1326,12 +1366,31 @@ mod tests {
             .native("claudeAgent", SESSION_ID, T3_THREAD_ID)
             .legacy("claudeAgent", "resume", imported, T3_THREAD_ID);
 
-        let open = open_claude_threads(&fixture.env).unwrap();
+        let open = open_threads(&fixture.env).unwrap();
         let sessions: Vec<String> = open
             .iter()
-            .map(|thread| thread.session.to_string())
+            .map(|thread| thread.session.id().to_string())
             .collect();
         assert_eq!(sessions, [SESSION_ID]);
+    }
+
+    #[test]
+    fn lists_an_imported_codex_thread_by_its_resume_cursor() {
+        let fixture = Fixture::empty(None, live_pid());
+        let codex = "01a1b8ed-bad7-79b0-a505-6a4fa4605789";
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Imported Codex thread", false)
+            .legacy("codex", "threadId", codex, T3_THREAD_ID)
+            .thread("claude", "Imported Claude thread", false)
+            .legacy("claudeAgent", "resume", SESSION_ID, "claude");
+
+        let open = open_threads(&fixture.env).unwrap();
+        let sessions: Vec<ProviderThread> = open.iter().map(|thread| thread.session).collect();
+        // both rows share a last-seen time, so their order is not part of the contract
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&ProviderThread::Codex(codex.parse().unwrap())));
+        assert!(sessions.contains(&ProviderThread::Claude(SESSION_ID.parse().unwrap())));
     }
 
     #[test]
@@ -1347,7 +1406,7 @@ mod tests {
             .instance("claude-work", "claudeAgent", SESSION_ID, T3_THREAD_ID);
 
         assert_eq!(owner(&fixture.env, claude_thread()), Ok(true));
-        let open = open_claude_threads(&fixture.env).unwrap();
+        let open = open_threads(&fixture.env).unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].t3_thread, T3_THREAD_ID);
     }

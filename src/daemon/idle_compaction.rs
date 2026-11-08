@@ -1,10 +1,10 @@
-//! Compact idle Claude sessions that wait on a task before their prompt cache
-//! lapses
+//! Compact idle Claude sessions and Codex threads that wait on a task before
+//! their prompt cache lapses
 //!
 //! A thread that waits on a task callback is checked every minute, so a
 //! compaction starts inside the window that
-//! [`ContextUse::idle_compaction_due`] allows. The transcript records any
-//! activity since, so a thread that moved on is left alone
+//! [`ContextUse::idle_compaction_due`] allows. The transcript or rollout
+//! records any activity since, so a thread that moved on is left alone
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,9 @@ pub(crate) fn scan(
 ) -> Attempts {
     attempts.retain(|thread, _| threads.iter().any(|(waiting, _)| waiting == thread));
     for (thread, context) in threads {
-        let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
+        // a waiting thread is only an id, so its provider is whichever record names it
+        let Some((provider_thread, usage)) = ContextUse::find(Path::new(&context.env.home), thread)
+        else {
             continue;
         };
         if !usage.idle_compaction_due(now) || attempts.get(&thread) == Some(&usage.last_active()) {
@@ -81,14 +83,15 @@ pub(crate) fn scan(
             PathBuf::from(&context.env.home),
             context.env.path.clone().into(),
         );
-        let outcome = compact_thread(&env, thread, &usage.compaction_key());
-        compaction_log::record(log, Trigger::Idle, thread, &usage, &outcome, now);
+        let outcome = compact_thread(&env, provider_thread, &usage.compaction_key());
+        compaction_log::record(log, Trigger::Idle, provider_thread, &usage, &outcome, now);
         match outcome {
             WakeOutcome::Woken { t3_thread } => info!(
                 %thread,
                 t3_thread,
+                provider = provider_thread.provider(),
                 tokens = usage.tokens(),
-                "compacting an idle Claude session before its prompt cache lapses"
+                "compacting an idle thread before its prompt cache lapses"
             ),
             // a terminal session compacts itself, and the socket cannot run `/compact`
             WakeOutcome::NotT3Thread => debug!(%thread, "idle session has no T3 thread"),

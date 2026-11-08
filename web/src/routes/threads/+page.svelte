@@ -12,10 +12,10 @@
 	import { untrack } from 'svelte';
 	import { useInterval } from 'runed';
 	import {
-		compactClaudeThread,
-		fetchLargeClaudeThreads,
+		compactThread,
+		fetchContextThreads,
 		type CompactResult,
-		type LargeClaudeThread
+		type ContextThread
 	} from '$lib/api';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import Elapsed from '$lib/components/Elapsed.svelte';
@@ -25,7 +25,7 @@
 	const REFRESH_MS = 60_000;
 	// settled threads idle longer than this are left out, even behind "show more"
 	const SETTLED_LIMIT_MS = 48 * 60 * 60 * 1000;
-	// matches the daemon's one-hour prompt cache lifetime
+	// matches the daemon's one-hour prompt cache lifetime, which Codex threads show too
 	const CACHE_MS = 60 * 60 * 1000;
 	// warm threads with less cache life than this go in the expiring block
 	const EXPIRING_MS = 15 * 60 * 1000;
@@ -36,7 +36,7 @@
 	// far past the minutes a large compaction takes, so a lost one stops spinning
 	const COMPACTING_TIMEOUT_MS = 10 * 60 * 1000;
 
-	let threads = $state<readonly LargeClaudeThread[]>([]);
+	let threads = $state<readonly ContextThread[]>([]);
 	let minTokens = $state(200_000);
 	let error = $state<string | null>(null);
 	let lastFetched = $state<number | null>(null);
@@ -44,7 +44,7 @@
 	/** Result of the last compaction request per session. */
 	let results = $state<Record<string, CompactResult>>({});
 	/** Thread the confirmation dialog names. */
-	let target = $state<LargeClaudeThread | null>(null);
+	let target = $state<ContextThread | null>(null);
 	let confirming = $state(false);
 	let showSettled = $state(false);
 	let showStale = $state(false);
@@ -52,12 +52,12 @@
 	let showSmall = $state(false);
 	let now = $state(Date.now());
 	/** Threads T3 is compacting, as they were when the request started. */
-	let compacting = $state<Record<string, { before: LargeClaudeThread; startedAt: number }>>({});
+	let compacting = $state<Record<string, { before: ContextThread; startedAt: number }>>({});
 	/**
 	 * Compactions that landed since the page loaded, newest first. `after` follows the thread's
 	 * size, an estimate until its next request, and is null once the thread closed.
 	 */
-	let compacted = $state<{ before: LargeClaudeThread; after: LargeClaudeThread | null }[]>([]);
+	let compacted = $state<{ before: ContextThread; after: ContextThread | null }[]>([]);
 
 	// sessions this page asks for below the listing size are for `compacted` only
 	const listed = $derived(
@@ -65,17 +65,17 @@
 	);
 	const warmCount = $derived(listed.filter(warm).length);
 
-	function cacheLeft(thread: LargeClaudeThread): number {
+	function cacheLeft(thread: ContextThread): number {
 		return CACHE_MS - (now - Date.parse(thread.last_active));
 	}
 
 	// the server answers warm as of its last read, so let a countdown that hit
 	// zero since then count as cold
-	function warm(thread: LargeClaudeThread): boolean {
+	function warm(thread: ContextThread): boolean {
 		return thread.cache_warm && cacheLeft(thread) > 0;
 	}
 
-	function expiring(thread: LargeClaudeThread): boolean {
+	function expiring(thread: ContextThread): boolean {
 		return warm(thread) && thread.tokens > EXPIRING_MIN_TOKENS && cacheLeft(thread) < EXPIRING_MS;
 	}
 
@@ -88,12 +88,12 @@
 		key: string;
 		title: string;
 		note: string;
-		threads: readonly LargeClaudeThread[];
+		threads: readonly ContextThread[];
 		stale: boolean;
 	}
 
 	// cold threads cost a full read to compact whatever their size, so they list newest first
-	function newestFirst(list: readonly LargeClaudeThread[]): LargeClaudeThread[] {
+	function newestFirst(list: readonly ContextThread[]): ContextThread[] {
 		return list.toSorted((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
 	}
 
@@ -144,7 +144,7 @@
 				...Object.keys(compacting),
 				...compacted.map((done) => done.before.session)
 			];
-			const answer = await fetchLargeClaudeThreads({ all: showSmall, include: followed });
+			const answer = await fetchContextThreads({ all: showSmall, include: followed });
 			settleCompactions(answer.threads);
 			threads = answer.threads;
 			minTokens = answer.min_tokens;
@@ -159,7 +159,7 @@
 	 * Move compactions that landed into `compacted`, and follow the size of those that did. A
 	 * finished compaction shows as a smaller context, and a thread that closed is no longer listed
 	 */
-	function settleCompactions(fresh: readonly LargeClaudeThread[]) {
+	function settleCompactions(fresh: readonly ContextThread[]) {
 		const find = (session: string) => fresh.find((thread) => thread.session === session) ?? null;
 		for (const done of compacted) {
 			done.after = find(done.before.session) ?? done.after;
@@ -187,10 +187,10 @@
 		untrack(() => void refresh());
 	});
 
-	async function compact(thread: LargeClaudeThread) {
+	async function compact(thread: ContextThread) {
 		pending = thread.session;
 		try {
-			const result = await compactClaudeThread(thread.session);
+			const result = await compactThread(thread.session);
 			results[thread.session] = result;
 			if (result.outcome === 'started') {
 				compacting[thread.session] = { before: thread, startedAt: Date.now() };
@@ -207,9 +207,17 @@
 	}
 
 	/** Size of `thread`, marked when it is an estimate after a compaction. */
-	function size(thread: LargeClaudeThread): string {
+	function size(thread: ContextThread): string {
 		return `${thread.tokens_estimated ? '~' : ''}${tokens(thread.tokens)}`;
 	}
+
+	/** Share of the model's context window in use, when the provider records the window. */
+	function windowShare(thread: ContextThread): string | null {
+		if (!thread.context_window) return null;
+		return `${Math.round((100 * thread.tokens) / thread.context_window)}%`;
+	}
+
+	const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex' } as const;
 
 	const ESTIMATE_NOTE =
 		"Estimated from the summary until the thread's next message reports the size";
@@ -225,7 +233,7 @@
 			<ArrowLeft class="size-3.5" />
 			all workers
 		</a>
-		<h1 class="text-base font-semibold tracking-tight">Large Claude threads</h1>
+		<h1 class="text-base font-semibold tracking-tight">Large threads</h1>
 		<span class="ml-auto text-muted-foreground">
 			{#if lastFetched}
 				updated <Elapsed from={lastFetched} suffix="ago" />
@@ -237,10 +245,10 @@
 
 	<p class="mt-2 max-w-4xl text-muted-foreground">
 		{showSmall
-			? 'Every open T3 Claude thread.'
-			: `Open T3 threads whose Claude context is at least ${tokens(minTokens)} tokens.`} Compacting while
-		the cache is warm reads the context at the cached price. A cold thread pays one full read, which its
-		next message would pay anyway, and every later request then reads the short summary.
+			? 'Every open T3 Claude and Codex thread.'
+			: `Open T3 Claude and Codex threads whose context is at least ${tokens(minTokens)} tokens.`} Compacting
+		while the cache is warm reads the context at the cached price. A cold thread pays one full read, which
+		its next message would pay anyway, and every later request then reads the short summary.
 	</p>
 
 	<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -365,9 +373,7 @@
 		</div>
 		{#if lastFetched !== null && expiringThreads.length === 0 && tiers.every((tier) => tier.threads.length === 0) && settledCold.length === 0}
 			<p class="px-3 py-6 text-center text-muted-foreground">
-				{showSmall
-					? 'No open Claude thread'
-					: `No open thread has ${tokens(minTokens)} tokens of context`}
+				{showSmall ? 'No open thread' : `No open thread has ${tokens(minTokens)} tokens of context`}
 			</p>
 		{/if}
 		{#each tiers as tier (tier.key)}
@@ -427,7 +433,7 @@
 	</h2>
 {/snippet}
 
-{#snippet row(thread: LargeClaudeThread, urgent: boolean)}
+{#snippet row(thread: ContextThread, urgent: boolean)}
 	{@const result = results[thread.session]}
 	{@const busy = compacting[thread.session] !== undefined}
 	{@const left = cacheLeft(thread)}
@@ -440,6 +446,16 @@
 	>
 		<span class="flex min-w-0 basis-full flex-col gap-0.5 sm:basis-auto">
 			<span class="flex min-w-0 items-center gap-1.5">
+				<span
+					class={[
+						'shrink-0 rounded px-1.5 text-[11px] leading-5 font-medium',
+						thread.provider === 'codex'
+							? 'bg-sky-500/15 text-sky-800 dark:text-sky-200'
+							: 'bg-orange-500/15 text-orange-800 dark:text-orange-200'
+					]}
+				>
+					{PROVIDER_NAMES[thread.provider]}
+				</span>
 				{#if details?.project}
 					<span
 						class="shrink-0 rounded bg-muted px-1.5 text-[11px] leading-5 font-medium text-foreground/80"
@@ -504,6 +520,14 @@
 		</span>
 		<span class="font-mono" title={thread.tokens_estimated ? ESTIMATE_NOTE : undefined}>
 			{size(thread)}
+			{#if windowShare(thread)}
+				<span
+					class="text-[11px] text-muted-foreground"
+					title={`Of the ${tokens(thread.context_window ?? 0)} context window`}
+				>
+					{windowShare(thread)}
+				</span>
+			{/if}
 		</span>
 		<span class="text-muted-foreground"><Elapsed from={thread.last_active} /></span>
 		<span class="tabular-nums">
@@ -574,8 +598,8 @@
 		if (target) void compact(target);
 	}}
 >
-	Claude replaces the thread's history with a summary. Messages sent during the compaction wait
-	until it finishes.
+	{target ? PROVIDER_NAMES[target.provider] : 'The agent'} replaces the thread's history with a summary.
+	Messages sent during the compaction wait until it finishes.
 	{#if target && !warm(target)}
 		The cache is cold, so the compaction reads the full {tokens(target.tokens)} tokens once.
 	{/if}

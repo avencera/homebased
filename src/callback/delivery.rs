@@ -232,10 +232,7 @@ impl<I: IntentIo> PendingT3Send<I> {
     }
 
     fn record(&self, provider_thread: ProviderThread) -> Result<(), SendFailure> {
-        let provider = match provider_thread {
-            ProviderThread::Claude(_) => "claude",
-            ProviderThread::Codex(_) => "codex",
-        };
+        let provider = provider_thread.provider();
         let temporary = self.temporary_path();
         let save = || -> io::Result<()> {
             let mut file = self.1.create(&temporary)?;
@@ -546,10 +543,7 @@ fn wake_provider_thread(
     gate: SendGate<'_>,
 ) -> Result<WakeOutcome, SendFailure> {
     let _lock = gate.lock()?;
-    let thread = match provider_thread {
-        ProviderThread::Claude(thread) | ProviderThread::Codex(thread) => thread,
-    };
-    let was_pending = pending.get(thread)?.is_some();
+    let was_pending = pending.get(provider_thread.id())?.is_some();
     // persist before the request: a lost reply must never enable another route
     if was_pending {
         // a prior save may have reached rename but failed its durability step
@@ -584,17 +578,19 @@ fn wake_provider_thread(
     Ok(outcome)
 }
 
-/// How the T3 thread takes the line, from the Claude session's transcript
+/// How the T3 thread takes the line, from the Claude session's transcript or
+/// the Codex thread's rollout
 ///
-/// A large context whose cache lapsed is compacted first. Its turn would write
-/// the whole context to the one-hour cache, while Claude Code's compaction
-/// request writes it at the cheaper five-minute rate, and every later request
+/// A large context whose cache lapsed is compacted first. A Claude turn would
+/// write the whole context to the one-hour cache, while Claude Code's
+/// compaction request writes it at the cheaper five-minute rate. A Codex turn
+/// pays the same cold read as its compaction. Either way every later request
 /// reads the summary instead of the whole context.
 ///
 /// With [`SendGate::hold`], the line then waits in the inbox, which survives a
 /// T3 restart, and [`SendFailure::Held`] asks for a later attempt. Each attempt
 /// repeats the compaction under the idle period's key, which T3 drops, until
-/// the transcript shows it finished or [`COMPACTION_HOLD_LIMIT`] passed.
+/// the record shows it finished or [`COMPACTION_HOLD_LIMIT`] passed.
 /// Otherwise the line goes now and T3 holds it in memory behind the compaction
 fn turn_start(
     context: &CallbackContext,
@@ -603,10 +599,7 @@ fn turn_start(
     pending: &PendingT3Send<impl IntentIo>,
     gate: SendGate<'_>,
 ) -> Result<TurnStart, SendFailure> {
-    let ProviderThread::Claude(thread) = provider_thread else {
-        return Ok(TurnStart::Auto);
-    };
-    let Some(usage) = ContextUse::read(Path::new(&context.env.home), thread) else {
+    let Some(usage) = ContextUse::read(Path::new(&context.env.home), provider_thread) else {
         return Ok(TurnStart::Auto);
     };
     let now = Utc::now();
@@ -627,9 +620,9 @@ fn turn_start(
         return Ok(usage.turn_start(now));
     }
 
-    let outcome = compact_thread(&t3_env(context), thread, &usage.compaction_key());
+    let outcome = compact_thread(&t3_env(context), provider_thread, &usage.compaction_key());
     if held_since.is_none() {
-        compaction_log::record_default(Trigger::Callback, thread, &usage, &outcome, now);
+        compaction_log::record_default(Trigger::Callback, provider_thread, &usage, &outcome, now);
         callback_log(
             log_path,
             &format!(
@@ -653,8 +646,12 @@ fn turn_start(
     if held_since.is_none() {
         pending.start_hold(now);
     }
+    let session = match provider_thread {
+        ProviderThread::Claude(thread) => format!("Claude session {thread}"),
+        ProviderThread::Codex(thread) => format!("Codex thread {thread}"),
+    };
     Err(SendFailure::Held(format!(
-        "waiting for T3 to compact Claude session {thread} ({} context tokens)",
+        "waiting for T3 to compact {session} ({} context tokens)",
         usage.tokens()
     )))
 }

@@ -228,6 +228,15 @@ carries it. Interactive Claude Code compacts a long idle session before the
 cache lapses, but T3 runs Claude through the Agent SDK, which does not. So
 homebased compacts Claude sessions that T3 threads own while they wait.
 
+Codex threads that T3 owns get the same treatment. OpenAI publishes no fixed
+cache lifetime, but on one machine's Codex rollouts the first request after an
+idle gap still read its context from the cache up to about 50 idle minutes,
+mostly up to 75, and rarely after that, so homebased treats it as an hour too.
+OpenAI charges no cache write premium, so compacting a cold Codex thread costs
+about the read its next turn would pay anyway, plus the summary, and every
+later request then reads the summary. T3 compacts a Codex thread through
+Codex's own compaction.
+
 While a thread waits on a task or queue job, the daemon checks it every minute.
 Once the session has been idle for 55 minutes with at least 200,000 context
 tokens, homebased sends `/compact` to the thread. The cache is still warm, so
@@ -245,7 +254,8 @@ compacts a cold thread until a message arrives, so a thread that is never
 resumed costs nothing.
 
 A task or queue job event that starts a compaction waits in the homebased inbox
-until the transcript shows the compaction finished, then goes as a normal turn.
+until the transcript or rollout shows the compaction finished, then goes as a
+normal turn.
 The inbox survives a T3 or daemon restart, while T3 keeps its own queue only in
 memory. If the compaction has not finished after 12 minutes, the event goes
 anyway. A direct message cannot wait, because its sender needs an answer, so
@@ -255,22 +265,39 @@ From 54 idle minutes on, an event for such a session explicitly waits for the
 active run, because T3 refuses to steer into a running compaction.
 
 Homebased reads idle time and context size from the session transcript in
-`~/.claude/projects/`.
+`~/.claude/projects/`, and for a Codex thread from its rollout in
+`~/.codex/sessions/`. There the last `token_count` event's `total_tokens` is
+the context size Codex shows itself; right after a compaction it is Codex's
+estimate of the summary until the next request. Homebased does not follow a T3
+Codex provider instance that sets its own `homePath`.
 
-The dashboard's threads page lists open T3 Claude threads with at least
-200,000 context tokens, with their idle time and whether the cache is still
-warm. It groups them as threads active in the last hour, threads settled in T3
+The dashboard's threads page lists open T3 Claude and Codex threads with at
+least 200,000 context tokens, with their idle time, whether the cache is still
+warm, and for Codex the share of the model's context window. It groups them as threads active in the last hour, threads settled in T3
 in the last hour, and active threads idle over an hour, which have a cold
 cache. A button reveals settled threads idle up to 48 hours; older settled
 threads are not listed. Its Compact button sends `/compact` to one thread. A
 second click in the same idle period is dropped. Homebased does not read
 settled state from T3 Code 0.1.0, so every thread counts as active.
 
+The daemon serves the same list as JSON at `GET /v1/threads`, on its socket and
+on the dashboard port, for this machine's T3 threads. `all=true` lists every
+open thread, and `include=<id>,<id>` adds those sessions below the size.
+`thread=<prefix>` lists only the threads whose T3 thread id, Claude session id,
+or Codex thread id starts with the prefix, at any size, so a client can look up
+one thread; an ambiguous prefix lists every match. Each thread has `provider`
+(`claude` or `codex`), `session`, `t3_thread`, `title`, `settled`, `tokens`,
+`tokens_estimated`, `context_window` (Codex only, else null), `last_active`,
+`cache_warm`, and `details`. A thread whose transcript or rollout has no
+request yet is not listed. `POST /v1/threads/{session}/compact` is the Compact
+button.
+
 Every compaction request, from the idle scan, a cold event, or the dashboard,
 is appended to `compactions.jsonl` in the homebased home directory. Each line
-records the trigger, session, T3 thread, context tokens, idle seconds, whether
-the cache was warm, and T3's answer. The size after compaction is in the session
-transcript's `compact_boundary` line.
+records the trigger, provider, session, T3 thread, context tokens, idle seconds,
+whether the cache was warm, and T3's answer. The size after compaction is in the
+session transcript's `compact_boundary` line, or in the `token_count` event
+after the Codex rollout's `compacted` line.
 
 If T3 may have taken an event but its reply was lost, every later attempt goes
 only through T3, which drops a repeated send, so the event never arrives twice

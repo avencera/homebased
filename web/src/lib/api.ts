@@ -718,27 +718,30 @@ const ThreadDetailsSchema = Schema.Struct({
 });
 export type ThreadDetails = typeof ThreadDetailsSchema.Type;
 
-const LargeClaudeThreadSchema = Schema.Struct({
+/** One open T3 thread and the size of its context. */
+const ContextThreadSchema = Schema.Struct({
+	provider: Schema.Literal('claude', 'codex'),
+	/** Claude Code session id or Codex thread id. */
 	session: Schema.String,
 	t3_thread: Schema.String,
 	title: Schema.String,
 	settled: Schema.Boolean,
 	tokens: Schema.Number,
-	// older daemons do not send it
-	tokens_estimated: Schema.optional(Schema.Boolean),
+	tokens_estimated: Schema.Boolean,
+	/** Model context window, which only Codex records. */
+	context_window: Schema.NullOr(Schema.Number),
 	last_active: Schema.String,
 	cache_warm: Schema.Boolean,
-	// older daemons do not send it
-	details: Schema.optional(ThreadDetailsSchema)
+	details: ThreadDetailsSchema
 });
-export type LargeClaudeThread = typeof LargeClaudeThreadSchema.Type;
+export type ContextThread = typeof ContextThreadSchema.Type;
 
-const LargeClaudeThreadsSchema = Schema.Struct({
+const ContextThreadsSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
 	min_tokens: Schema.Number,
-	threads: Schema.Array(LargeClaudeThreadSchema)
+	threads: Schema.Array(ContextThreadSchema)
 });
-export type LargeClaudeThreads = typeof LargeClaudeThreadsSchema.Type;
+export type ContextThreads = typeof ContextThreadsSchema.Type;
 
 const CompactResultSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
@@ -964,17 +967,17 @@ export function setResourceLabel(
 }
 
 /**
- * `GET /v1/claude/threads`: open T3 Claude threads with a large context, largest first. `all`
+ * `GET /v1/threads`: open T3 Claude and Codex threads with a large context, largest first. `all`
  * lists every open thread, and `include` adds those sessions at any size.
  */
-export function fetchLargeClaudeThreads(
+export function fetchContextThreads(
 	options: { all?: boolean; include?: readonly string[] } = {}
-): Promise<LargeClaudeThreads> {
+): Promise<ContextThreads> {
 	const query = new URLSearchParams();
 	if (options.all) query.set('all', 'true');
 	if (options.include?.length) query.set('include', options.include.join(','));
 	const search = query.size > 0 ? `?${query}` : '';
-	return getJson(`/claude/threads${search}`, LargeClaudeThreadsSchema);
+	return getJson(`/threads${search}`, ContextThreadsSchema);
 }
 
 /** `GET /v1/usage`: Claude token use and cost of finished tasks since `since`, optionally of one thread. */
@@ -985,15 +988,11 @@ export function fetchUsage(since: Date, thread?: string): Promise<UsageReport> {
 }
 
 /**
- * `POST /v1/claude/threads/{session}/compact`. A repeat in the same idle period reuses T3's
- * command id, so a double click compacts once.
+ * `POST /v1/threads/{session}/compact` for a Claude session or Codex thread. A repeat in the same
+ * idle period reuses T3's command id, so a double click compacts once.
  */
-export function compactClaudeThread(session: string): Promise<CompactResult> {
-	return postJson(
-		`/claude/threads/${encodeURIComponent(session)}/compact`,
-		{},
-		CompactResultSchema
-	);
+export function compactThread(session: string): Promise<CompactResult> {
+	return postJson(`/threads/${encodeURIComponent(session)}/compact`, {}, CompactResultSchema);
 }
 
 /** Filter for `GET /v1/fleet/tasks`. */

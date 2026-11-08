@@ -1,4 +1,5 @@
-//! Whether a Claude session should compact before a callback wakes it
+//! Whether a Claude session or Codex thread should compact before a callback
+//! wakes it
 //!
 //! Claude Code caches the conversation prefix for one hour. A callback that
 //! arrives later pays to read the whole context again, and every later request
@@ -14,6 +15,21 @@
 //! source: each assistant line carries the API `usage` of its request, and a
 //! `compact_boundary` system line carries the size of the conversation after a
 //! compaction, which the next request then reports in full
+//!
+//! A Codex thread that T3 Code runs follows the same rules from its rollout,
+//! see [`codex`]. OpenAI publishes no fixed lifetime for its prompt cache, but
+//! on this path it behaves like Claude's: on the Codex rollouts of one machine,
+//! the first request after an idle gap read its context from the cache up to 50
+//! idle minutes, mostly up to 75, and mostly not after that. OpenAI charges no
+//! cache write premium, so a cold compaction costs about the cold read the
+//! callback's turn would pay anyway, plus the summary, and every later request
+//! then reads the summary instead of the whole context
+
+mod codex;
+
+pub(crate) use codex::CodexRollouts;
+#[cfg(test)]
+pub(crate) use codex::test_support as codex_rollout;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -24,7 +40,7 @@ use serde::Deserialize;
 
 use super::claude_inbox::transcript_path;
 use crate::domain::ThreadId;
-use crate::t3::TurnStart;
+use crate::t3::{ProviderThread, TurnStart};
 
 /// Idle time after which the one-hour prompt cache has lapsed
 const CACHE_LIFETIME: TimeDelta = TimeDelta::hours(1);
@@ -45,7 +61,7 @@ const QUEUE_MARGIN: TimeDelta = TimeDelta::minutes(1);
 /// comes back before the cache would lapse
 pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
 
-/// Transcript suffix scanned for the last request
+/// Transcript or rollout suffix scanned for the last request
 ///
 /// The final assistant line of a turn is usually short text, so this only
 /// misses when tool output after it fills the suffix, and then nothing compacts
@@ -67,46 +83,45 @@ const FIRST_TAIL_BYTES: u64 = 64 * 1024;
 /// estimate within 8% of that request at the median and 23% at worst
 const PROMPT_OVERHEAD_TOKENS: u64 = 30_000;
 
-/// Context size and last activity of a Claude session
+/// Context size and last activity of a Claude session or Codex thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextUse {
     tokens: u64,
     /// Whether `tokens` is an estimate after a compaction, until the next
     /// request reports the real size
     estimated: bool,
+    /// Context window of the model, when the record names it
+    window: Option<u64>,
     last_active: DateTime<Utc>,
 }
 
 impl ContextUse {
-    /// Read the session `thread` from its transcript under `home`
+    /// Read `thread` from its Claude transcript or Codex rollout under `home`
     ///
-    /// `None` when there is no transcript or its tail has no request
-    pub(crate) fn read(home: &Path, thread: ThreadId) -> Option<Self> {
-        let path = transcript_path(&home.join(".claude/projects"), thread)?;
-        Self::from_file(&path)
+    /// `None` when there is no record or its tail has no request
+    pub(crate) fn read(home: &Path, thread: ProviderThread) -> Option<Self> {
+        match thread {
+            ProviderThread::Claude(session) => Self::read_claude(home, session),
+            ProviderThread::Codex(thread) => CodexRollouts::scan(home).context(thread),
+        }
     }
 
-    /// Scan growing suffixes of the transcript at `path` for the last request
+    /// Read a thread whose provider is unknown, and name the provider
     ///
-    /// A smaller suffix finds the same line as a larger one, since both scan
-    /// back from the end and only the first, possibly cut, line differs
-    fn from_file(path: &Path) -> Option<Self> {
-        let mut file = File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
-        let mut window = FIRST_TAIL_BYTES;
-        loop {
-            let start = len.saturating_sub(window);
-            file.seek(SeekFrom::Start(start)).ok()?;
-            let mut tail = Vec::new();
-            file.read_to_end(&mut tail).ok()?;
-            if let Some(found) = Self::from_tail(&tail) {
-                return Some(found);
-            }
-            if start == 0 || window >= TAIL_SCAN_BYTES {
-                return None;
-            }
-            window = (window * 4).min(TAIL_SCAN_BYTES);
+    /// The ids are UUIDs, so a Claude transcript and a Codex rollout never
+    /// share one; Claude is checked first
+    pub(crate) fn find(home: &Path, thread: ThreadId) -> Option<(ProviderThread, Self)> {
+        if let Some(usage) = Self::read_claude(home, thread) {
+            return Some((ProviderThread::Claude(thread), usage));
         }
+        let usage = CodexRollouts::scan(home).context(thread)?;
+        Some((ProviderThread::Codex(thread), usage))
+    }
+
+    /// Read the Claude session `thread` from its transcript under `home`
+    pub(crate) fn read_claude(home: &Path, thread: ThreadId) -> Option<Self> {
+        let path = transcript_path(&home.join(".claude/projects"), thread)?;
+        last_in_tail(&path, Self::from_tail)
     }
 
     /// How a T3 thread takes a message for this session at `now`
@@ -160,6 +175,11 @@ impl ContextUse {
         self.estimated
     }
 
+    /// Context window of the model, which only Codex records
+    pub(crate) fn context_window(&self) -> Option<u64> {
+        self.window
+    }
+
     /// Time of the last session activity
     pub(crate) fn last_active(&self) -> DateTime<Utc> {
         self.last_active
@@ -187,6 +207,7 @@ impl ContextUse {
                 return Some(Self {
                     tokens: conversation.unwrap_or(0) + PROMPT_OVERHEAD_TOKENS,
                     estimated: true,
+                    window: None,
                     last_active,
                 });
             }
@@ -194,11 +215,36 @@ impl ContextUse {
                 return Some(Self {
                     tokens,
                     estimated: false,
+                    window: None,
                     last_active,
                 });
             }
         }
         None
+    }
+}
+
+/// Scan growing suffixes of the JSON lines file at `path` with `parse`, which
+/// looks back from the end for the last request
+///
+/// A smaller suffix finds the same line as a larger one, since both scan back
+/// from the end and only the first, possibly cut, line differs
+fn last_in_tail<T>(path: &Path, parse: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut window = FIRST_TAIL_BYTES;
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        if let Some(found) = parse(&tail) {
+            return Some(found);
+        }
+        if start == 0 || window >= TAIL_SCAN_BYTES {
+            return None;
+        }
+        window = (window * 4).min(TAIL_SCAN_BYTES);
     }
 }
 
@@ -293,7 +339,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         let body: Vec<String> = lines.iter().map(Value::to_string).collect();
         fs::write(project.join(format!("{THREAD}.jsonl")), body.join("\n")).unwrap();
-        ContextUse::read(home.path(), ThreadId::from_str(THREAD).unwrap())
+        ContextUse::read_claude(home.path(), ThreadId::from_str(THREAD).unwrap())
     }
 
     #[test]

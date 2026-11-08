@@ -1779,3 +1779,172 @@ async fn event_goes_to_the_most_recently_registered_waiter() {
     assert_eq!(reader.await.unwrap(), 1);
     assert!(older_events.try_recv().is_err());
 }
+
+/// Rollout of the Codex thread `route.thread`, whose last request read
+/// 250,000 tokens `minutes_ago`, and after it the estimate Codex writes when
+/// a compaction finishes
+fn write_rollout(route: &OriginRoute, minutes_ago: i64, compacted: bool) {
+    use crate::callback::stale_context::codex_rollout::{rollout, token_count};
+
+    let now = chrono::Utc::now();
+    let mut lines = vec![token_count(
+        now - chrono::TimeDelta::minutes(minutes_ago),
+        249_000,
+        1_000,
+    )];
+    if compacted {
+        let mut estimate = token_count(now, 0, 0);
+        estimate["payload"]["info"]["last_token_usage"]["total_tokens"] = 24_740.into();
+        lines.push(estimate);
+    }
+    let home = PathBuf::from(&route.callback.env.home);
+    rollout(&home, &route.thread.to_string(), &lines);
+}
+
+/// WebSocket payloads the fake T3 server received
+fn dispatched_payloads(server: &FakeT3Server) -> Vec<serde_json::Value> {
+    server
+        .requests()
+        .iter()
+        .filter(|request| request.method == "WS")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn codex_thread_past_its_prompt_cache_waits_in_the_inbox_for_its_compaction() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let server = FakeT3Server::start(
+        Some(2),
+        vec![ticket(), dispatched(), ticket(), dispatched()],
+    );
+    let (_dir, home, mut route) =
+        fixture("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/commands\"\nexit 0\n");
+    let commands = configure_t3_codex(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
+    write_rollout(&route, 120, false);
+    let mut persisted = Store::open(&home.db_path()).unwrap();
+    persisted.insert_origin_route(&route).unwrap();
+    persisted
+        .accept_inbound_event(&event(&route, 1, true))
+        .unwrap();
+    drop(persisted);
+
+    let (store, store_handle) = StoreActor::spawn(None, StoreActor, home.db_path())
+        .await
+        .unwrap();
+    let (callback, callback_handle) = CallbackActor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+            claude_sessions: None,
+            waiters: WaiterRegistry::spawn(None).await.unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let delivery = || {
+        Store::open(&home.db_path())
+            .unwrap()
+            .inbound_events(route.task)
+            .unwrap()[0]
+            .delivery
+            .clone()
+    };
+    let run_inbox = || async {
+        let waiters = WaiterRegistry::spawn(None).await.unwrap();
+        dispatch_inbox(
+            store.clone(),
+            home.clone(),
+            route.task,
+            callback.clone(),
+            waiters,
+        )
+        .await
+        .unwrap()
+    };
+
+    run_inbox().await;
+    // T3 keeps a queued turn only in memory, so the event waits in the inbox
+    assert!(
+        matches!(delivery(), DeliveryState::AwaitingThread { .. }),
+        "{:?}",
+        delivery()
+    );
+    write_rollout(&route, 120, true);
+    run_inbox().await;
+
+    assert!(matches!(delivery(), DeliveryState::Delivered { .. }));
+    // T3 owns the thread, so the event never went through `codex queue`
+    assert!(!commands.exists());
+    let payloads = dispatched_payloads(&server);
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0]["text"], "/compact");
+    assert_eq!(payloads[0]["threadId"], T3_THREAD_ID);
+    assert!(
+        payloads[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("HOMEBASED_EVENT")
+    );
+    // the compacted thread has a fresh cache and nothing running
+    assert_eq!(payloads[1]["dispatchMode"]["type"], "start_immediately");
+
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+}
+
+#[test]
+fn idle_compaction_compacts_a_waiting_codex_thread_before_its_cache_lapses() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let server = FakeT3Server::start(Some(2), vec![ticket(), dispatched()]);
+    let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
+    configure_t3_codex(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
+    write_rollout(&route, 56, false);
+    let mut store = Store::open(&home.db_path()).unwrap();
+    store.insert_origin_route(&route).unwrap();
+
+    let log = home.compaction_log_path();
+    scan(
+        store.waiting_threads().unwrap(),
+        Attempts::new(),
+        chrono::Utc::now(),
+        &log,
+    );
+
+    let payloads = dispatched_payloads(&server);
+    assert_eq!(payloads.len(), 1, "{payloads:?}");
+    assert_eq!(payloads[0]["text"], "/compact");
+    assert_eq!(payloads[0]["threadId"], T3_THREAD_ID);
+    let logged: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+    assert_eq!(logged["provider"], "codex");
+    assert_eq!(logged["session"], route.thread.to_string());
+    assert_eq!(logged["tokens"], 250_000);
+    assert_eq!(logged["trigger"], "idle");
+}

@@ -47,8 +47,8 @@ use uuid::Uuid;
 
 use super::rpc::{self, Exit};
 use super::{
-    ApiFailure, COMPACT_COMMAND, ClaudeThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
-    PullRequest, ThreadDetails, TurnStart, claude_thread_rows, deterministic_id, failed, passed,
+    ApiFailure, COMPACT_COMMAND, OpenThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
+    PullRequest, ThreadDetails, TurnStart, deterministic_id, failed, open_thread_rows, passed,
     state_connection,
 };
 
@@ -91,23 +91,27 @@ const REQUIRED_STATE_SQL: &str = "
 // imported threads have no provider thread and resolve only through the copied
 // session table, as in `find_thread`
 // V2's settled state is unverified, so its threads all count as unsettled
-const OPEN_CLAUDE_THREADS_SQL: &str = "
-    SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0
+// a Codex thread that never started has no native id yet, and is left out
+const OPEN_THREADS_SQL: &str = "
+    SELECT COALESCE(p.driver, p.provider),
+           json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0
     FROM orchestration_v2_projection_provider_threads p
     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
-    WHERE COALESCE(p.driver, p.provider) = 'claudeAgent'
+    WHERE COALESCE(p.driver, p.provider) IN ('claudeAgent', 'codex')
       AND t.deleted_at IS NULL AND t.archived_at IS NULL
       AND json_valid(p.payload_json)
       AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
     ORDER BY p.updated_at DESC";
-const OPEN_LEGACY_CLAUDE_THREADS_SQL: &str = "
-    SELECT json_extract(r.resume_cursor_json, '$.resume'), t.thread_id, t.title, 0
+// the cursor paths are those of `ProviderThread::mapping`
+const OPEN_LEGACY_THREADS_SQL: &str = "
+    SELECT r.provider_name, json_extract(r.resume_cursor_json, c.path), t.thread_id, t.title, 0
     FROM provider_session_runtime r
+    JOIN (SELECT 'claudeAgent' AS provider, '$.resume' AS path
+          UNION ALL SELECT 'codex', '$.threadId') c ON c.provider = r.provider_name
     JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
-    WHERE r.provider_name = 'claudeAgent'
-      AND t.deleted_at IS NULL AND t.archived_at IS NULL
+    WHERE t.deleted_at IS NULL AND t.archived_at IS NULL
       AND json_valid(r.resume_cursor_json)
-      AND json_type(r.resume_cursor_json, '$.resume') = 'text'
+      AND json_type(r.resume_cursor_json, c.path) = 'text'
     ORDER BY r.last_seen_at DESC";
 // effort is one entry of the model options list, and the last linked pull
 // request is the newest
@@ -130,12 +134,13 @@ const THREAD_DETAILS_SQL: &str = "
       ON parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
     WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND json_valid(t.payload_json)";
 
-/// Claude sessions whose thread is neither archived nor deleted, newest first
-pub(super) fn open_claude_threads(path: &Path) -> Result<Vec<ClaudeThreadRow>, String> {
-    let mut rows = claude_thread_rows(path, OPEN_CLAUDE_THREADS_SQL)?;
+/// Claude sessions and Codex threads whose thread is neither archived nor
+/// deleted, newest first
+pub(super) fn open_threads(path: &Path) -> Result<Vec<OpenThreadRow>, String> {
+    let mut rows = open_thread_rows(path, OPEN_THREADS_SQL)?;
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
     if has_legacy_table(&db)? {
-        rows.extend(claude_thread_rows(path, OPEN_LEGACY_CLAUDE_THREADS_SQL)?);
+        rows.extend(open_thread_rows(path, OPEN_LEGACY_THREADS_SQL)?);
     }
     Ok(rows)
 }

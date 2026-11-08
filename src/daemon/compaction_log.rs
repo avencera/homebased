@@ -1,8 +1,10 @@
-//! JSON lines record of every Claude session compaction request
+//! JSON lines record of every Claude session and Codex thread compaction
+//! request
 //!
 //! Each line says what asked for the compaction, the session's size and idle
 //! time then, and what T3 answered. The size after compaction is in the session
-//! transcript's `compact_boundary` line, so analysis joins the two by session
+//! transcript's `compact_boundary` line, or the Codex rollout's `token_count`
+//! after its `compacted` line, so analysis joins the two by session
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -15,7 +17,7 @@ use tracing::warn;
 
 use crate::callback::stale_context::ContextUse;
 use crate::domain::ThreadId;
-use crate::t3::WakeOutcome;
+use crate::t3::{ProviderThread, WakeOutcome};
 
 /// What asked for a compaction
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -43,7 +45,7 @@ pub fn set_default(path: PathBuf) {
 /// [`record`] to the log set by [`set_default`], if any
 pub fn record_default(
     trigger: Trigger,
-    session: ThreadId,
+    session: ProviderThread,
     usage: &ContextUse,
     outcome: &WakeOutcome,
     now: DateTime<Utc>,
@@ -58,6 +60,8 @@ pub fn record_default(
 struct Record<'a> {
     at: DateTime<Utc>,
     trigger: Trigger,
+    /// `claude` or `codex`; lines from before Codex compaction have none
+    provider: &'static str,
     session: ThreadId,
     t3_thread: Option<&'a str>,
     tokens: u64,
@@ -74,7 +78,7 @@ struct Record<'a> {
 pub fn record(
     path: &Path,
     trigger: Trigger,
-    session: ThreadId,
+    session: ProviderThread,
     usage: &ContextUse,
     outcome: &WakeOutcome,
     now: DateTime<Utc>,
@@ -90,7 +94,8 @@ pub fn record(
     let line = Record {
         at: now,
         trigger,
-        session,
+        provider: session.provider(),
+        session: session.id(),
         t3_thread,
         tokens: usage.tokens(),
         last_active: usage.last_active(),

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::stale_context::CodexRollouts;
 use crate::domain::{TaskId, ThreadId, session_thread};
 use crate::error::AppError;
 use crate::home::Home;
@@ -218,8 +219,8 @@ impl SubmitOrigin {
     /// the order in which callback delivery looks them up
     fn known_threads(&self) -> BTreeMap<Uuid, ThreadDestination> {
         let mut known = BTreeMap::new();
-        for id in codex_rollout_ids(&self.codex_sessions) {
-            known.insert(id, ThreadDestination::CodexThread);
+        for id in CodexRollouts::in_sessions(&self.codex_sessions).ids() {
+            known.insert(id.0, ThreadDestination::CodexThread);
         }
         for id in claude_session_ids(&self.claude_dir) {
             known.insert(id, ThreadDestination::ClaudeSession);
@@ -352,31 +353,6 @@ fn registry_session_id(path: &Path) -> Option<Uuid> {
     let body = fs::read_to_string(path).ok()?;
     let record: Record = serde_json::from_str(&body).ok()?;
     Uuid::parse_str(&record.session_id?).ok()
-}
-
-/// Codex thread ids from `rollout-<timestamp>-<thread id>.jsonl` file names
-fn codex_rollout_ids(sessions: &Path) -> Vec<Uuid> {
-    let mut ids = Vec::new();
-    let mut pending = vec![sessions.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for path in read_dir_paths(&directory) {
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if let Some(id) = rollout_id(&path) {
-                ids.push(id);
-            }
-        }
-    }
-    ids
-}
-
-fn rollout_id(path: &Path) -> Option<Uuid> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-    let start = stem.len().checked_sub(36)?;
-    Uuid::parse_str(stem.get(start..)?).ok()
 }
 
 fn file_stem_uuid(path: &Path) -> Option<Uuid> {
