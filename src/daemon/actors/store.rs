@@ -463,7 +463,15 @@ pub(crate) enum StoreMsg {
     },
     /// Earliest unsettled event of each watch
     PendingWatchEvents {
-        reply: RpcReplyPort<Result<Vec<crate::store::PendingWatchEvent>, AppError>>,
+        reply: RpcReplyPort<
+            Result<
+                Vec<(
+                    crate::thread_watch::ThreadWatch,
+                    crate::thread_watch::WatchEvent,
+                )>,
+                AppError,
+            >,
+        >,
     },
     /// Settle one watch event
     SettleWatchEvent {

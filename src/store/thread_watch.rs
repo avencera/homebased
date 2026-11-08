@@ -66,9 +66,6 @@ pub struct WatchUpdate {
 
 const WATCH_COLUMNS: &str = "watch_json, armed, event_seq, ended_at, end_reason";
 
-/// The earliest unsettled event of one watch, with when it was recorded
-pub type PendingWatchEvent = (ThreadWatch, WatchEvent, DateTime<Utc>);
-
 impl Store {
     /// Save a watch, or find the live watch the same caller has with the same
     /// target, limit, and action, and return it with whether it is new
@@ -223,9 +220,9 @@ impl Store {
     }
 
     /// The earliest unsettled event of each watch, with its watch
-    pub fn pending_watch_events(&self) -> Result<Vec<PendingWatchEvent>, AppError> {
+    pub fn pending_watch_events(&self) -> Result<Vec<(ThreadWatch, WatchEvent)>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT w.watch_json, e.event_json, e.created_at FROM thread_watch_events e
+            "SELECT w.watch_json, e.event_json FROM thread_watch_events e
              JOIN thread_watches w ON w.id = e.watch_id
              WHERE e.settled_at IS NULL
                AND e.seq = (SELECT MIN(seq) FROM thread_watch_events
@@ -234,20 +231,12 @@ impl Store {
         )?;
         let rows = statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(watch, event, created)| {
-                Ok((
-                    serde_json::from_str(&watch)?,
-                    serde_json::from_str(&event)?,
-                    parse_time(&created)?,
-                ))
+            .map(|(watch, event)| {
+                Ok((serde_json::from_str(&watch)?, serde_json::from_str(&event)?))
             })
             .collect()
     }

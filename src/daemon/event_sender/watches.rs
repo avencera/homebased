@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -50,13 +50,16 @@ pub(crate) async fn run(state: AppState) {
     // retryable failures of the event each watch is on, by its seq; kept in
     // memory, so a restart grants a fresh budget
     let mut attempts: HashMap<WatchId, (u64, u32)> = HashMap::new();
+    // when the event each watch is on was first deferred, by its seq; like a
+    // task's wait, the limit counts from there, and a restart starts it over
+    let mut waiting: HashMap<WatchId, (u64, DateTime<Utc>)> = HashMap::new();
     let mut workers = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if let Err(error) = schedule(&state, &mut active, &retries, &attempts, &mut workers).await {
+                if let Err(error) = schedule(&state, &mut active, &retries, &attempts, &waiting, &mut workers).await {
                     warn!("watch event scan: {error}");
                 }
             }
@@ -67,6 +70,7 @@ pub(crate) async fn run(state: AppState) {
                         Ok(()) => {
                             retries.remove(&watch);
                             attempts.remove(&watch);
+                            waiting.remove(&watch);
                         }
                         Err(unsettled) => {
                             let error = match unsettled {
@@ -75,7 +79,12 @@ pub(crate) async fn run(state: AppState) {
                                     attempts.insert(watch, (seq, spent + 1));
                                     error
                                 }
-                                Unsettled::Later(error) => error,
+                                Unsettled::Later(error) => {
+                                    if waiting.get(&watch).is_none_or(|(on, _)| *on != seq) {
+                                        waiting.insert(watch, (seq, Utc::now()));
+                                    }
+                                    error
+                                }
                             };
                             warn!(%watch, "watch event delivery deferred: {error}");
                             let retry = Retry::after_failure(retries.get(&watch).copied(), Instant::now());
@@ -103,10 +112,11 @@ async fn schedule(
     active: &mut HashSet<WatchId>,
     retries: &HashMap<WatchId, Retry>,
     attempts: &HashMap<WatchId, (u64, u32)>,
+    waiting: &HashMap<WatchId, (u64, DateTime<Utc>)>,
     workers: &mut JoinSet<Attempt>,
 ) -> Result<(), AppError> {
     let pending = call(&state.store, |reply| StoreMsg::PendingWatchEvents { reply }).await?;
-    for (watch, event, created) in pending {
+    for (watch, event) in pending {
         if active.len() >= MAX_SENDERS {
             break;
         }
@@ -122,7 +132,10 @@ async fn schedule(
         let last = spent(attempts, id, event.seq) + 1 >= MAX_ATTEMPTS;
         // a caller that never comes back would hold its watch's later events
         // forever, so a wait ends at the limit task callbacks have
-        let waited_out = Utc::now() - created >= THREAD_WAIT_LIMIT;
+        let waited_out = waiting
+            .get(&id)
+            .filter(|(on, _)| *on == event.seq)
+            .is_some_and(|(_, since)| Utc::now() - *since >= THREAD_WAIT_LIMIT);
         let state = state.clone();
         workers.spawn(async move {
             let result =

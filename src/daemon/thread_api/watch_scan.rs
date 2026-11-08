@@ -493,7 +493,7 @@ mod tests {
                 .pending_watch_events()
                 .unwrap()
                 .into_iter()
-                .map(|(_, event, _)| event.seq)
+                .map(|(_, event)| event.seq)
                 .collect()
         };
         assert_eq!(pending(&store), [1]);

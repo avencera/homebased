@@ -37,7 +37,7 @@ pub use identity::IdentityError;
 pub use lifecycle::CancelResult;
 pub use presentation::{TaskOwners, TaskPresentation};
 pub use task::{NewTask, new_queued_task};
-pub use thread_watch::{PendingWatchEvent, WatchRecord, WatchUpdate, WorkerThread};
+pub use thread_watch::{WatchRecord, WatchUpdate, WorkerThread};
 
 /// Open or create the database
 pub struct Store {
