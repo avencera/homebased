@@ -8,6 +8,7 @@ pub mod notify;
 pub mod resource;
 pub mod t3;
 pub mod task;
+pub mod thread;
 pub mod update;
 pub mod wait;
 
@@ -83,7 +84,7 @@ pub enum Command {
         #[command(subcommand)]
         command: fleet::FleetCommand,
     },
-    /// Send a message to a Codex thread on this or another machine
+    /// Send a direct message to a Claude Code session or Codex thread on any Fleet machine
     Message {
         /// Message subcommand
         #[command(subcommand)]
@@ -107,17 +108,23 @@ pub enum Command {
         #[command(subcommand)]
         command: resource::ResourceCommand,
     },
+    /// Read, compact, and watch the context of agent threads on any Fleet machine
+    Thread {
+        /// Thread subcommand
+        #[command(subcommand)]
+        command: thread::ThreadCommand,
+    },
     /// Check T3 Code and launch threads in it on any Fleet machine
     T3 {
         /// T3 Code subcommand
         #[command(subcommand)]
         command: t3::T3Command,
     },
-    /// Print each callback event of tasks and GPU queue jobs as it arrives, until all of them end
+    /// Print each callback event of tasks, GPU queue jobs, and thread watches as it arrives, until all of them end
     ///
-    /// Takes task ids and job ids alike, such as the ids `task run`, `task submit`,
-    /// and `resource job submit` print, 1 to 16 in total. Each must have been
-    /// submitted from this session on this machine.
+    /// Takes task, job, and watch ids alike, such as the ids `task run`, `task submit`,
+    /// `resource job submit`, and `thread watch` print, 1 to 16 in total. Each must
+    /// have been submitted or made from this session on this machine.
     ///
     /// Run this with `--next` as a background Bash command of Claude Code in a T3
     /// Code thread. While it runs, the events of these tasks and jobs reach the
@@ -130,9 +137,11 @@ pub enum Command {
     ///
     /// A task's wait follows `TASK_WAITING` to its continuation run. A job's wait
     /// ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events
-    /// are printed and the wait goes on. Rides out a daemon restart and exits 0
-    /// once every task and job has ended, or with `--next` about a second after
-    /// the first event it prints.
+    /// are printed and the wait goes on. A watch's wait ends on `THREAD_WATCH_ENDED`.
+    /// Rides out a daemon restart and exits 0 once every target has ended, or
+    /// with `--next` about a second after the first event it prints. With
+    /// `--next --final-only` it prints interim events as they come but exits
+    /// only after an event that ends a target, or any watch event.
     Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
@@ -295,6 +304,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
+        Command::Thread { command } => thread::run(&ctx, command).await,
         Command::Wait(args) => wait::wait(&ctx, args).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {

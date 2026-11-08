@@ -324,21 +324,27 @@ After 3 days the event is marked failed and is written to
 ### Wait for tasks and jobs in a T3 thread
 
 ```sh
-homebased wait [--next] <id> [<id> ...]
+homebased wait [--next [--final-only]] <id> [<id> ...]
 ```
 
-`homebased wait` takes task ids and GPU queue job ids alike and works out which
-is which. It streams the `HOMEBASED_EVENT` line of each callback event for 1 to
-16 of this thread's tasks and GPU queue jobs to stdout and exits 0 once every
-target has its final outcome. A task follows `TASK_WAITING` to the continuation
-run. A job ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other
-events are printed and the wait goes on. While it runs, the
+`homebased wait` takes task ids, GPU queue job ids, and thread watch ids alike
+and works out which is which. It streams the `HOMEBASED_EVENT` line of each
+callback event for 1 to 16 of this thread's tasks, GPU queue jobs, and watches
+to stdout and exits 0 once every target has its final outcome. A task follows
+`TASK_WAITING` to the continuation run. A job ends on `JOB_SUCCEEDED`,
+`JOB_FAILED`, or `JOB_CANCELLED`; its other events are printed and the wait
+goes on. A watch ends on `THREAD_WATCH_ENDED`. While it runs, the
 daemon gives those events to it in place of normal delivery. It counts an
 event delivered only once the command confirms it printed the line, so an
 event the command never confirmed goes through normal delivery after about 5
 seconds, possibly as a repeat. It reconnects silently across a daemon restart
 for up to 5 minutes. With `--next`, it exits 0 about a second after it prints
-the first event, together with any that arrived in that second. It is meant
+the first event, together with any that arrived in that second. With
+`--next --final-only`, interim events such as `TASK_REPORTED` and
+`JOB_PREEMPTED` are printed and confirmed but do not end the command; it exits
+after a task's or job's final event or any watch event. A T3 `delegate_task`
+child uses it so that its interim events do not end its turn and wake its
+parent. It is meant
 for a background Bash command with `--next` in a Claude Code session in a T3
 Code thread, which T3 shows as Waiting. A Claude Code `Monitor` is killed
 after at most 30 minutes and wakes the thread each time, while a background
@@ -347,10 +353,65 @@ job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran
 here, which has no callback route. An id that is not a task or job submitted
-from this machine returns `wait_target_not_found`.
+from this machine returns `wait_target_not_found`. A watch of another caller
+returns `wait_unavailable`, and a watch id that does not exist here returns
+`watch_not_found`.
 
 A Codex thread cannot run a background command that wakes it, so each event starts a new turn, and
 T3 shows the thread as idle between events.
+
+### Thread context, compaction, and watches
+
+```sh
+homebased thread context [<ref>...] [--children [--live]] [--machine <name>]
+homebased thread compact [<ref>] [--machine <name>]
+homebased thread watch [<ref>...] --context-above <150k|80%> [--action compact] [--once] [--children]
+homebased thread watches [--all]
+homebased thread unwatch <watch-id>
+```
+
+A thread reference is T3 chip text (`[Thread: <title>; ref=thread_<id>]`),
+`thread_<id>`, a `t3-thread://v2/<environment>/<id>` link, a bare T3 id, a
+Claude Code session id, or a Codex thread id. With none, the command uses the
+calling thread; `--task <id>` and `--worker <id>` name a task's origin thread
+or worker. Each command looks on this machine first, then asks every reachable
+Fleet machine about the references it did not find. Each daemon advertises its
+T3 environment id to Fleet peers, so a `t3-thread://` link goes straight to
+the machine that runs it. Only `thread context` accepts a UUID prefix of at
+least 4 characters. A reference that matches several threads fails with
+`thread_ref_ambiguous` (exit 5), and one that matches none with
+`thread_not_found` (exit 3).
+
+`thread context` prints each thread's host (`t3`, `worker`, or `terminal`),
+provider, session, T3 id and link, title, state, context tokens, context window
+and percent (Codex only), last activity in US Central, whether the prompt cache
+is warm, and the last compaction. `--children` adds every T3 thread the calling
+T3 thread started, finished ones included unless `--live` is passed, with the
+parent link read from T3's thread lineage.
+
+`thread compact` sends `/compact` to a T3 thread on whichever machine runs it,
+and records it in `compactions.jsonl` with trigger `manual`. A thread outside
+T3 fails with `compact_unsupported_host`.
+
+`thread watch` keeps a watch on the calling machine and checks it every minute,
+right after the idle compaction scan, which keeps its 55-minute, 200,000-token
+rule. When the watched context climbs over the limit while the thread runs no
+turn, the caller gets one `THREAD_CONTEXT_OVER` event; the watch fires again
+only after the context drops below the limit. `--action compact` compacts the
+T3 thread first, with trigger `watch`, and puts the outcome in the event. The
+watch ends with `THREAD_WATCH_ENDED` when it fired with `--once`, is removed
+with `thread unwatch`, or its thread is archived, deleted, or gone. A target on
+another machine is read through that machine on each check; while it does not
+answer, the watch is left as it was. Events are delivered like task events and
+deduplicated by `(watch, seq)`. The skill's
+[threads.md](.agents/skills/homebased/references/threads.md) has the payload.
+
+On the socket, `POST /v1/threads/context` resolves references and
+`GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both
+are also served on the dashboard port. `POST /v1/threads/compact`,
+`POST /v1/threads/watches`, and `POST /v1/threads/watches/{id}/unwatch` are
+socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
+`POST /v1/cluster/threads/compact`.
 
 ### Launch a T3 thread on any machine
 
@@ -783,15 +844,19 @@ to ignore duplicates.
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |
 | `TASK_CANCELLED` | `task cancel` or `daemon stop --yes` ended it. With `cancel_reason`, a held task was cancelled before it started: a dependency ended, `task cancel` asked, or a newer task with the same `coalesce` key replaced it (`superseded`). |
 | `TASK_LOST` | Worker disappeared without `exit.json`. |
+| `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. |
+| `THREAD_WATCH_ENDED` | A watch's last event, with `reason`: `once`, `unwatched`, `archived`, `deleted`, or `session_gone`. |
 
 ### Direct messages
 
-Send a message to an exact Claude Code session or Codex thread on a known machine:
+Send a message to a Claude Code session or Codex thread on a known machine.
+`--thread` takes any thread reference that `homebased thread` takes, looked up
+on that machine; a UUID the lookup cannot find is sent as given:
 
 ```sh
 homebased --json message send \
   --machine code \
-  --thread <thread-uuid> \
+  --thread <thread-ref> \
   --source-thread <source-thread-uuid> \
   --message "Please review this change."
 ```

@@ -418,6 +418,56 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Vec<InboxEvent>, AppError>>,
     },
+    /// Save a thread watch, or update the caller's live watch of the same target
+    UpsertWatch {
+        watch: Box<crate::thread_watch::ThreadWatch>,
+        reply: RpcReplyPort<Result<(crate::store::WatchRecord, bool), AppError>>,
+    },
+    /// Read one thread watch
+    GetWatch {
+        id: crate::thread_watch::WatchId,
+        reply: RpcReplyPort<Result<Option<crate::store::WatchRecord>, AppError>>,
+    },
+    /// Read thread watches of one caller or every caller
+    ListWatches {
+        caller: Option<ThreadId>,
+        ended: bool,
+        reply: RpcReplyPort<Result<Vec<crate::store::WatchRecord>, AppError>>,
+    },
+    /// Apply one check of a watch
+    UpdateWatch {
+        id: crate::thread_watch::WatchId,
+        update: crate::store::WatchUpdate,
+        reply: RpcReplyPort<Result<Vec<crate::thread_watch::WatchEvent>, AppError>>,
+    },
+    /// Earliest unsettled event of each watch
+    PendingWatchEvents {
+        reply: RpcReplyPort<
+            Result<
+                Vec<(
+                    crate::thread_watch::ThreadWatch,
+                    crate::thread_watch::WatchEvent,
+                )>,
+                AppError,
+            >,
+        >,
+    },
+    /// Settle one watch event
+    SettleWatchEvent {
+        id: crate::thread_watch::WatchId,
+        seq: u64,
+        delivery: String,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Settled events of one watch, in sequence
+    SettledWatchEvents {
+        id: crate::thread_watch::WatchId,
+        reply: RpcReplyPort<Result<Vec<crate::thread_watch::WatchEvent>, AppError>>,
+    },
+    /// Worker sessions of local tasks, with whether each task still runs
+    WorkerThreads {
+        reply: RpcReplyPort<Result<Vec<crate::store::WorkerThread>, AppError>>,
+    },
     /// Read origin threads that still wait for a task callback
     WaitingThreads {
         reply: RpcReplyPort<Result<Vec<(ThreadId, CallbackContext)>, AppError>>,
@@ -944,6 +994,32 @@ impl Actor for StoreActor {
                 send_reply(reply, state.inbound_events(id).map_err(event_error));
             }
             StoreMsg::WaitingThreads { reply } => send_reply(reply, state.waiting_threads()),
+            StoreMsg::UpsertWatch { watch, reply } => send_reply(reply, state.upsert_watch(&watch)),
+            StoreMsg::GetWatch { id, reply } => send_reply(reply, state.watch_record(id)),
+            StoreMsg::ListWatches {
+                caller,
+                ended,
+                reply,
+            } => send_reply(reply, state.watch_records(caller, ended)),
+            StoreMsg::UpdateWatch { id, update, reply } => {
+                send_reply(reply, state.update_watch(id, update, Utc::now()));
+            }
+            StoreMsg::PendingWatchEvents { reply } => {
+                send_reply(reply, state.pending_watch_events());
+            }
+            StoreMsg::SettleWatchEvent {
+                id,
+                seq,
+                delivery,
+                reply,
+            } => send_reply(
+                reply,
+                state.settle_watch_event(id, seq, &delivery, Utc::now()),
+            ),
+            StoreMsg::SettledWatchEvents { id, reply } => {
+                send_reply(reply, state.settled_watch_events(id));
+            }
+            StoreMsg::WorkerThreads { reply } => send_reply(reply, state.worker_threads()),
             StoreMsg::HeldRoutes { reply } => send_reply(reply, state.held_routes()),
             StoreMsg::UnstartedDependentTasks { reply } => {
                 send_reply(reply, state.unstarted_dependent_tasks());

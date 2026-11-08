@@ -343,6 +343,7 @@ pub fn routes(fleet: FleetHandle) -> Router<AppState> {
         .merge(super::fleet_tasks::cluster_routes())
         .merge(super::thread_titles::cluster_routes())
         .merge(super::t3_launch::cluster_routes())
+        .merge(super::thread_api::cluster_routes())
 }
 
 async fn receive_message(

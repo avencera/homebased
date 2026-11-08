@@ -134,6 +134,9 @@ struct MachineRecord {
         deserialize_with = "lenient_dashboard_url"
     )]
     dashboard_url: Option<DashboardUrl>,
+    // records saved before the field existed load without it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    t3_environment: Option<String>,
     last_seen: DateTime<Utc>,
     identity: IdentityStatus,
 }
@@ -204,6 +207,10 @@ pub struct PeerView {
     /// because older daemons and CLIs decode this view strictly
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard_url: Option<DashboardUrl>,
+    /// T3 Code environment id the peer advertised, if any. Omitted when unset
+    /// for the same reason as `dashboard_url`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_environment: Option<String>,
     /// Reachability now.
     pub reachability: Reachability,
     /// Identity status.
@@ -446,13 +453,14 @@ impl PeerDirectory {
             // it, the runtime reports the conflict from its probe rounds
             return;
         }
-        let (capabilities, advertised, dashboard_url) = match probed {
+        let (capabilities, advertised, dashboard_url, t3_environment) = match probed {
             ProbedMachine::Compatible { advertisement, .. } => (
                 Some(advertisement.capabilities.clone()),
                 advertisement.addresses.clone(),
                 advertisement.dashboard_url.clone(),
+                advertisement.t3_environment.clone(),
             ),
-            ProbedMachine::Incompatible { .. } => (None, Vec::new(), None),
+            ProbedMachine::Incompatible { .. } => (None, Vec::new(), None, None),
         };
         let identity = self
             .machines
@@ -465,6 +473,7 @@ impl PeerDirectory {
                 capabilities,
                 advertised,
                 dashboard_url,
+                t3_environment,
                 last_seen: now,
                 identity,
             },
@@ -687,6 +696,7 @@ impl PeerDirectory {
             capabilities: record.capabilities.clone(),
             advertised: record.advertised.clone(),
             dashboard_url: record.dashboard_url.clone(),
+            t3_environment: record.t3_environment.clone(),
             reachability,
             identity: record.identity.clone(),
             name_conflict,
@@ -907,6 +917,7 @@ mod tests {
                 },
                 addresses: Vec::new(),
                 dashboard_url: None,
+                t3_environment: None,
             },
             version: CLUSTER_PROTOCOL_VERSION,
         }

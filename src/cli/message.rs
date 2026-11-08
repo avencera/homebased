@@ -14,6 +14,7 @@ use crate::message::{
     MessageId, MessageSendRequest, MessageSendResponse, MessageSourceSelector, MessageTarget,
     Recipient,
 };
+use crate::thread_ref::{ThreadContextRequest, ThreadContextResponse, ThreadRef, ThreadSelector};
 
 use super::{Ctx, OutputMode};
 
@@ -26,9 +27,11 @@ pub enum MessageCommand {
         /// Destination machine name or UUID. Required with `--thread` or `--cwd`.
         #[arg(long, conflicts_with_all = ["task", "worker"])]
         machine: Option<String>,
-        /// Exact destination Claude Code session or Codex thread UUID.
+        /// Destination thread on `--machine`: a Claude Code session or Codex
+        /// thread UUID, or any T3 reference (`thread_<id>`, chip text, a
+        /// `t3-thread://` link), which names the session T3 runs for it.
         #[arg(long, conflicts_with_all = ["cwd", "task", "worker"])]
-        thread: Option<ThreadId>,
+        thread: Option<String>,
         /// Destination working directory on the receiving machine. Selects Codex threads only.
         #[arg(long, conflicts_with_all = ["thread", "task", "worker"])]
         cwd: Option<PathBuf>,
@@ -64,7 +67,7 @@ pub enum MessageCommand {
 
 struct SendArgs {
     machine: Option<String>,
-    thread: Option<ThreadId>,
+    thread: Option<String>,
     cwd: Option<PathBuf>,
     task: Option<TaskId>,
     worker: Option<TaskId>,
@@ -114,9 +117,21 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
 }
 
 async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
+    let client = Client::new(ctx.home.sock_path());
+    let thread = match (args.machine.as_deref(), args.thread) {
+        (Some(machine), Some(reference)) => {
+            Some(destination_thread(&client, machine, reference).await?)
+        }
+        (None, Some(_)) => {
+            return Err(AppError::Usage {
+                message: "--thread needs --machine, the machine that runs the thread".into(),
+            });
+        }
+        (_, None) => None,
+    };
     let target = target(Destination {
         machine: args.machine,
-        thread: args.thread,
+        thread,
         cwd: args.cwd,
         task: args.task,
         worker: args.worker,
@@ -134,9 +149,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
     };
     request.validate()?;
 
-    let response: MessageSendResponse = Client::new(ctx.home.sock_path())
-        .post_json("/v1/messages/send", &request)
-        .await?;
+    let response: MessageSendResponse = client.post_json("/v1/messages/send", &request).await?;
     validate_response(&request, &response)?;
 
     let value = serde_json::to_value(&response)?;
@@ -150,6 +163,49 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
         OutputMode::Human => println!("{human}"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The Claude Code session or Codex thread that `reference` names on `machine`
+///
+/// A UUID that no lookup finds, or a daemon without thread lookups, keeps the
+/// old behavior: the UUID goes as given and the receiving machine checks it
+async fn destination_thread(
+    client: &Client,
+    machine: &str,
+    reference: String,
+) -> Result<ThreadId, AppError> {
+    let exact = ThreadRef::parse(&reference)?.uuid().map(ThreadId);
+    let request = ThreadContextRequest {
+        api_version: API_VERSION,
+        threads: vec![ThreadSelector::Reference {
+            text: reference.clone(),
+        }],
+        children_of: None,
+        live: false,
+        machine: Some(machine.to_owned()),
+        prefixes: false,
+    };
+    let lookup: Result<ThreadContextResponse, AppError> =
+        client.post_json("/v1/threads/context", &request).await;
+    match (lookup, exact) {
+        (Ok(response), _) => {
+            let thread = response
+                .threads
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Internal {
+                    message: "thread lookup returned no thread".into(),
+                })?;
+            thread.session.ok_or_else(|| AppError::Usage {
+                message: format!(
+                    "{reference} has not started a Claude Code session or Codex thread yet"
+                ),
+            })
+        }
+        (Err(error @ AppError::ThreadRefAmbiguous { .. }), _) => Err(error),
+        (Err(_), Some(exact)) => Ok(exact),
+        (Err(error), None) => Err(error),
+    }
 }
 
 /// Destination flags as the caller passed them

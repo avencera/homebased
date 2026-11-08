@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{ContextUse, last_in_tail};
+use super::{ContextUse, contains, last_in_tail};
 use crate::domain::ThreadId;
 
 /// Rollout files under one Codex sessions directory, by thread id
@@ -96,7 +96,8 @@ fn rollout_id(path: &Path) -> Option<Uuid> {
 
 fn from_tail(tail: &[u8]) -> Option<ContextUse> {
     let mut last_active = None;
-    for raw in tail.rsplit(|byte| *byte == b'\n') {
+    let mut lines = tail.rsplit(|byte| *byte == b'\n');
+    while let Some(raw) = lines.next() {
         // the first line of the tail may be cut off and does not parse
         let Ok(line) = serde_json::from_slice::<Line>(raw) else {
             continue;
@@ -113,11 +114,19 @@ fn from_tail(tail: &[u8]) -> Option<ContextUse> {
         if usage.total_tokens == 0 {
             continue;
         }
+        // the reading may itself follow the compaction, so the scan starts here
+        let compacted_at = std::iter::once(raw)
+            .chain(lines)
+            .filter(|raw| contains(raw, b"\"compacted\""))
+            .filter_map(|raw| serde_json::from_slice::<Line>(raw).ok())
+            .find(|line| line.kind.as_deref() == Some("compacted"))
+            .and_then(|line| line.timestamp);
         return Some(ContextUse {
             tokens: usage.total_tokens,
             estimated: usage.input_tokens == 0 && usage.output_tokens == 0,
             window: info.model_context_window,
             last_active,
+            compacted_at,
         });
     }
     None

@@ -130,7 +130,7 @@ const OPEN_LEGACY_THREADS_SQL: &str = "
     ORDER BY r.last_seen_at DESC";
 // effort is one entry of the model options list, and the last linked pull
 // request is the newest
-const THREAD_DETAILS_SQL: &str = "
+const THREAD_DETAILS_SELECT: &str = "
     SELECT t.thread_id, pr.title,
            COALESCE(json_extract(t.payload_json, '$.worktreePath'), pr.workspace_root),
            json_extract(t.payload_json, '$.branch'),
@@ -147,7 +147,86 @@ const THREAD_DETAILS_SQL: &str = "
     LEFT JOIN projection_projects pr ON pr.project_id = t.project_id
     LEFT JOIN orchestration_v2_projection_threads parent
       ON parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
-    WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND json_valid(t.payload_json)";
+    WHERE t.deleted_at IS NULL AND json_valid(t.payload_json)";
+const OPEN_THREAD_DETAILS_FILTER: &str = " AND t.archived_at IS NULL";
+// statuses of a run that has not finished, as T3's own run recovery index
+// lists them; settled is the sidebar state T3 records with `settledAt`
+const THREAD_ROWS_SQL: &str = "
+    SELECT t.thread_id, t.title, t.archived_at IS NOT NULL,
+           CASE WHEN json_valid(t.payload_json)
+               THEN COALESCE(json_extract(t.payload_json, '$.settledOverride') = 'settled', 0)
+               ELSE 0 END,
+           CASE WHEN json_valid(t.payload_json)
+               THEN json_extract(t.payload_json, '$.lineage.parentThreadId') END,
+           COALESCE((SELECT r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                     FROM orchestration_v2_projection_runs r
+                     WHERE r.thread_id = t.thread_id
+                     ORDER BY r.ordinal DESC LIMIT 1), 0)
+    FROM orchestration_v2_projection_threads t
+    WHERE t.deleted_at IS NULL
+    ORDER BY t.created_at DESC";
+// every provider thread of a thread that is not deleted, archived ones too
+const PROVIDER_ROWS_SQL: &str = "
+    SELECT COALESCE(p.driver, p.provider),
+           json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), t.thread_id, t.title, 0
+    FROM orchestration_v2_projection_provider_threads p
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+    WHERE COALESCE(p.driver, p.provider) IN ('claudeAgent', 'codex')
+      AND t.deleted_at IS NULL
+      AND json_valid(p.payload_json)
+      AND json_type(p.payload_json, '$.nativeThreadRef.nativeId') = 'text'
+    ORDER BY p.updated_at DESC";
+const PROVIDER_LEGACY_ROWS_SQL: &str = "
+    SELECT r.provider_name, json_extract(r.resume_cursor_json, c.path), t.thread_id, t.title, 0
+    FROM provider_session_runtime r
+    JOIN (SELECT 'claudeAgent' AS provider, '$.resume' AS path
+          UNION ALL SELECT 'codex', '$.threadId') c ON c.provider = r.provider_name
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
+    WHERE t.deleted_at IS NULL
+      AND json_valid(r.resume_cursor_json)
+      AND json_type(r.resume_cursor_json, c.path) = 'text'
+    ORDER BY r.last_seen_at DESC";
+
+/// One row of [`THREAD_ROWS_SQL`]
+pub(super) struct ThreadRow {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) archived: bool,
+    pub(super) settled: bool,
+    pub(super) parent: Option<String>,
+    pub(super) running: bool,
+}
+
+/// Every thread that is not deleted, newest first
+pub(super) fn thread_rows(path: &Path) -> Result<Vec<ThreadRow>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = db
+        .prepare(THREAD_ROWS_SQL)
+        .map_err(|error| format!("T3 thread query failed: {error}"))?;
+    statement
+        .query_map([], |row| {
+            Ok(ThreadRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                archived: row.get(2)?,
+                settled: row.get(3)?,
+                parent: row.get(4)?,
+                running: row.get(5)?,
+            })
+        })
+        .and_then(Iterator::collect)
+        .map_err(|error| format!("T3 thread query failed: {error}"))
+}
+
+/// Sessions of every thread that is not deleted, newest first
+pub(super) fn provider_rows(path: &Path) -> Result<Vec<OpenThreadRow>, String> {
+    let mut rows = open_thread_rows(path, PROVIDER_ROWS_SQL)?;
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    if has_legacy_table(&db)? {
+        rows.extend(open_thread_rows(path, PROVIDER_LEGACY_ROWS_SQL)?);
+    }
+    Ok(rows)
+}
 
 /// Claude sessions and Codex threads whose thread is neither archived nor
 /// deleted, newest first
@@ -165,9 +244,18 @@ pub(super) fn open_threads(path: &Path) -> Result<Vec<OpenThreadRow>, String> {
 /// Empty when the query fails, so a T3 change to these display-only fields
 /// hides them instead of breaking the thread list
 pub(super) fn thread_details(path: &Path) -> HashMap<String, ThreadDetails> {
+    details_where(path, OPEN_THREAD_DETAILS_FILTER)
+}
+
+/// Details of every thread that is not deleted, archived ones too
+pub(super) fn all_thread_details(path: &Path) -> HashMap<String, ThreadDetails> {
+    details_where(path, "")
+}
+
+fn details_where(path: &Path, filter: &str) -> HashMap<String, ThreadDetails> {
     let read = || -> rusqlite::Result<HashMap<String, ThreadDetails>> {
         let db = state_connection(path)?;
-        let mut statement = db.prepare(THREAD_DETAILS_SQL)?;
+        let mut statement = db.prepare(&format!("{THREAD_DETAILS_SELECT}{filter}"))?;
         statement
             .query_map([], |row| Ok((row.get(0)?, details_from_row(row)?)))?
             .collect()

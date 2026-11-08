@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::callback::EventKind;
 use crate::domain::{TaskId, ThreadId};
 use crate::queue::{JobEventKind, JobId};
+use crate::thread_watch::{WatchEventKind, WatchId};
 use crate::waiting::MAX_WAIT_TARGETS;
 
 /// Route that streams callback events to a waiter
@@ -47,7 +48,7 @@ impl Default for WaiterId {
 
 /// One target of a wait, whose events arrive in its own sequence
 ///
-/// On the wire it reads `{"task": id}` or `{"job": id}`
+/// On the wire it reads `{"task": id}`, `{"job": id}`, or `{"watch": id}`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitKey {
@@ -55,6 +56,8 @@ pub enum WaitKey {
     Task(TaskId),
     /// A GPU queue job, reported through `JOB_*` events
     Job(JobId),
+    /// A thread watch, reported through `THREAD_*` events
+    Watch(WatchId),
 }
 
 impl WaitKey {
@@ -64,6 +67,7 @@ impl WaitKey {
         match self {
             Self::Task(task) => task.0,
             Self::Job(job) => job.as_uuid(),
+            Self::Watch(watch) => watch.as_uuid(),
         }
     }
 }
@@ -73,6 +77,7 @@ impl fmt::Display for WaitKey {
         match self {
             Self::Task(task) => write!(f, "task {task}"),
             Self::Job(job) => write!(f, "job {job}"),
+            Self::Watch(watch) => write!(f, "watch {watch}"),
         }
     }
 }
@@ -81,7 +86,7 @@ impl fmt::Display for WaitKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WaitKeysError {
     /// No target was named
-    #[error("name at least one task or job id to wait on")]
+    #[error("name at least one task, job, or watch id to wait on")]
     Empty,
     /// The same id appears twice
     #[error("{id} is named more than once")]
@@ -96,7 +101,7 @@ pub enum WaitKeysError {
         count: usize,
     },
     /// A request named bare ids and typed targets together
-    #[error("a wait request names either ids or tasks and jobs, not both")]
+    #[error("a wait request names either ids or typed targets, not both")]
     Mixed,
 }
 
@@ -196,6 +201,9 @@ pub struct WaitRequest {
     /// GPU queue jobs to wait on
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobId>,
+    /// Thread watches to wait on
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<WatchId>,
 }
 
 impl WaitRequest {
@@ -207,17 +215,19 @@ impl WaitRequest {
             ids: ids.ids().to_vec(),
             tasks: Vec::new(),
             jobs: Vec::new(),
+            watches: Vec::new(),
         }
     }
 
     /// Request for every target still pending in `set`
     #[must_use]
     pub fn new(thread: ThreadId, set: &WaitSet) -> Self {
-        let (mut tasks, mut jobs) = (Vec::new(), Vec::new());
+        let (mut tasks, mut jobs, mut watches) = (Vec::new(), Vec::new(), Vec::new());
         for key in set.pending() {
             match key {
                 WaitKey::Task(task) => tasks.push(*task),
                 WaitKey::Job(job) => jobs.push(*job),
+                WaitKey::Watch(watch) => watches.push(*watch),
             }
         }
         Self {
@@ -225,6 +235,7 @@ impl WaitRequest {
             ids: Vec::new(),
             tasks,
             jobs,
+            watches,
         }
     }
 
@@ -242,10 +253,11 @@ impl WaitRequest {
                 .copied()
                 .map(WaitKey::Task)
                 .chain(self.jobs.iter().copied().map(WaitKey::Job))
+                .chain(self.watches.iter().copied().map(WaitKey::Watch))
                 .collect();
             return WaitKeys::new(keys).map(RequestedTargets::Keys);
         }
-        if !self.tasks.is_empty() || !self.jobs.is_empty() {
+        if !self.tasks.is_empty() || !self.jobs.is_empty() || !self.watches.is_empty() {
             return Err(WaitKeysError::Mixed);
         }
         WaitIds::new(self.ids.clone()).map(RequestedTargets::Ids)
@@ -254,7 +266,7 @@ impl WaitRequest {
 
 /// Body of an ack: the client printed one event of its stream
 ///
-/// Names exactly one of `task` and `job`
+/// Names exactly one of `task`, `job`, and `watch`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitAck {
@@ -267,6 +279,9 @@ pub struct WaitAck {
     // optional so a task ack keeps the shape older daemons and clients use
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobId>,
+    /// Thread watch the event belongs to
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchId>,
     /// Per-target event sequence
     pub seq: u64,
 }
@@ -275,24 +290,27 @@ impl WaitAck {
     /// Ack for event `seq` of `key`
     #[must_use]
     pub fn new(waiter: WaiterId, key: WaitKey, seq: u64) -> Self {
-        let (task, job) = match key {
-            WaitKey::Task(task) => (Some(task), None),
-            WaitKey::Job(job) => (None, Some(job)),
+        let (task, job, watch) = match key {
+            WaitKey::Task(task) => (Some(task), None, None),
+            WaitKey::Job(job) => (None, Some(job), None),
+            WaitKey::Watch(watch) => (None, None, Some(watch)),
         };
         Self {
             waiter,
             task,
             job,
+            watch,
             seq,
         }
     }
 
-    /// Target the ack names, or `None` when it names neither or both
+    /// Target the ack names, or `None` when it names none or several
     #[must_use]
     pub fn key(&self) -> Option<WaitKey> {
-        match (self.task, self.job) {
-            (Some(task), None) => Some(WaitKey::Task(task)),
-            (None, Some(job)) => Some(WaitKey::Job(job)),
+        match (self.task, self.job, self.watch) {
+            (Some(task), None, None) => Some(WaitKey::Task(task)),
+            (None, Some(job), None) => Some(WaitKey::Job(job)),
+            (None, None, Some(watch)) => Some(WaitKey::Watch(watch)),
             _ => None,
         }
     }
@@ -336,6 +354,17 @@ pub enum WaitFrame {
         seq: u64,
         /// What the event reports
         kind: JobEventKind,
+        /// The `HOMEBASED_EVENT` line, exactly as normal delivery would send it
+        line: String,
+    },
+    /// A thread watch event, sent only on streams that asked for watches
+    WatchEvent {
+        /// Watch the event belongs to
+        watch: WatchId,
+        /// Per-watch event sequence
+        seq: u64,
+        /// What the event reports
+        kind: WatchEventKind,
         /// The `HOMEBASED_EVENT` line, exactly as normal delivery would send it
         line: String,
     },
@@ -385,7 +414,21 @@ pub fn job_ends_wait(kind: JobEventKind) -> bool {
     }
 }
 
-/// Tasks and jobs a waiter still waits on, following waiting chains
+/// Whether an event wakes a `--final-only` wait
+///
+/// Every watch event does: `THREAD_CONTEXT_OVER` is the reason to watch, and
+/// `THREAD_WATCH_ENDED` is the watch's last event
+#[must_use]
+pub fn wakes_final_only(frame: &WaitFrame) -> bool {
+    match frame {
+        WaitFrame::Event { kind, .. } => ends_wait(*kind),
+        WaitFrame::JobEvent { kind, .. } => job_ends_wait(*kind),
+        WaitFrame::WatchEvent { .. } => true,
+        WaitFrame::Open { .. } | WaitFrame::Ping | WaitFrame::Restart | WaitFrame::Done => false,
+    }
+}
+
+/// Tasks, jobs, and watches a waiter still waits on, following waiting chains
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitSet {
     pending: Vec<WaitKey>,
@@ -453,6 +496,14 @@ impl WaitSet {
     pub fn apply_job(&mut self, job: JobId, kind: JobEventKind) {
         if job_ends_wait(kind) {
             self.pending.retain(|pending| *pending != WaitKey::Job(job));
+        }
+    }
+
+    /// Account for one watch event; `THREAD_WATCH_ENDED` ends the wait for its watch
+    pub fn apply_watch(&mut self, watch: WatchId, kind: WatchEventKind) {
+        if kind == WatchEventKind::Ended {
+            self.pending
+                .retain(|pending| *pending != WaitKey::Watch(watch));
         }
     }
 }

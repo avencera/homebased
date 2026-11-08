@@ -663,6 +663,8 @@ mod service;
 mod source_rules;
 #[path = "integration/submission.rs"]
 mod submission;
+#[path = "integration/threads.rs"]
+mod threads;
 #[path = "integration/wait.rs"]
 mod wait;
 #[path = "integration/waiting.rs"]

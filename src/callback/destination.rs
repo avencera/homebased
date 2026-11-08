@@ -322,7 +322,7 @@ fn typo_score(typed: Uuid, known: Uuid) -> Option<usize> {
 /// The registry keeps `<pid>.json` for each session, including stopped ones
 /// until Claude Code cleans them up. Transcripts live at
 /// `projects/<cwd key>/<session id>.jsonl`
-fn claude_session_ids(claude_dir: &Path) -> Vec<Uuid> {
+pub(crate) fn claude_session_ids(claude_dir: &Path) -> Vec<Uuid> {
     let mut ids = Vec::new();
     for path in read_dir_paths(&claude_dir.join("sessions")) {
         if path.extension().is_some_and(|ext| ext == "json")

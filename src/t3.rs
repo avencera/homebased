@@ -113,6 +113,20 @@ impl T3Env {
     }
 }
 
+/// Id of this T3 install's environment, which T3 links and Fleet machine
+/// advertisements name; `None` without T3
+#[must_use]
+pub fn environment_id(env: &T3Env) -> Option<String> {
+    read_environment_id(&env.userdata())
+}
+
+fn read_environment_id(userdata: &Path) -> Option<String> {
+    fs::read_to_string(userdata.join("environment-id"))
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
 /// Provider session that T3 can resume in its owning thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderThread {
@@ -414,7 +428,7 @@ pub(crate) struct OpenThread {
 ///
 /// Every field is optional: older threads lack some of them, and they come
 /// from T3 payloads that no protocol check covers
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadDetails {
     /// T3 project title
     pub project: Option<String>,
@@ -435,7 +449,7 @@ pub struct ThreadDetails {
 }
 
 /// Pull request linked to a T3 thread
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     /// Pull request number
     pub number: i64,
@@ -488,6 +502,66 @@ pub(crate) fn open_threads(env: &T3Env) -> Result<Vec<OpenThread>, String> {
         }
     }
     Ok(threads)
+}
+
+/// One T3 thread that is not deleted, open or archived, for thread lookups
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct T3Thread {
+    /// T3 thread id
+    pub(crate) id: String,
+    /// T3 thread title
+    pub(crate) title: String,
+    /// Whether the thread is archived
+    pub(crate) archived: bool,
+    /// Whether T3 settled the thread in its sidebar
+    pub(crate) settled: bool,
+    /// T3 thread that started this one as a subagent
+    pub(crate) parent: Option<String>,
+    /// Whether the newest run has not finished
+    pub(crate) running: bool,
+    /// Claude session or Codex thread the T3 thread resumes, once it has one
+    pub(crate) session: Option<ProviderThread>,
+    /// Project, branch, model, and other context T3 records for the thread
+    pub(crate) details: ThreadDetails,
+}
+
+/// Every T3 thread that is not deleted, newest first
+///
+/// Reads the state database on disk, so the server need not run. Empty when
+/// T3 is not installed or its schema changed
+pub(crate) fn thread_index(env: &T3Env) -> Result<Vec<T3Thread>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() || !v2::schema_matches(&state) {
+        return Ok(Vec::new());
+    }
+    let rows = v2::thread_rows(&state)?;
+    let mut sessions: std::collections::HashMap<String, ProviderThread> =
+        std::collections::HashMap::new();
+    // rows come newest first, and a T3 thread resumes only its newest session
+    for (driver, native, t3_thread, _, _) in v2::provider_rows(&state)? {
+        if let Some(session) = native
+            .parse::<ThreadId>()
+            .ok()
+            .and_then(|native| ProviderThread::from_driver(&driver, native))
+        {
+            sessions.entry(t3_thread).or_insert(session);
+        }
+    }
+    let details = v2::all_thread_details(&state);
+
+    Ok(rows
+        .into_iter()
+        .map(|row| T3Thread {
+            session: sessions.get(&row.id).copied(),
+            details: details.get(&row.id).cloned().unwrap_or_default(),
+            id: row.id,
+            title: row.title,
+            archived: row.archived,
+            settled: row.settled,
+            parent: row.parent,
+            running: row.running,
+        })
+        .collect())
 }
 
 /// Every row of a query that selects a driver, native id, T3 thread id,

@@ -111,6 +111,21 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
 
 Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Job specs do not support `after`. Submit once the inputs are ready. Run task IDs cannot be dependencies in a task spec's `after` list.
 
+## Never build inside a GPU lease
+
+A job holds its GPU from the first step to the last, so a build step keeps the GPU idle and every other job waiting; one job held gpu0 for 3.5 minutes while it compiled PTX. Build first, as an ordinary CPU task, and queue the GPU job only after the build succeeds. Job specs have no `after`, so chain a held task that submits the job:
+
+```bash
+job="$(uuidgen)"
+build="$(homebased --quiet task run --name "build trainer" -- cargo build --release)"
+homebased task run --name "queue training" --after "$build" -- \
+  homebased resource job submit --job-id "$job" --spec job.json
+```
+
+- Keep the job's steps to work that needs the GPU: no `cargo build`, `nvcc`, `make`, `pip install`, or first-run kernel compilation that a separate step could do ahead of time.
+- The held task runs only if the build succeeds; a failed build cancels it, and no GPU time is spent.
+- The submitting task is a worker of this thread, so the job's events come here. Once that task succeeds, add `$job` to your `homebased wait` in a T3 Claude thread.
+
 ## Command reference
 
 Use `homebased --json` before each command and parse the result. All results carry `api_version: 1`. Global flags are `--home <path>`, `--config <path>`, `--json`, `--quiet`, and `--help`. `--quiet` prints IDs and conflicts with `--json`. Full UUIDs are required.

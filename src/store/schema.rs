@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 8;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -27,6 +27,7 @@ const MIGRATIONS: [Migration; 7] = [
     add_machine_waits,
     drop_t3_holds,
     add_resource_labels,
+    add_thread_watches,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -76,6 +77,43 @@ fn add_resource_labels(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE resources ADD COLUMN {RESOURCE_LABEL};"
     ))
 }
+
+/// Version 9: thread watches and their events
+fn add_thread_watches(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(THREAD_WATCH_TABLES)
+}
+
+/// Thread watches of `homebased thread watch` and the events each one owes its
+/// caller, delivered like a job's
+///
+/// One live watch per caller and target: the same request again is the same watch
+const THREAD_WATCH_TABLES: &str = "
+CREATE TABLE thread_watches (
+    id TEXT PRIMARY KEY,
+    caller_thread TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    watch_json TEXT NOT NULL,
+    armed INTEGER NOT NULL CHECK (armed IN (0, 1)),
+    event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
+    created_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_reason TEXT CHECK ((ended_at IS NULL) = (end_reason IS NULL))
+);
+CREATE UNIQUE INDEX thread_watches_live ON thread_watches (caller_thread, target_key)
+    WHERE ended_at IS NULL;
+
+CREATE TABLE thread_watch_events (
+    watch_id TEXT NOT NULL REFERENCES thread_watches(id),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    event_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    delivery TEXT CHECK ((settled_at IS NULL) = (delivery IS NULL)),
+    PRIMARY KEY (watch_id, seq)
+);
+CREATE INDEX thread_watch_events_pending ON thread_watch_events (watch_id, seq)
+    WHERE settled_at IS NULL;
+";
 
 /// Display nickname of a resource; specs and commands keep using its name
 const RESOURCE_LABEL: &str = "label TEXT";
@@ -209,6 +247,7 @@ fn schema() -> String {
         .replace("{RESOURCE_LABEL}", RESOURCE_LABEL)
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
         .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
+        .replace("{THREAD_WATCH_TABLES}", THREAD_WATCH_TABLES)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -542,7 +581,8 @@ CREATE TABLE resource_job_delivery (
     acknowledged_seq INTEGER NOT NULL CHECK (acknowledged_seq >= 0)
 );
 {CHAIN_TABLES}
-{TASK_USAGE_TABLE}";
+{TASK_USAGE_TABLE}
+{THREAD_WATCH_TABLES}";
 
 #[cfg(test)]
 mod tests {
@@ -649,6 +689,7 @@ mod tests {
             .replace(&format!(",\n    {}", super::ROUTE_AFTER_RULE), "")
             .replace(super::CHAIN_TABLES, "")
             .replace(super::TASK_USAGE_TABLE, "")
+            .replace(super::THREAD_WATCH_TABLES, "")
             .replace(&format!(",\n    {}", super::RESOURCE_LABEL), "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");

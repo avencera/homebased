@@ -21,25 +21,8 @@ use crate::error::AppError;
 use crate::t3::{
     OpenThread, ProviderThread, T3Env, ThreadDetails, WakeOutcome, compact_thread, open_threads,
 };
-
-/// Agent that runs a T3 thread
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Provider {
-    /// Claude Code
-    Claude,
-    /// Codex
-    Codex,
-}
-
-impl From<ProviderThread> for Provider {
-    fn from(thread: ProviderThread) -> Self {
-        match thread {
-            ProviderThread::Claude(_) => Self::Claude,
-            ProviderThread::Codex(_) => Self::Codex,
-        }
-    }
-}
+use crate::thread_ref::Provider;
+use crate::thread_watch::CompactOutcome;
 
 /// One open T3 thread and the size of its context
 #[derive(Debug, Serialize)]
@@ -79,20 +62,6 @@ pub struct ContextThreads {
     pub min_tokens: u64,
     /// Listed threads, largest context first
     pub threads: Vec<ContextThread>,
-}
-
-/// Result of a compaction request
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactOutcome {
-    /// T3 started the compaction
-    Started,
-    /// No open T3 thread owns the session
-    NotFound,
-    /// T3 would not compact now, for example while a turn runs
-    Refused,
-    /// T3 could not be reached, or its reply was lost
-    Unavailable,
 }
 
 /// `POST /v1/threads/{session}/compact` answer
@@ -188,7 +157,8 @@ async fn compact(
 ) -> Result<Json<CompactAnswer>, AppError> {
     let log = state.home.compaction_log_path();
     let (outcome, detail) =
-        run_blocking(move || compact_session(&T3Env::from_env(), session, &log)).await?;
+        run_blocking(move || compact_session(&T3Env::from_env(), session, &log, Trigger::Manual))
+            .await?;
     Ok(Json(CompactAnswer {
         api_version: API_VERSION,
         outcome,
@@ -250,11 +220,12 @@ fn context_threads(
 }
 
 /// Ask T3 to compact `session`, once per idle period, recording the request
-/// in the compaction log at `log`
-fn compact_session(
+/// in the compaction log at `log` under `trigger`
+pub(super) fn compact_session(
     env: &T3Env,
     session: ThreadId,
     log: &std::path::Path,
+    trigger: Trigger,
 ) -> (CompactOutcome, Option<String>) {
     let Some((thread, usage)) = ContextUse::find_next(env, session) else {
         return (
@@ -265,7 +236,7 @@ fn compact_session(
 
     // a repeated click in the same idle period reuses the command id, which T3 drops
     let outcome = compact_thread(env, thread, &usage.compaction_key());
-    compaction_log::record(log, Trigger::Manual, thread, &usage, &outcome, Utc::now());
+    compaction_log::record(log, trigger, thread, &usage, &outcome, Utc::now());
     match outcome {
         WakeOutcome::Woken { .. } => (CompactOutcome::Started, None),
         WakeOutcome::NotT3Thread => (
@@ -281,7 +252,7 @@ fn compact_session(
     }
 }
 
-async fn run_blocking<T: Send + 'static>(
+pub(super) async fn run_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, AppError> {
     tokio::task::spawn_blocking(work)

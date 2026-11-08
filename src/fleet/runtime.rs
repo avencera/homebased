@@ -148,6 +148,7 @@ impl FleetRuntime {
             capabilities: Capabilities::detect_for_daemon(),
             addresses: listener.map(advertised_addresses).unwrap_or_default(),
             dashboard_url,
+            t3_environment: crate::t3::environment_id(&crate::t3::T3Env::from_env()),
         };
         let shared = Arc::new(Shared {
             local,
@@ -701,6 +702,7 @@ mod tests {
             },
             addresses: Vec::new(),
             dashboard_url: None,
+            t3_environment: None,
         };
         FleetHandle {
             shared: Arc::new(Shared {

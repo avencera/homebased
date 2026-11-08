@@ -16,6 +16,8 @@ use crate::machine::{MachineId, MachineName};
 use crate::queue::{JobId, QueueError};
 use crate::spec::CwdProblem;
 use crate::submission::RequestId;
+use crate::thread_ref::ThreadHost;
+use crate::thread_watch::WatchId;
 use crate::waiting::WaitingRejection;
 
 /// Hint for a `cwd` that names a path inside the container instead of a host path
@@ -104,6 +106,44 @@ pub enum AppError {
     WaitTargetAmbiguous {
         /// Id that matched both
         id: Uuid,
+    },
+    /// A watch's events cannot be streamed to this waiter
+    #[error("cannot wait on watch {watch}: {reason}")]
+    WatchWaitUnavailable {
+        /// Watch named by `wait`
+        watch: WatchId,
+        /// Why this waiter cannot take its events
+        reason: WatchWaitBlocker,
+    },
+    /// A thread reference names more than one thread
+    #[error("{reference} names {} threads; pass one of their exact references: {}", matches.len(), describe_matches(matches))]
+    ThreadRefAmbiguous {
+        /// Reference as the caller passed it
+        reference: String,
+        /// Every thread it names
+        matches: Vec<ThreadMatch>,
+    },
+    /// A thread reference names no thread
+    #[error("no thread matches {reference}{detail}")]
+    ThreadNotFound {
+        /// Reference as the caller passed it
+        reference: String,
+        /// Where the lookup looked, or why it could not, starting with `; `
+        detail: String,
+    },
+    /// The thread runs outside T3, which is the only host homebased can compact
+    #[error("{reference} runs as a {} session, and only T3 Code threads can be compacted by homebased", host.as_str())]
+    CompactUnsupportedHost {
+        /// Reference as the caller passed it
+        reference: String,
+        /// What hosts the thread
+        host: ThreadHost,
+    },
+    /// No watch has this id on this machine
+    #[error("no thread watch {watch} on this machine")]
+    WatchNotFound {
+        /// Watch id
+        watch: WatchId,
     },
     /// A task's worker cannot take a direct message
     #[error("the worker for task {task} cannot take a message: {reason}")]
@@ -626,6 +666,41 @@ pub enum JobWaitBlocker {
     Unconfirmed,
 }
 
+/// Why `homebased wait` cannot take a watch's events
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchWaitBlocker {
+    /// The watch reports to another thread
+    #[error("the watch reports to another thread")]
+    NotOwner,
+}
+
+/// One thread an ambiguous reference names
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadMatch {
+    /// Machine that runs the thread
+    pub machine: MachineId,
+    /// Name of that machine
+    pub machine_name: String,
+    /// Exact reference to pass instead
+    pub reference: String,
+    /// T3 thread title, if any
+    pub title: Option<String>,
+}
+
+fn describe_matches(matches: &[ThreadMatch]) -> String {
+    matches
+        .iter()
+        .map(|found| {
+            let title = found.title.as_deref().unwrap_or("untitled");
+            format!("{} ({title} on {})", found.reference, found.machine_name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Why a task's worker cannot take a direct message
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
@@ -659,6 +734,11 @@ impl AppError {
             Self::WaitUnavailable { .. } | Self::JobWaitUnavailable { .. } => "wait_unavailable",
             Self::WaitTargetNotFound { .. } => "wait_target_not_found",
             Self::WaitTargetAmbiguous { .. } => "wait_target_ambiguous",
+            Self::WatchWaitUnavailable { .. } => "wait_unavailable",
+            Self::ThreadRefAmbiguous { .. } => "thread_ref_ambiguous",
+            Self::ThreadNotFound { .. } => "thread_not_found",
+            Self::CompactUnsupportedHost { .. } => "compact_unsupported_host",
+            Self::WatchNotFound { .. } => "watch_not_found",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
             Self::FollowupWrongMachine { .. } => "followup_wrong_machine",
@@ -760,7 +840,12 @@ impl AppError {
             | Self::NotDirectory { .. }
             | Self::UnsupportedFile { .. }
             | Self::MachineNotFound { .. } => 3,
-            Self::AgentThreadNotFound { .. } => 3,
+            Self::AgentThreadNotFound { .. }
+            | Self::ThreadNotFound { .. }
+            | Self::WatchNotFound { .. } => 3,
+            Self::ThreadRefAmbiguous { .. }
+            | Self::CompactUnsupportedHost { .. }
+            | Self::WatchWaitUnavailable { .. } => 5,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
             | Self::TaskTerminal { .. }
@@ -824,9 +909,10 @@ impl AppError {
             | Self::ExecutableMissing { .. }
             | Self::FileNotFound { .. }
             | Self::MachineNotFound { .. } => http::StatusCode::NOT_FOUND,
-            Self::AgentThreadNotFound { .. } | Self::T3ProjectNotFound { .. } => {
-                http::StatusCode::NOT_FOUND
-            }
+            Self::AgentThreadNotFound { .. }
+            | Self::T3ProjectNotFound { .. }
+            | Self::ThreadNotFound { .. }
+            | Self::WatchNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::T3LaunchRefused { .. }
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => http::StatusCode::CONFLICT,
@@ -853,7 +939,10 @@ impl AppError {
             | Self::DuplicateMachineIdentity { .. }
             | Self::DuplicateMachineName { .. }
             | Self::ClusterProtocolIncompatible { .. }
-            | Self::WaitTargetAmbiguous { .. } => http::StatusCode::CONFLICT,
+            | Self::WaitTargetAmbiguous { .. }
+            | Self::WatchWaitUnavailable { .. }
+            | Self::ThreadRefAmbiguous { .. }
+            | Self::CompactUnsupportedHost { .. } => http::StatusCode::CONFLICT,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
             | Self::MessageConflict { .. } => http::StatusCode::CONFLICT,
@@ -913,6 +1002,19 @@ impl AppError {
             Self::WaitTargetNotFound { id } | Self::WaitTargetAmbiguous { id } => {
                 json!({ "id": id })
             }
+            Self::WatchWaitUnavailable { watch, reason } => {
+                json!({ "watch": watch, "reason": reason })
+            }
+            Self::ThreadRefAmbiguous { reference, matches } => {
+                json!({ "reference": reference, "matches": matches })
+            }
+            Self::ThreadNotFound { reference, detail } => {
+                json!({ "reference": reference, "detail": detail })
+            }
+            Self::CompactUnsupportedHost { reference, host } => {
+                json!({ "reference": reference, "host": host })
+            }
+            Self::WatchNotFound { watch } => json!({ "watch": watch }),
             Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }
