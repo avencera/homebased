@@ -7,7 +7,7 @@ use super::chain::start_continuation_on;
 use super::events::append_produced_event_on;
 use super::identity::insert_identity_on;
 use super::task::insert_accepted_task_on;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{ProcessStatus, TaskId, TaskRow};
 use crate::error::AppError;
 use crate::events::EventPayload;
@@ -26,7 +26,7 @@ pub enum LocalAdmission {
         /// Caller retry identity
         request: RequestId,
         /// Dependencies that had all succeeded when the request was admitted
-        after: Option<TaskDependencies>,
+        after: Option<Dependencies>,
     },
     /// A held route whose dependencies succeeded: accept the route saved at submit
     Released {

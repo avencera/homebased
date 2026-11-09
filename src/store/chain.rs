@@ -16,7 +16,7 @@ use super::Store;
 use super::dependency::dependent_route_on;
 use super::fmt_time;
 use super::lifecycle::reports_from;
-use crate::dependency::{ReleaseRule, TaskDependencies, TaskOutcome};
+use crate::dependency::{Dependencies, DependencyId, ReleaseRule, TaskOutcome};
 use crate::domain::{API_VERSION, AgentKind, ReportOutcome, TaskId, TaskRow, ThreadId, Workload};
 use crate::error::AppError;
 use crate::spec::{NormalizedAgentWorkload, NormalizedSpec, NormalizedWorkload};
@@ -277,10 +277,9 @@ pub(super) fn park_on(
         callback: route.callback.clone(),
         spec,
     });
-    let after =
-        TaskDependencies::new(waiting.on.tasks().to_vec()).map_err(|error| AppError::Internal {
-            message: format!("waiting targets are not a dependency list: {error}"),
-        })?;
+    let after = Dependencies::of_tasks(waiting.on.tasks()).map_err(|error| AppError::Internal {
+        message: format!("waiting targets are not a dependency list: {error}"),
+    })?;
     conn.execute(
         "INSERT INTO origin_routes (request_id, task_id, route_json, after_json, after_rule)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -379,6 +378,9 @@ fn pending_wait_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppEr
 }
 
 /// Tasks a held route still waits on
+///
+/// A job entry reads as a task with no route, which waits on nothing: a job
+/// can wait only on work that existed before it, so it closes no cycle
 fn held_after_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppError> {
     let Some((route, Some(after))) = dependent_route_on(conn, task)? else {
         return Ok(Vec::new());
@@ -390,7 +392,12 @@ fn held_after_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppErro
         }
     );
     Ok(if held {
-        after.tasks().to_vec()
+        after
+            .ids()
+            .iter()
+            .copied()
+            .map(DependencyId::as_task)
+            .collect()
     } else {
         Vec::new()
     })

@@ -10,7 +10,7 @@ use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
 };
 use crate::daemon::actors::send_reply;
-use crate::dependency::{DependencyLookup, HeldCancellation, TaskDependencies};
+use crate::dependency::{Dependencies, DependencyId, DependencyLookup, HeldCancellation};
 use crate::domain::{
     ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
@@ -432,7 +432,7 @@ pub(crate) enum StoreMsg {
     /// Read the dependencies saved with one origin route
     RouteDependencies {
         id: TaskId,
-        reply: RpcReplyPort<Result<Option<TaskDependencies>, AppError>>,
+        reply: RpcReplyPort<Result<Option<Dependencies>, AppError>>,
     },
     /// Read the retained origin inbox of one task in sequence order
     InboundEvents {
@@ -512,7 +512,7 @@ pub(crate) enum StoreMsg {
     },
     /// Read the state of each dependency, or `None` for one with no origin route here
     DependencyStates {
-        tasks: Vec<TaskId>,
+        ids: Vec<DependencyId>,
         reply: RpcReplyPort<Result<DependencyLookup, AppError>>,
     },
     /// Cancel a waiting held route and queue its terminal event
@@ -1059,8 +1059,8 @@ impl Actor for StoreActor {
             }
             StoreMsg::UnlaunchedTasks { reply } => send_reply(reply, state.unlaunched_tasks()),
             StoreMsg::UnlaunchedTask { id, reply } => send_reply(reply, state.unlaunched_task(id)),
-            StoreMsg::DependencyStates { tasks, reply } => {
-                send_reply(reply, state.dependency_states(&tasks));
+            StoreMsg::DependencyStates { ids, reply } => {
+                send_reply(reply, state.dependency_states(&ids));
             }
             StoreMsg::CancelHeldRoute { id, cause, reply } => {
                 send_reply(reply, state.cancel_held_route(id, cause));

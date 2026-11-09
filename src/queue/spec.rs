@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{API_VERSION, MIN_TIMEOUT, TaskName, TaskWorkload, ThreadId};
 use crate::error::AppError;
 use crate::invocation::{CommandLine, resolve_executable};
@@ -137,10 +137,10 @@ impl JobSpec {
 
     /// Parse a submitted spec file, whose `after` stays on the origin
     ///
-    /// The origin holds the job until each task in `after` succeeds, and the
+    /// The origin holds the job until each entry in `after` succeeds, and the
     /// queue's machine never sees the list, so it is split off here rather
     /// than kept in the spec
-    pub fn parse_submission(value: &Value) -> Result<(Self, Option<TaskDependencies>), AppError> {
+    pub fn parse_submission(value: &Value) -> Result<(Self, Option<Dependencies>), AppError> {
         let mut value = value.clone();
         let after = value
             .as_object_mut()
@@ -402,8 +402,9 @@ pub fn schema_json() -> Result<Value, AppError> {
     let mut generator = schemars::SchemaGenerator::default();
     let mut after = serde_json::to_value(crate::spec::after_schema(&mut generator))?;
     after["description"] = json!(
-        "Task UUIDs this machine submitted that must each succeed before the job joins the queue. \
-         The job is held under its id until then, and cancelled if one ends any other way"
+        "Task or job UUIDs this machine submitted that must each succeed before the job joins the \
+         queue; a job succeeds at JOB_SUCCEEDED. The job is held under its id until then, and \
+         cancelled if one ends any other way"
     );
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         properties.insert("after".into(), after);

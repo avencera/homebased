@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use super::{Ctx, OutputMode};
 use crate::callback::destination::SubmitOrigin;
 use crate::client::Client;
-use crate::dependency::TaskDependencies;
-use crate::domain::{TaskEnv, TaskId};
+use crate::dependency::{Dependencies, DependencyId};
+use crate::domain::TaskEnv;
 use crate::error::AppError;
 use crate::queue::build_hint::build_warnings;
 use crate::queue::gpu::GpuUuid;
@@ -100,11 +100,12 @@ pub enum JobCommand {
         /// Let a worker send callbacks to a thread other than its parent's thread
         #[arg(long)]
         allow_other_thread: bool,
-        /// Task this machine submitted that must succeed before the job joins
-        /// the queue; repeat for more. The job is held under its id until then,
-        /// and cancelled without using the queue if one ends any other way
-        #[arg(long = "after", value_name = "TASK")]
-        after: Vec<TaskId>,
+        /// Task or job this machine submitted that must succeed before the
+        /// job joins the queue; repeat for more. The job is held under its id
+        /// until then, and cancelled without using the queue if one ends any
+        /// other way
+        #[arg(long = "after", value_name = "TASK_OR_JOB")]
+        after: Vec<DependencyId>,
     },
     /// Show a job, its progress, and every run task for logs
     Show {
@@ -283,7 +284,7 @@ async fn submit(
     job_id: JobId,
     spec_path: &str,
     allow_other_thread: bool,
-    after_flags: Vec<TaskId>,
+    after_flags: Vec<DependencyId>,
 ) -> Result<(), AppError> {
     let origin = SubmitOrigin::capture(&ctx.home)?;
     let mut value = crate::spec::read_spec_value(spec_path)?;
@@ -312,7 +313,7 @@ async fn submit(
         value["warnings"] = json!(warnings);
     }
     let action = match value["held"]["state"].as_str() {
-        Some("held") => "held until its after tasks succeed:",
+        Some("held") => "held until its after entries succeed:",
         Some(_) => "ended before it queued:",
         None => "submitted",
     };
@@ -321,21 +322,21 @@ async fn submit(
     Ok(())
 }
 
-/// The spec's `after` and the `--after` flags as one list, each task once
+/// The spec's `after` and the `--after` flags as one list, each entry once
 fn merge_after(
-    spec: Option<TaskDependencies>,
-    flags: Vec<TaskId>,
-) -> Result<Option<TaskDependencies>, AppError> {
-    let mut tasks: Vec<TaskId> = spec.map(Vec::from).unwrap_or_default();
-    for task in flags {
-        if !tasks.contains(&task) {
-            tasks.push(task);
+    spec: Option<Dependencies>,
+    flags: Vec<DependencyId>,
+) -> Result<Option<Dependencies>, AppError> {
+    let mut ids: Vec<DependencyId> = spec.map(Vec::from).unwrap_or_default();
+    for id in flags {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
     }
-    if tasks.is_empty() {
+    if ids.is_empty() {
         return Ok(None);
     }
-    crate::spec::parse_after(&json!(tasks)).map(Some)
+    crate::spec::parse_after(&json!(ids)).map(Some)
 }
 
 fn path(base: &str, machine: &MachineArgs) -> String {
@@ -451,12 +452,7 @@ fn print_held(ctx: &Ctx, held: &Value) -> Result<(), AppError> {
         text("machine")
     );
     for dependency in held["after"].as_array().into_iter().flatten() {
-        let task = dependency["task"].as_str().unwrap_or("-");
-        let state = match dependency["outcome"].as_str() {
-            Some(outcome) => format!("ended {outcome}"),
-            None => dependency["state"].as_str().unwrap_or("-").to_owned(),
-        };
-        println!("after {task}: {state}");
+        println!("after {}", super::task::dependency_line(dependency));
     }
     if let Some(reason) = held["reason"].as_str() {
         println!("reason: {reason}");

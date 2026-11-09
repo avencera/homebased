@@ -15,7 +15,7 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 ## GPU priority queue
 
-Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. Build in a CPU task first and submit the job with `--after` that task: the job is held under its id until the build succeeds, and cancelled without taking a GPU if the build fails. Submit warns when a step itself runs a build tool such as `cargo build` or `pip install`. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. Build in a CPU task first and submit the job with `--after` that task: the job is held under its id until the build succeeds, and cancelled without taking a GPU if the build fails. `--after` also takes a job, so evaluation can wait for training as a CPU task. Submit warns when a step itself runs a build tool such as `cargo build` or `pip install`. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
 
 ## For agents
 
@@ -732,10 +732,10 @@ is unknown, or that meets `daemon_busy`, for about 90 seconds.
 
 ### Start after other tasks
 
-Set `after` to a list of task UUIDs to start a task only when those tasks
-succeed. The daemon that accepts the submit holds the task and starts it
-itself, so the orchestrator does not have to be running when the last
-dependency finishes.
+Set `after` to a list of task or GPU queue job UUIDs to start a task only when
+those tasks and jobs succeed. The daemon that accepts the submit holds the task
+and starts it itself, so the orchestrator does not have to be running when the
+last dependency finishes.
 
 ```json
 {
@@ -747,14 +747,18 @@ dependency finishes.
 }
 ```
 
-Each dependency must be a task submitted through the same daemon, local or
-remote; a held task can be a dependency too, so chains work. Success means
-`TASK_SUCCEEDED`. The submit returns `held` while a dependency is pending, or
-`queued` when all of them already succeeded. When a dependency ends any other
-way, the held task is cancelled before it starts and its thread gets
-`TASK_CANCELLED` with a `cancel_reason`. A held task starts with the
-environment and callback context saved at submit. `task cancel` cancels a held
-task before it starts. Tasks held on a cancelled task are cancelled too.
+Each dependency must be a task or job submitted through the same daemon, local
+or remote; held work can be a dependency too, so chains work. Success means
+`TASK_SUCCEEDED`, or `JOB_SUCCEEDED` for a job; `JOB_FAILED` and
+`JOB_CANCELLED` cancel the held task, and `JOB_PREEMPTED` does not. A job's
+events come back to the machine that submitted it, so a GPU job on another
+Fleet machine can feed a CPU task here. The submit returns `held` while a
+dependency is pending, or `queued` when all of them already succeeded. When a
+dependency ends any other way, the held task is cancelled before it starts and
+its thread gets `TASK_CANCELLED` with a `cancel_reason`. A held task starts
+with the environment and callback context saved at submit. `task cancel`
+cancels a held task before it starts. Tasks held on a cancelled task are
+cancelled too.
 
 ### Wait for an offline machine
 

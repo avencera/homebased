@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::views::DependencyView;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{API_VERSION, TaskEnv};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
@@ -108,7 +108,7 @@ struct SubmitBody {
     callback_cwd: PathBuf,
     /// Tasks on this origin that must succeed before the job is sent
     #[serde(default)]
-    after: Option<TaskDependencies>,
+    after: Option<Dependencies>,
 }
 
 /// A job the origin holds for its `after` tasks, or ended before it queued

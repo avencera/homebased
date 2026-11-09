@@ -12,10 +12,8 @@ use serde_json::{Value, json};
 use crate::agents::{AgentExtraArgsError, validate_agent_extra_args};
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
-use crate::dependency::{DependencyListError, MAX_DEPENDENCIES, TaskDependencies};
-use crate::domain::{
-    API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskId, TaskName, ThreadId,
-};
+use crate::dependency::{Dependencies, DependencyId, DependencyListError, MAX_DEPENDENCIES};
+use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
@@ -164,8 +162,10 @@ struct SubmitSpecWire {
     #[serde(default = "default_timeout", with = "humantime_serde")]
     #[schemars(schema_with = "timeout_schema")]
     timeout: Duration,
-    /// Task UUIDs that must succeed before this task starts. Each must be a
-    /// task this daemon is the origin for. Omit for no dependencies
+    /// Task or GPU queue job UUIDs that must succeed before this task starts.
+    /// Each must be a task or job this daemon is the origin for; a job
+    /// succeeds at `JOB_SUCCEEDED`, and a run task UUID is refused. Omit for
+    /// no dependencies
     // parsed from `Value` so each list error gets its own pointer
     #[serde(default)]
     #[schemars(schema_with = "after_schema")]
@@ -371,11 +371,11 @@ pub struct SubmitSpec {
     pub machine: Option<MachineName>,
     /// Output-inactivity timeout
     pub timeout: Duration,
-    /// Tasks that must succeed before this task starts
+    /// Tasks and jobs that must succeed before this task starts
     ///
     /// Origin-only: it travels beside the normalized spec, never inside it, so
     /// an executor cannot receive it
-    pub after: Option<TaskDependencies>,
+    pub after: Option<Dependencies>,
     /// Hold the task on its origin while its machine is unreachable
     ///
     /// Origin-only, like `after`: it travels beside the normalized spec
@@ -750,13 +750,11 @@ pub fn parse_machine_wait(
 ///
 /// The submit spec and the daemon socket envelope both carry `after` at the
 /// top level, so both report the same pointers
-pub fn parse_after(value: &Value) -> Result<TaskDependencies, AppError> {
-    let tasks: Vec<TaskId> = deserialize_under(value, "/after")?;
-    TaskDependencies::new(tasks).map_err(|error| {
+pub fn parse_after(value: &Value) -> Result<Dependencies, AppError> {
+    let ids: Vec<DependencyId> = deserialize_under(value, "/after")?;
+    Dependencies::new(ids).map_err(|error| {
         let (pointer, value) = match error {
-            DependencyListError::Duplicate { index, task } => {
-                (format!("/after/{index}"), json!(task))
-            }
+            DependencyListError::Duplicate { index, id } => (format!("/after/{index}"), json!(id)),
             DependencyListError::Empty | DependencyListError::TooMany { .. } => {
                 ("/after".to_owned(), value.clone())
             }

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::callback::destination::ThreadSuggestion;
-use crate::dependency::DependencyOutcome;
+use crate::dependency::{Dependency, DependencyId, DependencyOutcome};
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
@@ -179,21 +179,21 @@ pub enum AppError {
         /// Machine that ran the source task
         execution_machine: MachineId,
     },
-    /// An `after` entry names no task that this daemon is the origin for
+    /// An `after` entry names no task or job that this daemon is the origin for
     #[error(
-        "dependency {task} is not a task submitted through this machine; after may name only tasks this daemon is the origin for"
+        "dependency {dependency} is not a task or job submitted through this machine; after may name only tasks and jobs this daemon is the origin for"
     )]
     UnknownDependency {
-        /// Dependency without an origin route here
-        task: TaskId,
+        /// Dependency without a task or job route here
+        dependency: DependencyId,
     },
-    /// An `after` entry already ended without success, so the task could never start
+    /// An `after` entry already ended without success, so the work could never start
     #[error(
-        "dependency {task} already ended without success (outcome {outcome}); the task would never start"
+        "dependency {dependency} already ended without success (outcome {outcome}); the work would never start"
     )]
     DependencyFailed {
         /// Dependency that ended
-        task: TaskId,
+        dependency: Dependency,
         /// How it ended, `unknown` when no record says
         outcome: DependencyOutcome,
     },
@@ -1046,10 +1046,20 @@ impl AppError {
                 "execution_machine": execution_machine
             }),
             Self::TaskNotStarted { task } => json!({ "task": task }),
-            Self::UnknownDependency { task } => json!({ "pointer": "/after", "task": task }),
-            Self::DependencyFailed { task, outcome } => {
-                json!({ "pointer": "/after", "task": task, "outcome": outcome })
+            // `task` names the entry, a task or job UUID, as it did before
+            // `after` took jobs, so clients of either release decode it
+            Self::UnknownDependency { dependency } => {
+                json!({ "pointer": "/after", "task": dependency })
             }
+            Self::DependencyFailed {
+                dependency,
+                outcome,
+            } => json!({
+                "pointer": "/after",
+                "task": dependency.id(),
+                "dependency": dependency,
+                "outcome": outcome,
+            }),
             Self::RouteNotFound { task } | Self::ClusterTaskConflict { task } => {
                 json!({ "task": task })
             }

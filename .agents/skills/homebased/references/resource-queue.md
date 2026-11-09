@@ -109,9 +109,9 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
 | `timeout` | Output-inactivity notice per run. Default `1h`, minimum `30m`. Never stops work. |
 | `machine`, `resource` | Optional target selectors. |
 | `workload` or `steps` | Exactly one. One workload or 1 to 32 ordered steps. Each is `task` or `container`. |
-| `after` | Optional. 1 to 16 task UUIDs that this machine submitted. Each must succeed before the job joins the queue. Same as `--after`; both lists are merged. |
+| `after` | Optional. 1 to 16 task or job UUIDs that this machine submitted. Each must succeed before the job joins the queue; a job succeeds at `JOB_SUCCEEDED`. Same as `--after`; both lists are merged. |
 
-Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Run task IDs cannot be dependencies in any `after` list. Wait on their job instead.
+Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Run task IDs cannot be dependencies in any `after` list. Name their job instead.
 
 ## Never build inside a GPU lease
 
@@ -123,8 +123,8 @@ build="$(homebased --quiet task run --name "build trainer" -- cargo build --rele
 homebased --json resource job submit --job-id "$job" --after "$build" --spec job.json
 ```
 
-- The job gets its id at once. Your origin machine holds it out of the queue until every `--after` task succeeds. `resource job show "$job"` reports `held` with each task's state, and `homebased wait --next "$job"` works right away.
-- If an `--after` task fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task, and it uses no GPU time. `resource job cancel` ends a held job the same way. `show` and `cancel` find a held job on its origin machine, so a `--machine` that names this machine or the job's queue machine still reaches it.
+- The job gets its id at once. Your origin machine holds it out of the queue until every `--after` entry succeeds. `resource job show "$job"` reports `held` with each dependency's state, and `homebased wait --next "$job"` works right away.
+- If an `--after` entry fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task or job, and it uses no GPU time. `resource job cancel` ends a held job the same way. `show` and `cancel` find a held job on its origin machine, so a `--machine` that names this machine or the job's queue machine still reaches it.
 - Keep the job's steps to work that needs the GPU: no `cargo build`, `nvcc`, `make`, `pip install`, or first-run kernel compilation that a CPU task could do ahead of time. Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted.
 
 ## Command reference
@@ -138,8 +138,8 @@ Use `homebased --json` before each command and parse the result. All results car
 | `resource list` | Optional `--machine <name-or-uuid>`. Resources, active run phases, labels, and each indexed GPU's `gpu_uuid` from `nvidia-smi -L`. |
 | `resource jobs` | Optional `--machine <name-or-uuid>`. Non-terminal jobs in serving order. |
 | `resource schema` | Print JobSpec JSON Schema. No daemon needed. |
-| `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`, and `--after <task-uuid>` (repeatable) to hold the job until those tasks succeed. A held job's result has `held` in place of the queue's answer. Machine comes from the spec. No dry-run flag. |
-| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history with the `gpu_uuid` each attempt launched on, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` tasks, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` task's state, and the `reason` it ended. |
+| `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`, and `--after <task-or-job-uuid>` (repeatable) to hold the job until those tasks and jobs succeed. A held job's result has `held` in place of the queue's answer. Machine comes from the spec. No dry-run flag. |
+| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history with the `gpu_uuid` each attempt launched on, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` entries, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` entry as `{"task"` or `"job", "state"}`, and the `reason` it ended. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
 | `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |
@@ -186,7 +186,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `process` | Optional tagged exit result. Uses the task exit forms in [events.md](events.md). |
 | `attention` | Optional exact Attention UUID for release. |
 | `blocked` | Only on blocked notices: `episode`, `blocked_since`, and `blockers`. |
-| `held_ending` | Only when a job held for its `after` tasks ended before it queued. `reason` is `dependency` (with the `task` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
+| `held_ending` | Only when a job held for its `after` entries ended before it queued. `reason` is `dependency` (with the `task` or `job` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
 
 Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.
 

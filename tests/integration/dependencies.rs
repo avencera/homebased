@@ -334,3 +334,109 @@ fn restart_applies_dependency_endings_that_arrived_while_the_daemon_was_down() {
     let event = h.event(&cancelled, "TASK_CANCELLED");
     assert_eq!(event["cancel_reason"]["dependency"], failing.as_str());
 }
+
+/// A queue job on `gpu0` that waits for `gate` under the record directory, then exits with `code`
+fn gated_job(h: &Harness, gate: &str, code: i32) -> Value {
+    let gate = h.record.join(gate);
+    super::resource_jobs::spec(
+        h,
+        "medium",
+        "wait",
+        &format!(
+            "while [ ! -f '{}' ]; do sleep 0.1; done; exit {code}",
+            gate.display()
+        ),
+    )
+}
+
+#[test]
+fn a_task_and_a_job_held_after_a_job_start_once_it_succeeds() {
+    let h = Harness::new();
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+    let train = jobs.submit(&gated_job(&h, "train", 0)).to_string();
+
+    // a CPU task after the GPU job, the shape of a train-then-evaluate chain
+    let eval = h.submit_json(
+        &with_after(Harness::task_spec(&["/bin/echo", "eval"]), &[&train]),
+        &[],
+    );
+    assert_eq!(eval["status"], "held", "{eval}");
+    let eval = eval["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        h.show(&eval)["after"],
+        json!([{ "job": train, "state": "pending" }])
+    );
+    let next = homebased::queue::JobId::new();
+    let (held, _) = jobs.submit_with(
+        next,
+        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &["--after", &train],
+    );
+    assert_eq!(held["held"]["state"], "held", "{held}");
+    assert_eq!(
+        held["held"]["after"],
+        json!([{ "job": train, "state": "pending" }])
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(h.show(&eval)["status"], "held");
+
+    h.open_gate("train");
+    let shown = h.wait_status(&eval, "succeeded");
+    assert_eq!(
+        shown["after"],
+        json!([{ "job": train, "state": "ended", "outcome": "succeeded" }])
+    );
+    let events = super::resource_jobs::wait_callbacks(&h, next, 1);
+    assert_eq!(events[0]["event"], "JOB_SUCCEEDED", "{events:?}");
+}
+
+#[test]
+fn work_after_a_job_that_ends_without_success_is_cancelled_before_it_starts() {
+    let h = Harness::new();
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+
+    // only jobs this machine submitted can be dependencies
+    let unknown = homebased::queue::JobId::new().to_string();
+    let (error, _) = h.submit_error(
+        &with_after(Harness::task_spec(&["/bin/echo", "never"]), &[&unknown]),
+        &[],
+    );
+    assert_eq!(error["code"], "unknown_dependency", "{error}");
+    assert_eq!(error["input"]["task"], unknown.as_str());
+
+    let cancelled = jobs.submit(&gated_job(&h, "never", 0)).to_string();
+    let eval = h.submit(&with_after(
+        Harness::task_spec(&["/bin/echo", "never"]),
+        &[&cancelled],
+    ));
+    let out = h
+        .cmd()
+        .args(["resource", "job", "cancel", &cancelled])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let event = h.event(&eval, "TASK_CANCELLED");
+    assert_eq!(
+        event["cancel_reason"],
+        json!({ "type": "dependency_ended", "dependency": cancelled, "outcome": "cancelled" })
+    );
+
+    let failing = jobs.submit(&gated_job(&h, "failing", 1));
+    let after_failing = homebased::queue::JobId::new();
+    jobs.submit_with(
+        after_failing,
+        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &["--after", &failing.to_string()],
+    );
+    h.open_gate("failing");
+    let events = super::resource_jobs::wait_callbacks(&h, after_failing, 1);
+    assert_eq!(events[0]["event"], "JOB_CANCELLED", "{events:?}");
+    assert_eq!(
+        events[0]["held_ending"],
+        json!({ "reason": "dependency", "job": failing, "outcome": "failed" })
+    );
+}

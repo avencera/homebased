@@ -12,7 +12,7 @@ use crate::callback::{last_event_for_row, notify_event};
 use crate::client::Client;
 use crate::daemon::api::views::TaskFollowupSource;
 use crate::daemon::fleet_api::MachinesBody;
-use crate::dependency::TaskDependencies;
+use crate::dependency::{Dependencies, DependencyId};
 use crate::domain::{
     ProcessStatus, ReportKind, ReportOutcome, TASK_NAME_MAX_CHARS, TaskId, TaskStatus, ThreadId,
 };
@@ -71,9 +71,9 @@ pub enum TaskCommand {
         /// Fleet machine that runs the command. Omit to run here
         #[arg(long)]
         machine: Option<String>,
-        /// Task that must succeed first. Repeat for each one
-        #[arg(long = "after", value_name = "TASK_ID")]
-        after: Vec<TaskId>,
+        /// Task or GPU queue job this machine submitted that must succeed first. Repeat for each one
+        #[arg(long = "after", value_name = "TASK_OR_JOB_ID")]
+        after: Vec<DependencyId>,
         /// Hold the task while `--machine` is unreachable instead of failing
         #[arg(long, requires = "machine")]
         wait_for_machine: bool,
@@ -320,7 +320,7 @@ struct RunOptions {
     cwd: Option<std::path::PathBuf>,
     timeout: Option<String>,
     machine: Option<String>,
-    after: Vec<TaskId>,
+    after: Vec<DependencyId>,
     wait_for_machine: bool,
     command: Vec<String>,
 }
@@ -398,7 +398,7 @@ fn command_name(command: &[String]) -> String {
 /// One submit request: the normalized spec and the origin-only fields beside it
 struct Submission {
     spec: crate::spec::NormalizedSpec,
-    after: Option<TaskDependencies>,
+    after: Option<Dependencies>,
     machine_wait: Option<MachineWait>,
 }
 
@@ -903,6 +903,19 @@ fn print_chain(value: &Value) {
     }
 }
 
+/// One `after` entry for people: `task <id> pending` or `job <id> ended failed`
+pub(super) fn dependency_line(dependency: &Value) -> String {
+    let named = ["task", "job"].into_iter().find_map(|kind| {
+        let id = dependency.get(kind).and_then(Value::as_str)?;
+        Some(format!("{kind} {id}"))
+    });
+    let state = match dependency.get("outcome").and_then(Value::as_str) {
+        Some(outcome) => format!("ended {outcome}"),
+        None => "pending".to_owned(),
+    };
+    format!("{} {state}", named.as_deref().unwrap_or("-"))
+}
+
 /// One line per dependency in `after`: pending, or how it ended
 fn print_dependencies(value: &Value) {
     if value.get("wait_for_machine").and_then(Value::as_bool) == Some(true) {
@@ -915,15 +928,7 @@ fn print_dependencies(value: &Value) {
         return;
     };
     for dependency in after {
-        let task = dependency
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("-");
-        let state = match dependency.get("outcome").and_then(Value::as_str) {
-            Some(outcome) => format!("ended {outcome}"),
-            None => "pending".to_owned(),
-        };
-        println!("  after {task} {state}");
+        println!("  after {}", dependency_line(dependency));
     }
 }
 

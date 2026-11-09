@@ -12,6 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::net::UnixStream;
 
+use crate::dependency::Dependency;
 use crate::error::AppError;
 
 /// Client for the daemon Unix socket
@@ -249,14 +250,19 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }
         }
         "unknown_dependency" => decode_field(input, "task")
-            .map_or(AppError::Internal { message }, |task| {
-                AppError::UnknownDependency { task }
+            .map_or(AppError::Internal { message }, |dependency| {
+                AppError::UnknownDependency { dependency }
             }),
         "dependency_failed" => {
-            let task = decode_field(input, "task");
+            // a daemon from before job dependencies names only the task
+            let dependency = decode_field(input, "dependency")
+                .or_else(|| decode_field(input, "task").map(Dependency::Task));
             let outcome = decode_field(input, "outcome");
-            match (task, outcome) {
-                (Some(task), Some(outcome)) => AppError::DependencyFailed { task, outcome },
+            match (dependency, outcome) {
+                (Some(dependency), Some(outcome)) => AppError::DependencyFailed {
+                    dependency,
+                    outcome,
+                },
                 _ => AppError::Internal { message },
             }
         }

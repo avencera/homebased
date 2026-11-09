@@ -1,6 +1,6 @@
 # Submit a task
 
-For GPU work, use [resource-queue.md](resource-queue.md) instead of `task submit`. Run task UUIDs from jobs cannot be used in `after`. Job dependencies are not supported.
+For GPU work, use [resource-queue.md](resource-queue.md) instead of `task submit`. `after` takes a job UUID as well as a task UUID, so a CPU task can wait for a GPU job; run task UUIDs from jobs cannot be used in `after`.
 
 ## 1. Thread and machine
 
@@ -137,7 +137,7 @@ GitHub CI watcher as a normal task:
 | `cwd` | yes | A host directory that already exists and is accessible on the machine that runs the task. For local tasks, a directory on this machine. For remote tasks, an absolute path or `~/` path on the execution machine. The child runs there. Other relative paths are invalid for remote tasks. For a `container`, `cwd` is still a host path, never a path inside the container: use a mount `source` or another host directory, and set `workdir` for the directory inside the container. A missing `cwd` fails the submit with `invalid_cwd`. |
 | `machine` | no | Another Fleet machine that runs the child. Omit it to run locally. The field selects execution; the origin stays on the machine that accepted the submit. |
 | `timeout` | no | Attention check. Humantime. Default `1h`, min `30m`. Set an amount that matches the work. Writes to `output.log` restart it; expiry sends `TASK_CHECK_DUE` and does not kill the child. |
-| `after` | no | Array of task UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task submitted through this daemon, local or remote, including a task that is itself held. See [Start after other tasks](#start-after-other-tasks). |
+| `after` | no | Array of task or GPU queue job UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task or job submitted through this daemon, local or remote, including one that is itself held. See [Start after other tasks](#start-after-other-tasks). |
 | `wait_for_machine` | no | `true` holds a remote task on this daemon until `machine` answers and takes it, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
 | `coalesce` | no | With `wait_for_machine`: a key of 1 to 64 ASCII letters, digits, `.`, `_`, `-`, or `:`. Once this task is accepted, older tasks with the same key and machine that still wait on this daemon are cancelled. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
@@ -217,7 +217,7 @@ A task with a pending `after` dependency returns `"status": "held"`.
 
 ### Start after other tasks
 
-Set `after` to start a task only when other tasks succeed. The daemon holds the task and starts it itself, so the orchestrator does not need to be running when the last dependency finishes.
+Set `after` to start a task only when other tasks or GPU queue jobs succeed. The daemon holds the task and starts it itself, so the orchestrator does not need to be running when the last dependency finishes.
 
 ```json
 {
@@ -231,7 +231,8 @@ Set `after` to start a task only when other tasks succeed. The daemon holds the 
 
 - Success means `TASK_SUCCEEDED`: exit 0 and a last report of `succeeded`, or exit 0 with no report for a task, a container, or an agent with `report_trailer: false`. An agent told to report that exits 0 without a report fails. Any other ending cancels the held task before it starts, and so does an `unknown` outcome: a task that ended with no record of how.
 - An agent worker that parks on its own long tasks (`TASK_WAITING`) is not done. A task held after it, or after any later run of the same work, waits for the last run and starts only if that run succeeds. The worker's continuation itself is held until each task it waits on ended in any way; that rule is internal and `after` never uses it.
-- Every dependency must be a task submitted through this daemon. Another task fails with `unknown_dependency`. A dependency that already ended without success fails with `dependency_failed`.
+- A job dependency succeeds at `JOB_SUCCEEDED`. `JOB_FAILED` or `JOB_CANCELLED` cancels the held task; `JOB_PREEMPTED` does not, because the job queues again. A job's events come back to the machine that submitted it, so a job queued on another Fleet machine can release a task here.
+- Every dependency must be a task or job submitted through this daemon. Anything else fails with `unknown_dependency`, and a run task UUID with `usage`. A dependency that already ended without success fails with `dependency_failed`.
 - If every dependency already succeeded, the task starts at once and the response status is `queued`. Otherwise the response status is `held` and the task id is final.
 - A held task starts with the environment, `cwd`, and callback context saved at submit. A remote held task waits while its execution machine is unreachable and starts when it is back.
 - When a dependency ends without success, the held task gets `TASK_CANCELLED` with a `cancel_reason` that names the dependency. Tasks held on it are cancelled the same way. `homebased task cancel` on a held task cancels it before it starts.

@@ -379,7 +379,7 @@ fn schema_accepts_a_two_step_spec_and_rejects_refused_shapes() {
     );
     assert!(validator.is_valid(&held));
     let (_, after) = JobSpec::parse_submission(&held).unwrap();
-    assert_eq!(after.unwrap().tasks().len(), 1);
+    assert_eq!(after.unwrap().ids().len(), 1);
 
     let refused = [
         with(single(task.clone()), "steps", json!([task.clone()])),

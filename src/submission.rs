@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::dependency::{HeldCancellation, ReleaseRule, TaskDependencies};
+use crate::dependency::{Dependencies, HeldCancellation, ReleaseRule};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
@@ -192,7 +192,7 @@ pub struct OriginRoute {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReleaseTerms {
     /// Tasks that must succeed first
-    pub after: Option<TaskDependencies>,
+    pub after: Option<Dependencies>,
     /// Hold the route while its execution machine is unreachable
     pub machine_wait: Option<MachineWait>,
 }
@@ -215,7 +215,7 @@ pub struct DependentRoute {
     pub route: OriginRoute,
     /// Tasks that must end before it launches, or `None` for a route that
     /// waits only for its execution machine
-    pub after: Option<TaskDependencies>,
+    pub after: Option<Dependencies>,
     /// Which endings of `after` release it: success for a submitted `after`,
     /// any ending for a continuation
     pub rule: ReleaseRule,

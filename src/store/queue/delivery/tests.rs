@@ -228,8 +228,7 @@ fn a_job_thread_waits_until_an_ending_reaches_it() {
 fn a_refused_held_job_ends_with_its_final_event_whichever_send_saw_the_refusal() {
     let dir = tempdir().unwrap();
     let store = Store::open(&dir.path().join("homebased.db")).unwrap();
-    let after =
-        crate::dependency::TaskDependencies::new(vec![crate::domain::TaskId::new()]).unwrap();
+    let after = crate::dependency::Dependencies::of_tasks(&[crate::domain::TaskId::new()]).unwrap();
     let refusal = || JobRefusal {
         code: "invalid_cwd".into(),
         message: "cwd /gone does not exist".into(),
@@ -277,4 +276,60 @@ fn a_refused_held_job_ends_with_its_final_event_whichever_send_saw_the_refusal()
             .iter()
             .all(|(route, _)| route.job != ready.job)
     );
+}
+
+#[test]
+fn a_route_saved_before_job_dependencies_reads_and_saves_unchanged() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("homebased.db")).unwrap();
+    let task = "0199a000-0000-7000-8000-000000000001";
+    // the saved form of a held job that a failed task cancelled, from the
+    // release before `after` took jobs
+    let mut saved = serde_json::to_value(route()).unwrap();
+    saved["after"] = serde_json::json!([task]);
+    saved["owes_final_event"] = serde_json::json!(true);
+    saved["submission"] = serde_json::json!({
+        "state": "ended",
+        "ending": { "reason": "dependency", "task": task, "outcome": "failed" }
+    });
+    let json = serde_json::to_string(&saved).unwrap();
+    let job: JobId = saved["job"].as_str().unwrap().parse().unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_job_routes(job_id,route_json) VALUES (?1,?2)",
+            rusqlite::params![job.to_string(), json],
+        )
+        .unwrap();
+
+    let read = store.job_route(job).unwrap().unwrap();
+    let crate::queue::delivery::JobSubmission::Ended {
+        ending: HeldJobEnding::Dependency { dependency, .. },
+    } = &read.submission
+    else {
+        panic!("{:?}", read.submission);
+    };
+    assert_eq!(
+        *dependency,
+        crate::dependency::Dependency::Task(task.parse().unwrap())
+    );
+    assert_eq!(read.after.as_ref().unwrap().ids(), &[task.parse().unwrap()]);
+    assert_eq!(serde_json::to_value(&read).unwrap(), saved);
+
+    // a job ending names its `job`, and an ending must name exactly one of them
+    let other = JobId::new();
+    let ending = HeldJobEnding::Dependency {
+        dependency: crate::dependency::Dependency::Job(other),
+        outcome: crate::dependency::TaskOutcome::Cancelled.into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&ending).unwrap(),
+        serde_json::json!({ "reason": "dependency", "job": other, "outcome": "cancelled" })
+    );
+    for both in [
+        serde_json::json!({ "reason": "dependency", "outcome": "failed" }),
+        serde_json::json!({ "reason": "dependency", "task": task, "job": other, "outcome": "failed" }),
+    ] {
+        assert!(serde_json::from_value::<HeldJobEnding>(both).is_err());
+    }
 }

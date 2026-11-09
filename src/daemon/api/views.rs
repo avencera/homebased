@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, WorkloadView};
-use crate::dependency::DependencyState;
+use crate::dependency::{Dependency, DependencyState};
 use crate::domain::{
     API_VERSION, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason, ProcessStatus,
     TaskId, TaskName, TaskReport, TaskRow, TaskStatus, ThreadId, Workload,
@@ -91,7 +91,7 @@ pub struct TaskSummary {
     pub created_at: DateTime<Utc>,
     /// Last row update. For a terminal task this is the finish time.
     pub updated_at: DateTime<Utc>,
-    /// Tasks that must succeed before this one starts, with their current state.
+    /// Tasks and jobs that must succeed before this one starts, with their current state.
     /// Present only for a task submitted with `after`, and for a held
     /// continuation, which starts once each of them ended in any way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,11 +102,12 @@ pub struct TaskSummary {
     pub chain: Option<ChainView>,
 }
 
-/// One entry of a task's `after` list.
+/// One entry of a task's or a held job's `after` list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyView {
-    /// Dependency task.
-    pub task: TaskId,
+    /// The dependency, as `task` or `job` with its UUID.
+    #[serde(flatten)]
+    pub dependency: Dependency,
     /// `pending`, or `ended` with the dependency's `outcome`.
     #[serde(flatten)]
     pub state: DependencyState,

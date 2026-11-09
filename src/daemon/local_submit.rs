@@ -8,7 +8,7 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::SubmitBody;
 use super::origin_submit::conflict;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus};
 use crate::error::AppError;
 use crate::invocation::{persist_workload, resolve_workload_binary};
@@ -174,7 +174,7 @@ async fn resume(
     state: &AppState,
     route: OriginRoute,
     spec: &NormalizedSpec,
-    after: Option<&TaskDependencies>,
+    after: Option<&Dependencies>,
 ) -> Result<(TaskId, TaskStatus), AppError> {
     let local = state.machine.identity.machine;
     if route.origin_machine != local || route.execution_machine != local {

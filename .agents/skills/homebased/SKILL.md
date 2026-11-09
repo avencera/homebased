@@ -19,7 +19,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - Pass `--json` on data commands and parse the result.
 - Event delivery is at-least-once. Deduplicate by `(task, seq)`, `(job, seq)`, or `(watch, seq)`.
 - Do not poll a running task in a loop. Submit, tell the user the task id, end the turn, and wait for events.
-- To start work only after other tasks succeed, submit it now with `--after <id>` (or `after` in the spec). Do not wait for their events to submit the next phase.
+- To start work only after other tasks or GPU queue jobs succeed, submit it now with `--after <id>` (or `after` in the spec). Do not wait for their events to submit the next phase.
 - An agent worker with a long command submits it as its own task, reports `waiting`, and exits. On `TASK_WAITING`, do nothing.
 - Prefer a `task` workload for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
 - Use `homebased message send --machine <name> --thread <ref>` for a direct message to a session; `--thread` takes any thread reference, such as T3 chip text, `thread_<id>`, or a session UUID. Use `message send --worker <task>` to steer a running Claude worker, and `task followup` to resume a finished one. Read [messages.md](references/messages.md).
