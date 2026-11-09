@@ -1130,7 +1130,8 @@ pub struct JobEvent {
     pub gpu_idle: Option<gpu_idle::GpuIdleNotice>,
     /// GPU usage of the job's attempts, as stored when the event was appended:
     /// every attempt on a final event, the attempt that ended on a preemption
-    // older origins ignore the field, since this struct accepts unknown ones
+    // never sent to an origin on an older protocol, which would drop it when
+    // storing the event and then refuse a retry that still carries it
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_summaries: Vec<gpu_idle::GpuSummary>,
 }

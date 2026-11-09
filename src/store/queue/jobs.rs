@@ -542,14 +542,20 @@ impl Store {
     }
 
     /// Append a final or preemption event with the GPU summaries stored now
+    ///
+    /// The event omits them when the job's origin predates the field; they
+    /// stay stored on the attempts, where `resource job show` reads them
     pub(super) fn append_run_end_event(
         &self,
         job: JobId,
         event: JobEventKind,
         run: Option<EventRun>,
         process: Option<ExitReason>,
-        gpu_summaries: Vec<GpuSummary>,
+        mut gpu_summaries: Vec<GpuSummary>,
     ) -> Result<JobEvent, AppError> {
+        if !gpu_summaries.is_empty() && !self.origin_reads_gpu_idle(job)? {
+            gpu_summaries.clear();
+        }
         self.append_event(
             job,
             EventDraft {

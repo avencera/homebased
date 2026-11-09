@@ -202,11 +202,14 @@ impl Store {
         })
     }
 
-    /// Whether the job's origin can parse `JOB_GPU_IDLE`
+    /// Whether the job's origin reads the GPU idle protocol's event fields:
+    /// `JOB_GPU_IDLE` and `gpu_summaries`
     ///
-    /// An origin on an older cluster protocol would refuse the event and stall
-    /// every later event of the job behind it, so it gets none
-    fn origin_reads_gpu_idle(&self, job: JobId) -> Result<bool, AppError> {
+    /// An origin on an older cluster protocol would refuse `JOB_GPU_IDLE` and
+    /// stall every later event of the job behind it. It would also drop
+    /// `gpu_summaries` when it stores an event, so a retry after it upgrades
+    /// would no longer match its stored copy. Such an origin gets neither
+    pub(super) fn origin_reads_gpu_idle(&self, job: JobId) -> Result<bool, AppError> {
         let (machine, origin, protocol): (String, String, Option<u32>) = self.conn.query_row(
             "SELECT machine, origin_machine, origin_protocol FROM resource_jobs WHERE id = ?1",
             [job.to_string()],

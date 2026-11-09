@@ -415,6 +415,24 @@ fn netdata_idle_alerts_respect_snooze_recovery_and_old_origins() {
             .all(|event| event.event != JobEventKind::JobGpuIdle)
     );
     fs::write(h.home.join("finish"), "").unwrap();
+
+    // a local job's final event carries its summary, while an old origin's
+    // stores none, which keeps a retry after that origin upgrades identical
+    let done = final_event(&h, job, "JOB_SUCCEEDED");
+    assert_eq!(
+        done["gpu_summaries"].as_array().map(Vec::len),
+        Some(1),
+        "{done}"
+    );
+    assert!(wait_until(Duration::from_secs(30), || {
+        job_state(&h, old_origin) == "succeeded"
+    }));
+    let events = h.store().job_events(old_origin).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.event, JobEventKind::JobSucceeded, "{events:?}");
+    assert!(last.gpu_summaries.is_empty(), "{last:?}");
+    let old = show(&h, old_origin);
+    assert_eq!(old["runs"][0]["gpu_summary"]["status"], "ok", "{old}");
 }
 
 #[test]
