@@ -2490,11 +2490,13 @@ fn detection_names_each_gpu_and_every_attempt_keeps_the_one_it_launched_on() {
     assert_eq!(runs[0].task, run.task);
     assert_eq!(runs[0].gpu_uuid, uuid("GPU-old"));
 
-    // a failed probe keeps the saved UUIDs; a machine without nvidia-smi has none
+    // neither a failed probe nor a start without nvidia-smi lists devices,
+    // so both keep the saved UUIDs
     f.store.ensure_detected_resources(f.machine, &[]).unwrap();
     assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
     f.store
         .ensure_detected_resources(f.machine, &[DetectedResource::unindexed()])
         .unwrap();
-    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), None);
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu0"), uuid("GPU-new"));
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
 }

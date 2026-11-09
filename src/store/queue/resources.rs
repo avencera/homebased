@@ -31,7 +31,9 @@ impl Store {
     ) -> Result<Vec<ResourceRecord>, AppError> {
         self.immediate(|| {
             self.reconcile_detected(machine, detected)?;
-            if !detected.is_empty() {
+            // only a listing of devices says which cards are present; a failed
+            // probe or a missing `nvidia-smi` keeps the saved UUIDs
+            if detected.iter().any(|resource| resource.device.is_some()) {
                 self.save_detected_gpus(machine, detected)?;
             }
             self.resources_on(machine)
