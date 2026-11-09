@@ -291,6 +291,14 @@ fn netdata_idle_alerts_respect_snooze_recovery_and_old_origins() {
     let timeline = Timeline::default();
     let port = fake_netdata(timeline.clone());
     restart_with_gpus(&mut h, &bin, port);
+    // detection registers gpu1 shortly after start, slower under load
+    assert!(wait_until(Duration::from_secs(20), || {
+        h.store()
+            .resources_on(machine(&h))
+            .unwrap()
+            .iter()
+            .any(|record| record.resource.name.as_str() == "gpu1")
+    }));
 
     // a job from an origin on cluster protocol 3 runs on gpu1 and stays idle
     h.stop_daemon();
