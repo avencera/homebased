@@ -1063,6 +1063,20 @@ impl JobEventKind {
     pub const fn is_suppressible_notice(self) -> bool {
         matches!(self, Self::JobBlocked | Self::JobGpuIdle)
     }
+
+    /// Whether the event ends the run an earlier notice reports on, or shows
+    /// that a blocked job got to run
+    #[must_use]
+    pub const fn ends_run(self) -> bool {
+        matches!(
+            self,
+            Self::JobSucceeded
+                | Self::JobFailed
+                | Self::JobCancelled
+                | Self::JobPreempted
+                | Self::JobAttention
+        )
+    }
 }
 
 /// One blocked notice, tied to the exact stored episode

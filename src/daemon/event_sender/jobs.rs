@@ -211,9 +211,19 @@ async fn deliver_origin(
     event: RoutedJobEvent,
 ) -> Result<(), AppError> {
     let before_send = if event.event.event.is_suppressible_notice() {
-        // the authority owns the episode and the silence, including when the
-        // origin was offline
-        if !notice_current(state, &route, event.event.seq).await? {
+        // a later event that ends the run settles the notice here, so an
+        // offline authority never holds a received final event behind it
+        let job = route.job;
+        let seq = event.event.seq;
+        let overtaken = call(&state.store, |reply| StoreMsg::JobNoticeOvertaken {
+            job,
+            seq,
+            reply,
+        })
+        .await?;
+        // otherwise the authority owns the episode and the silence, including
+        // when the origin was offline
+        if overtaken || !notice_current(state, &route, event.event.seq).await? {
             return call(&state.store, |reply| StoreMsg::SuppressJobNotice {
                 job: route.job,
                 seq: event.event.seq,

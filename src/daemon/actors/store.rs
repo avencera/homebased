@@ -156,6 +156,12 @@ pub(crate) enum StoreMsg {
             >,
         >,
     },
+    /// Whether an origin job's inbox holds a later event that ends the run
+    JobNoticeOvertaken {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
     /// Settle an obsolete blocked notice without callback delivery
     SuppressJobNotice {
         job: crate::queue::JobId,
@@ -818,6 +824,9 @@ impl Actor for StoreActor {
                 send_reply(reply, state.accept_job_event(&event))
             }
             StoreMsg::PendingJobInbox { reply } => send_reply(reply, state.pending_job_inbox()),
+            StoreMsg::JobNoticeOvertaken { job, seq, reply } => {
+                send_reply(reply, state.job_notice_overtaken(job, seq))
+            }
             StoreMsg::SuppressJobNotice { job, seq, reply } => {
                 send_reply(reply, state.suppress_job_notice(job, seq))
             }

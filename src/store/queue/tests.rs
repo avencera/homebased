@@ -2244,6 +2244,7 @@ async fn notice_ends_during_callback_preparation() {
         event: f.store.job_events(head).unwrap()[0].clone(),
     };
     f.store.accept_job_event(&notice).unwrap();
+    assert!(!f.store.job_notice_overtaken(head, 1).unwrap());
     let delivery = home
         .root()
         .join("jobs")
@@ -2327,6 +2328,8 @@ async fn notice_ends_during_callback_preparation() {
         ..notice.clone()
     };
     f.store.accept_job_event(&success).unwrap();
+    // the received final event settles the notice even with the authority away
+    assert!(f.store.job_notice_overtaken(head, 1).unwrap());
     std::fs::write(delivery.join("release"), "").unwrap();
     assert!(holder.wait().unwrap().success());
     let outcome = pending.await.unwrap();
