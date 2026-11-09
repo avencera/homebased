@@ -606,6 +606,43 @@ mod tests {
     }
 
     #[test]
+    fn gpu_idle_settings_parse_and_refuse_bad_values() {
+        use crate::queue::gpu_idle::{GpuIdleConfig, SourceChoice};
+        use std::time::Duration;
+
+        assert_eq!(
+            Config::parse("").unwrap().resource.gpu_idle,
+            GpuIdleConfig::default()
+        );
+        let config = Config::parse(
+            "[resource.gpu_idle]\nsource = \"nvidia-smi\"\nnetdata_url = \"http://10.0.0.2:19999\"\n\
+             after = \"2m\"\nutil_below = 25\ninterval = \"5s\"\nnever_busy_after = \"3m\"\n",
+        )
+        .unwrap();
+        let idle = config.resource.gpu_idle;
+        assert_eq!(idle.source, SourceChoice::NvidiaSmi);
+        assert_eq!(idle.netdata_url.to_string(), "http://10.0.0.2:19999");
+        assert_eq!(idle.defaults.after, Duration::from_secs(120));
+        assert_eq!(idle.defaults.util_below, 25);
+        assert_eq!(idle.defaults.interval, Duration::from_secs(5));
+        assert_eq!(
+            idle.defaults.never_busy_after,
+            Some(Duration::from_secs(180))
+        );
+        for text in [
+            "[resource.gpu_idle]\nutil_below = 0\n",
+            "[resource.gpu_idle]\nutil_below = 101\n",
+            "[resource.gpu_idle]\nafter = \"0s\"\n",
+            "[resource.gpu_idle]\ninterval = \"soon\"\n",
+            "[resource.gpu_idle]\nsource = \"dcgm\"\n",
+            "[resource.gpu_idle]\nnetdata_url = \"not a url\"\n",
+            "[resource.gpu_idle]\nwindow = \"5m\"\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn dashboard_content_ports_parse_and_reject_unusable_pairs() {
         assert_eq!(Config::parse("").unwrap().dashboard, Dashboard::default());
         let config =
