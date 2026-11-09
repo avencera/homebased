@@ -36,7 +36,8 @@ const NETDATA_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the power limits are reread
 const POWER_LIMIT_EVERY: Duration = Duration::from_secs(3600);
-/// Shortest gap between two chart listings while a GPU has no charts
+/// Shortest gap between two chart listings for one GPU, whether it has no
+/// charts or its charts went stale
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 /// Netdata stores a sample a moment after it is collected
 const NETDATA_LAG: Duration = Duration::from_secs(2);
@@ -78,7 +79,10 @@ struct Watcher {
     config: GpuIdleConfig,
     netdata: Netdata,
     charts: HashMap<GpuUuid, GpuCharts>,
-    listed_at: Option<Instant>,
+    /// When each GPU's charts were last looked for because it had none
+    listed_at: HashMap<GpuUuid, Instant>,
+    /// When each GPU's charts were last looked for because they went stale
+    relisted_at: HashMap<GpuUuid, Instant>,
     power_limits: HashMap<GpuUuid, f64>,
     limits_read_at: Option<Instant>,
     probes: HashMap<GpuUuid, Samples>,
@@ -102,7 +106,8 @@ impl Watcher {
             machine,
             config,
             charts: HashMap::new(),
-            listed_at: None,
+            listed_at: HashMap::new(),
+            relisted_at: HashMap::new(),
             power_limits: HashMap::new(),
             limits_read_at: None,
             probes: HashMap::new(),
@@ -198,30 +203,51 @@ impl Watcher {
         self.charts.get(uuid)?.utilization.as_ref()
     }
 
-    /// List Netdata's charts again; `force` skips the rate limit after stale data
-    async fn discover(&mut self, targets: &[GpuIdleTarget], force: bool) {
-        if !force
-            && self
-                .listed_at
-                .is_some_and(|at| at.elapsed() < REDISCOVER_EVERY)
-        {
+    /// List Netdata's charts again for the targets' GPUs, each at most once
+    /// per [`REDISCOVER_EVERY`]
+    ///
+    /// Without `stale`, only GPUs that have no charts are looked for. With it,
+    /// the targets' charts went stale and are looked for even when known; that
+    /// limit is kept apart, so a GPU found a moment ago can still be relisted
+    /// once. Only the listed GPUs' charts change
+    async fn discover(&mut self, targets: &[GpuIdleTarget], stale: bool) {
+        let now = Instant::now();
+        let mut wanted = Vec::new();
+        for target in targets {
+            let uuid = &target.gpu_uuid;
+            if !stale && self.util_chart(uuid).is_some() {
+                continue;
+            }
+            let limits = if stale {
+                &mut self.relisted_at
+            } else {
+                &mut self.listed_at
+            };
+            if limits
+                .get(uuid)
+                .is_some_and(|at| now.duration_since(*at) < REDISCOVER_EVERY)
+            {
+                continue;
+            }
+            limits.insert(uuid.clone(), now);
+            wanted.push(uuid.clone());
+        }
+        if wanted.is_empty() {
             return;
         }
-        self.listed_at = Some(Instant::now());
-        let wanted: Vec<GpuUuid> = targets
-            .iter()
-            .map(|target| target.gpu_uuid.clone())
-            .collect();
         match self.netdata.charts(&wanted).await {
-            Ok(charts) => {
+            Ok(mut charts) => {
                 for uuid in &wanted {
                     self.problems.remove(uuid);
+                    match charts.remove(uuid) {
+                        Some(found) => self.charts.insert(uuid.clone(), found),
+                        None => self.charts.remove(uuid),
+                    };
                 }
-                self.charts = charts;
             }
             Err(error) => {
-                self.charts.clear();
                 for uuid in &wanted {
+                    self.charts.remove(uuid);
                     self.log_once(uuid, "Netdata unavailable", &error);
                 }
             }
