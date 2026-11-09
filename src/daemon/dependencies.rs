@@ -1,5 +1,10 @@
 //! Tasks held on their origin until their dependencies succeed
 //!
+//! A dependency is a task or a GPU queue job that this daemon is the origin
+//! for. A job's events reach this origin's job inbox wherever it queued, so a
+//! job dependency is met at `JOB_SUCCEEDED` and fails at `JOB_FAILED` or
+//! `JOB_CANCELLED`; `JOB_PREEMPTED` queues it again and decides nothing
+//!
 //! A submit with `after` is admitted here. When every dependency already
 //! succeeded it launches as usual; when one is still pending the origin saves
 //! a held route with the task UUID it returns. One loop then owns held routes:
@@ -14,7 +19,7 @@
 //!
 //! It also owns GPU queue jobs submitted with `after`. Such a job is saved
 //! on this origin as held, under the job id its submit returned, and sent to
-//! its queue once every task succeeded. Any other ending cancels it with a
+//! its queue once every dependency succeeded. Any other ending cancels it with a
 //! terminal job event before it uses its queue, and a send whose reply was
 //! lost is resent under the same id
 //!
@@ -41,8 +46,8 @@ use super::event_sender::Retry;
 use super::queue_api;
 use super::{local_submit, origin_submit};
 use crate::dependency::{
-    DependencyOutcome, DependencyState, HeldCancellation, HeldDecision, ReleaseRule,
-    TaskDependencies, decide,
+    Dependencies, Dependency, DependencyOutcome, DependencyState, HeldCancellation, HeldDecision,
+    ReleaseRule, decide,
 };
 use crate::domain::{ProcessStatus, TaskId, TaskStatus};
 use crate::error::AppError;
@@ -170,18 +175,15 @@ async fn try_supersede(state: &AppState, key: &CoalesceKey, by: TaskId) -> Resul
 }
 
 /// Whether a job with `after` must wait, after refusing unknown, failed,
-/// and run tasks the way a task submit does
-pub(super) async fn must_wait(
-    state: &AppState,
-    after: &TaskDependencies,
-) -> Result<bool, AppError> {
+/// and run-task entries the way a task submit does
+pub(super) async fn must_wait(state: &AppState, after: &Dependencies) -> Result<bool, AppError> {
     Ok(matches!(admit(state, after).await?, Admission::Pending))
 }
 
 /// Check the dependencies of a dry run the way a submit would, saving nothing
 pub(super) async fn preview(
     state: &AppState,
-    after: &TaskDependencies,
+    after: &Dependencies,
 ) -> Result<Vec<DependencyView>, AppError> {
     admit(state, after).await?;
     views(state, Some(after)).await
@@ -190,12 +192,12 @@ pub(super) async fn preview(
 /// Dependency states in `after` order, for inspection; none for a route without `after`
 pub(super) async fn views(
     state: &AppState,
-    after: Option<&TaskDependencies>,
+    after: Option<&Dependencies>,
 ) -> Result<Vec<DependencyView>, AppError> {
     Ok(known_states(state, after)
         .await?
         .into_iter()
-        .map(|(task, state)| DependencyView { task, state })
+        .map(|(dependency, state)| DependencyView { dependency, state })
         .collect())
 }
 
@@ -272,7 +274,7 @@ async fn settle_jobs(
                     HeldDecision::Wait => continue,
                     HeldDecision::Cancel(failure) => {
                         let ending = HeldJobEnding::Dependency {
-                            task: failure.dependency,
+                            dependency: failure.dependency,
                             outcome: failure.outcome,
                         };
                         call(&state.store, |reply| StoreMsg::EndHeldJob {
@@ -309,23 +311,23 @@ enum Admission {
     Pending,
 }
 
-/// Refuse unknown and failed dependencies, then report whether the task must wait
-async fn admit(state: &AppState, after: &TaskDependencies) -> Result<Admission, AppError> {
-    let tasks = after.tasks().to_vec();
+/// Refuse unknown and failed dependencies, then report whether the work must wait
+async fn admit(state: &AppState, after: &Dependencies) -> Result<Admission, AppError> {
+    let ids = after.ids().to_vec();
     let states = call(&state.store, |reply| StoreMsg::DependencyStates {
-        tasks,
+        ids,
         reply,
     })
     .await?;
     let mut known = Vec::with_capacity(states.len());
-    for (task, state) in states {
-        known.push((task, state.ok_or(AppError::UnknownDependency { task })?));
+    for (dependency, state) in states {
+        known.push(state.ok_or(AppError::UnknownDependency { dependency })?);
     }
     match decide(known, ReleaseRule::Succeeded) {
         HeldDecision::Release => Ok(Admission::Ready),
         HeldDecision::Wait => Ok(Admission::Pending),
         HeldDecision::Cancel(failure) => Err(AppError::DependencyFailed {
-            task: failure.dependency,
+            dependency: failure.dependency,
             outcome: failure.outcome,
         }),
     }
@@ -334,27 +336,28 @@ async fn admit(state: &AppState, after: &TaskDependencies) -> Result<Admission, 
 /// Dependency states, with a dependency whose route is gone read as an unknown ending
 ///
 /// Admission accepted each dependency by its route here, and routes are not
-/// deleted. If one is gone anyway, it can never be shown to succeed
+/// deleted. If one is gone anyway, it can never be shown to succeed; it reads
+/// as a task, the only kind `after` named before jobs
 async fn known_states(
     state: &AppState,
-    after: Option<&TaskDependencies>,
-) -> Result<Vec<(TaskId, DependencyState)>, AppError> {
+    after: Option<&Dependencies>,
+) -> Result<Vec<(Dependency, DependencyState)>, AppError> {
     let Some(after) = after else {
         return Ok(Vec::new());
     };
-    let tasks = after.tasks().to_vec();
+    let ids = after.ids().to_vec();
     let states = call(&state.store, |reply| StoreMsg::DependencyStates {
-        tasks,
+        ids,
         reply,
     })
     .await?;
     Ok(states
         .into_iter()
-        .map(|(task, state)| {
-            (
-                task,
-                state.unwrap_or(DependencyState::Ended(DependencyOutcome::Unknown)),
-            )
+        .map(|(id, state)| {
+            state.unwrap_or((
+                Dependency::Task(id.as_task()),
+                DependencyState::Ended(DependencyOutcome::Unknown),
+            ))
         })
         .collect())
 }

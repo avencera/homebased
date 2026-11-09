@@ -233,6 +233,8 @@ impl Store {
                     at: Utc::now(),
                     blocked: None,
                     held_ending: Some(ending.clone()),
+                    gpu_idle: None,
+                    gpu_summaries: Vec::new(),
                 },
             };
             route.submission = JobSubmission::Ended { ending };
@@ -451,7 +453,28 @@ impl Store {
         self.immediate(|| self.settle_job_event_inner(job, seq, sql_seq))
     }
 
-    /// Retain an obsolete blocked event and settle it without a callback
+    /// Whether one job's origin inbox already holds an event after `seq` that
+    /// ends the run, which makes a notice at `seq` obsolete without asking
+    /// the authority
+    pub fn job_notice_overtaken(&self, job: JobId, seq: u64) -> Result<bool, AppError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT event_json FROM resource_job_inbox WHERE job_id=?1 AND seq>?2")?;
+        let rows = statement
+            .query_map(params![job.to_string(), sql_seq(seq)?], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for json in rows {
+            let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
+            if envelope.event.event.ends_run() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Retain an obsolete blocked or GPU idle notice and settle it without a callback
     pub fn suppress_job_notice(&self, job: JobId, seq: u64) -> Result<(), AppError> {
         let sql_seq = sql_seq(seq)?;
         self.immediate(|| {
@@ -461,9 +484,9 @@ impl Store {
                 |row| row.get(0),
             )?;
             let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
-            if envelope.event.event != JobEventKind::JobBlocked {
+            if !envelope.event.event.is_suppressible_notice() {
                 return Err(QueueError::Invariant {
-                    message: "only a blocked notice can be suppressed".into(),
+                    message: "only a blocked or GPU idle notice can be suppressed".into(),
                 }
                 .into());
             }

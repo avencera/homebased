@@ -140,7 +140,10 @@ fn after_is_optional_sorted_and_kept_out_of_the_normalized_spec() {
     let mut value = valid_task();
     value["after"] = json!([second, first]);
     let spec = parse_spec_value(&value).unwrap();
-    assert_eq!(spec.after.as_ref().unwrap().tasks(), &[first, second]);
+    assert_eq!(
+        spec.after.as_ref().unwrap().ids(),
+        &[first.into(), second.into()]
+    );
     let normalized = serde_json::to_value(normalize(&spec).unwrap()).unwrap();
     assert!(normalized.get("after").is_none());
 }

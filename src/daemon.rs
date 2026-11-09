@@ -14,6 +14,7 @@ pub mod fleet_api;
 pub mod fleet_queues;
 pub mod fleet_tasks;
 pub mod fleet_view;
+mod gpu_idle;
 pub(crate) mod idle_compaction;
 mod inspection;
 mod keyed_locks;
@@ -199,6 +200,12 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
+    let gpu_idle_watcher = tokio::spawn(gpu_idle::run(
+        state.store.clone(),
+        home.clone(),
+        state.machine.identity.machine,
+        config.resource.gpu_idle.clone(),
+    ));
     let hold_sweep = tokio::spawn(end_leftover_holds());
     // a blocking task cannot be aborted, so shutdown sets this flag instead
     let usage_backfill_stop = Arc::new(AtomicBool::new(false));
@@ -254,6 +261,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     cancellation.abort();
     t3_watcher.abort();
     idle_compactor.abort();
+    gpu_idle_watcher.abort();
     hold_sweep.abort();
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {

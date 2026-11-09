@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{API_VERSION, MIN_TIMEOUT, TaskName, TaskWorkload, ThreadId};
 use crate::error::AppError;
 use crate::invocation::{CommandLine, resolve_executable};
@@ -26,6 +26,7 @@ use crate::spec::{
     cwd_problem, default_timeout, escape_token, invalid_spec_from_de, workload_content,
 };
 
+use super::gpu_idle::GpuIdleSpec;
 use super::{Preemption, Priority, ResourceSelector, StepWorkload, Steps};
 
 /// Container path under which the authority mounts the job and run directories
@@ -122,6 +123,11 @@ pub struct JobSpec {
     pub resource: Option<ResourceSelector>,
     /// What the job runs, in order
     pub steps: Steps,
+    /// GPU idle alert setting; the machine defaults when absent
+    // left out of the canonical form when absent, so the digests of specs
+    // saved before this field existed do not change
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_idle: Option<GpuIdleSpec>,
 }
 
 impl JobSpec {
@@ -137,10 +143,10 @@ impl JobSpec {
 
     /// Parse a submitted spec file, whose `after` stays on the origin
     ///
-    /// The origin holds the job until each task in `after` succeeds, and the
+    /// The origin holds the job until each entry in `after` succeeds, and the
     /// queue's machine never sees the list, so it is split off here rather
     /// than kept in the spec
-    pub fn parse_submission(value: &Value) -> Result<(Self, Option<TaskDependencies>), AppError> {
+    pub fn parse_submission(value: &Value) -> Result<(Self, Option<Dependencies>), AppError> {
         let mut value = value.clone();
         let after = value
             .as_object_mut()
@@ -191,6 +197,21 @@ impl JobSpec {
                 ));
             }
         };
+        let gpu_idle = wire
+            .gpu_idle
+            .as_ref()
+            .map(GpuIdleSpec::parse)
+            .transpose()
+            .map_err(|error| {
+                let pointer = format!("/gpu_idle{}", error.pointer);
+                let value = wire
+                    .gpu_idle
+                    .as_ref()
+                    .and_then(|value| value.pointer(error.pointer))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                invalid(pointer, value, error.message)
+            })?;
         Ok(Self {
             api_version: API_VERSION,
             thread: wire.thread,
@@ -202,6 +223,7 @@ impl JobSpec {
             preempt,
             resource: wire.resource,
             steps,
+            gpu_idle,
         })
     }
 
@@ -303,6 +325,15 @@ struct JobSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "steps_schema")]
     steps: Option<Value>,
+    /// GPU idle alerts: "off", or an object overriding the machine's idle
+    /// window and utilization threshold
+    #[serde(default)]
+    #[schemars(schema_with = "gpu_idle_schema")]
+    gpu_idle: Option<Value>,
+}
+
+fn gpu_idle_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::Schema::try_from(GpuIdleSpec::schema()).unwrap_or_default()
 }
 
 fn api_version_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -402,8 +433,9 @@ pub fn schema_json() -> Result<Value, AppError> {
     let mut generator = schemars::SchemaGenerator::default();
     let mut after = serde_json::to_value(crate::spec::after_schema(&mut generator))?;
     after["description"] = json!(
-        "Task UUIDs this machine submitted that must each succeed before the job joins the queue. \
-         The job is held under its id until then, and cancelled if one ends any other way"
+        "Task or job UUIDs this machine submitted that must each succeed before the job joins the \
+         queue; a job succeeds at JOB_SUCCEEDED. The job is held under its id until then, and \
+         cancelled if one ends any other way"
     );
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         properties.insert("after".into(), after);

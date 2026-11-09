@@ -213,11 +213,14 @@ impl Harness {
     /// process, not the worker pid the test signalled
     fn agent_pid(&self, id: &str) -> i32 {
         let path = self.record.join(format!("agent-pid-{id}.txt"));
+        // the shell creates the file before it writes the pid, so wait for a
+        // whole number rather than the file
+        let read = || fs::read_to_string(&path).ok()?.trim().parse().ok();
         assert!(
-            wait_until(Duration::from_secs(10), || path.exists()),
+            wait_until(Duration::from_secs(10), || read().is_some()),
             "agent for {id} never recorded its pid"
         );
-        fs::read_to_string(&path).unwrap().trim().parse().unwrap()
+        read().unwrap()
     }
 
     /// Bytes the fake agent read on stdin for exactly this task
@@ -654,6 +657,10 @@ mod containers;
 mod dashboard;
 #[path = "integration/dependencies.rs"]
 mod dependencies;
+// the GPU idle watcher only runs on Linux
+#[cfg(target_os = "linux")]
+#[path = "integration/gpu_idle.rs"]
+mod gpu_idle;
 #[path = "integration/lifecycle.rs"]
 mod lifecycle;
 #[path = "integration/reports.rs"]

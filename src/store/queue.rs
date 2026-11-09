@@ -8,6 +8,7 @@
 //! end and moves its job in the same transaction
 
 mod delivery;
+mod gpu_idle;
 pub mod interface;
 mod jobs;
 mod resources;
@@ -18,6 +19,7 @@ mod runtime;
 mod tests;
 
 pub use delivery::JobCursors;
+pub use gpu_idle::GpuIdleTarget;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -130,6 +132,8 @@ pub struct NewJob {
     pub spec: JobSpec,
     /// Submitter's environment for resolving executables
     pub env: TaskEnv,
+    /// Cluster protocol of the submit request; this build's for a local submit
+    pub origin_protocol: crate::fleet::protocol::ClusterProtocolVersion,
 }
 
 /// Submit response: the job and its slot now

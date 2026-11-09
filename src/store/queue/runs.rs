@@ -168,8 +168,11 @@ impl Store {
             resume,
             phase: RunPhase::Launching { reserved_at: now },
         };
+        // the attempt keeps the GPU it launched on, even if a later detection
+        // finds another card at the resource's index
         self.conn.execute(
-            "INSERT INTO resource_run_history(task_id,resource_id) VALUES (?1,?2)",
+            "INSERT INTO resource_run_history(task_id,resource_id,gpu_uuid)
+             SELECT ?1, id, gpu_uuid FROM resources WHERE id = ?2",
             params![task.to_string(), resource.to_string()],
         )?;
         self.write_run(&run)
@@ -649,10 +652,30 @@ impl Store {
             ..run.clone()
         };
         self.write_run(&cleaning)?;
+        // the summary is final before any event can carry it, so a stored
+        // event never needs a later rewrite
+        let summary = self.save_gpu_summary(run, self.run_exit_time(run.task))?;
         if let Some(kind) = after.event {
-            self.append_job_event(job.id, kind, Some(event_run(run)), process, None)?;
+            let summaries = match kind {
+                JobEventKind::JobPreempted => summary.into_iter().collect(),
+                _ => self.gpu_summaries(job.id)?,
+            };
+            self.append_run_end_event(job.id, kind, Some(event_run(run)), process, summaries)?;
         }
         Ok(())
+    }
+
+    /// When a run's child exited: the time its worker wrote `exit.json`, or
+    /// now without one
+    ///
+    /// The daemon may apply a saved exit long after it happened, such as at
+    /// its next start, and the attempt's GPU summary must end at the exit. A
+    /// run lost with no `exit.json` has no record of when it ended
+    fn run_exit_time(&self, task: TaskId) -> DateTime<Utc> {
+        let now = Utc::now();
+        std::fs::metadata(self.tasks_dir.join(task.to_string()).join("exit.json"))
+            .and_then(|metadata| metadata.modified())
+            .map_or(now, |modified| DateTime::<Utc>::from(modified).min(now))
     }
 
     /// The active run of `resource`, which must belong to `task`

@@ -1,90 +1,184 @@
-//! Task dependencies: tasks that must succeed before a held task launches
+//! Dependencies: tasks and GPU queue jobs that must succeed before a held
+//! task or job launches
 //!
 //! The origin daemon owns every dependency. A submission with `after` names
-//! tasks that this daemon is the origin for, and the daemon holds the new task
-//! until each of them succeeds. Any other ending cancels the held task before
-//! launch, and that cancellation is itself an ending for tasks held on it
+//! tasks or jobs that this daemon is the origin for, and the daemon holds the
+//! new work until each of them succeeds. Any other ending cancels the held
+//! work before launch, and that cancellation is itself an ending for work held
+//! on it. A job's events reach the machine that submitted it, so a job queued
+//! on another Fleet machine can release work here
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
 
 use crate::callback::EventKind;
 use crate::domain::TaskId;
+use crate::queue::{JobEventKind, JobId};
 
-/// Most tasks one submission may wait on
+/// Most tasks and jobs one submission may wait on
 pub const MAX_DEPENDENCIES: usize = 16;
+
+/// One `after` entry: the UUID of a task or a job submitted through this origin
+///
+/// The wire form is the bare UUID, as it was when `after` named only tasks,
+/// so saved specs and routes keep their content and retry identity. The
+/// origin resolves which kind it names when it reads its state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DependencyId(Uuid);
+
+impl DependencyId {
+    /// The entry read as a task UUID
+    #[must_use]
+    pub const fn as_task(self) -> TaskId {
+        TaskId(self.0)
+    }
+
+    /// The entry read as a job UUID
+    #[must_use]
+    pub const fn as_job(self) -> JobId {
+        JobId::from_uuid(self.0)
+    }
+}
+
+impl From<TaskId> for DependencyId {
+    fn from(task: TaskId) -> Self {
+        Self(task.0)
+    }
+}
+
+impl From<JobId> for DependencyId {
+    fn from(job: JobId) -> Self {
+        Self(job.as_uuid())
+    }
+}
+
+impl fmt::Display for DependencyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for DependencyId {
+    type Err = uuid::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(raw).map(Self)
+    }
+}
+
+/// What a resolved `after` entry names
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dependency {
+    /// A task, or the chain of agent runs it started
+    Task(TaskId),
+    /// A GPU queue job; its terminal job event decides
+    Job(JobId),
+}
+
+impl Dependency {
+    /// The `after` entry that names it
+    #[must_use]
+    pub fn id(self) -> DependencyId {
+        match self {
+            Self::Task(task) => task.into(),
+            Self::Job(job) => job.into(),
+        }
+    }
+}
+
+impl fmt::Display for Dependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task(task) => write!(f, "task {task}"),
+            Self::Job(job) => write!(f, "job {job}"),
+        }
+    }
+}
 
 /// Validated `after` list: non-empty, without duplicates, and at most [`MAX_DEPENDENCIES`]
 ///
-/// The tasks are kept sorted, so two requests that name the same tasks in a
+/// The entries are kept sorted, so two requests that name the same work in a
 /// different order carry the same content for retry conflict checks
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "Vec<TaskId>", into = "Vec<TaskId>")]
-pub struct TaskDependencies(Vec<TaskId>);
+#[serde(try_from = "Vec<DependencyId>", into = "Vec<DependencyId>")]
+pub struct Dependencies(Vec<DependencyId>);
 
 /// Why a submitted `after` list is invalid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DependencyListError {
-    /// `after` was present but named no task
-    #[error("after must name at least one task; omit it for no dependencies")]
+    /// `after` was present but named nothing
+    #[error("after must name at least one task or job; omit it for no dependencies")]
     Empty,
-    /// The same task appears twice
-    #[error("after names task {task} more than once")]
+    /// The same entry appears twice
+    #[error("after names {id} more than once")]
     Duplicate {
         /// Position of the repeated entry in the submitted list
         index: usize,
-        /// Repeated task
-        task: TaskId,
+        /// Repeated entry
+        id: DependencyId,
     },
     /// The list is longer than [`MAX_DEPENDENCIES`]
-    #[error("after names {count} tasks; the limit is {MAX_DEPENDENCIES}")]
+    #[error("after names {count} tasks and jobs; the limit is {MAX_DEPENDENCIES}")]
     TooMany {
         /// Number of submitted entries
         count: usize,
     },
 }
 
-impl TaskDependencies {
+impl Dependencies {
     /// Validate a submitted list
     ///
     /// # Errors
     ///
-    /// Refuses an empty list, a repeated task, and more than [`MAX_DEPENDENCIES`] tasks
-    pub fn new(tasks: Vec<TaskId>) -> Result<Self, DependencyListError> {
-        if tasks.is_empty() {
+    /// Refuses an empty list, a repeated entry, and more than [`MAX_DEPENDENCIES`] entries
+    pub fn new(ids: Vec<DependencyId>) -> Result<Self, DependencyListError> {
+        if ids.is_empty() {
             return Err(DependencyListError::Empty);
         }
-        if tasks.len() > MAX_DEPENDENCIES {
-            return Err(DependencyListError::TooMany { count: tasks.len() });
+        if ids.len() > MAX_DEPENDENCIES {
+            return Err(DependencyListError::TooMany { count: ids.len() });
         }
-        for (index, task) in tasks.iter().enumerate() {
-            if tasks[..index].contains(task) {
-                return Err(DependencyListError::Duplicate { index, task: *task });
+        for (index, id) in ids.iter().enumerate() {
+            if ids[..index].contains(id) {
+                return Err(DependencyListError::Duplicate { index, id: *id });
             }
         }
-        let mut tasks = tasks;
-        tasks.sort_by_key(|task| task.0);
-        Ok(Self(tasks))
+        let mut ids = ids;
+        ids.sort_unstable();
+        Ok(Self(ids))
     }
 
-    /// Dependencies in UUID order, which is creation order for UUID v7 tasks
+    /// A list of tasks, such as the targets of a parked worker
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]
+    pub fn of_tasks(tasks: &[TaskId]) -> Result<Self, DependencyListError> {
+        Self::new(tasks.iter().copied().map(DependencyId::from).collect())
+    }
+
+    /// Entries in UUID order, which is creation order for UUID v7 ids
     #[must_use]
-    pub fn tasks(&self) -> &[TaskId] {
+    pub fn ids(&self) -> &[DependencyId] {
         &self.0
     }
 }
 
-impl TryFrom<Vec<TaskId>> for TaskDependencies {
+impl TryFrom<Vec<DependencyId>> for Dependencies {
     type Error = DependencyListError;
 
-    fn try_from(tasks: Vec<TaskId>) -> Result<Self, Self::Error> {
-        Self::new(tasks)
+    fn try_from(ids: Vec<DependencyId>) -> Result<Self, Self::Error> {
+        Self::new(ids)
     }
 }
 
-impl From<TaskDependencies> for Vec<TaskId> {
-    fn from(dependencies: TaskDependencies) -> Self {
+impl From<Dependencies> for Vec<DependencyId> {
+    fn from(dependencies: Dependencies) -> Self {
         dependencies.0
     }
 }
@@ -131,7 +225,24 @@ impl TaskOutcome {
         }
     }
 
-    /// Whether a task held on this one may launch
+    /// Outcome a job's final event names, or `None` while the job can still run
+    ///
+    /// `JOB_PREEMPTED` names none: the job is queued again and resumes
+    #[must_use]
+    pub fn from_job_event(kind: JobEventKind) -> Option<Self> {
+        match kind {
+            JobEventKind::JobSucceeded => Some(Self::Succeeded),
+            JobEventKind::JobFailed => Some(Self::Failed),
+            JobEventKind::JobCancelled => Some(Self::Cancelled),
+            JobEventKind::JobPreempted
+            | JobEventKind::JobAttention
+            | JobEventKind::JobBlocked
+            | JobEventKind::JobCheckDue
+            | JobEventKind::JobGpuIdle => None,
+        }
+    }
+
+    /// Whether work held on this one may launch
     #[must_use]
     pub fn is_success(self) -> bool {
         matches!(self, Self::Succeeded)
@@ -242,15 +353,15 @@ pub enum DependencyState {
     Ended(DependencyOutcome),
 }
 
-/// State of each named dependency, in order, or `None` for a task with no origin route here
-pub type DependencyLookup = Vec<(TaskId, Option<DependencyState>)>;
+/// Each named entry in order, with what it names and its state, or `None`
+/// for an entry with no task or job route here
+pub type DependencyLookup = Vec<(DependencyId, Option<(Dependency, DependencyState)>)>;
 
 /// One dependency that ended without success
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DependencyFailure {
-    /// Dependency task
-    pub dependency: TaskId,
+    /// Dependency task or job
+    pub dependency: Dependency,
     /// How it ended
     pub outcome: DependencyOutcome,
 }
@@ -308,7 +419,7 @@ impl ReleaseRule {
 /// dependency ended
 #[must_use]
 pub fn decide(
-    states: impl IntoIterator<Item = (TaskId, DependencyState)>,
+    states: impl IntoIterator<Item = (Dependency, DependencyState)>,
     rule: ReleaseRule,
 ) -> HeldDecision {
     let mut pending = false;
@@ -340,8 +451,8 @@ pub fn decide(
 pub enum HeldCancellation {
     /// A dependency ended without success
     DependencyEnded {
-        /// Dependency task
-        dependency: TaskId,
+        /// Dependency task or job
+        dependency: DependencyId,
         /// How it ended
         outcome: DependencyOutcome,
     },
@@ -357,7 +468,7 @@ pub enum HeldCancellation {
 impl From<DependencyFailure> for HeldCancellation {
     fn from(failure: DependencyFailure) -> Self {
         Self::DependencyEnded {
-            dependency: failure.dependency,
+            dependency: failure.dependency.id(),
             outcome: failure.outcome,
         }
     }
@@ -383,26 +494,32 @@ impl fmt::Display for HeldCancellation {
 #[cfg(test)]
 mod tests {
     use super::{
-        DependencyFailure, DependencyListError, DependencyOutcome, DependencyState, HeldDecision,
-        MAX_DEPENDENCIES, ReleaseRule, TaskDependencies, TaskOutcome, decide,
+        Dependencies, Dependency, DependencyFailure, DependencyId, DependencyListError,
+        DependencyOutcome, DependencyState, HeldDecision, MAX_DEPENDENCIES, ReleaseRule,
+        TaskOutcome, decide,
     };
     use crate::callback::EventKind;
     use crate::domain::TaskId;
+    use crate::queue::{JobEventKind, JobId};
+
+    fn id() -> DependencyId {
+        TaskId::new().into()
+    }
 
     #[test]
     fn list_refuses_empty_duplicate_and_oversized_input() {
         assert_eq!(
-            TaskDependencies::new(Vec::new()),
+            Dependencies::new(Vec::new()),
             Err(DependencyListError::Empty)
         );
-        let task = TaskId::new();
+        let task = id();
         assert_eq!(
-            TaskDependencies::new(vec![task, TaskId::new(), task]),
-            Err(DependencyListError::Duplicate { index: 2, task })
+            Dependencies::new(vec![task, JobId::new().into(), task]),
+            Err(DependencyListError::Duplicate { index: 2, id: task })
         );
-        let many: Vec<_> = (0..=MAX_DEPENDENCIES).map(|_| TaskId::new()).collect();
+        let many: Vec<_> = (0..=MAX_DEPENDENCIES).map(|_| id()).collect();
         assert_eq!(
-            TaskDependencies::new(many),
+            Dependencies::new(many),
             Err(DependencyListError::TooMany {
                 count: MAX_DEPENDENCIES + 1
             })
@@ -411,15 +528,15 @@ mod tests {
 
     #[test]
     fn list_order_does_not_change_its_content() {
-        let first = TaskId::new();
-        let second = TaskId::new();
+        let first = id();
+        let second = DependencyId::from(JobId::new());
         assert_eq!(
-            TaskDependencies::new(vec![second, first]).unwrap(),
-            TaskDependencies::new(vec![first, second]).unwrap()
+            Dependencies::new(vec![second, first]).unwrap(),
+            Dependencies::new(vec![first, second]).unwrap()
         );
-        let wire = serde_json::to_value(TaskDependencies::new(vec![second, first]).unwrap());
+        let wire = serde_json::to_value(Dependencies::new(vec![second, first]).unwrap());
         assert_eq!(wire.unwrap(), serde_json::json!([first, second]));
-        assert!(serde_json::from_value::<TaskDependencies>(serde_json::json!([])).is_err());
+        assert!(serde_json::from_value::<Dependencies>(serde_json::json!([])).is_err());
     }
 
     #[test]
@@ -440,12 +557,25 @@ mod tests {
         assert_eq!(TaskOutcome::from_event(EventKind::TaskReported), None);
         assert_eq!(TaskOutcome::from_event(EventKind::TaskCheckDue), None);
         assert_eq!(TaskOutcome::from_event(EventKind::TaskWaiting), None);
+        // a job ends only at success, failure, or cancel; a preempted job runs again
+        for (kind, outcome) in [
+            (JobEventKind::JobSucceeded, Some(TaskOutcome::Succeeded)),
+            (JobEventKind::JobFailed, Some(TaskOutcome::Failed)),
+            (JobEventKind::JobCancelled, Some(TaskOutcome::Cancelled)),
+            (JobEventKind::JobPreempted, None),
+            (JobEventKind::JobAttention, None),
+            (JobEventKind::JobBlocked, None),
+            (JobEventKind::JobCheckDue, None),
+            (JobEventKind::JobGpuIdle, None),
+        ] {
+            assert_eq!(TaskOutcome::from_job_event(kind), outcome, "{kind:?}");
+        }
     }
 
     #[test]
     fn a_continuation_waits_for_every_ending_and_never_cancels() {
-        let a = TaskId::new();
-        let b = TaskId::new();
+        let a = Dependency::Task(TaskId::new());
+        let b = Dependency::Job(JobId::new());
         let failed = DependencyState::Ended(TaskOutcome::Failed.into());
         assert_eq!(
             decide(
@@ -468,8 +598,8 @@ mod tests {
 
     #[test]
     fn decision_waits_releases_or_cancels_on_the_first_failure() {
-        let a = TaskId::new();
-        let b = TaskId::new();
+        let a = Dependency::Task(TaskId::new());
+        let b = Dependency::Job(JobId::new());
         let succeeded = DependencyState::Ended(TaskOutcome::Succeeded.into());
         assert_eq!(
             decide(
@@ -499,7 +629,7 @@ mod tests {
 
     #[test]
     fn an_unknown_ending_cancels_and_reads_unknown() {
-        let a = TaskId::new();
+        let a = Dependency::Task(TaskId::new());
         let unknown = DependencyState::Ended(DependencyOutcome::Unknown);
         assert_eq!(
             decide([(a, unknown)], ReleaseRule::Succeeded),

@@ -60,6 +60,8 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             at: Utc::now(),
             blocked: None,
             held_ending: None,
+            gpu_idle: None,
+            gpu_summaries: Vec::new(),
         },
     }
 }
@@ -228,8 +230,7 @@ fn a_job_thread_waits_until_an_ending_reaches_it() {
 fn a_refused_held_job_ends_with_its_final_event_whichever_send_saw_the_refusal() {
     let dir = tempdir().unwrap();
     let store = Store::open(&dir.path().join("homebased.db")).unwrap();
-    let after =
-        crate::dependency::TaskDependencies::new(vec![crate::domain::TaskId::new()]).unwrap();
+    let after = crate::dependency::Dependencies::of_tasks(&[crate::domain::TaskId::new()]).unwrap();
     let refusal = || JobRefusal {
         code: "invalid_cwd".into(),
         message: "cwd /gone does not exist".into(),
@@ -277,4 +278,86 @@ fn a_refused_held_job_ends_with_its_final_event_whichever_send_saw_the_refusal()
             .iter()
             .all(|(route, _)| route.job != ready.job)
     );
+}
+
+#[test]
+fn a_route_saved_before_job_dependencies_reads_and_saves_unchanged() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("homebased.db")).unwrap();
+    let task = "0199a000-0000-7000-8000-000000000001";
+    // the saved form of a held job that a failed task cancelled, from the
+    // release before `after` took jobs
+    let mut saved = serde_json::to_value(route()).unwrap();
+    saved["after"] = serde_json::json!([task]);
+    saved["owes_final_event"] = serde_json::json!(true);
+    saved["submission"] = serde_json::json!({
+        "state": "ended",
+        "ending": { "reason": "dependency", "task": task, "outcome": "failed" }
+    });
+    let json = serde_json::to_string(&saved).unwrap();
+    let job: JobId = saved["job"].as_str().unwrap().parse().unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_job_routes(job_id,route_json) VALUES (?1,?2)",
+            rusqlite::params![job.to_string(), json],
+        )
+        .unwrap();
+
+    let read = store.job_route(job).unwrap().unwrap();
+    let crate::queue::delivery::JobSubmission::Ended {
+        ending: HeldJobEnding::Dependency { dependency, .. },
+    } = &read.submission
+    else {
+        panic!("{:?}", read.submission);
+    };
+    assert_eq!(
+        *dependency,
+        crate::dependency::Dependency::Task(task.parse().unwrap())
+    );
+    assert_eq!(read.after.as_ref().unwrap().ids(), &[task.parse().unwrap()]);
+    assert_eq!(serde_json::to_value(&read).unwrap(), saved);
+
+    // a job ending names its `job`, and an ending must name exactly one of them
+    let other = JobId::new();
+    let ending = HeldJobEnding::Dependency {
+        dependency: crate::dependency::Dependency::Job(other),
+        outcome: crate::dependency::TaskOutcome::Cancelled.into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&ending).unwrap(),
+        serde_json::json!({ "reason": "dependency", "job": other, "outcome": "cancelled" })
+    );
+    for both in [
+        serde_json::json!({ "reason": "dependency", "outcome": "failed" }),
+        serde_json::json!({ "reason": "dependency", "task": task, "job": other, "outcome": "failed" }),
+    ] {
+        assert!(serde_json::from_value::<HeldJobEnding>(both).is_err());
+    }
+}
+
+/// A route exactly as v0.25.4 saved it, before specs had `gpu_idle`
+const ROUTE_BEFORE_GPU_IDLE: &str = r#"{"job":"01a1bed3-41be-7471-b472-12bc75437215","origin":"01a1bed3-41bf-763b-9b53-114a4a3d3cb4","authority":"01a1bed3-41bf-763b-9b53-114b1045a8c1","thread":"77777777-7777-4777-8777-777777777777","callback":{"env":{"path":"/bin","home":"/tmp"},"cwd":"/tmp","codex":{"type":"available","path":"/bin/true"}},"spec":{"api_version":1,"thread":"77777777-7777-4777-8777-777777777777","name":"route test","cwd":"/tmp","timeout":"1h","priority":"low","preempt":{"mode":"wait"},"steps":[{"type":"task","command":["/bin/true"]}]},"digest":"9efe2b4b0da17021ea901eb18a773a1b51258cfe6900be2b8957e64e816b5eb1","target":null,"submission":{"state":"unknown"}}"#;
+
+#[test]
+fn a_route_saved_before_gpu_idle_keeps_its_digest() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let job: JobId = "01a1bed3-41be-7471-b472-12bc75437215".parse().unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_job_routes (job_id, route_json) VALUES (?1, ?2)",
+            rusqlite::params![job.to_string(), ROUTE_BEFORE_GPU_IDLE],
+        )
+        .unwrap();
+    // reading checks the saved digest against the spec's canonical form
+    let route = store.job_route(job).unwrap().unwrap();
+    assert_eq!(route.spec.gpu_idle, None);
+    assert_eq!(
+        route.digest,
+        "9efe2b4b0da17021ea901eb18a773a1b51258cfe6900be2b8957e64e816b5eb1"
+    );
+    let saved: serde_json::Value = serde_json::from_str(ROUTE_BEFORE_GPU_IDLE).unwrap();
+    assert_eq!(serde_json::to_value(&route.spec).unwrap(), saved["spec"]);
 }

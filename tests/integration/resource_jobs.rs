@@ -380,6 +380,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
                 path: "/bin".into(),
                 home: h.user_home.display().to_string(),
             },
+            origin_protocol: homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
         })
         .unwrap();
     store

@@ -22,6 +22,9 @@ const CONTAINER_YIELD_FILE: &str = "/homebased/run/yield";
 /// Name of the yield file in the run's control directory
 const YIELD_FILE_NAME: &str = "yield";
 
+/// `CUDA_DEVICE_ORDER` value that numbers GPUs the way `nvidia-smi` does
+const PCI_BUS_ORDER: &str = "PCI_BUS_ID";
+
 /// Run-owned paths and child environment, derived from the reserved resource
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
@@ -154,6 +157,11 @@ impl Checkpoint {
         ];
         if let Some(ordinal) = cuda_ordinal {
             env.push((run_env::CUDA_VISIBLE_DEVICES, ordinal.to_string()));
+            // CUDA's default order puts the fastest card first, so on a mixed
+            // host its ordinal can name another GPU than `nvidia-smi` and
+            // Docker do; bus order matches their indices. Inside a container
+            // the one visible GPU is ordinal 0 in either order
+            env.push((run_env::CUDA_DEVICE_ORDER, PCI_BUS_ORDER.into()));
         }
         env
     }
@@ -167,9 +175,10 @@ impl Checkpoint {
         let mut workload = workload.clone();
         // device selection belongs to the resource even when the job supplied
         // a container variable and the selected lane has no device index
-        workload
-            .env
-            .retain(|key, _| key.as_str() != run_env::CUDA_VISIBLE_DEVICES);
+        workload.env.retain(|key, _| {
+            key.as_str() != run_env::CUDA_VISIBLE_DEVICES
+                && key.as_str() != run_env::CUDA_DEVICE_ORDER
+        });
         workload.mounts.extend([
             ContainerMount {
                 source: self.job_dir(home),

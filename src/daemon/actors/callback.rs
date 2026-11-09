@@ -596,6 +596,16 @@ pub(crate) fn job_event_line(
     payload["task"] = serde_json::json!(event.run.map(|run| run.task));
     payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
     payload["step"] = serde_json::json!(event.run.map(|run| run.step));
+    // one readable line per attempt, derived from the stored summary, so a
+    // repeated delivery renders the same text
+    if let Some(summaries) = payload
+        .get_mut("gpu_summaries")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (value, summary) in summaries.iter_mut().zip(&event.gpu_summaries) {
+            value["brief"] = serde_json::json!(summary.brief());
+        }
+    }
     Ok(format!(
         "HOMEBASED_EVENT {}",
         serde_json::to_string(&payload)?
@@ -604,7 +614,7 @@ pub(crate) fn job_event_line(
 
 /// Deliver one job event through the same Claude, Codex, and T3 routing as task events
 ///
-/// Returns `None` only when a blocked notice ended before the callback write
+/// Returns `None` only when a blocked or GPU idle notice ended before the callback write
 pub(crate) async fn deliver_job_event(
     home: &Home,
     route: &crate::queue::delivery::JobRoute,
@@ -627,7 +637,7 @@ pub(crate) async fn deliver_job_event(
             delivery_lock: dir.join("delivery.lock"),
         },
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
-        before_send: before_send.filter(|_| event.event == crate::queue::JobEventKind::JobBlocked),
+        before_send: before_send.filter(|_| event.event.is_suppressible_notice()),
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 9;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 11] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -28,6 +28,9 @@ const MIGRATIONS: [Migration; 8] = [
     drop_t3_holds,
     add_resource_labels,
     add_thread_watches,
+    add_gpu_uuids,
+    add_gpu_idle,
+    add_gpu_summaries,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -82,6 +85,120 @@ fn add_resource_labels(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn add_thread_watches(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(THREAD_WATCH_TABLES)
 }
+
+/// Version 10: GPU UUIDs of detected devices, resources, and run attempts
+///
+/// Resources and attempts saved before this version have none until the next
+/// detection fills in the resources; ended attempts stay without one
+fn add_gpu_uuids(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE resources ADD COLUMN {RESOURCE_GPU_UUID};
+         ALTER TABLE resource_run_history ADD COLUMN {RUN_GPU_UUID};
+         {DETECTED_GPUS_TABLE}"
+    ))
+}
+
+/// Version 11: GPU idle accounting, agent silences, and each job's origin protocol
+///
+/// `resource_operations` is rebuilt because SQLite cannot change a CHECK in
+/// place; nothing references it. Jobs accepted before this version have no
+/// origin protocol, so only jobs of this machine's own origin get idle alerts
+fn add_gpu_idle(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE resource_jobs ADD COLUMN {JOB_ORIGIN_PROTOCOL};
+         CREATE TABLE resource_operations_v11 (
+             id TEXT PRIMARY KEY,
+             machine TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ({OPERATION_KINDS})),
+             content_digest TEXT NOT NULL,
+             result_json TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );
+         INSERT INTO resource_operations_v11
+             SELECT id, machine, kind, content_digest, result_json, created_at
+             FROM resource_operations;
+         DROP TABLE resource_operations;
+         ALTER TABLE resource_operations_v11 RENAME TO resource_operations;
+         {GPU_IDLE_TABLES}"
+    ))
+}
+
+/// Version 12: each run attempt's GPU usage summary and its end-of-attempt read
+///
+/// Attempts that ended before this version have no summary
+fn add_gpu_summaries(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "ALTER TABLE resource_run_history ADD COLUMN gpu_end_json TEXT;
+         ALTER TABLE resource_run_history ADD COLUMN gpu_summary_json TEXT;",
+    )
+}
+
+/// The worker's whole-attempt Netdata read, saved just before the exit
+/// commit, and the summary that commit computes once; the summary is never
+/// rewritten, since final job events carry it
+const RUN_GPU_SUMMARY: &str = "gpu_end_json TEXT,\n    gpu_summary_json TEXT";
+
+/// Cluster protocol of the request that submitted the job; `NULL` for jobs
+/// accepted before version 11
+const JOB_ORIGIN_PROTOCOL: &str = "origin_protocol INTEGER CHECK (origin_protocol >= 1)";
+
+/// Kinds of replayable queue operation
+const OPERATION_KINDS: &str = "'move', 'cancel', 'release', 'gpu_idle'";
+
+/// Idle accounting of each watched attempt, and each job's agent controls
+///
+/// The attempt row keeps its counters as columns for summaries and its
+/// rolling episode in `watch_json`. A control row is never changed: the latest
+/// one decides the silence, and the history is the record of why
+const GPU_IDLE_TABLES: &str = "
+CREATE TABLE resource_gpu_idle_attempts (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
+    started_at TEXT NOT NULL,
+    first_busy_at TEXT,
+    episode INTEGER NOT NULL CHECK (episode >= 1),
+    idle_buckets INTEGER NOT NULL CHECK (idle_buckets >= 0),
+    busy_buckets INTEGER NOT NULL CHECK (busy_buckets >= 0),
+    unknown_buckets INTEGER NOT NULL CHECK (unknown_buckets >= 0),
+    alerts INTEGER NOT NULL CHECK (alerts >= 0),
+    source TEXT CHECK (source IN ('netdata', 'nvidia_smi')),
+    watch_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX resource_gpu_idle_attempts_job ON resource_gpu_idle_attempts(job_id);
+
+CREATE TABLE resource_gpu_idle_controls (
+    id INTEGER PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES resource_jobs(id),
+    action TEXT NOT NULL CHECK (action IN ('snooze', 'off', 'clear')),
+    until TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    CHECK ((action = 'snooze') = (until IS NOT NULL)),
+    CHECK ((action = 'clear') = (reason IS NULL))
+);
+CREATE INDEX resource_gpu_idle_controls_job ON resource_gpu_idle_controls(job_id);
+";
+
+/// UUID of the GPU at the resource's device index, from the last detection
+/// that listed devices; `NULL` for an unindexed resource or an unlisted index
+const RESOURCE_GPU_UUID: &str = "gpu_uuid TEXT CHECK (gpu_uuid IS NULL OR device IS NOT NULL)";
+
+/// UUID the attempt's resource had when the attempt was reserved
+const RUN_GPU_UUID: &str = "gpu_uuid TEXT";
+
+/// Each GPU the last listing detection found on a machine, by device index
+///
+/// A resource registered by hand after startup reads its UUID here, so it
+/// needs no probe of its own
+const DETECTED_GPUS_TABLE: &str = "
+CREATE TABLE detected_gpus (
+    machine TEXT NOT NULL,
+    device INTEGER NOT NULL CHECK (device >= 0),
+    uuid TEXT NOT NULL,
+    PRIMARY KEY (machine, device)
+);
+";
 
 /// Thread watches of `homebased thread watch` and the events each one owes its
 /// caller, delivered like a job's
@@ -249,6 +366,13 @@ fn schema() -> String {
         .replace("{JOB_ROUTE_CREATED_AT}", JOB_ROUTE_CREATED_AT)
         .replace("{TASK_USAGE_TABLE}", TASK_USAGE_TABLE)
         .replace("{THREAD_WATCH_TABLES}", THREAD_WATCH_TABLES)
+        .replace("{RESOURCE_GPU_UUID}", RESOURCE_GPU_UUID)
+        .replace("{RUN_GPU_UUID}", RUN_GPU_UUID)
+        .replace("{RUN_GPU_SUMMARY}", RUN_GPU_SUMMARY)
+        .replace("{DETECTED_GPUS_TABLE}", DETECTED_GPUS_TABLE)
+        .replace("{JOB_ORIGIN_PROTOCOL}", JOB_ORIGIN_PROTOCOL)
+        .replace("{OPERATION_KINDS}", OPERATION_KINDS)
+        .replace("{GPU_IDLE_TABLES}", GPU_IDLE_TABLES)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -466,6 +590,7 @@ CREATE TABLE resources (
     run_attention_id TEXT UNIQUE,
     run_attention_failure TEXT,
     {RESOURCE_LABEL},
+    {RESOURCE_GPU_UUID},
     UNIQUE (machine, name),
     UNIQUE (id, machine),
     FOREIGN KEY (run_job, machine) REFERENCES resource_jobs(id, machine),
@@ -511,6 +636,7 @@ CREATE TABLE resource_jobs (
     event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    {JOB_ORIGIN_PROTOCOL},
     UNIQUE (id, machine),
     FOREIGN KEY (target_resource, machine) REFERENCES resources(id, machine),
     FOREIGN KEY (active_resource, machine) REFERENCES resources(id, machine),
@@ -537,7 +663,7 @@ CREATE TABLE resource_job_events (
 CREATE TABLE resource_operations (
     id TEXT PRIMARY KEY,
     machine TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('move', 'cancel', 'release')),
+    kind TEXT NOT NULL CHECK (kind IN ({OPERATION_KINDS})),
     content_digest TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -558,7 +684,9 @@ CREATE TABLE resource_run_history (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
     resource_id TEXT NOT NULL REFERENCES resources(id),
     stop_cause TEXT,
-    cleanup_json TEXT
+    cleanup_json TEXT,
+    {RUN_GPU_UUID},
+    {RUN_GPU_SUMMARY}
 );
 
 CREATE TABLE resource_job_routes (
@@ -583,7 +711,9 @@ CREATE TABLE resource_job_delivery (
 );
 {CHAIN_TABLES}
 {TASK_USAGE_TABLE}
-{THREAD_WATCH_TABLES}";
+{THREAD_WATCH_TABLES}
+{DETECTED_GPUS_TABLE}
+{GPU_IDLE_TABLES}";
 
 #[cfg(test)]
 mod tests {
@@ -692,6 +822,12 @@ mod tests {
             .replace(super::TASK_USAGE_TABLE, "")
             .replace(super::THREAD_WATCH_TABLES, "")
             .replace(&format!(",\n    {}", super::RESOURCE_LABEL), "")
+            .replace(&format!(",\n    {}", super::RESOURCE_GPU_UUID), "")
+            .replace(&format!(",\n    {}", super::RUN_GPU_SUMMARY), "")
+            .replace(&format!(",\n    {}", super::RUN_GPU_UUID), "")
+            .replace(super::DETECTED_GPUS_TABLE, "")
+            .replace(&format!(",\n    {}", super::JOB_ORIGIN_PROTOCOL), "")
+            .replace(super::GPU_IDLE_TABLES, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -719,6 +855,12 @@ mod tests {
             "resource_job_routes",
             "task_usage",
             "resources",
+            "resource_run_history",
+            "detected_gpus",
+            "resource_jobs",
+            "resource_operations",
+            "resource_gpu_idle_attempts",
+            "resource_gpu_idle_controls",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }

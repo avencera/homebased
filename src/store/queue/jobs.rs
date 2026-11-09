@@ -14,6 +14,7 @@ use super::{
 use crate::domain::{ExitReason, TaskEnv};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
 use crate::queue::{
     AttentionId, BlockedNotice, EventRun, JobEvent, JobEventKind, JobId, JobState, LevelEnd,
     MoveRefusal, OperationId, Placement, Priority, QueueError, ResourceId, Side, StopCause, Target,
@@ -24,6 +25,17 @@ use crate::store::{Store, fmt_time};
 /// Added to every position of a level before it is rewritten, so the unique
 /// slot index never sees two jobs on one position mid-renumber
 const RENUMBER_OFFSET: i64 = 1 << 40;
+
+/// The fields of a job event before it gets its sequence and time
+struct EventDraft {
+    event: JobEventKind,
+    run: Option<EventRun>,
+    process: Option<ExitReason>,
+    attention: Option<AttentionId>,
+    blocked: Option<BlockedNotice>,
+    gpu_idle: Option<GpuIdleNotice>,
+    gpu_summaries: Vec<GpuSummary>,
+}
 
 /// Where a move inserts the job within its new level
 #[derive(Debug, Clone, Copy)]
@@ -69,9 +81,10 @@ impl Store {
             self.conn.execute(
                 "INSERT INTO resource_jobs (id, machine, origin_machine, thread_id, spec_json,
                     spec_digest, env_path, env_home, target_resource, priority, position, state,
-                    step, resume, last_run_number, event_seq, created_at, updated_at)
+                    step, resume, last_run_number, event_seq, created_at, updated_at,
+                    origin_protocol)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', 0, 0, 0, 0,
-                    ?12, ?12)",
+                    ?12, ?12, ?13)",
                 params![
                     new.id.to_string(),
                     new.machine.to_string(),
@@ -85,6 +98,7 @@ impl Store {
                     priority.rank(),
                     sql_position(position)?,
                     now,
+                    new.origin_protocol.0,
                 ],
             )?;
             Ok(accepted(&self.require_job(new.id)?))
@@ -362,7 +376,8 @@ impl Store {
             }
             JobState::Queued { .. } => {
                 self.end_job(&job, JobState::Cancelled)?;
-                self.append_job_event(id, JobEventKind::JobCancelled, None, None, None)?;
+                let summaries = self.gpu_summaries(id)?;
+                self.append_run_end_event(id, JobEventKind::JobCancelled, None, None, summaries)?;
                 Ok(CancelResult::Cancelled)
             }
             JobState::Active { resource } => {
@@ -512,6 +527,80 @@ impl Store {
         attention: Option<AttentionId>,
         blocked: Option<BlockedNotice>,
     ) -> Result<JobEvent, AppError> {
+        self.append_event(
+            job,
+            EventDraft {
+                event,
+                run,
+                process,
+                attention,
+                blocked,
+                gpu_idle: None,
+                gpu_summaries: Vec::new(),
+            },
+        )
+    }
+
+    /// Append a final or preemption event with the GPU summaries stored now
+    ///
+    /// The event omits them when the job's origin predates the field; they
+    /// stay stored on the attempts, where `resource job show` reads them
+    pub(super) fn append_run_end_event(
+        &self,
+        job: JobId,
+        event: JobEventKind,
+        run: Option<EventRun>,
+        process: Option<ExitReason>,
+        mut gpu_summaries: Vec<GpuSummary>,
+    ) -> Result<JobEvent, AppError> {
+        if !gpu_summaries.is_empty() && !self.origin_reads_gpu_idle(job)? {
+            gpu_summaries.clear();
+        }
+        self.append_event(
+            job,
+            EventDraft {
+                event,
+                run,
+                process,
+                attention: None,
+                blocked: None,
+                gpu_idle: None,
+                gpu_summaries,
+            },
+        )
+    }
+
+    /// Append one `JOB_GPU_IDLE` alert of a running attempt
+    pub(super) fn append_gpu_idle_event(
+        &self,
+        job: JobId,
+        run: EventRun,
+        notice: GpuIdleNotice,
+    ) -> Result<JobEvent, AppError> {
+        self.append_event(
+            job,
+            EventDraft {
+                event: JobEventKind::JobGpuIdle,
+                run: Some(run),
+                process: None,
+                attention: None,
+                blocked: None,
+                gpu_idle: Some(notice),
+                gpu_summaries: Vec::new(),
+            },
+        )
+    }
+
+    fn append_event(&self, job: JobId, draft: EventDraft) -> Result<JobEvent, AppError> {
+        let EventDraft {
+            event,
+            run,
+            process,
+            attention,
+            blocked,
+            gpu_idle,
+            gpu_summaries,
+        } = draft;
         self.conn.execute(
             "UPDATE resource_jobs SET event_seq = event_seq + 1 WHERE id = ?1",
             [job.to_string()],
@@ -537,6 +626,8 @@ impl Store {
             at: Utc::now(),
             blocked,
             held_ending: None,
+            gpu_idle,
+            gpu_summaries,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)

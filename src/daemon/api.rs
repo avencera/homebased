@@ -21,7 +21,7 @@ use crate::daemon::api::views::{
 };
 use crate::daemon::cancel_delivery::CancelResponse;
 use crate::daemon::{AppState, web};
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{
     API_VERSION, AgentKind, ProcessStatus, TaskEnv, TaskId, TaskIdentity, TaskStatus, ThreadId,
     Workload,
@@ -194,7 +194,7 @@ pub(super) struct SubmitBody {
     pub(super) request: RequestId,
     pub(super) callback_cwd: Option<PathBuf>,
     /// Origin-only dependencies, kept beside the spec so no executor receives them
-    pub(super) after: Option<TaskDependencies>,
+    pub(super) after: Option<Dependencies>,
     /// Origin-only request to hold the task while its machine is unreachable
     pub(super) machine_wait: Option<MachineWait>,
 }
@@ -873,7 +873,7 @@ mod tests {
         let task = TaskId::new();
         value["after"] = json!([task]);
         let body = extract(&value).await.unwrap();
-        assert_eq!(body.after.unwrap().tasks(), &[task]);
+        assert_eq!(body.after.unwrap().ids(), &[task.into()]);
 
         value["after"] = json!([]);
         let (pointer, _) = invalid_spec(extract(&value).await.unwrap_err());

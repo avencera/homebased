@@ -15,20 +15,24 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::views::DependencyView;
-use crate::dependency::TaskDependencies;
+use crate::dependency::Dependencies;
 use crate::domain::{API_VERSION, TaskEnv};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
+use crate::fleet::protocol::{
+    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+};
 use crate::machine::MachineId;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::gpu_idle::GpuIdleControl;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, OperationId, Placement, QueueError, ResourceLabel, ResourceName,
     ResourceSelector,
 };
 use crate::store::queue::JobAccepted;
-use crate::store::queue::interface::QueueRequest;
+use crate::store::queue::interface::{QueueRequest, submit_protocol};
 use crate::submission::CallbackContext;
 
 /// Application JSON extractor: malformed or oversized bodies use the normal error envelope
@@ -74,6 +78,7 @@ pub fn control_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/resource/jobs/{job}/move", post(move_job))
         .route("/v1/resource/jobs/{job}/cancel", post(cancel))
+        .route("/v1/resource/jobs/{job}/gpu-idle", post(gpu_idle))
         .route("/v1/resource/release", post(release))
         .route("/v1/resource/label", post(label))
 }
@@ -108,7 +113,7 @@ struct SubmitBody {
     callback_cwd: PathBuf,
     /// Tasks on this origin that must succeed before the job is sent
     #[serde(default)]
-    after: Option<TaskDependencies>,
+    after: Option<Dependencies>,
 }
 
 /// A job the origin holds for its `after` tasks, or ended before it queued
@@ -172,6 +177,13 @@ struct MoveBody {
 #[serde(deny_unknown_fields)]
 struct OperationBody {
     operation_id: OperationId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GpuIdleBody {
+    operation_id: OperationId,
+    control: GpuIdleControl,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +332,9 @@ async fn submit(
                 Some(after) => super::dependencies::must_wait(&state, after).await?,
                 None => false,
             };
+            if held {
+                check_held_authority(&state, authority, &body.spec).await?;
+            }
             let route = JobRoute {
                 job: body.job_id,
                 origin: state.machine.identity.machine,
@@ -481,6 +496,41 @@ async fn cancel(
     .map(Json)
 }
 
+async fn gpu_idle(
+    State(state): State<AppState>,
+    Path(job): Path<JobId>,
+    Query(query): Query<MachineQuery>,
+    QueueJson(body): QueueJson<GpuIdleBody>,
+) -> Result<Json<Value>, AppError> {
+    body.control
+        .validate()
+        .map_err(|message| AppError::Usage { message })?;
+    {
+        // a held job has no run yet and its authority has no record to silence
+        let _guard = state.locks.job_submissions.lock(job).await;
+        if let Some(view) = local_held_view(&state, job, query.machine.as_ref()).await? {
+            return Err(AppError::Usage {
+                message: format!(
+                    "job {job} is {} on its origin and has not reached its queue; GPU idle alerts start once it runs",
+                    view.state
+                ),
+            });
+        }
+    }
+    let machine = job_authority(&state, job, query.machine.as_ref()).await?;
+    forward(
+        &state,
+        machine,
+        QueueRequest::GpuIdle {
+            operation: body.operation_id,
+            job,
+            control: body.control,
+        },
+    )
+    .await
+    .map(Json)
+}
+
 async fn release(
     State(state): State<AppState>,
     Query(query): Query<MachineQuery>,
@@ -570,6 +620,7 @@ pub(super) async fn forward(
             machine: machine.to_string(),
         })?;
     let destination = fleet.connect(machine).await?;
+    require_protocol(machine, destination.protocol, request.min_protocol())?;
     let body = ClusterQueue {
         api_version: API_VERSION,
         protocol_version: destination.protocol.0,
@@ -608,7 +659,68 @@ pub(super) async fn forward(
     Ok(value)
 }
 
+/// Refuse a request that `machine`'s negotiated protocol is too old for
+///
+/// An older authority would refuse it as unknown, so this names the cause
+fn require_protocol(
+    machine: MachineId,
+    negotiated: ClusterProtocolVersion,
+    needed: ClusterProtocolVersion,
+) -> Result<(), AppError> {
+    if negotiated >= needed {
+        return Ok(());
+    }
+    let local = ProtocolRange::new(needed, SUPPORTED_PROTOCOLS.max()).ok_or_else(|| {
+        AppError::Internal {
+            message: "request needs a newer protocol than this daemon".into(),
+        }
+    })?;
+    let remote = ProtocolRange::new(negotiated, negotiated).ok_or_else(|| AppError::Internal {
+        message: "negotiated protocol is not a range".into(),
+    })?;
+    Err(AppError::ClusterProtocolIncompatible {
+        machine,
+        local,
+        remote,
+    })
+}
+
+/// Refuse a job held for its `after` entries now, rather than once they
+/// succeeded, when its queue machine is reachable and too old for its spec
+///
+/// An unreachable queue machine is checked again when the job is sent
+async fn check_held_authority(
+    state: &AppState,
+    authority: MachineId,
+    spec: &JobSpec,
+) -> Result<(), AppError> {
+    if authority == state.machine.identity.machine {
+        return Ok(());
+    }
+    let needed = submit_protocol(spec);
+    if needed <= SUPPORTED_PROTOCOLS.min() {
+        return Ok(());
+    }
+    let Some(fleet) = state.fleet.handle() else {
+        return Ok(());
+    };
+    match fleet.connect(authority).await {
+        Ok(destination) => require_protocol(authority, destination.protocol, needed),
+        Err(_) => Ok(()),
+    }
+}
+
 async fn execute(state: &AppState, request: QueueRequest, env: TaskEnv) -> Result<Value, AppError> {
+    execute_at(state, request, env, CLUSTER_PROTOCOL_VERSION).await
+}
+
+/// Apply a request that arrived over cluster protocol `protocol`
+async fn execute_at(
+    state: &AppState,
+    request: QueueRequest,
+    env: TaskEnv,
+    protocol: ClusterProtocolVersion,
+) -> Result<Value, AppError> {
     if let QueueRequest::Submit { job, origin, spec } = &request {
         let stored = call(&state.store, |reply| StoreMsg::QueueJob { id: *job, reply }).await?;
         match stored {
@@ -627,6 +739,7 @@ async fn execute(state: &AppState, request: QueueRequest, env: TaskEnv) -> Resul
         machine: state.machine.identity.machine,
         request: Box::new(request),
         env,
+        protocol,
         reply,
     })
     .await
@@ -642,7 +755,8 @@ async fn cluster_request(
         .check_destination(body.destination_machine)?;
     super::cluster::check_api_version(body.api_version)?;
     super::cluster::check_protocol(body.protocol_version, body.destination_machine)?;
-    let mut value = execute(&state, body.request, TaskEnv::capture()).await?;
+    let protocol = ClusterProtocolVersion(body.protocol_version);
+    let mut value = execute_at(&state, body.request, TaskEnv::capture(), protocol).await?;
     value["protocol_version"] = json!(body.protocol_version);
     Ok(Json(value))
 }

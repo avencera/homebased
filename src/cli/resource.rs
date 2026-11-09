@@ -3,17 +3,21 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::{Ctx, OutputMode};
 use crate::callback::destination::SubmitOrigin;
 use crate::client::Client;
-use crate::dependency::TaskDependencies;
-use crate::domain::{TaskEnv, TaskId};
+use crate::dependency::{Dependencies, DependencyId};
+use crate::domain::TaskEnv;
 use crate::error::AppError;
 use crate::queue::build_hint::build_warnings;
+use crate::queue::gpu::GpuUuid;
+use crate::queue::gpu_idle::{
+    GpuIdleControl, GpuIdleControlResult, GpuIdleDetail, SampleSource, Silence,
+};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
@@ -99,11 +103,12 @@ pub enum JobCommand {
         /// Let a worker send callbacks to a thread other than its parent's thread
         #[arg(long)]
         allow_other_thread: bool,
-        /// Task this machine submitted that must succeed before the job joins
-        /// the queue; repeat for more. The job is held under its id until then,
-        /// and cancelled without using the queue if one ends any other way
-        #[arg(long = "after", value_name = "TASK")]
-        after: Vec<TaskId>,
+        /// Task or job this machine submitted that must succeed before the
+        /// job joins the queue; repeat for more. The job is held under its id
+        /// until then, and cancelled without using the queue if one ends any
+        /// other way
+        #[arg(long = "after", value_name = "TASK_OR_JOB")]
+        after: Vec<DependencyId>,
     },
     /// Show a job, its progress, and every run task for logs
     Show {
@@ -126,6 +131,50 @@ pub enum JobCommand {
         #[command(flatten)]
         machine: MachineArgs,
     },
+    /// Snooze, turn off, or restore a job's GPU idle alerts
+    ///
+    /// Alerts only notify; they never stop the job. The latest control wins
+    GpuIdle(GpuIdleArgs),
+}
+
+/// Exactly one GPU idle control, with a reason for every silence
+#[derive(Debug, Args)]
+#[command(group = ArgGroup::new("control").required(true).args(["snooze", "off", "clear"]))]
+pub struct GpuIdleArgs {
+    /// Job UUID
+    pub job: JobId,
+    /// Hold alerts for this long, such as 15m or 2h; any positive duration
+    #[arg(long, value_name = "DURATION")]
+    pub snooze: Option<humantime::Duration>,
+    /// Turn alerts off for the rest of the job
+    #[arg(long)]
+    pub off: bool,
+    /// Drop any snooze or off switch, so the spec's gpu_idle setting applies
+    #[arg(long)]
+    pub clear: bool,
+    /// Why the GPU may sit idle; shown to other agents in job show
+    #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+    pub reason: Option<String>,
+    /// Replay identity; generated once when omitted
+    #[arg(long)]
+    pub operation_id: Option<OperationId>,
+    /// Queue authority when submitted from another origin
+    #[command(flatten)]
+    pub machine: MachineArgs,
+}
+
+impl GpuIdleArgs {
+    fn control(&self) -> GpuIdleControl {
+        let reason = self.reason.clone().unwrap_or_default();
+        match (self.snooze, self.off) {
+            (Some(duration), _) => GpuIdleControl::Snooze {
+                duration: duration.into(),
+                reason,
+            },
+            (None, true) => GpuIdleControl::Off { reason },
+            (None, false) => GpuIdleControl::Clear,
+        }
+    }
 }
 
 /// Exactly one placement is validated before sending a move
@@ -273,6 +322,34 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             .await?;
             print_result(ctx, &value, "cancel requested for", &job.to_string())
         }
+        JobCommand::GpuIdle(args) => {
+            let control = args.control();
+            control
+                .validate()
+                .map_err(|message| AppError::Usage { message })?;
+            let operation_id = args.operation_id.unwrap_or_default();
+            let value = post_retry(
+                client,
+                &path(
+                    &format!("/v1/resource/jobs/{}/gpu-idle", args.job),
+                    &args.machine,
+                ),
+                &json!({ "operation_id": operation_id, "control": control }),
+            )
+            .await?;
+            let result: GpuIdleControlResult = decode(value.clone())?;
+            let action = format!("GPU idle alerts {} for", silence_label(&result.silence));
+            print_result(ctx, &value, &action, &args.job.to_string())
+        }
+    }
+}
+
+fn silence_label(silence: &Silence) -> String {
+    match silence {
+        Silence::Watching => "on".into(),
+        Silence::Snoozed { until, .. } => format!("snoozed until {}", until.to_rfc3339()),
+        Silence::Off { .. } => "off".into(),
+        Silence::SpecOff => "off by spec".into(),
     }
 }
 
@@ -282,7 +359,7 @@ async fn submit(
     job_id: JobId,
     spec_path: &str,
     allow_other_thread: bool,
-    after_flags: Vec<TaskId>,
+    after_flags: Vec<DependencyId>,
 ) -> Result<(), AppError> {
     let origin = SubmitOrigin::capture(&ctx.home)?;
     let mut value = crate::spec::read_spec_value(spec_path)?;
@@ -311,7 +388,7 @@ async fn submit(
         value["warnings"] = json!(warnings);
     }
     let action = match value["held"]["state"].as_str() {
-        Some("held") => "held until its after tasks succeed:",
+        Some("held") => "held until its after entries succeed:",
         Some(_) => "ended before it queued:",
         None => "submitted",
     };
@@ -320,21 +397,21 @@ async fn submit(
     Ok(())
 }
 
-/// The spec's `after` and the `--after` flags as one list, each task once
+/// The spec's `after` and the `--after` flags as one list, each entry once
 fn merge_after(
-    spec: Option<TaskDependencies>,
-    flags: Vec<TaskId>,
-) -> Result<Option<TaskDependencies>, AppError> {
-    let mut tasks: Vec<TaskId> = spec.map(Vec::from).unwrap_or_default();
-    for task in flags {
-        if !tasks.contains(&task) {
-            tasks.push(task);
+    spec: Option<Dependencies>,
+    flags: Vec<DependencyId>,
+) -> Result<Option<Dependencies>, AppError> {
+    let mut ids: Vec<DependencyId> = spec.map(Vec::from).unwrap_or_default();
+    for id in flags {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
     }
-    if tasks.is_empty() {
+    if ids.is_empty() {
         return Ok(None);
     }
-    crate::spec::parse_after(&json!(tasks)).map(Some)
+    crate::spec::parse_after(&json!(ids)).map(Some)
 }
 
 fn path(base: &str, machine: &MachineArgs) -> String {
@@ -383,7 +460,7 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     let list: ResourceList = decode(value)?;
     if ctx.output == OutputMode::Human {
         println!(
-            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE                            LABEL"
+            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE                            GPU UUID                                 LABEL"
         );
     }
     for record in &list.resources {
@@ -408,8 +485,9 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             _ => String::new(),
         };
         let label = resource.label.as_ref().map_or("-", ResourceLabel::as_str);
+        let gpu = resource.gpu_uuid.as_ref().map_or("-", GpuUuid::as_str);
         let run = format!("{task}{age}");
-        println!("{id} {name:<16} {device:<6} {state:<12} {run:<42} {label}");
+        println!("{id} {name:<16} {device:<6} {state:<12} {run:<42} {gpu:<40} {label}");
     }
     Ok(())
 }
@@ -449,12 +527,7 @@ fn print_held(ctx: &Ctx, held: &Value) -> Result<(), AppError> {
         text("machine")
     );
     for dependency in held["after"].as_array().into_iter().flatten() {
-        let task = dependency["task"].as_str().unwrap_or("-");
-        let state = match dependency["outcome"].as_str() {
-            Some(outcome) => format!("ended {outcome}"),
-            None => dependency["state"].as_str().unwrap_or("-").to_owned(),
-        };
-        println!("after {task}: {state}");
+        println!("after {}", super::task::dependency_line(dependency));
     }
     if let Some(reason) = held["reason"].as_str() {
         println!("reason: {reason}");
@@ -516,10 +589,57 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let on = run.resource.map_or_else(String::new, |resource| {
             format!(" on {}", resource_label(resource, &detail.resources))
         });
+        let gpu = run
+            .gpu_uuid
+            .as_ref()
+            .map_or_else(String::new, |uuid| format!(" ({uuid})"));
         println!(
-            "run {} step {}: {} {}{on}; cleanup: {cleanup}",
+            "run {} step {}: {} {}{on}{gpu}; cleanup: {cleanup}",
             run.run_number, run.step, run.task, run.status
         );
+        if let Some(summary) = &run.gpu_summary {
+            println!("  gpu: {}", summary.brief());
+        }
+    }
+    // jobs that never ran on a watched GPU and were never silenced say nothing
+    if let Some(idle) = detail.gpu_idle.as_ref().filter(|idle| {
+        !idle.attempts.is_empty() || !idle.controls.is_empty() || idle.silence.silenced()
+    }) {
+        print_gpu_idle(idle);
     }
     Ok(())
+}
+
+fn print_gpu_idle(idle: &GpuIdleDetail) {
+    let reason = match &idle.silence {
+        Silence::Snoozed { reason, .. } | Silence::Off { reason } => format!(" ({reason})"),
+        Silence::Watching | Silence::SpecOff => String::new(),
+    };
+    println!("gpu idle alerts: {}{reason}", silence_label(&idle.silence));
+    for attempt in &idle.attempts {
+        let source = attempt.source.map_or("-", SampleSource::as_str);
+        println!(
+            "gpu idle {}: {} alerts, episode {}; buckets {} busy, {} idle, {} unknown; source {source}",
+            attempt.task,
+            attempt.alerts,
+            attempt.episode,
+            attempt.busy_buckets,
+            attempt.idle_buckets,
+            attempt.unknown_buckets
+        );
+    }
+    for control in &idle.controls {
+        let until = control.until.map_or_else(String::new, |until| {
+            format!(" until {}", until.to_rfc3339())
+        });
+        let reason = control
+            .reason
+            .as_ref()
+            .map_or_else(String::new, |reason| format!(": {reason}"));
+        println!(
+            "gpu idle {} at {}{until}{reason}",
+            control.action,
+            control.at.to_rfc3339()
+        );
+    }
 }

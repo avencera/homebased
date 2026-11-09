@@ -27,6 +27,7 @@ pub mod classify;
 pub mod delivery;
 mod error;
 pub mod gpu;
+pub mod gpu_idle;
 pub mod schedule;
 pub mod spec;
 
@@ -501,6 +502,10 @@ pub struct Resource {
     // a peer on an older release sends no label
     #[serde(default)]
     pub label: Option<ResourceLabel>,
+    /// UUID of the GPU at `device`, from the last detection that listed it
+    // a peer on an older release sends none
+    #[serde(default)]
+    pub gpu_uuid: Option<gpu::GpuUuid>,
 }
 
 /// A resource named in a job spec or command, by UUID or by name
@@ -1047,6 +1052,31 @@ pub enum JobEventKind {
     JobBlocked,
     /// A running job's output reached its inactivity threshold
     JobCheckDue,
+    /// A running job's GPU stayed near idle past its threshold
+    JobGpuIdle,
+}
+
+impl JobEventKind {
+    /// Whether the authority may suppress this notice before delivery once
+    /// the condition it reports has ended
+    #[must_use]
+    pub const fn is_suppressible_notice(self) -> bool {
+        matches!(self, Self::JobBlocked | Self::JobGpuIdle)
+    }
+
+    /// Whether the event ends the run an earlier notice reports on, or shows
+    /// that a blocked job got to run
+    #[must_use]
+    pub const fn ends_run(self) -> bool {
+        matches!(
+            self,
+            Self::JobSucceeded
+                | Self::JobFailed
+                | Self::JobCancelled
+                | Self::JobPreempted
+                | Self::JobAttention
+        )
+    }
 }
 
 /// One blocked notice, tied to the exact stored episode
@@ -1109,6 +1139,15 @@ pub struct JobEvent {
     /// only the origin records such an event
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_ending: Option<delivery::HeldJobEnding>,
+    /// Present only on a GPU idle alert
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_idle: Option<gpu_idle::GpuIdleNotice>,
+    /// GPU usage of the job's attempts, as stored when the event was appended:
+    /// every attempt on a final event, the attempt that ended on a preemption
+    // never sent to an origin on an older protocol, which would drop it when
+    // storing the event and then refuse a retry that still carries it
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_summaries: Vec<gpu_idle::GpuSummary>,
 }
 
 #[cfg(test)]

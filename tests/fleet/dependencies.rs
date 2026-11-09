@@ -104,12 +104,15 @@ fn held_remote_task_waits_for_an_unreachable_executor_then_launches() {
     assert!(wait_until(Duration::from_secs(10), || {
         Store::open(&origin.home.join(homebased::home::DB_NAME))
             .unwrap()
-            .dependency_states(&[dependency])
+            .dependency_states(&[dependency.into()])
             .unwrap()
             == vec![(
-                dependency,
-                Some(homebased::dependency::DependencyState::Ended(
-                    homebased::dependency::TaskOutcome::Succeeded.into(),
+                dependency.into(),
+                Some((
+                    homebased::dependency::Dependency::Task(dependency),
+                    homebased::dependency::DependencyState::Ended(
+                        homebased::dependency::TaskOutcome::Succeeded.into(),
+                    ),
                 )),
             )]
     }));

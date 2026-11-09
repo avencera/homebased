@@ -50,6 +50,7 @@ impl Fixture {
             .map(|(index, name)| DetectedResource {
                 name: ResourceName::parse(name).unwrap(),
                 device: Some(u32::try_from(index).unwrap()),
+                uuid: None,
             })
             .collect();
         self.store
@@ -199,6 +200,7 @@ fn new_job(id: JobId, machine: MachineId, spec: Value) -> NewJob {
             path: "/usr/bin:/bin".into(),
             home: "/tmp".into(),
         },
+        origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
     }
 }
 
@@ -1557,6 +1559,7 @@ fn detection_moves_the_fallback_onto_the_first_detected_device() {
             .map(|&device| DetectedResource {
                 name: ResourceName::gpu(device),
                 device: Some(device),
+                uuid: None,
             })
             .collect();
         let resources = f
@@ -1613,6 +1616,7 @@ fn detection_never_renames_or_replaces_a_manual_resource() {
     let detected = [DetectedResource {
         name: ResourceName::gpu(1),
         device: Some(1),
+        uuid: None,
     }];
     let resources = fixture
         .store
@@ -1637,6 +1641,7 @@ fn detection_never_renames_or_replaces_a_manual_resource() {
     let detected = [0, 1].map(|device| DetectedResource {
         name: ResourceName::gpu(device),
         device: Some(device),
+        uuid: None,
     });
     fixture
         .store
@@ -2005,6 +2010,7 @@ fn detection_defers_all_phases_of_an_active_fallback() {
         let detected = [0, 1].map(|device| DetectedResource {
             name: ResourceName::gpu(device),
             device: Some(device),
+            uuid: None,
         });
         let resources = f
             .store
@@ -2238,6 +2244,7 @@ async fn notice_ends_during_callback_preparation() {
         event: f.store.job_events(head).unwrap()[0].clone(),
     };
     f.store.accept_job_event(&notice).unwrap();
+    assert!(!f.store.job_notice_overtaken(head, 1).unwrap());
     let delivery = home
         .root()
         .join("jobs")
@@ -2321,6 +2328,8 @@ async fn notice_ends_during_callback_preparation() {
         ..notice.clone()
     };
     f.store.accept_job_event(&success).unwrap();
+    // the received final event settles the notice even with the authority away
+    assert!(f.store.job_notice_overtaken(head, 1).unwrap());
     std::fs::write(delivery.join("release"), "").unwrap();
     assert!(holder.wait().unwrap().success());
     let outcome = pending.await.unwrap();
@@ -2405,4 +2414,131 @@ fn bugfix_cleanup_count_overflow_preserves_the_attempt() {
         fixture.run_on("gpu0").unwrap().phase,
         RunPhase::Cleaning { attempt: u32::MAX }
     );
+}
+
+#[test]
+fn detection_names_each_gpu_and_every_attempt_keeps_the_one_it_launched_on() {
+    use crate::queue::gpu::GpuUuid;
+
+    let uuid = |raw: &str| Some(GpuUuid::parse(raw).unwrap());
+    let listed = |uuids: [&str; 2]| {
+        [0, 1].map(|device| DetectedResource {
+            name: ResourceName::gpu(device),
+            device: Some(device),
+            uuid: uuid(uuids[device as usize]),
+        })
+    };
+    let gpu_uuid = |f: &Fixture, machine: MachineId, name: &str| {
+        f.store
+            .resolve_resource(
+                machine,
+                &crate::queue::ResourceSelector::Name(ResourceName::parse(name).unwrap()),
+            )
+            .unwrap()
+            .resource
+            .gpu_uuid
+    };
+
+    // an adopted fallback and a new lane both take the listed UUIDs
+    let f = Fixture::new();
+    let machine = MachineId::new();
+    f.store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, machine, "gpu0"), None);
+    f.store
+        .ensure_detected_resources(machine, &listed(["GPU-a", "GPU-b"]))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, machine, "gpu0"), uuid("GPU-a"));
+    assert_eq!(gpu_uuid(&f, machine, "gpu1"), uuid("GPU-b"));
+
+    // a hand-registered lane reads the last listing, and an unlisted index has none
+    let manual = MachineId::new();
+    let detected = [DetectedResource {
+        name: ResourceName::gpu(0),
+        device: Some(0),
+        uuid: uuid("GPU-m0"),
+    }];
+    f.store
+        .ensure_detected_resources(manual, &detected)
+        .unwrap();
+    f.store
+        .register_resource(manual, ResourceName::parse("spare").unwrap(), Some(3))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, manual, "spare"), None);
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO detected_gpus (machine, device, uuid) VALUES (?1, 4, 'GPU-m4')",
+            [manual.to_string()],
+        )
+        .unwrap();
+    f.store
+        .register_resource(manual, ResourceName::parse("late").unwrap(), Some(4))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, manual, "late"), uuid("GPU-m4"));
+
+    // an attempt keeps its GPU after a later detection finds another card there
+    f.store
+        .ensure_detected_resources(f.machine, &listed(["GPU-old", "GPU-b"]))
+        .unwrap();
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", Utc::now());
+    f.store
+        .ensure_detected_resources(f.machine, &listed(["GPU-new", "GPU-b"]))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu0"), uuid("GPU-new"));
+    let runs = f.store.job_runs(job).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].task, run.task);
+    assert_eq!(runs[0].gpu_uuid, uuid("GPU-old"));
+
+    // neither a failed probe nor a start without nvidia-smi lists devices,
+    // so both keep the saved UUIDs
+    f.store.ensure_detected_resources(f.machine, &[]).unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
+    f.store
+        .ensure_detected_resources(f.machine, &[DetectedResource::unindexed()])
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu0"), uuid("GPU-new"));
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
+}
+
+#[test]
+fn a_run_applied_after_its_exit_ends_its_gpu_summary_at_the_exit() {
+    let f = Fixture::new();
+    let started = Utc::now() - chrono::Duration::seconds(600);
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", started);
+
+    // the worker wrote exit.json 30s in, and the daemon applies it much later
+    let dir = f._dir.path().join("tasks").join(run.task.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_json = dir.join("exit.json");
+    crate::store::write_exit_json(
+        &exit_json,
+        &ExitReason::Exit { code: 0 },
+        ProcessGroupExitEvidence::ConfirmedExited,
+    )
+    .unwrap();
+    let exited = started + chrono::Duration::seconds(30);
+    std::fs::File::options()
+        .write(true)
+        .open(&exit_json)
+        .unwrap()
+        .set_modified(exited.into())
+        .unwrap();
+    f.exit(&run, ExitReason::Exit { code: 0 });
+    let summary = f.store.gpu_summary(run.task).unwrap().unwrap();
+    assert_eq!(summary.attempt_secs, 30, "{summary:?}");
+
+    // a run lost with no exit.json can only end now
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu1", started);
+    f.store
+        .cas_status(run.task, ProcessStatus::Running, ProcessStatus::Lost)
+        .unwrap()
+        .unwrap();
+    let summary = f.store.gpu_summary(run.task).unwrap().unwrap();
+    assert!(summary.attempt_secs >= 600, "{summary:?}");
 }

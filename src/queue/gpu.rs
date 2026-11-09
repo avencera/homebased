@@ -5,12 +5,84 @@
 //! one GPU, which becomes `gpu0` with no device index. A Linux machine that
 //! has no `nvidia-smi` still gets an unindexed exclusive lane. An installed
 //! probe that fails or returns no usable devices defers detection until a later start
+//!
+//! The same output names each GPU's UUID, which stays with the physical card
+//! when indices move, so later readers can tell which card a run held
 
+use std::fmt;
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::ResourceName;
+
+/// A GPU's UUID as `nvidia-smi` reports it, such as `GPU-6f3c1d2e-...`
+///
+/// Kept as the driver prints it: Netdata labels and `nvidia-smi --query-gpu`
+/// use the same text, so it is compared as an opaque token
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GpuUuid(String);
+
+impl GpuUuid {
+    /// Longest UUID accepted; NVIDIA's are 40 characters
+    const MAX_LEN: usize = 128;
+
+    /// Accept one non-empty token of printable ASCII
+    ///
+    /// # Errors
+    ///
+    /// Refuses empty, overlong, and non-printable text, and text with spaces
+    /// or parentheses, which cannot come from one `(UUID: ...)` field
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let valid = !raw.is_empty()
+            && raw.len() <= Self::MAX_LEN
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'(' && byte != b')');
+        if valid {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(format!("invalid GPU UUID {raw:?}"))
+        }
+    }
+
+    /// The UUID text
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GpuUuid {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<GpuUuid> for String {
+    fn from(uuid: GpuUuid) -> Self {
+        uuid.0
+    }
+}
+
+impl fmt::Display for GpuUuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One GPU line of `nvidia-smi -L`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedGpu {
+    /// Device index, the one `CUDA_VISIBLE_DEVICES` takes in PCI bus order
+    pub index: u32,
+    /// UUID, when the line names one
+    pub uuid: Option<GpuUuid>,
+}
 
 /// A resource that detection says this machine has
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +91,8 @@ pub struct DetectedResource {
     pub name: ResourceName,
     /// GPU index exported to runs, if the platform has one
     pub device: Option<u32>,
+    /// UUID of the indexed GPU, when the probe named one
+    pub uuid: Option<GpuUuid>,
 }
 
 impl DetectedResource {
@@ -28,6 +102,7 @@ impl DetectedResource {
         Self {
             name: ResourceName::gpu(0),
             device: None,
+            uuid: None,
         }
     }
 }
@@ -53,45 +128,56 @@ impl Platform {
     }
 }
 
-/// Device indices from `nvidia-smi -L` output, in ascending order
+/// GPUs from `nvidia-smi -L` output, in ascending index order
 ///
-/// Each GPU is a line such as `GPU 0: NVIDIA GeForce RTX 5090 (UUID: ...)`.
+/// Each GPU is a line such as `GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-...)`.
 /// Indented MIG device lines and anything else are ignored, and a repeated
-/// index counts once
+/// index counts once, with its first line's UUID
 #[must_use]
-pub fn parse_nvidia_smi_list(output: &str) -> Vec<u32> {
-    let mut indices: Vec<u32> = output
+pub fn parse_nvidia_smi_list(output: &str) -> Vec<ListedGpu> {
+    let mut gpus: Vec<ListedGpu> = output
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix("GPU ")?;
-            let (index, _) = rest.split_once(':')?;
-            index.parse().ok()
+            let (index, description) = rest.split_once(':')?;
+            Some(ListedGpu {
+                index: index.parse().ok()?,
+                uuid: listed_uuid(description),
+            })
         })
         .collect();
-    indices.sort_unstable();
-    indices.dedup();
-    indices
+    // a stable sort keeps the first line of a repeated index ahead of the rest
+    gpus.sort_by_key(|gpu| gpu.index);
+    gpus.dedup_by_key(|gpu| gpu.index);
+    gpus
+}
+
+/// The `(UUID: ...)` field of one GPU line, if it holds a usable UUID
+fn listed_uuid(description: &str) -> Option<GpuUuid> {
+    let (_, rest) = description.rsplit_once("(UUID: ")?;
+    let (uuid, _) = rest.split_once(')')?;
+    GpuUuid::parse(uuid.trim()).ok()
 }
 
 /// Resources for a platform, given the `nvidia-smi -L` output when it ran
 #[must_use]
 pub fn resources_for(platform: Platform, nvidia_smi: Option<&str>) -> Vec<DetectedResource> {
-    let indices = match platform {
+    let gpus = match platform {
         Platform::MacOs => Vec::new(),
         Platform::Linux => nvidia_smi.map(parse_nvidia_smi_list).unwrap_or_default(),
     };
     if platform == Platform::MacOs || nvidia_smi.is_none() {
         return vec![DetectedResource::unindexed()];
     }
-    if indices.is_empty() {
+    if gpus.is_empty() {
         warn!("nvidia-smi returned no usable devices; GPU detection deferred");
         return Vec::new();
     }
-    indices
-        .into_iter()
-        .map(|index| DetectedResource {
-            name: ResourceName::gpu(index),
-            device: Some(index),
+    gpus.into_iter()
+        .map(|gpu| DetectedResource {
+            name: ResourceName::gpu(gpu.index),
+            device: Some(gpu.index),
+            uuid: gpu.uuid,
         })
         .collect()
 }
@@ -141,7 +227,7 @@ fn probe_nvidia_smi(command: &mut Command) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectedResource, Platform, ResourceName, parse_nvidia_smi_list, probe_nvidia_smi,
+        DetectedResource, GpuUuid, Platform, ResourceName, parse_nvidia_smi_list, probe_nvidia_smi,
         resources_for,
     };
 
@@ -157,29 +243,54 @@ GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-11111111-2222-3333-4444-555555555555)
 GPU 1: NVIDIA A100-SXM4-40GB (UUID: GPU-22222222-2222-3333-4444-555555555555)
 ";
 
-    fn indexed(index: u32) -> DetectedResource {
+    fn indexed(index: u32, uuid: &str) -> DetectedResource {
         DetectedResource {
             name: ResourceName::gpu(index),
             device: Some(index),
+            uuid: Some(GpuUuid::parse(uuid).unwrap()),
         }
     }
 
     #[test]
-    fn nvidia_smi_fixtures_parse_to_device_indices() {
+    fn nvidia_smi_fixtures_parse_to_device_indices_and_uuids() {
         let cases = [
-            (TWO_GPUS, vec![0, 1]),
-            (MIG, vec![0, 1]),
+            (
+                TWO_GPUS,
+                vec![
+                    (0, Some("GPU-6f3c1d2e-0000-1111-2222-333344445555")),
+                    (1, Some("GPU-7a4d2e3f-0000-1111-2222-333344445555")),
+                ],
+            ),
+            (
+                MIG,
+                vec![
+                    (0, Some("GPU-11111111-2222-3333-4444-555555555555")),
+                    (1, Some("GPU-22222222-2222-3333-4444-555555555555")),
+                ],
+            ),
             ("", vec![]),
             ("No devices were found\n", vec![]),
             (
                 "NVIDIA-SMI has failed because it couldn't communicate\n",
                 vec![],
             ),
-            ("GPU 1: second\nGPU 0: first\nGPU 1: again\n", vec![0, 1]),
+            (
+                "GPU 1: second (UUID: GPU-b)\nGPU 0: first\nGPU 1: again (UUID: GPU-c)\n",
+                vec![(0, None), (1, Some("GPU-b"))],
+            ),
+            ("GPU 0: blank (UUID: )\n", vec![(0, None)]),
             ("GPU x: not a number\n", vec![]),
         ];
         for (output, expected) in cases {
-            assert_eq!(parse_nvidia_smi_list(output), expected, "{output:?}");
+            let parsed: Vec<_> = parse_nvidia_smi_list(output)
+                .into_iter()
+                .map(|gpu| (gpu.index, gpu.uuid.map(String::from)))
+                .collect();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(index, uuid)| (index, uuid.map(str::to_owned)))
+                .collect();
+            assert_eq!(parsed, expected, "{output:?}");
         }
     }
 
@@ -187,7 +298,10 @@ GPU 1: NVIDIA A100-SXM4-40GB (UUID: GPU-22222222-2222-3333-4444-555555555555)
     fn linux_gets_one_resource_per_nvidia_gpu() {
         assert_eq!(
             resources_for(Platform::Linux, Some(TWO_GPUS)),
-            vec![indexed(0), indexed(1)]
+            vec![
+                indexed(0, "GPU-6f3c1d2e-0000-1111-2222-333344445555"),
+                indexed(1, "GPU-7a4d2e3f-0000-1111-2222-333344445555")
+            ]
         );
     }
 

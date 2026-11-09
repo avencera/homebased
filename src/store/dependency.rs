@@ -14,14 +14,16 @@ use super::Store;
 use super::chain::{chain_of_on, end_chain_on};
 use crate::callback::{UnlaunchedEnding, unlaunched_event};
 use crate::dependency::{
-    DependencyLookup, DependencyOutcome, DependencyState, HeldCancellation, ReleaseRule,
-    TaskDependencies, TaskOutcome,
+    Dependencies, Dependency, DependencyId, DependencyLookup, DependencyOutcome, DependencyState,
+    HeldCancellation, ReleaseRule, TaskOutcome,
 };
 use crate::domain::{CallbackStatus, ProcessStatus, TaskId};
 use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
+use crate::queue::JobId;
+use crate::queue::delivery::{HeldJobEnding, JobSubmission, RoutedJobEvent};
 use crate::submission::{
     DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
@@ -35,7 +37,7 @@ fn decode_route(json: &str) -> Result<OriginRoute, AppError> {
     Ok(route)
 }
 
-fn decode_after(json: Option<&str>) -> Result<Option<TaskDependencies>, AppError> {
+fn decode_after(json: Option<&str>) -> Result<Option<Dependencies>, AppError> {
     Ok(json.map(serde_json::from_str).transpose()?)
 }
 
@@ -43,7 +45,7 @@ fn decode_after(json: Option<&str>) -> Result<Option<TaskDependencies>, AppError
 pub(super) fn dependent_route_on(
     conn: &Connection,
     task: TaskId,
-) -> Result<Option<(OriginRoute, Option<TaskDependencies>)>, AppError> {
+) -> Result<Option<(OriginRoute, Option<Dependencies>)>, AppError> {
     let saved: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT route_json,after_json FROM origin_routes WHERE task_id=?1",
@@ -222,7 +224,7 @@ pub enum HeldCancel {
 
 impl Store {
     /// Dependencies saved with a route, or `None` for a route submitted without `after`
-    pub fn route_dependencies(&self, task: TaskId) -> Result<Option<TaskDependencies>, AppError> {
+    pub fn route_dependencies(&self, task: TaskId) -> Result<Option<Dependencies>, AppError> {
         let saved: Option<Option<String>> = self
             .conn
             .query_row(
@@ -376,15 +378,74 @@ impl Store {
         rows.iter().map(|json| decode_route(json)).collect()
     }
 
-    /// State of each dependency, or `None` for a task with no origin route here
-    pub fn dependency_states(&self, tasks: &[TaskId]) -> Result<DependencyLookup, AppError> {
-        tasks
-            .iter()
-            .map(|&task| self.dependency_state(task).map(|state| (task, state)))
+    /// What each entry names and its state, or `None` for an entry with no
+    /// task or job route here
+    pub fn dependency_states(&self, ids: &[DependencyId]) -> Result<DependencyLookup, AppError> {
+        ids.iter()
+            .map(|&id| self.dependency_state(id).map(|state| (id, state)))
             .collect()
     }
 
-    fn dependency_state(&self, task: TaskId) -> Result<Option<DependencyState>, AppError> {
+    /// A task route wins over a job route; UUIDs are random, so one entry
+    /// never names both
+    fn dependency_state(
+        &self,
+        id: DependencyId,
+    ) -> Result<Option<(Dependency, DependencyState)>, AppError> {
+        let task = id.as_task();
+        if let Some(state) = self.task_dependency_state(task)? {
+            return Ok(Some((Dependency::Task(task), state)));
+        }
+        let job = id.as_job();
+        Ok(self
+            .job_dependency_state(job)?
+            .map(|state| (Dependency::Job(job), state)))
+    }
+
+    /// How a job submitted through this origin ended, or `None` without its route
+    ///
+    /// Its events reach this origin's job inbox wherever it queued, and its
+    /// final event names the outcome. A job that never reached its queue
+    /// ended with its route
+    fn job_dependency_state(&self, job: JobId) -> Result<Option<DependencyState>, AppError> {
+        let Some(route) = self.job_route(job)? else {
+            return Ok(None);
+        };
+        let closed = match &route.submission {
+            JobSubmission::Rejected { .. }
+            | JobSubmission::Ended {
+                ending: HeldJobEnding::Refused { .. },
+            } => Some(TaskOutcome::Failed),
+            JobSubmission::Ended { .. } => Some(TaskOutcome::Cancelled),
+            JobSubmission::Unknown | JobSubmission::Accepted | JobSubmission::Held => None,
+        };
+        let outcome = match closed {
+            Some(outcome) => Some(outcome),
+            None => self.job_final_outcome(job)?,
+        };
+        Ok(Some(outcome.map_or(DependencyState::Pending, |outcome| {
+            DependencyState::Ended(outcome.into())
+        })))
+    }
+
+    /// Outcome of the first final event in a job's origin inbox
+    fn job_final_outcome(&self, job: JobId) -> Result<Option<TaskOutcome>, AppError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT event_json FROM resource_job_inbox WHERE job_id = ?1 ORDER BY seq")?;
+        let events = statement
+            .query_map([job.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for json in events {
+            let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
+            if let Some(outcome) = TaskOutcome::from_job_event(envelope.event.event) {
+                return Ok(Some(outcome));
+            }
+        }
+        Ok(None)
+    }
+
+    fn task_dependency_state(&self, task: TaskId) -> Result<Option<DependencyState>, AppError> {
         if self.job_run_link(task)?.is_some() {
             return Err(AppError::Usage {
                 message: format!(
@@ -534,7 +595,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::HeldCancel;
-    use crate::dependency::{DependencyState, HeldCancellation, TaskDependencies, TaskOutcome};
+    use crate::dependency::{
+        Dependencies, Dependency, DependencyState, HeldCancellation, TaskOutcome,
+    };
     use crate::domain::{TaskEnv, TaskId};
     use crate::events::EventPayload;
     use crate::machine::MachineId;
@@ -573,11 +636,11 @@ mod tests {
         })
     }
 
-    fn after() -> TaskDependencies {
-        TaskDependencies::new(vec![TaskId::new()]).unwrap()
+    fn after() -> Dependencies {
+        Dependencies::of_tasks(&[TaskId::new()]).unwrap()
     }
 
-    fn after_terms(after: TaskDependencies) -> ReleaseTerms {
+    fn after_terms(after: Dependencies) -> ReleaseTerms {
         ReleaseTerms {
             after: Some(after),
             machine_wait: None,
@@ -623,8 +686,11 @@ mod tests {
         );
         assert_eq!(store.route_dependencies(route.task).unwrap(), Some(after));
         assert_eq!(
-            store.dependency_states(&[route.task]).unwrap(),
-            vec![(route.task, Some(DependencyState::Pending))]
+            store.dependency_states(&[route.task.into()]).unwrap(),
+            vec![(
+                route.task.into(),
+                Some((Dependency::Task(route.task), DependencyState::Pending))
+            )]
         );
     }
 
@@ -717,10 +783,13 @@ mod tests {
         assert_eq!(event.event, crate::callback::EventKind::TaskCancelled);
         assert_eq!(event.cancel_reason, Some(cause));
         assert_eq!(
-            store.dependency_states(&[route.task]).unwrap(),
+            store.dependency_states(&[route.task.into()]).unwrap(),
             vec![(
-                route.task,
-                Some(DependencyState::Ended(TaskOutcome::Cancelled.into()))
+                route.task.into(),
+                Some((
+                    Dependency::Task(route.task),
+                    DependencyState::Ended(TaskOutcome::Cancelled.into())
+                ))
             )]
         );
         // a cancelled route never launches
@@ -774,10 +843,13 @@ mod tests {
             })
         );
         assert_eq!(
-            store.dependency_states(&[route.task]).unwrap(),
+            store.dependency_states(&[route.task.into()]).unwrap(),
             vec![(
-                route.task,
-                Some(DependencyState::Ended(TaskOutcome::Failed.into()))
+                route.task.into(),
+                Some((
+                    Dependency::Task(route.task),
+                    DependencyState::Ended(TaskOutcome::Failed.into())
+                ))
             )]
         );
     }

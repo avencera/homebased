@@ -115,6 +115,35 @@ pub fn process_identity(pid: Pid) -> io::Result<ProcessIdentity> {
     }
 }
 
+/// Every live process whose `HOMEBASED_TASK_ID` is `marker`
+///
+/// The same scan a sweep starts with, without signalling anything. Processes
+/// whose environment cannot be read, such as another user's, are skipped
+///
+/// # Errors
+///
+/// The process table cannot be listed
+pub fn marked_processes(marker: TaskId) -> io::Result<Vec<ProcessIdentity>> {
+    let mut source = SystemProcesses::new()?;
+    let marker = marker.to_string().into_bytes();
+    let mut found = Vec::new();
+    for pid in source.list()? {
+        let Read::Found(environment) = source.environment(pid) else {
+            continue;
+        };
+        if !environment.carries(&marker) {
+            continue;
+        }
+        if let Read::Found(info) = source.info(pid) {
+            found.push(ProcessIdentity {
+                pid,
+                start: info.start,
+            });
+        }
+    }
+    Ok(found)
+}
+
 /// Consecutive empty scans that finish cleanup even when listed processes
 /// keep exiting before inspection, as they do on a busy machine
 const BUSY_EMPTY_SCANS: u32 = 8;

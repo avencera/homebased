@@ -6,7 +6,12 @@ use serde_json::{Value, json};
 use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
+use crate::fleet::protocol::{
+    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL, SUPPORTED_PROTOCOLS,
+};
 use crate::machine::MachineId;
+use crate::queue::gpu::GpuUuid;
+use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
@@ -84,6 +89,40 @@ pub enum QueueRequest {
         /// Attention checked by the operator
         attention: AttentionId,
     },
+    /// Snooze, turn off, or restore a job's GPU idle alerts; cluster
+    /// protocol 4 and later
+    GpuIdle {
+        /// Operation replay identity
+        operation: OperationId,
+        /// Job whose alerts change
+        job: JobId,
+        /// What to do
+        control: GpuIdleControl,
+    },
+}
+
+impl QueueRequest {
+    /// Lowest cluster protocol whose authorities understand this request
+    #[must_use]
+    pub fn min_protocol(&self) -> ClusterProtocolVersion {
+        match self {
+            Self::GpuIdle { .. } => GPU_IDLE_PROTOCOL,
+            Self::Submit { spec, .. } => submit_protocol(spec),
+            _ => SUPPORTED_PROTOCOLS.min(),
+        }
+    }
+}
+
+/// Lowest cluster protocol whose authorities accept `spec`
+///
+/// An older authority refuses a spec with `gpu_idle` as an unknown field
+#[must_use]
+pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
+    if spec.gpu_idle.is_some() {
+        GPU_IDLE_PROTOCOL
+    } else {
+        SUPPORTED_PROTOCOLS.min()
+    }
 }
 
 /// One machine's resources, by name, with their active runs
@@ -132,6 +171,10 @@ pub struct JobDetail {
     // an older peer sends none
     #[serde(default)]
     pub resources: Vec<Resource>,
+    /// GPU idle silences and per-attempt accounting
+    // an older peer sends none
+    #[serde(default)]
+    pub gpu_idle: Option<GpuIdleDetail>,
 }
 
 /// One historical attempt, including cleanup and the last committed stop cause
@@ -153,6 +196,14 @@ pub struct JobRunView {
     pub stop_cause: Option<StopCause>,
     /// Attributable cleanup result, present once cleanup finished
     pub cleanup: Option<Result<(), CleanupFailure>>,
+    /// UUID of the GPU the attempt launched on, when its resource had one
+    // an older peer sends none
+    #[serde(default)]
+    pub gpu_uuid: Option<GpuUuid>,
+    /// GPU usage of the attempt, computed once when it ended
+    // an older peer sends none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_summary: Option<GpuSummary>,
 }
 
 impl Store {
@@ -162,6 +213,20 @@ impl Store {
         machine: MachineId,
         request: &QueueRequest,
         env: &TaskEnv,
+    ) -> Result<Value, AppError> {
+        self.queue_request_at(machine, request, env, CLUSTER_PROTOCOL_VERSION)
+    }
+
+    /// Apply an operation that arrived over cluster protocol `protocol`
+    ///
+    /// A submit keeps the version, so the queue sends its origin only events
+    /// that version can parse
+    pub fn queue_request_at(
+        &self,
+        machine: MachineId,
+        request: &QueueRequest,
+        env: &TaskEnv,
+        protocol: ClusterProtocolVersion,
     ) -> Result<Value, AppError> {
         let mut result = match request {
             QueueRequest::Resources => serde_json::to_value(ResourceList {
@@ -217,6 +282,7 @@ impl Store {
                     last_stop_cause,
                     events: self.job_events(*job)?,
                     resources,
+                    gpu_idle: Some(self.gpu_idle_detail(*job)?),
                 })?
             }
             QueueRequest::NoticeCurrent { job, seq } => {
@@ -236,6 +302,7 @@ impl Store {
                     origin: *origin,
                     spec: *spec.clone(),
                     env: env.clone(),
+                    origin_protocol: protocol,
                 })?)?
             }
             QueueRequest::Move {
@@ -255,6 +322,17 @@ impl Store {
             } => serde_json::to_value(
                 self.release_resource_attention(machine, *operation, *attention)?,
             )?,
+            QueueRequest::GpuIdle {
+                operation,
+                job,
+                control,
+            } => serde_json::to_value(self.set_gpu_idle_control(
+                machine,
+                *operation,
+                *job,
+                control,
+                chrono::Utc::now(),
+            )?)?,
         };
         if let Some(object) = result.as_object_mut() {
             object.insert("api_version".into(), json!(API_VERSION));
@@ -265,7 +343,8 @@ impl Store {
     /// Every run of the job, even after the resource starts other work
     pub fn job_runs(&self, job: JobId) -> Result<Vec<JobRunView>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT t.id, t.run_number, t.step_index, h.resource_id, h.stop_cause, h.cleanup_json
+            "SELECT t.id, t.run_number, t.step_index, h.resource_id, h.stop_cause, h.cleanup_json,
+                    h.gpu_uuid
              FROM tasks t LEFT JOIN resource_run_history h ON h.task_id = t.id
              WHERE t.resource_job_id = ?1 ORDER BY t.run_number",
         )?;
@@ -278,30 +357,39 @@ impl Store {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(task, run_number, step, resource, cause, cleanup)| {
-                let task: TaskId = task.parse()?;
-                let row = self
-                    .get_task(task)?
-                    .ok_or(AppError::TaskNotFound { id: task })?;
-                Ok(JobRunView {
-                    task,
-                    run_number,
-                    step,
-                    status: row.status(),
-                    outcome: TaskOutcome::from_storage(row.status().as_str()),
-                    resource: resource.map(|value| value.parse()).transpose()?,
-                    stop_cause: cause
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                    cleanup: cleanup
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                })
-            })
+            .map(
+                |(task, run_number, step, resource, cause, cleanup, gpu_uuid)| {
+                    let task: TaskId = task.parse()?;
+                    let row = self
+                        .get_task(task)?
+                        .ok_or(AppError::TaskNotFound { id: task })?;
+                    Ok(JobRunView {
+                        task,
+                        run_number,
+                        step,
+                        status: row.status(),
+                        outcome: TaskOutcome::from_storage(row.status().as_str()),
+                        resource: resource.map(|value| value.parse()).transpose()?,
+                        stop_cause: cause
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        cleanup: cleanup
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        gpu_uuid: gpu_uuid
+                            .as_deref()
+                            .map(GpuUuid::parse)
+                            .transpose()
+                            .map_err(|message| QueueError::Corrupt { message })?,
+                        gpu_summary: self.gpu_summary(task)?,
+                    })
+                },
+            )
             .collect()
     }
 }

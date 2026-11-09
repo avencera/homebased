@@ -21,11 +21,18 @@ impl fmt::Display for ClusterProtocolVersion {
 }
 
 /// Version this build speaks by default
-pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(3);
+pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(4);
+
+/// First version whose origins parse `JOB_GPU_IDLE`; a queue sends the event
+/// only to origins that submitted at this version or later
+pub const GPU_IDLE_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(4);
 
 /// Range this build accepts
+///
+/// Version 3 differs only in lacking `JOB_GPU_IDLE` and the `gpu_idle` queue
+/// command, so peers on the previous release keep working
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {
-    min: CLUSTER_PROTOCOL_VERSION,
+    min: ClusterProtocolVersion(3),
     max: CLUSTER_PROTOCOL_VERSION,
 };
 

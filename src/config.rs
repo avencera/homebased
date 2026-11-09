@@ -143,6 +143,8 @@ pub struct Dashboard {
 pub struct ResourceConfig {
     /// Time to wait before recording a notice for the blocked head
     pub notify_blocked_after: crate::queue::schedule::NoticeThresholds,
+    /// GPU idle alert sampling and thresholds
+    pub gpu_idle: crate::queue::gpu_idle::GpuIdleConfig,
 }
 
 /// Whether this machine joins a fleet
@@ -294,6 +296,85 @@ impl RawDashboard {
 struct RawResource {
     #[serde(default)]
     notify_blocked_after: RawBlockedThresholds,
+    #[serde(default)]
+    gpu_idle: RawGpuIdle,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGpuIdle {
+    #[serde(default)]
+    source: Option<crate::queue::gpu_idle::SourceChoice>,
+    #[serde(default)]
+    netdata_url: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    util_below: Option<u8>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    never_busy_after: Option<String>,
+    #[serde(default)]
+    recover_after: Option<String>,
+    #[serde(default)]
+    remind_after: Option<String>,
+}
+
+impl RawGpuIdle {
+    fn validate(self) -> Result<crate::queue::gpu_idle::GpuIdleConfig, String> {
+        let mut config = crate::queue::gpu_idle::GpuIdleConfig::default();
+        if let Some(source) = self.source {
+            config.source = source;
+        }
+        if let Some(raw) = self.netdata_url {
+            config.netdata_url = raw
+                .parse()
+                .map_err(|error| format!("resource.gpu_idle.netdata_url: {error}"))?;
+        }
+        if let Some(util) = self.util_below {
+            if !(1..=100).contains(&util) {
+                return Err("resource.gpu_idle.util_below must be from 1 to 100".into());
+            }
+            config.defaults.util_below = util;
+        }
+        let defaults = &mut config.defaults;
+        for (name, raw, target) in [
+            ("after", self.after, &mut defaults.after),
+            ("interval", self.interval, &mut defaults.interval),
+            (
+                "recover_after",
+                self.recover_after,
+                &mut defaults.recover_after,
+            ),
+            (
+                "remind_after",
+                self.remind_after,
+                &mut defaults.remind_after,
+            ),
+        ] {
+            if let Some(raw) = raw {
+                *target = positive_duration(&format!("resource.gpu_idle.{name}"), &raw)?;
+            }
+        }
+        if let Some(raw) = self.never_busy_after {
+            defaults.never_busy_after = Some(positive_duration(
+                "resource.gpu_idle.never_busy_after",
+                &raw,
+            )?);
+        }
+        Ok(config)
+    }
+}
+
+fn positive_duration(name: &str, raw: &str) -> Result<std::time::Duration, String> {
+    let duration = humantime::parse_duration(raw).map_err(|error| format!("{name}: {error}"))?;
+    if duration.is_zero() || chrono::Duration::from_std(duration).is_err() {
+        return Err(format!(
+            "{name}: duration must be positive and fit the clock"
+        ));
+    }
+    Ok(duration)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +413,7 @@ impl RawResource {
         }
         Ok(ResourceConfig {
             notify_blocked_after: thresholds,
+            gpu_idle: self.gpu_idle.validate()?,
         })
     }
 }
@@ -520,6 +602,43 @@ mod tests {
             "[resource.notify_blocked_after]\nyeld = \"1m\"\n",
         ] {
             assert!(Config::parse(text).is_err());
+        }
+    }
+
+    #[test]
+    fn gpu_idle_settings_parse_and_refuse_bad_values() {
+        use crate::queue::gpu_idle::{GpuIdleConfig, SourceChoice};
+        use std::time::Duration;
+
+        assert_eq!(
+            Config::parse("").unwrap().resource.gpu_idle,
+            GpuIdleConfig::default()
+        );
+        let config = Config::parse(
+            "[resource.gpu_idle]\nsource = \"nvidia-smi\"\nnetdata_url = \"http://10.0.0.2:19999\"\n\
+             after = \"2m\"\nutil_below = 25\ninterval = \"5s\"\nnever_busy_after = \"3m\"\n",
+        )
+        .unwrap();
+        let idle = config.resource.gpu_idle;
+        assert_eq!(idle.source, SourceChoice::NvidiaSmi);
+        assert_eq!(idle.netdata_url.to_string(), "http://10.0.0.2:19999");
+        assert_eq!(idle.defaults.after, Duration::from_secs(120));
+        assert_eq!(idle.defaults.util_below, 25);
+        assert_eq!(idle.defaults.interval, Duration::from_secs(5));
+        assert_eq!(
+            idle.defaults.never_busy_after,
+            Some(Duration::from_secs(180))
+        );
+        for text in [
+            "[resource.gpu_idle]\nutil_below = 0\n",
+            "[resource.gpu_idle]\nutil_below = 101\n",
+            "[resource.gpu_idle]\nafter = \"0s\"\n",
+            "[resource.gpu_idle]\ninterval = \"soon\"\n",
+            "[resource.gpu_idle]\nsource = \"dcgm\"\n",
+            "[resource.gpu_idle]\nnetdata_url = \"not a url\"\n",
+            "[resource.gpu_idle]\nwindow = \"5m\"\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
         }
     }
 

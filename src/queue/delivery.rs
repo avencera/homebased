@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::dependency::{DependencyOutcome, TaskDependencies};
+use crate::dependency::{Dependencies, Dependency, DependencyOutcome};
 use crate::domain::{TaskId, ThreadId};
 use crate::machine::MachineId;
 use crate::submission::CallbackContext;
@@ -25,7 +25,7 @@ pub enum JobSubmission {
         /// HTTP status of the refusal
         status: u16,
     },
-    /// Saved on the origin until every task in the route's `after` succeeds;
+    /// Saved on the origin until every task or job in the route's `after` succeeds;
     /// the authority has not seen it
     Held,
     /// Ended on the origin before it joined the queue, with its terminal
@@ -36,14 +36,16 @@ pub enum JobSubmission {
     },
 }
 
-/// Why a job held for its `after` tasks ended before it joined the queue
+/// Why a job held for its `after` entries ended before it joined the queue
+///
+/// A dependency ending names its `task` or its `job`; see [`WireHeldJobEnding`]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(try_from = "WireHeldJobEnding", into = "WireHeldJobEnding")]
 pub enum HeldJobEnding {
-    /// A task in `after` ended without succeeding, so the job was cancelled
+    /// A task or job in `after` ended without succeeding, so the job was cancelled
     Dependency {
-        /// The task that ended
-        task: TaskId,
+        /// The task or job that ended
+        dependency: Dependency,
         /// How it ended
         outcome: DependencyOutcome,
     },
@@ -58,18 +60,84 @@ pub enum HeldJobEnding {
     },
 }
 
+/// Saved and sent form of [`HeldJobEnding`]
+///
+/// A task dependency keeps the `task` key it had before `after` took jobs,
+/// and a job dependency puts its UUID under `job` instead, so readers tell
+/// them apart by key without a second `reason`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+enum WireHeldJobEnding {
+    Dependency {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<JobId>,
+        outcome: DependencyOutcome,
+    },
+    Requested,
+    Refused {
+        code: String,
+        message: String,
+    },
+}
+
+impl TryFrom<WireHeldJobEnding> for HeldJobEnding {
+    type Error = String;
+
+    fn try_from(wire: WireHeldJobEnding) -> Result<Self, Self::Error> {
+        Ok(match wire {
+            WireHeldJobEnding::Dependency { task, job, outcome } => {
+                let dependency = match (task, job) {
+                    (Some(task), None) => Dependency::Task(task),
+                    (None, Some(job)) => Dependency::Job(job),
+                    _ => return Err("a dependency ending names exactly one task or job".into()),
+                };
+                Self::Dependency {
+                    dependency,
+                    outcome,
+                }
+            }
+            WireHeldJobEnding::Requested => Self::Requested,
+            WireHeldJobEnding::Refused { code, message } => Self::Refused { code, message },
+        })
+    }
+}
+
+impl From<HeldJobEnding> for WireHeldJobEnding {
+    fn from(ending: HeldJobEnding) -> Self {
+        match ending {
+            HeldJobEnding::Dependency {
+                dependency,
+                outcome,
+            } => {
+                let (task, job) = match dependency {
+                    Dependency::Task(task) => (Some(task), None),
+                    Dependency::Job(job) => (None, Some(job)),
+                };
+                Self::Dependency { task, job, outcome }
+            }
+            HeldJobEnding::Requested => Self::Requested,
+            HeldJobEnding::Refused { code, message } => Self::Refused { code, message },
+        }
+    }
+}
+
 impl HeldJobEnding {
     /// One line for people, such as `task 0199… ended failed`
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::Dependency { task, outcome } => {
-                format!("after task {task} ended {outcome}, so the job never queued")
+            Self::Dependency {
+                dependency,
+                outcome,
+            } => {
+                format!("after {dependency} ended {outcome}, so the job never queued")
             }
-            Self::Requested => "cancelled while it waited for its after tasks".to_owned(),
+            Self::Requested => "cancelled while it waited for its after entries".to_owned(),
             Self::Refused { code, message } => {
                 format!(
-                    "the queue refused the job once its after tasks succeeded: {code}: {message}"
+                    "the queue refused the job once its after entries succeeded: {code}: {message}"
                 )
             }
         }
@@ -97,9 +165,9 @@ pub struct JobRoute {
     pub target: Option<Target>,
     /// Submission result separate from job state
     pub submission: JobSubmission,
-    /// Tasks on this origin that must each succeed before the job is sent
+    /// Tasks and jobs on this origin that must each succeed before the job is sent
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<TaskDependencies>,
+    pub after: Option<Dependencies>,
     /// Whether the job was held, so the origin owns sending it and owes its
     /// thread a final event even when the queue refuses it; set once, when
     /// the route is saved, and kept by every later send

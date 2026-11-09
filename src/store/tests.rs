@@ -771,12 +771,15 @@ fn preempted_run_keeps_its_state_event_and_outcome_and_is_never_success() {
         )
         .unwrap();
     assert_eq!(outcome, "preempted");
-    let states = store.dependency_states(&[id]).unwrap();
+    let states = store.dependency_states(&[id.into()]).unwrap();
     assert_eq!(
         states,
         vec![(
-            id,
-            Some(DependencyState::Ended(TaskOutcome::Preempted.into()))
+            id.into(),
+            Some((
+                crate::dependency::Dependency::Task(id),
+                DependencyState::Ended(TaskOutcome::Preempted.into())
+            ))
         )]
     );
     assert!(!TaskOutcome::Preempted.is_success());
