@@ -37,7 +37,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the power limits are reread
 const POWER_LIMIT_EVERY: Duration = Duration::from_secs(3600);
 /// Shortest gap between two chart listings for one GPU, whether it has no
-/// charts or its charts went stale
+/// charts or its charts went stale or failed
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 /// Netdata stores a sample a moment after it is collected
 const NETDATA_LAG: Duration = Duration::from_secs(2);
@@ -82,6 +82,7 @@ struct Watcher {
     /// When each GPU's charts were last looked for because it had none
     listed_at: HashMap<GpuUuid, Instant>,
     /// When each GPU's charts were last looked for because they went stale
+    /// or failed
     relisted_at: HashMap<GpuUuid, Instant>,
     power_limits: HashMap<GpuUuid, f64>,
     limits_read_at: Option<Instant>,
@@ -207,9 +208,9 @@ impl Watcher {
     /// per [`REDISCOVER_EVERY`]
     ///
     /// Without `stale`, only GPUs that have no charts are looked for. With it,
-    /// the targets' charts went stale and are looked for even when known; that
-    /// limit is kept apart, so a GPU found a moment ago can still be relisted
-    /// once. Only the listed GPUs' charts change
+    /// the targets' charts went stale or failed and are looked for even when
+    /// known; that limit is kept apart, so a GPU found a moment ago can still
+    /// be relisted once. Only the listed GPUs' charts change
     async fn discover(&mut self, targets: &[GpuIdleTarget], stale: bool) {
         let now = Instant::now();
         let mut wanted = Vec::new();
@@ -317,7 +318,7 @@ impl Watcher {
     }
 
     /// Samples since the attempt's last counted bucket, or `None` when
-    /// Netdata failed or its data stayed stale after a fresh listing
+    /// Netdata failed or went stale and a fresh listing found no other charts
     async fn netdata_samples(
         &mut self,
         target: &GpuIdleTarget,
@@ -342,24 +343,30 @@ impl Watcher {
         for attempt in 0..2 {
             let charts = self.charts.get(&target.gpu_uuid).cloned()?;
             let utilization = charts.utilization.as_ref()?;
-            let util = match self.netdata.range(&range(utilization, after, before)).await {
+            let read = match self.netdata.range(&range(utilization, after, before)).await {
+                Ok(series) if series.newest().is_some_and(|newest| newest >= stale_before) => {
+                    Ok(series)
+                }
+                Ok(_) => Err(("Netdata data is stale", "using nvidia-smi".to_owned())),
+                Err(error) => Err(("Netdata query failed", error)),
+            };
+            let util = match read {
                 Ok(series) => series,
-                Err(error) => {
+                Err((what, detail)) => {
+                    // a collector restart or config change can retire the saved
+                    // chart ids, leaving them stale or answering 404, so list the
+                    // charts again and retry only when that found different ones
+                    if attempt == 0 {
+                        self.discover(std::slice::from_ref(target), true).await;
+                        if self.charts.get(&target.gpu_uuid) != Some(&charts) {
+                            continue;
+                        }
+                    }
                     let uuid = target.gpu_uuid.clone();
-                    self.log_once(&uuid, "Netdata query failed", &error);
+                    self.log_once(&uuid, what, &detail);
                     return None;
                 }
             };
-            if util.newest().is_none_or(|newest| newest < stale_before) {
-                if attempt == 0 {
-                    // the collector may have restarted under new chart ids
-                    self.discover(std::slice::from_ref(target), true).await;
-                    continue;
-                }
-                let uuid = target.gpu_uuid.clone();
-                self.log_once(&uuid, "Netdata data is stale", "using nvidia-smi");
-                return None;
-            }
             self.logged.retain(|(uuid, _)| uuid != &target.gpu_uuid);
             self.problems.remove(&target.gpu_uuid);
             let mut samples = Samples {
