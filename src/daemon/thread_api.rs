@@ -45,8 +45,9 @@ use crate::thread_ref::{
     ThreadRef, ThreadSelector,
 };
 use crate::thread_watch::{
-    CompactOutcome, CompactRequest, CompactResponse, ThreadWatch, Threshold, WatchAction,
-    WatchEndReason, WatchId, WatchRequest, WatchTarget, WatchesResponse,
+    CompactOutcome, CompactRequest, CompactResponse, StallAfter, ThreadWatch, Threshold,
+    WatchAction, WatchCondition, WatchEndReason, WatchId, WatchRequest, WatchTarget,
+    WatchesResponse,
 };
 
 const CLUSTER_CONTEXT_PATH: &str = "/v1/cluster/threads/context";
@@ -934,15 +935,31 @@ async fn watch(
     let mut targets = Vec::new();
     // the CLI parses only valid limits, but the socket takes any JSON, and a
     // zero limit fires on every reading and never re-arms
-    if matches!(body.threshold, Threshold::Tokens(0))
-        || matches!(body.threshold, Threshold::Percent(percent) if percent == 0 || percent > 100)
-    {
-        return Err(AppError::Usage {
-            message: format!(
-                "--context-above {} is not a limit a watch can use",
-                body.threshold
-            ),
-        });
+    match body.condition {
+        WatchCondition::ContextAbove(threshold)
+            if matches!(threshold, Threshold::Tokens(0))
+                || matches!(threshold, Threshold::Percent(percent) if percent == 0 || percent > 100) =>
+        {
+            return Err(AppError::Usage {
+                message: format!("--context-above {threshold} is not a limit a watch can use"),
+            });
+        }
+        WatchCondition::StalledAfter(after) if !after.in_range() => {
+            return Err(AppError::Usage {
+                message: format!(
+                    "--stalled-after {after} is outside {}m to {}h",
+                    StallAfter::MIN_MINUTES,
+                    StallAfter::MAX_MINUTES / 60
+                ),
+            });
+        }
+        // compacting is the answer to a full context, not to a thread that stopped
+        WatchCondition::StalledAfter(_) if body.action == WatchAction::Compact => {
+            return Err(AppError::Usage {
+                message: "--stalled-after only notifies; drop --action compact".into(),
+            });
+        }
+        _ => {}
     }
     for thread in threads.iter().chain(&children) {
         if body.action == WatchAction::Compact && thread.host != ThreadHost::T3 {
@@ -954,8 +971,10 @@ async fn watch(
                 host: thread.host,
             });
         }
-        if matches!(body.threshold, Threshold::Percent(_))
-            && thread.provider == Some(Provider::Claude)
+        if matches!(
+            body.condition,
+            WatchCondition::ContextAbove(Threshold::Percent(_))
+        ) && thread.provider == Some(Provider::Claude)
         {
             return Err(AppError::Usage {
                 message: format!(
@@ -999,7 +1018,7 @@ async fn watch(
                 .clone()
                 .unwrap_or_else(|| thread.exact_reference()),
             title: thread.title.clone(),
-            threshold: body.threshold,
+            condition: body.condition,
             action: body.action,
             once: body.once,
             created_at: now,

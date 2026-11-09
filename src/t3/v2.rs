@@ -240,30 +240,34 @@ const TASK_STATES_SQL: &str = "
 // resumes, so it reports nothing on its own. T3 before delivery states
 // records neither, so a task with no state counts only while it runs, and a
 // run with no cohort is open
-const COMPLETION_WAKE_DUE_SQL: &str = "
-    SELECT EXISTS (
-        SELECT 1 FROM orchestration_v2_projection_subagents s
-        JOIN orchestration_v2_projection_nodes n ON n.node_id = s.subagent_id
-        JOIN orchestration_v2_projection_runs r ON r.run_id = s.run_id
-        WHERE s.thread_id = ?1 AND s.origin = 'app_owned' AND json_valid(s.payload_json)
-          AND json_valid(r.payload_json)
-          AND COALESCE(json_extract(r.payload_json, '$.delegatedCompletion.disposition'), 'open')
-              = 'open'
-          AND COALESCE(json_extract(s.payload_json, '$.completionWake'), 'always') = 'always'
-          AND n.status != 'idle'
-          AND (json_extract(s.payload_json, '$.completionDelivery.state') IN ('pending', 'claimed')
-               OR (json_extract(s.payload_json, '$.completionDelivery.state') IS NULL
-                   AND n.status NOT IN
-                       ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back'))))";
+const COMPLETION_WAKES_DUE_SQL: &str = "
+    SELECT DISTINCT s.thread_id FROM orchestration_v2_projection_subagents s
+    JOIN orchestration_v2_projection_nodes n ON n.node_id = s.subagent_id
+    JOIN orchestration_v2_projection_runs r ON r.run_id = s.run_id
+    WHERE s.origin = 'app_owned' AND json_valid(s.payload_json)
+      AND json_valid(r.payload_json)
+      AND COALESCE(json_extract(r.payload_json, '$.delegatedCompletion.disposition'), 'open')
+          = 'open'
+      AND COALESCE(json_extract(s.payload_json, '$.completionWake'), 'always') = 'always'
+      AND n.status != 'idle'
+      AND (json_extract(s.payload_json, '$.completionDelivery.state') IN ('pending', 'claimed')
+           OR (json_extract(s.payload_json, '$.completionDelivery.state') IS NULL
+               AND n.status NOT IN
+                   ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back')))";
 
-/// Whether T3 is due to wake `parent` with a delegated task's report
+/// Every parent thread T3 is due to wake with a delegated task's report
 ///
 /// # Errors
 ///
 /// When the state cannot be read or lacks the delegated task tables
-pub(super) fn completion_wake_due(path: &Path, parent: &str) -> Result<bool, String> {
+pub(super) fn completion_wakes_due(path: &Path) -> Result<HashSet<String>, String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
-    db.query_row(COMPLETION_WAKE_DUE_SQL, [parent], |row| row.get(0))
+    let mut statement = db
+        .prepare(COMPLETION_WAKES_DUE_SQL)
+        .map_err(|error| format!("T3 delegated task wake query failed: {error}"))?;
+    statement
+        .query_map([], |row| row.get(0))
+        .and_then(Iterator::collect)
         .map_err(|error| format!("T3 delegated task wake query failed: {error}"))
 }
 

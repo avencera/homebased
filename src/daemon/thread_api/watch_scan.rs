@@ -2,9 +2,12 @@
 //!
 //! Each machine that runs a watched thread is asked once per scan, for the
 //! watched threads only, so only their transcript or rollout tails are read.
-//! A watch fires when its thread is over the limit and no turn runs, then
-//! stays quiet until the context drops below the limit again. A machine that
-//! does not answer leaves its watches as they are until the next scan
+//! A context watch fires when its thread is over the limit and no turn runs,
+//! then stays quiet until the context drops below the limit again. A stall
+//! watch fires when its thread has sat idle past the grace, with no turn
+//! running and nothing due to wake it, then stays quiet until the thread is
+//! active again. A machine that does not answer leaves its watches as they
+//! are until the next scan
 //!
 //! A watch also ends once nothing it could report is left: when its T3 thread
 //! stays finished, settled or idle after its delegated task ended, for
@@ -30,8 +33,8 @@ use crate::machine::MachineId;
 use crate::store::{WatchRecord, WatchUpdate};
 use crate::thread_ref::{Provider, ThreadContext, ThreadHost, ThreadState};
 use crate::thread_watch::{
-    CompactOutcome, ThreadWatch, Threshold, WatchAction, WatchEndReason, WatchEventKind, WatchId,
-    WatchTarget,
+    CompactOutcome, StallAfter, ThreadWatch, Threshold, WatchAction, WatchCondition,
+    WatchEndReason, WatchEventKind, WatchId, WatchTarget,
 };
 
 /// Scans in a row that must find a watched thread or its caller gone before
@@ -89,6 +92,9 @@ struct Track {
     gone: u8,
     /// When it was first seen finished with the reading it still has
     quiet: Option<Quiet>,
+    /// When a scan last saw it running or waiting, which a stall watch
+    /// counts from as well as `last_active`
+    active_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -282,11 +288,12 @@ fn caller_gone(seen: CallerSeen<'_>, track: &mut Track, clock: Clock) -> bool {
 enum Decision<'a> {
     /// Nothing changes
     Unchanged,
-    /// The context dropped below the limit, so the next climb fires again
+    /// The context dropped below the limit, or the stalled thread is active
+    /// again, so the condition fires again when next met
     Rearm,
     /// The watched thread is gone, put away, or done
     End(WatchEndReason, Option<&'a ThreadContext>),
-    /// Over the limit while no turn runs, and armed
+    /// The condition is met, and the watch armed
     Fire(&'a ThreadContext),
 }
 
@@ -332,40 +339,100 @@ fn decide<'a>(
     }
     // the watch refuses a percent limit on a Claude thread, but a T3 thread
     // can start on Claude after the watch is made, and then it never fires
-    if matches!(watch.threshold, Threshold::Percent(_)) && thread.provider == Some(Provider::Claude)
+    if matches!(
+        watch.condition,
+        WatchCondition::ContextAbove(Threshold::Percent(_))
+    ) && thread.provider == Some(Provider::Claude)
     {
         return Decision::End(WatchEndReason::NoContextWindow, Some(thread));
     }
 
-    // only a known reading on one side of the limit moves the watch: a missing
-    // token count or window, or a reading right at the limit, changes nothing
-    let reading = thread
-        .tokens
-        .zip(watch.threshold.limit(thread.context_window));
-    let over = reading.is_some_and(|(tokens, limit)| tokens > limit);
-    let under = reading.is_some_and(|(tokens, limit)| tokens < limit);
-
-    // a finished thread grows no more, so compacting or reporting it costs
-    // a turn for nothing; it counts again once it starts new work. The thread
-    // a session names is the T3 thread that runs it, so a session watch of a
-    // T3 thread follows the same rule. Only T3 records a thread as done
+    // a finished thread grows no more and owes no report, so compacting or
+    // reporting it costs a turn for nothing; it counts again once it starts
+    // new work. The thread a session names is the T3 thread that runs it, so
+    // a session watch of a T3 thread follows the same rule. Only T3 records a
+    // thread as done
     let finished = thread.done();
     if track.quiet_for(thread, finished, clock) {
         return Decision::End(WatchEndReason::Finished, Some(thread));
     }
+    match watch.condition {
+        WatchCondition::ContextAbove(threshold) => {
+            context_decision(record.armed, thread, threshold, finished)
+        }
+        WatchCondition::StalledAfter(after) => {
+            stall_decision(record.armed, thread, after, finished, track, clock.now)
+        }
+    }
+}
+
+/// [`decide`] for a context watch, once its thread is known to be there
+fn context_decision(
+    armed: bool,
+    thread: &ThreadContext,
+    threshold: Threshold,
+    finished: bool,
+) -> Decision<'_> {
+    // only a known reading on one side of the limit moves the watch: a missing
+    // token count or window, or a reading right at the limit, changes nothing
+    let reading = thread.tokens.zip(threshold.limit(thread.context_window));
+    let over = reading.is_some_and(|(tokens, limit)| tokens > limit);
+    let under = reading.is_some_and(|(tokens, limit)| tokens < limit);
+
     if finished {
         // re-arming is silent, so a watch that fired before the thread
         // finished still fires when new work takes it over the limit again
-        return if !record.armed && under {
+        return if !armed && under {
             Decision::Rearm
         } else {
             Decision::Unchanged
         };
     }
 
-    match record.armed {
+    match armed {
         true if over && !thread.state.busy() => Decision::Fire(thread),
         false if under => Decision::Rearm,
+        _ => Decision::Unchanged,
+    }
+}
+
+/// [`decide`] for a stall watch, once its thread is known to be there
+///
+/// A thread stalls when it is idle, its work is not done, and its last
+/// activity is older than the grace. `idle` already leaves out a thread that
+/// homebased work or a T3 delegated task still owes a wake, which shows as
+/// `waiting`. A fired watch re-arms only on activity: a turn, a wait, or new
+/// session activity within the grace, so one stall fires once
+///
+/// Waiting writes nothing to the session, so after a long wait `last_active`
+/// is old. The wake that ends a wait lands a moment after the thread stops
+/// showing `waiting`, and one failed T3 read can hide a delegated task's wake
+/// too, so the grace also counts from the last scan that saw the thread
+/// running or waiting
+fn stall_decision<'a>(
+    armed: bool,
+    thread: &'a ThreadContext,
+    after: StallAfter,
+    finished: bool,
+    track: &mut Track,
+    now: DateTime<Utc>,
+) -> Decision<'a> {
+    if matches!(thread.state, ThreadState::Running | ThreadState::Waiting) {
+        track.active_at = Some(now);
+    }
+    let since = thread.last_active.max(track.active_at);
+    let recent = since.map(|last| now - last < after.duration());
+    let active = match thread.state {
+        ThreadState::Running | ThreadState::Waiting => true,
+        ThreadState::Idle => recent == Some(true),
+        // a settled thread is finished, and an unknown one tells nothing
+        ThreadState::Settled | ThreadState::Archived | ThreadState::Unknown => false,
+    };
+    let stalled = !finished && thread.state == ThreadState::Idle && recent == Some(false);
+
+    match armed {
+        true if stalled => Decision::Fire(thread),
+        false if active && !finished => Decision::Rearm,
         _ => Decision::Unchanged,
     }
 }
@@ -510,7 +577,7 @@ pub(crate) fn ended(
     }
 }
 
-/// `THREAD_CONTEXT_OVER`, which also ends a `--once` watch
+/// `THREAD_CONTEXT_OVER` or `THREAD_STALLED`, which also ends a `--once` watch
 ///
 /// The event says so itself, so a `--once` watch wakes its caller once and
 /// sends no `THREAD_WATCH_ENDED`
@@ -521,18 +588,12 @@ fn fired(
     compaction: Option<&(CompactOutcome, Option<String>)>,
 ) -> WatchUpdate {
     let end = watch.once.then_some(WatchEndReason::Once);
+    let kind = watch.condition.fires();
     WatchUpdate {
         armed: false,
         events: vec![(
-            WatchEventKind::ContextOver,
-            payload(
-                local,
-                watch,
-                WatchEventKind::ContextOver,
-                Some(thread),
-                compaction,
-                end,
-            ),
+            kind,
+            payload(local, watch, kind, Some(thread), compaction, end),
         )],
         end,
         caller_t3: None,
@@ -554,7 +615,15 @@ pub(crate) fn payload(
     let title = thread
         .and_then(|thread| thread.title.clone())
         .or_else(|| watch.title.clone());
-    let limit = thread.and_then(|thread| watch.threshold.limit(thread.context_window));
+    let condition = match watch.condition {
+        WatchCondition::ContextAbove(threshold) => json!({
+            "context_above": threshold.to_string(),
+            "limit": thread.and_then(|thread| threshold.limit(thread.context_window)),
+        }),
+        WatchCondition::StalledAfter(after) => json!({
+            "stalled_after": after.to_string(),
+        }),
+    };
     let context = thread.map(|thread| {
         json!({
             "tokens": thread.tokens,
@@ -587,10 +656,7 @@ pub(crate) fn payload(
             "provider": thread.and_then(|thread| thread.provider),
             "title": title,
         },
-        "condition": {
-            "context_above": watch.threshold.to_string(),
-            "limit": limit,
-        },
+        "condition": condition,
         "action": watch.action,
         "context": context,
         "compaction": compaction.map(|(outcome, detail)| json!({
@@ -612,7 +678,8 @@ fn next_action(
     reason: Option<WatchEndReason>,
     exact: &str,
 ) -> String {
-    let after = if reason == Some(WatchEndReason::Once) {
+    let once = reason == Some(WatchEndReason::Once);
+    let after = if once {
         "this --once watch ended with this event, so nothing more arrives for it"
     } else {
         "the watch fires again after the context drops below the limit and climbs back"
@@ -641,6 +708,23 @@ fn next_action(
                 "homebased compacts only T3 threads, so tell this session to run /compact or hand its work to a fresh thread; {after}"
             ),
         },
+        WatchEventKind::Stalled => {
+            let grace = match watch.condition {
+                WatchCondition::StalledAfter(after) => after.to_string(),
+                WatchCondition::ContextAbove(_) => "the grace".into(),
+            };
+            let then = if once {
+                "This --once watch ended with this event, so nothing more arrives for it".to_owned()
+            } else {
+                format!(
+                    "The watch fires again only after the thread is active and then stalls again. If it already sent its final report, end the watch with `homebased thread unwatch {}`",
+                    watch.id
+                )
+            };
+            format!(
+                "The thread has sat idle for over {grace} with no turn running and nothing due to wake it, so it may have ended its turn without its report or a registered wait. Read its last turn with `t3_thread_read` or `homebased thread context {exact}`, then send it a message to carry on or report, or hand its work to a fresh thread. {then}"
+            )
+        }
         WatchEventKind::Ended => match reason {
             Some(WatchEndReason::Once) => {
                 "The --once watch fired and ended; nothing more will arrive for it".into()
@@ -693,7 +777,8 @@ mod tests {
     use crate::t3::ThreadDetails;
     use crate::thread_ref::{ThreadContext, ThreadHost, ThreadState};
     use crate::thread_watch::{
-        ThreadWatch, Threshold, WatchAction, WatchEndReason, WatchEventKind, WatchId, WatchTarget,
+        StallAfter, ThreadWatch, Threshold, WatchAction, WatchCondition, WatchEndReason,
+        WatchEventKind, WatchId, WatchTarget,
     };
 
     fn watch(caller: ThreadId, target: WatchTarget, once: bool) -> ThreadWatch {
@@ -712,7 +797,7 @@ mod tests {
             target,
             reference: "thread_mcp:launch:feed".into(),
             title: Some("child".into()),
-            threshold: Threshold::Tokens(100_000),
+            condition: WatchCondition::ContextAbove(Threshold::Tokens(100_000)),
             action: WatchAction::Notify,
             once,
             created_at: Utc::now(),
@@ -804,8 +889,20 @@ mod tests {
             id: WatchId,
             now: &[ThreadContext],
         ) -> Vec<WatchEventKind> {
+            self.step_at(store, local, id, now, at(0))
+        }
+
+        /// [`Self::step`] at the time `clock` says
+        fn step_at(
+            &mut self,
+            store: &Store,
+            local: MachineId,
+            id: WatchId,
+            now: &[ThreadContext],
+            clock: Clock,
+        ) -> Vec<WatchEventKind> {
             let record: WatchRecord = store.watch_record(id).unwrap().unwrap();
-            let update = match self.decide(&record, now, at(0)) {
+            let update = match self.decide(&record, now, clock) {
                 Decision::Unchanged => return Vec::new(),
                 Decision::Rearm => WatchUpdate {
                     armed: true,
@@ -822,6 +919,104 @@ mod tests {
                 .into_iter()
                 .map(|event| event.kind)
                 .collect()
+        }
+    }
+
+    #[test]
+    fn a_stall_watch_fires_once_per_idle_stretch_and_never_on_a_waiting_or_done_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let local = MachineId::new();
+        let caller = ThreadId(uuid::Uuid::now_v7());
+        let mut stall = watch(caller, t3_target(local), false);
+        stall.condition = WatchCondition::StalledAfter("20m".parse::<StallAfter>().unwrap());
+        // a context watch on the same thread is a second watch
+        let (context, _) = store
+            .upsert_watch(&watch(caller, t3_target(local), false))
+            .unwrap();
+        let (record, created) = store.upsert_watch(&stall).unwrap();
+        assert!(created);
+        assert_ne!(record.watch.id, context.watch.id);
+        let id = record.watch.id;
+        let mut scans = Scans::default();
+
+        let seen = |state, active_at: i64| {
+            let mut thread = thread(local, 10, state);
+            thread.last_active = Some(start() + TimeDelta::minutes(active_at));
+            [thread]
+        };
+        let mut step =
+            |now: &[ThreadContext], minute| scans.step_at(&store, local, id, now, at(minute));
+        assert!(step(&seen(ThreadState::Idle, 0), 10).is_empty());
+        assert_eq!(
+            step(&seen(ThreadState::Idle, 0), 25),
+            [WatchEventKind::Stalled]
+        );
+        // the same idle stretch fires once
+        assert!(step(&seen(ThreadState::Idle, 0), 40).is_empty());
+        // activity re-arms it silently, and the next stall fires again
+        assert!(step(&seen(ThreadState::Running, 45), 45).is_empty());
+        assert!(step(&seen(ThreadState::Idle, 46), 60).is_empty());
+        assert_eq!(
+            step(&seen(ThreadState::Idle, 46), 70),
+            [WatchEventKind::Stalled]
+        );
+        // homebased work or a delegated task owes it a wake, so it is no
+        // stall; a long wait writes nothing, so the wake that ends it finds an
+        // old `last_active`, and the grace counts from the last scan that saw
+        // it waiting
+        assert!(step(&seen(ThreadState::Waiting, 46), 80).is_empty());
+        assert!(step(&seen(ThreadState::Waiting, 46), 120).is_empty());
+        assert!(step(&seen(ThreadState::Idle, 46), 121).is_empty());
+        assert!(step(&seen(ThreadState::Idle, 46), 135).is_empty());
+        assert_eq!(
+            step(&seen(ThreadState::Idle, 46), 141),
+            [WatchEventKind::Stalled]
+        );
+
+        let event = store.settled_watch_events(id).unwrap();
+        assert!(event.is_empty(), "nothing settles events here");
+        let pending = store.pending_watch_events().unwrap();
+        let (_, first) = pending.iter().find(|(watch, _)| watch.id == id).unwrap();
+        assert_eq!(first.payload["event"], "THREAD_STALLED");
+        assert_eq!(first.payload["condition"]["stalled_after"], "20m");
+        assert!(first.wakes_caller(None));
+        let next = first.payload["next_action"].as_str().unwrap();
+        assert!(
+            next.contains(&format!("homebased thread unwatch {id}")),
+            "{next}"
+        );
+
+        // a delegate whose task ended, or a settled thread, owes nothing
+        for finish in [
+            |thread: &mut ThreadContext| thread.task_finished = true,
+            |thread: &mut ThreadContext| {
+                thread.settled = true;
+                thread.state = ThreadState::Settled;
+            },
+        ] {
+            let mut quiet = watch(caller, t3_target(local), false);
+            quiet.condition = stall.condition;
+            quiet.reference = format!("quiet-{}", WatchId::new());
+            quiet.target = WatchTarget::T3 {
+                machine: local,
+                t3_thread: quiet.reference.clone(),
+            };
+            let (record, _) = store.upsert_watch(&quiet).unwrap();
+            let mut done = seen(ThreadState::Idle, 0);
+            finish(&mut done[0]);
+            let mut scans = Scans::default();
+            assert!(
+                scans
+                    .step_at(&store, local, record.watch.id, &done, at(30))
+                    .is_empty()
+            );
+            assert_eq!(
+                scans.step_at(&store, local, record.watch.id, &done, at(95)),
+                [WatchEventKind::Ended]
+            );
+            let ended = store.watch_record(record.watch.id).unwrap().unwrap();
+            assert_eq!(ended.end_reason, Some(WatchEndReason::Finished));
         }
     }
 
@@ -1302,7 +1497,7 @@ mod tests {
         let target = t3_target(local);
         let with = |threshold, armed| {
             let mut watch = watch(caller, target.clone(), false);
-            watch.threshold = threshold;
+            watch.condition = WatchCondition::ContextAbove(threshold);
             record(watch, armed)
         };
         let reading = |tokens: Option<u64>, window: Option<u64>| {
@@ -1339,7 +1534,7 @@ mod tests {
     fn a_percent_watch_ends_once_its_thread_runs_claude() {
         let local = MachineId::new();
         let mut watch = watch(ThreadId(uuid::Uuid::now_v7()), t3_target(local), false);
-        watch.threshold = Threshold::Percent(80);
+        watch.condition = WatchCondition::ContextAbove(Threshold::Percent(80));
         let record = record(watch, true);
         let mut scans = Scans::default();
         // no session yet, so no provider: the watch waits for the first turn
@@ -1377,9 +1572,9 @@ mod tests {
         let caller = ThreadId(uuid::Uuid::now_v7());
         let target = t3_target(local);
         let mut notify = watch(caller, target.clone(), false);
-        notify.threshold = Threshold::Tokens(200_000);
+        notify.condition = WatchCondition::ContextAbove(Threshold::Tokens(200_000));
         let mut compact = watch(caller, target, false);
-        compact.threshold = Threshold::Tokens(250_000);
+        compact.condition = WatchCondition::ContextAbove(Threshold::Tokens(250_000));
         compact.action = WatchAction::Compact;
         let (notify, created) = store.upsert_watch(&notify).unwrap();
         assert!(created);

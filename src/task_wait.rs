@@ -418,8 +418,8 @@ pub fn job_ends_wait(kind: JobEventKind) -> bool {
 
 /// Whether an event wakes a `--final-only` wait
 ///
-/// Every watch event does: `THREAD_CONTEXT_OVER` is the reason to watch, and
-/// `THREAD_WATCH_ENDED` is the watch's last event
+/// Every watch event does: `THREAD_CONTEXT_OVER` and `THREAD_STALLED` are the
+/// reason to watch, and `THREAD_WATCH_ENDED` is the watch's last event
 #[must_use]
 pub fn wakes_final_only(frame: &WaitFrame) -> bool {
     match frame {

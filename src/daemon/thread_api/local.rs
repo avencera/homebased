@@ -16,7 +16,7 @@ use crate::domain::ThreadId;
 use crate::machine::MachineId;
 use crate::store::WorkerThread;
 use crate::t3::{
-    ProviderThread, T3Env, T3Thread, completion_wake_due, environment_id, thread_index,
+    ProviderThread, T3Env, T3Thread, completion_wakes_due, environment_id, thread_index,
 };
 use crate::thread_ref::{
     ACTIVE_WITHOUT_T3, Caller, Provider, ThreadContext, ThreadHost, ThreadRef, ThreadState, t3_link,
@@ -44,6 +44,8 @@ pub(crate) struct LocalIndex {
     sources: LocalSources,
     environment: Option<String>,
     t3: Vec<T3Thread>,
+    /// T3 threads here that T3 is due to wake with a delegated task's report
+    delegate_wakes: HashSet<String>,
     // walking every Codex session or Claude project is skipped unless a lookup needs it
     rollouts: OnceLock<CodexRollouts>,
     claude: OnceLock<Vec<ThreadId>>,
@@ -68,6 +70,7 @@ impl LocalIndex {
         let t3 = thread_index(&sources.env)?;
         Ok(Self {
             environment: environment_id(&sources.env),
+            delegate_wakes: completion_wakes_due(&sources.env),
             sources,
             t3,
             rollouts: OnceLock::new(),
@@ -246,7 +249,7 @@ impl LocalIndex {
         let owed_events = std::iter::once(session)
             .chain(current.map(ProviderThread::id))
             .any(|session| self.sources.waiting.contains(&session));
-        owed_events || t3.is_some_and(|t3| completion_wake_due(&self.sources.env, t3) == Some(true))
+        owed_events || t3.is_some_and(|t3| self.delegate_wakes.contains(t3))
     }
 
     /// The task worker of `session`; follow-ups share a Codex thread, and the
@@ -283,7 +286,10 @@ impl LocalIndex {
                     }
                 }
         });
-        let waiting = session_id.is_some_and(|id| self.sources.waiting.contains(&id));
+        // a delegated task T3 will report wakes the thread as surely as a
+        // homebased task, so a coordinator waiting on its delegates is not idle
+        let waiting = session_id.is_some_and(|id| self.sources.waiting.contains(&id))
+            || t3.is_some_and(|t3| self.delegate_wakes.contains(&t3.id));
         let host = match (t3, worker) {
             (Some(_), _) => ThreadHost::T3,
             (None, Some(_)) => ThreadHost::Worker,
@@ -758,9 +764,16 @@ mod tests {
         let owed = |waiting: &[&str]| {
             let mut sources = sources(home);
             sources.waiting = waiting.iter().map(|id| id.parse().unwrap()).collect();
-            LocalIndex::load(sources, Utc::now())
-                .unwrap()
-                .wake_owed(session, Some(A))
+            let index = LocalIndex::load(sources, Utc::now()).unwrap();
+            let owed = index.wake_owed(session, Some(A));
+            // the wake shows in the root's own state too, so a stall watch
+            // does not take a root waiting on a delegate for a stalled one
+            let root = index.find(&ThreadRef::parse(&format!("thread_{A}")).unwrap(), false);
+            let shown_waiting = root.first().map(|root| root.state) == Some(ThreadState::Waiting);
+            if waiting.is_empty() || waiting == [SESSION_A] {
+                assert_eq!(shown_waiting, owed, "{waiting:?}");
+            }
+            owed
         };
         // a T3 before delivery states counts a running task
         let state = V2State::create(&state_path(home))

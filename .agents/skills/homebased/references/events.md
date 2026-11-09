@@ -33,7 +33,7 @@ For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENT
 
 ## Thread watch events
 
-`THREAD_CONTEXT_OVER` and `THREAD_WATCH_ENDED` come from `homebased thread watch` ([threads.md](threads.md)). They identify a watch, not a task. Deduplicate by `(watch, seq)`. Events that ask nothing of the caller never wake it, and only a running `homebased wait` prints them: a `THREAD_CONTEXT_OVER` whose `compaction.outcome` is `started` on a thread other than the caller, one that started on the caller itself while a delegated task's report from T3, or a homebased task or job, is still due to wake it, and a `THREAD_WATCH_ENDED` whose `reason` is `unwatched`, `finished`, or `caller_gone`. A `--once` watch ends with its `THREAD_CONTEXT_OVER`, which has `watch_ended: true`, and sends no `THREAD_WATCH_ENDED`.
+`THREAD_CONTEXT_OVER`, `THREAD_STALLED`, and `THREAD_WATCH_ENDED` come from `homebased thread watch` ([threads.md](threads.md)). They identify a watch, not a task. Deduplicate by `(watch, seq)`. Events that ask nothing of the caller never wake it, and only a running `homebased wait` prints them: a `THREAD_CONTEXT_OVER` whose `compaction.outcome` is `started` on a thread other than the caller, one that started on the caller itself while a delegated task's report from T3, or a homebased task or job, is still due to wake it, and a `THREAD_WATCH_ENDED` whose `reason` is `unwatched`, `finished`, or `caller_gone`. A `--once` watch ends with its `THREAD_CONTEXT_OVER` or `THREAD_STALLED`, which has `watch_ended: true`, and sends no `THREAD_WATCH_ENDED`.
 
 | Key | Meaning |
 | --- | --- |
@@ -42,18 +42,19 @@ For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENT
 | `thread` | The thread the event was addressed to. |
 | `machine` | UUID of the machine that keeps the watch. |
 | `target` | The watched thread: `reference` as given, `exact_reference` for later commands, `machine`, `machine_name`, `host`, `t3_thread`, `t3_link`, `session`, `provider`, `title`. |
-| `condition` | `context_above` as given and `limit` in tokens. |
+| `condition` | For a context watch, `context_above` as given and `limit` in tokens. For a stall watch, `stalled_after` as given, such as `20m`; `context.last_active` says when the thread last did anything. |
 | `action` | `notify` or `compact`. |
 | `context` | `tokens`, `tokens_estimated`, `context_window`, `percent`, `state`, `task_finished`, `settled`, `last_active`, `cache_warm`, `compacted_at`, or `null` when the thread is gone. |
 | `compaction` | With `--action compact`: `outcome` (`started`, `not_found`, `refused`, `unavailable`) and `detail`. Otherwise `null`. |
 | `reason` | On `THREAD_WATCH_ENDED`: `unwatched`, `archived`, `deleted`, `session_gone`, `no_context_window` (a percent watch whose thread runs Claude Code, which records no context window), `finished` (the T3 thread stayed done, settled or finished with its delegated task and running no turn, for an hour without activity, even while it showed `waiting`), or `caller_gone` (the T3 thread the events go to was archived or deleted, or stayed done for an hour without activity). Otherwise `null`. |
-| `watch_ended` | Whether this event ends the watch: `true` on `THREAD_WATCH_ENDED` and on the `THREAD_CONTEXT_OVER` of a `--once` watch, `false` otherwise. Nothing more arrives for a watch after an event with `true`. |
-| `end_reason` | Why the watch ended with this event: `once` on a `--once` watch's `THREAD_CONTEXT_OVER`, the same as `reason` on `THREAD_WATCH_ENDED`, otherwise `null`. |
+| `watch_ended` | Whether this event ends the watch: `true` on `THREAD_WATCH_ENDED` and on the firing event of a `--once` watch, `false` otherwise. Nothing more arrives for a watch after an event with `true`. |
+| `end_reason` | Why the watch ended with this event: `once` on a `--once` watch's firing event, the same as `reason` on `THREAD_WATCH_ENDED`, otherwise `null`. |
 | `next_action` | Suggested step, as a sentence. |
 
 | `event` | What happened | Do this |
 | --- | --- | --- |
 | `THREAD_CONTEXT_OVER` | The context climbed over the limit while the thread was not running a turn and was not done (settled, or finished with its delegated task, even while it showed `waiting`). It fires again only after a reading shows the context below the limit and it climbs back. With `watch_ended: true`, a `--once` watch fired and ended. | With `compaction.outcome: "started"`, nothing; on another thread only a running `homebased wait` sees this one, and on your own thread it arrives after the compaction only when nothing else is due to wake you, so pick the work back up. Otherwise compact a T3 thread with `homebased thread compact <target.exact_reference>`, or hand its work to a fresh thread. Ask a session outside T3 to run `/compact`. |
+| `THREAD_STALLED` | The watched thread sat `idle` past `condition.stalled_after`: no turn running, nothing due to wake it, and not done. It fires once per idle stretch, and again only after the thread is active and stalls again. With `watch_ended: true`, a `--once` watch fired and ended. | Read the thread's last turn (`t3_thread_read`, or `homebased thread context <target.exact_reference>`). If it ended without its report, send it a message to carry on or report, or hand its work to a fresh thread. If it already reported, run `homebased thread unwatch <watch>`. |
 | `THREAD_WATCH_ENDED` | The watch's last event, except after a `--once` watch fired. | Nothing, unless `reason` is `archived`, `deleted`, or `session_gone` and the thread still matters; then watch its replacement. `unwatched` and `finished` reach only a running `homebased wait`; for `finished`, watch the thread again only if it takes new work. For `no_context_window`, watch the thread again with a token count such as `--context-above 150k`. `caller_gone` reaches only a running `homebased wait`; nothing to do. No watch event of a caller whose T3 thread is archived or deleted is delivered; only a running wait gets it. |
 
 ## Event table

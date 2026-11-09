@@ -380,11 +380,31 @@ fn a_watch_is_listed_reused_and_ends_through_wait() {
     let higher = ok(&watch(&["--context-above", "200k"]));
     assert_eq!(higher["watches"][0]["created"], true);
     assert_eq!(
-        higher["watches"][0]["threshold"],
-        json!({ "unit": "tokens", "value": 200_000 })
+        higher["watches"][0]["condition"],
+        json!({ "context_above": { "unit": "tokens", "value": 200_000 } })
     );
     let higher = higher["watches"][0]["watch"].as_str().unwrap().to_owned();
     assert_ne!(higher, id);
+    // a stall watch takes a whole grace in range, only notifies, and is a
+    // watch of its own beside the context watches
+    refused(&watch(&["--stalled-after", "2m"]), 2, "");
+    refused(
+        &watch(&["--stalled-after", "20m", "--context-above", "100k"]),
+        2,
+        "",
+    );
+    refused(
+        &watch(&["--stalled-after", "20m", "--action", "compact"]),
+        2,
+        "usage",
+    );
+    let stall = ok(&watch(&["--stalled-after", "1h30m"]));
+    assert_eq!(
+        stall["watches"][0]["condition"],
+        json!({ "stalled_after": 90 })
+    );
+    let stall = stall["watches"][0]["watch"].as_str().unwrap().to_owned();
+    ok(&h.thread_cmd(Some(THREAD), &["unwatch", &stall]));
 
     let listed = ok(&h.thread_cmd(Some(THREAD), &["watches"]));
     assert_eq!(listed["watches"].as_array().unwrap().len(), 2, "{listed}");
@@ -979,6 +999,32 @@ fn children_watches_and_live_context_leave_out_delegates_that_are_done() {
         .map(|watch| watch["target"].clone())
         .collect();
     assert_eq!(names(&Value::Array(targets)), live, "{watched}");
+}
+
+#[test]
+fn a_thread_idle_past_its_grace_sends_one_stall_event() {
+    let mut h = Harness::new();
+    // its last activity is 10 minutes old
+    h.terminal_session(TERMINAL, 1_000);
+    let watched = ok(&h.thread_cmd(Some(THREAD), &["watch", TERMINAL, "--stalled-after", "5m"]));
+    let watch = watched["watches"][0]["watch"].as_str().unwrap().to_owned();
+    h.restart_daemon_with_env(&[("HOMEBASED_TEST_SCAN_SECS", "1")]);
+
+    assert!(
+        wait_until(Duration::from_secs(20), || !h
+            .watch_events(&watch)
+            .is_empty()),
+        "the idle thread did not stall"
+    );
+    // later scans see the same idle stretch, so it fires once
+    std::thread::sleep(Duration::from_secs(3));
+    let events = h.watch_events(&watch);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let fired = &events[0].0;
+    assert_eq!(fired["event"], "THREAD_STALLED", "{fired}");
+    assert_eq!(fired["condition"]["stalled_after"], "5m", "{fired}");
+    assert_eq!(fired["context"]["state"], "idle", "{fired}");
+    assert_eq!(fired["watch_ended"], false, "{fired}");
 }
 
 #[test]

@@ -1,7 +1,9 @@
-//! Thread watches: a stored condition on another thread's context that sends
-//! `THREAD_CONTEXT_OVER` to the thread that asked, and `THREAD_WATCH_ENDED`
-//! when the watch ends. A `--once` watch ends with the event that fires it,
-//! which says so in `watch_ended`, and sends no separate end event
+//! Thread watches: a stored condition on another thread that sends the thread
+//! that asked `THREAD_CONTEXT_OVER` when the context passes a limit, or
+//! `THREAD_STALLED` when the thread sits idle with nothing due to wake it, and
+//! `THREAD_WATCH_ENDED` when the watch ends. A `--once` watch ends with the
+//! event that fires it, which says so in `watch_ended`, and sends no separate
+//! end event
 //!
 //! A watch lives on the machine of the thread that made it, which delivers its
 //! events like a GPU queue job's. The watched thread may run on any Fleet
@@ -13,7 +15,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -25,6 +27,9 @@ use crate::thread_ref::{Caller, Provider, ThreadContext, ThreadSelector, short_t
 
 /// Event a watch sends when its thread's context is over the limit
 pub const CONTEXT_OVER_EVENT: &str = "THREAD_CONTEXT_OVER";
+
+/// Event a stall watch sends when its thread sits idle with nothing due to wake it
+pub const STALLED_EVENT: &str = "THREAD_STALLED";
 
 /// Final event of every watch but a `--once` watch that fired
 pub const WATCH_ENDED_EVENT: &str = "THREAD_WATCH_ENDED";
@@ -143,11 +148,142 @@ impl fmt::Display for Threshold {
     }
 }
 
+/// How long a thread must sit idle, with no turn running and nothing due to
+/// wake it, before a stall watch fires; whole minutes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StallAfter(u32);
+
+impl StallAfter {
+    /// Shortest grace a watch takes; the scan runs each minute, and a thread
+    /// between two quick turns must not count as stalled
+    pub const MIN_MINUTES: u32 = 5;
+
+    /// Longest grace a watch takes
+    pub const MAX_MINUTES: u32 = 24 * 60;
+
+    /// The grace in whole minutes
+    #[must_use]
+    pub const fn minutes(self) -> u32 {
+        self.0
+    }
+
+    /// The grace as a duration
+    #[must_use]
+    pub fn duration(self) -> TimeDelta {
+        TimeDelta::minutes(i64::from(self.0))
+    }
+
+    /// Whether the grace is one a watch can use, since the socket takes any JSON
+    #[must_use]
+    pub const fn in_range(self) -> bool {
+        self.0 >= Self::MIN_MINUTES && self.0 <= Self::MAX_MINUTES
+    }
+}
+
+impl FromStr for StallAfter {
+    type Err = AppError;
+
+    /// `20m`, `20` (minutes), `1h`, or `1h30m`
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let usage = || AppError::Usage {
+            message: format!(
+                "--stalled-after takes minutes (20m or 20), hours (1h), or both (1h30m), from {}m to {}h, not {raw:?}",
+                Self::MIN_MINUTES,
+                Self::MAX_MINUTES / 60
+            ),
+        };
+        let text = raw.trim().to_ascii_lowercase();
+        let (hours, rest) = match text.split_once('h') {
+            Some((hours, rest)) => (hours.trim().parse::<u32>().map_err(|_| usage())?, rest),
+            None => (0, text.as_str()),
+        };
+        let rest = rest.trim();
+        let minutes = match rest.strip_suffix('m').unwrap_or(rest).trim() {
+            // a bare `1h` has nothing after it
+            "" if hours > 0 => 0,
+            minutes => minutes.parse::<u32>().map_err(|_| usage())?,
+        };
+        let total = hours
+            .checked_mul(60)
+            .and_then(|hours| hours.checked_add(minutes))
+            .map(Self)
+            .ok_or_else(usage)?;
+        if total.in_range() {
+            Ok(total)
+        } else {
+            Err(usage())
+        }
+    }
+}
+
+impl fmt::Display for StallAfter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.0 / 60, self.0 % 60) {
+            (0, minutes) => write!(f, "{minutes}m"),
+            (hours, 0) => write!(f, "{hours}h"),
+            (hours, minutes) => write!(f, "{hours}h{minutes}m"),
+        }
+    }
+}
+
+/// What a watch waits for
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchCondition {
+    /// The context passes this limit while no turn runs; sends
+    /// `THREAD_CONTEXT_OVER`, and again only after it drops below the limit
+    ContextAbove(Threshold),
+    /// The thread sits idle this long, with no turn running and nothing due to
+    /// wake it, while its work is not done; sends `THREAD_STALLED`, and again
+    /// only after the thread is active again
+    StalledAfter(StallAfter),
+}
+
+impl WatchCondition {
+    /// The context limit, for a context watch
+    #[must_use]
+    pub const fn threshold(self) -> Option<Threshold> {
+        match self {
+            Self::ContextAbove(threshold) => Some(threshold),
+            Self::StalledAfter(_) => None,
+        }
+    }
+
+    /// The event this watch fires with
+    #[must_use]
+    pub const fn fires(self) -> WatchEventKind {
+        match self {
+            Self::ContextAbove(_) => WatchEventKind::ContextOver,
+            Self::StalledAfter(_) => WatchEventKind::Stalled,
+        }
+    }
+
+    /// Part of [`ThreadWatch::key`]; a context watch keeps the key it had
+    /// before stall watches, so a repeat still finds it
+    fn key(self) -> String {
+        match self {
+            Self::ContextAbove(Threshold::Tokens(tokens)) => format!("tokens:{tokens}"),
+            Self::ContextAbove(Threshold::Percent(percent)) => format!("percent:{percent}"),
+            Self::StalledAfter(after) => format!("stalled:{}", after.minutes()),
+        }
+    }
+}
+
+impl fmt::Display for WatchCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContextAbove(threshold) => write!(f, "above {threshold}"),
+            Self::StalledAfter(after) => write!(f, "stalled after {after}"),
+        }
+    }
+}
+
 /// What the daemon does when a watch fires
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchAction {
-    /// Send `THREAD_CONTEXT_OVER` and leave the decision to the caller
+    /// Send the event and leave the decision to the caller
     #[default]
     Notify,
     /// Compact the thread, then send `THREAD_CONTEXT_OVER` with the outcome
@@ -237,13 +373,16 @@ pub enum WatchEventKind {
     /// The context is over the limit while the thread is idle
     #[serde(rename = "THREAD_CONTEXT_OVER")]
     ContextOver,
+    /// The thread sat idle past the grace with nothing due to wake it
+    #[serde(rename = "THREAD_STALLED")]
+    Stalled,
     /// The watch ended; always its last event
     #[serde(rename = "THREAD_WATCH_ENDED")]
     Ended,
 }
 
 /// Whether a watch event with `payload` is its watch's last:
-/// `THREAD_WATCH_ENDED`, or the `THREAD_CONTEXT_OVER` that ends a `--once` watch
+/// `THREAD_WATCH_ENDED`, or the event that fires and ends a `--once` watch
 #[must_use]
 pub fn ends_watch(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
     kind == WatchEventKind::Ended
@@ -273,6 +412,8 @@ pub fn wakes_caller(
         WatchEventKind::ContextOver => {
             !compaction_started(payload) || own_compaction(kind, payload, caller_t3)
         }
+        // a stall is the one thing the caller cannot learn any other way
+        WatchEventKind::Stalled => true,
         WatchEventKind::Ended => {
             let reason = payload
                 .get("reason")
@@ -356,8 +497,8 @@ pub struct ThreadWatch {
     pub reference: String,
     /// Title when the watch was made
     pub title: Option<String>,
-    /// Limit the context must pass
-    pub threshold: Threshold,
+    /// What the watch waits for
+    pub condition: WatchCondition,
     /// What firing does
     pub action: WatchAction,
     /// End after the first firing
@@ -369,20 +510,18 @@ pub struct ThreadWatch {
 impl ThreadWatch {
     /// Key that makes a repeat of the same watch by one caller that watch
     ///
-    /// Two limits or actions on one thread are two watches, so a caller can be
-    /// told at one size and have the thread compacted at a larger one; only a
-    /// retry of all four finds the existing watch
+    /// Two conditions or actions on one thread are two watches, so a caller
+    /// can be told at one size and have the thread compacted at a larger one,
+    /// and watch the same thread for a stall; only a retry of all four finds
+    /// the existing watch
     #[must_use]
     pub fn key(&self) -> String {
-        let threshold = match self.threshold {
-            Threshold::Tokens(tokens) => format!("tokens:{tokens}"),
-            Threshold::Percent(percent) => format!("percent:{percent}"),
-        };
+        let condition = self.condition.key();
         let action = match self.action {
             WatchAction::Notify => "notify",
             WatchAction::Compact => "compact",
         };
-        format!("{}/{threshold}/{action}", self.target.key())
+        format!("{}/{condition}/{action}", self.target.key())
     }
 }
 
@@ -399,14 +538,14 @@ pub struct WatchView {
     pub reference: String,
     /// Title when the watch was made
     pub title: Option<String>,
-    /// Limit the context must pass
-    pub threshold: Threshold,
+    /// What the watch waits for
+    pub condition: WatchCondition,
     /// What firing does
     pub action: WatchAction,
     /// End after the first firing
     pub once: bool,
-    /// Whether the next climb over the limit fires; false until the context
-    /// drops below it again
+    /// Whether the condition fires when next met; false after a firing until
+    /// the context drops below the limit, or the stalled thread is active again
     pub armed: bool,
     /// Last event sequence
     pub seq: u64,
@@ -431,14 +570,19 @@ impl WatchView {
             WatchAction::Compact => "compact",
         };
         let once = if self.once { ", once" } else { "" };
-        let status = match (self.end_reason, self.armed) {
-            (Some(reason), _) => format!("ended: {}", end_reason_str(reason)),
-            (None, true) => "armed".into(),
-            (None, false) => "fired, re-arms below the limit".into(),
+        let status = match (self.end_reason, self.armed, self.condition) {
+            (Some(reason), _, _) => format!("ended: {}", end_reason_str(reason)),
+            (None, true, _) => "armed".into(),
+            (None, false, WatchCondition::ContextAbove(_)) => {
+                "fired, re-arms below the limit".into()
+            }
+            (None, false, WatchCondition::StalledAfter(_)) => {
+                "fired, re-arms once the thread is active".into()
+            }
         };
         format!(
-            "{} {title} above {} ({action}{once}) {status} [{}]",
-            self.watch, self.threshold, self.reference
+            "{} {title} {} ({action}{once}) {status} [{}]",
+            self.watch, self.condition, self.reference
         )
     }
 }
@@ -519,8 +663,8 @@ pub struct WatchRequest {
     /// Look only on this machine, by name or UUID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
-    /// Limit the context must pass
-    pub threshold: Threshold,
+    /// What the watch waits for
+    pub condition: WatchCondition,
     /// What firing does
     #[serde(default)]
     pub action: WatchAction,
@@ -599,7 +743,7 @@ pub struct CompactResponse {
 mod tests {
     use serde_json::json;
 
-    use super::{Threshold, WatchEventKind, wakes_caller};
+    use super::{StallAfter, Threshold, WatchEventKind, wakes_caller};
 
     #[test]
     fn only_events_that_ask_something_of_the_caller_wake_it() {
@@ -669,6 +813,33 @@ mod tests {
         for reason in ["archived", "deleted", "session_gone", "no_context_window"] {
             assert!(ended(reason), "{reason}");
         }
+    }
+
+    #[test]
+    fn stall_graces_read_minutes_and_hours_within_range() {
+        let parse = |text: &str| text.parse::<StallAfter>().ok().map(StallAfter::minutes);
+        assert_eq!(parse("20m"), Some(20));
+        assert_eq!(parse("20"), Some(20));
+        assert_eq!(parse("1h"), Some(60));
+        assert_eq!(parse("1H30m"), Some(90));
+        assert_eq!(parse("24h"), Some(24 * 60));
+        for bad in [
+            "4m",
+            "0",
+            "25h",
+            "1h99999999999m",
+            "-5m",
+            "soon",
+            "",
+            "h",
+            "m",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+        let shown = |text: &str| text.parse::<StallAfter>().unwrap().to_string();
+        assert_eq!(shown("90"), "1h30m");
+        assert_eq!(shown("120m"), "2h");
+        assert_eq!(shown("45m"), "45m");
     }
 
     #[test]

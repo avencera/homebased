@@ -138,7 +138,7 @@ pub enum Command {
     /// A task's wait follows `TASK_WAITING` to its continuation run. A job's wait
     /// ends on `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`; its other events
     /// are printed and the wait goes on. A watch's wait ends on `THREAD_WATCH_ENDED`,
-    /// or on the `THREAD_CONTEXT_OVER` that ends a `--once` watch.
+    /// or on the `THREAD_CONTEXT_OVER` or `THREAD_STALLED` that ends a `--once` watch.
     /// Rides out a daemon restart and exits 0 once every target has ended, or
     /// with `--next` about a second after the first event it prints. With
     /// `--next --final-only` it prints interim events as they come but exits

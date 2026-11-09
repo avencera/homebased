@@ -12,7 +12,8 @@ use crate::thread_ref::{
     Caller, ThreadContext, ThreadContextRequest, ThreadContextResponse, ThreadSelector,
 };
 use crate::thread_watch::{
-    CompactRequest, CompactResponse, Threshold, WatchAction, WatchId, WatchRequest, WatchesResponse,
+    CompactRequest, CompactResponse, StallAfter, Threshold, WatchAction, WatchCondition, WatchId,
+    WatchRequest, WatchesResponse,
 };
 
 use super::task::select_thread;
@@ -61,20 +62,27 @@ pub enum ThreadCommand {
         #[arg(long, conflicts_with_all = ["refs", "task"])]
         worker: Option<TaskId>,
     },
-    /// Get one event when a thread's context passes a limit while it is idle
+    /// Get one event when a thread's context passes a limit while it is idle,
+    /// or when it stalls
     ///
-    /// Sends `THREAD_CONTEXT_OVER` once per climb over the limit, and again
-    /// only after the context drops below it. The calling thread receives the
-    /// events like task callbacks; `homebased wait --next <watch id>` takes
-    /// them instead while it runs. The same watch again (thread, limit, and
-    /// action) is the existing watch; another limit or action on the same
-    /// thread is a second watch. A T3 thread that is settled, or finished with
-    /// its delegated task, and runs no turn never fires, even while it shows
-    /// `waiting`, and its watch ends after an
-    /// hour without activity, as do the watches of a calling T3 thread that
-    /// is archived, deleted, or done for as long. A started compaction of
-    /// another thread, an unwatch, and a finished thread's end wake no caller; only a running
-    /// `homebased wait` prints them.
+    /// With --context-above, sends `THREAD_CONTEXT_OVER` once per climb over
+    /// the limit, and again only after the context drops below it. With
+    /// --stalled-after, sends `THREAD_STALLED` once the thread has sat `idle`
+    /// that long: no turn running, no homebased task or job owing it events,
+    /// and no T3 delegated task due to report to it. It fires again only after
+    /// the thread is active and stalls again. A stall watch on a top-level
+    /// thread cannot tell a stall from a thread that sent its last report, so
+    /// unwatch it when that report arrives; a delegate's watch ends on its own.
+    /// The calling thread receives the events like task callbacks; `homebased
+    /// wait --next <watch id>` takes them instead while it runs. The same watch
+    /// again (thread, condition, and action) is the existing watch; another
+    /// condition or action on the same thread is a second watch. A T3 thread
+    /// that is settled, or finished with its delegated task, and runs no turn
+    /// never fires, even while it shows `waiting`, and its watch ends after an
+    /// hour without activity, as do the watches of a calling T3 thread that is
+    /// archived, deleted, or done for as long. A started compaction of another
+    /// thread, an unwatch, and a finished thread's end wake no caller; only a
+    /// running `homebased wait` prints them.
     #[command(after_help = REFERENCE_HELP)]
     Watch {
         /// Thread references; the calling thread when none is given
@@ -82,13 +90,22 @@ pub enum ThreadCommand {
         refs: Vec<String>,
         /// Limit as tokens (150000, 150k, 1.2m) or a percent of the context
         /// window (80%, Codex only)
-        #[arg(long, value_name = "LIMIT")]
-        context_above: Threshold,
-        /// What to do when the watch fires
+        #[arg(
+            long,
+            value_name = "LIMIT",
+            required_unless_present = "stalled_after",
+            conflicts_with = "stalled_after"
+        )]
+        context_above: Option<Threshold>,
+        /// How long the thread must sit idle with nothing due to wake it, as
+        /// minutes (20m, 20) or hours (1h, 1h30m), from 5m to 24h
+        #[arg(long, value_name = "GRACE")]
+        stalled_after: Option<StallAfter>,
+        /// What to do when the watch fires; a stall watch only notifies
         #[arg(long, value_enum, default_value_t = WatchAction::Notify)]
         action: WatchAction,
-        /// End the watch after it fires once; that `THREAD_CONTEXT_OVER` says
-        /// `watch_ended`, and no `THREAD_WATCH_ENDED` follows
+        /// End the watch after it fires once; that event says `watch_ended`,
+        /// and no `THREAD_WATCH_ENDED` follows
         #[arg(long)]
         once: bool,
         /// Watch the calling thread's live T3 subagents too: those not
@@ -180,6 +197,7 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
         ThreadCommand::Watch {
             refs,
             context_above,
+            stalled_after,
             action,
             once,
             children,
@@ -204,7 +222,16 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 threads,
                 children,
                 machine,
-                threshold: context_above,
+                // clap requires exactly one of the two
+                condition: match (context_above, stalled_after) {
+                    (Some(threshold), _) => WatchCondition::ContextAbove(threshold),
+                    (None, Some(after)) => WatchCondition::StalledAfter(after),
+                    (None, None) => {
+                        return Err(AppError::Usage {
+                            message: "pass --context-above or --stalled-after".into(),
+                        });
+                    }
+                },
                 action,
                 once,
             };

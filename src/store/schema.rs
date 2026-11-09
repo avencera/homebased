@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 12;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 11] = [
+const MIGRATIONS: [Migration; 12] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -31,6 +31,7 @@ const MIGRATIONS: [Migration; 11] = [
     add_gpu_uuids,
     add_gpu_idle,
     add_gpu_summaries,
+    add_watch_conditions,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -130,6 +131,22 @@ fn add_gpu_summaries(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "ALTER TABLE resource_run_history ADD COLUMN gpu_end_json TEXT;
          ALTER TABLE resource_run_history ADD COLUMN gpu_summary_json TEXT;",
+    )
+}
+
+/// Version 13: a watch names its condition, so it can wait for a stall as
+/// well as a context limit
+///
+/// Every watch saved before this version is a context watch, whose
+/// `threshold` becomes `condition.context_above`; its key is unchanged
+fn add_watch_conditions(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "UPDATE thread_watches
+         SET watch_json = json_set(
+             json_remove(watch_json, '$.threshold'),
+             '$.condition',
+             json_object('context_above', json_extract(watch_json, '$.threshold')))
+         WHERE json_valid(watch_json) AND json_type(watch_json, '$.threshold') = 'object';",
     )
 }
 
@@ -887,6 +904,51 @@ mod tests {
                 [],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_context_watch_saved_before_conditions_still_reads() {
+        use crate::thread_watch::{ThreadWatch, Threshold, WatchCondition};
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        // the shape version 12 saved: `threshold` where `condition` is now
+        let old = serde_json::json!({
+            "id": "01a1c0f8-575f-75f7-8f4b-a012f78dedeb",
+            "caller": "4d9345d7-e506-40af-8d67-78de08bc397f",
+            "callback": {
+                "env": { "path": "/bin", "home": "/tmp" },
+                "cwd": "/tmp",
+                "codex": { "type": "available", "path": "/bin/true" },
+            },
+            "target": { "type": "t3", "machine": "01a0d117-07b3-76a8-ad09-60bf243f0014", "t3_thread": "child" },
+            "reference": "thread_child",
+            "title": null,
+            "threshold": { "unit": "tokens", "value": 150_000 },
+            "action": "compact",
+            "once": false,
+            "created_at": "2026-11-08T12:00:00Z",
+        });
+        conn.execute(
+            "INSERT INTO thread_watches
+             (id, caller_thread, watch_key, watch_json, armed, event_seq, created_at)
+             VALUES ('w', 'c', 'k', ?1, 1, 0, 'x')",
+            [old.to_string()],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let json: String = conn
+            .query_row("SELECT watch_json FROM thread_watches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let watch: ThreadWatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            watch.condition,
+            WatchCondition::ContextAbove(Threshold::Tokens(150_000))
         );
     }
 

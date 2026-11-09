@@ -20,7 +20,7 @@ use crate::thread_watch::{
 pub struct WatchRecord {
     /// The stored watch
     pub watch: ThreadWatch,
-    /// Whether the next climb over the limit fires
+    /// Whether the condition fires when next met
     pub armed: bool,
     /// Last event sequence
     pub seq: u64,
@@ -40,7 +40,7 @@ impl WatchRecord {
             target: self.watch.target.clone(),
             reference: self.watch.reference.clone(),
             title: self.watch.title.clone(),
-            threshold: self.watch.threshold,
+            condition: self.watch.condition,
             action: self.watch.action,
             once: self.watch.once,
             armed: self.armed,

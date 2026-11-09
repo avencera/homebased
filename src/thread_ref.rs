@@ -353,7 +353,8 @@ pub enum ThreadState {
     Running,
     /// No turn runs and nothing is pending
     Idle,
-    /// No turn runs, and homebased tasks or jobs it submitted still owe it events
+    /// No turn runs, and homebased tasks or jobs it submitted still owe it
+    /// events, or T3 is due to wake it with a delegated task's report
     Waiting,
     /// T3 settled the thread: its work is done
     Settled,
