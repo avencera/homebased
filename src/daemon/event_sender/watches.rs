@@ -6,9 +6,10 @@
 //! events after it still go out. A route that can no longer run, such as a
 //! `codex queue` whose binary is gone, settles at once, and a retryable
 //! failure settles after [`MAX_ATTEMPTS`]. An event that asks nothing of the
-//! caller (see [`WatchEvent::wakes_caller`]), or whose caller's T3 thread is
-//! archived or deleted, or whose watch ended as `caller_gone`, reaches only a
-//! connected wait, and settles as suppressed otherwise
+//! caller (see [`WatchEvent::wakes_caller`]), the caller's own compaction
+//! while a delegate or task is still due to wake it, an event whose caller's
+//! T3 thread is archived or deleted, and one whose watch ended as
+//! `caller_gone` reach only a connected wait, and settle as suppressed otherwise
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use super::Retry;
 use crate::daemon::AppState;
 use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
-use crate::daemon::thread_api::caller_t3_here;
+use crate::daemon::thread_api::{caller_t3_here, caller_wake_owed};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, THREAD_WAIT_LIMIT};
 use crate::thread_watch::{ThreadWatch, WatchEndReason, WatchEvent, WatchId};
@@ -217,6 +218,13 @@ async fn deliver(
         return Ok(settle("printed").await?);
     }
     if !event.wakes_caller(watch.caller_t3.as_deref()) || caller_put_away(state, watch).await? {
+        return Ok(settle("suppressed").await?);
+    }
+    // a root that compacted while it waits on delegates or tasks resumes when
+    // they report, so waking it now spends a turn to learn nothing
+    if event.own_compaction(watch.caller_t3.as_deref())
+        && caller_wake_owed(state, watch.caller, watch.caller_t3.clone()).await
+    {
         return Ok(settle("suppressed").await?);
     }
     // the routes that run `codex queue` check the saved cwd and Codex binary

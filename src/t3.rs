@@ -579,6 +579,20 @@ pub(crate) fn thread_put_away(env: &T3Env, thread_id: &str) -> Option<bool> {
         .ok()
 }
 
+/// Whether this machine's T3 is due to wake `parent` with the report of a
+/// delegated task it started
+///
+/// `None` when there is no T3 state or it cannot be read, which tells nothing
+pub(crate) fn completion_wake_due(env: &T3Env, parent: &str) -> Option<bool> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return None;
+    }
+    v2::completion_wake_due(&state, parent)
+        .inspect_err(|error| tracing::debug!(%error, "T3 delegated task wakes cannot be read"))
+        .ok()
+}
+
 /// Every T3 thread that is not deleted, newest first
 ///
 /// Reads the state database on disk, so the server need not run. Empty only

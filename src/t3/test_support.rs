@@ -485,6 +485,58 @@ impl V2State {
         self
     }
 
+    /// The delivery `state` T3 records for the report of task `node_id`, and
+    /// its `wake` setting
+    pub(crate) fn delivery(self, node_id: &str, state: Option<&str>, wake: &str) -> Self {
+        let delivery = state.map(|state| json!({ "state": state }));
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_subagents
+                 SET payload_json = json_set(payload_json, '$.completionDelivery', json(?2),
+                                             '$.completionWake', ?3)
+                 WHERE subagent_id = ?1",
+                rusqlite::params![node_id, serde_json::to_string(&delivery).unwrap(), wake],
+            )
+            .unwrap();
+        self
+    }
+
+    /// The parent run `run_id` that owns task `node_id`
+    pub(crate) fn task_run(self, node_id: &str, run_id: &str) -> Self {
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_subagents SET run_id = ?2 WHERE subagent_id = ?1",
+                rusqlite::params![node_id, run_id],
+            )
+            .unwrap();
+        self
+    }
+
+    /// The `disposition` of the delegated task cohort of run `run_id`
+    pub(crate) fn cohort(self, run_id: &str, disposition: &str) -> Self {
+        let cohort = json!({ "disposition": disposition, "nextGeneration": 1, "delivery": null });
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_runs
+                 SET payload_json = json_set(payload_json, '$.delegatedCompletion', json(?2))
+                 WHERE run_id = ?1",
+                rusqlite::params![run_id, cohort.to_string()],
+            )
+            .unwrap();
+        self
+    }
+
+    /// The node status of task `node_id`
+    pub(crate) fn task_status(self, node_id: &str, status: &str) -> Self {
+        self.0
+            .execute(
+                "UPDATE orchestration_v2_projection_nodes SET status = ?2 WHERE node_id = ?1",
+                rusqlite::params![node_id, status],
+            )
+            .unwrap();
+        self
+    }
+
     /// The copied session table that maps a thread imported from the previous
     /// orchestrator
     pub(crate) fn legacy(
@@ -546,6 +598,7 @@ pub(crate) fn add_task(
          CREATE TABLE IF NOT EXISTS orchestration_v2_projection_subagents (
             subagent_id TEXT PRIMARY KEY,
             thread_id TEXT NOT NULL,
+            run_id TEXT,
             parent_node_id TEXT NOT NULL,
             provider TEXT NOT NULL,
             child_thread_id TEXT,

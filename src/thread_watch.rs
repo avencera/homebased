@@ -260,10 +260,9 @@ pub fn ends_watch(kind: WatchEventKind, payload: &serde_json::Value) -> bool {
 /// of a watch on a thread that finished ask nothing of the caller, and waking
 /// it would spend a turn re-reading its whole context to learn that. A
 /// connected `homebased wait` still prints them, and the store keeps them. A
-/// caller that watches itself still wakes for its own compaction: it ended its
-/// turn so T3 could compact it, and this event is what resumes it. `caller_t3` is the caller's T3 thread on the machine that
-/// keeps the watch; matching on it finds a T3 caller that now runs in another
-/// session than the one that made the watch, such as after a provider switch
+/// caller that watches itself may wake for its own compaction (see
+/// [`own_compaction`]), which delivery skips too when something else will
+/// wake the caller
 #[must_use]
 pub fn wakes_caller(
     kind: WatchEventKind,
@@ -272,10 +271,7 @@ pub fn wakes_caller(
 ) -> bool {
     match kind {
         WatchEventKind::ContextOver => {
-            let outcome = payload
-                .pointer("/compaction/outcome")
-                .and_then(|outcome| CompactOutcome::deserialize(outcome).ok());
-            outcome != Some(CompactOutcome::Started) || targets_caller(payload, caller_t3)
+            !compaction_started(payload) || own_compaction(kind, payload, caller_t3)
         }
         WatchEventKind::Ended => {
             let reason = payload
@@ -287,6 +283,32 @@ pub fn wakes_caller(
             )
         }
     }
+}
+
+/// Whether a watch event with `payload` reports a compaction it started on
+/// the caller's own thread
+///
+/// A root that ended its turn so T3 could compact it resumes on this event,
+/// unless something else is due to wake it. `caller_t3` is the caller's T3
+/// thread on the machine that keeps the watch; matching on it finds a T3
+/// caller that now runs in another session than the one that made the watch,
+/// such as after a provider switch
+#[must_use]
+pub fn own_compaction(
+    kind: WatchEventKind,
+    payload: &serde_json::Value,
+    caller_t3: Option<&str>,
+) -> bool {
+    kind == WatchEventKind::ContextOver
+        && compaction_started(payload)
+        && targets_caller(payload, caller_t3)
+}
+
+fn compaction_started(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/compaction/outcome")
+        .and_then(|outcome| CompactOutcome::deserialize(outcome).ok())
+        == Some(CompactOutcome::Started)
 }
 
 /// Whether the event's target is the thread that receives it
@@ -458,6 +480,12 @@ impl WatchEvent {
     #[must_use]
     pub fn wakes_caller(&self, caller_t3: Option<&str>) -> bool {
         wakes_caller(self.kind, &self.payload, caller_t3)
+    }
+
+    /// Whether this reports a compaction of the caller itself, see [`own_compaction`]
+    #[must_use]
+    pub fn own_compaction(&self, caller_t3: Option<&str>) -> bool {
+        own_compaction(self.kind, &self.payload, caller_t3)
     }
 
     /// The line delivery sends

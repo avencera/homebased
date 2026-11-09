@@ -1037,6 +1037,36 @@ pub(in crate::daemon) async fn caller_t3_here(
         .t3_thread
 }
 
+/// Whether the watch caller `caller`, whose T3 thread here is `caller_t3`
+/// when known, has a wake coming other than its watch events, see
+/// [`LocalIndex::wake_owed`]
+///
+/// `false` when this machine's threads cannot be read, so a caller that
+/// needs the event to resume still gets it
+pub(in crate::daemon) async fn caller_wake_owed(
+    state: &AppState,
+    caller: ThreadId,
+    caller_t3: Option<String>,
+) -> bool {
+    let Ok(sources) = local_sources(state).await else {
+        return false;
+    };
+    run_blocking(move || {
+        let index = LocalIndex::load(sources, Utc::now())?;
+        let t3 = caller_t3.or_else(|| {
+            index.caller_t3(&Caller {
+                t3_thread: None,
+                session: Some(caller),
+            })
+        });
+        Ok::<_, String>(index.wake_owed(caller, t3.as_deref()))
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(false)
+}
+
 /// `GET /v1/threads/watches` query
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

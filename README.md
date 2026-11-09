@@ -442,7 +442,8 @@ watch; another limit or action on the same thread is a second watch, and each
 fires on its own. `--action compact` compacts the
 T3 thread first, with trigger `watch`, and puts the outcome in the event, which
 wakes the caller only when the compaction did not start or the caller watches
-itself; the
+itself and no delegated task report from T3, homebased task, or job is still
+due to wake it; the
 watch is read again just before, so one removed meanwhile compacts nothing. A
 watched T3 thread that is done, settled or finished with its delegated task
 and running no turn, even while it shows `waiting`, never fires or compacts, even over the limit, whether the watch names the

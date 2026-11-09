@@ -231,6 +231,42 @@ const TASK_STATES_SQL: &str = "
     WHERE n.kind = 'subagent' AND s.child_thread_id IS NOT NULL
     ORDER BY COALESCE(n.started_at, s.started_at, s.updated_at), n.node_id";
 
+// a delegated task T3 will report to its parent: one T3 owns, set to wake the
+// parent whatever its state, whose report is not yet delivered, read, or
+// disposed, as when the parent's run was stopped. The run that owns the task
+// must still take reports, since T3 disposes of one that ends after its run's
+// cohort closed, as a follow-up to a finished child of a stopped parent can.
+// A follow-up paused when its child was stopped sits `idle` until its queue
+// resumes, so it reports nothing on its own. T3 before delivery states
+// records neither, so a task with no state counts only while it runs, and a
+// run with no cohort is open
+const COMPLETION_WAKE_DUE_SQL: &str = "
+    SELECT EXISTS (
+        SELECT 1 FROM orchestration_v2_projection_subagents s
+        JOIN orchestration_v2_projection_nodes n ON n.node_id = s.subagent_id
+        JOIN orchestration_v2_projection_runs r ON r.run_id = s.run_id
+        WHERE s.thread_id = ?1 AND s.origin = 'app_owned' AND json_valid(s.payload_json)
+          AND json_valid(r.payload_json)
+          AND COALESCE(json_extract(r.payload_json, '$.delegatedCompletion.disposition'), 'open')
+              = 'open'
+          AND COALESCE(json_extract(s.payload_json, '$.completionWake'), 'always') = 'always'
+          AND n.status != 'idle'
+          AND (json_extract(s.payload_json, '$.completionDelivery.state') IN ('pending', 'claimed')
+               OR (json_extract(s.payload_json, '$.completionDelivery.state') IS NULL
+                   AND n.status NOT IN
+                       ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back'))))";
+
+/// Whether T3 is due to wake `parent` with a delegated task's report
+///
+/// # Errors
+///
+/// When the state cannot be read or lacks the delegated task tables
+pub(super) fn completion_wake_due(path: &Path, parent: &str) -> Result<bool, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    db.query_row(COMPLETION_WAKE_DUE_SQL, [parent], |row| row.get(0))
+        .map_err(|error| format!("T3 delegated task wake query failed: {error}"))
+}
+
 /// One row of [`THREAD_ROWS_SQL`]
 pub(super) struct ThreadRow {
     pub(super) id: String,

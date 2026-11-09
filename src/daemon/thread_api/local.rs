@@ -15,7 +15,9 @@ use crate::callback::stale_context::{CodexRollouts, ContextUse};
 use crate::domain::ThreadId;
 use crate::machine::MachineId;
 use crate::store::WorkerThread;
-use crate::t3::{ProviderThread, T3Env, T3Thread, environment_id, thread_index};
+use crate::t3::{
+    ProviderThread, T3Env, T3Thread, completion_wake_due, environment_id, thread_index,
+};
 use crate::thread_ref::{
     ACTIVE_WITHOUT_T3, Caller, Provider, ThreadContext, ThreadHost, ThreadRef, ThreadState, t3_link,
 };
@@ -227,6 +229,24 @@ impl LocalIndex {
             .map(|(index, _)| self.context(Found::T3(index)))
             .filter(|child| !live || !child.put_away())
             .collect()
+    }
+
+    /// Whether something other than a watch event will wake the caller whose
+    /// session is `session` and whose T3 thread here is `t3`: a homebased task
+    /// or job that still owes it events, or a delegated task T3 is due to
+    /// report to it
+    ///
+    /// A live child alone is no proof: stopping the parent's run disposes of
+    /// its tasks' reports, even of those still running
+    ///
+    /// The session T3 runs the thread in now counts too, since tasks submitted
+    /// after a provider switch call back to that one
+    pub(crate) fn wake_owed(&self, session: ThreadId, t3: Option<&str>) -> bool {
+        let current = t3.and_then(|id| self.t3.iter().find(|thread| thread.id == id)?.session);
+        let owed_events = std::iter::once(session)
+            .chain(current.map(ProviderThread::id))
+            .any(|session| self.sources.waiting.contains(&session));
+        owed_events || t3.is_some_and(|t3| completion_wake_due(&self.sources.env, t3) == Some(true))
     }
 
     /// The task worker of `session`; follow-ups share a Codex thread, and the
@@ -722,6 +742,70 @@ mod tests {
         );
         let live: HashSet<String> = index.children(A, true).iter().map(key).collect();
         assert_eq!(live, HashSet::from([WORKING.to_owned()]));
+    }
+
+    #[test]
+    fn a_caller_is_owed_a_wake_by_a_task_t3_will_report_or_by_homebased_work() {
+        const CHILD: &str = "thread:delegated-task:spike";
+        const NODE: &str = "node:spike";
+        const SWITCHED: &str = "0199abcd-4444-7000-8000-000000000002";
+        const OTHER: &str = "0199abcd-4444-7000-8000-000000000003";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        let run = format!("run-{A}-2");
+        let session: ThreadId = SESSION_A.parse().unwrap();
+        let owed = |waiting: &[&str]| {
+            let mut sources = sources(home);
+            sources.waiting = waiting.iter().map(|id| id.parse().unwrap()).collect();
+            LocalIndex::load(sources, Utc::now())
+                .unwrap()
+                .wake_owed(session, Some(A))
+        };
+        // a T3 before delivery states counts a running task
+        let state = V2State::create(&state_path(home))
+            .thread(A, "root", false)
+            .native("codex", SESSION_A, A)
+            .thread(CHILD, "spike", false)
+            .task(A, CHILD, NODE, "running", "2026-11-08T10:00:00Z");
+        // T3 reports a task only through the run that owns it
+        assert!(!owed(&[]));
+        let state = state.run(A, 2, "completed", "go").task_run(NODE, &run);
+        assert!(owed(&[]));
+
+        // stopping the root disposed of the report, so its end wakes nobody
+        let state = state.delivery(NODE, Some("disposed"), "always");
+        assert!(!owed(&[]));
+        let state = state.delivery(NODE, Some("pending"), "settled_only");
+        assert!(!owed(&[]));
+        // a follow-up filed under a stopped run is disposed of when it ends
+        let state = state
+            .delivery(NODE, Some("pending"), "always")
+            .cohort(&run, "stopped");
+        assert!(!owed(&[]));
+        let state = state.cohort(&run, "open");
+        assert!(owed(&[]));
+        // a follow-up paused with its stopped child runs only once resumed
+        let state = state.task_status(NODE, "idle");
+        assert!(!owed(&[]));
+        let state = state.task_status(NODE, "running");
+        assert!(owed(&[]));
+        // finished, with its report still on the way
+        let state = state
+            .task_status(NODE, "completed")
+            .delivery(NODE, Some("claimed"), "always");
+        assert!(owed(&[]));
+        let state = state.delivery(NODE, Some("delivered"), "always");
+        assert!(!owed(&[]));
+        let state = state.delivery(NODE, None, "always");
+        assert!(!owed(&[]));
+
+        assert!(owed(&[SESSION_A]));
+        assert!(!owed(&[SWITCHED]));
+        // a task submitted from the session T3 runs the root in after a switch
+        let _state = state.instance("claude", "claudeAgent", SWITCHED, A);
+        assert!(owed(&[SWITCHED]));
+        assert!(!owed(&[OTHER]));
     }
 
     #[test]
