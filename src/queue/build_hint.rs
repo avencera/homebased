@@ -54,6 +54,8 @@ fn build_command(argv: &[String]) -> Option<String> {
     if let Some(tool) = build_tool(&words) {
         return Some(tool);
     }
+    // `env FOO=1 bash -lc '...'` runs the shell after its prefixes
+    let words = command_words(&words);
     let program = words.first().map(|program| basename(program))?;
     if !SHELLS.contains(&program) {
         return None;
@@ -83,12 +85,8 @@ fn build_command(argv: &[String]) -> Option<String> {
 
 /// The build tool and subcommand one simple command runs, such as `cargo build`
 fn build_tool(words: &[&str]) -> Option<String> {
-    // leading `NAME=value` assignments and wrappers run the command after them
-    let start = words
-        .iter()
-        .position(|word| !is_assignment(word) && !PREFIXES.contains(&basename(word)))?;
-    let words = &words[start..];
-    let program = basename(words[0]);
+    let words = command_words(words);
+    let program = basename(words.first()?);
     // cargo takes a toolchain such as `+nightly` before its subcommand
     let mut rest = words[1..]
         .iter()
@@ -123,6 +121,24 @@ fn build_tool(words: &[&str]) -> Option<String> {
 }
 
 /// A short flag group that holds `c`, such as `-c` or `-lc`
+/// `words` from the command that leading `NAME=value` assignments and
+/// wrappers such as `nice -n 10` run
+fn command_words<'a, 'b>(words: &'b [&'a str]) -> &'b [&'a str] {
+    let mut wrapped = false;
+    let start = words
+        .iter()
+        .position(|word| {
+            let prefix = PREFIXES.contains(&basename(word));
+            wrapped |= prefix;
+            // a wrapper's options and numeric values, such as `-n 10`, come before
+            // the command it runs
+            let option = wrapped && (word.starts_with('-') || word.parse::<i64>().is_ok());
+            !is_assignment(word) && !prefix && !option
+        })
+        .unwrap_or(words.len());
+    &words[start..]
+}
+
 fn is_command_flag(word: &str) -> bool {
     word.starts_with('-') && !word.starts_with("--") && word.contains('c')
 }
@@ -149,6 +165,11 @@ mod tests {
     fn a_build_is_found_in_argv_and_in_a_shell_script() {
         let cases: &[(&[&str], Option<&str>)] = &[
             (&["cargo", "build", "--release"], Some("cargo build")),
+            (
+                &["env", "FOO=1", "bash", "-lc", "cargo build && ./bench"],
+                Some("cargo build"),
+            ),
+            (&["nice", "-n", "10", "cargo", "oxide"], Some("cargo oxide")),
             (&["/usr/bin/cargo", "+nightly", "run"], Some("cargo run")),
             (&["./target/release/train", "--epochs", "3"], None),
             (&["cargo", "fmt"], None),

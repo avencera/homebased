@@ -4,8 +4,9 @@
 //! narrower question: does any process of the run hold a CUDA context on the
 //! run's GPU? It reads NVML's compute processes through
 //! `nvidia-smi --query-compute-apps` and matches their PIDs against the
-//! processes carrying the run's marker, which covers re-parented children
-//! and container steps. A run that held no context for
+//! processes carrying the run's marker, which covers re-parented children.
+//! Container steps run under `dockerd` without the marker and are not
+//! watched. A run that held no context for
 //! [`LeaseGuardConfig::idle_after`] trips the guard. The default of 5 minutes
 //! sits well above the 40-90 seconds a fresh process needs to compile and
 //! load before it opens a context
@@ -32,7 +33,7 @@ pub struct LeaseGuardConfig {
     pub enabled: bool,
     /// Time a run may hold its GPU with no CUDA context before it trips
     pub idle_after: Duration,
-    /// Time between probes
+    /// Time between probes; a context held at least this long is always seen
     pub interval: Duration,
     /// Time a guard-requested yield may stay pending before the job is cancelled
     pub yield_grace: Duration,
@@ -43,7 +44,7 @@ impl Default for LeaseGuardConfig {
         Self {
             enabled: true,
             idle_after: Duration::from_secs(5 * 60),
-            interval: Duration::from_secs(15),
+            interval: Duration::from_secs(5),
             yield_grace: Duration::from_secs(10 * 60),
         }
     }

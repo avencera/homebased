@@ -17,7 +17,7 @@ use crate::fleet::protocol::{ClusterProtocolVersion, LEASE_IDLE_PROTOCOL};
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::lease_guard::{LeaseIdleTrip, TripAction};
-use crate::queue::{ActiveRun, JobId, Preemption, RunPhase, StopCause};
+use crate::queue::{ActiveRun, JobId, Preemption, RunPhase, StepWorkload, StopCause};
 use crate::store::Store;
 
 /// One GPU run the guard watches
@@ -45,8 +45,8 @@ pub struct JobLeaseNote {
 }
 
 impl Store {
-    /// Executing GPU runs of `machine`, and runs told to yield that still
-    /// hold their GPU
+    /// Executing GPU task steps of `machine`, and those told to yield that
+    /// still hold their GPU
     pub fn lease_guard_targets(&self, machine: MachineId) -> Result<Vec<LeaseTarget>, AppError> {
         let mut targets = Vec::new();
         for record in self.resources_on(machine)? {
@@ -69,8 +69,14 @@ impl Store {
             let Some(gpu_uuid) = self.run_gpu_uuid(run.task)? else {
                 continue;
             };
+            // a container's processes run under dockerd without the run's
+            // marker, so the guard cannot match them to NVML's PIDs
+            let spec = self.require_job(run.job)?.spec;
+            if matches!(spec.steps.get(run.step), Some(StepWorkload::Container(_))) {
+                continue;
+            }
             targets.push(LeaseTarget {
-                preempt: self.require_job(run.job)?.spec.preempt,
+                preempt: spec.preempt,
                 trip: self.lease_idle_trip(run.task)?,
                 gpu_uuid,
                 run,
@@ -161,6 +167,24 @@ impl Store {
             .optional()?;
         raw.map(|raw| serde_json::from_str(&raw).map_err(AppError::from))
             .transpose()
+    }
+
+    /// The trip an event ending `task`'s attempt carries: the attempt's own,
+    /// or for a final event the job's latest
+    ///
+    /// Each step runs as its own attempt, and one that tripped and then
+    /// finished its step ends with no event, so the final event reports it
+    pub(super) fn lease_idle_for_event(
+        &self,
+        job: JobId,
+        task: TaskId,
+        last: bool,
+    ) -> Result<Option<LeaseIdleTrip>, AppError> {
+        match self.lease_idle_trip(task)? {
+            Some(trip) => Ok(Some(trip)),
+            None if last => Ok(self.lease_idle_trips(job)?.pop()),
+            None => Ok(None),
+        }
     }
 
     /// Every trip of one job, oldest first

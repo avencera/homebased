@@ -559,7 +559,15 @@ impl Store {
             gpu_summaries.clear();
         }
         let lease_idle = match &run {
-            Some(run) if self.origin_reads_lease_idle(job)? => self.lease_idle_trip(run.task)?,
+            Some(run) if self.origin_reads_lease_idle(job)? => {
+                let last = matches!(
+                    event,
+                    JobEventKind::JobSucceeded
+                        | JobEventKind::JobFailed
+                        | JobEventKind::JobCancelled
+                );
+                self.lease_idle_for_event(job, run.task, last)?
+            }
             _ => None,
         };
         self.append_event(

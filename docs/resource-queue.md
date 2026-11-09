@@ -123,7 +123,7 @@ Use `homebased daemon restart` to load changed settings. Let active jobs finish 
 
 ## GPU lease guard
 
-On Linux with NVIDIA GPUs, the queue machine checks every 15 seconds whether any process of each running GPU attempt holds a CUDA context on the attempt's GPU. It reads NVML's compute processes with `nvidia-smi --query-compute-apps=gpu_uuid,pid` and matches their PIDs against the processes that carry the run's marker, so children and container steps count. Utilization plays no part. An attempt that holds no context for 5 minutes trips the guard. A fresh process that compiles and loads for a minute or two before it opens a context stays well under that. A failed probe, or a run whose processes cannot be read, restarts the clock, and so does a daemon restart, so a trip always follows a full threshold of observed idle time.
+On Linux with NVIDIA GPUs, the queue machine checks every 5 seconds whether any process of each running GPU task step holds a CUDA context on the attempt's GPU. It reads NVML's compute processes with `nvidia-smi --query-compute-apps=gpu_uuid,pid` and matches their PIDs against the processes that carry the run's marker, so children count. A context held for at least one interval is always seen. Container steps are not watched, since their processes run under `dockerd` without the marker; the GPU idle alerts below still cover them. Utilization plays no part. An attempt that holds no context for 5 minutes trips the guard. A fresh process that compiles and loads for a minute or two before it opens a context stays well under that. A failed probe, or a run whose processes cannot be read, restarts the clock, and so does a daemon restart, so a trip always follows a full threshold of observed idle time.
 
 A trip releases the lease by the job's preemption mode:
 
@@ -133,7 +133,7 @@ A trip releases the lease by the job's preemption mode:
 | `restart` | killed and queued again | the spec declared the step safe to repeat, and a later attempt may get past a stall |
 | `wait` | cancelled | the spec promised the step is never killed for other work, so repeating it may not be safe; the owner reruns the CPU part as a task |
 
-A job that already tripped once is cancelled on its next trip, whatever its mode, so CPU work in a lease cannot loop. The trip is stored on the queue machine. The event that ends the attempt (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries it as `lease_idle`, with a `reason` that says what to do instead. `resource jobs` prints the reason under the job, `resource job show` lists every trip, and the web UI marks the job. The queue owner gets an ntfy notice when `[notify.ntfy]` is set. Origins on an older release get the event without `lease_idle`.
+A job that already tripped once is cancelled on its next trip, whatever its mode, so CPU work in a lease cannot loop. The trip is stored on the queue machine. The event that ends the attempt (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries it as `lease_idle`, with a `reason` that says what to do instead. Each step runs as its own attempt, so a step that tripped and then finished ends with no event; the job's final event carries its latest trip instead. `resource jobs` prints the reason under the job, `resource job show` lists every trip, and the web UI marks the job. The queue owner gets an ntfy notice when `[notify.ntfy]` is set. Origins on an older release get the event without `lease_idle`.
 
 `resource jobs` also flags a yield request that has been pending for 10 minutes or more while the step keeps running. Homebased cannot see whether a step reads the yield file, so the flag says the step may not poll it: fix the step, or submit it as `wait`.
 
@@ -141,7 +141,7 @@ A job that already tripped once is cancelled on its next trip, whatever its mode
 [resource.lease_guard]
 enabled = true
 idle_after = "5m"     # time with no CUDA context before a trip
-interval = "15s"      # probe interval
+interval = "5s"       # probe interval
 yield_grace = "10m"   # time a guard yield may stay pending before a cancel
 ```
 

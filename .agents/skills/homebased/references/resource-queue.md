@@ -40,7 +40,7 @@ Each attempt gets a new task UUID and run directory. Save checkpoints in `HOMEBA
 
 `HOMEBASED_HOME` is installation configuration, not a run marker. Do not replace run variables. In containers, `/homebased/job` is writable and `/homebased/run` is read-only. Do not set `gpus`, mount at or under `/homebased`, or set `HOMEBASED_*` in the container spec. Homebased owns these values.
 
-When the yield file appears, finish the current unit, save progress, and exit 75. Exit 0 completes the step. Exit 75 without a committed yield request fails the job. A yield request does not kill the run after a deadline. Clean up all child work before exit.
+When the yield file appears, finish the current unit, save progress, and exit 75. Exit 0 completes the step. Exit 75 without a committed yield request fails the job. A yield request from the scheduler does not kill the run after a deadline; one from the lease guard (below) cancels the job if the step still runs 10 minutes later. Clean up all child work before exit.
 
 This Python example stores the next unit after each unit. Replace the `print` with one finite unit of GPU work. Keep checkpoint writes atomic.
 
@@ -142,7 +142,7 @@ homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 
 ### The lease guard
 
-The queue machine checks whether any process of a running GPU attempt holds a CUDA context on its GPU (NVML compute processes, not utilization). After 5 minutes with none, it releases the lease: a `yield` job is asked to yield and is cancelled if still running 10 minutes later, a `restart` job is killed and queued again, and a `wait` job is cancelled. A job's second trip always cancels it. The ending event (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries `lease_idle` with a `reason`. When you get one, move the CPU work into its own task, chain the GPU job with `--after`, and resubmit. Startup that compiles or loads for a minute or two before the first CUDA call is fine.
+The queue machine checks every 5 seconds whether any process of a running GPU task step holds a CUDA context on its GPU (NVML compute processes, not utilization). Container steps are not watched. After 5 minutes with none, it releases the lease: a `yield` job is asked to yield and is cancelled if still running 10 minutes later, a `restart` job is killed and queued again, and a `wait` job is cancelled. A job's second trip always cancels it. The ending event (`JOB_PREEMPTED` or `JOB_CANCELLED`, or the job's final event when the tripped step finished anyway) carries `lease_idle` with a `reason`. When you get one, move the CPU work into its own task, chain the GPU job with `--after`, and resubmit. Startup that compiles or loads for a minute or two before the first CUDA call is fine.
 
 `resource jobs` flags a yield request pending for 10 minutes or more: the step is not polling `HOMEBASED_YIELD_FILE`. Fix the step or resubmit it as `wait`.
 
