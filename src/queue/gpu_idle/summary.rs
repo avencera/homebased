@@ -363,8 +363,11 @@ impl EndReading {
         power_limit_watts: Option<f64>,
         budget: Duration,
     ) -> Option<Self> {
-        // both bounds are inclusive, so a 10s attempt is 11 one-second points
-        let (after, before) = (started.timestamp(), ended.timestamp());
+        // both bounds are inclusive, and a point stamped `t` holds the second
+        // that ends at `t`, so the first point read is the first whole second
+        // after the start; an earlier one can hold the previous attempt's tail
+        let after = started.timestamp() + 1 + i64::from(started.timestamp_subsec_nanos() > 0);
+        let before = ended.timestamp();
         if before < after {
             return None;
         }
@@ -878,9 +881,10 @@ mod tests {
             .await
             .unwrap();
 
-        // 13 rows 5 seconds apart cover the whole minute, not 13 seconds of it
-        assert_eq!(reading.util.coverage.netdata_ms, 65_000);
-        assert_eq!(reading.power_pct.coverage.netdata_ms, 65_000);
+        // the read starts a second after the start, so the second before it
+        // stays out, and 12 rows 5 seconds apart cover the whole minute
+        assert_eq!(reading.util.coverage.netdata_ms, 60_000);
+        assert_eq!(reading.power_pct.coverage.netdata_ms, 60_000);
         let summary = GpuSummary::build(&SummaryInput {
             attempt: TaskId::new(),
             run_number: 1,
