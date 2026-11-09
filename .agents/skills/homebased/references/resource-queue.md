@@ -36,6 +36,7 @@ Each attempt gets a new task UUID and run directory. Save checkpoints in `HOMEBA
 | `HOMEBASED_YIELD_FILE` | File that appears when this run must yield. Host: `<home>/tasks/<task>/control/yield`. Container: `/homebased/run/yield`. |
 | `HOMEBASED_RESOURCE` | Assigned resource name. |
 | `CUDA_VISIBLE_DEVICES` | Assigned host GPU index for host steps; `0` inside containers, where Docker exposes only the selected host GPU. Removed when the resource has no index. |
+| `CUDA_DEVICE_ORDER` | `PCI_BUS_ID` whenever `CUDA_VISIBLE_DEVICES` is set, so the index means the same GPU as in `nvidia-smi`. |
 
 `HOMEBASED_HOME` is installation configuration, not a run marker. Do not replace run variables. In containers, `/homebased/job` is writable and `/homebased/run` is read-only. Do not set `gpus`, mount at or under `/homebased`, or set `HOMEBASED_*` in the container spec. Homebased owns these values.
 
@@ -134,11 +135,11 @@ Use `homebased --json` before each command and parse the result. All results car
 | --- | --- |
 | `resource register --name <name>` | Optional `--device <index>`. Register on the local machine. Do not create two lanes for one physical GPU. |
 | `resource label <resource> <label>` | Or `--clear` instead of a label. Optional `--machine <name-or-uuid>`. Set a display nickname of 1 to 40 characters. Specs and pins keep using the name. |
-| `resource list` | Optional `--machine <name-or-uuid>`. Resources, active run phases, and labels. |
+| `resource list` | Optional `--machine <name-or-uuid>`. Resources, active run phases, labels, and each indexed GPU's `gpu_uuid` from `nvidia-smi -L`. |
 | `resource jobs` | Optional `--machine <name-or-uuid>`. Non-terminal jobs in serving order. |
 | `resource schema` | Print JobSpec JSON Schema. No daemon needed. |
 | `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`, and `--after <task-uuid>` (repeatable) to hold the job until those tasks succeed. A held job's result has `held` in place of the queue's answer. Machine comes from the spec. No dry-run flag. |
-| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` tasks, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` task's state, and the `reason` it ended. |
+| `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history with the `gpu_uuid` each attempt launched on, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` tasks, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` task's state, and the `reason` it ended. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
 | `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |

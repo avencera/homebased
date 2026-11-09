@@ -501,6 +501,10 @@ pub struct Resource {
     // a peer on an older release sends no label
     #[serde(default)]
     pub label: Option<ResourceLabel>,
+    /// UUID of the GPU at `device`, from the last detection that listed it
+    // a peer on an older release sends none
+    #[serde(default)]
+    pub gpu_uuid: Option<gpu::GpuUuid>,
 }
 
 /// A resource named in a job spec or command, by UUID or by name

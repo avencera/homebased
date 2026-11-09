@@ -7,6 +7,7 @@ use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::queue::gpu::GpuUuid;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
@@ -153,6 +154,10 @@ pub struct JobRunView {
     pub stop_cause: Option<StopCause>,
     /// Attributable cleanup result, present once cleanup finished
     pub cleanup: Option<Result<(), CleanupFailure>>,
+    /// UUID of the GPU the attempt launched on, when its resource had one
+    // an older peer sends none
+    #[serde(default)]
+    pub gpu_uuid: Option<GpuUuid>,
 }
 
 impl Store {
@@ -265,7 +270,8 @@ impl Store {
     /// Every run of the job, even after the resource starts other work
     pub fn job_runs(&self, job: JobId) -> Result<Vec<JobRunView>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT t.id, t.run_number, t.step_index, h.resource_id, h.stop_cause, h.cleanup_json
+            "SELECT t.id, t.run_number, t.step_index, h.resource_id, h.stop_cause, h.cleanup_json,
+                    h.gpu_uuid
              FROM tasks t LEFT JOIN resource_run_history h ON h.task_id = t.id
              WHERE t.resource_job_id = ?1 ORDER BY t.run_number",
         )?;
@@ -278,30 +284,38 @@ impl Store {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(task, run_number, step, resource, cause, cleanup)| {
-                let task: TaskId = task.parse()?;
-                let row = self
-                    .get_task(task)?
-                    .ok_or(AppError::TaskNotFound { id: task })?;
-                Ok(JobRunView {
-                    task,
-                    run_number,
-                    step,
-                    status: row.status(),
-                    outcome: TaskOutcome::from_storage(row.status().as_str()),
-                    resource: resource.map(|value| value.parse()).transpose()?,
-                    stop_cause: cause
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                    cleanup: cleanup
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                })
-            })
+            .map(
+                |(task, run_number, step, resource, cause, cleanup, gpu_uuid)| {
+                    let task: TaskId = task.parse()?;
+                    let row = self
+                        .get_task(task)?
+                        .ok_or(AppError::TaskNotFound { id: task })?;
+                    Ok(JobRunView {
+                        task,
+                        run_number,
+                        step,
+                        status: row.status(),
+                        outcome: TaskOutcome::from_storage(row.status().as_str()),
+                        resource: resource.map(|value| value.parse()).transpose()?,
+                        stop_cause: cause
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        cleanup: cleanup
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        gpu_uuid: gpu_uuid
+                            .as_deref()
+                            .map(GpuUuid::parse)
+                            .transpose()
+                            .map_err(|message| QueueError::Corrupt { message })?,
+                    })
+                },
+            )
             .collect()
     }
 }

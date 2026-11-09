@@ -36,6 +36,12 @@ pub const RESOURCE: &str = "HOMEBASED_RESOURCE";
 /// Device selection owned by the assigned resource
 pub const CUDA_VISIBLE_DEVICES: &str = "CUDA_VISIBLE_DEVICES";
 
+/// How CUDA numbers the devices that [`CUDA_VISIBLE_DEVICES`] names
+///
+/// Set with it on queue runs, but not a run marker: an inherited value tells
+/// cleanup nothing, so other children keep the daemon's value
+pub const CUDA_DEVICE_ORDER: &str = "CUDA_DEVICE_ORDER";
+
 /// Every variable that belongs to exactly one run
 ///
 /// Configuration such as `HOMEBASED_HOME` is not listed: it describes the

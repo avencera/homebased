@@ -4,7 +4,9 @@ Use the resource queue for all GPU work on a machine that has it. Each machine h
 
 ## Check resources and jobs
 
-At daemon startup, Linux detects NVIDIA GPU indices with `nvidia-smi -L` and creates `gpu0`, `gpu1`, and so on. macOS gets `gpu0` without a device index. If `nvidia-smi` is not installed, Linux gets an unindexed `gpu0`. If an installed probe fails or returns no usable devices, Homebased logs a warning and waits until a later start to detect resources. This exclusive lane does not prove that a physical GPU is available. A later successful detection assigns the first device to a detected fallback and keeps its UUID. Detection waits if that fallback has a run in any phase, including cleanup or Attention. Manual registrations do not change.
+At daemon startup, Linux detects NVIDIA GPU indices with `nvidia-smi -L` and creates `gpu0`, `gpu1`, and so on. macOS gets `gpu0` without a device index. If `nvidia-smi` is not installed, Linux gets an unindexed `gpu0`. If an installed probe fails or returns no usable devices, Homebased logs a warning and waits until a later start to detect resources. This exclusive lane does not prove that a physical GPU is available. A later successful detection assigns the first device to a detected fallback and keeps its UUID. Detection waits if that fallback has a run in any phase, including cleanup or Attention. Manual registrations keep their names and indices.
+
+The same `nvidia-smi -L` output names each GPU's UUID, such as `GPU-6f3c1d2e-…`. Each detection that lists devices gives every indexed resource, manual ones included, the UUID listed at its index, or none when the index is not listed. A resource registered later takes the UUID from the last listing. A machine without `nvidia-smi` has no UUIDs, and a probe that fails keeps the saved ones. Each run attempt keeps the UUID its resource had when it launched, so a later card swap does not rewrite history.
 
 ```sh
 homebased --json resource list
@@ -17,6 +19,7 @@ Use human output for a quick view. Use `--json` for scripts and Attention IDs.
 | --- | --- |
 | Resource `ID`, `NAME`, `DEVICE` | Resource UUID, machine-local name, optional CUDA device index. |
 | Resource `STATE`, `RUN / YIELD AGE` | Active run phase, task UUID, and elapsed seconds since a yield request. No run means idle. |
+| Resource `GPU UUID` | UUID of the GPU at the device index from the last detection, or `-`. |
 | Resource `LABEL` | Optional nickname, or `-`. |
 | Job `PRIORITY`, `POSITION` | Level and slot within that level. High serves before medium, then low. |
 | Job `STATE`, `TARGET / NAME` | Job state, pinned resource or `any`, and submitted label. |
@@ -29,7 +32,7 @@ Registration is local and socket-only. Add a lane only for a separate exclusive 
 homebased --json resource register --name auxiliary
 ```
 
-For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUDA_VISIBLE_DEVICES` for host steps. For containers, Docker selects that host device with `--gpus device=<index>` and `CUDA_VISIBLE_DEVICES=0` selects the one exposed GPU inside the container. An unindexed resource removes that variable. Registration does not test the physical device.
+For an indexed GPU, add `--device <index>`. Homebased exports that index as `CUDA_VISIBLE_DEVICES` for host steps, with `CUDA_DEVICE_ORDER=PCI_BUS_ID` so CUDA numbers GPUs the way `nvidia-smi` and Docker do; CUDA's default order puts the fastest GPU first, which can select a different card on a host with mixed GPUs. For containers, Docker selects that host device with `--gpus device=<index>` and `CUDA_VISIBLE_DEVICES=0` selects the one exposed GPU inside the container. An unindexed resource removes `CUDA_VISIBLE_DEVICES`. Registration does not test the physical device.
 
 ## Give a resource a nickname
 
@@ -44,7 +47,7 @@ Name the resource by name or UUID. Add `--machine <Fleet-name-or-UUID>` to label
 
 ## Inspect, move, or cancel
 
-Set `job` to the full job UUID. Job show lists every run task UUID. Set `task` to one of these to read its output. Set `move` and `cancel` to separate new UUIDs before the first action. Save them for retries.
+Set `job` to the full job UUID. Job show lists every run task UUID, with the GPU UUID each attempt launched on (`gpu_uuid` in `--json`). Set `task` to one of these to read its output. Set `move` and `cancel` to separate new UUIDs before the first action. Save them for retries.
 
 ```sh
 homebased --json resource job show "$job"

@@ -7,6 +7,7 @@ use super::{JobRecord, ResourceOrigin, ResourceRecord, corrupt, parse_uuid};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::queue::gpu::GpuUuid;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, JobId, JobState, Priority, QueueError, Resource, ResourceId,
@@ -18,7 +19,7 @@ pub(super) const RESOURCE_SELECT: &str =
     "SELECT id, machine, name, device, run_job, run_task, run_number,
     run_step, run_phase, run_reserved_at, run_started_at, run_stop_cause,
     run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin,
-    run_resume, label
+    run_resume, label, gpu_uuid
  FROM resources";
 
 pub(super) const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest,
@@ -57,6 +58,7 @@ pub(super) struct RawResource {
     origin: String,
     run_resume: Option<bool>,
     label: Option<String>,
+    gpu_uuid: Option<String>,
 }
 
 impl RawResource {
@@ -81,6 +83,7 @@ impl RawResource {
             origin: row.get(16)?,
             run_resume: row.get(17)?,
             label: row.get(18)?,
+            gpu_uuid: row.get(19)?,
         })
     }
 
@@ -137,6 +140,12 @@ impl RawResource {
                 .as_deref()
                 .map(ResourceLabel::parse)
                 .transpose()?,
+            gpu_uuid: self
+                .gpu_uuid
+                .as_deref()
+                .map(GpuUuid::parse)
+                .transpose()
+                .map_err(corrupt)?,
         };
         let machine: MachineId = self.machine.parse()?;
         let run = match (

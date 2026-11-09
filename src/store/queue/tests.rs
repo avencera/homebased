@@ -50,6 +50,7 @@ impl Fixture {
             .map(|(index, name)| DetectedResource {
                 name: ResourceName::parse(name).unwrap(),
                 device: Some(u32::try_from(index).unwrap()),
+                uuid: None,
             })
             .collect();
         self.store
@@ -1557,6 +1558,7 @@ fn detection_moves_the_fallback_onto_the_first_detected_device() {
             .map(|&device| DetectedResource {
                 name: ResourceName::gpu(device),
                 device: Some(device),
+                uuid: None,
             })
             .collect();
         let resources = f
@@ -1613,6 +1615,7 @@ fn detection_never_renames_or_replaces_a_manual_resource() {
     let detected = [DetectedResource {
         name: ResourceName::gpu(1),
         device: Some(1),
+        uuid: None,
     }];
     let resources = fixture
         .store
@@ -1637,6 +1640,7 @@ fn detection_never_renames_or_replaces_a_manual_resource() {
     let detected = [0, 1].map(|device| DetectedResource {
         name: ResourceName::gpu(device),
         device: Some(device),
+        uuid: None,
     });
     fixture
         .store
@@ -2005,6 +2009,7 @@ fn detection_defers_all_phases_of_an_active_fallback() {
         let detected = [0, 1].map(|device| DetectedResource {
             name: ResourceName::gpu(device),
             device: Some(device),
+            uuid: None,
         });
         let resources = f
             .store
@@ -2405,4 +2410,90 @@ fn bugfix_cleanup_count_overflow_preserves_the_attempt() {
         fixture.run_on("gpu0").unwrap().phase,
         RunPhase::Cleaning { attempt: u32::MAX }
     );
+}
+
+#[test]
+fn detection_names_each_gpu_and_every_attempt_keeps_the_one_it_launched_on() {
+    use crate::queue::gpu::GpuUuid;
+
+    let uuid = |raw: &str| Some(GpuUuid::parse(raw).unwrap());
+    let listed = |uuids: [&str; 2]| {
+        [0, 1].map(|device| DetectedResource {
+            name: ResourceName::gpu(device),
+            device: Some(device),
+            uuid: uuid(uuids[device as usize]),
+        })
+    };
+    let gpu_uuid = |f: &Fixture, machine: MachineId, name: &str| {
+        f.store
+            .resolve_resource(
+                machine,
+                &crate::queue::ResourceSelector::Name(ResourceName::parse(name).unwrap()),
+            )
+            .unwrap()
+            .resource
+            .gpu_uuid
+    };
+
+    // an adopted fallback and a new lane both take the listed UUIDs
+    let f = Fixture::new();
+    let machine = MachineId::new();
+    f.store
+        .ensure_detected_resources(machine, &[DetectedResource::unindexed()])
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, machine, "gpu0"), None);
+    f.store
+        .ensure_detected_resources(machine, &listed(["GPU-a", "GPU-b"]))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, machine, "gpu0"), uuid("GPU-a"));
+    assert_eq!(gpu_uuid(&f, machine, "gpu1"), uuid("GPU-b"));
+
+    // a hand-registered lane reads the last listing, and an unlisted index has none
+    let manual = MachineId::new();
+    let detected = [DetectedResource {
+        name: ResourceName::gpu(0),
+        device: Some(0),
+        uuid: uuid("GPU-m0"),
+    }];
+    f.store
+        .ensure_detected_resources(manual, &detected)
+        .unwrap();
+    f.store
+        .register_resource(manual, ResourceName::parse("spare").unwrap(), Some(3))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, manual, "spare"), None);
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO detected_gpus (machine, device, uuid) VALUES (?1, 4, 'GPU-m4')",
+            [manual.to_string()],
+        )
+        .unwrap();
+    f.store
+        .register_resource(manual, ResourceName::parse("late").unwrap(), Some(4))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, manual, "late"), uuid("GPU-m4"));
+
+    // an attempt keeps its GPU after a later detection finds another card there
+    f.store
+        .ensure_detected_resources(f.machine, &listed(["GPU-old", "GPU-b"]))
+        .unwrap();
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", Utc::now());
+    f.store
+        .ensure_detected_resources(f.machine, &listed(["GPU-new", "GPU-b"]))
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu0"), uuid("GPU-new"));
+    let runs = f.store.job_runs(job).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].task, run.task);
+    assert_eq!(runs[0].gpu_uuid, uuid("GPU-old"));
+
+    // a failed probe keeps the saved UUIDs; a machine without nvidia-smi has none
+    f.store.ensure_detected_resources(f.machine, &[]).unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
+    f.store
+        .ensure_detected_resources(f.machine, &[DetectedResource::unindexed()])
+        .unwrap();
+    assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), None);
 }

@@ -14,6 +14,7 @@ use crate::dependency::TaskDependencies;
 use crate::domain::{TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::queue::build_hint::build_warnings;
+use crate::queue::gpu::GpuUuid;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
@@ -383,7 +384,7 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     let list: ResourceList = decode(value)?;
     if ctx.output == OutputMode::Human {
         println!(
-            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE                            LABEL"
+            "ID                                   NAME             DEVICE STATE        RUN / YIELD AGE                            GPU UUID                                 LABEL"
         );
     }
     for record in &list.resources {
@@ -408,8 +409,9 @@ fn print_resources(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             _ => String::new(),
         };
         let label = resource.label.as_ref().map_or("-", ResourceLabel::as_str);
+        let gpu = resource.gpu_uuid.as_ref().map_or("-", GpuUuid::as_str);
         let run = format!("{task}{age}");
-        println!("{id} {name:<16} {device:<6} {state:<12} {run:<42} {label}");
+        println!("{id} {name:<16} {device:<6} {state:<12} {run:<42} {gpu:<40} {label}");
     }
     Ok(())
 }
@@ -516,8 +518,12 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let on = run.resource.map_or_else(String::new, |resource| {
             format!(" on {}", resource_label(resource, &detail.resources))
         });
+        let gpu = run
+            .gpu_uuid
+            .as_ref()
+            .map_or_else(String::new, |uuid| format!(" ({uuid})"));
         println!(
-            "run {} step {}: {} {}{on}; cleanup: {cleanup}",
+            "run {} step {}: {} {}{on}{gpu}; cleanup: {cleanup}",
             run.run_number, run.step, run.task, run.status
         );
     }

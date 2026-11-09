@@ -19,37 +19,82 @@ impl Store {
     /// An idle fallback adopts its first device's name unless that name is taken
     /// Detected resources are never removed, so a GPU that disappears leaves
     /// its resource in place
+    ///
+    /// Every resource of `machine` with a device index, hand-registered ones
+    /// included, then takes the UUID that detection listed at that index, or
+    /// none when the index is not listed. An empty `detected`, from a probe
+    /// that failed, keeps the UUIDs that were saved
     pub fn ensure_detected_resources(
         &self,
         machine: MachineId,
         detected: &[DetectedResource],
     ) -> Result<Vec<ResourceRecord>, AppError> {
         self.immediate(|| {
-            let existing = self.resources_on(machine)?;
-            let first_device = detected.iter().find_map(|resource| resource.device);
-            let Some(device) = first_device else {
-                // a fallback is never added beside an indexed resource
-                if existing
-                    .iter()
-                    .any(|record| record.resource.device.is_some())
-                {
-                    return Ok(existing);
-                }
-                self.insert_detected(machine, detected)?;
-                return self.resources_on(machine);
-            };
-
-            let fallback = existing
-                .iter()
-                .find(|record| record.origin == ResourceOrigin::DetectedFallback);
-            if let Some(fallback) = fallback
-                && !self.adopt_fallback_device(machine, &existing, fallback, device)?
-            {
-                return Ok(existing);
+            self.reconcile_detected(machine, detected)?;
+            if !detected.is_empty() {
+                self.save_detected_gpus(machine, detected)?;
             }
-            self.insert_detected(machine, detected)?;
             self.resources_on(machine)
         })
+    }
+
+    fn reconcile_detected(
+        &self,
+        machine: MachineId,
+        detected: &[DetectedResource],
+    ) -> Result<(), AppError> {
+        let existing = self.resources_on(machine)?;
+        let first_device = detected.iter().find_map(|resource| resource.device);
+        let Some(device) = first_device else {
+            // a fallback is never added beside an indexed resource
+            if existing
+                .iter()
+                .all(|record| record.resource.device.is_none())
+            {
+                self.insert_detected(machine, detected)?;
+            }
+            return Ok(());
+        };
+
+        let fallback = existing
+            .iter()
+            .find(|record| record.origin == ResourceOrigin::DetectedFallback);
+        if let Some(fallback) = fallback
+            && !self.adopt_fallback_device(machine, &existing, fallback, device)?
+        {
+            return Ok(());
+        }
+        self.insert_detected(machine, detected)
+    }
+
+    /// Replace the machine's detected GPU list and give each indexed resource
+    /// the UUID listed at its device index
+    fn save_detected_gpus(
+        &self,
+        machine: MachineId,
+        detected: &[DetectedResource],
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "DELETE FROM detected_gpus WHERE machine = ?1",
+            [machine.to_string()],
+        )?;
+        for resource in detected {
+            if let (Some(device), Some(uuid)) = (resource.device, &resource.uuid) {
+                self.conn.execute(
+                    "INSERT INTO detected_gpus (machine, device, uuid) VALUES (?1, ?2, ?3)",
+                    params![machine.to_string(), i64::from(device), uuid.as_str()],
+                )?;
+            }
+        }
+        self.conn.execute(
+            "UPDATE resources SET gpu_uuid = (
+                 SELECT uuid FROM detected_gpus g
+                 WHERE g.machine = resources.machine AND g.device = resources.device
+             )
+             WHERE machine = ?1",
+            [machine.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Give an idle fallback the first detected device, keeping its UUID
@@ -166,9 +211,12 @@ impl Store {
                 .into());
             }
             let id = ResourceId::new();
+            // the last detection that listed devices names the GPU at this index
             self.conn.execute(
-                "INSERT INTO resources (id, machine, name, device, created_at, origin)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO resources (id, machine, name, device, created_at, origin, gpu_uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (
+                     SELECT uuid FROM detected_gpus WHERE machine = ?2 AND device = ?4
+                 ))",
                 params![
                     id.to_string(),
                     machine.to_string(),

@@ -168,8 +168,11 @@ impl Store {
             resume,
             phase: RunPhase::Launching { reserved_at: now },
         };
+        // the attempt keeps the GPU it launched on, even if a later detection
+        // finds another card at the resource's index
         self.conn.execute(
-            "INSERT INTO resource_run_history(task_id,resource_id) VALUES (?1,?2)",
+            "INSERT INTO resource_run_history(task_id,resource_id,gpu_uuid)
+             SELECT ?1, id, gpu_uuid FROM resources WHERE id = ?2",
             params![task.to_string(), resource.to_string()],
         )?;
         self.write_run(&run)

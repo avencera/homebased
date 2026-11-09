@@ -568,7 +568,7 @@ fn two_resources_pinning_and_device_environment() {
     );
     h.executing(low);
     let pin = h.submit("high", wait_mode(), &script("exit 0"), Some("gpu0"));
-    let body = "test \"$HOMEBASED_RESOURCE\" = gpu1 && test \"$CUDA_VISIBLE_DEVICES\" = 7; while [ ! -e done ]; do sleep 0.02; done";
+    let body = "test \"$HOMEBASED_RESOURCE\" = gpu1 && test \"$CUDA_VISIBLE_DEVICES\" = 7 && test \"$CUDA_DEVICE_ORDER\" = PCI_BUS_ID || exit 1; while [ ! -e done ]; do sleep 0.02; done";
     let any = h.submit("medium", wait_mode(), &script(body), None);
     h.executing(any);
     assert!(matches!(h.job(pin).state, JobState::Queued { .. }));
@@ -1036,11 +1036,11 @@ fn container_contract_uses_resource_and_fixed_mounts() {
     assert_eq!(env["HOMEBASED_JOB_DIR"], "/homebased/job");
     assert_eq!(env["HOMEBASED_YIELD_FILE"], "/homebased/run/yield");
     assert_eq!(env["CUDA_VISIBLE_DEVICES"], "0");
-    assert!(
-        checkpoint
-            .host_environment(&h.home)
-            .contains(&("CUDA_VISIBLE_DEVICES", "3".into()))
-    );
+    assert_eq!(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID");
+    let host = checkpoint.host_environment(&h.home);
+    assert!(host.contains(&("CUDA_VISIBLE_DEVICES", "3".into())));
+    // the host index means the card `nvidia-smi` and Docker call 3
+    assert!(host.contains(&("CUDA_DEVICE_ORDER", "PCI_BUS_ID".into())));
     let paths = h.home.task_paths(task);
     let args = create_args(
         &workload,
@@ -1061,7 +1061,7 @@ fn container_contract_uses_resource_and_fixed_mounts() {
             &ContainerWorkload::from_value(&json!({
                 "image": format!("sha256:{}", "0".repeat(64)),
                 "memory": "1g",
-                "env": { "CUDA_VISIBLE_DEVICES": "99" },
+                "env": { "CUDA_VISIBLE_DEVICES": "99", "CUDA_DEVICE_ORDER": "FASTEST_FIRST" },
             }))
             .unwrap(),
         )
@@ -1079,7 +1079,7 @@ fn container_contract_uses_resource_and_fixed_mounts() {
         !workload
             .env
             .keys()
-            .any(|key| key.as_str() == "CUDA_VISIBLE_DEVICES")
+            .any(|key| matches!(key.as_str(), "CUDA_VISIBLE_DEVICES" | "CUDA_DEVICE_ORDER"))
     );
     assert!(
         !checkpoint
