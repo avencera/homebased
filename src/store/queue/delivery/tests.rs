@@ -61,6 +61,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             blocked: None,
             held_ending: None,
             gpu_idle: None,
+            gpu_summaries: Vec::new(),
         },
     }
 }

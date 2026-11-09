@@ -157,6 +157,25 @@ remind_after = "15m"       # first reminder; then 2x, then every 4x
 
 With `source = "netdata"`, a GPU without Netdata charts has unknown buckets and gets no alerts. `off` stops sampling on the machine. A spec's `after` also sets that job's never-busy point to twice its value.
 
+## GPU summaries
+
+Each attempt on a resource with a device index gets a GPU summary when it ends, whether it finished a step, failed, was cancelled, or was preempted. `JOB_SUCCEEDED`, `JOB_FAILED`, and `JOB_CANCELLED` carry the summaries of every attempt of the job in `gpu_summaries`, and `JOB_PREEMPTED` carries the attempt it ended. `resource job show` prints each run's summary on a `gpu:` line, and `--json` puts it in `runs[].gpu_summary`.
+
+The idle sampler keeps running totals for each attempt while it samples, from whichever source answered at the time. When the attempt's child exits, its worker reads the whole attempt from Netdata, using the charts the sampler last found, in at most 2 seconds. That read replaces a sampled field when it covers more of the attempt. If Netdata is slow, down, or never had the GPU's charts, the sampled totals stand, including the `nvidia-smi` ones. The summary is computed once, in the same commit that ends the attempt, so every delivery of an event carries the same numbers. A summary never holds back the run's end, its cleanup, or the next job.
+
+| Field | Meaning |
+| --- | --- |
+| `util_avg` | Average utilization, in percent. |
+| `power_pct_avg` | Average power draw over the enforced power limit, in percent. The sampler uses the limit it read at the time; the end read uses the latest one. |
+| `mem_peak_mib`, `mem_total_mib` | Highest framebuffer memory in use, and the memory size, in MiB. |
+| `idle_pct` | Share of the sampler's 10-second buckets that were idle, out of those with enough samples. Always from the live buckets, never from Netdata's coarser history. |
+| `first_busy_after_secs` | Seconds from the child's start to its first busy bucket; absent when it never got busy. |
+| `idle_alerts`, `snoozes` | `JOB_GPU_IDLE` alerts produced for the attempt, and each snooze, off switch, and clear in force during it, with its reason and time. |
+
+Each measured field is an object with `value`, `covered_secs`, `coverage_pct` (the share of the attempt's `attempt_secs` it covers), and `source`, `netdata` or `nvidia-smi`. A field with no samples is absent. The summary's own `source` is `mixed` when its fields, or parts of one field, came from both. `status` is `ok`, or `unavailable` with a `reason` when no field has samples, such as an attempt that ended before its child started, a machine with `source = "off"`, or a source that never answered. Callbacks add a one-line `brief` to each summary.
+
+The numbers are device-level. Anything else on the same physical GPU, such as a process started outside the queue, is included. Without the end read, the last 10 to 20 seconds of an attempt are not covered, and coverage below 100% says so.
+
 ## Find checkpoints and logs
 
 `<home>` is `--home`, then `HOMEBASED_HOME`, then `$XDG_STATE_HOME/homebased`, then `~/.local/state/homebased`.

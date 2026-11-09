@@ -11,6 +11,7 @@ mod notice;
 pub mod nvidia_smi;
 pub mod process;
 pub mod samples;
+pub mod summary;
 mod watch;
 
 use std::fmt;
@@ -24,6 +25,7 @@ pub use notice::{
     GpuIdleAttemptView, GpuIdleControl, GpuIdleControlRecord, GpuIdleControlResult, GpuIdleDetail,
     GpuIdleNotice, MAX_REASON_LEN, SampleSource, Silence, next_steps,
 };
+pub use summary::{GpuSummary, Metric, SummarySource, SummaryStatus};
 pub use watch::{AlertDue, AttemptWatch, Bucket, BucketTotals, Episode, Thresholds, Verdict};
 
 /// Alert setting of one job spec, the `gpu_idle` field

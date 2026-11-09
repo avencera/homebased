@@ -14,7 +14,7 @@ use super::{
 use crate::domain::{ExitReason, TaskEnv};
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::queue::gpu_idle::GpuIdleNotice;
+use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
 use crate::queue::{
     AttentionId, BlockedNotice, EventRun, JobEvent, JobEventKind, JobId, JobState, LevelEnd,
     MoveRefusal, OperationId, Placement, Priority, QueueError, ResourceId, Side, StopCause, Target,
@@ -34,6 +34,7 @@ struct EventDraft {
     attention: Option<AttentionId>,
     blocked: Option<BlockedNotice>,
     gpu_idle: Option<GpuIdleNotice>,
+    gpu_summaries: Vec<GpuSummary>,
 }
 
 /// Where a move inserts the job within its new level
@@ -375,7 +376,8 @@ impl Store {
             }
             JobState::Queued { .. } => {
                 self.end_job(&job, JobState::Cancelled)?;
-                self.append_job_event(id, JobEventKind::JobCancelled, None, None, None)?;
+                let summaries = self.gpu_summaries(id)?;
+                self.append_run_end_event(id, JobEventKind::JobCancelled, None, None, summaries)?;
                 Ok(CancelResult::Cancelled)
             }
             JobState::Active { resource } => {
@@ -534,6 +536,30 @@ impl Store {
                 attention,
                 blocked,
                 gpu_idle: None,
+                gpu_summaries: Vec::new(),
+            },
+        )
+    }
+
+    /// Append a final or preemption event with the GPU summaries stored now
+    pub(super) fn append_run_end_event(
+        &self,
+        job: JobId,
+        event: JobEventKind,
+        run: Option<EventRun>,
+        process: Option<ExitReason>,
+        gpu_summaries: Vec<GpuSummary>,
+    ) -> Result<JobEvent, AppError> {
+        self.append_event(
+            job,
+            EventDraft {
+                event,
+                run,
+                process,
+                attention: None,
+                blocked: None,
+                gpu_idle: None,
+                gpu_summaries,
             },
         )
     }
@@ -554,6 +580,7 @@ impl Store {
                 attention: None,
                 blocked: None,
                 gpu_idle: Some(notice),
+                gpu_summaries: Vec::new(),
             },
         )
     }
@@ -566,6 +593,7 @@ impl Store {
             attention,
             blocked,
             gpu_idle,
+            gpu_summaries,
         } = draft;
         self.conn.execute(
             "UPDATE resource_jobs SET event_seq = event_seq + 1 WHERE id = ?1",
@@ -593,6 +621,7 @@ impl Store {
             blocked,
             held_ending: None,
             gpu_idle,
+            gpu_summaries,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)

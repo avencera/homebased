@@ -597,6 +597,9 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             "run {} step {}: {} {}{on}{gpu}; cleanup: {cleanup}",
             run.run_number, run.step, run.task, run.status
         );
+        if let Some(summary) = &run.gpu_summary {
+            println!("  gpu: {}", summary.brief());
+        }
     }
     // jobs that never ran on a watched GPU and were never silenced say nothing
     if let Some(idle) = detail.gpu_idle.as_ref().filter(|idle| {

@@ -159,6 +159,18 @@ Any agent may cancel a GPU job, its own or another thread's, whose GPU has staye
 
 Then run `resource job cancel <job>`. A cancel removes no checkpoints: what the job saved in `HOMEBASED_JOB_DIR` stays in `<home>/jobs/<job>/state/` on the queue machine. The owner gets `JOB_CANCELLED`, moves the CPU part into its own task, and resubmits the GPU part. The new job gets a new, empty `HOMEBASED_JOB_DIR`, so have it read the old checkpoint from that path, or copy it in at the start of its first step.
 
+### Read the GPU summary
+
+Final callbacks (`JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`) carry `gpu_summaries`, one per attempt of the job, and `JOB_PREEMPTED` carries the attempt it ended. `resource job show` has the same summary on each run. Read each summary's `brief` first, then the fields you need. Before you resubmit or report a result, use it to judge whether the job used its GPU well:
+
+- Low `util_avg` with low `idle_pct` means the GPU was busy only in bursts. The input pipeline is likely the bottleneck: add data-loader workers, prefetch, pin memory, or raise the batch size.
+- High `idle_pct` means CPU work sat inside the lease: data prep, scoring, uploads, or a loop that never ended. Move that work into its own task before the next run ([GPU jobs contain only GPU work](#gpu-jobs-contain-only-gpu-work)).
+- A large `first_busy_after_secs` means a slow start, such as loading or tokenizing data before the first step. Prepare that data in a CPU task and point the job at it.
+- `mem_peak_mib` far below `mem_total_mib` leaves room for a larger batch. A peak near the total explains out-of-memory failures.
+- `idle_alerts` and `snoozes` show whether the job was alerted and why it was silenced.
+
+Each field has its own `covered_secs`, `coverage_pct`, and `source` (`netdata` or `nvidia-smi`). Treat a field with low coverage as a partial reading. The summary's `source` is `mixed` when its fields came from both. `status: "unavailable"` comes with a `reason`, such as a machine with GPU sampling off. The numbers are device-level: other work on the same GPU is included.
+
 ## Command reference
 
 Use `homebased --json` before each command and parse the result. All results carry `api_version: 1`. Global flags are `--home <path>`, `--config <path>`, `--json`, `--quiet`, and `--help`. `--quiet` prints IDs and conflicts with `--json`. Full UUIDs are required.
@@ -221,6 +233,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `attention` | Optional exact Attention UUID for release. |
 | `blocked` | Only on blocked notices: `episode`, `blocked_since`, and `blockers`. |
 | `gpu_idle` | Only on GPU idle alerts. `attempt` (run task), `episode`, `reminder` (0 for the first alert), `never_busy`, `gpu_uuid`, `idle_since`, `idle_secs`, `window_secs`, `idle_buckets` and `known_buckets` of the window, `util_below`, and the window's `util_peak_pct`, `power_peak_watts`, `power_peak_pct`, `memory_used_mib`, `memory_total_mib`, each `null` when unread. `last_output_at` is the run's last log output. `process` is the run's busiest process: `pid`, `command`, `state`, `cpu_pct` (one full core is 100), and `marked`, the count of the run's processes. `source` is `netdata` or `nvidia_smi`. `next_steps` repeats what to do. |
+| `gpu_summaries` | On `JOB_SUCCEEDED`, `JOB_FAILED`, and `JOB_CANCELLED`, one summary per attempt on a GPU resource; on `JOB_PREEMPTED`, the attempt it ended. Absent when no attempt ran on one. Each has `attempt` (run task), `run_number`, `step`, `status` (`ok` or `unavailable` with `reason`), `gpu_uuid`, `source` (`netdata`, `nvidia-smi`, or `mixed`), `attempt_secs`, `util_avg`, `power_pct_avg` (percent of the power limit), `mem_peak_mib`, `mem_total_mib`, `idle_pct`, `first_busy_after_secs`, `idle_alerts`, `snoozes` (each control in force during the attempt: `action`, `reason`, `at`, `until`), and `brief`, one line of the same. Each measured field is `{value, covered_secs, coverage_pct, source}` and is absent without samples. See [Read the GPU summary](#read-the-gpu-summary). |
 | `held_ending` | Only when a job held for its `after` entries ended before it queued. `reason` is `dependency` (with the `task` or `job` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
 
 Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.

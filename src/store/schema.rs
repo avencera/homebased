@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 11;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -30,6 +30,7 @@ const MIGRATIONS: [Migration; 10] = [
     add_thread_watches,
     add_gpu_uuids,
     add_gpu_idle,
+    add_gpu_summaries,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -121,6 +122,21 @@ fn add_gpu_idle(conn: &Connection) -> Result<(), rusqlite::Error> {
          {GPU_IDLE_TABLES}"
     ))
 }
+
+/// Version 12: each run attempt's GPU usage summary and its end-of-attempt read
+///
+/// Attempts that ended before this version have no summary
+fn add_gpu_summaries(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "ALTER TABLE resource_run_history ADD COLUMN gpu_end_json TEXT;
+         ALTER TABLE resource_run_history ADD COLUMN gpu_summary_json TEXT;",
+    )
+}
+
+/// The worker's whole-attempt Netdata read, saved just before the exit
+/// commit, and the summary that commit computes once; the summary is never
+/// rewritten, since final job events carry it
+const RUN_GPU_SUMMARY: &str = "gpu_end_json TEXT,\n    gpu_summary_json TEXT";
 
 /// Cluster protocol of the request that submitted the job; `NULL` for jobs
 /// accepted before version 11
@@ -352,6 +368,7 @@ fn schema() -> String {
         .replace("{THREAD_WATCH_TABLES}", THREAD_WATCH_TABLES)
         .replace("{RESOURCE_GPU_UUID}", RESOURCE_GPU_UUID)
         .replace("{RUN_GPU_UUID}", RUN_GPU_UUID)
+        .replace("{RUN_GPU_SUMMARY}", RUN_GPU_SUMMARY)
         .replace("{DETECTED_GPUS_TABLE}", DETECTED_GPUS_TABLE)
         .replace("{JOB_ORIGIN_PROTOCOL}", JOB_ORIGIN_PROTOCOL)
         .replace("{OPERATION_KINDS}", OPERATION_KINDS)
@@ -668,7 +685,8 @@ CREATE TABLE resource_run_history (
     resource_id TEXT NOT NULL REFERENCES resources(id),
     stop_cause TEXT,
     cleanup_json TEXT,
-    {RUN_GPU_UUID}
+    {RUN_GPU_UUID},
+    {RUN_GPU_SUMMARY}
 );
 
 CREATE TABLE resource_job_routes (
@@ -805,6 +823,7 @@ mod tests {
             .replace(super::THREAD_WATCH_TABLES, "")
             .replace(&format!(",\n    {}", super::RESOURCE_LABEL), "")
             .replace(&format!(",\n    {}", super::RESOURCE_GPU_UUID), "")
+            .replace(&format!(",\n    {}", super::RUN_GPU_SUMMARY), "")
             .replace(&format!(",\n    {}", super::RUN_GPU_UUID), "")
             .replace(super::DETECTED_GPUS_TABLE, "")
             .replace(&format!(",\n    {}", super::JOB_ORIGIN_PROTOCOL), "")

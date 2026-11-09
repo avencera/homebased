@@ -1,4 +1,5 @@
-//! GPU idle accounting, agent controls, and atomic `JOB_GPU_IDLE` production
+//! GPU idle accounting, agent controls, atomic `JOB_GPU_IDLE` production, and
+//! the per-attempt GPU summaries of final job events
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -9,9 +10,10 @@ use crate::error::AppError;
 use crate::fleet::protocol::{ClusterProtocolVersion, GPU_IDLE_PROTOCOL};
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
+use crate::queue::gpu_idle::summary::{EndReading, SummaryInput};
 use crate::queue::gpu_idle::{
     AttemptWatch, GpuIdleAttemptView, GpuIdleControl, GpuIdleControlRecord, GpuIdleControlResult,
-    GpuIdleDetail, GpuIdleNotice, GpuIdleSpec, SampleSource, Silence,
+    GpuIdleDetail, GpuIdleNotice, GpuIdleSpec, GpuSummary, SampleSource, Silence,
 };
 use crate::queue::{
     ActiveRun, JobEvent, JobId, OperationId, QueueError, ResourceLabel, ResourceName, RunPhase,
@@ -374,6 +376,108 @@ impl Store {
             controls: self.gpu_idle_controls(job)?,
             attempts,
         })
+    }
+}
+
+impl Store {
+    /// Compute and save the GPU summary of an attempt that is ending
+    ///
+    /// Runs in the attempt's terminal transaction, before its job event is
+    /// appended, and reads only stored data: the watcher's totals and any
+    /// end-of-attempt read the worker saved. An attempt on a resource with no
+    /// GPU index gets none. A summary already saved is returned unchanged
+    pub(super) fn save_gpu_summary(
+        &self,
+        run: &ActiveRun,
+        ended_at: DateTime<Utc>,
+    ) -> Result<Option<GpuSummary>, AppError> {
+        if let Some(saved) = self.gpu_summary(run.task)? {
+            return Ok(Some(saved));
+        }
+        if self
+            .require_resource(run.resource)?
+            .resource
+            .device
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let started_at = match run.phase {
+            RunPhase::Executing { started_at } => Some(started_at),
+            RunPhase::Stopping { started_at, .. } => started_at,
+            _ => None,
+        };
+        let end_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT gpu_end_json FROM resource_run_history WHERE task_id = ?1",
+                [run.task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let end_reading: Option<EndReading> =
+            end_json.as_deref().map(serde_json::from_str).transpose()?;
+        let gpu_uuid = self.run_gpu_uuid(run.task)?;
+        let watch = self.gpu_idle_watch(run.task)?;
+        let controls = self.gpu_idle_controls(run.job)?;
+        let summary = GpuSummary::build(&SummaryInput {
+            attempt: run.task,
+            run_number: run.run_number.get(),
+            step: run.step.get(),
+            gpu_uuid: gpu_uuid.as_ref(),
+            started_at,
+            ended_at,
+            watch: watch.as_ref(),
+            end_reading: end_reading.as_ref(),
+            controls: &controls,
+        });
+        self.conn.execute(
+            "UPDATE resource_run_history SET gpu_summary_json = ?2 WHERE task_id = ?1",
+            params![run.task.to_string(), serde_json::to_string(&summary)?],
+        )?;
+        Ok(Some(summary))
+    }
+
+    /// Save the worker's whole-attempt Netdata read, just before its exit commit
+    pub fn save_gpu_end_reading(&self, task: TaskId, reading: &EndReading) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE resource_run_history SET gpu_end_json = ?2
+             WHERE task_id = ?1 AND gpu_summary_json IS NULL",
+            params![task.to_string(), serde_json::to_string(reading)?],
+        )?;
+        Ok(())
+    }
+
+    /// The saved GPU summary of one attempt
+    pub fn gpu_summary(&self, task: TaskId) -> Result<Option<GpuSummary>, AppError> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT gpu_summary_json FROM resource_run_history WHERE task_id = ?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        json.map(|json| serde_json::from_str(&json).map_err(AppError::from))
+            .transpose()
+    }
+
+    /// The saved GPU summaries of every attempt of a job, oldest first
+    pub(super) fn gpu_summaries(&self, job: JobId) -> Result<Vec<GpuSummary>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT h.gpu_summary_json FROM tasks t
+             JOIN resource_run_history h ON h.task_id = t.id
+             WHERE t.resource_job_id = ?1 AND h.gpu_summary_json IS NOT NULL
+             ORDER BY t.run_number",
+        )?;
+        let rows = statement
+            .query_map([job.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter()
+            .map(|json| serde_json::from_str(json).map_err(AppError::from))
+            .collect()
     }
 }
 

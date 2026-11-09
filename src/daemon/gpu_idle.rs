@@ -23,6 +23,7 @@ use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::netdata::{Chart, GpuCharts, Group, Netdata, RangeQuery};
 use crate::queue::gpu_idle::samples::{Samples, bucketize, min_samples};
+use crate::queue::gpu_idle::summary::{NetdataCharts, SampleSpacing};
 use crate::queue::gpu_idle::{
     AlertDue, AttemptWatch, GpuIdleConfig, GpuIdleNotice, SampleSource, SourceChoice, Thresholds,
     next_steps, nvidia_smi, process,
@@ -41,6 +42,11 @@ const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 const NETDATA_LAG: Duration = Duration::from_secs(2);
 /// Longest stretch one tick reads back; older buckets count as unknown
 const MAX_CATCH_UP: Duration = Duration::from_secs(3600);
+/// Logged when a tick's buckets got no utilization; a symptom, so it never
+/// replaces the condition that caused it
+const NO_SAMPLES: &str = "no utilization samples";
+/// Logged when Netdata lists no utilization chart for a GPU
+const NO_CHART: &str = "no Netdata utilization chart";
 /// How long the busiest process is sampled for the alert text
 const PROCESS_SAMPLE: Duration = Duration::from_secs(1);
 
@@ -77,6 +83,9 @@ struct Watcher {
     limits_read_at: Option<Instant>,
     probes: HashMap<GpuUuid, Samples>,
     logged: HashSet<(GpuUuid, &'static str)>,
+    /// The latest condition of each lane, the reason a summary gives when
+    /// an attempt got no samples
+    problems: HashMap<GpuUuid, String>,
 }
 
 impl Watcher {
@@ -98,11 +107,23 @@ impl Watcher {
             limits_read_at: None,
             probes: HashMap::new(),
             logged: HashSet::new(),
+            problems: HashMap::new(),
         }
     }
 
     /// Log a lane's condition once until it changes
     fn log_once(&mut self, uuid: &GpuUuid, what: &'static str, detail: &str) {
+        let problem = format!("{what}: {detail}");
+        match what {
+            NO_SAMPLES => {}
+            // a missing chart after a failed listing is that failure's symptom
+            NO_CHART => {
+                self.problems.entry(uuid.clone()).or_insert(problem);
+            }
+            _ => {
+                self.problems.insert(uuid.clone(), problem);
+            }
+        }
         if self.logged.insert((uuid.clone(), what)) {
             info!(gpu = %uuid, "GPU idle watcher: {what}: {detail}");
         }
@@ -142,11 +163,7 @@ impl Watcher {
                 SampleSource::Netdata
             } else if self.config.source == SourceChoice::Netdata {
                 let uuid = target.gpu_uuid.clone();
-                self.log_once(
-                    &uuid,
-                    "no Netdata utilization chart",
-                    "buckets stay unknown",
-                );
+                self.log_once(&uuid, NO_CHART, "buckets stay unknown");
                 // no samples: every bucket is unknown, and the counters stay complete
                 self.advance(target, None, Samples::default(), now).await?;
                 continue;
@@ -196,7 +213,12 @@ impl Watcher {
             .map(|target| target.gpu_uuid.clone())
             .collect();
         match self.netdata.charts(&wanted).await {
-            Ok(charts) => self.charts = charts,
+            Ok(charts) => {
+                for uuid in &wanted {
+                    self.problems.remove(uuid);
+                }
+                self.charts = charts;
+            }
             Err(error) => {
                 self.charts.clear();
                 for uuid in &wanted {
@@ -283,8 +305,8 @@ impl Watcher {
             return Some(Samples::default());
         };
         let to = *last + chrono::Duration::from_std(thresholds.bucket).ok()?;
-        // Netdata's lower bound is exclusive, so it starts one second early
-        let after = first.timestamp() - 1;
+        // both bounds are inclusive
+        let after = first.timestamp();
         let before = (to - chrono::Duration::milliseconds(1)).timestamp();
         let stale_after = thresholds
             .bucket
@@ -313,6 +335,7 @@ impl Watcher {
                 return None;
             }
             self.logged.retain(|(uuid, _)| uuid != &target.gpu_uuid);
+            self.problems.remove(&target.gpu_uuid);
             let mut samples = Samples {
                 util: millis(util.values("gpu")),
                 ..Samples::default()
@@ -339,6 +362,28 @@ impl Watcher {
             return Some(samples);
         }
         None
+    }
+
+    /// Time one sample of each field stands for: a chart's collection
+    /// interval, or one probe per tick
+    fn spacing(&self, uuid: &GpuUuid, source: SampleSource, bucket_ms: u64) -> SampleSpacing {
+        let charts = match source {
+            SampleSource::Netdata => self.charts.get(uuid),
+            SampleSource::NvidiaSmi => None,
+        };
+        let Some(charts) = charts else {
+            return SampleSpacing::uniform(bucket_ms);
+        };
+        let every = |chart: &Option<Chart>| {
+            chart
+                .as_ref()
+                .map_or(1000, |chart| u64::from(chart.update_every) * 1000)
+        };
+        SampleSpacing {
+            util: every(&charts.utilization),
+            power: every(&charts.power),
+            memory: every(&charts.memory),
+        }
     }
 
     fn thresholds(&self, target: &GpuIdleTarget) -> Thresholds {
@@ -382,9 +427,47 @@ impl Watcher {
         );
         if !starts.is_empty() && buckets.iter().all(|bucket| bucket.util_peak.is_none()) {
             let uuid = target.gpu_uuid.clone();
-            self.log_once(&uuid, "no utilization samples", "buckets stay unknown");
+            self.log_once(&uuid, NO_SAMPLES, "buckets stay unknown");
+            let latest = self.problems.get(&uuid);
+            watch.usage.problem = Some(match (source, latest) {
+                (Some(source), Some(latest)) => {
+                    format!("{} gave no utilization ({latest})", source.as_str())
+                }
+                (Some(source), None) => format!("{} gave no utilization", source.as_str()),
+                (None, Some(latest)) => latest.clone(),
+                (None, None) => "no utilization source".into(),
+            });
+        }
+        let bucket_ms = u64::try_from(thresholds.bucket.as_millis()).unwrap_or(u64::MAX);
+        if let (Some(source), Some(first)) = (source, starts.first()) {
+            let from = first.timestamp_millis();
+            let count = i64::try_from(starts.len()).unwrap_or(i64::MAX);
+            let to = from
+                .saturating_add(count.saturating_mul(i64::try_from(bucket_ms).unwrap_or(i64::MAX)));
+            let spacing = self.spacing(&target.gpu_uuid, source, bucket_ms);
+            let limit = self.power_limits.get(&target.gpu_uuid).copied();
+            if limit.is_some() {
+                watch.usage.power_limit_watts = limit;
+            }
+            if source == SampleSource::Netdata
+                && let Some(charts) = self.charts.get(&target.gpu_uuid)
+            {
+                let id = |chart: &Option<Chart>| chart.as_ref().map(|chart| chart.id.clone());
+                watch.usage.netdata = Some(NetdataCharts {
+                    url: self.config.netdata_url.clone(),
+                    utilization: id(&charts.utilization),
+                    power: id(&charts.power),
+                    memory: id(&charts.memory),
+                });
+            }
+            watch
+                .usage
+                .add_samples(&samples, (from, to), spacing, limit, source);
         }
         for bucket in buckets {
+            if let Some(source) = source {
+                watch.usage.add_bucket(bucket.verdict, bucket_ms, source);
+            }
             watch.push(bucket, &thresholds);
         }
 

@@ -28,6 +28,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
 use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
+use crate::queue::gpu_idle::summary::EndReading;
 use crate::report::REPORT_TRAILER;
 use crate::run_env;
 use crate::store::{self, Store};
@@ -225,6 +226,7 @@ pub async fn run(home: Home, id: TaskId, lock_fd: i32) -> Result<(), AppError> {
         exit.process_group_exit_evidence.into(),
         &row,
     )
+    .await
 }
 
 async fn run_host_workload(
@@ -272,7 +274,7 @@ async fn run_host_workload(
 /// Write `exit.json`, then commit the terminal state it describes
 ///
 /// The file lets the daemon apply the exit if this worker stops before the commit
-fn record_exit(
+async fn record_exit(
     store: &Store,
     id: TaskId,
     paths: &TaskPaths,
@@ -281,6 +283,7 @@ fn record_exit(
     row: &TaskRow,
 ) -> Result<(), AppError> {
     store::write_exit_json(&paths.exit_json, reason, evidence.clone())?;
+    record_gpu_end(store, id).await;
     record_usage(store, row, paths);
     let worker_thread = worker_thread(row, paths);
     if store
@@ -291,6 +294,45 @@ fn record_exit(
         warn!(%id, status = %current.status(), "cas_exit failed");
     }
     Ok(())
+}
+
+/// Longest the end-of-attempt GPU read may hold the exit commit back
+const GPU_END_READ_BUDGET: Duration = Duration::from_secs(2);
+
+/// Read a GPU attempt's whole history from Netdata before the exit commits,
+/// so the summary on its job event covers the attempt to its end
+///
+/// The read uses the agent and charts the idle watcher saved for the attempt,
+/// and is bounded by [`GPU_END_READ_BUDGET`]. Like usage, it is an
+/// observation: a failure leaves the watcher's totals in place and never
+/// holds the exit back
+async fn record_gpu_end(store: &Store, id: TaskId) {
+    let watch = match store.gpu_idle_watch(id) {
+        Ok(Some(watch)) => watch,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(%id, "read GPU accounting: {err}");
+            return;
+        }
+    };
+    let Some(charts) = watch.usage.netdata.as_ref() else {
+        return;
+    };
+    let reading = EndReading::read(
+        charts,
+        watch.started_at,
+        chrono::Utc::now(),
+        watch.usage.power_limit_watts,
+        GPU_END_READ_BUDGET,
+    )
+    .await;
+    let Some(reading) = reading else {
+        info!(%id, "Netdata did not answer the end-of-attempt read; the summary uses sampled totals");
+        return;
+    };
+    if let Err(err) = store.save_gpu_end_reading(id, &reading) {
+        warn!(%id, "save GPU end reading: {err}");
+    }
 }
 
 /// Save the worker's token usage before the exit commits, so the exit event carries it

@@ -10,6 +10,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::summary::UsageTotals;
+
 /// Thresholds for one attempt, from the machine config and the job spec
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
@@ -148,6 +150,10 @@ pub struct AttemptWatch {
     pub alerts: u32,
     /// The current episode
     pub current: Episode,
+    /// Running usage totals for the attempt's summary
+    // accounting saved before summaries has none
+    #[serde(default)]
+    pub usage: UsageTotals,
 }
 
 /// Why an alert is due
@@ -196,6 +202,7 @@ impl AttemptWatch {
             totals: BucketTotals::default(),
             alerts: 0,
             current: Episode::default(),
+            usage: UsageTotals::default(),
         }
     }
 

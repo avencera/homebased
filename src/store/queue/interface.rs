@@ -11,7 +11,7 @@ use crate::fleet::protocol::{
 };
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
-use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail};
+use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
@@ -187,6 +187,10 @@ pub struct JobRunView {
     // an older peer sends none
     #[serde(default)]
     pub gpu_uuid: Option<GpuUuid>,
+    /// GPU usage of the attempt, computed once when it ended
+    // an older peer sends none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_summary: Option<GpuSummary>,
 }
 
 impl Store {
@@ -369,6 +373,7 @@ impl Store {
                             .map(GpuUuid::parse)
                             .transpose()
                             .map_err(|message| QueueError::Corrupt { message })?,
+                        gpu_summary: self.gpu_summary(task)?,
                     })
                 },
             )

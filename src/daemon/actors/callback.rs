@@ -596,6 +596,16 @@ pub(crate) fn job_event_line(
     payload["task"] = serde_json::json!(event.run.map(|run| run.task));
     payload["run_number"] = serde_json::json!(event.run.map(|run| run.run_number));
     payload["step"] = serde_json::json!(event.run.map(|run| run.step));
+    // one readable line per attempt, derived from the stored summary, so a
+    // repeated delivery renders the same text
+    if let Some(summaries) = payload
+        .get_mut("gpu_summaries")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (value, summary) in summaries.iter_mut().zip(&event.gpu_summaries) {
+            value["brief"] = serde_json::json!(summary.brief());
+        }
+    }
     Ok(format!(
         "HOMEBASED_EVENT {}",
         serde_json::to_string(&payload)?

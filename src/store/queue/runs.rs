@@ -652,8 +652,15 @@ impl Store {
             ..run.clone()
         };
         self.write_run(&cleaning)?;
+        // the summary is final before any event can carry it, so a stored
+        // event never needs a later rewrite
+        let summary = self.save_gpu_summary(run, Utc::now())?;
         if let Some(kind) = after.event {
-            self.append_job_event(job.id, kind, Some(event_run(run)), process, None)?;
+            let summaries = match kind {
+                JobEventKind::JobPreempted => summary.into_iter().collect(),
+                _ => self.gpu_summaries(job.id)?,
+            };
+            self.append_run_end_event(job.id, kind, Some(event_run(run)), process, summaries)?;
         }
         Ok(())
     }

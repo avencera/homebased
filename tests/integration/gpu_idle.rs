@@ -8,9 +8,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use homebased::domain::TaskEnv;
@@ -78,15 +79,32 @@ impl Timeline {
     }
 }
 
+/// A fake Netdata agent's state, shared with the test
+#[derive(Clone, Default)]
+struct FakeNetdata {
+    timeline: Timeline,
+    /// Leave data requests unanswered, like an agent that stopped responding
+    hang: Arc<AtomicBool>,
+    /// Data requests with `group=average`, which only end-of-attempt reads make
+    averages: Arc<AtomicUsize>,
+}
+
 /// A Netdata agent with the go.d `nvidia_smi` charts of both GPUs: gpu0's
 /// carry a `uuid` label, gpu1's only name the UUID in their ids
 fn fake_netdata(timeline: Timeline) -> u16 {
+    serve_netdata(FakeNetdata {
+        timeline,
+        ..FakeNetdata::default()
+    })
+}
+
+fn serve_netdata(fake: FakeNetdata) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let timeline = timeline.clone();
-            thread::spawn(move || serve(stream, &timeline));
+            let fake = fake.clone();
+            thread::spawn(move || serve(stream, &fake));
         }
     });
     port
@@ -104,7 +122,7 @@ fn chart(uuid: &str, context: &str, suffix: &str, labeled: bool) -> (String, Val
     (id, chart)
 }
 
-fn serve(mut stream: TcpStream, timeline: &Timeline) {
+fn serve(mut stream: TcpStream, fake: &FakeNetdata) {
     let mut request = Vec::new();
     let mut buffer = [0; 4096];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -132,7 +150,14 @@ fn serve(mut stream: TcpStream, timeline: &Timeline) {
         }
         json!({ "charts": charts })
     } else if let Some(query) = target.strip_prefix("/api/v1/data?") {
-        data(query, timeline)
+        if query.contains("group=average") {
+            fake.averages.fetch_add(1, Ordering::SeqCst);
+        }
+        if fake.hang.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        data(query, &fake.timeline)
     } else {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -146,8 +171,11 @@ fn serve(mut stream: TcpStream, timeline: &Timeline) {
     );
 }
 
-/// One row per second in `(after, before]`, newest first like Netdata, and
+/// One row per second in `after..=before`, newest first like Netdata, and
 /// never past the present
+///
+/// Every read in these tests asks for one point per second, so values are
+/// never grouped
 fn data(query: &str, timeline: &Timeline) -> Value {
     let param = |name: &str| {
         query
@@ -179,7 +207,7 @@ fn data(query: &str, timeline: &Timeline) -> Value {
             Box::new(move |at| json!([at, 30.0 * gib, 2.0 * gib, 0.0])),
         )
     };
-    let rows: Vec<Value> = ((after + 1)..=last).rev().map(row).collect();
+    let rows: Vec<Value> = (after..=last).rev().map(row).collect();
     json!({ "labels": labels, "data": rows })
 }
 
@@ -192,12 +220,17 @@ fn machine(h: &Harness) -> MachineId {
 
 /// Restart the daemon with the fake GPUs on `PATH` and second-scale thresholds
 fn restart_with_gpus(h: &mut Harness, bin: &Path, netdata_port: u16) {
+    restart_with_config(h, bin, netdata_port, "");
+}
+
+/// Restart as [`restart_with_gpus`] does, with `extra` lines in `[resource.gpu_idle]`
+fn restart_with_config(h: &mut Harness, bin: &Path, netdata_port: u16, extra: &str) {
     let config = h.dir.path().join("config.toml");
     fs::write(
         &config,
         format!(
             "[resource.gpu_idle]\nnetdata_url = \"http://127.0.0.1:{netdata_port}\"\n\
-             interval = \"1s\"\nafter = \"4s\"\nrecover_after = \"2s\"\nremind_after = \"3s\"\n"
+             interval = \"1s\"\nafter = \"4s\"\nrecover_after = \"2s\"\nremind_after = \"3s\"\n{extra}"
         ),
     )
     .unwrap();
@@ -435,4 +468,190 @@ fn nvidia_smi_fallback_counts_missing_readings_as_unknown_and_alerts_never_busy_
         2
     );
     fs::write(h.home.join("finish"), "").unwrap();
+
+    // with Netdata down from the start, the summary comes from the probes
+    let done = final_event(&h, job, "JOB_SUCCEEDED");
+    let summary = &done["gpu_summaries"][0];
+    assert_eq!(summary["status"], "ok", "{done}");
+    assert_eq!(summary["source"], "nvidia-smi");
+    assert_eq!(summary["util_avg"]["value"], 3);
+    assert_eq!(summary["util_avg"]["source"], "nvidia-smi");
+    // 40 W of a 500 W limit
+    assert_eq!(summary["power_pct_avg"]["value"], 8);
+    assert_eq!(summary["mem_peak_mib"]["value"], 2048);
+    assert_eq!(summary["mem_total_mib"]["value"], 32768);
+    assert_eq!(summary["idle_pct"]["value"], 100);
+    assert!(summary["first_busy_after_secs"].is_null());
+    assert!(summary["idle_alerts"].as_u64() >= Some(1));
+    let kinds: Vec<_> = summary["snoozes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|control| control["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["off", "clear"]);
+    // readings were missing for the first part of the run
+    assert!(summary["util_avg"]["coverage_pct"].as_u64() < Some(100));
+}
+
+/// A script that runs until the test creates `file`, for at most 60 seconds
+fn run_until(file: &str) -> String {
+    format!("n=0; while [ ! -f {file} ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done; exit 0")
+}
+
+/// The job's callback of kind `event`, once delivered
+fn final_event(h: &Harness, job: JobId, event: &str) -> Value {
+    let found = || {
+        callbacks(h, job)
+            .into_iter()
+            .find(|callback| callback["event"] == event)
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || found().is_some()),
+        "no {event} for {job}: {:?}; show: {}",
+        callbacks(h, job),
+        show(h, job)
+    );
+    found().unwrap()
+}
+
+fn job_state(h: &Harness, job: JobId) -> Value {
+    show(h, job)["job"]["state"]["state"].clone()
+}
+
+#[test]
+fn final_callbacks_carry_netdata_summaries_of_every_attempt() {
+    let mut h = Harness::new();
+    let bin = fake_nvidia_smi(h.dir.path());
+    let fake = FakeNetdata::default();
+    fake.timeline.set(60.0);
+    let port = serve_netdata(fake.clone());
+    restart_with_gpus(&mut h, &bin, port);
+
+    let mut jobs = Jobs::new(&h);
+    let mut steps = spec(&h, "low", "wait", "exit 0");
+    steps.as_object_mut().unwrap().remove("workload");
+    steps["steps"] = json!([
+        { "type": "task", "command": ["/bin/sh", "-c", "sleep 4; exit 0"] },
+        { "type": "task", "command": ["/bin/sh", "-c", run_until("finish")] }
+    ]);
+    let job = jobs.submit(&steps);
+    assert!(wait_until(Duration::from_secs(30), || {
+        show(&h, job)["gpu_idle"]["attempts"]
+            .get(1)
+            .is_some_and(|attempt| attempt["busy_buckets"].as_u64() >= Some(3))
+    }));
+    fs::write(h.home.join("finish"), "").unwrap();
+
+    let done = final_event(&h, job, "JOB_SUCCEEDED");
+    let summaries = done["gpu_summaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 2, "{done}");
+    for (index, summary) in summaries.iter().enumerate() {
+        assert_eq!(summary["run_number"], index + 1, "{summary}");
+        assert_eq!(summary["step"], index);
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["source"], "netdata");
+        assert_eq!(summary["gpu_uuid"], GPU0);
+        assert_eq!(summary["util_avg"]["value"], 60, "{summary}");
+        // 50 W of a 500 W limit
+        assert_eq!(summary["power_pct_avg"]["value"], 10);
+        assert_eq!(summary["mem_peak_mib"]["value"], 2048);
+        assert_eq!(summary["mem_total_mib"]["value"], 32768);
+        assert_eq!(summary["idle_pct"]["value"], 0);
+        assert_eq!(summary["first_busy_after_secs"], 0);
+        assert_eq!(summary["idle_alerts"], 0);
+        // the end read covers the attempt up to its last second or two
+        let secs = summary["attempt_secs"].as_u64().unwrap();
+        let covered = summary["util_avg"]["covered_secs"].as_u64().unwrap();
+        assert!(secs >= 3 && covered + 2 >= secs, "{summary}");
+        assert!(
+            summary["brief"]
+                .as_str()
+                .unwrap()
+                .contains("util 60% avg, power 10% of limit avg, mem peak 2048/32768 MiB"),
+            "{summary}"
+        );
+    }
+    assert!(
+        fake.averages.load(Ordering::SeqCst) >= 2,
+        "each attempt's end read asks Netdata for averages"
+    );
+    // `resource job show` keeps the stored summary on each run
+    let shown = show(&h, job);
+    let mut stored = summaries[1].clone();
+    stored.as_object_mut().unwrap().remove("brief");
+    assert_eq!(shown["runs"][1]["gpu_summary"], stored);
+    let human = h
+        .cmd()
+        .args(["resource", "job", "show", &job.to_string()])
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.contains("  gpu: run 1 step 0: util 60% avg"),
+        "{human}"
+    );
+
+    // an agent that stops answering at the end costs at most the read's budget
+    let held = jobs.submit(&spec(&h, "low", "wait", &run_until("finish-held")));
+    assert!(wait_until(Duration::from_secs(30), || {
+        attempt(&h, held)["busy_buckets"].as_u64() >= Some(3)
+    }));
+    fake.hang.store(true, Ordering::SeqCst);
+    let asked = Instant::now();
+    fs::write(h.home.join("finish-held"), "").unwrap();
+    assert!(wait_until(Duration::from_secs(30), || job_state(&h, held)
+        == "succeeded"));
+    assert!(
+        asked.elapsed() < Duration::from_secs(8),
+        "the job took {:?} to end",
+        asked.elapsed()
+    );
+    let done = final_event(&h, held, "JOB_SUCCEEDED");
+    let summary = &done["gpu_summaries"][0];
+    assert_eq!(summary["status"], "ok", "{done}");
+    // the watcher's totals stand in; nvidia-smi reports no utilization here
+    assert_eq!(summary["util_avg"]["value"], 60);
+    assert_eq!(summary["util_avg"]["source"], "netdata");
+    fake.hang.store(false, Ordering::SeqCst);
+}
+
+#[test]
+fn an_unreachable_netdata_gives_unavailable_summaries_and_never_delays_the_end() {
+    let mut h = Harness::new();
+    let bin = fake_nvidia_smi(h.dir.path());
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    restart_with_config(&mut h, &bin, closed, "source = \"netdata\"\n");
+
+    let mut jobs = Jobs::new(&h);
+    let job = jobs.submit(&spec(&h, "low", "wait", RUN_UNTIL_FINISH));
+    assert!(wait_until(Duration::from_secs(20), || {
+        attempt(&h, job)["unknown_buckets"].as_u64() >= Some(3)
+    }));
+    let asked = Instant::now();
+    fs::write(h.home.join("finish"), "").unwrap();
+    assert!(wait_until(Duration::from_secs(30), || job_state(&h, job)
+        == "succeeded"));
+    assert!(
+        asked.elapsed() < Duration::from_secs(6),
+        "the job took {:?} to end",
+        asked.elapsed()
+    );
+    let done = final_event(&h, job, "JOB_SUCCEEDED");
+    let summary = &done["gpu_summaries"][0];
+    assert_eq!(summary["status"], "unavailable", "{done}");
+    let reason = summary["reason"].as_str().unwrap();
+    assert!(reason.contains("Netdata unavailable"), "{reason}");
+    assert!(summary["util_avg"].is_null());
+    assert!(
+        summary["brief"]
+            .as_str()
+            .unwrap()
+            .contains("GPU summary unavailable"),
+        "{summary}"
+    );
 }

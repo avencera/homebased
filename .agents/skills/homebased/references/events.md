@@ -29,7 +29,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 
 ## Job events
 
-For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, `JOB_CHECK_DUE`, and `JOB_GPU_IDLE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
+For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, `JOB_CHECK_DUE`, and `JOB_GPU_IDLE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Final job events carry `gpu_summaries`, each attempt's GPU use with a one-line `brief`, and `JOB_PREEMPTED` carries the attempt it ended; read them before resubmitting. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
 
 ## Thread watch events
 

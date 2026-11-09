@@ -61,7 +61,8 @@ pub(super) async fn run(
                     &ExitReason::SpawnFailed { message },
                     ProcessGroupExitEvidence::NoChildSpawned.into(),
                     row,
-                );
+                )
+                .await;
             }
             let args = create_args(
                 workload,
@@ -76,18 +77,21 @@ pub(super) async fn run(
         Entry::Adopt => run.adopt(&paths.container_cid).await,
     };
     match end {
-        ContainerRunEnd::Finished { reason, evidence } => record_exit(
-            store,
-            id,
-            paths,
-            &reason,
-            TaskExitEvidence {
-                // the worker's Docker clients prove nothing about the container
-                process_group: ProcessGroupExitEvidence::Unconfirmed,
-                container: evidence,
-            },
-            row,
-        ),
+        ContainerRunEnd::Finished { reason, evidence } => {
+            record_exit(
+                store,
+                id,
+                paths,
+                &reason,
+                TaskExitEvidence {
+                    // the worker's Docker clients prove nothing about the container
+                    process_group: ProcessGroupExitEvidence::Unconfirmed,
+                    container: evidence,
+                },
+                row,
+            )
+            .await
+        }
         ContainerRunEnd::Lost { note } => {
             append_note(&paths.output, &note);
             if store

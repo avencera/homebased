@@ -1128,6 +1128,11 @@ pub struct JobEvent {
     /// Present only on a GPU idle alert
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_idle: Option<gpu_idle::GpuIdleNotice>,
+    /// GPU usage of the job's attempts, as stored when the event was appended:
+    /// every attempt on a final event, the attempt that ended on a preemption
+    // older origins ignore the field, since this struct accepts unknown ones
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_summaries: Vec<gpu_idle::GpuSummary>,
 }
 
 #[cfg(test)]
