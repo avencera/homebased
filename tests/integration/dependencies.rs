@@ -364,7 +364,7 @@ fn a_task_and_a_job_held_after_a_job_start_once_it_succeeds() {
     let eval = eval["id"].as_str().unwrap().to_owned();
     assert_eq!(
         h.show(&eval)["after"],
-        json!([{ "job": train, "state": "pending" }])
+        json!([{ "task": train, "kind": "job", "state": "pending" }])
     );
     let next = homebased::queue::JobId::new();
     let (held, _) = jobs.submit_with(
@@ -375,7 +375,7 @@ fn a_task_and_a_job_held_after_a_job_start_once_it_succeeds() {
     assert_eq!(held["held"]["state"], "held", "{held}");
     assert_eq!(
         held["held"]["after"],
-        json!([{ "job": train, "state": "pending" }])
+        json!([{ "task": train, "kind": "job", "state": "pending" }])
     );
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(h.show(&eval)["status"], "held");
@@ -384,7 +384,7 @@ fn a_task_and_a_job_held_after_a_job_start_once_it_succeeds() {
     let shown = h.wait_status(&eval, "succeeded");
     assert_eq!(
         shown["after"],
-        json!([{ "job": train, "state": "ended", "outcome": "succeeded" }])
+        json!([{ "task": train, "kind": "job", "state": "ended", "outcome": "succeeded" }])
     );
     let events = super::resource_jobs::wait_callbacks(&h, next, 1);
     assert_eq!(events[0]["event"], "JOB_SUCCEEDED", "{events:?}");

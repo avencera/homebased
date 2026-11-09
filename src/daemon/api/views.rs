@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{HomebasedEvent, WorkloadView};
-use crate::dependency::{Dependency, DependencyState};
+use crate::dependency::{Dependency, DependencyId, DependencyState};
 use crate::domain::{
     API_VERSION, CallbackStatus, ContainerExitEvidence, ContainerId, ExitReason, ProcessStatus,
     TaskId, TaskName, TaskReport, TaskRow, TaskStatus, ThreadId, Workload,
@@ -103,14 +103,73 @@ pub struct TaskSummary {
 }
 
 /// One entry of a task's or a held job's `after` list.
+///
+/// On the wire, `task` holds the entry's UUID, and a job entry adds
+/// `"kind": "job"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "WireDependencyView", from = "WireDependencyView")]
 pub struct DependencyView {
-    /// The dependency, as `task` or `job` with its UUID.
-    #[serde(flatten)]
+    /// The task or job the entry names.
     pub dependency: Dependency,
     /// `pending`, or `ended` with the dependency's `outcome`.
-    #[serde(flatten)]
     pub state: DependencyState,
+}
+
+/// Wire form of [`DependencyView`]
+///
+/// Peers on the previous release decode `task` from every entry, and a single
+/// entry they cannot read would make them refuse the machine's whole task
+/// list. A job entry therefore keeps its UUID in `task` and adds `kind`,
+/// which those peers ignore
+#[derive(Serialize, Deserialize)]
+struct WireDependencyView {
+    task: DependencyId,
+    // a task entry keeps the previous release's shape, which had no kind
+    #[serde(default, skip_serializing_if = "DependencyKind::is_task")]
+    kind: DependencyKind,
+    #[serde(flatten)]
+    state: DependencyState,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DependencyKind {
+    #[default]
+    Task,
+    Job,
+}
+
+impl DependencyKind {
+    const fn is_task(&self) -> bool {
+        matches!(self, Self::Task)
+    }
+}
+
+impl From<DependencyView> for WireDependencyView {
+    fn from(view: DependencyView) -> Self {
+        let kind = match view.dependency {
+            Dependency::Task(_) => DependencyKind::Task,
+            Dependency::Job(_) => DependencyKind::Job,
+        };
+        Self {
+            task: view.dependency.id(),
+            kind,
+            state: view.state,
+        }
+    }
+}
+
+impl From<WireDependencyView> for DependencyView {
+    fn from(wire: WireDependencyView) -> Self {
+        let dependency = match wire.kind {
+            DependencyKind::Task => Dependency::Task(wire.task.as_task()),
+            DependencyKind::Job => Dependency::Job(wire.task.as_job()),
+        };
+        Self {
+            dependency,
+            state: wire.state,
+        }
+    }
 }
 
 impl TaskSummary {
@@ -323,4 +382,59 @@ pub struct LogTail {
     pub log: String,
     /// Whether earlier lines were dropped by `tail`.
     pub truncated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::DependencyView;
+    use crate::dependency::{Dependency, DependencyOutcome, DependencyState, TaskOutcome};
+    use crate::domain::TaskId;
+    use crate::queue::JobId;
+
+    /// The `after` entry of a task view as the previous release reads it
+    #[derive(Deserialize)]
+    struct PreviousDependencyView {
+        task: TaskId,
+        #[serde(flatten)]
+        state: DependencyState,
+    }
+
+    #[test]
+    fn the_previous_release_reads_every_after_entry() {
+        let job = JobId::new();
+        let task = TaskId::new();
+        let ended = DependencyState::Ended(DependencyOutcome::Known(TaskOutcome::Succeeded));
+        let views = vec![
+            DependencyView {
+                dependency: Dependency::Job(job),
+                state: DependencyState::Pending,
+            },
+            DependencyView {
+                dependency: Dependency::Task(task),
+                state: ended,
+            },
+        ];
+        let wire = serde_json::to_value(&views).unwrap();
+        assert_eq!(
+            wire,
+            json!([
+                { "task": job, "kind": "job", "state": "pending" },
+                { "task": task, "state": "ended", "outcome": "succeeded" },
+            ])
+        );
+
+        let previous: Vec<PreviousDependencyView> = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(previous[0].task.0, job.as_uuid());
+        assert_eq!(previous[0].state, DependencyState::Pending);
+        assert_eq!(previous[1].task, task);
+        assert_eq!(previous[1].state, ended);
+
+        // and this release reads both kinds back
+        let read: Vec<DependencyView> = serde_json::from_value(wire).unwrap();
+        assert_eq!(read[0].dependency, Dependency::Job(job));
+        assert_eq!(read[1].dependency, Dependency::Task(task));
+    }
 }

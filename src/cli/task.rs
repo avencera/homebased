@@ -905,10 +905,15 @@ fn print_chain(value: &Value) {
 
 /// One `after` entry for people: `task <id> pending` or `job <id> ended failed`
 pub(super) fn dependency_line(dependency: &Value) -> String {
-    let named = ["task", "job"].into_iter().find_map(|kind| {
-        let id = dependency.get(kind).and_then(Value::as_str)?;
-        Some(format!("{kind} {id}"))
-    });
+    // a job entry keeps its UUID in `task` and adds `"kind": "job"`
+    let kind = dependency
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("task");
+    let named = dependency
+        .get("task")
+        .and_then(Value::as_str)
+        .map(|id| format!("{kind} {id}"));
     let state = match dependency.get("outcome").and_then(Value::as_str) {
         Some(outcome) => format!("ended {outcome}"),
         None => "pending".to_owned(),
