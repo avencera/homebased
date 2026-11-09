@@ -264,8 +264,8 @@ impl AttemptWatch {
                 episode.busy_run = 0;
                 episode.idle_since.get_or_insert(bucket.start);
             }
-            // a gap in the data neither ends nor extends a busy stretch
-            Verdict::Unknown => {}
+            // recovery needs continuous busy time, which a gap in the data breaks
+            Verdict::Unknown => episode.busy_run = 0,
         }
         episode.window.push_back(bucket);
         while episode.window.len() > thresholds.window_buckets() {
@@ -457,6 +457,27 @@ mod tests {
         );
         assert_eq!(watch.alerts, 2);
         assert_eq!((watch.totals.busy, watch.totals.idle), (5, 22));
+    }
+
+    #[test]
+    fn a_gap_between_busy_buckets_restarts_recovery() {
+        let th = thresholds();
+        let mut watch = AttemptWatch::new(start());
+        feed(&mut watch, Verdict::Busy, 1);
+        let now = feed(&mut watch, Verdict::Idle, 6);
+        assert_eq!(
+            watch.alert_due(now, &th, false),
+            Some(AlertDue::First { never_busy: false })
+        );
+        watch.record_alert(now);
+
+        // two busy buckets, a gap, then one more never make 30s of continuous busy
+        feed(&mut watch, Verdict::Busy, 2);
+        feed(&mut watch, Verdict::Unknown, 1);
+        feed(&mut watch, Verdict::Busy, 1);
+        assert_eq!(watch.episode, 1, "the gap broke the busy stretch");
+        feed(&mut watch, Verdict::Busy, 2);
+        assert_eq!(watch.episode, 2, "three continuous busy buckets recover");
     }
 
     #[test]
