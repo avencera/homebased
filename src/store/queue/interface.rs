@@ -107,8 +107,21 @@ impl QueueRequest {
     pub fn min_protocol(&self) -> ClusterProtocolVersion {
         match self {
             Self::GpuIdle { .. } => GPU_IDLE_PROTOCOL,
+            Self::Submit { spec, .. } => submit_protocol(spec),
             _ => SUPPORTED_PROTOCOLS.min(),
         }
+    }
+}
+
+/// Lowest cluster protocol whose authorities accept `spec`
+///
+/// An older authority refuses a spec with `gpu_idle` as an unknown field
+#[must_use]
+pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
+    if spec.gpu_idle.is_some() {
+        GPU_IDLE_PROTOCOL
+    } else {
+        SUPPORTED_PROTOCOLS.min()
     }
 }
 

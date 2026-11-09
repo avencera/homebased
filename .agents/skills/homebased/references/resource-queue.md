@@ -109,7 +109,7 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
 | `timeout` | Output-inactivity notice per run. Default `1h`, minimum `30m`. Never stops work. |
 | `machine`, `resource` | Optional target selectors. |
 | `workload` or `steps` | Exactly one. One workload or 1 to 32 ordered steps. Each is `task` or `container`. |
-| `gpu_idle` | Optional. `"off"` turns this job's GPU idle alerts off. `{"after": "10m", "util_below": 5}` sets its idle window (any positive duration), threshold (1 to 100 percent), or both. Omit it to use the machine's defaults. |
+| `gpu_idle` | Optional. `"off"` turns this job's GPU idle alerts off. `{"after": "10m", "util_below": 5}` sets its idle window (any positive duration), threshold (1 to 100 percent), or both. Omit it to use the machine's defaults. A queue machine on an older release cannot take it: the submit fails with `cluster_protocol_incompatible`, also for a job held for `after` when that machine is reachable at submit. A held job whose machine was unreachable then is retried after release until that machine updates. |
 | `after` | Optional. 1 to 16 task or job UUIDs that this machine submitted. Each must succeed before the job joins the queue; a job succeeds at `JOB_SUCCEEDED`. Same as `--after`; both lists are merged. |
 
 Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Run task IDs cannot be dependencies in any `after` list. Name their job instead.

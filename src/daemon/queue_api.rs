@@ -32,7 +32,7 @@ use crate::queue::{
     ResourceSelector,
 };
 use crate::store::queue::JobAccepted;
-use crate::store::queue::interface::QueueRequest;
+use crate::store::queue::interface::{QueueRequest, submit_protocol};
 use crate::submission::CallbackContext;
 
 /// Application JSON extractor: malformed or oversized bodies use the normal error envelope
@@ -332,6 +332,9 @@ async fn submit(
                 Some(after) => super::dependencies::must_wait(&state, after).await?,
                 None => false,
             };
+            if held {
+                check_held_authority(&state, authority, &body.spec).await?;
+            }
             let route = JobRoute {
                 job: body.job_id,
                 origin: state.machine.identity.machine,
@@ -617,26 +620,7 @@ pub(super) async fn forward(
             machine: machine.to_string(),
         })?;
     let destination = fleet.connect(machine).await?;
-    let needed = request.min_protocol();
-    if destination.protocol < needed {
-        // an older authority would refuse the request as unknown, so name the cause
-        let local = ProtocolRange::new(needed, SUPPORTED_PROTOCOLS.max()).ok_or_else(|| {
-            AppError::Internal {
-                message: "request needs a newer protocol than this daemon".into(),
-            }
-        })?;
-        let remote =
-            ProtocolRange::new(destination.protocol, destination.protocol).ok_or_else(|| {
-                AppError::Internal {
-                    message: "negotiated protocol is not a range".into(),
-                }
-            })?;
-        return Err(AppError::ClusterProtocolIncompatible {
-            machine,
-            local,
-            remote,
-        });
-    }
+    require_protocol(machine, destination.protocol, request.min_protocol())?;
     let body = ClusterQueue {
         api_version: API_VERSION,
         protocol_version: destination.protocol.0,
@@ -673,6 +657,57 @@ pub(super) async fn forward(
         object.remove("protocol_version");
     }
     Ok(value)
+}
+
+/// Refuse a request that `machine`'s negotiated protocol is too old for
+///
+/// An older authority would refuse it as unknown, so this names the cause
+fn require_protocol(
+    machine: MachineId,
+    negotiated: ClusterProtocolVersion,
+    needed: ClusterProtocolVersion,
+) -> Result<(), AppError> {
+    if negotiated >= needed {
+        return Ok(());
+    }
+    let local = ProtocolRange::new(needed, SUPPORTED_PROTOCOLS.max()).ok_or_else(|| {
+        AppError::Internal {
+            message: "request needs a newer protocol than this daemon".into(),
+        }
+    })?;
+    let remote = ProtocolRange::new(negotiated, negotiated).ok_or_else(|| AppError::Internal {
+        message: "negotiated protocol is not a range".into(),
+    })?;
+    Err(AppError::ClusterProtocolIncompatible {
+        machine,
+        local,
+        remote,
+    })
+}
+
+/// Refuse a job held for its `after` entries now, rather than once they
+/// succeeded, when its queue machine is reachable and too old for its spec
+///
+/// An unreachable queue machine is checked again when the job is sent
+async fn check_held_authority(
+    state: &AppState,
+    authority: MachineId,
+    spec: &JobSpec,
+) -> Result<(), AppError> {
+    if authority == state.machine.identity.machine {
+        return Ok(());
+    }
+    let needed = submit_protocol(spec);
+    if needed <= SUPPORTED_PROTOCOLS.min() {
+        return Ok(());
+    }
+    let Some(fleet) = state.fleet.handle() else {
+        return Ok(());
+    };
+    match fleet.connect(authority).await {
+        Ok(destination) => require_protocol(authority, destination.protocol, needed),
+        Err(_) => Ok(()),
+    }
 }
 
 async fn execute(state: &AppState, request: QueueRequest, env: TaskEnv) -> Result<Value, AppError> {
