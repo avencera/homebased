@@ -113,19 +113,39 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
 
 Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Run task IDs cannot be dependencies in any `after` list. Name their job instead.
 
-## Never build inside a GPU lease
+## GPU jobs contain only GPU work
 
-A job holds its GPU from the first step to the last. A build step leaves the GPU idle and keeps every other job waiting. One job held gpu0 for 3.5 minutes while it compiled PTX. Build first in an ordinary CPU task, then submit the job with `--after` that task:
+A job holds its GPU from the first step to the last. Any CPU step leaves the GPU idle and keeps every other job waiting. One job held gpu0 for 3.5 minutes while it compiled PTX. Keep these out of the job and run them as ordinary CPU tasks:
+
+- builds: `cargo build`, `nvcc`, `make`, `pip install`, first-run kernel compilation
+- data prep: downloads, decoding, tokenizing, packing, shuffling, writing shards
+- CPU evaluation and scoring of a checkpoint or of model outputs
+- reports, plots, and summaries
+- uploads of checkpoints, datasets, or results
+
+Saving a checkpoint that takes a few minutes can stay in the job. Chain the parts with `--after`: prepare in a CPU task, hold the GPU job after it, and hold the evaluation after the job:
 
 ```bash
 job="$(uuidgen)"
-build="$(homebased --quiet task run --name "build trainer" -- cargo build --release)"
-homebased --json resource job submit --job-id "$job" --after "$build" --spec job.json
+prep="$(homebased --quiet task run --name "build trainer and pack data" -- ./prep.sh)"
+homebased --json resource job submit --job-id "$job" --after "$prep" --spec job.json
+homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 ```
 
 - The job gets its id at once. Your origin machine holds it out of the queue until every `--after` entry succeeds. `resource job show "$job"` reports `held` with each dependency's state, and `homebased wait --next "$job"` works right away.
 - If an `--after` entry fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task or job, and it uses no GPU time. `resource job cancel` ends a held job the same way. `show` and `cancel` find a held job on its origin machine, so a `--machine` that names this machine or the job's queue machine still reaches it.
-- Keep the job's steps to work that needs the GPU: no `cargo build`, `nvcc`, `make`, `pip install`, or first-run kernel compilation that a CPU task could do ahead of time. Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted.
+- The evaluation task starts once the job sends `JOB_SUCCEEDED`. `JOB_FAILED` or `JOB_CANCELLED` cancels it, and `JOB_PREEMPTED` leaves it held while the job queues again.
+- Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted. It does not detect other CPU work, so split that out yourself.
+
+### Cancel a job that leaves its GPU idle
+
+Any agent may cancel a GPU job, its own or another thread's, whose GPU has stayed near 0% utilization for 20 minutes or more. That job is doing CPU work, or is stuck, while others wait. Check before you cancel:
+
+1. `resource job show <job>` names the active run's resource and `gpu_uuid`. `resource list` maps the resource to its device.
+2. `nvidia-smi` on the queue machine, or the machine's Netdata GPU charts for the last 20 minutes, shows utilization near 0% on that GPU.
+3. `homebased task log <run-task> --tail 50` shows what the job is doing, such as tokenizing, scoring, or uploading.
+
+Then run `resource job cancel <job>`. A cancel removes no checkpoints: what the job saved in `HOMEBASED_JOB_DIR` stays in `<home>/jobs/<job>/state/` on the queue machine. The owner gets `JOB_CANCELLED`, moves the CPU part into its own task, and resubmits the GPU part. The new job gets a new, empty `HOMEBASED_JOB_DIR`, so have it read the old checkpoint from that path, or copy it in at the start of its first step.
 
 ## Command reference
 

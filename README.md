@@ -15,7 +15,7 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 ## GPU priority queue
 
-Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. Build in a CPU task first and submit the job with `--after` that task: the job is held under its id until the build succeeds, and cancelled without taking a GPU if the build fails. `--after` also takes a job, so evaluation can wait for training as a CPU task. Submit warns when a step itself runs a build tool such as `cargo build` or `pip install`. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority and can yield at checkpoints for urgent work. Each resource runs one attempt at a time. A job holds its GPU from first step to last, so keep it to GPU work: run builds, data prep, CPU evaluation, reports, and uploads as CPU tasks chained with `--after`. A job submitted `--after` a prep task is held under its id until the prep succeeds, and cancelled without taking a GPU if it fails; a task submitted `--after` a job starts at `JOB_SUCCEEDED`. Any agent may cancel a job whose GPU sits near 0% for 20 minutes or more. Submit warns when a step itself runs a build tool such as `cargo build` or `pip install`. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, cancellation, and cleanup.
 
 ## For agents
 

@@ -2,6 +2,21 @@
 
 Use the resource queue for all GPU work on a machine that has it. Each machine has one queue. Each resource runs one attempt at a time. Work outside the queue can use a GPU that Homebased considers free.
 
+## Keep GPU jobs to GPU work
+
+A job holds its GPU from its first step to its last, so any CPU step idles the GPU while other jobs wait. Run builds, data prep (downloads, tokenizing, packing, shards), CPU evaluation and scoring, reports, and uploads as ordinary tasks, and chain them to the job with `--after`. A checkpoint save of a few minutes can stay in the job.
+
+```sh
+job="$(uuidgen)"
+prep="$(homebased --quiet task run --name "build trainer and pack data" -- ./prep.sh)"
+homebased --json resource job submit --job-id "$job" --after "$prep" --spec job.json
+homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
+```
+
+The job stays out of the queue until the prep task succeeds, and the evaluation starts at `JOB_SUCCEEDED`. Submit warns when a step runs a build tool. It does not detect other CPU work.
+
+Any agent or operator may cancel a GPU job whose GPU has stayed near 0% utilization for 20 minutes or more. Confirm it first: `resource job show` names the active run's resource and `gpu_uuid`; `nvidia-smi` or the machine's Netdata GPU charts show that GPU's utilization over the last 20 minutes; and `task log <run-task> --tail 50` shows what the job is doing. Cancelling removes no checkpoints, and `<home>/jobs/<job>/state/` stays on the queue machine. The owner then moves the CPU part into its own task and resubmits the GPU part, pointing it at the old checkpoint, since the new job starts with an empty `HOMEBASED_JOB_DIR`.
+
 ## Check resources and jobs
 
 At daemon startup, Linux detects NVIDIA GPU indices with `nvidia-smi -L` and creates `gpu0`, `gpu1`, and so on. macOS gets `gpu0` without a device index. If `nvidia-smi` is not installed, Linux gets an unindexed `gpu0`. If an installed probe fails or returns no usable devices, Homebased logs a warning and waits until a later start to detect resources. This exclusive lane does not prove that a physical GPU is available. A later successful detection assigns the first device to a detected fallback and keeps its UUID. Detection waits if that fallback has a run in any phase, including cleanup or Attention. Manual registrations keep their names and indices.
