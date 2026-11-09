@@ -18,6 +18,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::events::EventPayload;
 use crate::queue::StopCause;
+use crate::queue::gpu_idle::summary::EndReading;
 use crate::submission::ExecutorIdentity;
 use crate::waiting::{WaitTargets, WaitingNotes, WaitingReport};
 
@@ -98,7 +99,25 @@ impl Store {
         evidence: impl Into<TaskExitEvidence>,
         worker_thread: Option<ThreadId>,
     ) -> Result<Option<TaskRow>, AppError> {
-        let evidence = &evidence.into();
+        self.cas_worker_exit(id, from, reason, evidence.into(), worker_thread, None)
+    }
+
+    /// [`Self::cas_exit_with_evidence`] that also saves the worker's
+    /// end-of-attempt GPU read of a queue run
+    ///
+    /// The read is saved in the exit's own transaction, before the attempt's
+    /// summary is computed from it, so the optional observation adds no
+    /// separate write that the required exit commit could wait behind
+    pub(crate) fn cas_worker_exit(
+        &self,
+        id: TaskId,
+        from: ProcessStatus,
+        reason: &ExitReason,
+        evidence: TaskExitEvidence,
+        worker_thread: Option<ThreadId>,
+        gpu_end: Option<&EndReading>,
+    ) -> Result<Option<TaskRow>, AppError> {
+        let evidence = &evidence;
         check_exit_evidence(from, reason, evidence)?;
         let to = ProcessStatus::from(reason);
         check_status_transition(from, to)?;
@@ -112,6 +131,9 @@ impl Store {
                 return Err(AppError::Internal {
                     message: "container evidence requires a container task".into(),
                 });
+            }
+            if let Some(reading) = gpu_end {
+                self.save_gpu_end_reading(id, reading)?;
             }
             self.cas_exit_inner(id, from, reason, evidence, worker_thread)
         })

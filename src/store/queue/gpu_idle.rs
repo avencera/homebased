@@ -442,8 +442,12 @@ impl Store {
         Ok(Some(summary))
     }
 
-    /// Save the worker's whole-attempt Netdata read, just before its exit commit
-    pub fn save_gpu_end_reading(&self, task: TaskId, reading: &EndReading) -> Result<(), AppError> {
+    /// Save the worker's whole-attempt Netdata read, in its exit transaction
+    pub(in crate::store) fn save_gpu_end_reading(
+        &self,
+        task: TaskId,
+        reading: &EndReading,
+    ) -> Result<(), AppError> {
         self.conn.execute(
             "UPDATE resource_run_history SET gpu_end_json = ?2
              WHERE task_id = ?1 AND gpu_summary_json IS NULL",

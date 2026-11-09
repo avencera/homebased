@@ -283,11 +283,18 @@ async fn record_exit(
     row: &TaskRow,
 ) -> Result<(), AppError> {
     store::write_exit_json(&paths.exit_json, reason, evidence.clone())?;
-    record_gpu_end(store, id).await;
+    let gpu_end = read_gpu_end(store, id).await;
     record_usage(store, row, paths);
     let worker_thread = worker_thread(row, paths);
     if store
-        .cas_exit_with_evidence(id, ProcessStatus::Running, reason, evidence, worker_thread)?
+        .cas_worker_exit(
+            id,
+            ProcessStatus::Running,
+            reason,
+            evidence,
+            worker_thread,
+            gpu_end.as_ref(),
+        )?
         .is_none()
     {
         let current = store.require_task(id)?;
@@ -303,21 +310,19 @@ const GPU_END_READ_BUDGET: Duration = Duration::from_secs(2);
 /// so the summary on its job event covers the attempt to its end
 ///
 /// The read uses the agent and charts the idle watcher saved for the attempt,
-/// and is bounded by [`GPU_END_READ_BUDGET`]. Like usage, it is an
-/// observation: a failure leaves the watcher's totals in place and never
-/// holds the exit back
-async fn record_gpu_end(store: &Store, id: TaskId) {
+/// and is bounded by [`GPU_END_READ_BUDGET`]. The exit commit saves it in the
+/// same transaction, so it adds no write of its own. Like usage, it is an
+/// observation: a failure leaves the watcher's totals in place
+async fn read_gpu_end(store: &Store, id: TaskId) -> Option<EndReading> {
     let watch = match store.gpu_idle_watch(id) {
         Ok(Some(watch)) => watch,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(err) => {
             warn!(%id, "read GPU accounting: {err}");
-            return;
+            return None;
         }
     };
-    let Some(charts) = watch.usage.netdata.as_ref() else {
-        return;
-    };
+    let charts = watch.usage.netdata.as_ref()?;
     let reading = EndReading::read(
         charts,
         watch.started_at,
@@ -326,13 +331,10 @@ async fn record_gpu_end(store: &Store, id: TaskId) {
         GPU_END_READ_BUDGET,
     )
     .await;
-    let Some(reading) = reading else {
+    if reading.is_none() {
         info!(%id, "Netdata did not answer the end-of-attempt read; the summary uses sampled totals");
-        return;
-    };
-    if let Err(err) = store.save_gpu_end_reading(id, &reading) {
-        warn!(%id, "save GPU end reading: {err}");
     }
+    reading
 }
 
 /// Save the worker's token usage before the exit commits, so the exit event carries it
