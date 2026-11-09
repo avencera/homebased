@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::netdata::{Group, Netdata, RangeQuery};
+use super::netdata::{Group, Netdata, RangeQuery, Series};
 use super::notice::{GpuIdleControlRecord, SampleSource};
 use super::samples::Samples;
 use super::watch::{AttemptWatch, Verdict};
@@ -349,9 +349,13 @@ const END_READ_POINTS: i64 = 1200;
 impl EndReading {
     /// Read the attempt `started..=ended` from Netdata, within `budget` in all
     ///
-    /// Utilization and power are averaged per point and memory is the peak per
-    /// point; a point with data counts its whole width as covered. `None` when
-    /// the agent fails, is slow, or has no data, so the watcher's totals stand
+    /// Utilization and power are averaged per point, and memory in use is the
+    /// peak per point. Memory size is the sum of the averaged dimensions: the
+    /// sum is constant, so its average is the size, while a sum of per-point
+    /// peaks taken at different moments would overstate it. A point with data
+    /// counts the spacing Netdata returned as covered, which is wider than the
+    /// one asked for when the collector or tier is coarser. `None` when the
+    /// agent fails, is slow, or has no data, so the watcher's totals stand
     pub async fn read(
         charts: &NetdataCharts,
         started: DateTime<Utc>,
@@ -384,29 +388,42 @@ impl EndReading {
                 netdata.range(&query).await.ok()
             }
         };
-        let (util, power, memory) = tokio::time::timeout(budget, async {
+        let (util, power, memory_peak, memory_mean) = tokio::time::timeout(budget, async {
             tokio::join!(
                 read(charts.utilization.as_ref(), Group::Average),
                 read(charts.power.as_ref(), Group::Average),
                 read(charts.memory.as_ref(), Group::Max),
+                read(charts.memory.as_ref(), Group::Average),
             )
         })
         .await
         .ok()?;
 
         let netdata = SampleSource::Netdata;
+        let width = |series: &Series| series.spacing_ms(width_ms);
         let mut reading = Self::default();
-        for (_, value) in util.iter().flat_map(|series| series.values("gpu")) {
-            reading.util.add(value, width_ms, netdata);
-        }
-        if let Some(limit) = power_limit_watts.filter(|limit| *limit > 0.0) {
-            for (_, watts) in power.iter().flat_map(|series| series.values("power_draw")) {
-                reading
-                    .power_pct
-                    .add(watts / limit * 100.0, width_ms, netdata);
+        if let Some(util) = &util {
+            let width = width(util);
+            for (_, value) in util.values("gpu") {
+                reading.util.add(value, width, netdata);
             }
         }
-        if let Some(memory) = &memory {
+        if let Some(limit) = power_limit_watts.filter(|limit| *limit > 0.0)
+            && let Some(power) = &power
+        {
+            let width = width(power);
+            for (_, watts) in power.values("power_draw") {
+                reading.power_pct.add(watts / limit * 100.0, width, netdata);
+            }
+        }
+        if let Some(memory) = &memory_peak {
+            let width = width(memory);
+            for (_, used) in memory.values("used").filter(|(_, bytes)| *bytes >= 0.0) {
+                reading.mem_used.add(used as u64, width, netdata);
+            }
+        }
+        if let Some(memory) = &memory_mean {
+            let width = width(memory);
             for (_, values) in &memory.rows {
                 let column = |name: &str| {
                     let index = memory
@@ -415,15 +432,12 @@ impl EndReading {
                         .position(|dimension| dimension == name)?;
                     values.get(index).copied().flatten()
                 };
-                if let Some(used) = column("used").filter(|bytes| *bytes >= 0.0) {
-                    reading.mem_used.add(used as u64, width_ms, netdata);
-                }
                 let total: f64 = ["free", "used", "reserved"]
                     .into_iter()
                     .filter_map(column)
                     .sum();
                 if total > 0.0 {
-                    reading.mem_total.add(total as u64, width_ms, netdata);
+                    reading.mem_total.add(total as u64, width, netdata);
                 }
             }
         }
@@ -660,9 +674,13 @@ fn controls_during(input: &SummaryInput<'_>) -> Vec<GpuIdleControlRecord> {
 mod tests {
     use chrono::{TimeZone, Utc};
 
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+
     use super::{
-        GpuSummary, SampleSource, SampleSpacing, SummaryInput, SummarySource, SummaryStatus,
-        UsageTotals,
+        EndReading, GpuSummary, NetdataCharts, SampleSource, SampleSpacing, SummaryInput,
+        SummarySource, SummaryStatus, UsageTotals,
     };
     use crate::domain::TaskId;
     use crate::queue::gpu::GpuUuid;
@@ -778,5 +796,108 @@ mod tests {
         });
         assert_eq!(empty.status, SummaryStatus::Unavailable);
         assert!(empty.reason.unwrap().contains("refused"));
+    }
+
+    /// A Netdata agent that answers every data query with one row per 5
+    /// seconds, as a slow collector or a coarse tier does, and whose
+    /// framebuffer split moves within each grouped point
+    async fn coarse_netdata() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let query = request.split_whitespace().nth(1).unwrap_or_default();
+                let param = |name: &str| {
+                    query
+                        .split(['?', '&'])
+                        .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                let after: i64 = param("after").parse().unwrap();
+                let before: i64 = param("before").parse().unwrap();
+                let gib = f64::from(1u32 << 30);
+                let (labels, row) = match (param("chart").as_str(), param("group").as_str()) {
+                    ("util", _) => (json!(["time", "gpu"]), json!([50.0])),
+                    // free and used swapped between 30 and 2 GiB inside each point
+                    ("memory", "max") => (
+                        json!(["time", "free", "used", "reserved"]),
+                        json!([30.0 * gib, 30.0 * gib, 0.0]),
+                    ),
+                    ("memory", _) => (
+                        json!(["time", "free", "used", "reserved"]),
+                        json!([16.0 * gib, 16.0 * gib, 0.0]),
+                    ),
+                    _ => (json!(["time", "power_draw"]), json!([100.0])),
+                };
+                // newest first, like Netdata
+                let mut times: Vec<i64> = (after..=before).step_by(5).collect();
+                times.reverse();
+                let rows: Vec<Value> = times
+                    .into_iter()
+                    .map(|at| {
+                        let mut values = vec![json!(at)];
+                        values.extend(row.as_array().unwrap().iter().cloned());
+                        Value::Array(values)
+                    })
+                    .collect();
+                let body = json!({ "labels": labels, "data": rows }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn an_end_read_counts_the_returned_spacing_and_the_physical_memory_size() {
+        let port = coarse_netdata().await;
+        let charts = NetdataCharts {
+            url: format!("http://127.0.0.1:{port}").parse().unwrap(),
+            utilization: Some("util".into()),
+            power: Some("power".into()),
+            memory: Some("memory".into()),
+        };
+        let start = Utc.with_ymd_and_hms(2026, 11, 9, 12, 0, 0).unwrap();
+        let end = start + chrono::Duration::seconds(60);
+        let reading = EndReading::read(&charts, start, end, Some(500.0), Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // 13 rows 5 seconds apart cover the whole minute, not 13 seconds of it
+        assert_eq!(reading.util.coverage.netdata_ms, 65_000);
+        assert_eq!(reading.power_pct.coverage.netdata_ms, 65_000);
+        let summary = GpuSummary::build(&SummaryInput {
+            attempt: TaskId::new(),
+            run_number: 1,
+            step: 0,
+            gpu_uuid: None,
+            started_at: Some(start),
+            ended_at: end,
+            watch: None,
+            end_reading: Some(&reading),
+            controls: &[],
+        });
+        let util = summary.util_avg.unwrap();
+        assert_eq!((util.value, util.coverage_pct), (50, 100));
+        assert_eq!(summary.power_pct_avg.unwrap().value, 20);
+
+        // the peak in use is the busiest moment, and the size stays physical
+        assert_eq!(summary.mem_peak_mib.unwrap().value, 30 * 1024);
+        assert_eq!(summary.mem_total_mib.unwrap().value, 32 * 1024);
     }
 }

@@ -116,6 +116,22 @@ impl Series {
         })
     }
 
+    /// Milliseconds between the returned rows: the smallest gap between two
+    /// neighbours, or `fallback` with fewer than two rows
+    ///
+    /// Netdata returns fewer points than asked for when its collector or tier
+    /// is coarser, so each row then stands for more time than requested. The
+    /// smallest gap is used, so a hole in the data never widens the rows
+    #[must_use]
+    pub fn spacing_ms(&self, fallback: u64) -> u64 {
+        self.rows
+            .windows(2)
+            .filter_map(|pair| u64::try_from(pair[1].0 - pair[0].0).ok())
+            .filter(|gap| *gap > 0)
+            .min()
+            .map_or(fallback, |gap| gap.saturating_mul(1000))
+    }
+
     /// Newest row time, if any row has a value
     #[must_use]
     pub fn newest(&self) -> Option<i64> {
