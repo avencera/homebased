@@ -268,6 +268,6 @@ pub fn next_steps(job: crate::queue::JobId, task: TaskId) -> String {
          chain with that work in its own task (`--after`). For a short expected gap such as a \
          large checkpoint write: `homebased resource job gpu-idle {job} --snooze 15m --reason \
          \"...\"`; to stop alerts for this job: `--off --reason \"...\"`. After 20m idle with no \
-         snooze, any agent may cancel it."
+         snooze or off switch, any agent may cancel it."
     )
 }
