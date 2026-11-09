@@ -478,6 +478,18 @@ fn a_waiting_report_needs_a_local_agent_known_targets_and_no_cycle() {
     assert_eq!(refusal(&out), ("waiting_cycle".into(), 5));
     let out = h.report_waiting(&second, &[&held], Some("transitive"));
     assert_eq!(refusal(&out), ("waiting_cycle".into(), 5));
+    // nor through a GPU job held after the worker and a task held after that job
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+    let job = homebased::queue::JobId::new();
+    let (held_job, _) = jobs.submit_with(
+        job,
+        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &["--after", &first],
+    );
+    assert_eq!(held_job["held"]["state"], "held", "{held_job}");
+    let behind = h.submit(&after(Harness::task_spec(&["true"]), &[&job.to_string()]));
+    let out = h.report_waiting(&first, &[&behind], Some("wait through the job"));
+    assert_eq!(refusal(&out), ("waiting_cycle".into(), 5));
 
     // a task that runs for another origin
     let remote = TaskId::new();

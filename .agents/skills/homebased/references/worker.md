@@ -43,7 +43,7 @@ Continue the task from these notes. Do not redo completed work.
 
 - The notes are the only memory the next run has besides the repository. Write everything it needs into them: what is already done and verified, what each outcome means, and what to do next. Do not write a `RESUME.md` or any other handoff file into the repository.
 - The continuation is a new task with your name plus ` (continued)`, the same `cwd`, agent, model, `extra_args`, and parent thread. It reports like any worker, and may park again.
-- Name 1 to 16 tasks, each once. Each must be a task on this machine that was submitted here, not a GPU queue run, and not a task that already waits on you. Errors: `unknown_dependency`, `waiting_target_unsupported`, `waiting_remote_unsupported`, `waiting_cycle`. Only agent workers can park (`waiting_unsupported_workload`), and only on the machine that submitted them.
+- Name 1 to 16 tasks, each once. Each must be a task on this machine that was submitted here, not a GPU queue run, and not a task that already waits on you, directly or through held tasks and GPU jobs. Errors: `unknown_dependency`, `waiting_target_unsupported`, `waiting_remote_unsupported`, `waiting_cycle`. Only agent workers can park (`waiting_unsupported_workload`), and only on the machine that submitted them.
 - One unit of work has at most 20 runs. On the last one, `waiting` fails with `too_many_continuations`; report `blocked` instead.
 - The last report wins. If you report `waiting` and then decide to finish the work yourself, report `succeeded` or `failed` before you exit. A waiting report followed by a non-zero exit is `TASK_FAILED`, and nothing continues.
 

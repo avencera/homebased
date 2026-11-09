@@ -19,6 +19,8 @@ use super::lifecycle::reports_from;
 use crate::dependency::{Dependencies, DependencyId, ReleaseRule, TaskOutcome};
 use crate::domain::{API_VERSION, AgentKind, ReportOutcome, TaskId, TaskRow, ThreadId, Workload};
 use crate::error::AppError;
+use crate::queue::JobId;
+use crate::queue::delivery::{JobRoute, JobSubmission};
 use crate::spec::{NormalizedAgentWorkload, NormalizedSpec, NormalizedWorkload};
 use crate::submission::{HeldPhase, NewHeldRoute, OriginRoute, RequestId, SubmissionState};
 use crate::waiting::{
@@ -347,19 +349,54 @@ pub(super) fn thread_reserved_by_on(
     task.as_deref().map(parse_task).transpose()
 }
 
-/// One node of the wait graph: a chain, or a task that never parked
+/// One node of the wait graph: a chain, a task that never parked, or a
+/// GPU queue job submitted through this origin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WaitNode {
     Chain(TaskId),
     Task(TaskId),
+    Job(JobId),
 }
 
 fn node_on(conn: &Connection, task: TaskId) -> Result<WaitNode, AppError> {
     Ok(chain_of_on(conn, task)?.map_or(WaitNode::Task(task), |chain| WaitNode::Chain(chain.id)))
 }
 
+/// The node an `after` entry names: a task route wins over a job route, as
+/// in dependency lookups
+fn dependency_node_on(conn: &Connection, id: DependencyId) -> Result<WaitNode, AppError> {
+    let task = id.as_task();
+    if !task_exists_on(conn, task)? && held_job_after_on(conn, id.as_job())?.is_some() {
+        return Ok(WaitNode::Job(id.as_job()));
+    }
+    node_on(conn, task)
+}
+
+/// The `after` list of a job this origin still holds, or `None` for a job
+/// that is not held here
+///
+/// A job that left the origin's hold waits on nothing here, since its queue
+/// runs it on its own
+fn held_job_after_on(conn: &Connection, job: JobId) -> Result<Option<Vec<DependencyId>>, AppError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT route_json FROM resource_job_routes WHERE job_id = ?1",
+            [job.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let route: JobRoute = serde_json::from_str(&json)?;
+    Ok(match (route.submission, route.after) {
+        (JobSubmission::Held, Some(after)) => Some(after.ids().to_vec()),
+        _ => None,
+    })
+}
+
 /// Targets of a task's final waiting report while it still runs
-fn pending_wait_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppError> {
+fn pending_wait_on(conn: &Connection, task: TaskId) -> Result<Vec<DependencyId>, AppError> {
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM tasks WHERE id = ?1",
@@ -372,16 +409,17 @@ fn pending_wait_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppEr
     }
     let reports = reports_from(conn, task)?;
     Ok(match reports.last().map(|report| &report.outcome) {
-        Some(ReportOutcome::Waiting(waiting)) => waiting.on.tasks().to_vec(),
+        Some(ReportOutcome::Waiting(waiting)) => task_entries(waiting.on.tasks()),
         _ => Vec::new(),
     })
 }
 
-/// Tasks a held route still waits on
-///
-/// A job entry reads as a task with no route, which waits on nothing: a job
-/// can wait only on work that existed before it, so it closes no cycle
-fn held_after_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppError> {
+fn task_entries(tasks: &[TaskId]) -> Vec<DependencyId> {
+    tasks.iter().copied().map(DependencyId::from).collect()
+}
+
+/// Entries a held route still waits on, tasks and jobs alike
+fn held_after_on(conn: &Connection, task: TaskId) -> Result<Vec<DependencyId>, AppError> {
     let Some((route, Some(after))) = dependent_route_on(conn, task)? else {
         return Ok(Vec::new());
     };
@@ -392,20 +430,15 @@ fn held_after_on(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>, AppErro
         }
     );
     Ok(if held {
-        after
-            .ids()
-            .iter()
-            .copied()
-            .map(DependencyId::as_task)
-            .collect()
+        after.ids().to_vec()
     } else {
         Vec::new()
     })
 }
 
-/// Tasks one node waits on: `after` lists of held routes, saved waiting
-/// reports of running workers, and the targets of a parked chain
-fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<TaskId>, AppError> {
+/// Entries one node waits on: `after` lists of held routes and held jobs,
+/// saved waiting reports of running workers, and the targets of a parked chain
+fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<DependencyId>, AppError> {
     match node {
         WaitNode::Task(task) => {
             let mut waits = held_after_on(conn, task)?;
@@ -415,7 +448,7 @@ fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<TaskId>, AppErro
         WaitNode::Chain(chain) => {
             let state = chain_of_on(conn, chain)?.map(|chain| chain.state);
             match state {
-                Some(ChainState::Waiting { on, .. }) => Ok(on.tasks().to_vec()),
+                Some(ChainState::Waiting { on, .. }) => Ok(task_entries(on.tasks())),
                 Some(ChainState::Running { current }) => {
                     let mut waits = held_after_on(conn, current)?;
                     waits.extend(pending_wait_on(conn, current)?);
@@ -424,6 +457,7 @@ fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<TaskId>, AppErro
                 Some(ChainState::Ended { .. }) | None => Ok(Vec::new()),
             }
         }
+        WaitNode::Job(job) => Ok(held_job_after_on(conn, job)?.unwrap_or_default()),
     }
 }
 
@@ -444,7 +478,7 @@ fn leads_back_on(conn: &Connection, worker: WaitNode, target: TaskId) -> Result<
             });
         }
         for next in waits_of_on(conn, node)? {
-            stack.push(node_on(conn, next)?);
+            stack.push(dependency_node_on(conn, next)?);
         }
     }
     Ok(false)
