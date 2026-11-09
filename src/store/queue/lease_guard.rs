@@ -173,18 +173,25 @@ impl Store {
     /// or for a final event the job's latest
     ///
     /// Each step runs as its own attempt, and one that tripped and then
-    /// finished its step ends with no event, so the final event reports it
+    /// finished its step ends with no event, so the final event reports it,
+    /// even a cancel that came before the next step ran
     pub(super) fn lease_idle_for_event(
         &self,
         job: JobId,
-        task: TaskId,
+        task: Option<TaskId>,
         last: bool,
     ) -> Result<Option<LeaseIdleTrip>, AppError> {
-        match self.lease_idle_trip(task)? {
-            Some(trip) => Ok(Some(trip)),
-            None if last => Ok(self.lease_idle_trips(job)?.pop()),
-            None => Ok(None),
+        if let Some(trip) = task
+            .map(|task| self.lease_idle_trip(task))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(Some(trip));
         }
+        if last {
+            return Ok(self.lease_idle_trips(job)?.pop());
+        }
+        Ok(None)
     }
 
     /// Every trip of one job, oldest first

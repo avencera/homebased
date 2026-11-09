@@ -33,7 +33,7 @@ pub struct LeaseGuardConfig {
     pub enabled: bool,
     /// Time a run may hold its GPU with no CUDA context before it trips
     pub idle_after: Duration,
-    /// Time between probes; a context held at least this long is always seen
+    /// Time between probes; a context is seen only when it overlaps one
     pub interval: Duration,
     /// Time a guard-requested yield may stay pending before the job is cancelled
     pub yield_grace: Duration,

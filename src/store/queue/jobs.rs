@@ -558,17 +558,14 @@ impl Store {
         if !gpu_summaries.is_empty() && !self.origin_reads_gpu_idle(job)? {
             gpu_summaries.clear();
         }
-        let lease_idle = match &run {
-            Some(run) if self.origin_reads_lease_idle(job)? => {
-                let last = matches!(
-                    event,
-                    JobEventKind::JobSucceeded
-                        | JobEventKind::JobFailed
-                        | JobEventKind::JobCancelled
-                );
-                self.lease_idle_for_event(job, run.task, last)?
-            }
-            _ => None,
+        let lease_idle = if self.origin_reads_lease_idle(job)? {
+            let last = matches!(
+                event,
+                JobEventKind::JobSucceeded | JobEventKind::JobFailed | JobEventKind::JobCancelled
+            );
+            self.lease_idle_for_event(job, run.as_ref().map(|run| run.task), last)?
+        } else {
+            None
         };
         self.append_event(
             job,

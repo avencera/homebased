@@ -122,21 +122,45 @@ fn build_tool(words: &[&str]) -> Option<String> {
 
 /// A short flag group that holds `c`, such as `-c` or `-lc`
 /// `words` from the command that leading `NAME=value` assignments and
-/// wrappers such as `nice -n 10` run
+/// wrappers such as `nice -n 10` run; empty when a wrapper only looks a
+/// command up, as `command -v nvcc` does
 fn command_words<'a, 'b>(words: &'b [&'a str]) -> &'b [&'a str] {
-    let mut wrapped = false;
-    let start = words
-        .iter()
-        .position(|word| {
-            let prefix = PREFIXES.contains(&basename(word));
-            wrapped |= prefix;
-            // a wrapper's options and numeric values, such as `-n 10`, come before
-            // the command it runs
-            let option = wrapped && (word.starts_with('-') || word.parse::<i64>().is_ok());
-            !is_assignment(word) && !prefix && !option
-        })
-        .unwrap_or(words.len());
-    &words[start..]
+    let mut at = 0;
+    while let Some(word) = words.get(at) {
+        let wrapper = basename(word);
+        if is_assignment(word) {
+            at += 1;
+            continue;
+        }
+        if !PREFIXES.contains(&wrapper) {
+            break;
+        }
+        at += 1;
+        while let Some(option) = words.get(at).filter(|word| word.starts_with('-')) {
+            if wrapper == "command" && matches!(*option, "-v" | "-V") {
+                return &[];
+            }
+            at += 1;
+            // an option that takes its value as the next word, such as `-n 10`
+            if wrapper_option_takes_value(wrapper, option) {
+                at += 1;
+            }
+        }
+    }
+    words.get(at..).unwrap_or(&[])
+}
+
+/// Whether `option` of `wrapper` takes the next word as its value
+fn wrapper_option_takes_value(wrapper: &str, option: &str) -> bool {
+    let options: &[&str] = match wrapper {
+        "nice" => &["-n", "--adjustment"],
+        "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        "sudo" => &["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"],
+        "time" => &["-f", "--format", "-o", "--output"],
+        "exec" => &["-a"],
+        _ => &[],
+    };
+    options.contains(&option)
 }
 
 fn is_command_flag(word: &str) -> bool {
@@ -170,6 +194,12 @@ mod tests {
                 Some("cargo build"),
             ),
             (&["nice", "-n", "10", "cargo", "oxide"], Some("cargo oxide")),
+            (
+                &["env", "-u", "PYTHONPATH", "bash", "-lc", "cargo build"],
+                Some("cargo build"),
+            ),
+            (&["bash", "-lc", "command -v nvcc && ./bench"], None),
+            (&["time", "./bench"], None),
             (&["/usr/bin/cargo", "+nightly", "run"], Some("cargo run")),
             (&["./target/release/train", "--epochs", "3"], None),
             (&["cargo", "fmt"], None),
