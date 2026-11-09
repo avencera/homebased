@@ -508,13 +508,22 @@ impl GpuSummary {
                 .or(sampled)
                 .and_then(|total| metric(total.mean(), total.coverage))
         };
+        // both readings saw the same device during the attempt, so the peak is
+        // the higher of the two; only the coverage follows the covering one
         let pick_peak = |end: Option<&PeakTotal>, sampled: Option<&PeakTotal>| {
             let sampled_ms = sampled.map_or(0, |total| total.coverage.total_ms());
-            end.filter(|total| covers(total.coverage.total_ms(), sampled_ms))
-                .or(sampled)
-                .and_then(|total| {
-                    metric(total.peak.map(|bytes| (bytes / MIB) as f64), total.coverage)
-                })
+            let (covering, other) =
+                match end.filter(|total| covers(total.coverage.total_ms(), sampled_ms)) {
+                    Some(end) => (end, sampled),
+                    None => (sampled?, end),
+                };
+            let other_peak = other.filter(|other| other.peak > covering.peak);
+            let peak = other_peak.map_or(covering.peak, |other| other.peak);
+            let mut metric = metric(peak.map(|bytes| (bytes / MIB) as f64), covering.coverage)?;
+            if let Some(source) = other_peak.and_then(|other| other.coverage.source()) {
+                metric.source = metric.source.join(source);
+            }
+            Some(metric)
         };
         let end = input.end_reading;
         let util_avg = pick_mean(end.map(|end| &end.util), usage.map(|usage| &usage.util));
@@ -682,8 +691,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        EndReading, GpuSummary, NetdataCharts, SampleSource, SampleSpacing, SummaryInput,
-        SummarySource, SummaryStatus, UsageTotals,
+        Coverage, EndReading, GpuSummary, NetdataCharts, PeakTotal, SampleSource, SampleSpacing,
+        SummaryInput, SummarySource, SummaryStatus, UsageTotals,
     };
     use crate::domain::TaskId;
     use crate::queue::gpu::GpuUuid;
@@ -799,6 +808,31 @@ mod tests {
         });
         assert_eq!(empty.status, SummaryStatus::Unavailable);
         assert!(empty.reason.unwrap().contains("refused"));
+
+        // an end read covering more time keeps the higher peak the watcher saw
+        let end_reading = EndReading {
+            mem_used: PeakTotal {
+                peak: Some(1 << 30),
+                coverage: Coverage {
+                    netdata_ms: 50_000,
+                    nvidia_smi_ms: 0,
+                },
+            },
+            ..EndReading::default()
+        };
+        let summary = GpuSummary::build(&SummaryInput {
+            attempt: TaskId::new(),
+            run_number: 2,
+            step: 0,
+            gpu_uuid: Some(&uuid),
+            started_at: Some(start),
+            ended_at: start + chrono::Duration::seconds(50),
+            watch: Some(&watch),
+            end_reading: Some(&end_reading),
+            controls: &[],
+        });
+        let peak = summary.mem_peak_mib.unwrap();
+        assert_eq!((peak.value, peak.covered_secs), (3072, 50));
     }
 
     /// A Netdata agent that answers every data query with one row per 5
