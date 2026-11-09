@@ -604,7 +604,7 @@ pub(crate) fn job_event_line(
 
 /// Deliver one job event through the same Claude, Codex, and T3 routing as task events
 ///
-/// Returns `None` only when a blocked notice ended before the callback write
+/// Returns `None` only when a blocked or GPU idle notice ended before the callback write
 pub(crate) async fn deliver_job_event(
     home: &Home,
     route: &crate::queue::delivery::JobRoute,
@@ -627,7 +627,7 @@ pub(crate) async fn deliver_job_event(
             delivery_lock: dir.join("delivery.lock"),
         },
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
-        before_send: before_send.filter(|_| event.event == crate::queue::JobEventKind::JobBlocked),
+        before_send: before_send.filter(|_| event.event.is_suppressible_notice()),
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);

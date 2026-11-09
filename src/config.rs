@@ -143,6 +143,8 @@ pub struct Dashboard {
 pub struct ResourceConfig {
     /// Time to wait before recording a notice for the blocked head
     pub notify_blocked_after: crate::queue::schedule::NoticeThresholds,
+    /// GPU idle alert sampling and thresholds
+    pub gpu_idle: crate::queue::gpu_idle::GpuIdleConfig,
 }
 
 /// Whether this machine joins a fleet
@@ -294,6 +296,85 @@ impl RawDashboard {
 struct RawResource {
     #[serde(default)]
     notify_blocked_after: RawBlockedThresholds,
+    #[serde(default)]
+    gpu_idle: RawGpuIdle,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGpuIdle {
+    #[serde(default)]
+    source: Option<crate::queue::gpu_idle::SourceChoice>,
+    #[serde(default)]
+    netdata_url: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    util_below: Option<u8>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    never_busy_after: Option<String>,
+    #[serde(default)]
+    recover_after: Option<String>,
+    #[serde(default)]
+    remind_after: Option<String>,
+}
+
+impl RawGpuIdle {
+    fn validate(self) -> Result<crate::queue::gpu_idle::GpuIdleConfig, String> {
+        let mut config = crate::queue::gpu_idle::GpuIdleConfig::default();
+        if let Some(source) = self.source {
+            config.source = source;
+        }
+        if let Some(raw) = self.netdata_url {
+            config.netdata_url = raw
+                .parse()
+                .map_err(|error| format!("resource.gpu_idle.netdata_url: {error}"))?;
+        }
+        if let Some(util) = self.util_below {
+            if !(1..=100).contains(&util) {
+                return Err("resource.gpu_idle.util_below must be from 1 to 100".into());
+            }
+            config.defaults.util_below = util;
+        }
+        let defaults = &mut config.defaults;
+        for (name, raw, target) in [
+            ("after", self.after, &mut defaults.after),
+            ("interval", self.interval, &mut defaults.interval),
+            (
+                "recover_after",
+                self.recover_after,
+                &mut defaults.recover_after,
+            ),
+            (
+                "remind_after",
+                self.remind_after,
+                &mut defaults.remind_after,
+            ),
+        ] {
+            if let Some(raw) = raw {
+                *target = positive_duration(&format!("resource.gpu_idle.{name}"), &raw)?;
+            }
+        }
+        if let Some(raw) = self.never_busy_after {
+            defaults.never_busy_after = Some(positive_duration(
+                "resource.gpu_idle.never_busy_after",
+                &raw,
+            )?);
+        }
+        Ok(config)
+    }
+}
+
+fn positive_duration(name: &str, raw: &str) -> Result<std::time::Duration, String> {
+    let duration = humantime::parse_duration(raw).map_err(|error| format!("{name}: {error}"))?;
+    if duration.is_zero() || chrono::Duration::from_std(duration).is_err() {
+        return Err(format!(
+            "{name}: duration must be positive and fit the clock"
+        ));
+    }
+    Ok(duration)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +413,7 @@ impl RawResource {
         }
         Ok(ResourceConfig {
             notify_blocked_after: thresholds,
+            gpu_idle: self.gpu_idle.validate()?,
         })
     }
 }

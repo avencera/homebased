@@ -119,7 +119,11 @@ impl Store {
         })
     }
 
-    /// Check an authority notice at delivery and retain suppression evidence if its episode ended
+    /// Check an authority notice at delivery and retain suppression evidence if it ended
+    ///
+    /// A blocked notice is current while its episode is open and its job is
+    /// still the blocked head. A GPU idle alert is current while its attempt
+    /// still runs in the same idle episode and the job is not silenced
     pub fn job_notice_is_current(&self, job: JobId, seq: u64) -> Result<bool, AppError> {
         let seq = super::delivery::sql_seq(seq)?;
         self.immediate(|| {
@@ -131,33 +135,46 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let event: JobEvent = serde_json::from_str(&json)?;
-            if event.event != JobEventKind::JobBlocked {
-                return Err(super::corrupt("notice eligibility requires JOB_BLOCKED").into());
-            }
-            let notice = event
-                .blocked
-                .ok_or_else(|| super::corrupt("blocked event has no episode"))?;
-            let open: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM resource_blocked_notices
-                 WHERE id = ?1 AND job_id = ?2 AND machine = ?3 AND ended_at IS NULL)",
-                params![notice.episode, job.to_string(), record.machine.to_string()],
-                |row| row.get(0),
-            )?;
-            let current = !suppressed
-                && open
-                && decide(&self.queue_snapshot(
-                    record.machine,
-                    Utc::now(),
-                    NoticeThresholds::default(),
-                )?)
-                .blocked
-                .is_some_and(|head| head.job == job);
+            let current = match event.event {
+                JobEventKind::JobBlocked => {
+                    let notice = event
+                        .blocked
+                        .ok_or_else(|| super::corrupt("blocked event has no episode"))?;
+                    let open: bool = self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM resource_blocked_notices
+                         WHERE id = ?1 AND job_id = ?2 AND machine = ?3 AND ended_at IS NULL)",
+                        params![notice.episode, job.to_string(), record.machine.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    let current = !suppressed
+                        && open
+                        && decide(&self.queue_snapshot(
+                            record.machine,
+                            Utc::now(),
+                            NoticeThresholds::default(),
+                        )?)
+                        .blocked
+                        .is_some_and(|head| head.job == job);
+                    if !current {
+                        self.conn.execute(
+                            "UPDATE resource_blocked_notices SET ended_at = COALESCE(ended_at, ?2)
+                             WHERE id = ?1",
+                            params![notice.episode, fmt_time(Utc::now())],
+                        )?;
+                    }
+                    current
+                }
+                JobEventKind::JobGpuIdle => {
+                    !suppressed && self.gpu_idle_notice_is_current(job, &event)?
+                }
+                _ => {
+                    return Err(super::corrupt(
+                        "notice eligibility requires JOB_BLOCKED or JOB_GPU_IDLE",
+                    )
+                    .into());
+                }
+            };
             if !current {
-                self.conn.execute(
-                    "UPDATE resource_blocked_notices SET ended_at = COALESCE(ended_at, ?2)
-                     WHERE id = ?1",
-                    params![notice.episode, fmt_time(Utc::now())],
-                )?;
                 self.conn.execute(
                     "UPDATE resource_job_events SET suppressed_at = COALESCE(suppressed_at, ?3)
                      WHERE job_id = ?1 AND seq = ?2",

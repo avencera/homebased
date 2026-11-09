@@ -26,6 +26,7 @@ use crate::spec::{
     cwd_problem, default_timeout, escape_token, invalid_spec_from_de, workload_content,
 };
 
+use super::gpu_idle::GpuIdleSpec;
 use super::{Preemption, Priority, ResourceSelector, StepWorkload, Steps};
 
 /// Container path under which the authority mounts the job and run directories
@@ -122,6 +123,11 @@ pub struct JobSpec {
     pub resource: Option<ResourceSelector>,
     /// What the job runs, in order
     pub steps: Steps,
+    /// GPU idle alert setting; the machine defaults when absent
+    // left out of the canonical form when absent, so the digests of specs
+    // saved before this field existed do not change
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_idle: Option<GpuIdleSpec>,
 }
 
 impl JobSpec {
@@ -191,6 +197,21 @@ impl JobSpec {
                 ));
             }
         };
+        let gpu_idle = wire
+            .gpu_idle
+            .as_ref()
+            .map(GpuIdleSpec::parse)
+            .transpose()
+            .map_err(|error| {
+                let pointer = format!("/gpu_idle{}", error.pointer);
+                let value = wire
+                    .gpu_idle
+                    .as_ref()
+                    .and_then(|value| value.pointer(error.pointer))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                invalid(pointer, value, error.message)
+            })?;
         Ok(Self {
             api_version: API_VERSION,
             thread: wire.thread,
@@ -202,6 +223,7 @@ impl JobSpec {
             preempt,
             resource: wire.resource,
             steps,
+            gpu_idle,
         })
     }
 
@@ -303,6 +325,15 @@ struct JobSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "steps_schema")]
     steps: Option<Value>,
+    /// GPU idle alerts: "off", or an object overriding the machine's idle
+    /// window and utilization threshold
+    #[serde(default)]
+    #[schemars(schema_with = "gpu_idle_schema")]
+    gpu_idle: Option<Value>,
+}
+
+fn gpu_idle_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::Schema::try_from(GpuIdleSpec::schema()).unwrap_or_default()
 }
 
 fn api_version_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {

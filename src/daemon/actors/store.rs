@@ -72,7 +72,24 @@ pub(crate) enum StoreMsg {
         machine: MachineId,
         request: Box<crate::store::queue::interface::QueueRequest>,
         env: crate::domain::TaskEnv,
+        /// Cluster protocol the request arrived with
+        protocol: crate::fleet::protocol::ClusterProtocolVersion,
         reply: RpcReplyPort<Result<serde_json::Value, AppError>>,
+    },
+    /// Running attempts the GPU idle watcher samples
+    GpuIdleTargets {
+        machine: MachineId,
+        now: DateTime<Utc>,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::GpuIdleTarget>, AppError>>,
+    },
+    /// Save one attempt's idle accounting and produce its alert if still due
+    GpuIdleCommit {
+        task: TaskId,
+        watch: Box<crate::queue::gpu_idle::AttemptWatch>,
+        source: Option<crate::queue::gpu_idle::SampleSource>,
+        alert: Option<Box<crate::queue::gpu_idle::GpuIdleNotice>>,
+        now: DateTime<Utc>,
+        reply: RpcReplyPort<Result<bool, AppError>>,
     },
     /// Origin route lookup
     JobRoute {
@@ -749,8 +766,28 @@ impl Actor for StoreActor {
                 machine,
                 request,
                 env,
+                protocol,
                 reply,
-            } => send_reply(reply, state.queue_request(machine, &request, &env)),
+            } => send_reply(
+                reply,
+                state.queue_request_at(machine, &request, &env, protocol),
+            ),
+            StoreMsg::GpuIdleTargets {
+                machine,
+                now,
+                reply,
+            } => send_reply(reply, state.gpu_idle_targets(machine, now)),
+            StoreMsg::GpuIdleCommit {
+                task,
+                watch,
+                source,
+                alert,
+                now,
+                reply,
+            } => send_reply(
+                reply,
+                state.commit_gpu_idle(task, *watch, source, alert.map(|alert| *alert), now),
+            ),
             StoreMsg::JobRoute { job, reply } => send_reply(reply, state.job_route(job)),
             StoreMsg::HeldJobRoutes { reply } => send_reply(reply, state.held_job_routes()),
             StoreMsg::ReleaseHeldJob { job, reply } => {

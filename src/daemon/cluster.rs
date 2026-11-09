@@ -762,7 +762,9 @@ async fn executor_identity(
     .await?;
     Ok(Json(IdentityBody {
         api_version: API_VERSION,
-        protocol_version: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION.0,
+        // the read names no version and means the same at each one, so it
+        // answers the oldest, which origins on that release check for
+        protocol_version: SUPPORTED_PROTOCOLS.min().0,
         identity,
     }))
 }

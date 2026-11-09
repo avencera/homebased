@@ -19,7 +19,7 @@ use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::{ClusterClient, ClusterResponse};
 use crate::fleet::probe::VerifiedDestination;
-use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
+use crate::fleet::protocol::{ClusterProtocolVersion, SUPPORTED_PROTOCOLS};
 use crate::invocation::resolve_agent_binary;
 use crate::machine::{MachineId, MachineName};
 use crate::spec::{self, NormalizedSpec};
@@ -387,7 +387,9 @@ async fn reconcile(state: &AppState, route: OriginRoute) -> Result<(TaskId, Task
         .get(&destination.address, &query)
         .await
         .map_err(|error| unknown(&route, error.to_string()))?;
-    let found = decode_identity(&route, response, CLUSTER_PROTOCOL_VERSION)?;
+    // the identity read is the same at every version, and an executor names
+    // the oldest one it accepts
+    let found = decode_identity(&route, response, SUPPORTED_PROTOCOLS.min())?;
     if found.identity.is_some() {
         return resolve_identity(state, route, found.identity).await;
     }

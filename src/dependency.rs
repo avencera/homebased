@@ -237,7 +237,8 @@ impl TaskOutcome {
             JobEventKind::JobPreempted
             | JobEventKind::JobAttention
             | JobEventKind::JobBlocked
-            | JobEventKind::JobCheckDue => None,
+            | JobEventKind::JobCheckDue
+            | JobEventKind::JobGpuIdle => None,
         }
     }
 
@@ -565,6 +566,7 @@ mod tests {
             (JobEventKind::JobAttention, None),
             (JobEventKind::JobBlocked, None),
             (JobEventKind::JobCheckDue, None),
+            (JobEventKind::JobGpuIdle, None),
         ] {
             assert_eq!(TaskOutcome::from_job_event(kind), outcome, "{kind:?}");
         }

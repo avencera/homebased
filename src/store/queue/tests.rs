@@ -200,6 +200,7 @@ fn new_job(id: JobId, machine: MachineId, spec: Value) -> NewJob {
             path: "/usr/bin:/bin".into(),
             home: "/tmp".into(),
         },
+        origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
     }
 }
 

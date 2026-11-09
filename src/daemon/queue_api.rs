@@ -20,6 +20,7 @@ use crate::domain::{API_VERSION, TaskEnv};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
+use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
 use crate::machine::MachineId;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
@@ -609,6 +610,16 @@ pub(super) async fn forward(
 }
 
 async fn execute(state: &AppState, request: QueueRequest, env: TaskEnv) -> Result<Value, AppError> {
+    execute_at(state, request, env, CLUSTER_PROTOCOL_VERSION).await
+}
+
+/// Apply a request that arrived over cluster protocol `protocol`
+async fn execute_at(
+    state: &AppState,
+    request: QueueRequest,
+    env: TaskEnv,
+    protocol: ClusterProtocolVersion,
+) -> Result<Value, AppError> {
     if let QueueRequest::Submit { job, origin, spec } = &request {
         let stored = call(&state.store, |reply| StoreMsg::QueueJob { id: *job, reply }).await?;
         match stored {
@@ -627,6 +638,7 @@ async fn execute(state: &AppState, request: QueueRequest, env: TaskEnv) -> Resul
         machine: state.machine.identity.machine,
         request: Box::new(request),
         env,
+        protocol,
         reply,
     })
     .await
@@ -642,7 +654,8 @@ async fn cluster_request(
         .check_destination(body.destination_machine)?;
     super::cluster::check_api_version(body.api_version)?;
     super::cluster::check_protocol(body.protocol_version, body.destination_machine)?;
-    let mut value = execute(&state, body.request, TaskEnv::capture()).await?;
+    let protocol = ClusterProtocolVersion(body.protocol_version);
+    let mut value = execute_at(&state, body.request, TaskEnv::capture(), protocol).await?;
     value["protocol_version"] = json!(body.protocol_version);
     Ok(Json(value))
 }

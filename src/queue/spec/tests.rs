@@ -431,3 +431,61 @@ fn steps_keep_task_and_container_workloads() {
         .collect();
     assert_eq!(kinds, [true, false]);
 }
+
+#[test]
+fn gpu_idle_parses_off_and_overrides_and_refuses_bad_values() {
+    use crate::queue::gpu_idle::GpuIdleSpec;
+    use std::time::Duration;
+
+    let base = single(json!({ "type": "task", "command": ["true"] }));
+    let off = JobSpec::parse_value(&with(base.clone(), "gpu_idle", json!("off"))).unwrap();
+    assert_eq!(off.gpu_idle, Some(GpuIdleSpec::Off));
+    let watch = JobSpec::parse_value(&with(
+        base.clone(),
+        "gpu_idle",
+        json!({ "after": "90m", "util_below": 5 }),
+    ))
+    .unwrap();
+    assert_eq!(
+        watch.gpu_idle,
+        Some(GpuIdleSpec::Watch {
+            after: Some(Duration::from_secs(5400)),
+            util_below: Some(5),
+        })
+    );
+    // the stored form parses back to the same value and digest
+    for spec in [&off, &watch] {
+        let stored: Value = serde_json::from_str(&spec.to_canonical_json().unwrap()).unwrap();
+        let reparsed = JobSpec::parse_value(&stored).unwrap();
+        assert_eq!(&reparsed, spec);
+        assert_eq!(reparsed.digest().unwrap(), spec.digest().unwrap());
+    }
+    assert_ne!(off.digest().unwrap(), watch.digest().unwrap());
+
+    let validator = jsonschema::validator_for(&schema_json().unwrap()).unwrap();
+    for good in [
+        json!("off"),
+        json!({ "after": "1s" }),
+        json!({ "util_below": 100 }),
+    ] {
+        assert!(validator.is_valid(&with(base.clone(), "gpu_idle", good)));
+    }
+    // the schema leaves duration text to the parser, like the spec's other durations
+    let cases = [
+        (json!("on"), "/gpu_idle", true),
+        (json!({}), "/gpu_idle", true),
+        (json!({ "after": "0s" }), "/gpu_idle/after", false),
+        (json!({ "after": "soon" }), "/gpu_idle/after", false),
+        (json!({ "util_below": 0 }), "/gpu_idle/util_below", true),
+        (json!({ "util_below": 101 }), "/gpu_idle/util_below", true),
+        (json!({ "util": 5 }), "/gpu_idle", true),
+    ];
+    for (value, pointer, schema_refuses) in cases {
+        let spec = with(base.clone(), "gpu_idle", value.clone());
+        let error = JobSpec::parse_value(&spec).unwrap_err();
+        assert_eq!(pointer_of(&error), pointer, "{value}");
+        if schema_refuses {
+            assert!(!validator.is_valid(&spec), "schema must refuse {value}");
+        }
+    }
+}

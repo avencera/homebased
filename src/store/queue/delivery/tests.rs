@@ -60,6 +60,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             at: Utc::now(),
             blocked: None,
             held_ending: None,
+            gpu_idle: None,
         },
     }
 }
@@ -332,4 +333,30 @@ fn a_route_saved_before_job_dependencies_reads_and_saves_unchanged() {
     ] {
         assert!(serde_json::from_value::<HeldJobEnding>(both).is_err());
     }
+}
+
+/// A route exactly as v0.25.4 saved it, before specs had `gpu_idle`
+const ROUTE_BEFORE_GPU_IDLE: &str = r#"{"job":"01a1bed3-41be-7471-b472-12bc75437215","origin":"01a1bed3-41bf-763b-9b53-114a4a3d3cb4","authority":"01a1bed3-41bf-763b-9b53-114b1045a8c1","thread":"77777777-7777-4777-8777-777777777777","callback":{"env":{"path":"/bin","home":"/tmp"},"cwd":"/tmp","codex":{"type":"available","path":"/bin/true"}},"spec":{"api_version":1,"thread":"77777777-7777-4777-8777-777777777777","name":"route test","cwd":"/tmp","timeout":"1h","priority":"low","preempt":{"mode":"wait"},"steps":[{"type":"task","command":["/bin/true"]}]},"digest":"9efe2b4b0da17021ea901eb18a773a1b51258cfe6900be2b8957e64e816b5eb1","target":null,"submission":{"state":"unknown"}}"#;
+
+#[test]
+fn a_route_saved_before_gpu_idle_keeps_its_digest() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let job: JobId = "01a1bed3-41be-7471-b472-12bc75437215".parse().unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_job_routes (job_id, route_json) VALUES (?1, ?2)",
+            rusqlite::params![job.to_string(), ROUTE_BEFORE_GPU_IDLE],
+        )
+        .unwrap();
+    // reading checks the saved digest against the spec's canonical form
+    let route = store.job_route(job).unwrap().unwrap();
+    assert_eq!(route.spec.gpu_idle, None);
+    assert_eq!(
+        route.digest,
+        "9efe2b4b0da17021ea901eb18a773a1b51258cfe6900be2b8957e64e816b5eb1"
+    );
+    let saved: serde_json::Value = serde_json::from_str(ROUTE_BEFORE_GPU_IDLE).unwrap();
+    assert_eq!(serde_json::to_value(&route.spec).unwrap(), saved["spec"]);
 }

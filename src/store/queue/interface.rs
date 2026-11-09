@@ -6,8 +6,10 @@ use serde_json::{Value, json};
 use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
+use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
+use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
@@ -85,6 +87,16 @@ pub enum QueueRequest {
         /// Attention checked by the operator
         attention: AttentionId,
     },
+    /// Snooze, turn off, or restore a job's GPU idle alerts; cluster
+    /// protocol 4 and later
+    GpuIdle {
+        /// Operation replay identity
+        operation: OperationId,
+        /// Job whose alerts change
+        job: JobId,
+        /// What to do
+        control: GpuIdleControl,
+    },
 }
 
 /// One machine's resources, by name, with their active runs
@@ -133,6 +145,10 @@ pub struct JobDetail {
     // an older peer sends none
     #[serde(default)]
     pub resources: Vec<Resource>,
+    /// GPU idle silences and per-attempt accounting
+    // an older peer sends none
+    #[serde(default)]
+    pub gpu_idle: Option<GpuIdleDetail>,
 }
 
 /// One historical attempt, including cleanup and the last committed stop cause
@@ -167,6 +183,20 @@ impl Store {
         machine: MachineId,
         request: &QueueRequest,
         env: &TaskEnv,
+    ) -> Result<Value, AppError> {
+        self.queue_request_at(machine, request, env, CLUSTER_PROTOCOL_VERSION)
+    }
+
+    /// Apply an operation that arrived over cluster protocol `protocol`
+    ///
+    /// A submit keeps the version, so the queue sends its origin only events
+    /// that version can parse
+    pub fn queue_request_at(
+        &self,
+        machine: MachineId,
+        request: &QueueRequest,
+        env: &TaskEnv,
+        protocol: ClusterProtocolVersion,
     ) -> Result<Value, AppError> {
         let mut result = match request {
             QueueRequest::Resources => serde_json::to_value(ResourceList {
@@ -222,6 +252,7 @@ impl Store {
                     last_stop_cause,
                     events: self.job_events(*job)?,
                     resources,
+                    gpu_idle: Some(self.gpu_idle_detail(*job)?),
                 })?
             }
             QueueRequest::NoticeCurrent { job, seq } => {
@@ -241,6 +272,7 @@ impl Store {
                     origin: *origin,
                     spec: *spec.clone(),
                     env: env.clone(),
+                    origin_protocol: protocol,
                 })?)?
             }
             QueueRequest::Move {
@@ -260,6 +292,17 @@ impl Store {
             } => serde_json::to_value(
                 self.release_resource_attention(machine, *operation, *attention)?,
             )?,
+            QueueRequest::GpuIdle {
+                operation,
+                job,
+                control,
+            } => serde_json::to_value(self.set_gpu_idle_control(
+                machine,
+                *operation,
+                *job,
+                control,
+                chrono::Utc::now(),
+            )?)?,
         };
         if let Some(object) = result.as_object_mut() {
             object.insert("api_version".into(), json!(API_VERSION));

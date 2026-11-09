@@ -398,8 +398,9 @@ pub fn ends_wait(kind: EventKind) -> bool {
 /// Whether an event ends the wait for its job
 ///
 /// Every way a job ends records one of `JOB_SUCCEEDED`, `JOB_FAILED`, and
-/// `JOB_CANCELLED`. `JOB_PREEMPTED` requeues the job, and `JOB_BLOCKED` and
-/// `JOB_CHECK_DUE` are notices about a job that is still queued or running.
+/// `JOB_CANCELLED`. `JOB_PREEMPTED` requeues the job, and `JOB_BLOCKED`,
+/// `JOB_CHECK_DUE`, and `JOB_GPU_IDLE` are notices about a job that is still
+/// queued or running.
 /// `JOB_ATTENTION` reports a failed cleanup of one run's resource and says
 /// nothing about the job; when it follows the final event of the job's last
 /// run, the wait has already ended and normal delivery carries it
@@ -409,7 +410,8 @@ pub fn job_ends_wait(kind: JobEventKind) -> bool {
         JobEventKind::JobPreempted
         | JobEventKind::JobAttention
         | JobEventKind::JobBlocked
-        | JobEventKind::JobCheckDue => false,
+        | JobEventKind::JobCheckDue
+        | JobEventKind::JobGpuIdle => false,
         JobEventKind::JobSucceeded | JobEventKind::JobFailed | JobEventKind::JobCancelled => true,
     }
 }

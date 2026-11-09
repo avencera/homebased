@@ -23,7 +23,7 @@ use crate::error::AppError;
 use crate::events::{DeliveryOutcome, EventAcceptance};
 use crate::fleet::http::ClusterClient;
 use crate::queue::delivery::{JobRoute, RoutedJobEvent};
-use crate::queue::{JobEvent, JobEventKind, JobId};
+use crate::queue::{JobEvent, JobId};
 use crate::store::queue::interface::QueueRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -210,8 +210,9 @@ async fn deliver_origin(
     route: JobRoute,
     event: RoutedJobEvent,
 ) -> Result<(), AppError> {
-    let before_send = if event.event.event == JobEventKind::JobBlocked {
-        // the authority owns the episode, including when the origin was offline
+    let before_send = if event.event.event.is_suppressible_notice() {
+        // the authority owns the episode and the silence, including when the
+        // origin was offline
         if !notice_current(state, &route, event.event.seq).await? {
             return call(&state.store, |reply| StoreMsg::SuppressJobNotice {
                 job: route.job,
@@ -243,13 +244,13 @@ async fn deliver_origin(
     // a connected `homebased wait` stream prints the line for the agent that
     // armed it; waking the thread as well would wake the agent twice
     let line = job_event_line(&route, &event.event)?;
-    let blocked = event.event.event == JobEventKind::JobBlocked;
+    let notice = event.event.event.is_suppressible_notice();
     let seq = event.event.seq;
     // an unanswered check leaves the notice to normal delivery, whose own
     // check settles it
     let route_ref = &route;
     let current = || async move {
-        if blocked {
+        if notice {
             notice_current(state, route_ref, seq).await.ok()
         } else {
             Some(true)
@@ -267,7 +268,7 @@ async fn deliver_origin(
             let delivered = Some(DeliveryOutcome::Delivered);
             return settle_callback(&state.store, route.job, seq, delivered).await;
         }
-        JobHandoff::Obsolete if blocked => {
+        JobHandoff::Obsolete if notice => {
             return settle_callback(&state.store, route.job, seq, None).await;
         }
         JobHandoff::Obsolete | JobHandoff::Declined => {}

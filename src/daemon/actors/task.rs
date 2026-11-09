@@ -197,7 +197,7 @@ fn inactivity_wait(
 
 /// Modification time of a non-empty `output.log`. An empty or missing file is
 /// not activity: the runner creates the log at spawn
-fn last_output_at(output: &Path) -> Option<DateTime<Utc>> {
+pub(crate) fn last_output_at(output: &Path) -> Option<DateTime<Utc>> {
     let metadata = match std::fs::metadata(output) {
         Ok(metadata) if metadata.len() != 0 => metadata,
         Ok(_) => return None,

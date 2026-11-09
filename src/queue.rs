@@ -27,6 +27,7 @@ pub mod classify;
 pub mod delivery;
 mod error;
 pub mod gpu;
+pub mod gpu_idle;
 pub mod schedule;
 pub mod spec;
 
@@ -1051,6 +1052,17 @@ pub enum JobEventKind {
     JobBlocked,
     /// A running job's output reached its inactivity threshold
     JobCheckDue,
+    /// A running job's GPU stayed near idle past its threshold
+    JobGpuIdle,
+}
+
+impl JobEventKind {
+    /// Whether the authority may suppress this notice before delivery once
+    /// the condition it reports has ended
+    #[must_use]
+    pub const fn is_suppressible_notice(self) -> bool {
+        matches!(self, Self::JobBlocked | Self::JobGpuIdle)
+    }
 }
 
 /// One blocked notice, tied to the exact stored episode
@@ -1113,6 +1125,9 @@ pub struct JobEvent {
     /// only the origin records such an event
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_ending: Option<delivery::HeldJobEnding>,
+    /// Present only on a GPU idle alert
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_idle: Option<gpu_idle::GpuIdleNotice>,
 }
 
 #[cfg(test)]
