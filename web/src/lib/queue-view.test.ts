@@ -173,19 +173,21 @@ function resource(machine: string, name: string, job: string | null): ResourceRe
 
 test('busy queues drop idle resources and machines with nothing to show', () => {
 	const busy = busyQueues([
-		{ machine: 'idle', resources: [resource('idle', 'gpu0', null)], jobs: [] },
+		{ machine: 'idle', resources: [resource('idle', 'gpu0', null)], jobs: [], lease_notes: {} },
 		{
 			machine: 'code',
 			resources: [resource('code', 'gpu0', 'run'), resource('code', 'gpu1', null)],
 			jobs: [
 				job('run', 'high', 1, { state: { state: 'active', resource: 'code-gpu0' } }),
 				job('next', 'low', 1)
-			]
+			],
+			lease_notes: {}
 		},
 		{
 			machine: 'waiting',
 			resources: [resource('waiting', 'gpu0', null)],
-			jobs: [job('w', 'low', 1)]
+			jobs: [job('w', 'low', 1)],
+			lease_notes: {}
 		}
 	]);
 	assert.deepEqual(

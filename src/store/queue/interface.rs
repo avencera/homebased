@@ -1,5 +1,7 @@
 //! Typed authority operations and public queue inspection shapes
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -12,6 +14,7 @@ use crate::fleet::protocol::{
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
+use crate::queue::lease_guard::LeaseIdleTrip;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
@@ -19,7 +22,7 @@ use crate::queue::{
 };
 use crate::store::Store;
 
-use super::{JobRecord, NewJob, ResourceRecord};
+use super::{JobLeaseNote, JobRecord, NewJob, ResourceRecord};
 
 /// One operation on the receiving machine's queue; selectors are resolved by the origin
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +144,10 @@ pub struct JobList {
     pub machine: MachineId,
     /// Jobs, highest level first, then by position
     pub jobs: Vec<JobRecord>,
+    /// Lease guard trips and pending yields, by job
+    // an older peer sends none
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lease_notes: BTreeMap<JobId, JobLeaseNote>,
 }
 
 /// One machine's resources and non-terminal jobs from a single store read
@@ -152,6 +159,10 @@ pub struct QueueOverview {
     pub resources: Vec<ResourceRecord>,
     /// Jobs, highest level first, then by position
     pub jobs: Vec<JobRecord>,
+    /// Lease guard trips and pending yields, by job
+    // an older peer sends none
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lease_notes: BTreeMap<JobId, JobLeaseNote>,
 }
 
 /// One job with its active run, every attempt, and its events
@@ -175,6 +186,10 @@ pub struct JobDetail {
     // an older peer sends none
     #[serde(default)]
     pub gpu_idle: Option<GpuIdleDetail>,
+    /// Every lease guard trip of the job, oldest first
+    // an older peer sends none
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_idle: Vec<LeaseIdleTrip>,
 }
 
 /// One historical attempt, including cleanup and the last committed stop cause
@@ -233,15 +248,23 @@ impl Store {
                 machine,
                 resources: self.resources_on(machine)?,
             })?,
-            QueueRequest::Jobs => serde_json::to_value(JobList {
-                machine,
-                jobs: self.machine_queue(machine)?,
-            })?,
-            QueueRequest::Overview => serde_json::to_value(QueueOverview {
-                machine,
-                resources: self.resources_on(machine)?,
-                jobs: self.machine_queue(machine)?,
-            })?,
+            QueueRequest::Jobs => {
+                let jobs = self.machine_queue(machine)?;
+                serde_json::to_value(JobList {
+                    machine,
+                    lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
+                    jobs,
+                })?
+            }
+            QueueRequest::Overview => {
+                let jobs = self.machine_queue(machine)?;
+                serde_json::to_value(QueueOverview {
+                    machine,
+                    resources: self.resources_on(machine)?,
+                    lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
+                    jobs,
+                })?
+            }
             QueueRequest::Show { job } => {
                 let record = self
                     .job(*job)?
@@ -283,6 +306,7 @@ impl Store {
                     events: self.job_events(*job)?,
                     resources,
                     gpu_idle: Some(self.gpu_idle_detail(*job)?),
+                    lease_idle: self.lease_idle_trips(*job)?,
                 })?
             }
             QueueRequest::NoticeCurrent { job, seq } => {

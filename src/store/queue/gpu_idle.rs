@@ -101,7 +101,7 @@ impl Store {
         Ok(targets)
     }
 
-    fn run_gpu_uuid(&self, task: TaskId) -> Result<Option<GpuUuid>, AppError> {
+    pub(super) fn run_gpu_uuid(&self, task: TaskId) -> Result<Option<GpuUuid>, AppError> {
         let uuid: Option<Option<String>> = self
             .conn
             .query_row(

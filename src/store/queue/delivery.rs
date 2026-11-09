@@ -235,6 +235,7 @@ impl Store {
                     held_ending: Some(ending.clone()),
                     gpu_idle: None,
                     gpu_summaries: Vec::new(),
+                    lease_idle: None,
                 },
             };
             route.submission = JobSubmission::Ended { ending };

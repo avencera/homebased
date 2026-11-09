@@ -18,13 +18,14 @@ use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{
     GpuIdleControl, GpuIdleControlResult, GpuIdleDetail, SampleSource, Silence,
 };
+use crate::queue::lease_guard::{YIELD_OVERDUE, yield_overdue};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
     ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase, StopCause, Target,
 };
-use crate::store::queue::ResourceRecord;
 use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
+use crate::store::queue::{JobLeaseNote, ResourceRecord};
 
 /// Resource and machine queue commands
 #[derive(Debug, Subcommand)]
@@ -103,6 +104,10 @@ pub enum JobCommand {
         /// Let a worker send callbacks to a thread other than its parent's thread
         #[arg(long)]
         allow_other_thread: bool,
+        /// Submit even though a step runs a build tool, for the rare build
+        /// that truly needs the GPU, such as an autotuner that times kernels
+        #[arg(long)]
+        allow_build: bool,
         /// Task or job this machine submitted that must succeed before the
         /// job joins the queue; repeat for more. The job is held under its id
         /// until then, and cancelled without using the queue if one ends any
@@ -276,8 +281,15 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             job_id,
             spec,
             allow_other_thread,
+            allow_build,
             after,
-        } => submit(ctx, client, job_id, &spec, allow_other_thread, after).await,
+        } => {
+            let flags = SubmitFlags {
+                allow_other_thread,
+                allow_build,
+            };
+            submit(ctx, client, job_id, &spec, flags, after).await
+        }
         JobCommand::Show { job, machine } => {
             let value = client
                 .get(&path(&format!("/v1/resource/jobs/{job}"), &machine))
@@ -353,12 +365,19 @@ fn silence_label(silence: &Silence) -> String {
     }
 }
 
+/// Submit overrides
+#[derive(Debug, Clone, Copy)]
+struct SubmitFlags {
+    allow_other_thread: bool,
+    allow_build: bool,
+}
+
 async fn submit(
     ctx: &Ctx,
     client: &Client,
     job_id: JobId,
     spec_path: &str,
-    allow_other_thread: bool,
+    flags: SubmitFlags,
     after_flags: Vec<DependencyId>,
 ) -> Result<(), AppError> {
     let origin = SubmitOrigin::capture(&ctx.home)?;
@@ -368,9 +387,20 @@ async fn submit(
     }
     let (spec, after) = JobSpec::parse_submission(&value)?;
     let after = merge_after(after, after_flags)?;
-    origin.check(spec.thread, allow_other_thread)?;
-    // a hint only: the job is submitted either way
+    origin.check(spec.thread, flags.allow_other_thread)?;
+    // a build holds the GPU idle while other jobs wait; refuse it before
+    // anything is sent, unless the submitter says the build needs the GPU
     let warnings = build_warnings(&spec);
+    if !warnings.is_empty() && !flags.allow_build {
+        return Err(AppError::InvalidSpec {
+            pointer: "/steps".into(),
+            value: Value::Null,
+            message: format!(
+                "{}; pass --allow-build only if the build itself needs the GPU",
+                warnings.join("; ")
+            ),
+        });
+    }
     let body = json!({
         "job_id": job_id,
         "spec": spec,
@@ -555,8 +585,33 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let target = target_label(job.target, &[]);
         let name = &job.spec.name;
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
+        if let Some(note) = list.lease_notes.get(&id) {
+            for line in lease_note_lines(note, chrono::Utc::now()) {
+                println!("  ! {line}");
+            }
+        }
     }
     Ok(())
+}
+
+/// Warnings for one job in `resource jobs`: its latest guard trip, and a
+/// yield request pending so long that the step likely never reads the
+/// yield file
+fn lease_note_lines(note: &JobLeaseNote, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(trip) = &note.lease_idle {
+        lines.push(trip.reason());
+    }
+    if let Some(requested) = note.yield_requested_at
+        && yield_overdue(requested, now, YIELD_OVERDUE)
+    {
+        let minutes = (now - requested).num_minutes();
+        lines.push(format!(
+            "yield requested {minutes}m ago and the step is still running: it may not poll \
+             HOMEBASED_YIELD_FILE; fix the step or submit it with preempt `wait`"
+        ));
+    }
+    lines
 }
 
 fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
@@ -600,6 +655,9 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         if let Some(summary) = &run.gpu_summary {
             println!("  gpu: {}", summary.brief());
         }
+    }
+    for trip in &detail.lease_idle {
+        println!("lease guard, run task {}: {}", trip.attempt, trip.reason());
     }
     // jobs that never ran on a watched GPU and were never silenced say nothing
     if let Some(idle) = detail.gpu_idle.as_ref().filter(|idle| {

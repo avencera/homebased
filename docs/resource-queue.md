@@ -13,7 +13,7 @@ homebased --json resource job submit --job-id "$job" --after "$prep" --spec job.
 homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 ```
 
-The job stays out of the queue until the prep task succeeds, and the evaluation starts at `JOB_SUCCEEDED`. Submit warns when a step runs a build tool. It does not detect other CPU work.
+The job stays out of the queue until the prep task succeeds, and the evaluation starts at `JOB_SUCCEEDED`. Submit refuses a step whose argv or `sh -c` script runs a build tool (`cargo build`, `cargo test`, `cargo oxide`, `nvcc`, `ptxas`, `build-ptx.sh`, `sass_mix.sh`, `make`, `pip install`, and the like). `--allow-build` submits it anyway, with a warning, for the rare build that needs the GPU itself, such as an autotuner that times kernels. A wrapper script that builds slips past this check; the [lease guard](#gpu-lease-guard) catches it at run time.
 
 Homebased watches each running attempt's GPU and sends the job's thread a `JOB_GPU_IDLE` alert when the GPU stays near idle for 5 minutes (see [GPU idle alerts](#gpu-idle-alerts)). The alert only notifies. The owner decides whether to cancel, split the CPU work out, or snooze. Any agent or operator may cancel a GPU job whose GPU has stayed near 0% utilization for 20 minutes or more with no snooze or off switch. Confirm it first: `resource job show` names the active run's resource and `gpu_uuid`, and its `gpu_idle` section shows any snooze or off switch with its reason; `nvidia-smi` or the machine's Netdata GPU charts show that GPU's utilization over the last 20 minutes; and `task log <run-task> --tail 50` shows what the job is doing. Cancelling removes no checkpoints, and `<home>/jobs/<job>/state/` stays on the queue machine. The owner then moves the CPU part into its own task and resubmits the GPU part, pointing it at the old checkpoint, since the new job starts with an empty `HOMEBASED_JOB_DIR`.
 
@@ -120,6 +120,30 @@ homebased --json config validate
 ```
 
 Use `homebased daemon restart` to load changed settings. Let active jobs finish first. Do not use a raw service-manager stop. Output-inactivity notices are separate. Each job spec has `timeout`, default `1h`, minimum `30m`. `JOB_CHECK_DUE` also leaves the run alive.
+
+## GPU lease guard
+
+On Linux with NVIDIA GPUs, the queue machine checks every 15 seconds whether any process of each running GPU attempt holds a CUDA context on the attempt's GPU. It reads NVML's compute processes with `nvidia-smi --query-compute-apps=gpu_uuid,pid` and matches their PIDs against the processes that carry the run's marker, so children and container steps count. Utilization plays no part. An attempt that holds no context for 5 minutes trips the guard. A fresh process that compiles and loads for a minute or two before it opens a context stays well under that. A failed probe, or a run whose processes cannot be read, restarts the clock, and so does a daemon restart, so a trip always follows a full threshold of observed idle time.
+
+A trip releases the lease by the job's preemption mode:
+
+| Mode | First trip | Why |
+| --- | --- | --- |
+| `yield` | asked to yield; the job queues again and resumes | the step stops cleanly at its next checkpoint. If it is still running after `yield_grace` (10 minutes), it never reads `HOMEBASED_YIELD_FILE`, and the job is cancelled |
+| `restart` | killed and queued again | the spec declared the step safe to repeat, and a later attempt may get past a stall |
+| `wait` | cancelled | the spec promised the step is never killed for other work, so repeating it may not be safe; the owner reruns the CPU part as a task |
+
+A job that already tripped once is cancelled on its next trip, whatever its mode, so CPU work in a lease cannot loop. The trip is stored on the queue machine. The event that ends the attempt (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries it as `lease_idle`, with a `reason` that says what to do instead. `resource jobs` prints the reason under the job, `resource job show` lists every trip, and the web UI marks the job. The queue owner gets an ntfy notice when `[notify.ntfy]` is set. Origins on an older release get the event without `lease_idle`.
+
+`resource jobs` also flags a yield request that has been pending for 10 minutes or more while the step keeps running. Homebased cannot see whether a step reads the yield file, so the flag says the step may not poll it: fix the step, or submit it as `wait`.
+
+```toml
+[resource.lease_guard]
+enabled = true
+idle_after = "5m"     # time with no CUDA context before a trip
+interval = "15s"      # probe interval
+yield_grace = "10m"   # time a guard yield may stay pending before a cancel
+```
 
 ## GPU idle alerts
 

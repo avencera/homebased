@@ -4,10 +4,11 @@
 //! reads `[N/A]` and is missing, never zero, so a failed or partial probe
 //! never makes a GPU look idle
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::queue::gpu::GpuUuid;
+use crate::queue::lease_guard::parse_compute_apps;
 
 /// Fields of one reading, in query order
 const READING_FIELDS: &str =
@@ -86,10 +87,11 @@ pub fn parse_power_limits(output: &str) -> HashMap<GpuUuid, f64> {
         .collect()
 }
 
+/// Run one CSV query, such as `--query-gpu=<fields>`
 async fn run(query: &str, timeout: Duration) -> Result<String, String> {
     let mut command = tokio::process::Command::new("nvidia-smi");
     crate::run_env::scrub(command.as_std_mut())
-        .arg(format!("--query-gpu={query}"))
+        .arg(query)
         .arg("--format=csv,noheader,nounits");
     command.kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
@@ -108,7 +110,7 @@ async fn run(query: &str, timeout: Duration) -> Result<String, String> {
 ///
 /// `nvidia-smi` is missing, fails, or exceeds `timeout`
 pub async fn read(timeout: Duration) -> Result<Vec<GpuReading>, String> {
-    run(READING_FIELDS, timeout)
+    run(&format!("--query-gpu={READING_FIELDS}"), timeout)
         .await
         .map(|output| parse_readings(&output))
 }
@@ -119,9 +121,20 @@ pub async fn read(timeout: Duration) -> Result<Vec<GpuReading>, String> {
 ///
 /// `nvidia-smi` is missing, fails, or exceeds `timeout`
 pub async fn power_limits(timeout: Duration) -> Result<HashMap<GpuUuid, f64>, String> {
-    run("uuid,enforced.power.limit", timeout)
+    run("--query-gpu=uuid,enforced.power.limit", timeout)
         .await
         .map(|output| parse_power_limits(&output))
+}
+
+/// PIDs holding a CUDA context, per GPU
+///
+/// # Errors
+///
+/// `nvidia-smi` is missing, fails, or exceeds `timeout`
+pub async fn compute_apps(timeout: Duration) -> Result<HashMap<GpuUuid, HashSet<i32>>, String> {
+    run("--query-compute-apps=gpu_uuid,pid", timeout)
+        .await
+        .map(|output| parse_compute_apps(&output))
 }
 
 #[cfg(test)]

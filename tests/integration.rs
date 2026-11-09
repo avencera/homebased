@@ -661,6 +661,10 @@ mod dependencies;
 #[cfg(target_os = "linux")]
 #[path = "integration/gpu_idle.rs"]
 mod gpu_idle;
+// the lease guard only runs on Linux
+#[cfg(target_os = "linux")]
+#[path = "integration/lease_guard.rs"]
+mod lease_guard;
 #[path = "integration/lifecycle.rs"]
 mod lifecycle;
 #[path = "integration/reports.rs"]

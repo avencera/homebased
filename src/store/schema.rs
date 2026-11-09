@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 13;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 12] = [
+const MIGRATIONS: [Migration; 13] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -32,6 +32,7 @@ const MIGRATIONS: [Migration; 12] = [
     add_gpu_idle,
     add_gpu_summaries,
     add_watch_conditions,
+    add_lease_idle_trips,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -133,6 +134,23 @@ fn add_gpu_summaries(conn: &Connection) -> Result<(), rusqlite::Error> {
          ALTER TABLE resource_run_history ADD COLUMN gpu_summary_json TEXT;",
     )
 }
+
+/// Version 14: the GPU lease guard records each trip per attempt
+fn add_lease_idle_trips(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(LEASE_IDLE_TABLE)
+}
+
+/// One row per attempt the lease guard tripped; `trip_json` is a
+/// `LeaseIdleTrip`
+const LEASE_IDLE_TABLE: &str = "
+CREATE TABLE lease_idle_trips (
+    task_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    trip_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX lease_idle_trips_job ON lease_idle_trips (job_id);
+";
 
 /// Version 13: a watch names its condition, so it can wait for a stall as
 /// well as a context limit
@@ -390,6 +408,7 @@ fn schema() -> String {
         .replace("{JOB_ORIGIN_PROTOCOL}", JOB_ORIGIN_PROTOCOL)
         .replace("{OPERATION_KINDS}", OPERATION_KINDS)
         .replace("{GPU_IDLE_TABLES}", GPU_IDLE_TABLES)
+        .replace("{LEASE_IDLE_TABLE}", LEASE_IDLE_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -730,7 +749,8 @@ CREATE TABLE resource_job_delivery (
 {TASK_USAGE_TABLE}
 {THREAD_WATCH_TABLES}
 {DETECTED_GPUS_TABLE}
-{GPU_IDLE_TABLES}";
+{GPU_IDLE_TABLES}
+{LEASE_IDLE_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -845,6 +865,7 @@ mod tests {
             .replace(super::DETECTED_GPUS_TABLE, "")
             .replace(&format!(",\n    {}", super::JOB_ORIGIN_PROTOCOL), "")
             .replace(super::GPU_IDLE_TABLES, "")
+            .replace(super::LEASE_IDLE_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -913,6 +934,8 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        // version 12 had no lease guard table
+        conn.execute_batch("DROP TABLE lease_idle_trips").unwrap();
         conn.pragma_update(None, "user_version", 12).unwrap();
         // the shape version 12 saved: `threshold` where `condition` is now
         let old = serde_json::json!({

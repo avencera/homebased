@@ -577,13 +577,47 @@ const JobRecordSchema = Schema.Struct({
 });
 export type JobRecord = typeof JobRecordSchema.Type;
 
+/** A GPU lease guard trip: the run held no CUDA context past the threshold. */
+const LeaseIdleTripSchema = Schema.Struct({
+	attempt: Schema.String,
+	gpu_uuid: Schema.String,
+	idle_since: Schema.String,
+	tripped_at: Schema.String,
+	idle_after_secs: Schema.Number,
+	action: Schema.Literal('yield', 'restart', 'cancel'),
+	trip: Schema.Number,
+	escalated_at: Schema.optional(Schema.String)
+});
+export type LeaseIdleTrip = typeof LeaseIdleTripSchema.Type;
+
+/** A job's latest lease guard trip and any pending yield request. */
+const JobLeaseNoteSchema = Schema.Struct({
+	lease_idle: Schema.optional(LeaseIdleTripSchema),
+	yield_requested_at: Schema.optional(Schema.String)
+});
+export type JobLeaseNote = typeof JobLeaseNoteSchema.Type;
+
+/** One-line label of a lease guard trip. */
+export function leaseIdleLabel(trip: LeaseIdleTrip): string {
+	if (trip.escalated_at) return 'lease idle: cancelled, yield ignored';
+	const done = { yield: 'yielded', restart: 'requeued', cancel: 'cancelled' }[trip.action];
+	return `lease idle: no CUDA context, ${done}`;
+}
+
 /** One machine's resources and jobs in `GET /v1/fleet/queues`, read together. */
 const MachineQueueSchema = Schema.Struct({
 	machine: Schema.String,
 	/** By name. */
 	resources: Schema.Array(ResourceRecordSchema),
 	/** Serving order. */
-	jobs: Schema.Array(JobRecordSchema)
+	jobs: Schema.Array(JobRecordSchema),
+	/** Lease guard trips and pending yields by job id; older daemons send none. */
+	lease_notes: Schema.optionalWith(
+		Schema.Record({ key: Schema.String, value: JobLeaseNoteSchema }),
+		{
+			default: () => ({})
+		}
+	)
 });
 export type MachineQueue = typeof MachineQueueSchema.Type;
 
@@ -634,7 +668,9 @@ const JobDetailSchema = Schema.Struct({
 	/** Every attempt, oldest first. */
 	runs: Schema.Array(JobRunSchema),
 	last_stop_cause: Schema.NullOr(StopCauseSchema),
-	events: Schema.Array(JobEventViewSchema)
+	events: Schema.Array(JobEventViewSchema),
+	/** Every lease guard trip, oldest first; older daemons send none. */
+	lease_idle: Schema.optionalWith(Schema.Array(LeaseIdleTripSchema), { default: () => [] })
 });
 export type JobDetail = typeof JobDetailSchema.Type;
 

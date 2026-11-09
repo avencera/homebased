@@ -606,6 +606,10 @@ pub(crate) fn job_event_line(
             value["brief"] = serde_json::json!(summary.brief());
         }
     }
+    // the guard's reason, with what to do instead, in words the thread can act on
+    if let (Some(trip), Some(value)) = (&event.lease_idle, payload.get_mut("lease_idle")) {
+        value["reason"] = serde_json::json!(trip.reason());
+    }
     Ok(format!(
         "HOMEBASED_EVENT {}",
         serde_json::to_string(&payload)?

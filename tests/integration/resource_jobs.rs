@@ -1004,15 +1004,47 @@ fn a_job_held_for_a_build_that_fails_is_cancelled_before_it_queues() {
 }
 
 #[test]
-fn a_build_step_warns_at_submit_and_is_still_submitted() {
+fn a_build_step_is_refused_at_submit_unless_allowed() {
     let h = Harness::new();
+    // the shell never reaches the build, so an allowed run itself succeeds
+    let build_step = spec(
+        &h,
+        "medium",
+        "wait",
+        "true || ./scripts/build-ptx.sh sm_120",
+    );
+    let path = h.home.join("build-step.json");
+    fs::write(&path, serde_json::to_vec(&build_step).unwrap()).unwrap();
+    let refused = h
+        .cmd()
+        .args(["--json", "resource", "job", "submit", "--job-id"])
+        .arg(JobId::new().to_string())
+        .arg("--spec")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    // the refusal is the one structured error `--json` promises, and names the fix
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap_or_else(|failure| {
+        panic!(
+            "stderr is not one JSON error ({failure}): {}",
+            String::from_utf8_lossy(&refused.stderr)
+        )
+    });
+    let message = error["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("build-ptx.sh")
+            && message.contains("--after")
+            && message.contains("--allow-build"),
+        "{error}"
+    );
+    assert_eq!(cli(&h, &["resource", "jobs"])["jobs"], json!([]));
+
     let mut jobs = Jobs::new(&h);
     let job = JobId::new();
-    // the shell never reaches the build, so the run itself succeeds
-    let build_step = spec(&h, "medium", "wait", "true || cargo build --release");
-    let (submitted, stderr) = jobs.submit_with(job, &build_step, &[]);
+    let (submitted, stderr) = jobs.submit_with(job, &build_step, &["--allow-build"]);
     assert!(
-        stderr.contains("warning: step 0 runs `cargo build`") && stderr.contains("--after"),
+        stderr.contains("warning: step 0 runs `build-ptx.sh`"),
         "{stderr}"
     );
     assert_eq!(
@@ -1021,30 +1053,4 @@ fn a_build_step_warns_at_submit_and_is_still_submitted() {
         "{submitted}"
     );
     wait_state(&h, job, "succeeded");
-}
-
-#[test]
-fn a_refused_build_step_submit_leaves_only_the_json_error() {
-    let h = Harness::new();
-    let mut build_step = spec(&h, "medium", "wait", "cargo build --release");
-    build_step["resource"] = json!("no-such-gpu");
-    let path = h.home.join("refused-build.json");
-    fs::write(&path, serde_json::to_vec(&build_step).unwrap()).unwrap();
-    let output = h
-        .cmd()
-        .args(["--json", "resource", "job", "submit", "--job-id"])
-        .arg(JobId::new().to_string())
-        .arg("--spec")
-        .arg(path)
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    // the build warning comes only with a submitted job, never before an error
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|failure| {
-        panic!(
-            "stderr is not one JSON error ({failure}): {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    assert!(error["error"]["code"].is_string(), "{error}");
 }

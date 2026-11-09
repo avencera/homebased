@@ -15,7 +15,7 @@ New jobs join the back of their level. Only a strictly higher level can preempt 
 Choose in this order:
 
 1. Split the work into `steps`. Each successful step is a checkpoint. Use `wait` if a step cannot yield.
-2. Use `yield` when the command can save progress and check for a yield request between units of work.
+2. Use `yield` only when the command polls `HOMEBASED_YIELD_FILE` between units of work and saves progress. A step labelled `yield` that never reads the file holds its GPU while higher-priority work waits; label it `wait` instead.
 3. Use `restart` for short, idempotent work whose current step can safely run again from the start.
 4. Use `wait` when none of these choices works. Higher-priority work waits for the step to finish.
 
@@ -116,9 +116,11 @@ Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` expli
 
 ## GPU jobs contain only GPU work
 
+Never put a CPU-only step in a GPU job. A GPU job runs prebuilt binaries only; build and prepare in a CPU `homebased task run` task and submit the job with `resource job submit --after <task-id>`.
+
 A job holds its GPU from the first step to the last. Any CPU step leaves the GPU idle and keeps every other job waiting. One job held gpu0 for 3.5 minutes while it compiled PTX. Keep these out of the job and run them as ordinary CPU tasks:
 
-- builds: `cargo build`, `nvcc`, `make`, `pip install`, first-run kernel compilation
+- builds: `cargo build`, `cargo test` (build test binaries with `cargo test --no-run` and run the binary in the job), `cargo oxide`, `build-ptx.sh`, PTX and cubin compiles (`nvcc`, `ptxas`), `sass_mix.sh`, `make`, `pip install`, first-run kernel compilation
 - data prep: downloads, decoding, tokenizing, packing, shuffling, writing shards
 - CPU evaluation and scoring of a checkpoint or of model outputs
 - reports, plots, and summaries
@@ -136,7 +138,13 @@ homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 - The job gets its id at once. Your origin machine holds it out of the queue until every `--after` entry succeeds. `resource job show "$job"` reports `held` with each dependency's state, and `homebased wait --next "$job"` works right away.
 - If an `--after` entry fails or is cancelled, the job is cancelled before it reaches the queue. It sends a `JOB_CANCELLED` event whose `held_ending` names that task or job, and it uses no GPU time. `resource job cancel` ends a held job the same way. `show` and `cancel` find a held job on its origin machine, so a `--machine` that names this machine or the job's queue machine still reaches it.
 - The evaluation task starts once the job sends `JOB_SUCCEEDED`. `JOB_FAILED` or `JOB_CANCELLED` cancels it, and `JOB_PREEMPTED` leaves it held while the job queues again.
-- Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted. It does not detect other CPU work, so split that out yourself.
+- Submit refuses a job whose step argv or `sh -c` script runs a build tool. Pass `--allow-build` only when the build itself needs the GPU, such as an autotuner that times kernels; the job is then submitted with the warning on stderr and in `warnings`. The check does not see inside wrapper scripts or other CPU work, so split that out yourself.
+
+### The lease guard
+
+The queue machine checks whether any process of a running GPU attempt holds a CUDA context on its GPU (NVML compute processes, not utilization). After 5 minutes with none, it releases the lease: a `yield` job is asked to yield and is cancelled if still running 10 minutes later, a `restart` job is killed and queued again, and a `wait` job is cancelled. A job's second trip always cancels it. The ending event (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries `lease_idle` with a `reason`. When you get one, move the CPU work into its own task, chain the GPU job with `--after`, and resubmit. Startup that compiles or loads for a minute or two before the first CUDA call is fine.
+
+`resource jobs` flags a yield request pending for 10 minutes or more: the step is not polling `HOMEBASED_YIELD_FILE`. Fix the step or resubmit it as `wait`.
 
 ### Handle a `JOB_GPU_IDLE` alert
 
@@ -233,6 +241,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `attention` | Optional exact Attention UUID for release. |
 | `blocked` | Only on blocked notices: `episode`, `blocked_since`, and `blockers`. |
 | `gpu_idle` | Only on GPU idle alerts. `attempt` (run task), `episode`, `reminder` (0 for the first alert), `never_busy`, `gpu_uuid`, `idle_since`, `idle_secs`, `window_secs`, `idle_buckets` and `known_buckets` of the window, `util_below`, and the window's `util_peak_pct`, `power_peak_watts`, `power_peak_pct`, `memory_used_mib`, `memory_total_mib`, each `null` when unread. `last_output_at` is the run's last log output. `process` is the run's busiest process: `pid`, `command`, `state`, `cpu_pct` (one full core is 100), and `marked`, the count of the run's processes. `source` is `netdata` or `nvidia_smi`. `next_steps` repeats what to do. |
+| `lease_idle` | On the `JOB_PREEMPTED` or `JOB_CANCELLED` that ends an attempt the lease guard stopped. `attempt` (run task), `gpu_uuid`, `idle_since`, `tripped_at`, `idle_after_secs`, `action` (`yield`, `restart`, or `cancel`), `trip` (1 for the job's first), `escalated_at` when an ignored yield became a cancel, and `reason`, one line that says what to do. Absent for jobs from a machine on an older release. See [The lease guard](#the-lease-guard). |
 | `gpu_summaries` | On `JOB_SUCCEEDED`, `JOB_FAILED`, and `JOB_CANCELLED`, one summary per attempt on a GPU resource; on `JOB_PREEMPTED`, the attempt it ended. Absent when no attempt ran on one, or when the job came from a machine on the previous release. Each has `attempt` (run task), `run_number`, `step`, `status` (`ok` or `unavailable` with `reason`), `gpu_uuid`, `source` (`netdata`, `nvidia-smi`, or `mixed`), `attempt_secs`, `util_avg`, `power_pct_avg` (percent of the power limit), `mem_peak_mib`, `mem_total_mib`, `idle_pct`, `first_busy_after_secs`, `idle_alerts`, `snoozes` (each control in force during the attempt: `action`, `reason`, `at`, `until`), and `brief`, one line of the same. Each measured field is `{value, covered_secs, coverage_pct, source}` and is absent without samples. See [Read the GPU summary](#read-the-gpu-summary). |
 | `held_ending` | Only when a job held for its `after` entries ended before it queued. `reason` is `dependency` (with the `task` or `job` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
 

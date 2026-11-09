@@ -28,6 +28,7 @@ pub mod delivery;
 mod error;
 pub mod gpu;
 pub mod gpu_idle;
+pub mod lease_guard;
 pub mod schedule;
 pub mod spec;
 
@@ -1142,6 +1143,11 @@ pub struct JobEvent {
     /// Present only on a GPU idle alert
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_idle: Option<gpu_idle::GpuIdleNotice>,
+    /// The lease guard's trip, on the event that ends the attempt it stopped
+    // never sent to an origin on an older protocol, for the same reason as
+    // `gpu_summaries`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_idle: Option<lease_guard::LeaseIdleTrip>,
     /// GPU usage of the job's attempts, as stored when the event was appended:
     /// every attempt on a final event, the attempt that ended on a preemption
     // never sent to an origin on an older protocol, which would drop it when

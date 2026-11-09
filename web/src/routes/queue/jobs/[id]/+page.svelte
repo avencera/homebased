@@ -28,6 +28,7 @@
 	import QueueBadge from '$lib/components/QueueBadge.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import ThreadLabel from '$lib/components/ThreadLabel.svelte';
+	import { leaseIdleLabel } from '$lib/api';
 	import { JobStore, QueueControl } from '$lib/daemon.svelte';
 	import { EM_DASH, formatTimestamp, shortId, shortenHome } from '$lib/format';
 	import {
@@ -104,6 +105,20 @@
 			{/if}
 		</span>
 	</header>
+
+	{#each detail?.lease_idle ?? [] as trip (trip.attempt)}
+		<p
+			class="mt-3 flex items-start gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200"
+			role="status"
+		>
+			<CircleAlert class="mt-0.5 size-4 shrink-0" />
+			<span
+				>{leaseIdleLabel(trip)}: run {shortId(trip.attempt, 13)} held GPU {trip.gpu_uuid} with no CUDA
+				context from {formatTimestamp(trip.idle_since)}. Run builds and other CPU work as
+				<code>homebased task run</code> tasks and chain the GPU job with <code>--after</code>.</span
+			>
+		</p>
+	{/each}
 
 	{#each [store.error, control.error] as error, index (index)}
 		{#if error}

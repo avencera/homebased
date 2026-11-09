@@ -138,13 +138,15 @@ pub struct Dashboard {
     pub content_https_port: Option<u16>,
 }
 
-/// Resource queue notice settings; these never stop a job
+/// Resource queue notice and guard settings
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ResourceConfig {
     /// Time to wait before recording a notice for the blocked head
     pub notify_blocked_after: crate::queue::schedule::NoticeThresholds,
-    /// GPU idle alert sampling and thresholds
+    /// GPU idle alert sampling and thresholds; these alerts never stop a job
     pub gpu_idle: crate::queue::gpu_idle::GpuIdleConfig,
+    /// The lease guard, which releases a GPU whose run holds no CUDA context
+    pub lease_guard: crate::queue::lease_guard::LeaseGuardConfig,
 }
 
 /// Whether this machine joins a fleet
@@ -298,6 +300,40 @@ struct RawResource {
     notify_blocked_after: RawBlockedThresholds,
     #[serde(default)]
     gpu_idle: RawGpuIdle,
+    #[serde(default)]
+    lease_guard: RawLeaseGuard,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLeaseGuard {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    idle_after: Option<String>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    yield_grace: Option<String>,
+}
+
+impl RawLeaseGuard {
+    fn validate(self) -> Result<crate::queue::lease_guard::LeaseGuardConfig, String> {
+        let mut config = crate::queue::lease_guard::LeaseGuardConfig::default();
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        for (name, raw, target) in [
+            ("idle_after", self.idle_after, &mut config.idle_after),
+            ("interval", self.interval, &mut config.interval),
+            ("yield_grace", self.yield_grace, &mut config.yield_grace),
+        ] {
+            if let Some(raw) = raw {
+                *target = positive_duration(&format!("resource.lease_guard.{name}"), &raw)?;
+            }
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -414,6 +450,7 @@ impl RawResource {
         Ok(ResourceConfig {
             notify_blocked_after: thresholds,
             gpu_idle: self.gpu_idle.validate()?,
+            lease_guard: self.lease_guard.validate()?,
         })
     }
 }

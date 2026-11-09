@@ -1,15 +1,20 @@
-//! Submit-time hint for job steps that build on the GPU lease
+//! Submit-time check for job steps that build on the GPU lease
 //!
 //! A step that compiles holds its GPU for the whole build, while other jobs
 //! wait. Building in a CPU task and submitting the job with `--after` that
-//! task keeps the lease for the run itself. This is only a hint: the shell
-//! reading is rough, and a step it flags still submits
+//! task keeps the lease for the run itself. Submit refuses a flagged step
+//! unless `--allow-build` is given. The shell reading is rough on purpose: a
+//! wrapper script that builds slips past it, and the lease guard catches
+//! that run once it holds the GPU with no CUDA context
 
 use super::StepWorkload;
 use super::spec::JobSpec;
 
 /// Shells whose `-c` script is read for build commands too
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// Build scripts that only compile, matched by file name
+const BUILD_SCRIPTS: &[&str] = &["build-ptx.sh", "sass_mix.sh"];
 
 /// Words that run the command after them, so the build tool is the next word
 const PREFIXES: &[&str] = &["env", "exec", "time", "nice", "nohup", "sudo", "command"];
@@ -37,7 +42,7 @@ pub fn build_warnings(spec: &JobSpec) -> Vec<String> {
             let tool = build_command(&argv)?;
             Some(format!(
                 "step {index} runs `{tool}`, which holds the GPU while it builds; build in a CPU \
-                 task first and submit the job with `--after <task-id>`"
+                 `homebased task run` task first and submit the job with `--after <task-id>`"
             ))
         })
         .collect()
@@ -53,10 +58,17 @@ fn build_command(argv: &[String]) -> Option<String> {
     if !SHELLS.contains(&program) {
         return None;
     }
+    // `bash build-ptx.sh`: the first operand is a script the shell runs
+    if let Some(script) = words[1..].iter().find(|word| !word.starts_with('-'))
+        && !words[1..].iter().any(|word| is_command_flag(word))
+        && let Some(tool) = build_tool(&[script])
+    {
+        return Some(tool);
+    }
     // the script is the argument after `-c`, which may be combined with other flags
     let script = words
         .iter()
-        .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))
+        .position(|word| is_command_flag(word))
         .and_then(|flag| words.get(flag + 1))?;
     script
         .split(['\n', ';', '|', '&', '(', ')', '{', '}'])
@@ -84,8 +96,12 @@ fn build_tool(words: &[&str]) -> Option<String> {
         .filter(|word| !word.starts_with('+'));
     let sub = rest.next().unwrap_or("");
     let builds = match program {
-        "nvcc" | "make" | "cmake" | "ninja" => return Some(program.to_owned()),
-        "cargo" => matches!(sub, "build" | "b" | "run" | "r" | "test" | "t" | "install"),
+        "nvcc" | "ptxas" | "make" | "cmake" | "ninja" => return Some(program.to_owned()),
+        script if BUILD_SCRIPTS.contains(&script) => return Some(program.to_owned()),
+        "cargo" => matches!(
+            sub,
+            "build" | "b" | "run" | "r" | "test" | "t" | "install" | "oxide"
+        ),
         "pip" | "pip3" => sub == "install",
         "uv" => match sub {
             "sync" | "build" => true,
@@ -104,6 +120,11 @@ fn build_tool(words: &[&str]) -> Option<String> {
         "uv" if sub == "pip" => "uv pip install".to_owned(),
         _ => format!("{program} {sub}"),
     })
+}
+
+/// A short flag group that holds `c`, such as `-c` or `-lc`
+fn is_command_flag(word: &str) -> bool {
+    word.starts_with('-') && !word.starts_with("--") && word.contains('c')
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -154,6 +175,21 @@ mod tests {
             ),
             (&["npm", "ci"], Some("npm ci")),
             (&["sh", "-c", "echo 'pip install later'"], None),
+            (
+                &["bash", "scripts/build-ptx.sh", "--arch", "sm_120"],
+                Some("build-ptx.sh"),
+            ),
+            (&["./build-ptx.sh"], Some("build-ptx.sh")),
+            (&["cargo", "oxide", "build"], Some("cargo oxide")),
+            (
+                &["sh", "-c", "ptxas -arch=sm_120 k.ptx && ./bench"],
+                Some("ptxas"),
+            ),
+            (
+                &["bash", "-lc", "scripts/sass_mix.sh a b"],
+                Some("sass_mix.sh"),
+            ),
+            (&["bash", "bench.sh"], None),
         ];
         for (words, expected) in cases {
             assert_eq!(

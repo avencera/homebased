@@ -11,6 +11,7 @@ mod delivery;
 mod gpu_idle;
 pub mod interface;
 mod jobs;
+mod lease_guard;
 mod resources;
 mod rows;
 mod runs;
@@ -20,6 +21,7 @@ mod tests;
 
 pub use delivery::JobCursors;
 pub use gpu_idle::GpuIdleTarget;
+pub use lease_guard::{JobLeaseNote, LeaseTarget};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};

@@ -35,6 +35,7 @@ struct EventDraft {
     blocked: Option<BlockedNotice>,
     gpu_idle: Option<GpuIdleNotice>,
     gpu_summaries: Vec<GpuSummary>,
+    lease_idle: Option<crate::queue::lease_guard::LeaseIdleTrip>,
 }
 
 /// Where a move inserts the job within its new level
@@ -537,6 +538,7 @@ impl Store {
                 blocked,
                 gpu_idle: None,
                 gpu_summaries: Vec::new(),
+                lease_idle: None,
             },
         )
     }
@@ -556,6 +558,10 @@ impl Store {
         if !gpu_summaries.is_empty() && !self.origin_reads_gpu_idle(job)? {
             gpu_summaries.clear();
         }
+        let lease_idle = match &run {
+            Some(run) if self.origin_reads_lease_idle(job)? => self.lease_idle_trip(run.task)?,
+            _ => None,
+        };
         self.append_event(
             job,
             EventDraft {
@@ -566,6 +572,7 @@ impl Store {
                 blocked: None,
                 gpu_idle: None,
                 gpu_summaries,
+                lease_idle,
             },
         )
     }
@@ -587,6 +594,7 @@ impl Store {
                 blocked: None,
                 gpu_idle: Some(notice),
                 gpu_summaries: Vec::new(),
+                lease_idle: None,
             },
         )
     }
@@ -600,6 +608,7 @@ impl Store {
             blocked,
             gpu_idle,
             gpu_summaries,
+            lease_idle,
         } = draft;
         self.conn.execute(
             "UPDATE resource_jobs SET event_seq = event_seq + 1 WHERE id = ?1",
@@ -628,6 +637,7 @@ impl Store {
             held_ending: None,
             gpu_idle,
             gpu_summaries,
+            lease_idle,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)

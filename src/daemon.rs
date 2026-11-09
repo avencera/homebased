@@ -18,6 +18,7 @@ mod gpu_idle;
 pub(crate) mod idle_compaction;
 mod inspection;
 mod keyed_locks;
+mod lease_guard;
 mod local_submit;
 pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
@@ -198,6 +199,12 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
+    let lease_guard = tokio::spawn(lease_guard::run(
+        state.store.clone(),
+        state.machine.identity.machine,
+        config.resource.lease_guard.clone(),
+        notifier.clone(),
+    ));
     let t3_watcher = tokio::spawn(t3_watch::run(notifier, state.machine.name.to_string()));
     let idle_compactor = tokio::spawn(idle_compaction::run(state.clone()));
     let gpu_idle_watcher = tokio::spawn(gpu_idle::run(
@@ -262,6 +269,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     t3_watcher.abort();
     idle_compactor.abort();
     gpu_idle_watcher.abort();
+    lease_guard.abort();
     hold_sweep.abort();
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {

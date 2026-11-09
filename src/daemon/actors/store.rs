@@ -60,6 +60,18 @@ fn event_error(error: EventError) -> AppError {
     }
 }
 
+/// Reply of a lease guard trip or escalation: the stopped run and its trip,
+/// or `None` when the attempt is no longer the active run
+pub(crate) type LeaseTripReply = RpcReplyPort<
+    Result<
+        Option<(
+            crate::queue::ActiveRun,
+            crate::queue::lease_guard::LeaseIdleTrip,
+        )>,
+        AppError,
+    >,
+>;
+
 /// Messages for daemon SQLite operations
 pub(crate) enum StoreMsg {
     /// Retained authority events for sequence gap recovery
@@ -81,6 +93,26 @@ pub(crate) enum StoreMsg {
         machine: MachineId,
         now: DateTime<Utc>,
         reply: RpcReplyPort<Result<Vec<crate::store::queue::GpuIdleTarget>, AppError>>,
+    },
+    /// GPU runs the lease guard watches
+    LeaseGuardTargets {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::LeaseTarget>, AppError>>,
+    },
+    /// Record a lease guard trip and commit its stop
+    LeaseGuardTrip {
+        task: TaskId,
+        gpu_uuid: crate::queue::gpu::GpuUuid,
+        idle_since: DateTime<Utc>,
+        idle_after: std::time::Duration,
+        now: DateTime<Utc>,
+        reply: LeaseTripReply,
+    },
+    /// Turn an unhonored guard yield into a cancel
+    LeaseGuardEscalate {
+        task: TaskId,
+        now: DateTime<Utc>,
+        reply: LeaseTripReply,
     },
     /// Save one attempt's idle accounting and produce its alert if still due
     GpuIdleCommit {
@@ -783,6 +815,23 @@ impl Actor for StoreActor {
                 now,
                 reply,
             } => send_reply(reply, state.gpu_idle_targets(machine, now)),
+            StoreMsg::LeaseGuardTargets { machine, reply } => {
+                send_reply(reply, state.lease_guard_targets(machine));
+            }
+            StoreMsg::LeaseGuardTrip {
+                task,
+                gpu_uuid,
+                idle_since,
+                idle_after,
+                now,
+                reply,
+            } => send_reply(
+                reply,
+                state.commit_lease_trip(task, gpu_uuid, idle_since, idle_after, now),
+            ),
+            StoreMsg::LeaseGuardEscalate { task, now, reply } => {
+                send_reply(reply, state.escalate_lease_yield(task, now));
+            }
             StoreMsg::GpuIdleCommit {
                 task,
                 watch,

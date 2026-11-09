@@ -33,6 +33,7 @@
 	import GripVertical from '@lucide/svelte/icons/grip-vertical';
 	import {
 		moveJob,
+		leaseIdleLabel,
 		peerQueueHref,
 		peerTaskHref,
 		type FleetMachine,
@@ -348,6 +349,15 @@
 									</a>
 									{#if job.state.state === 'queued' && job.state.resume}
 										<span class="shrink-0 text-[11px] text-muted-foreground">resumes</span>
+									{/if}
+									{#if queue.lease_notes[job.id]?.lease_idle}
+										{@const trip = queue.lease_notes[job.id].lease_idle!}
+										<span
+											class="text-destructive shrink-0 text-[11px] font-medium"
+											title={`GPU ${trip.gpu_uuid} idle since ${trip.idle_since}`}
+										>
+											{leaseIdleLabel(trip)}
+										</span>
 									{/if}
 								</span>
 								<span class="font-mono text-[11px]">{targetLabel(job.target, names)}</span>
