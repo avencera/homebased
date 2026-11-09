@@ -213,6 +213,9 @@ impl Harness {
     /// process, not the worker pid the test signalled
     fn agent_pid(&self, id: &str) -> i32 {
         let path = self.record.join(format!("agent-pid-{id}.txt"));
+        // the shell creates the file before it writes the pid, so wait for a
+        // whole number rather than the file
+        let read = || fs::read_to_string(&path).ok()?.trim().parse().ok();
         assert!(
             wait_until(Duration::from_secs(10), || path.exists()),
             "agent for {id} never recorded its pid"
