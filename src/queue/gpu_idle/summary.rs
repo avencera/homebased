@@ -363,10 +363,12 @@ impl EndReading {
         power_limit_watts: Option<f64>,
         budget: Duration,
     ) -> Option<Self> {
-        // both bounds are inclusive, and a point stamped `t` holds the second
-        // that ends at `t`, so the first point read is the first whole second
-        // after the start; an earlier one can hold the previous attempt's tail
-        let after = started.timestamp() + 1 + i64::from(started.timestamp_subsec_nanos() > 0);
+        // a point stamped `t` holds the time from `t - width` to `t`, and one
+        // that begins before the start can hold the previous attempt's tail;
+        // both bounds are inclusive, so the first point that can be kept is
+        // the one-second point after the first whole second
+        let start = started.timestamp() + i64::from(started.timestamp_subsec_nanos() > 0);
+        let after = start + 1;
         let before = ended.timestamp();
         if before < after {
             return None;
@@ -403,31 +405,39 @@ impl EndReading {
         .ok()?;
 
         let netdata = SampleSource::Netdata;
-        let width = |series: &Series| series.spacing_ms(width_ms);
+        // Netdata fills whole groups back from `before` and may begin the
+        // first one before `after`, so every point is checked against the
+        // width it came back with
+        let width = |series: &Series| {
+            let width = series.spacing_ms(width_ms);
+            let first = start + i64::try_from(width.div_ceil(1000)).unwrap_or(i64::MAX);
+            (width, move |at: &i64| *at >= first)
+        };
         let mut reading = Self::default();
         if let Some(util) = &util {
-            let width = width(util);
-            for (_, value) in util.values("gpu") {
+            let (width, inside) = width(util);
+            for (_, value) in util.values("gpu").filter(|(at, _)| inside(at)) {
                 reading.util.add(value, width, netdata);
             }
         }
         if let Some(limit) = power_limit_watts.filter(|limit| *limit > 0.0)
             && let Some(power) = &power
         {
-            let width = width(power);
-            for (_, watts) in power.values("power_draw") {
+            let (width, inside) = width(power);
+            for (_, watts) in power.values("power_draw").filter(|(at, _)| inside(at)) {
                 reading.power_pct.add(watts / limit * 100.0, width, netdata);
             }
         }
         if let Some(memory) = &memory_peak {
-            let width = width(memory);
-            for (_, used) in memory.values("used").filter(|(_, bytes)| *bytes >= 0.0) {
+            let (width, inside) = width(memory);
+            let used = memory.values("used");
+            for (_, used) in used.filter(|(at, bytes)| inside(at) && *bytes >= 0.0) {
                 reading.mem_used.add(used as u64, width, netdata);
             }
         }
         if let Some(memory) = &memory_mean {
-            let width = width(memory);
-            for (_, values) in &memory.rows {
+            let (width, inside) = width(memory);
+            for (_, values) in memory.rows.iter().filter(|(at, _)| inside(at)) {
                 let column = |name: &str| {
                     let index = memory
                         .dimensions
@@ -838,6 +848,10 @@ mod tests {
     /// A Netdata agent that answers every data query with one row per 5
     /// seconds, as a slow collector or a coarse tier does, and whose
     /// framebuffer split moves within each grouped point
+    ///
+    /// Rows are stamped back from `before`, as Netdata groups them. The
+    /// `memory_tail` chart holds 30 GiB in its oldest row and 1 GiB after
+    /// it, like a previous attempt's tail caught in the first group
     async fn coarse_netdata() -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -865,27 +879,38 @@ mod tests {
                 let after: i64 = param("after").parse().unwrap();
                 let before: i64 = param("before").parse().unwrap();
                 let gib = f64::from(1u32 << 30);
-                let (labels, row) = match (param("chart").as_str(), param("group").as_str()) {
+                // newest first, like Netdata
+                let times: Vec<i64> = (0..)
+                    .map(|step| before - step * 5)
+                    .take_while(|at| *at >= after)
+                    .collect();
+                let oldest = times.last().copied();
+                let chart = param("chart");
+                let (labels, row) = match (chart.as_str(), param("group").as_str()) {
                     ("util", _) => (json!(["time", "gpu"]), json!([50.0])),
+                    ("memory_tail", "max") => (
+                        json!(["time", "free", "used", "reserved"]),
+                        json!([2.0 * gib, 30.0 * gib, 0.0]),
+                    ),
                     // free and used swapped between 30 and 2 GiB inside each point
                     ("memory", "max") => (
                         json!(["time", "free", "used", "reserved"]),
                         json!([30.0 * gib, 30.0 * gib, 0.0]),
                     ),
-                    ("memory", _) => (
+                    ("memory" | "memory_tail", _) => (
                         json!(["time", "free", "used", "reserved"]),
                         json!([16.0 * gib, 16.0 * gib, 0.0]),
                     ),
                     _ => (json!(["time", "power_draw"]), json!([100.0])),
                 };
-                // newest first, like Netdata
-                let mut times: Vec<i64> = (after..=before).step_by(5).collect();
-                times.reverse();
                 let rows: Vec<Value> = times
                     .into_iter()
                     .map(|at| {
                         let mut values = vec![json!(at)];
                         values.extend(row.as_array().unwrap().iter().cloned());
+                        if chart == "memory_tail" && Some(at) != oldest {
+                            values[2] = json!(gib);
+                        }
                         Value::Array(values)
                     })
                     .collect();
@@ -915,8 +940,8 @@ mod tests {
             .await
             .unwrap();
 
-        // the read starts a second after the start, so the second before it
-        // stays out, and 12 rows 5 seconds apart cover the whole minute
+        // 12 rows 5 seconds apart, the oldest holding the minute's first five
+        // seconds, cover the whole minute
         assert_eq!(reading.util.coverage.netdata_ms, 60_000);
         assert_eq!(reading.power_pct.coverage.netdata_ms, 60_000);
         let summary = GpuSummary::build(&SummaryInput {
@@ -937,5 +962,19 @@ mod tests {
         // the peak in use is the busiest moment, and the size stays physical
         assert_eq!(summary.mem_peak_mib.unwrap().value, 30 * 1024);
         assert_eq!(summary.mem_total_mib.unwrap().value, 32 * 1024);
+
+        // two seconds later the oldest group begins before the start, so its
+        // 30 GiB belongs to the previous attempt and stays out
+        let charts = NetdataCharts {
+            memory: Some("memory_tail".into()),
+            ..charts
+        };
+        let end = start + chrono::Duration::seconds(62);
+        let reading = EndReading::read(&charts, start, end, Some(500.0), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(reading.mem_used.peak, Some(1 << 30));
+        assert_eq!(reading.mem_used.coverage.netdata_ms, 60_000);
+        assert_eq!(reading.util.coverage.netdata_ms, 60_000);
     }
 }
