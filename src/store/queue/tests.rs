@@ -2500,3 +2500,42 @@ fn detection_names_each_gpu_and_every_attempt_keeps_the_one_it_launched_on() {
     assert_eq!(gpu_uuid(&f, f.machine, "gpu0"), uuid("GPU-new"));
     assert_eq!(gpu_uuid(&f, f.machine, "gpu1"), uuid("GPU-b"));
 }
+
+#[test]
+fn a_run_applied_after_its_exit_ends_its_gpu_summary_at_the_exit() {
+    let f = Fixture::new();
+    let started = Utc::now() - chrono::Duration::seconds(600);
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu0", started);
+
+    // the worker wrote exit.json 30s in, and the daemon applies it much later
+    let dir = f._dir.path().join("tasks").join(run.task.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_json = dir.join("exit.json");
+    crate::store::write_exit_json(
+        &exit_json,
+        &ExitReason::Exit { code: 0 },
+        ProcessGroupExitEvidence::ConfirmedExited,
+    )
+    .unwrap();
+    let exited = started + chrono::Duration::seconds(30);
+    std::fs::File::options()
+        .write(true)
+        .open(&exit_json)
+        .unwrap()
+        .set_modified(exited.into())
+        .unwrap();
+    f.exit(&run, ExitReason::Exit { code: 0 });
+    let summary = f.store.gpu_summary(run.task).unwrap().unwrap();
+    assert_eq!(summary.attempt_secs, 30, "{summary:?}");
+
+    // a run lost with no exit.json can only end now
+    let job = f.submit(Priority::Low);
+    let run = f.start(job, "gpu1", started);
+    f.store
+        .cas_status(run.task, ProcessStatus::Running, ProcessStatus::Lost)
+        .unwrap()
+        .unwrap();
+    let summary = f.store.gpu_summary(run.task).unwrap().unwrap();
+    assert!(summary.attempt_secs >= 600, "{summary:?}");
+}

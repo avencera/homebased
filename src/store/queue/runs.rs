@@ -654,7 +654,7 @@ impl Store {
         self.write_run(&cleaning)?;
         // the summary is final before any event can carry it, so a stored
         // event never needs a later rewrite
-        let summary = self.save_gpu_summary(run, Utc::now())?;
+        let summary = self.save_gpu_summary(run, self.run_exit_time(run.task))?;
         if let Some(kind) = after.event {
             let summaries = match kind {
                 JobEventKind::JobPreempted => summary.into_iter().collect(),
@@ -663,6 +663,19 @@ impl Store {
             self.append_run_end_event(job.id, kind, Some(event_run(run)), process, summaries)?;
         }
         Ok(())
+    }
+
+    /// When a run's child exited: the time its worker wrote `exit.json`, or
+    /// now without one
+    ///
+    /// The daemon may apply a saved exit long after it happened, such as at
+    /// its next start, and the attempt's GPU summary must end at the exit. A
+    /// run lost with no `exit.json` has no record of when it ended
+    fn run_exit_time(&self, task: TaskId) -> DateTime<Utc> {
+        let now = Utc::now();
+        std::fs::metadata(self.tasks_dir.join(task.to_string()).join("exit.json"))
+            .and_then(|metadata| metadata.modified())
+            .map_or(now, |modified| DateTime::<Utc>::from(modified).min(now))
     }
 
     /// The active run of `resource`, which must belong to `task`
