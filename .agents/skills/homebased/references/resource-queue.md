@@ -109,6 +109,7 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
 | `timeout` | Output-inactivity notice per run. Default `1h`, minimum `30m`. Never stops work. |
 | `machine`, `resource` | Optional target selectors. |
 | `workload` or `steps` | Exactly one. One workload or 1 to 32 ordered steps. Each is `task` or `container`. |
+| `gpu_idle` | Optional. `"off"` turns this job's GPU idle alerts off. `{"after": "10m", "util_below": 5}` sets its idle window (any positive duration), threshold (1 to 100 percent), or both. Omit it to use the machine's defaults. |
 | `after` | Optional. 1 to 16 task or job UUIDs that this machine submitted. Each must succeed before the job joins the queue; a job succeeds at `JOB_SUCCEEDED`. Same as `--after`; both lists are merged. |
 
 Task commands are argv arrays. Homebased does not add a shell. Use `sh -c` explicitly when needed. Container fields follow [submit.md](submit.md), with the reserved fields above. Unknown fields fail validation. Run task IDs cannot be dependencies in any `after` list. Name their job instead.
@@ -137,11 +138,22 @@ homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 - The evaluation task starts once the job sends `JOB_SUCCEEDED`. `JOB_FAILED` or `JOB_CANCELLED` cancels it, and `JOB_PREEMPTED` leaves it held while the job queues again.
 - Submit warns on stderr, and in `warnings` with `--json`, when a step's argv or `sh -c` script runs a build tool. The job is still submitted. It does not detect other CPU work, so split that out yourself.
 
+### Handle a `JOB_GPU_IDLE` alert
+
+The queue machine watches each running attempt's GPU. Your thread gets `JOB_GPU_IDLE` when the GPU stays below 10% utilization for 5 minutes after it was busy, or for the first 10 minutes of an attempt that never got busy. Reminders follow 15 and 30 minutes later, then hourly, while it stays idle. Homebased never cancels or yields the job for this. When the alert arrives:
+
+1. Read `homebased task log <task> --tail 50`, and the alert's `gpu_idle.process` (the run's busiest process, its state and CPU use) and `gpu_idle.last_output_at`.
+2. If the run is stuck or broken, cancel it: `homebased --json resource job cancel <job>`.
+3. If CPU work runs inside the lease (data prep, scoring, reports, uploads), cancel it and resubmit as a chain with that work in its own task (`--after`, above).
+4. If the gap is short and expected, such as a large checkpoint write, snooze it for that long: `homebased --json resource job gpu-idle <job> --snooze 15m --reason "writing a 30 GB checkpoint"`. If the work really runs at low GPU use, turn alerts off with `--off --reason "..."`. Both are recorded with their reason in `resource job show`, and other agents read them before acting.
+
+Do not snooze to hide CPU work in the lease. Other jobs wait for that GPU.
+
 ### Cancel a job that leaves its GPU idle
 
-Any agent may cancel a GPU job, its own or another thread's, whose GPU has stayed near 0% utilization for 20 minutes or more. That job is doing CPU work, or is stuck, while others wait. Check before you cancel:
+Any agent may cancel a GPU job, its own or another thread's, whose GPU has stayed near 0% utilization for 20 minutes or more with no snooze or off switch. The owner got its alert at 5 minutes. That job is doing CPU work, or is stuck, while others wait. Check before you cancel:
 
-1. `resource job show <job>` names the active run's resource and `gpu_uuid`. `resource list` maps the resource to its device.
+1. `homebased --json resource job show <job>` names the active run's resource and `gpu_uuid`. Its `gpu_idle.silence` is `watching` unless an agent snoozed alerts or turned them off, and `gpu_idle.controls` lists each control with its reason. Leave a snoozed job alone until the snooze ends. Respect an off switch unless its reason no longer holds. `gpu_idle.attempts` counts the attempt's idle, busy, and unknown 10-second buckets.
 2. `nvidia-smi` on the queue machine, or the machine's Netdata GPU charts for the last 20 minutes, shows utilization near 0% on that GPU.
 3. `homebased task log <run-task> --tail 50` shows what the job is doing, such as tokenizing, scoring, or uploading.
 
@@ -162,13 +174,14 @@ Use `homebased --json` before each command and parse the result. All results car
 | `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history with the `gpu_uuid` each attempt launched on, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` entries, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` entry as `{"task"` or `"job", "state"}`, and the `reason` it ended. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
+| `resource job gpu-idle <job>` | Exactly one of `--snooze <duration>`, `--off`, or `--clear`. `--snooze` and `--off` require `--reason <text>`. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Snooze for any positive duration, or turn this job's GPU idle alerts off; `--clear` restores the spec's setting. The latest control wins. Never stops the job. Refused for a job still held for its `after` entries, and by a queue machine on an older release. |
 | `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |
 
 Move with `--front`, `--back`, or `--priority <low-or-medium-or-high>`. Front and back can include priority. Priority alone joins the new level's back. `--before <job>` and `--after <job>` take the target's level. An optional priority must match that level. Do not combine two placement flags or move relative to the same job.
 
-Machine reads and release default to local. Show, move, and cancel use the saved job authority when machine is absent. If you submitted from another origin, give the authority explicitly.
+Machine reads and release default to local. Show, move, cancel, and gpu-idle use the saved job authority when machine is absent. If you submitted from another origin, give the authority explicitly.
 
-For scripts, save an operation UUID before move, cancel, or release. Retry the exact command with the same `--operation-id`. New content needs a new operation UUID. Without the flag, the CLI makes one UUID for its own transport retries. A later CLI invocation makes a new one.
+For scripts, save an operation UUID before move, cancel, gpu-idle, or release. Retry the exact command with the same `--operation-id`. New content needs a new operation UUID. Without the flag, the CLI makes one UUID for its own transport retries. A later CLI invocation makes a new one.
 
 Get a run task UUID from job show, then read its log:
 
@@ -195,6 +208,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `JOB_ATTENTION` | Cleanup could not finish safely. Check the machine and release the hold if nothing from the run remains. |
 | `JOB_BLOCKED` | A lower-level run or an Attention has held the job up past the threshold. Inspect the listed blockers. This is a notice, never a stop. |
 | `JOB_CHECK_DUE` | Inspect the current run and its recent output. Inactivity does not stop it. |
+| `JOB_GPU_IDLE` | The run's GPU has been near idle. Follow [Handle a `JOB_GPU_IDLE` alert](#handle-a-job_gpu_idle-alert). This is a notice, never a stop. |
 
 | Callback field | Meaning |
 | --- | --- |
@@ -206,6 +220,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `process` | Optional tagged exit result. Uses the task exit forms in [events.md](events.md). |
 | `attention` | Optional exact Attention UUID for release. |
 | `blocked` | Only on blocked notices: `episode`, `blocked_since`, and `blockers`. |
+| `gpu_idle` | Only on GPU idle alerts. `attempt` (run task), `episode`, `reminder` (0 for the first alert), `never_busy`, `gpu_uuid`, `idle_since`, `idle_secs`, `window_secs`, `idle_buckets` and `known_buckets` of the window, `util_below`, and the window's `util_peak_pct`, `power_peak_watts`, `power_peak_pct`, `memory_used_mib`, `memory_total_mib`, each `null` when unread. `last_output_at` is the run's last log output. `process` is the run's busiest process: `pid`, `command`, `state`, `cpu_pct` (one full core is 100), and `marked`, the count of the run's processes. `source` is `netdata` or `nvidia_smi`. `next_steps` repeats what to do. |
 | `held_ending` | Only when a job held for its `after` entries ended before it queued. `reason` is `dependency` (with the `task` or `job` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
 
 Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.

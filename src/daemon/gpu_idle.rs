@@ -388,7 +388,8 @@ impl Watcher {
             watch.push(bucket, &thresholds);
         }
 
-        let due = watch.alert_due(now, &thresholds, target.silence.silenced());
+        let held = target.silence.silenced() || !target.notifiable;
+        let due = watch.alert_due(now, &thresholds, held);
         let alert = match (due, source) {
             (Some(due), Some(source)) => Some(Box::new(
                 self.notice(&target, &watch, &thresholds, due, source, now)

@@ -36,6 +36,9 @@ pub struct GpuIdleTarget {
     pub spec: Option<GpuIdleSpec>,
     /// Silence at the time of the read
     pub silence: Silence,
+    /// Whether the job's origin can read `JOB_GPU_IDLE`; the attempt is
+    /// still counted when it cannot, but no alert is built
+    pub notifiable: bool,
     /// Stored accounting, or `None` before the first tick
     pub watch: Option<AttemptWatch>,
 }
@@ -88,6 +91,7 @@ impl Store {
                 resource_label: record.resource.label,
                 spec: job.spec.gpu_idle,
                 silence: self.gpu_idle_silence(run.job, now)?,
+                notifiable: self.origin_reads_gpu_idle(run.job)?,
                 watch: self.gpu_idle_watch(run.task)?,
                 run,
             });

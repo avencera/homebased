@@ -15,7 +15,7 @@ homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 
 The job stays out of the queue until the prep task succeeds, and the evaluation starts at `JOB_SUCCEEDED`. Submit warns when a step runs a build tool. It does not detect other CPU work.
 
-Any agent or operator may cancel a GPU job whose GPU has stayed near 0% utilization for 20 minutes or more. Confirm it first: `resource job show` names the active run's resource and `gpu_uuid`; `nvidia-smi` or the machine's Netdata GPU charts show that GPU's utilization over the last 20 minutes; and `task log <run-task> --tail 50` shows what the job is doing. Cancelling removes no checkpoints, and `<home>/jobs/<job>/state/` stays on the queue machine. The owner then moves the CPU part into its own task and resubmits the GPU part, pointing it at the old checkpoint, since the new job starts with an empty `HOMEBASED_JOB_DIR`.
+Homebased watches each running attempt's GPU and sends the job's thread a `JOB_GPU_IDLE` alert when the GPU stays near idle for 5 minutes (see [GPU idle alerts](#gpu-idle-alerts)). The alert only notifies. The owner decides whether to cancel, split the CPU work out, or snooze. Any agent or operator may cancel a GPU job whose GPU has stayed near 0% utilization for 20 minutes or more with no snooze or off switch. Confirm it first: `resource job show` names the active run's resource and `gpu_uuid`, and its `gpu_idle` section shows any snooze or off switch with its reason; `nvidia-smi` or the machine's Netdata GPU charts show that GPU's utilization over the last 20 minutes; and `task log <run-task> --tail 50` shows what the job is doing. Cancelling removes no checkpoints, and `<home>/jobs/<job>/state/` stays on the queue machine. The owner then moves the CPU part into its own task and resubmits the GPU part, pointing it at the old checkpoint, since the new job starts with an empty `HOMEBASED_JOB_DIR`.
 
 ## Check resources and jobs
 
@@ -79,9 +79,9 @@ A job submitted with `--after <task-or-job>`, or with `after` in its spec, waits
 
 Cancellation stops queued work directly. For an active job, it requests a stop and cleanup. The response does not prove that cleanup has finished. Check job show and resource list.
 
-Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, and cancel use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.
+Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, cancel, and gpu-idle use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.
 
-The web listener serves queue reads and move, cancel, and release. `GET /v1/fleet/queues` and the dashboard's `/queue` page show the resources and jobs of every Fleet machine. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
+The web listener serves queue reads and move, cancel, gpu-idle, and release. `GET /v1/fleet/queues` and the dashboard's `/queue` page show the resources and jobs of every Fleet machine. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
 
 ## Clear Attention after a machine check
 
@@ -120,6 +120,42 @@ homebased --json config validate
 ```
 
 Use `homebased daemon restart` to load changed settings. Let active jobs finish first. Do not use a raw service-manager stop. Output-inactivity notices are separate. Each job spec has `timeout`, default `1h`, minimum `30m`. `JOB_CHECK_DUE` also leaves the run alive.
+
+## GPU idle alerts
+
+On Linux with NVIDIA GPUs, the queue machine samples the GPU of each attempt that is executing, or that was asked to yield and is still running. It reads the machine's Netdata agent first and falls back to `nvidia-smi`. Resources without a device index or a saved GPU UUID are not watched. macOS is not watched.
+
+- Netdata charts come from the go.d `nvidia_smi` collector. They are found by context (`nvidia_smi.gpu_utilization`, `nvidia_smi.gpu_power_draw`, `nvidia_smi.gpu_frame_buffer_memory_usage`) and matched to the GPU by its `uuid` label, or by the UUID in the chart id. When the data goes stale, the charts are listed again before falling back. The power limit comes from `nvidia-smi` when sampling starts, then hourly.
+- The `nvidia-smi` fallback runs once per interval, only while some attempt needs it. A failed probe or an `[N/A]` reading leaves the time unknown, never idle.
+- Time is counted in 10-second buckets from the attempt's start, so an earlier attempt's busy tail never counts. A bucket is idle when its peak utilization stays below 10%, and unknown when it has too few samples. Unknown buckets never count as idle, and an alert needs at least half the window readable.
+
+The first alert comes when at least 90% of the known buckets in the last 5 minutes are idle, after the attempt was busy at least once. An attempt that is never busy alerts 10 minutes in, when every known bucket is idle. Reminders follow 15 and 30 minutes after the first alert, then hourly, while the GPU stays idle. One minute of continuous busy ends the episode. A later idle stretch is a new episode with its own alert. Each alert names the attempt, idle time, utilization, power and memory peaks, last log output, and the busiest process of the run with its CPU use. An alert whose attempt ended, whose episode ended, or whose job was silenced since it was recorded is dropped before delivery.
+
+The owner, or any agent, controls a job's alerts. Homebased never caps or overrides these choices:
+
+```sh
+homebased --json resource job gpu-idle "$job" --snooze 15m --reason "writing a 30 GB checkpoint" --operation-id "$op"
+homebased --json resource job gpu-idle "$job" --off --reason "known CPU phase, splitting it out next run"
+homebased --json resource job gpu-idle "$job" --clear
+```
+
+`--snooze` takes any positive duration, and `--off` silences alerts for the rest of the job. Both need a reason, which `resource job show` lists with each control. The latest control wins. `--clear` drops both, so the spec's setting applies again. Controls are stored on the job's queue machine and routed like move and cancel. A job still held for its `after` entries refuses them. A peer on an older release refuses them too, and jobs submitted from such a peer get no alerts. A job spec can turn alerts off with `"gpu_idle": "off"`, or set its own window and threshold with `"gpu_idle": {"after": "10m", "util_below": 5}`.
+
+Machine defaults go in the same config file as blocked notices. Durations must be positive.
+
+```toml
+[resource.gpu_idle]
+source = "auto"            # auto, netdata, nvidia-smi, or off
+netdata_url = "http://127.0.0.1:19999"
+after = "5m"               # idle window before the first alert
+util_below = 10            # percent, 1 to 100
+interval = "10s"           # bucket length and sampling interval
+never_busy_after = "10m"   # default twice after
+recover_after = "1m"       # continuous busy that ends an episode
+remind_after = "15m"       # first reminder; then 2x, then every 4x
+```
+
+With `source = "netdata"`, a GPU without Netdata charts has unknown buckets and gets no alerts. `off` stops sampling on the machine. A spec's `after` also sets that job's never-busy point to twice its value.
 
 ## Find checkpoints and logs
 

@@ -654,6 +654,8 @@ mod containers;
 mod dashboard;
 #[path = "integration/dependencies.rs"]
 mod dependencies;
+#[path = "integration/gpu_idle.rs"]
+mod gpu_idle;
 #[path = "integration/lifecycle.rs"]
 mod lifecycle;
 #[path = "integration/reports.rs"]

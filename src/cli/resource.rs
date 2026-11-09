@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -15,6 +15,9 @@ use crate::domain::TaskEnv;
 use crate::error::AppError;
 use crate::queue::build_hint::build_warnings;
 use crate::queue::gpu::GpuUuid;
+use crate::queue::gpu_idle::{
+    GpuIdleControl, GpuIdleControlResult, GpuIdleDetail, SampleSource, Silence,
+};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
@@ -128,6 +131,50 @@ pub enum JobCommand {
         #[command(flatten)]
         machine: MachineArgs,
     },
+    /// Snooze, turn off, or restore a job's GPU idle alerts
+    ///
+    /// Alerts only notify; they never stop the job. The latest control wins
+    GpuIdle(GpuIdleArgs),
+}
+
+/// Exactly one GPU idle control, with a reason for every silence
+#[derive(Debug, Args)]
+#[command(group = ArgGroup::new("control").required(true).args(["snooze", "off", "clear"]))]
+pub struct GpuIdleArgs {
+    /// Job UUID
+    pub job: JobId,
+    /// Hold alerts for this long, such as 15m or 2h; any positive duration
+    #[arg(long, value_name = "DURATION")]
+    pub snooze: Option<humantime::Duration>,
+    /// Turn alerts off for the rest of the job
+    #[arg(long)]
+    pub off: bool,
+    /// Drop any snooze or off switch, so the spec's gpu_idle setting applies
+    #[arg(long)]
+    pub clear: bool,
+    /// Why the GPU may sit idle; shown to other agents in job show
+    #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+    pub reason: Option<String>,
+    /// Replay identity; generated once when omitted
+    #[arg(long)]
+    pub operation_id: Option<OperationId>,
+    /// Queue authority when submitted from another origin
+    #[command(flatten)]
+    pub machine: MachineArgs,
+}
+
+impl GpuIdleArgs {
+    fn control(&self) -> GpuIdleControl {
+        let reason = self.reason.clone().unwrap_or_default();
+        match (self.snooze, self.off) {
+            (Some(duration), _) => GpuIdleControl::Snooze {
+                duration: duration.into(),
+                reason,
+            },
+            (None, true) => GpuIdleControl::Off { reason },
+            (None, false) => GpuIdleControl::Clear,
+        }
+    }
 }
 
 /// Exactly one placement is validated before sending a move
@@ -275,6 +322,34 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             .await?;
             print_result(ctx, &value, "cancel requested for", &job.to_string())
         }
+        JobCommand::GpuIdle(args) => {
+            let control = args.control();
+            control
+                .validate()
+                .map_err(|message| AppError::Usage { message })?;
+            let operation_id = args.operation_id.unwrap_or_default();
+            let value = post_retry(
+                client,
+                &path(
+                    &format!("/v1/resource/jobs/{}/gpu-idle", args.job),
+                    &args.machine,
+                ),
+                &json!({ "operation_id": operation_id, "control": control }),
+            )
+            .await?;
+            let result: GpuIdleControlResult = decode(value.clone())?;
+            let action = format!("GPU idle alerts {} for", silence_label(&result.silence));
+            print_result(ctx, &value, &action, &args.job.to_string())
+        }
+    }
+}
+
+fn silence_label(silence: &Silence) -> String {
+    match silence {
+        Silence::Watching => "on".into(),
+        Silence::Snoozed { until, .. } => format!("snoozed until {}", until.to_rfc3339()),
+        Silence::Off { .. } => "off".into(),
+        Silence::SpecOff => "off by spec".into(),
     }
 }
 
@@ -523,5 +598,45 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
             run.run_number, run.step, run.task, run.status
         );
     }
+    // jobs that never ran on a watched GPU and were never silenced say nothing
+    if let Some(idle) = detail.gpu_idle.as_ref().filter(|idle| {
+        !idle.attempts.is_empty() || !idle.controls.is_empty() || idle.silence.silenced()
+    }) {
+        print_gpu_idle(idle);
+    }
     Ok(())
+}
+
+fn print_gpu_idle(idle: &GpuIdleDetail) {
+    let reason = match &idle.silence {
+        Silence::Snoozed { reason, .. } | Silence::Off { reason } => format!(" ({reason})"),
+        Silence::Watching | Silence::SpecOff => String::new(),
+    };
+    println!("gpu idle alerts: {}{reason}", silence_label(&idle.silence));
+    for attempt in &idle.attempts {
+        let source = attempt.source.map_or("-", SampleSource::as_str);
+        println!(
+            "gpu idle {}: {} alerts, episode {}; buckets {} busy, {} idle, {} unknown; source {source}",
+            attempt.task,
+            attempt.alerts,
+            attempt.episode,
+            attempt.busy_buckets,
+            attempt.idle_buckets,
+            attempt.unknown_buckets
+        );
+    }
+    for control in &idle.controls {
+        let until = control.until.map_or_else(String::new, |until| {
+            format!(" until {}", until.to_rfc3339())
+        });
+        let reason = control
+            .reason
+            .as_ref()
+            .map_or_else(String::new, |reason| format!(": {reason}"));
+        println!(
+            "gpu idle {} at {}{until}{reason}",
+            control.action,
+            control.at.to_rfc3339()
+        );
+    }
 }

@@ -20,9 +20,12 @@ use crate::domain::{API_VERSION, TaskEnv};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
-use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
+use crate::fleet::protocol::{
+    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+};
 use crate::machine::MachineId;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
+use crate::queue::gpu_idle::GpuIdleControl;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
     AttentionId, JobId, OperationId, Placement, QueueError, ResourceLabel, ResourceName,
@@ -75,6 +78,7 @@ pub fn control_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/resource/jobs/{job}/move", post(move_job))
         .route("/v1/resource/jobs/{job}/cancel", post(cancel))
+        .route("/v1/resource/jobs/{job}/gpu-idle", post(gpu_idle))
         .route("/v1/resource/release", post(release))
         .route("/v1/resource/label", post(label))
 }
@@ -173,6 +177,13 @@ struct MoveBody {
 #[serde(deny_unknown_fields)]
 struct OperationBody {
     operation_id: OperationId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GpuIdleBody {
+    operation_id: OperationId,
+    control: GpuIdleControl,
 }
 
 #[derive(Deserialize)]
@@ -482,6 +493,41 @@ async fn cancel(
     .map(Json)
 }
 
+async fn gpu_idle(
+    State(state): State<AppState>,
+    Path(job): Path<JobId>,
+    Query(query): Query<MachineQuery>,
+    QueueJson(body): QueueJson<GpuIdleBody>,
+) -> Result<Json<Value>, AppError> {
+    body.control
+        .validate()
+        .map_err(|message| AppError::Usage { message })?;
+    {
+        // a held job has no run yet and its authority has no record to silence
+        let _guard = state.locks.job_submissions.lock(job).await;
+        if let Some(view) = local_held_view(&state, job, query.machine.as_ref()).await? {
+            return Err(AppError::Usage {
+                message: format!(
+                    "job {job} is {} on its origin and has not reached its queue; GPU idle alerts start once it runs",
+                    view.state
+                ),
+            });
+        }
+    }
+    let machine = job_authority(&state, job, query.machine.as_ref()).await?;
+    forward(
+        &state,
+        machine,
+        QueueRequest::GpuIdle {
+            operation: body.operation_id,
+            job,
+            control: body.control,
+        },
+    )
+    .await
+    .map(Json)
+}
+
 async fn release(
     State(state): State<AppState>,
     Query(query): Query<MachineQuery>,
@@ -571,6 +617,26 @@ pub(super) async fn forward(
             machine: machine.to_string(),
         })?;
     let destination = fleet.connect(machine).await?;
+    let needed = request.min_protocol();
+    if destination.protocol < needed {
+        // an older authority would refuse the request as unknown, so name the cause
+        let local = ProtocolRange::new(needed, SUPPORTED_PROTOCOLS.max()).ok_or_else(|| {
+            AppError::Internal {
+                message: "request needs a newer protocol than this daemon".into(),
+            }
+        })?;
+        let remote =
+            ProtocolRange::new(destination.protocol, destination.protocol).ok_or_else(|| {
+                AppError::Internal {
+                    message: "negotiated protocol is not a range".into(),
+                }
+            })?;
+        return Err(AppError::ClusterProtocolIncompatible {
+            machine,
+            local,
+            remote,
+        });
+    }
     let body = ClusterQueue {
         api_version: API_VERSION,
         protocol_version: destination.protocol.0,

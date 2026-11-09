@@ -39,14 +39,10 @@ impl Thresholds {
     }
 
     /// Time from the last alert to the next reminder, given the alerts sent
-    /// so far in the episode: the reminders land 1x, 2x, and 4x
-    /// `remind_after` after the first alert, then every 4x
+    /// so far in the episode: the reminders land 1x and 2x `remind_after`
+    /// after the first alert, then every 4x, so 15m, 30m, then hourly by default
     fn reminder_gap(&self, sent: u32) -> Duration {
-        let factor = match sent {
-            0..=2 => 1,
-            3 => 2,
-            _ => 4,
-        };
+        let factor = if sent <= 2 { 1 } else { 4 };
         self.remind_after.saturating_mul(factor)
     }
 }

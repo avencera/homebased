@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
-use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
+use crate::fleet::protocol::{
+    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL, SUPPORTED_PROTOCOLS,
+};
 use crate::machine::MachineId;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail};
@@ -97,6 +99,17 @@ pub enum QueueRequest {
         /// What to do
         control: GpuIdleControl,
     },
+}
+
+impl QueueRequest {
+    /// Lowest cluster protocol whose authorities understand this request
+    #[must_use]
+    pub fn min_protocol(&self) -> ClusterProtocolVersion {
+        match self {
+            Self::GpuIdle { .. } => GPU_IDLE_PROTOCOL,
+            _ => SUPPORTED_PROTOCOLS.min(),
+        }
+    }
 }
 
 /// One machine's resources, by name, with their active runs
