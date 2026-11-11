@@ -8,7 +8,7 @@ homebased --json thread context --children           # this thread's T3 children
 homebased --json thread context --children --live    # only children still working
 homebased --json thread context 'thread_3f2a…' 9c1e  # several references; 9c1e is a prefix
 homebased --json thread compact 'thread_3f2a…'
-homebased --json thread watch --children --context-above 150k
+homebased --json thread watch <child-thread-id> --context-above <limit> --action compact
 homebased --json thread watch --children --stalled-after 20m
 homebased --json thread watches
 homebased --json thread unwatch <watch-id>
@@ -53,7 +53,7 @@ Human output gives times in US Central.
 
 ### The children ledger
 
-`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Forks of this thread are not children, so `watch --children --action compact` never compacts one. Each child has `task_finished`, so the ledger tells finished delegates from working ones. Add `--live` to leave out children that are archived or done, including done children that show `waiting` because a homebased task still owes them events. A child T3 records no task for, such as one made by an older T3, is left out only when settled or archived. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
+`thread context --children` lists every T3 thread that the calling T3 thread started with `delegate_task`, finished ones included, each with title, link, state, provider, model, and context. Forks of this thread are not children, so `--children` never reaches one. Each child has `task_finished`, so the ledger tells finished delegates from working ones. Add `--live` to leave out children that are archived or done, including done children that show `waiting` because a homebased task still owes them events. A child T3 records no task for, such as one made by an older T3, is left out only when settled or archived. After a compaction, use it instead of memory to find out which delegates exist and what state they are in.
 
 The list can be incomplete. When a reachable Fleet machine does not answer, the result has `children_complete: false` and names each such machine with the reason in `unanswered`. Human output warns on stderr. Run the command again before you rely on the list. Machines that Fleet lists as offline are not asked and not listed.
 
@@ -70,8 +70,8 @@ The daemon's own idle compaction is separate: after about 55 idle minutes, at 17
 ## `thread watch`
 
 ```bash
-homebased --json thread watch <ref>... --context-above 150k [--action compact] [--once]
-homebased --json thread watch --children --context-above 70%
+homebased --json thread watch <ref>... --context-above <limit> [--action compact] [--once]
+homebased --json thread watch <codex-thread-id> --context-above 70%
 homebased --json thread watch <ref>... --stalled-after 20m [--once]
 homebased --json thread watch --children --stalled-after 20m
 ```
@@ -79,7 +79,7 @@ homebased --json thread watch --children --stalled-after 20m
 Each watch has one condition: `--context-above` or `--stalled-after`.
 
 - `--context-above` takes tokens (`150000`, `150k`, `1.2m`) or a percent of the context window (`80%`). A percent needs a known window, so it is refused for Claude threads; a percent watch on a T3 thread that starts running Claude later ends with `THREAD_WATCH_ENDED` reason `no_context_window`; watch again with a token count, keeping `--action compact` if it had it.
-- `--children` also watches the calling thread's live T3 children at the time you run it: those not settled, not archived, and not finished with their delegated task. Children started later need another `thread watch`. If a reachable machine does not answer the children lookup, it fails with `thread_lookup_incomplete` (exit 1, retryable) and saves no watch. Retry it.
+- `--children` also watches the calling thread's live T3 children at the time you run it: those not settled, not archived, and not finished with their delegated task. Children started later need another `thread watch`. Use it for stall watches, not context watches. It has no model filter, so a context watch would also catch Codex delegates. Running it again also adds a watch at its limit next to any limit you raised for one child, since another limit on the same thread is a second watch. Give each context watch the thread ids it is for. If a reachable machine does not answer the children lookup, it fails with `thread_lookup_incomplete` (exit 1, retryable) and saves no watch. Retry it.
 - The watch checks about once a minute. It sends `THREAD_CONTEXT_OVER` once when the context climbs over the limit while the thread is idle or waiting, never while a turn runs. It fires again only after a reading shows the context below the limit and it climbs over again. A missing reading, or one exactly at the limit, changes nothing.
 - A watched T3 thread that is done (settled, or `task_finished`, with no turn running, even while it shows `waiting`) never fires and is never compacted, even over the limit, whether you watch it by T3 id or by the session it runs. Dropping below the limit while done re-arms the watch silently, so once it is unsettled or gets a new task, it fires as before.
 - `--action compact` compacts the T3 thread when it fires and still sends the event, with the outcome in `compaction`. A compaction that started on another thread wakes no caller, since nothing is left to do; only a running `homebased wait` prints it. A caller that watches itself wakes for its own compaction, which is how a root that ended its turn to be compacted resumes, unless something else is due to wake it: a delegated task whose report T3 will still deliver to it, running or finished, or a homebased task or queue job that still owes it events. Then only a running `homebased wait` prints it, and the root picks the work back up when that report arrives. A delegate whose report T3 disposed of, as when the root's run was stopped, or one started to report only once the root settles, does not count. A compaction T3 would not start (`refused`, `unavailable`, `not_found`) wakes the caller as usual. It is refused for threads outside T3. A watch removed while the check runs compacts nothing.
@@ -106,7 +106,7 @@ Events go to the calling thread like task callbacks, in order per watch, except 
 A T3 root that delegates long work:
 
 1. Start children with `delegate_task`.
-2. Watch the children once: `homebased --json thread watch --children --context-above 200k --action compact` compacts a child while it is idle once it passes 200k. A compaction that starts wakes you for nothing; you hear only when T3 would not compact it. After the compaction drops the context, the watch re-arms. Add a notify-only watch (no `--action`) only for a child whose work you would rather hand to a fresh thread than compact. `--children` skips delegates that are already done, so run it again after each batch of `delegate_task` calls; the existing watches are reused (`created: false`).
+2. Watch context one thread at a time. Watch your own thread with `homebased --json thread watch --context-above <limit> --action compact`, with no reference. For each Claude delegate, run `homebased --json thread watch <child-thread-id> --context-above <limit> --action compact` with the child thread id that `delegate_task` returned; it compacts the child while it is idle once it passes the limit. A compaction that starts wakes you for nothing; you hear only when T3 would not compact it. After the compaction drops the context, the watch re-arms. To raise one child's limit, unwatch its old watch, since a new limit adds a second watch. Add a notify-only watch (no `--action`) only for a child whose work you would rather hand to a fresh thread than compact. Do not use `--children` for context watches (see `thread watch` above). The orchestrate skill sets the default limits for the root and each kind of delegate.
 3. After your own compaction, run `homebased --json thread context --children` to rebuild the list of delegates, their links, and their states; `task_finished` marks the ones whose task ended. `--children --live` lists only those still working.
 4. Watch the children for stalls too: `homebased --json thread watch --children --stalled-after 20m` wakes you with `THREAD_STALLED` when a child ends its turn without a report or a registered wait and sits idle for 20 minutes. Read its last turn, then send it a message to carry on or report, or hand its work to a fresh delegate. For threads you started as top-level threads, pass their references instead of `--children`, and unwatch each one when its report arrives.
 5. A done child never fires, and its watches end with `finished` after an hour without activity, without waking you, so there is nothing to unwatch. Unwatching one yourself wakes you for nothing either. Archiving a child ends its watches at once, and settling or archiving the root ends the root's watches with `caller_gone`.
