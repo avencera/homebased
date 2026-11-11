@@ -356,11 +356,18 @@ parent. It is meant
 for a background Bash command with `--next` in a Claude Code session in a T3
 Code thread, which T3 shows as Waiting. A Claude Code `Monitor` is killed
 after at most 30 minutes and wakes the thread each time, while a background
-command wakes it only when it exits. Give that command a 55-minute timeout
-(`3300000`), so each wake-up lands inside the session's hour-long prompt cache;
-a wake-up after the cache expires rewrites the whole context. For work expected
-to take over 4 hours, first run `homebased thread compact`, which compacts the
-thread once the turn ends, then use the 2-hour maximum. A task of another thread or machine and a
+command wakes it only when it exits. Give that command Claude Code's 2-hour
+maximum timeout (`7200000`) and let the wait pick its own limit: in a Claude
+session that a T3 thread owns, the wait exits after 55 minutes with no event,
+so each wake-up lands inside the session's hour-long prompt cache, while a
+wake-up after the cache expires rewrites the whole context. On that exit it
+prints, on stderr, the command that starts the wait again on the ids still
+pending; with `--final-only`, interim events may already be on stdout. For work expected to take over 4 hours, add
+`--long`: it compacts the thread once the turn ends, as `thread compact` does,
+and waits up to 115 minutes. It skips the compaction when the context is under
+60,000 tokens, and keeps the 55-minute limit when the compaction cannot start.
+`--timeout <duration>` sets the limit by hand; other callers have none unless
+they pass it. A task of another thread or machine and a
 job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran

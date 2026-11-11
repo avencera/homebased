@@ -61,7 +61,7 @@ The list can be incomplete. When a reachable Fleet machine does not answer, the 
 
 Asks T3 to compact a T3 thread on whichever machine runs it. The result `outcome` is `started`, `queued`, `not_found`, `refused` (T3 would not compact now), or `unavailable`.
 
-- A thread running a turn answers `queued`: T3 compacts it once that turn ends. That includes the calling thread, so run `homebased thread compact` mid-turn to compact yourself after the turn, for example before a long `homebased wait`. Asking again during the same turn queues no second compaction.
+- A thread running a turn answers `queued`: T3 compacts it once that turn ends. That includes the calling thread, so run `homebased thread compact` mid-turn to compact yourself after the turn, for example before a long wait, which `homebased wait --next --long` does for you. Asking again during the same turn queues no second compaction.
 - Nothing wakes a thread after a queued compaction. To resume right after it with no wait running, watch yourself with `--action compact --once` and end the turn instead.
 
 - Only T3 threads can be compacted. Any other thread fails with `compact_unsupported_host` (exit 5); tell that session to run `/compact` instead.

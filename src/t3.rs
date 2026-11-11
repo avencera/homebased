@@ -378,6 +378,15 @@ pub(crate) fn owning_thread(env: &T3Env, thread: ThreadId) -> Option<String> {
     .find_map(|candidate| find_thread(&userdata, candidate).ok().flatten())
 }
 
+/// Whether T3's state maps a T3 thread to `thread`, without asking the T3
+/// server, so the answer holds while the server is slow or restarting
+pub(crate) fn maps_session(env: &T3Env, thread: ProviderThread) -> bool {
+    find_thread(&env.userdata(), thread)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// Start a `/compact` turn in the T3 thread that owns a Claude session or
 /// Codex thread
 ///

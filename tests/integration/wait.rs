@@ -505,6 +505,52 @@ fn next_waiter_exits_after_the_first_event_and_leaves_the_rest_to_normal_deliver
 }
 
 #[test]
+fn next_waiter_with_no_event_exits_at_its_timeout_and_says_how_to_wait_again() {
+    let h = Harness::new();
+    let task = h.gated("timeout-task");
+
+    let output = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["wait", "--next", "--final-only", "--timeout", "2s", &task])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "`homebased wait --next --final-only --timeout 2s {task}`"
+        )),
+        "{stderr}"
+    );
+
+    // the task still reports once it ends, through normal delivery
+    h.release_gate("timeout-task");
+    assert!(wait_until(Duration::from_secs(20), || {
+        h.normally_delivered(&task).len() == 1
+    }));
+}
+
+#[test]
+fn long_wait_outside_a_t3_claude_session_is_refused() {
+    let h = Harness::new();
+    let task = h.gated("long-task");
+
+    let output = h
+        .cmd()
+        .env("CODEX_THREAD_ID", THREAD)
+        .args(["wait", "--next", "--long", &task])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--long"));
+    h.release_gate("long-task");
+}
+
+#[test]
 fn job_waiter_on_a_delivered_job_exits_without_output() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);

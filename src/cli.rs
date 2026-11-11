@@ -143,6 +143,13 @@ pub enum Command {
     /// with `--next` about a second after the first event it prints. With
     /// `--next --final-only` it prints interim events as they come but exits
     /// only after an event that ends a target, or any watch event.
+    ///
+    /// In a Claude session that a T3 thread owns, a wait with no event that
+    /// ends it exits 0 after 55 minutes, inside the session's hour-long prompt cache,
+    /// and prints on stderr the command that waits again on the ids still
+    /// pending. `--long` compacts the thread once the turn ends and waits up to
+    /// 115 minutes instead, for work expected to take over 4 hours. Give the
+    /// background command a 2-hour timeout (7200000) so the wait ends first.
     Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),

@@ -474,14 +474,36 @@ async fn submit_normalized(
 ///
 /// `id` is the task or job id that follows `homebased wait`
 pub(super) fn print_t3_wait_hint(id: &str, thread: ThreadId) {
-    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .and_then(|value| value.parse().ok());
-    let worker = std::env::var_os("HOMEBASED_TASK_ID").is_some();
+    let (session, worker) = claude_caller_env();
     // stderr keeps `--json` and `--quiet` output parseable
     if let Some(hint) = t3_wait_hint(&T3Env::from_env(), id, thread, session, worker) {
         eprintln!("{hint}");
     }
+}
+
+/// This process's Claude Code session, and whether it runs as a homebased worker
+fn claude_caller_env() -> (Option<ThreadId>, bool) {
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    (session, std::env::var_os("HOMEBASED_TASK_ID").is_some())
+}
+
+/// Whether this process is the Claude session `thread`, which T3's state maps
+/// to a T3 thread, and not a homebased worker, read from its environment
+///
+/// Only such a caller waits with a background `homebased wait`, whose
+/// wake-ups should land inside the session's hour-long prompt cache. It does
+/// not ask the T3 server, since the wake-up costs the same while it is down
+pub(super) fn is_t3_claude_caller(thread: ThreadId) -> bool {
+    let (session, worker) = claude_caller_env();
+    claude_session_caller(thread, session, worker)
+        && crate::t3::maps_session(&T3Env::from_env(), ProviderThread::Claude(thread))
+}
+
+/// Whether the caller is the Claude session `thread` itself, not a homebased worker
+fn claude_session_caller(thread: ThreadId, session: Option<ThreadId>, worker: bool) -> bool {
+    !worker && session == Some(thread)
 }
 
 /// How a Claude session that a T3 thread owns waits on a task or job it submitted
@@ -499,18 +521,17 @@ fn t3_wait_hint(
     session: Option<ThreadId>,
     worker: bool,
 ) -> Option<String> {
-    if worker || session != Some(thread) {
+    if !claude_session_caller(thread, session, worker)
+        || crate::t3::owner(env, ProviderThread::Claude(thread)) != Ok(true)
+    {
         return None;
     }
-    if crate::t3::owner(env, ProviderThread::Claude(thread)) != Ok(true) {
-        return None;
-    }
-    // 55 minutes keeps each wake-up inside the hour-long prompt cache of a T3
-    // Claude session; a wait that outlives it wakes the agent on a cold cache,
-    // which rewrites the whole context. Past about 4 hours of work, compacting
-    // once costs less than re-arming every 55 minutes
+    // the wait picks its own deadline, so the Bash timeout is Claude Code's
+    // maximum and only has to stay out of its way
     Some(format!(
-        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 3300000, pass its task id to t3_background_wait, and end the turn; when it exits or times out, handle its events and start it again until the final event. For work expected to take over 4 hours, first run `homebased --json thread compact`, which compacts this thread once the turn ends, then use timeout 7200000 with a `# long-wait: <expected duration>` comment"
+        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after the next events, or after {cache} minutes with none, inside the hour-long prompt cache; handle its output and run the command it prints to start it again, until the final event. For work expected to take over 4 hours, add `--long`, which compacts this thread once the turn ends and waits up to {long} minutes",
+        cache = super::wait::CACHE_LIMIT.as_secs() / 60,
+        long = super::wait::LONG_LIMIT.as_secs() / 60,
     ))
 }
 
@@ -1155,6 +1176,8 @@ mod tests {
         let hint = t3_wait_hint(&fixture.env, "task-1", session, Some(session), false).unwrap();
         assert!(hint.contains("`homebased wait --next task-1`"), "{hint}");
         assert!(hint.contains("t3_background_wait"));
+        assert!(hint.contains("timeout 7200000"), "{hint}");
+        assert!(hint.contains("after 55 minutes"), "{hint}");
 
         // a worker parks with `waiting`, and another session cannot wait on the task
         assert_eq!(
