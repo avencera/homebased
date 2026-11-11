@@ -356,7 +356,11 @@ parent. It is meant
 for a background Bash command with `--next` in a Claude Code session in a T3
 Code thread, which T3 shows as Waiting. A Claude Code `Monitor` is killed
 after at most 30 minutes and wakes the thread each time, while a background
-command runs for up to 2 hours and wakes it only when it exits. A task of another thread or machine and a
+command wakes it only when it exits. Give that command a 55-minute timeout
+(`3300000`), so each wake-up lands inside the session's hour-long prompt cache;
+a wake-up after the cache expires rewrites the whole context. For work expected
+to take over 4 hours, first run `homebased thread compact`, which compacts the
+thread once the turn ends, then use the 2-hour maximum. A task of another thread or machine and a
 job of another thread return `wait_unavailable`, and so do a task or job
 submitted without a thread, a job the queue refused or has not confirmed, and a
 queue run that ran

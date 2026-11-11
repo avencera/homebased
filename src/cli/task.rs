@@ -505,8 +505,12 @@ fn t3_wait_hint(
     if crate::t3::owner(env, ProviderThread::Claude(thread)) != Ok(true) {
         return None;
     }
+    // 55 minutes keeps each wake-up inside the hour-long prompt cache of a T3
+    // Claude session; a wait that outlives it wakes the agent on a cold cache,
+    // which rewrites the whole context. Past about 4 hours of work, compacting
+    // once costs less than re-arming every 55 minutes
     Some(format!(
-        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn; when it exits, handle its events and start it again until the final event"
+        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 3300000, pass its task id to t3_background_wait, and end the turn; when it exits or times out, handle its events and start it again until the final event. For work expected to take over 4 hours, first run `homebased --json thread compact`, which compacts this thread once the turn ends, then use timeout 7200000 with a `# long-wait: <expected duration>` comment"
     ))
 }
 
