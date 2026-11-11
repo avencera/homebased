@@ -18,10 +18,6 @@ use std::time::Duration;
 
 use chrono::Utc;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-#[cfg(target_os = "linux")]
-use nix::sys::prctl;
-#[cfg(target_os = "linux")]
-use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use regex::Regex;
 use tokio::net::TcpStream;
@@ -41,6 +37,11 @@ use crate::store::Store;
 
 /// How often the worker checks readiness and its deadlines
 const TICK: Duration = Duration::from_millis(250);
+
+// with no readiness check, a service is up once it has run this long, so one
+// that dies at once, such as on a bad flag, fails `start` instead of passing it
+// and waking the owner with SERVICE_EXITED a moment later
+const SPAWN_SETTLE: Duration = Duration::from_secs(1);
 
 /// Ticks between reads of a stop request, which SIGTERM normally brings at once
 const STOP_POLL_TICKS: u32 = 4;
@@ -189,7 +190,7 @@ async fn supervise(
         return ending(ServiceEnd::NotReady, exit, Some("exited at once".into()));
     };
     let identity = cleanup::process_identity(Pid::from_raw(pgid)).ok();
-    let mut ready = service.readiness == Readiness::Spawned;
+    let mut ready = false;
     if let Err(err) = store.set_service_started(service.id, identity, ready, Utc::now()) {
         warn!(id = %service.id, "record service start: {err}");
     }
@@ -197,7 +198,7 @@ async fn supervise(
     let started = Instant::now();
     let ready_deadline = started + service.ready_timeout;
     let max_deadline = started + service.max;
-    let mut probe = Probe::new(&service.readiness, &paths.output);
+    let mut probe = Probe::new(&service.readiness, &paths.output, started);
     let mut tick = time::interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut ticks: u32 = 0;
@@ -279,19 +280,15 @@ fn spawn_child(service: &Service, output: &Path) -> io::Result<tokio::process::C
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
-        .kill_on_drop(true)
+        // not tied to the worker's life: when the worker dies, the daemon kills
+        // the whole group by the leader's recorded identity, which a leader
+        // killed along with the worker would no longer match, orphaning its
+        // children with the port they hold
         .process_group(0);
     // Python block-buffers stdout into a file, which would hold a ready line
     // back until the buffer fills; an explicit setting from the caller wins
     if std::env::var_os("PYTHONUNBUFFERED").is_none() {
         cmd.env("PYTHONUNBUFFERED", "1");
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            prctl::set_pdeathsig(Some(Signal::SIGKILL)).map_err(io::Error::from)?;
-            Ok(())
-        });
     }
     cmd.spawn()
 }
@@ -320,15 +317,16 @@ pub(crate) async fn port_open(port: u16) -> bool {
 
 /// Readiness check of one service
 enum Probe {
-    Spawned,
+    /// Spawned at this instant
+    Spawned(Instant),
     Port(u16),
     Line(LineScan),
 }
 
 impl Probe {
-    fn new(readiness: &Readiness, output: &Path) -> Self {
+    fn new(readiness: &Readiness, output: &Path, started: Instant) -> Self {
         match readiness {
-            Readiness::Spawned => Self::Spawned,
+            Readiness::Spawned => Self::Spawned(started),
             Readiness::Port { port } => Self::Port(*port),
             // validated at start; an invalid pattern never matches
             Readiness::Line { pattern } => Self::Line(LineScan {
@@ -342,7 +340,7 @@ impl Probe {
 
     async fn ready(&mut self) -> bool {
         match self {
-            Self::Spawned => true,
+            Self::Spawned(started) => started.elapsed() >= SPAWN_SETTLE,
             Self::Port(port) => port_open(*port).await,
             Self::Line(scan) => scan.matched().unwrap_or_else(|err| {
                 warn!("read service output: {err}");

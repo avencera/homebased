@@ -145,7 +145,11 @@ impl Store {
                 },
                 None => ending,
             };
-            let due = ending.end.sends_event() && !record.service.owner.is_detached();
+            // a service that never became ready failed `start`, which already
+            // told the caller, so its end wakes nobody
+            let due = ending.end.sends_event()
+                && record.ready_at.is_some()
+                && !record.service.owner.is_detached();
             self.conn.execute(
                 "UPDATE services SET ended_at = ?2, ending_json = ?3, event_due = ?4
                  WHERE id = ?1",

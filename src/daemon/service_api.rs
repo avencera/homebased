@@ -191,6 +191,8 @@ struct LogQuery {
     tail: Option<usize>,
 }
 
+const DEFAULT_LOG_TAIL: usize = 200;
+
 async fn log(
     State(state): State<AppState>,
     Path(id): Path<ServiceId>,
@@ -198,7 +200,10 @@ async fn log(
 ) -> Result<Json<Value>, AppError> {
     require(&state, id).await?;
     let paths = state.home.service_paths(id);
-    let output = tokio::task::spawn_blocking(move || paths.read_output(query.tail))
+    // a service can log for hours, so a request without a tail still gets a
+    // bounded answer rather than the whole file in daemon memory
+    let tail = query.tail.unwrap_or(DEFAULT_LOG_TAIL);
+    let output = tokio::task::spawn_blocking(move || paths.read_output(Some(tail)))
         .await
         .map_err(|error| AppError::Internal {
             message: format!("read service log join: {error}"),

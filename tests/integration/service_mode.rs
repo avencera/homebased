@@ -285,10 +285,30 @@ fn a_service_that_is_not_ready_in_time_or_exits_first_is_stopped_and_start_fails
     let crashed = input["service"].as_str().unwrap();
     assert_eq!(h.service_view(crashed)["exit"]["code"], 3);
 
+    // with no readiness check, a command that dies at once, such as on a bad
+    // flag, fails `start` rather than passing it and sending an event after
+    let out = h
+        .service_cmd(Some(THREAD))
+        .args([
+            "start",
+            "--name",
+            "bad-flag",
+            "--",
+            "sh",
+            "-c",
+            "echo unknown flag; exit 2",
+        ])
+        .output()
+        .unwrap();
+    let error = refused(&out, "service_not_ready");
+    let bad_flag = error["error"]["input"]["service"].as_str().unwrap();
+    assert_eq!(h.service_view(bad_flag)["exit"]["code"], 2);
+
     // a failed start is reported to `start` itself, never as an event
     std::thread::sleep(Duration::from_secs(2));
     assert!(h.service_events(id).is_empty());
     assert!(h.service_events(crashed).is_empty());
+    assert!(h.service_events(bad_flag).is_empty());
 }
 
 #[test]
@@ -302,7 +322,7 @@ fn a_service_that_exits_on_its_own_sends_its_owner_one_event() {
             "--",
             "sh",
             "-c",
-            "echo serving; sleep 1; echo out of memory; exit 7",
+            "echo serving; sleep 3; echo out of memory; exit 7",
         ],
     );
     assert!(

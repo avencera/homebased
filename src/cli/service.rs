@@ -47,7 +47,7 @@ pub enum ServiceCommand {
     /// current directory (or `--cwd`) with this shell's whole environment. With
     /// `--port`, it is ready once 127.0.0.1 or ::1 accepts a connection on that
     /// port; with `--ready-line`, once a line of its output matches; with
-    /// neither, as soon as it spawns. If it exits or is not ready within
+    /// neither, once it has run for a second. If it exits or is not ready within
     /// `--ready-timeout`, it is stopped, its last output lines go to stderr, and
     /// this command fails.
     ///
@@ -94,9 +94,10 @@ pub enum ServiceCommand {
     Log {
         /// Service id
         id: ServiceId,
-        /// Last N lines
-        #[arg(long)]
-        tail: Option<usize>,
+        /// Last N lines. A service can run for hours, so the whole log is
+        /// never sent at once
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
     },
     /// Stop a service and its process group, and wait until it has ended.
     /// Idempotent: an ended service is left as it is
@@ -190,7 +191,9 @@ async fn start(ctx: &Ctx, options: StartOptions) -> Result<ExitCode, AppError> {
         }
         tokio::time::sleep(POLL).await;
     };
-    if view.state != ServiceState::Ready {
+    // a service that was ready and died before this poll started fine; its
+    // SERVICE_EXITED tells the owner it died
+    if view.ready_at.is_none() {
         return Err(not_ready(ctx, &client, &view).await);
     }
 
@@ -287,11 +290,8 @@ async fn list(ctx: &Ctx, ended: bool, all_threads: bool) -> Result<ExitCode, App
     Ok(ExitCode::SUCCESS)
 }
 
-async fn log(ctx: &Ctx, id: ServiceId, tail: Option<usize>) -> Result<ExitCode, AppError> {
-    let path = match tail {
-        Some(tail) => format!("/v1/services/{id}/log?tail={tail}"),
-        None => format!("/v1/services/{id}/log"),
-    };
+async fn log(ctx: &Ctx, id: ServiceId, tail: usize) -> Result<ExitCode, AppError> {
+    let path = format!("/v1/services/{id}/log?tail={tail}");
     let value = Client::new(ctx.home.sock_path()).get(&path).await?;
     if ctx.output == OutputMode::Json {
         ctx.print_json(value)?;

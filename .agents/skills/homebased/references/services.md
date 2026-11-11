@@ -16,7 +16,7 @@ homebased service start --name watcher --max 2h -- sh -c 'cargo watch -x check'
 - `start` returns once the service is ready and prints its id: bare with `--quiet`, the whole service with `--json`, and a one-line summary otherwise.
   - `--port <n>`: ready once `127.0.0.1:<n>` or `[::1]:<n>` accepts a TCP connection. A port that already accepts connections before the service starts fails at once, since another process holds it.
   - `--ready-line <regex>`: ready once a line of its combined stdout and stderr matches. Color codes are stripped first, and a line still being written counts.
-  - Neither: ready as soon as it spawns.
+  - Neither: ready once it has run for a second, so a command that dies at once fails `start`.
 - `--ready-timeout` (default `2m`) bounds the wait. If the service exits, fails to spawn, or is not ready in time, it is stopped with its process group, its last 20 output lines go to stderr, and `start` exits non-zero with `service_not_ready`. No `SERVICE_EXITED` follows.
 - `--max` (default `12h`) is the longest it may run. It is then stopped, and no event is sent. Pick the shortest lifetime the work needs.
 - A service has no output-inactivity check and sends no check-due reminders: it may stay silent for hours.
