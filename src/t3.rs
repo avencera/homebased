@@ -382,13 +382,73 @@ pub(crate) fn owning_thread(env: &T3Env, thread: ThreadId) -> Option<String> {
 /// Codex thread
 ///
 /// `key` names the idle period being compacted, so T3 drops a repeated
-/// request for it. T3 refuses it while a turn runs. T3 compacts a Codex thread
-/// through Codex's own `thread/compact/start`
+/// request for it. T3 refuses it while a turn runs, which suits the automatic
+/// triggers: a compaction pays off only before the idle period's prompt cache
+/// lapses. T3 compacts a Codex thread through Codex's own `thread/compact/start`
 pub(crate) fn compact_thread(env: &T3Env, thread: ProviderThread, key: &str) -> WakeOutcome {
     with_owner(env, thread, |owner| {
-        v2::compact(owner.origin, owner.thread, key, owner.token, None)
+        v2::compact(
+            owner.origin,
+            owner.thread,
+            key,
+            owner.token,
+            TurnStart::Auto,
+        )
     })
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
+/// What T3 did with a compaction requested by [`request_compaction`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactRequest {
+    /// Whether T3 took the request
+    pub(crate) outcome: WakeOutcome,
+    /// The T3 run the compaction waits behind, when T3 took it while that run
+    /// held the thread
+    pub(crate) behind_run: Option<String>,
+}
+
+/// Compact the T3 thread that owns a Claude session or Codex thread as soon as
+/// it is idle: now when no run is active, else queued behind the active run
+///
+/// This is for a compaction someone asked for, including a thread asking to
+/// compact itself mid-turn, which T3 would otherwise refuse. `idle_key` names
+/// the idle period, as for [`compact_thread`]; a queued request is keyed by the
+/// run it waits behind instead, so asking again during one turn queues one
+/// compaction. The run is read before the dispatch, so one that ends or starts
+/// in between only mislabels the answer: T3 still starts the compaction at
+/// once or queues it
+pub(crate) fn request_compaction(
+    env: &T3Env,
+    thread: ProviderThread,
+    idle_key: &str,
+) -> CompactRequest {
+    let mut behind_run = None;
+    let outcome = with_owner(env, thread, |owner| {
+        behind_run = v2::active_run(owner.state, owner.thread).unwrap_or_else(|detail| {
+            tracing::debug!(%detail, "active T3 run cannot be read");
+            None
+        });
+        let key = behind_run
+            .as_ref()
+            .map_or_else(|| idle_key.to_string(), |run| format!("after run {run}"));
+        v2::compact(
+            owner.origin,
+            owner.thread,
+            &key,
+            owner.token,
+            TurnStart::AfterActive,
+        )
+    })
+    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()));
+
+    if !matches!(outcome, WakeOutcome::Woken { .. }) {
+        behind_run = None;
+    }
+    CompactRequest {
+        outcome,
+        behind_run,
+    }
 }
 
 /// End the placeholder runs that `--hold` left in T3, and return how many ended

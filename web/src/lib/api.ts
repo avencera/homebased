@@ -781,7 +781,7 @@ export type ContextThreads = typeof ContextThreadsSchema.Type;
 
 const CompactResultSchema = Schema.Struct({
 	api_version: ApiVersionSchema,
-	outcome: Schema.Literal('started', 'not_found', 'refused', 'unavailable'),
+	outcome: Schema.Literal('started', 'queued', 'not_found', 'refused', 'unavailable'),
 	detail: Schema.optional(Schema.String)
 });
 export type CompactResult = typeof CompactResultSchema.Type;
@@ -1025,7 +1025,8 @@ export function fetchUsage(since: Date, thread?: string): Promise<UsageReport> {
 
 /**
  * `POST /v1/threads/{session}/compact` for a Claude session or Codex thread. A repeat in the same
- * idle period reuses T3's command id, so a double click compacts once.
+ * idle period or turn reuses T3's command id, so a double click compacts once. A thread running a
+ * turn answers `queued`: T3 compacts it once that turn ends.
  */
 export function compactThread(session: string): Promise<CompactResult> {
 	return postJson(`/threads/${encodeURIComponent(session)}/compact`, {}, CompactResultSchema);

@@ -104,7 +104,7 @@ pub(crate) fn scan(index: &LocalIndex, mut attempts: Attempts, log: &Path) -> At
 
         attempts.insert(thread, usage);
         let outcome = compact_thread(index.env(), session, &usage.compaction_key());
-        compaction_log::record(log, Trigger::Idle, session, &usage, &outcome, now);
+        compaction_log::record(log, Trigger::Idle, session, &usage, &outcome, None, now);
         match outcome {
             WakeOutcome::Woken { t3_thread } => info!(
                 %thread,

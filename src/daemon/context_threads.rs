@@ -5,7 +5,8 @@
 //! the T3 thread is neither archived nor deleted, and the session transcript
 //! or Codex rollout shows at least [`MIN_IDLE_CONTEXT_TOKENS`] context tokens,
 //! or the request asked for every thread, for its session, or for its id.
-//! Compaction goes through T3, which holds messages that arrive during it
+//! Compaction goes through T3, which holds messages that arrive during it,
+//! and queues a manual compaction behind a running turn
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -19,7 +20,8 @@ use crate::callback::stale_context::{CodexRollouts, ContextUse, MIN_IDLE_CONTEXT
 use crate::domain::{API_VERSION, ThreadId};
 use crate::error::AppError;
 use crate::t3::{
-    OpenThread, ProviderThread, T3Env, ThreadDetails, WakeOutcome, compact_thread, open_threads,
+    CompactRequest, OpenThread, ProviderThread, T3Env, ThreadDetails, WakeOutcome, compact_thread,
+    open_threads, request_compaction,
 };
 use crate::thread_ref::Provider;
 use crate::thread_watch::CompactOutcome;
@@ -219,8 +221,13 @@ fn context_threads(
     Ok(threads)
 }
 
-/// Ask T3 to compact `session`, once per idle period, recording the request
-/// in the compaction log at `log` under `trigger`
+/// Ask T3 to compact `session`, once per idle period or turn, recording the
+/// request in the compaction log at `log` under `trigger`
+///
+/// A manual request waits behind a running turn, so a thread can ask to
+/// compact itself mid-turn. A watch compacts only now: it fired on an idle
+/// reading, and a turn that started since then is new work, not the idle
+/// period it fired for
 pub(super) fn compact_session(
     env: &T3Env,
     session: ThreadId,
@@ -234,10 +241,30 @@ pub(super) fn compact_session(
         );
     };
 
-    // a repeated click in the same idle period reuses the command id, which T3 drops
-    let outcome = compact_thread(env, thread, &usage.compaction_key());
-    compaction_log::record(log, trigger, thread, &usage, &outcome, Utc::now());
-    match outcome {
+    // a repeated click in the same idle period or turn reuses the command id, which T3 drops
+    let key = usage.compaction_key();
+    let request = match trigger {
+        Trigger::Manual => request_compaction(env, thread, &key),
+        Trigger::Idle | Trigger::Watch | Trigger::Callback => CompactRequest {
+            outcome: compact_thread(env, thread, &key),
+            behind_run: None,
+        },
+    };
+    let behind_run = request.behind_run.as_deref();
+    compaction_log::record(
+        log,
+        trigger,
+        thread,
+        &usage,
+        &request.outcome,
+        behind_run,
+        Utc::now(),
+    );
+    match request.outcome {
+        WakeOutcome::Woken { .. } if behind_run.is_some() => (
+            CompactOutcome::Queued,
+            Some("T3 compacts the thread once its running turn ends".into()),
+        ),
         WakeOutcome::Woken { .. } => (CompactOutcome::Started, None),
         WakeOutcome::NotT3Thread => (
             CompactOutcome::NotFound,
@@ -271,10 +298,14 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{Listing, Provider, context_threads};
+    use super::{Listing, Provider, compact_session, context_threads};
     use crate::callback::stale_context::codex_rollout::{rollout, token_count};
+    use crate::daemon::compaction_log::Trigger;
     use crate::t3::T3Env;
-    use crate::t3::test_support::V2State;
+    use crate::t3::test_support::{
+        FakeT3Server, Fixture, SESSION_ID, T3_THREAD_ID, V2State, dispatched, live_pid, ticket,
+    };
+    use crate::thread_watch::CompactOutcome;
 
     /// Claude transcript whose last request carried `tokens` `minutes_ago`
     fn transcript(home: &Path, session: &str, minutes_ago: i64, tokens: u64) {
@@ -411,5 +442,85 @@ mod tests {
         // an ambiguous prefix lists every match, for the caller to narrow
         assert_eq!(lookup("mcp:launch:8bd").len(), 2);
         assert!(lookup("nothing").is_empty());
+    }
+
+    #[test]
+    fn a_manual_compaction_queues_behind_a_running_turn_once_per_turn() {
+        let server = FakeT3Server::start(
+            Some(2),
+            (0..4).flat_map(|_| [ticket(), dispatched()]).collect(),
+        );
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Busy thread", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID)
+            .run(T3_THREAD_ID, 1, "running", "long build");
+        transcript(fixture.dir.path(), SESSION_ID, 2, 180_000);
+        let log = fixture.dir.path().join("compactions.jsonl");
+        let session = SESSION_ID.parse().unwrap();
+        let compact = |trigger| compact_session(&fixture.env, session, &log, trigger).0;
+
+        // a thread asking to compact itself mid-turn, twice
+        assert_eq!(compact(Trigger::Manual), CompactOutcome::Queued);
+        assert_eq!(compact(Trigger::Manual), CompactOutcome::Queued);
+        // a watch fired on an idle reading, so it does not wait for the turn
+        assert_eq!(compact(Trigger::Watch), CompactOutcome::Started);
+        rusqlite::Connection::open(fixture.userdata().join("statev2.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE orchestration_v2_projection_runs SET status = 'completed'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(compact(Trigger::Manual), CompactOutcome::Started);
+
+        let payloads: Vec<serde_json::Value> = server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "WS")
+            .map(|request| {
+                serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
+            })
+            .collect();
+        assert_eq!(payloads.len(), 4, "{payloads:?}");
+        assert!(payloads.iter().all(|payload| payload["text"] == "/compact"));
+        let queued = json!({ "type": "queue_after_active" });
+        // without `deliveryIntent`, T3 queues instead of refusing a steer
+        for manual in [&payloads[0], &payloads[1], &payloads[3]] {
+            assert_eq!(manual["dispatchMode"], queued);
+            assert!(manual.get("deliveryIntent").is_none(), "{manual}");
+        }
+        assert_eq!(payloads[2]["deliveryIntent"], "auto");
+        // one turn queues one compaction, which T3 replays for the same command id
+        assert_eq!(payloads[0]["commandId"], payloads[1]["commandId"]);
+        assert_ne!(payloads[1]["commandId"], payloads[3]["commandId"]);
+
+        let logged: Vec<serde_json::Value> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let outcomes: Vec<(&str, &str)> = logged
+            .iter()
+            .map(|line| {
+                (
+                    line["trigger"].as_str().unwrap(),
+                    line["outcome"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("manual", "queued"),
+                ("manual", "queued"),
+                ("watch", "started"),
+                ("manual", "started"),
+            ]
+        );
+        let run = format!("run-{T3_THREAD_ID}-1");
+        assert_eq!(logged[0]["behind_run"], run.as_str());
+        assert!(logged[3].get("behind_run").is_none());
     }
 }

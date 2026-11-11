@@ -704,6 +704,9 @@ pub struct CompactRequest {
 pub enum CompactOutcome {
     /// T3 started the compaction
     Started,
+    /// T3 queued the compaction behind the thread's running turn and starts
+    /// it once that turn ends; only a manual request queues
+    Queued,
     /// No open T3 thread owns the session
     NotFound,
     /// T3 would not compact now, for example while a turn runs
@@ -718,6 +721,7 @@ impl CompactOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::Queued => "queued",
             Self::NotFound => "not_found",
             Self::Refused => "refused",
             Self::Unavailable => "unavailable",

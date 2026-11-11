@@ -25,7 +25,8 @@ use crate::t3::{ProviderThread, WakeOutcome};
 pub enum Trigger {
     /// The daemon's scan of idle threads that wait on a task
     Idle,
-    /// The dashboard's Compact button, or `homebased thread compact`
+    /// The dashboard's Compact button, or `homebased thread compact`; it
+    /// waits behind a running turn instead of being refused
     Manual,
     /// A `homebased thread watch --action compact` that fired
     Watch,
@@ -53,7 +54,7 @@ pub fn record_default(
     now: DateTime<Utc>,
 ) {
     if let Some(path) = DEFAULT_PATH.get() {
-        record(path, trigger, session, usage, outcome, now);
+        record(path, trigger, session, usage, outcome, None, now);
     }
 }
 
@@ -72,20 +73,28 @@ struct Record<'a> {
     cache_warm: bool,
     outcome: &'static str,
     detail: Option<&'a str>,
+    /// T3 run a queued compaction waits behind
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind_run: Option<&'a str>,
 }
 
 /// Append one request and T3's answer to the log at `path`
 ///
-/// The log is for analysis, so a write failure is only reported
+/// `behind_run` is the T3 run that a queued compaction waits behind. The log
+/// is for analysis, so a write failure is only reported
 pub fn record(
     path: &Path,
     trigger: Trigger,
     session: ProviderThread,
     usage: &ContextUse,
     outcome: &WakeOutcome,
+    behind_run: Option<&str>,
     now: DateTime<Utc>,
 ) {
     let (label, t3_thread, detail) = match outcome {
+        WakeOutcome::Woken { t3_thread } if behind_run.is_some() => {
+            ("queued", Some(t3_thread.as_str()), None)
+        }
         WakeOutcome::Woken { t3_thread } => ("started", Some(t3_thread.as_str()), None),
         WakeOutcome::NotT3Thread => ("not_t3_thread", None, None),
         WakeOutcome::Unavailable(detail) => ("unavailable", None, Some(detail.as_str())),
@@ -105,6 +114,7 @@ pub fn record(
         cache_warm: usage.cache_warm(now),
         outcome: label,
         detail,
+        behind_run,
     };
 
     let written = serde_json::to_string(&line)

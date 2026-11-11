@@ -513,7 +513,9 @@
 					</span>
 				{/if}
 				<span class="font-mono" title={thread.session}>{shortId(thread.session)}</span>
-				{#if result && result.outcome !== 'started'}
+				{#if result?.outcome === 'queued'}
+					<span class="text-muted-foreground" title={result.detail}>compacts after this turn</span>
+				{:else if result && result.outcome !== 'started'}
 					<span class="text-red-700 dark:text-red-300">{resultText(result)}</span>
 				{/if}
 			</span>

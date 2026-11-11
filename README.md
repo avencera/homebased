@@ -438,7 +438,12 @@ fails with the retryable `thread_lookup_incomplete` and saves no watch.
 Machines that Fleet lists as offline are not asked.
 
 `thread compact` sends `/compact` to a T3 thread on whichever machine runs it,
-and records it in `compactions.jsonl` with trigger `manual`. A thread outside
+and records it in `compactions.jsonl` with trigger `manual`. A thread that is
+running a turn, including the calling thread, answers `queued`: T3 compacts it
+once that turn ends, and asking again during the same turn queues no second
+compaction. Nothing wakes the thread after a queued compaction, so a thread
+that should resume on its own afterwards keeps a `homebased wait` running or
+watches itself with `--action compact --once` instead. A thread outside
 T3 fails with `compact_unsupported_host` (exit 5), and a T3 thread with no
 session to compact yet with `thread_not_found` (exit 3).
 

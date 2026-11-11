@@ -35,6 +35,10 @@
 //!   compaction turn (`RunExecutionService.ts`). T3 rejects a message that
 //!   would steer into it, so the message after it uses `queue_after_active`
 //!   without `deliveryIntent`, like the web client's "compact first" send
+//! - A `/compact` with `deliveryIntent: "auto"` resolves to a steer while a
+//!   run is active, which T3 refuses (`Orchestrator.ts`), while one with
+//!   `queue_after_active` and no intent waits behind that run and starts as a
+//!   compaction turn once it ends; checked against T3 Code `v0.1.9`
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -143,6 +147,11 @@ const ARCHIVED_SQL: &str =
     "SELECT archived_at IS NOT NULL FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
 const PUT_AWAY_SQL: &str = "SELECT archived_at IS NOT NULL OR deleted_at IS NOT NULL
      FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
+// the statuses of T3's `isActiveRun`, the run a queued message waits behind
+const ACTIVE_RUN_SQL: &str = "
+    SELECT run_id FROM orchestration_v2_projection_runs
+    WHERE thread_id = ?1 AND status IN ('preparing', 'starting', 'running', 'waiting')
+    ORDER BY ordinal DESC LIMIT 1";
 const REQUIRED_STATE_SQL: &str = "
     SELECT p.thread_id, p.provider, p.driver, p.payload_json, p.updated_at,
            t.thread_id, t.title, t.archived_at, t.deleted_at
@@ -441,6 +450,14 @@ pub(super) fn active_thread(path: &Path, t3_thread: &str) -> Result<Option<Activ
         .map_err(|_| "statev2.sqlite active provider thread lookup failed".to_string())
 }
 
+/// Run of T3 thread `t3_thread` that holds its provider turn, if any
+pub(super) fn active_run(path: &Path, t3_thread: &str) -> Result<Option<String>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    db.query_row(ACTIVE_RUN_SQL, [t3_thread], |row| row.get(0))
+        .optional()
+        .map_err(|_| "statev2.sqlite active run lookup failed".to_string())
+}
+
 /// Active provider thread of every thread that is not deleted, as in [`active_thread`]
 pub(super) fn active_threads(path: &Path) -> Result<Vec<ActiveThread>, String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
@@ -580,28 +597,23 @@ pub(super) fn start_turn(
     dispatch(origin, token, &payload, before_send)
 }
 
-/// Start a `/compact` turn, keyed by `key`
+/// Send a `/compact` turn, keyed by `key`
 ///
-/// The ids derive from `key`, so a retry for the same message or idle period
-/// does not compact twice, while a later one can compact again. T3 refuses it
-/// while a run is active
+/// The ids derive from `key`, so a retry for the same message, idle period, or
+/// run does not compact twice, while a later one can compact again. With
+/// [`TurnStart::Auto`] T3 refuses it while a run is active; with
+/// [`TurnStart::AfterActive`] it waits behind that run
 pub(super) fn compact(
     origin: &str,
     thread_id: &str,
     key: &str,
     token: &str,
-    before_send: Option<&crate::callback::send_check::SendCheck>,
+    start: TurnStart,
 ) -> Result<(), ApiFailure> {
     let command_id = deterministic_id("homebased-t3-compact-command", thread_id, key);
     let message_id = deterministic_id("homebased-t3-compact-message", thread_id, key);
-    let payload = dispatch_payload(
-        thread_id,
-        &command_id,
-        &message_id,
-        COMPACT_COMMAND,
-        TurnStart::Auto,
-    );
-    dispatch(origin, token, &payload, before_send)
+    let payload = dispatch_payload(thread_id, &command_id, &message_id, COMPACT_COMMAND, start);
+    dispatch(origin, token, &payload, None)
 }
 
 pub(super) fn dispatch(

@@ -143,6 +143,8 @@ pub enum ThreadCommand {
     },
     /// Ask T3 to compact a T3 thread on whichever machine runs it
     ///
+    /// A thread running a turn, the calling thread included, answers `queued`:
+    /// T3 compacts it once that turn ends, and nothing wakes it afterwards.
     /// The reference must name exactly one thread; prefixes are not accepted.
     /// Threads outside T3 cannot be compacted by homebased.
     #[command(after_help = REFERENCE_HELP)]

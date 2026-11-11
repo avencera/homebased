@@ -694,7 +694,7 @@ fn next_action(
                 format!("Compaction started; nothing to do, and {after}")
             }
             Some((outcome, detail)) => format!(
-                "Compaction did not start ({}{}). Run `homebased thread compact {exact}` once the thread is idle, or hand its work to a fresh thread; {after}",
+                "Compaction did not start ({}{}). Run `homebased thread compact {exact}`, which waits for a running turn, or hand its work to a fresh thread; {after}",
                 outcome.as_str(),
                 detail
                     .as_deref()
