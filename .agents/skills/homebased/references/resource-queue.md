@@ -179,6 +179,15 @@ Final callbacks (`JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`) carry `gpu_summ
 
 Each field has its own `covered_secs`, `coverage_pct`, and `source` (`netdata` or `nvidia-smi`). Treat a field with low coverage as a partial reading. The summary's `source` is `mixed` when its fields came from both. `status: "unavailable"` comes with a `reason`, such as a machine with GPU sampling off. The numbers are device-level: other work on the same GPU is included.
 
+## Run GPU work on a Mac
+
+On Apple silicon the GPU shares the machine's memory. One large Metal job, such as MLX or PyTorch MPS, can push the Mac into swap and stall everything else on it. A Mac has a single unindexed `gpu0` lane, and homebased only serializes jobs on it: it does not limit, reserve, or watch memory. The lease guard, idle alerts, and GPU summaries need an NVIDIA GPU UUID, so none of them run on a Mac, and the 20-minute idle-cancel rule above does not apply there. Until homebased handles memory itself, follow these rules on any macOS queue machine:
+
+- Submit every Metal or MPS run as a job on the Mac's queue (`--machine <mac>`), never as a task or a direct command, so two large runs never overlap.
+- Cap the job's memory inside the job, leaving at least 16 GB for the rest of the machine. In MLX, call `mx.set_memory_limit(<bytes>)` before the first allocation. For PyTorch MPS, prefix the step's argv with `env PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.6` (or lower), since the spec has no `env` field. A run that passes the cap then fails with an out-of-memory error instead of making the Mac swap; lower the batch size and resubmit.
+- Chain memory-heavy CPU work, such as data packing, large evaluations, or model conversion, with `--after` so it runs before or after the GPU job instead of beside it. When it cannot be ordered that way, submit it as a job on `gpu0` too. This exception to [GPU jobs contain only GPU work](#gpu-jobs-contain-only-gpu-work) holds only on a Mac, because there memory, not GPU time, is the contended resource and no idle check runs.
+- To start only once memory is free, make the first step a gate: `["sh", "-c", "while [ \"$(sysctl -n kern.memorystatus_vm_pressure_level)\" != 1 ]; do sleep 30; done"]`. Level 1 is normal, 2 is warn, and 4 is critical. The gate holds the lane while it waits.
+
 ## Command reference
 
 Use `homebased --json` before each command and parse the result. All results carry `api_version: 1`. Global flags are `--home <path>`, `--config <path>`, `--json`, `--quiet`, and `--help`. `--quiet` prints IDs and conflicts with `--json`. Full UUIDs are required.
