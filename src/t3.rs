@@ -364,6 +364,20 @@ fn resumed(active: &v2::ActiveThread) -> Option<ProviderThread> {
     ProviderThread::from_driver(&active.driver, native.parse().ok()?)
 }
 
+/// T3 thread that owns `thread`, a Claude session or Codex thread whose
+/// provider is unknown, as its current session or an earlier one
+///
+/// `None` when no T3 thread owns it or T3's state cannot be read
+pub(crate) fn owning_thread(env: &T3Env, thread: ThreadId) -> Option<String> {
+    let userdata = env.userdata();
+    [
+        ProviderThread::Claude(thread),
+        ProviderThread::Codex(thread),
+    ]
+    .into_iter()
+    .find_map(|candidate| find_thread(&userdata, candidate).ok().flatten())
+}
+
 /// Start a `/compact` turn in the T3 thread that owns a Claude session or
 /// Codex thread
 ///

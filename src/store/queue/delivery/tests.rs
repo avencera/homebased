@@ -215,12 +215,7 @@ fn a_job_thread_waits_until_an_ending_reaches_it() {
         )
         .unwrap();
 
-    let waiting: Vec<_> = store
-        .waiting_threads()
-        .unwrap()
-        .into_iter()
-        .map(|(thread, _)| thread)
-        .collect();
+    let waiting = store.waiting_threads().unwrap();
     assert_eq!(
         waiting,
         [queued.thread, ending_unsent.thread, notified.thread]

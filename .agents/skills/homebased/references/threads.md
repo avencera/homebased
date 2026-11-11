@@ -65,7 +65,7 @@ Asks T3 to compact a T3 thread on whichever machine runs it. The result `outcome
 - A T3 thread with no session yet fails with `thread_not_found` (exit 3).
 - A peer that predates the command fails with a usage error; run `homebased update` there.
 
-The daemon's own idle compaction of waiting threads (after about 55 minutes idle, above 200K tokens) is separate and unchanged.
+The daemon's own idle compaction is separate: after about 55 idle minutes, at 175K tokens or more, it compacts any T3 thread that is not archived, runs no turn, and will likely run again. That is one a homebased task or a delegated task's report will wake, or one that is neither settled nor a finished delegate, such as an idle root or a thread waiting on the user.
 
 ## `thread watch`
 

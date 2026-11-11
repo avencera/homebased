@@ -229,7 +229,7 @@ Claude Code caches a conversation for an hour. After that, the next turn
 re-reads the whole context at full price, and every request in that turn
 carries it. Interactive Claude Code compacts a long idle session before the
 cache lapses, but T3 runs Claude through the Agent SDK, which does not. So
-homebased compacts Claude sessions that T3 threads own while they wait.
+homebased compacts idle Claude sessions that T3 threads own.
 
 Codex threads that T3 owns get the same treatment. OpenAI publishes no fixed
 cache lifetime, but on one machine's Codex rollouts the first request after an
@@ -240,16 +240,23 @@ about the read its next turn would pay anyway, plus the summary, and every
 later request then reads the summary. T3 compacts a Codex thread through
 Codex's own compaction.
 
-While a thread waits on a task or queue job, the daemon checks it every minute.
-Once the session has been idle for 55 minutes with at least 200,000 context
-tokens, homebased sends `/compact` to the thread. The cache is still warm, so
-the compaction costs a fraction of a cold read. Any activity in the thread moves
-the 55 minutes, and each idle period gets one attempt. A queue job counts until
-its ending event reaches the thread, or for at most seven days, in case its
-queue machine never reports one.
+The daemon checks this machine's T3 threads every minute. Once a thread's
+session has been idle for 55 minutes with at least 175,000 context tokens,
+homebased sends `/compact` to the thread. The cache is still warm, so the
+compaction costs a fraction of a cold read. A thread qualifies when it is not
+archived, runs no turn, and will likely run again: a homebased task or queue
+job, or a delegated task T3 will report, still owes it a wake, or it is
+unsettled and not a delegate whose task ended. That covers
+a root waiting on its delegated tasks, a thread waiting on you, and an idle
+interactive thread alike. A settled thread or a finished delegate rarely runs
+again, so compacting it would cost more than it saves. Any activity in the
+thread moves the 55 minutes, and each idle period gets one attempt. A queue job
+counts until its ending event reaches the thread, or for at most seven days, in
+case its queue machine never reports one. A terminal session has no T3 thread
+to compact, so it is left alone.
 
 An event or message for a session whose cache already lapsed, with at least
-200,000 context tokens, sends `/compact` first and then the event. The event's
+175,000 context tokens, sends `/compact` first and then the event. The event's
 turn would write the whole context back to the one-hour cache, while Claude
 Code's compaction request writes it at the cheaper five-minute rate, and every
 later request then reads the summary instead of the full context. Nothing
@@ -275,7 +282,7 @@ estimate of the summary until the next request. Homebased does not follow a T3
 Codex provider instance that sets its own `homePath`.
 
 The dashboard's threads page lists open T3 Claude and Codex threads with at
-least 200,000 context tokens, with their idle time, whether the cache is still
+least 175,000 context tokens, with their idle time, whether the cache is still
 warm, and for Codex the share of the model's context window. It groups them as threads active in the last hour, threads settled in T3
 in the last hour, and active threads idle over an hour, which have a cold
 cache. A button reveals settled threads idle up to 48 hours; older settled
@@ -436,7 +443,7 @@ T3 fails with `compact_unsupported_host` (exit 5), and a T3 thread with no
 session to compact yet with `thread_not_found` (exit 3).
 
 `thread watch` keeps a watch on the calling machine and checks it every minute,
-right after the idle compaction scan, which keeps its 55-minute, 200,000-token
+right after the idle compaction scan, which keeps its 55-minute, 175,000-token
 rule. When the watched context climbs over the limit while the thread runs no
 turn, the caller gets one `THREAD_CONTEXT_OVER` event; the watch fires again
 only after a reading shows the context below the limit, so a missing reading

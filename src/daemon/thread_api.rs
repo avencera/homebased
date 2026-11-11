@@ -9,7 +9,7 @@
 //! same destination and protocol checks as other Fleet writes. Watches live on
 //! the caller's machine, which checks them in the idle compaction scan
 
-mod local;
+pub(crate) mod local;
 pub(crate) mod watch_scan;
 
 use std::collections::{HashMap, HashSet};
@@ -137,12 +137,11 @@ struct ClusterCompactBody {
 }
 
 /// What the daemon knows about this machine's threads before reading files
-async fn local_sources(state: &AppState) -> Result<LocalSources, AppError> {
+pub(in crate::daemon) async fn local_sources(state: &AppState) -> Result<LocalSources, AppError> {
     let workers = call(&state.store, |reply| StoreMsg::WorkerThreads { reply }).await?;
     let waiting = call(&state.store, |reply| StoreMsg::WaitingThreads { reply })
         .await?
         .into_iter()
-        .map(|(thread, _)| thread)
         .collect();
     Ok(LocalSources {
         env: T3Env::from_env(),

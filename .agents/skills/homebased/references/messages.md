@@ -127,11 +127,13 @@ and a retry with the same `--message-id` goes only through T3, which drops the
 repeat. With T3 unreachable, that retry keeps failing instead of sending a
 second copy another way.
 
-A Claude session or Codex thread that a T3 thread owns may be compacted while it waits.
-When a task or queue job for it is still running, the daemon sends `/compact` to that
-thread after 55 idle minutes if the context has at least 200,000 tokens, while
-the prompt cache is still warm. A message for such a session whose cache
-already lapsed, with at least 200,000 context tokens, sends `/compact` first.
+A Claude session or Codex thread that a T3 thread owns may be compacted while it idles.
+When it is not archived, runs no turn, and will likely run again (a task or queue job still runs
+for it, T3 owes it a delegated task's report, or it is unsettled and not a
+finished delegate), the daemon sends `/compact` to that thread after 55 idle minutes
+if the context has at least 175,000 tokens, while the prompt cache is still warm. A
+message for such a session whose cache already lapsed, with at least 175,000 context
+tokens, sends `/compact` first.
 A message that arrives during a compaction waits behind it, so the agent reads
 it with a compacted summary instead of its full history. A task or queue job
 event waits in the homebased inbox until the compaction finishes, for at most

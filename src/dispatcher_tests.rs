@@ -17,13 +17,17 @@ use crate::daemon::actors::callback::{
 };
 use crate::daemon::actors::{StoreActor, StoreMsg, call};
 use crate::daemon::idle_compaction::{Attempts, scan};
-use crate::domain::{ProcessStatus, TaskEnv, TaskId};
+use crate::daemon::thread_api::local::{LocalIndex, LocalSources};
+use crate::domain::{ProcessStatus, TaskEnv, TaskId, ThreadId};
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
 use crate::machine::MachineId;
 use crate::store::Store;
 use crate::submission::{CallbackContext, OriginRoute, RequestId, SubmissionState};
-use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
+use crate::t3::T3Env;
+use crate::t3::test_support::{
+    FakeResponse, FakeT3Server, V2State, dispatched, rpc_exit, ticket, write_runtime,
+};
 use crate::task_wait::WaitKey;
 
 const T3_THREAD_ID: &str = "31c5fd73-3cc4-4ecb-a1cd-8f01c39fcb85";
@@ -353,6 +357,12 @@ fn finish_compaction(route: &OriginRoute) {
 }
 
 fn write_transcript(route: &OriginRoute, minutes_ago: i64, tokens: u64) {
+    write_session_transcript(route, &route.thread.to_string(), minutes_ago, tokens);
+}
+
+/// Claude transcript of `session` under the route's saved home, whose last
+/// request carried `tokens + 2` context tokens `minutes_ago`
+fn write_session_transcript(route: &OriginRoute, session: &str, minutes_ago: i64, tokens: u64) {
     let project = PathBuf::from(&route.callback.env.home).join(".claude/projects/-work");
     std::fs::create_dir_all(&project).unwrap();
     let line = serde_json::json!({
@@ -360,48 +370,219 @@ fn write_transcript(route: &OriginRoute, minutes_ago: i64, tokens: u64) {
         "timestamp": (chrono::Utc::now() - chrono::TimeDelta::minutes(minutes_ago)).to_rfc3339(),
         "message": { "usage": { "input_tokens": 2, "cache_read_input_tokens": tokens } }
     });
-    std::fs::write(
-        project.join(format!("{}.jsonl", route.thread)),
-        line.to_string(),
-    )
-    .unwrap();
+    std::fs::write(project.join(format!("{session}.jsonl")), line.to_string()).unwrap();
+}
+
+/// The machine's threads as the idle scan reads them now, under the route's
+/// saved home, with `waiting` owed homebased events
+fn idle_index(route: &OriginRoute, waiting: impl IntoIterator<Item = ThreadId>) -> LocalIndex {
+    let sources = LocalSources {
+        env: T3Env::new(
+            PathBuf::from(&route.callback.env.home),
+            route.callback.env.path.clone().into(),
+        ),
+        machine: MachineId::new(),
+        machine_name: "test".into(),
+        workers: Vec::new(),
+        waiting: waiting.into_iter().collect(),
+        titles: None,
+    };
+    LocalIndex::load(sources, chrono::Utc::now()).unwrap()
+}
+
+/// Run the idle scan twice, as two daemon ticks, and return the T3 threads
+/// the fake server was asked to compact
+fn compacted_by_two_scans(
+    route: &OriginRoute,
+    server: &FakeT3Server,
+    home: &Home,
+    waiting: &[ThreadId],
+) -> std::collections::BTreeSet<String> {
+    let log = home.compaction_log_path();
+    let attempts = scan(
+        &idle_index(route, waiting.iter().copied()),
+        Attempts::new(),
+        &log,
+    );
+    scan(&idle_index(route, waiting.iter().copied()), attempts, &log);
+    let payloads = dispatched_payloads(server);
+    assert!(
+        payloads.iter().all(|payload| payload["text"] == "/compact"),
+        "{payloads:?}"
+    );
+    let threads: Vec<String> = payloads
+        .iter()
+        .map(|payload| payload["threadId"].as_str().unwrap().to_owned())
+        .collect();
+    let distinct: std::collections::BTreeSet<String> = threads.iter().cloned().collect();
+    // each idle period gets one attempt
+    assert_eq!(distinct.len(), threads.len(), "{threads:?}");
+    distinct
+}
+
+/// T3 thread payload that settles the thread in T3's sidebar
+fn settled_payload() -> serde_json::Value {
+    serde_json::json!({ "settledOverride": "settled" })
+}
+
+/// T3 thread payload of a delegate that `parent` started
+fn delegate_payload(parent: &str) -> serde_json::Value {
+    serde_json::json!({ "lineage": { "parentThreadId": parent, "relationshipToParent": "subagent" } })
+}
+
+/// Fake T3 responses for `count` compactions
+fn compaction_responses(count: usize) -> Vec<FakeResponse> {
+    (0..count).flat_map(|_| [ticket(), dispatched()]).collect()
 }
 
 #[test]
-fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
-    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
-    let dispatched = || {
-        FakeResponse::WebSocket(vec![rpc_exit(
-            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
-        )])
-    };
-    // room for a second compaction, so a repeat would show up
-    let server = FakeT3Server::start(
-        Some(2),
-        vec![ticket(), dispatched(), ticket(), dispatched()],
-    );
+fn idle_compaction_compacts_a_root_waiting_only_on_a_delegated_task() {
+    const ROOT: &str = "thread:root:open";
+    const SETTLED_ROOT: &str = "thread:root:settled";
+    const CHILD: &str = "thread:delegated-task:running";
+    // room for an extra compaction, so a wrong one would show up
+    let server = FakeT3Server::start(Some(2), compaction_responses(3));
     let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
     let userdata = configure_t3(
         &mut route,
         &server.origin,
         i32::try_from(std::process::id()).unwrap(),
     );
+    let [root, settled_root, child] = std::array::from_fn(|_| uuid::Uuid::now_v7().to_string());
+    // each root's last run ended after starting a delegated task that still
+    // runs, so T3 will wake the root with its report; no homebased work waits
     V2State::create(&userdata.join("statev2.sqlite"))
-        .thread(T3_THREAD_ID, "V2 thread", false)
-        .native("claudeAgent", &route.thread.to_string(), T3_THREAD_ID);
-    write_transcript(&route, 56, 250_000);
+        .thread(ROOT, "orchestrator", false)
+        .native("claudeAgent", &root, ROOT)
+        .run(ROOT, 1, "completed", "delegate the work")
+        .task(ROOT, CHILD, "node:child", "running", "2026-11-10T10:00:00Z")
+        .task_run("node:child", &format!("run-{ROOT}-1"))
+        // settled, but T3 owes it the report, so it runs again all the same
+        .thread(SETTLED_ROOT, "settled orchestrator", false)
+        .payload(SETTLED_ROOT, &settled_payload())
+        .native("claudeAgent", &settled_root, SETTLED_ROOT)
+        .run(SETTLED_ROOT, 1, "completed", "delegate more")
+        .task(
+            SETTLED_ROOT,
+            "thread:delegated-task:other",
+            "node:other",
+            "running",
+            "2026-11-10T10:00:00Z",
+        )
+        .task_run("node:other", &format!("run-{SETTLED_ROOT}-1"))
+        // the child sits in a long tool call: its turn runs, though its
+        // transcript has been quiet for as long
+        .thread(CHILD, "delegate", false)
+        .payload(CHILD, &delegate_payload(ROOT))
+        .native("claudeAgent", &child, CHILD)
+        .run(CHILD, 1, "running", "do the work");
+    write_session_transcript(&route, &root, 56, 190_000);
+    write_session_transcript(&route, &settled_root, 57, 400_000);
+    write_session_transcript(&route, &child, 56, 300_000);
+
+    let compacted = compacted_by_two_scans(&route, &server, &home, &[]);
+
+    assert_eq!(
+        compacted,
+        [ROOT, SETTLED_ROOT]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn idle_compaction_compacts_an_idle_interactive_thread_from_175k_tokens() {
+    const LARGE: &str = "thread:interactive:185k";
+    const SMALL: &str = "thread:interactive:165k";
+    const SETTLED: &str = "thread:interactive:settled";
+    const FINISHED: &str = "thread:delegated-task:finished";
+    let server = FakeT3Server::start(Some(2), compaction_responses(2));
+    let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
+    let userdata = configure_t3(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
+    let [large, small, settled, finished] =
+        std::array::from_fn(|_| uuid::Uuid::now_v7().to_string());
+    // a settled thread and a delegate whose task ended rarely run again, so
+    // compacting them would cost more than it saves
+    V2State::create(&userdata.join("statev2.sqlite"))
+        .thread(LARGE, "large", false)
+        .native("claudeAgent", &large, LARGE)
+        .run(LARGE, 1, "completed", "what next?")
+        .thread(SMALL, "small", false)
+        .native("claudeAgent", &small, SMALL)
+        .run(SMALL, 1, "completed", "what next?")
+        .thread(SETTLED, "settled", false)
+        .payload(SETTLED, &settled_payload())
+        .native("claudeAgent", &settled, SETTLED)
+        .thread(FINISHED, "finished delegate", false)
+        .payload(FINISHED, &delegate_payload(LARGE))
+        .native("claudeAgent", &finished, FINISHED)
+        .task(
+            LARGE,
+            FINISHED,
+            "node:done",
+            "completed",
+            "2026-11-10T10:00:00Z",
+        );
+    write_session_transcript(&route, &large, 56, 185_000);
+    write_session_transcript(&route, &small, 56, 165_000);
+    write_session_transcript(&route, &settled, 56, 300_000);
+    write_session_transcript(&route, &finished, 56, 300_000);
+
+    let compacted = compacted_by_two_scans(&route, &server, &home, &[]);
+
+    assert_eq!(compacted, [LARGE.to_owned()].into_iter().collect());
+    let logged: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(home.compaction_log_path())
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(logged["session"], large);
+    assert_eq!(logged["tokens"], 185_002);
+    assert_eq!(logged["trigger"], "idle");
+}
+
+#[test]
+fn idle_compaction_compacts_a_settled_thread_homebased_work_will_wake_once() {
+    // room for a second compaction, so a repeat would show up
+    let server = FakeT3Server::start(Some(2), compaction_responses(3));
+    let (_dir, home, mut route) = fixture("#!/bin/sh\nexit 0\n");
+    let userdata = configure_t3(
+        &mut route,
+        &server.origin,
+        i32::try_from(std::process::id()).unwrap(),
+    );
     // a thread whose task already reported its outcome waits for nothing
     let mut finished = route.clone();
     finished.request = RequestId::new();
     finished.task = TaskId::new();
     finished.thread = crate::domain::ThreadId(uuid::Uuid::now_v7());
-    write_transcript(&finished, 56, 250_000);
     // a run that parked has a terminal state but never records an outcome
     let mut parked = route.clone();
     parked.request = RequestId::new();
     parked.task = TaskId::new();
     parked.thread = crate::domain::ThreadId(uuid::Uuid::now_v7());
-    write_transcript(&parked, 56, 250_000);
+    // settled threads run again only when something wakes them, here only the
+    // homebased task that still runs for the first
+    let mut state = V2State::create(&userdata.join("statev2.sqlite"));
+    for (index, waiting) in [&route, &finished, &parked].into_iter().enumerate() {
+        let t3_thread = if index == 0 {
+            T3_THREAD_ID.to_owned()
+        } else {
+            format!("thread:{index}")
+        };
+        state = state
+            .thread(&t3_thread, "V2 thread", false)
+            .payload(&t3_thread, &settled_payload())
+            .native("claudeAgent", &waiting.thread.to_string(), &t3_thread);
+        write_transcript(waiting, 56, 250_000);
+    }
+    drop(state);
     let mut store = Store::open(&home.db_path()).unwrap();
     store.insert_origin_route(&route).unwrap();
     store.insert_origin_route(&finished).unwrap();
@@ -423,30 +604,13 @@ fn idle_compaction_compacts_a_waiting_session_once_before_its_cache_lapses() {
         )
         .unwrap();
 
-    let threads = store.waiting_threads().unwrap();
-    let log = home.compaction_log_path();
-    let attempts = scan(threads.clone(), Attempts::new(), chrono::Utc::now(), &log);
-    scan(threads.clone(), attempts, chrono::Utc::now(), &log);
+    let waiting = store.waiting_threads().unwrap();
+    let compacted = compacted_by_two_scans(&route, &server, &home, &waiting);
 
-    assert_eq!(
-        threads
-            .iter()
-            .map(|(thread, _)| *thread)
-            .collect::<Vec<_>>(),
-        [route.thread]
-    );
-    let dispatches: Vec<serde_json::Value> = server
-        .requests()
-        .iter()
-        .filter(|request| request.method == "WS")
-        .map(|request| {
-            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["payload"].clone()
-        })
-        .collect();
-    assert_eq!(dispatches.len(), 1, "{dispatches:?}");
-    assert_eq!(dispatches[0]["text"], "/compact");
-    assert_eq!(dispatches[0]["threadId"], T3_THREAD_ID);
+    assert_eq!(waiting, [route.thread]);
+    assert_eq!(compacted, [T3_THREAD_ID.to_owned()].into_iter().collect());
     // one line per request, joinable to the transcript by session
+    let log = home.compaction_log_path();
     let logged: Vec<serde_json::Value> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
@@ -1968,13 +2132,20 @@ fn idle_compaction_compacts(imported: bool) {
     let pid = i32::try_from(std::process::id()).unwrap();
     let session = if imported {
         let userdata = configure_t3(&mut route, &server.origin, pid);
+        // settled, so only the task still reporting to the imported thread
+        // marks it as one that runs again
         V2State::create(&userdata.join("statev2.sqlite"))
             .thread(T3_THREAD_ID, "Imported thread", false)
+            .payload(T3_THREAD_ID, &settled_payload())
             .legacy("codex", "threadId", &route.thread.to_string(), T3_THREAD_ID)
             .native("codex", RESUMED_CODEX_THREAD, T3_THREAD_ID);
         RESUMED_CODEX_THREAD.to_string()
     } else {
-        configure_t3_codex(&mut route, &server.origin, pid);
+        let userdata = configure_t3(&mut route, &server.origin, pid);
+        V2State::create(&userdata.join("statev2.sqlite"))
+            .thread(T3_THREAD_ID, "V2 thread", false)
+            .payload(T3_THREAD_ID, &settled_payload())
+            .native("codex", &route.thread.to_string(), T3_THREAD_ID);
         route.thread.to_string()
     };
     write_rollout(&route, &session, 56, false);
@@ -1983,9 +2154,8 @@ fn idle_compaction_compacts(imported: bool) {
 
     let log = home.compaction_log_path();
     scan(
-        store.waiting_threads().unwrap(),
+        &idle_index(&route, store.waiting_threads().unwrap()),
         Attempts::new(),
-        chrono::Utc::now(),
         &log,
     );
 

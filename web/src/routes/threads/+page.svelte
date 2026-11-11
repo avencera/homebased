@@ -30,14 +30,14 @@
 	// warm threads with less cache life than this go in the expiring block
 	const EXPIRING_MS = 15 * 60 * 1000;
 	// only contexts above this size are worth a warning, whatever the listing size
-	const EXPIRING_MIN_TOKENS = 200_000;
+	const EXPIRING_MIN_TOKENS = 175_000;
 	// a compaction takes about a minute, so poll faster until it lands
 	const COMPACTING_REFRESH_MS = 5_000;
 	// far past the minutes a large compaction takes, so a lost one stops spinning
 	const COMPACTING_TIMEOUT_MS = 10 * 60 * 1000;
 
 	let threads = $state<readonly ContextThread[]>([]);
-	let minTokens = $state(200_000);
+	let minTokens = $state(175_000);
 	let error = $state<string | null>(null);
 	let lastFetched = $state<number | null>(null);
 	let pending = $state<string | null>(null);

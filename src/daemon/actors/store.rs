@@ -34,8 +34,8 @@ use crate::store::{
     UnlaunchedTask,
 };
 use crate::submission::{
-    CallbackContext, CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute,
-    RejectionTombstone, ReleaseTerms, RequestId, SubmissionState,
+    CallbackExecutable, DependentRoute, ExecutorIdentity, OriginRoute, RejectionTombstone,
+    ReleaseTerms, RequestId, SubmissionState,
 };
 
 fn identity_error(error: IdentityError) -> AppError {
@@ -544,9 +544,9 @@ pub(crate) enum StoreMsg {
     WorkerThreads {
         reply: RpcReplyPort<Result<Vec<crate::store::WorkerThread>, AppError>>,
     },
-    /// Read origin threads that still wait for a task callback
+    /// Read origin threads that still wait for a task or queue job callback
     WaitingThreads {
-        reply: RpcReplyPort<Result<Vec<(ThreadId, CallbackContext)>, AppError>>,
+        reply: RpcReplyPort<Result<Vec<ThreadId>, AppError>>,
     },
     /// Read routes that wait for dependencies or for their launch to be answered
     HeldRoutes {

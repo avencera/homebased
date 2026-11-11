@@ -10,8 +10,8 @@ use crate::machine::MachineId;
 use crate::machine_wait::{CoalesceKey, MachineWait};
 use crate::queue::delivery::JobRoute;
 use crate::submission::{
-    CallbackContext, ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute,
-    PreAcceptanceRejection, RejectionTombstone, ReleaseTerms, RequestId, SubmissionState,
+    ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute, PreAcceptanceRejection,
+    RejectionTombstone, ReleaseTerms, RequestId, SubmissionState,
 };
 
 /// Age after which a queue job route no longer counts as waiting
@@ -170,15 +170,14 @@ fn storage(error: rusqlite::Error) -> IdentityError {
 }
 
 impl Store {
-    /// Origin threads that still wait for a task or queue job callback, each
-    /// with the saved callback context of its first such route
+    /// Origin threads that still wait for a task or queue job callback
     ///
     /// An accepted, unconfirmed, or held task submission calls back until its
     /// task reports an outcome. A rejected or cancelled submission never does.
     /// A run that parked has a terminal state but no outcome, and its
     /// continuation has a route of its own. A queue job waits until an ending
     /// event reached the thread, or until [`JOB_WAIT_LIMIT`] passes
-    pub fn waiting_threads(&self) -> Result<Vec<(ThreadId, CallbackContext)>, AppError> {
+    pub fn waiting_threads(&self) -> Result<Vec<ThreadId>, AppError> {
         let mut tasks = self.conn.prepare(
             "SELECT route_json FROM origin_routes
              WHERE outcome IS NULL AND json_valid(route_json)
@@ -211,20 +210,20 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut threads: Vec<(ThreadId, CallbackContext)> = Vec::new();
-        let mut add = |thread: ThreadId, callback: CallbackContext| {
+        let mut threads: Vec<ThreadId> = Vec::new();
+        let mut add = |thread: ThreadId| {
             // no session waits on a task submitted without a thread
-            if !thread.is_detached() && !threads.iter().any(|(waiting, _)| *waiting == thread) {
-                threads.push((thread, callback));
+            if !thread.is_detached() && !threads.contains(&thread) {
+                threads.push(thread);
             }
         };
         for json in task_routes {
             let route: OriginRoute = serde_json::from_str(&json)?;
-            add(route.thread, route.callback);
+            add(route.thread);
         }
         for json in job_routes {
             let route: JobRoute = serde_json::from_str(&json)?;
-            add(route.thread, route.callback);
+            add(route.thread);
         }
         Ok(threads)
     }

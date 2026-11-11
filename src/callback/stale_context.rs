@@ -5,7 +5,7 @@
 //! arrives later pays to read the whole context again, and every later request
 //! carries it too. Interactive Claude Code compacts a long idle session before
 //! the cache lapses, but Agent SDK hosts such as T3 Code do not, so homebased
-//! asks the host to compact while a callback is still pending, at 55 idle
+//! asks T3 to compact an idle thread that will likely run again at 55 idle
 //! minutes, while the cache is warm. A callback that arrives after the cache
 //! lapsed compacts first: the compaction's cold write costs less than the
 //! callback's turn would pay, and every later request then reads the small
@@ -57,9 +57,14 @@ const IDLE_COMPACTION_AFTER: TimeDelta = TimeDelta::minutes(55);
 /// started, and T3 refuses to steer it into the compaction
 const QUEUE_MARGIN: TimeDelta = TimeDelta::minutes(1);
 
-/// Smallest context worth an idle compaction, which runs even if no callback
-/// comes back before the cache would lapse
-pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 200_000;
+/// Smallest context worth an idle compaction, which runs even if the thread
+/// never resumes
+///
+/// Six weeks of Claude usage put a cold resume at 150K to 200K at about $1.25
+/// for the cache rewrite, against about $0.50 for a compaction. A smaller
+/// context saves less from a compaction and loses detail, so the limit sits in
+/// the middle of that range
+pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 175_000;
 
 /// Transcript or rollout suffix scanned for the last request
 ///
@@ -506,7 +511,12 @@ mod tests {
         assert!(!large(50).idle_compaction_due(now()));
         assert!(large(56).idle_compaction_due(now()));
         assert!(!large(61).idle_compaction_due(now()));
-        let medium = context(&[assistant(56, 150_000)]).unwrap();
+        assert!(
+            context(&[assistant(56, 175_000)])
+                .unwrap()
+                .idle_compaction_due(now())
+        );
+        let medium = context(&[assistant(56, 172_000)]).unwrap();
         assert!(!medium.idle_compaction_due(now()));
 
         // a message arriving mid-compaction queues instead of steering into it
