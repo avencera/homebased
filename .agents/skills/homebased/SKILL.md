@@ -23,6 +23,7 @@ description: Run long, unattended agent CLIs and general task commands through t
 - An agent worker with a long command submits it as its own task, reports `waiting`, and exits. On `TASK_WAITING`, do nothing.
 - Command and agent tasks run in the daemon's own cgroup with no per-task memory limit. A cap on the daemon's unit, such as systemd `MemoryMax`, bounds them all together, and the kernel kills the largest task when they outgrow it. Run memory-heavy work as a task rather than in the submitting session, so that cap applies, and do not stack large tasks. Docker runs a `container` workload outside the daemon's cgroup, so its `memory` field is its only limit.
 - Prefer a `task` workload for long commands and CI watchers. Use `agent` only when a model must reason and produce a report.
+- Start a process that keeps running and that nothing waits on, such as a dev server, proxy, or emulator, with `homebased service start --name <label> [--port <n> | --ready-line <regex>] -- <command...>`, never as a background shell command. It returns once the service is ready, is stopped with its owner's T3 thread or after `--max` (default 12h), and sends one `SERVICE_EXITED` only if it dies on its own. Stop it with `homebased service stop <id>` when done. Read [services.md](references/services.md).
 - Use `homebased message send --machine <name> --thread <ref>` for a direct message to a session; `--thread` takes any thread reference, such as T3 chip text, `thread_<id>`, or a session UUID. Use `message send --worker <task>` to steer a running Claude worker, and `task followup` to resume a finished one. Read [messages.md](references/messages.md).
 - Use `homebased thread context`, `thread compact`, and `thread watch` to read how full a thread's context is, compact a T3 thread, or get one event when a context passes a limit. `thread context --children` lists a T3 root's delegates, finished ones included and marked by `task_finished`; use it after a compaction instead of memory. Watches skip finished delegates and end on their own once their thread or caller is done. Events that ask nothing of you (a started compaction of another thread, `unwatched`, `finished`) never wake the thread. Read [threads.md](references/threads.md).
 - Use `homebased t3 launch --machine <name>` to start a top-level T3 Code thread on another Fleet machine, `homebased t3 project add <path> --machine <name>` to add a project there first, and `homebased t3 project icon <path> --machine <name>` to set a project's icon. Read [t3.md](references/t3.md#launching-a-thread-on-another-machine) first.
@@ -35,10 +36,12 @@ Pick the first row that matches, then read only that file.
 | Situation | Read |
 | --- | --- |
 | `HOMEBASED_TASK_ID` is set in this session's environment | [worker.md](references/worker.md). You are the worker, not the orchestrator. |
+| A message starting with `HOMEBASED_EVENT ` arrived with `"event":"SERVICE_EXITED"` | [services.md](references/services.md#service_exited) |
 | A message starting with `HOMEBASED_EVENT ` arrived | [events.md](references/events.md) |
 | GPU work, resource queues, job specs, priority, preemption, or Attention | [resource-queue.md](references/resource-queue.md) |
 | Writing a spec for an agent or container, following up a finished task, chaining work with `after`, or retrying a lost submit | [submit.md](references/submit.md) |
 | Listing, showing, reading logs, or cancelling tasks, or finding the tokens workers spent | [inspect.md](references/inspect.md) |
+| Starting, listing, reading, or stopping a long-lived process such as a dev server or emulator | [services.md](references/services.md) |
 | Inside a T3 Code thread (the `t3-code` MCP tools are present) | [t3.md](references/t3.md) |
 | Starting a T3 Code thread on another machine | [t3.md](references/t3.md#launching-a-thread-on-another-machine) |
 | Configuring Fleet or discovering machines | [fleet.md](references/fleet.md) |
@@ -57,3 +60,9 @@ homebased --json task submit --spec spec.json
 ```
 
 Each prints the task id. Then end the turn. Events arrive later as one line: `HOMEBASED_EVENT {...}`.
+
+```bash
+id=$(homebased --quiet service start --name api --port 8787 -- pnpm wrangler dev --port 8787)
+# ... use http://127.0.0.1:8787 ...
+homebased service stop "$id"
+```

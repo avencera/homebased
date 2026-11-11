@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::message::MessageId;
+use crate::service::ServiceId;
 
 /// Unix socket file name under `$HOMEBASED_HOME`.
 pub const SOCK_NAME: &str = "homebased.sock";
@@ -32,6 +33,8 @@ pub const MESSAGES_DIR: &str = "messages";
 pub const MESSAGE_QUEUE_LOG: &str = "queue.log";
 /// Process-shared lock inherited by one direct-message queue child.
 pub const MESSAGE_DELIVERY_LOCK: &str = "delivery.lock";
+/// Directory for long-lived services.
+pub const SERVICES_DIR: &str = "services";
 
 /// Resolved state root plus helpers for the on-disk layout.
 #[derive(Debug, Clone)]
@@ -149,6 +152,19 @@ impl Home {
         TaskPaths::new(self.task_dir(id))
     }
 
+    /// Layout for one service.
+    #[must_use]
+    pub fn service_paths(&self, id: ServiceId) -> ServicePaths {
+        let dir = self.root.join(SERVICES_DIR).join(id.to_string());
+        ServicePaths {
+            output: dir.join("output.log"),
+            runner_lock: dir.join("runner.lock"),
+            worker_log: dir.join("worker.log"),
+            delivery: dir.join("delivery"),
+            dir,
+        }
+    }
+
     /// Create the directory for one direct message and return its queue evidence paths.
     pub fn prepare_message(&self, id: MessageId) -> Result<MessagePaths, AppError> {
         let paths = MessagePaths::new(self.root.join(MESSAGES_DIR).join(id.to_string()));
@@ -196,6 +212,28 @@ pub struct TaskPaths {
     pub delivery_lock: PathBuf,
     /// Container ID that Docker writes when it creates a container task's container.
     pub container_cid: PathBuf,
+}
+
+/// Files inside `services/<id>/`.
+#[derive(Debug, Clone)]
+pub struct ServicePaths {
+    /// Service directory.
+    pub dir: PathBuf,
+    /// Combined stdout/stderr of the service.
+    pub output: PathBuf,
+    /// Exclusive flock held by `service-run` while the service is supervised.
+    pub runner_lock: PathBuf,
+    /// Stderr of `service-run` itself.
+    pub worker_log: PathBuf,
+    /// Callback delivery evidence of its `SERVICE_EXITED` event.
+    pub delivery: PathBuf,
+}
+
+impl ServicePaths {
+    /// Read `output.log` like [`TaskPaths::read_output`].
+    pub fn read_output(&self, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
+        read_output_file(&self.output, tail)
+    }
 }
 
 /// Files inside `messages/<id>/`.
@@ -267,21 +305,27 @@ impl TaskPaths {
     /// Child output is arbitrary bytes, so invalid UTF-8 is replaced rather
     /// than rejected.
     pub fn read_output(&self, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
-        let mut file = match File::open(&self.output) {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let Some(tail) = tail else {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            return Ok(Some(OutputTail {
-                text: String::from_utf8_lossy(&bytes).into_owned(),
-                truncated: false,
-            }));
-        };
-        Ok(Some(read_tail(&mut file, tail.min(MAX_TAIL_LINES))?))
+        read_output_file(&self.output, tail)
     }
+}
+
+/// Read a child's output log, whole or its last `tail` lines; `Ok(None)`
+/// when the file does not exist
+fn read_output_file(path: &Path, tail: Option<usize>) -> Result<Option<OutputTail>, AppError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let Some(tail) = tail else {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Ok(Some(OutputTail {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated: false,
+        }));
+    };
+    Ok(Some(read_tail(&mut file, tail.min(MAX_TAIL_LINES))?))
 }
 
 /// Maximum bytes read for a tail, including a log with no line breaks

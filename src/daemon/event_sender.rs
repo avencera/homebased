@@ -1,6 +1,7 @@
 //! Ordered executor outbox delivery and recovery
 
 pub(crate) mod jobs;
+pub(crate) mod services;
 pub(crate) mod watches;
 
 use crate::fleet::probe::VerifiedDestination;

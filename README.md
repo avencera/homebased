@@ -8,6 +8,7 @@ Use it to:
 
 - Send a coding task or review to Codex, Claude, Grok, or OpenCode while you work on something else.
 - Run a build, test suite, or CI watcher and get the result without repeated status checks.
+- Keep a dev server, proxy, or emulator running for the agent, stopped once its thread is done.
 
 Homebased keeps task status and logs. An optional web dashboard lets you inspect tasks and browse files. If a task stops producing output, Homebased asks the agent to check it and leaves the task running.
 
@@ -969,6 +970,46 @@ to ignore duplicates.
 | `THREAD_CONTEXT_OVER` | A watched thread's context passed the watch's limit while it ran no turn. Identified by `(watch, seq)`. With `compaction.outcome: "started"` on a thread other than the caller, only a running `homebased wait` gets it. `watch_ended` is true, with `end_reason: "once"`, when it ends a `--once` watch, which then sends no `THREAD_WATCH_ENDED`. |
 | `THREAD_STALLED` | A thread watched with `--stalled-after` sat idle past the grace with nothing due to wake it and its work not done. Identified by `(watch, seq)`. It fires once per idle stretch. `watch_ended` is true, with `end_reason: "once"`, when it ends a `--once` watch. |
 | `THREAD_WATCH_ENDED` | A watch's last event, unless a `--once` watch fired, with `reason`: `unwatched`, `archived`, `deleted`, `session_gone`, `no_context_window` (a percent watch on a thread that runs Claude Code), `finished` (the T3 thread stayed done and quiet for an hour), or `caller_gone` (the caller's T3 thread was archived, deleted, or stayed done and quiet for an hour). Only a running `homebased wait` gets `unwatched`, `finished`, and `caller_gone`. |
+| `SERVICE_EXITED` | A service that was ready exited on its own, or its worker was lost. Identified by `service`; each service sends at most one. See [Services](#services). |
+
+### Services
+
+A service is a long-lived process that an agent starts and does not wait on,
+such as a dev server, a binding proxy, an Android emulator, or a phone test
+runner. Run it with `service start` instead of a background shell command, which
+dies with the agent's shell and is never cleaned up:
+
+```sh
+homebased service start --name api --port 8787 -- pnpm wrangler dev --port 8787
+homebased service start --name emulator --ready-line 'boot completed' --ready-timeout 5m -- emulator -avd Pixel_8
+homebased --json service list                # this thread's live services and their state
+homebased service log <id> --tail 100
+homebased service stop <id>                  # idempotent
+```
+
+The daemon runs the service on this machine, detached from the caller's shell,
+in the current directory or `--cwd`, with the caller's whole environment, as a
+background shell command would have. A `task run` command gets the daemon's
+environment with only the caller's `PATH` and `HOME`, because it may start
+later or on another machine; a service starts now, here, on the caller's
+behalf, so it gets the tools, versions, and tokens the caller sees. The environment goes to the service's worker in memory and is not stored.
+
+`start` returns once the service is ready and prints its id. With `--port`, it
+is ready when `127.0.0.1` or `::1` accepts a TCP connection on that port. With
+`--ready-line`, it is ready when a line of its output matches the regular
+expression. With neither, it is ready when it spawns. If it exits or is not
+ready within `--ready-timeout` (default `2m`), Homebased stops it, prints its
+last 20 output lines on stderr, and fails with `service_not_ready`.
+
+A service belongs to the calling thread, found as for `task run`. It is
+stopped, with its whole process group, by `service stop`, when that thread's T3
+thread is archived, settled, finished with its delegated task, or deleted, or
+when `--max` (default `12h`) elapses. None of these sends an event. If the
+service exits on its own after it was ready, the thread gets one
+`SERVICE_EXITED` event with its exit and last output lines, through normal
+callback delivery. A service has no output-inactivity check. Services are kept
+apart from tasks: `task list`, `homebased wait`, and task callbacks never see
+them, and `daemon stop` or `restart` leaves them running.
 
 ### Direct messages
 

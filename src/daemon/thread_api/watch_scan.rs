@@ -28,7 +28,7 @@ use super::{compact_resolved, find_on};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::compaction_log::Trigger;
-use crate::domain::API_VERSION;
+use crate::domain::{API_VERSION, ThreadId};
 use crate::machine::MachineId;
 use crate::store::{WatchRecord, WatchUpdate};
 use crate::thread_ref::{Provider, ThreadContext, ThreadHost, ThreadState};
@@ -39,7 +39,7 @@ use crate::thread_watch::{
 
 /// Scans in a row that must find a watched thread or its caller gone before
 /// the watch ends, so a T3 file that is briefly missing ends nothing
-const GONE_SCANS: u8 = 2;
+pub(crate) const GONE_SCANS: u8 = 2;
 
 /// How long a finished thread must stay quiet before the watches on it, or
 /// the watches it made, end
@@ -238,15 +238,22 @@ pub(crate) async fn scan(state: &AppState, memory: &mut WatchMemory, now: DateTi
 /// A watch from before `caller_t3` knows only the caller's session, which
 /// names its T3 thread while T3 runs that session next
 fn caller_reference(watch: &ThreadWatch) -> String {
-    match &watch.caller_t3 {
+    owner_reference(watch.caller, watch.caller_t3.as_deref())
+}
+
+/// The reference that finds a thread here by its T3 thread when known, else
+/// by its session; services find their owner the same way watches find
+/// their caller
+pub(crate) fn owner_reference(session: ThreadId, t3_thread: Option<&str>) -> String {
+    match t3_thread {
         Some(thread) => format!("thread_{thread}"),
-        None => watch.caller.to_string(),
+        None => session.to_string(),
     }
 }
 
-/// What the scan found of a watch's caller
+/// What the scan found of a watch's caller, or a service's owner
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum CallerSeen<'a> {
+pub(crate) enum CallerSeen<'a> {
     /// No T3 thread the scan can follow, such as a session outside T3
     Untracked,
     /// The caller's T3 thread is gone
@@ -256,11 +263,20 @@ enum CallerSeen<'a> {
 }
 
 fn caller_seen<'a>(watch: &ThreadWatch, matches: &'a [ThreadContext]) -> CallerSeen<'a> {
-    let t3 = match &watch.caller_t3 {
+    owner_seen(watch.caller_t3.as_deref(), matches)
+}
+
+/// What the lookup of [`owner_reference`] found, given the T3 thread the
+/// owner was known by, if any
+pub(crate) fn owner_seen<'a>(
+    t3_thread: Option<&str>,
+    matches: &'a [ThreadContext],
+) -> CallerSeen<'a> {
+    let t3 = match t3_thread {
         Some(id) => {
             let found = matches
                 .iter()
-                .find(|thread| thread.t3_thread.as_deref() == Some(id.as_str()));
+                .find(|thread| thread.t3_thread.as_deref() == Some(id));
             return found.map_or(CallerSeen::Gone, CallerSeen::T3);
         }
         // a session that no T3 thread runs may be a terminal session, or a T3

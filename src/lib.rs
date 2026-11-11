@@ -29,6 +29,7 @@ pub mod queue;
 pub mod report;
 pub mod run_env;
 pub mod runner;
+pub mod service;
 pub mod spec;
 pub mod store;
 pub mod submission;

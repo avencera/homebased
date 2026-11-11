@@ -31,6 +31,10 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 
 For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, `JOB_CHECK_DUE`, and `JOB_GPU_IDLE`, use [resource-queue.md](resource-queue.md). These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Final job events carry `gpu_summaries`, each attempt's GPU use with a one-line `brief`, and `JOB_PREEMPTED` carries the attempt it ended; read them before resubmitting. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.
 
+## Service events
+
+`SERVICE_EXITED` comes from `homebased service start` ([services.md](services.md#service_exited)): a service that was ready exited on its own, or its worker was lost. It identifies a service, not a task, and each service sends at most one, so deduplicate by `service`. Read its `output_tail` and restart the service only if the work still needs it.
+
 ## Thread watch events
 
 `THREAD_CONTEXT_OVER`, `THREAD_STALLED`, and `THREAD_WATCH_ENDED` come from `homebased thread watch` ([threads.md](threads.md)). They identify a watch, not a task. Deduplicate by `(watch, seq)`. Events that ask nothing of the caller never wake it, and only a running `homebased wait` prints them: a `THREAD_CONTEXT_OVER` whose `compaction.outcome` is `started` on a thread other than the caller, one that started on the caller itself while a delegated task's report from T3, or a homebased task or job, is still due to wake it, and a `THREAD_WATCH_ENDED` whose `reason` is `unwatched`, `finished`, or `caller_gone`. A `--once` watch ends with its `THREAD_CONTEXT_OVER` or `THREAD_STALLED`, which has `watch_ended: true`, and sends no `THREAD_WATCH_ENDED`.

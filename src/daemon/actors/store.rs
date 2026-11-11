@@ -540,6 +540,50 @@ pub(crate) enum StoreMsg {
         id: crate::thread_watch::WatchId,
         reply: RpcReplyPort<Result<Vec<crate::thread_watch::WatchEvent>, AppError>>,
     },
+    /// Save a new service
+    InsertService {
+        service: Box<crate::service::Service>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Record a service's spawned worker
+    SetServiceWorker {
+        id: crate::service::ServiceId,
+        pid: i32,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read one service
+    GetService {
+        id: crate::service::ServiceId,
+        reply: RpcReplyPort<Result<Option<crate::service::ServiceRecord>, AppError>>,
+    },
+    /// Read the services of one owner or every owner
+    ListServices {
+        owner: Option<ThreadId>,
+        ended: bool,
+        reply: RpcReplyPort<Result<Vec<crate::service::ServiceRecord>, AppError>>,
+    },
+    /// Ask a live service to stop
+    RequestServiceStop {
+        id: crate::service::ServiceId,
+        request: crate::service::StopRequest,
+        reply: RpcReplyPort<Result<crate::service::ServiceRecord, AppError>>,
+    },
+    /// End a live service whose worker cannot
+    EndService {
+        id: crate::service::ServiceId,
+        ending: crate::service::Ending,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Ended services whose event has not settled
+    PendingServiceEvents {
+        reply: RpcReplyPort<Result<Vec<crate::service::ServiceRecord>, AppError>>,
+    },
+    /// Settle one service event
+    SettleServiceEvent {
+        id: crate::service::ServiceId,
+        delivery: String,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// Worker sessions of local tasks, with whether each task still runs
     WorkerThreads {
         reply: RpcReplyPort<Result<Vec<crate::store::WorkerThread>, AppError>>,
@@ -1147,6 +1191,32 @@ impl Actor for StoreActor {
             StoreMsg::SettledWatchEvents { id, reply } => {
                 send_reply(reply, state.settled_watch_events(id));
             }
+            StoreMsg::InsertService { service, reply } => {
+                send_reply(reply, state.insert_service(&service));
+            }
+            StoreMsg::SetServiceWorker { id, pid, reply } => {
+                send_reply(reply, state.set_service_worker(id, pid));
+            }
+            StoreMsg::GetService { id, reply } => send_reply(reply, state.service_record(id)),
+            StoreMsg::ListServices {
+                owner,
+                ended,
+                reply,
+            } => send_reply(reply, state.service_records(owner, ended)),
+            StoreMsg::RequestServiceStop { id, request, reply } => {
+                send_reply(reply, state.request_service_stop(id, request));
+            }
+            StoreMsg::EndService { id, ending, reply } => {
+                send_reply(reply, state.end_service(id, ending));
+            }
+            StoreMsg::PendingServiceEvents { reply } => {
+                send_reply(reply, state.pending_service_events());
+            }
+            StoreMsg::SettleServiceEvent {
+                id,
+                delivery,
+                reply,
+            } => send_reply(reply, state.settle_service_event(id, &delivery, Utc::now())),
             StoreMsg::WorkerThreads { reply } => send_reply(reply, state.worker_threads()),
             StoreMsg::HeldRoutes { reply } => send_reply(reply, state.held_routes()),
             StoreMsg::UnstartedDependentTasks { reply } => {

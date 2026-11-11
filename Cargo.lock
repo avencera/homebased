@@ -839,6 +839,7 @@ dependencies = [
  "nix",
  "predicates",
  "ractor",
+ "regex",
  "rusqlite",
  "rust-embed",
  "schemars",

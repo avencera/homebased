@@ -29,6 +29,7 @@ mdns-sd = "0.21.4"
 mime_guess = "2"
 nix = { version = "0.31.3", features = ["fs", "hostname", "process", "signal", "user"] }
 ractor = "0.16.5"
+regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = { version = "8.12.0", features = ["mime-guess"] }
 schemars = { version = "1.2.2", features = ["derive"] }

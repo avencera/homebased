@@ -369,7 +369,7 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
 }
 
 /// A quoted `~/path` under this machine's home, as the shell would have expanded it
-fn expand_home(path: std::path::PathBuf) -> std::path::PathBuf {
+pub(super) fn expand_home(path: std::path::PathBuf) -> std::path::PathBuf {
     match (path.strip_prefix("~"), std::env::home_dir()) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path,

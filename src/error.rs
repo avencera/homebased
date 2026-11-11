@@ -14,6 +14,7 @@ use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
 use crate::machine::{MachineId, MachineName};
 use crate::queue::{JobId, QueueError};
+use crate::service::ServiceId;
 use crate::spec::CwdProblem;
 use crate::submission::RequestId;
 use crate::thread_ref::ThreadHost;
@@ -150,6 +151,22 @@ pub enum AppError {
     WatchNotFound {
         /// Watch id
         watch: WatchId,
+    },
+    /// No service has this id on this machine
+    #[error("no service {service} on this machine")]
+    ServiceNotFound {
+        /// Service id
+        service: ServiceId,
+    },
+    /// `service start` stopped a service that did not become ready
+    #[error("service {service} did not become ready: {reason}")]
+    ServiceNotReady {
+        /// Service id
+        service: ServiceId,
+        /// What went wrong
+        reason: String,
+        /// Last lines of its output
+        output_tail: Vec<String>,
     },
     /// A task's worker cannot take a direct message
     #[error("the worker for task {task} cannot take a message: {reason}")]
@@ -745,6 +762,8 @@ impl AppError {
             Self::ThreadNotFound { .. } => "thread_not_found",
             Self::CompactUnsupportedHost { .. } => "compact_unsupported_host",
             Self::WatchNotFound { .. } => "watch_not_found",
+            Self::ServiceNotFound { .. } => "service_not_found",
+            Self::ServiceNotReady { .. } => "service_not_ready",
             Self::ThreadLookupIncomplete { .. } => "thread_lookup_incomplete",
             Self::WorkerMessageUnavailable { .. } => "worker_message_unavailable",
             Self::ResumeThreadBusy { .. } => "resume_thread_busy",
@@ -850,7 +869,9 @@ impl AppError {
             | Self::MachineNotFound { .. } => 3,
             Self::AgentThreadNotFound { .. }
             | Self::ThreadNotFound { .. }
-            | Self::WatchNotFound { .. } => 3,
+            | Self::WatchNotFound { .. }
+            | Self::ServiceNotFound { .. } => 3,
+            Self::ServiceNotReady { .. } => 1,
             Self::ThreadRefAmbiguous { .. }
             | Self::CompactUnsupportedHost { .. }
             | Self::WatchWaitUnavailable { .. } => 5,
@@ -920,7 +941,9 @@ impl AppError {
             Self::AgentThreadNotFound { .. }
             | Self::T3ProjectNotFound { .. }
             | Self::ThreadNotFound { .. }
-            | Self::WatchNotFound { .. } => http::StatusCode::NOT_FOUND,
+            | Self::WatchNotFound { .. }
+            | Self::ServiceNotFound { .. } => http::StatusCode::NOT_FOUND,
+            Self::ServiceNotReady { .. } => http::StatusCode::CONFLICT,
             Self::T3LaunchRefused { .. }
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => http::StatusCode::CONFLICT,
@@ -1025,6 +1048,12 @@ impl AppError {
                 json!({ "reference": reference, "host": host })
             }
             Self::WatchNotFound { watch } => json!({ "watch": watch }),
+            Self::ServiceNotFound { service } => json!({ "service": service }),
+            Self::ServiceNotReady {
+                service,
+                reason,
+                output_tail,
+            } => json!({ "service": service, "reason": reason, "output_tail": output_tail }),
             Self::ThreadLookupIncomplete { unanswered } => json!({ "unanswered": unanswered }),
             Self::WorkerMessageUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })

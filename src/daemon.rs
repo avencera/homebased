@@ -25,6 +25,7 @@ pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
 pub mod queue_api;
+mod service_api;
 pub mod t3_launch;
 mod t3_watch;
 pub mod thread_api;
@@ -196,6 +197,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     ));
     let job_events = tokio::spawn(event_sender::jobs::run(state.clone()));
     let watch_events = tokio::spawn(event_sender::watches::run(state.clone()));
+    let service_events = tokio::spawn(event_sender::services::run(state.clone()));
+    let service_liveness = tokio::spawn(service_api::run(state.clone()));
     let recovery = tokio::spawn(origin_submit::recover(state.clone()));
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
@@ -263,6 +266,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     sender.abort();
     job_events.abort();
     watch_events.abort();
+    service_events.abort();
+    service_liveness.abort();
     recovery.abort();
     dependency_release.abort();
     cancellation.abort();

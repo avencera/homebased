@@ -673,6 +673,8 @@ mod reports;
 mod resource_jobs;
 #[path = "integration/service.rs"]
 mod service;
+#[path = "integration/service_mode.rs"]
+mod service_mode;
 #[path = "integration/source_rules.rs"]
 mod source_rules;
 #[path = "integration/submission.rs"]

@@ -336,6 +336,10 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             .map_or(AppError::Internal { message }, |watch| {
                 AppError::WatchNotFound { watch }
             }),
+        "service_not_found" => decode_field(input, "service")
+            .map_or(AppError::Internal { message }, |service| {
+                AppError::ServiceNotFound { service }
+            }),
         "wait_target_ambiguous" => decode_field(input, "id")
             .map_or(AppError::Internal { message }, |id| {
                 AppError::WaitTargetAmbiguous { id }

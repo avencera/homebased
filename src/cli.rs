@@ -6,6 +6,7 @@ pub mod fleet;
 pub mod message;
 pub mod notify;
 pub mod resource;
+pub mod service;
 pub mod t3;
 pub mod task;
 pub mod thread;
@@ -108,6 +109,20 @@ pub enum Command {
         #[command(subcommand)]
         command: resource::ResourceCommand,
     },
+    /// Run long-lived processes, such as dev servers and emulators, that this thread starts and does not wait on
+    ///
+    /// A service runs under the daemon, detached from the caller's shell, in the
+    /// caller's directory and with its whole environment. It belongs to the
+    /// calling thread and is stopped when `service stop` asks, when that
+    /// thread's T3 thread is archived, settled, or deleted, or when `--max`
+    /// elapses. If it exits on its own, its owner gets one `SERVICE_EXITED`
+    /// event. Use it instead of a background shell command for anything that
+    /// keeps running, and `task run` for long commands whose end you wait on
+    Service {
+        /// Service subcommand
+        #[command(subcommand)]
+        command: service::ServiceCommand,
+    },
     /// Read, compact, and watch the context of agent threads on any Fleet machine
     Thread {
         /// Thread subcommand
@@ -164,6 +179,19 @@ pub enum Command {
         /// Task id
         #[arg(long)]
         id: TaskId,
+        /// Inherited flock file descriptor
+        #[arg(long)]
+        lock_fd: i32,
+    },
+    /// Hidden worker parent of one service
+    #[command(name = "service-run", hide = true)]
+    ServiceRun {
+        /// State directory
+        #[arg(long)]
+        home: PathBuf,
+        /// Service id
+        #[arg(long)]
+        id: crate::service::ServiceId,
         /// Inherited flock file descriptor
         #[arg(long)]
         lock_fd: i32,
@@ -302,6 +330,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         crate::runner::run(home, *id, *lock_fd).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    if let Command::ServiceRun { home, id, lock_fd } = &cli.command {
+        let home = Home::resolve(Some(home.clone()))?;
+        crate::service::worker::run(home, *id, *lock_fd).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let ctx = Ctx::new(&cli)?;
     match cli.command {
         Command::Daemon { command } => daemon::run(&ctx, command).await,
@@ -311,6 +344,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
+        Command::Service { command } => service::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Thread { command } => thread::run(&ctx, command).await,
         Command::Wait(args) => wait::wait(&ctx, args).await,
@@ -319,7 +353,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
             version(&ctx)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::TaskRun { .. } => unreachable!("handled above"),
+        Command::TaskRun { .. } | Command::ServiceRun { .. } => unreachable!("handled above"),
     }
 }
 

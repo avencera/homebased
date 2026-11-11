@@ -8,7 +8,8 @@
 //! tasks, and an interactive thread waiting on the user alike. A terminal
 //! session has no T3 thread to send `/compact` to, so it compacts itself
 //!
-//! The same loop then checks every `homebased thread watch`
+//! The same loop then checks every `homebased thread watch`, and stops the
+//! services whose owner's T3 thread is done
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +21,7 @@ use tracing::{info, warn};
 
 use super::AppState;
 use super::compaction_log::{self, Trigger};
+use super::service_api::{self, OwnerMemory};
 use super::thread_api::local::LocalIndex;
 use super::thread_api::local_sources;
 use super::thread_api::watch_scan::{self, WatchMemory};
@@ -56,6 +58,7 @@ pub(super) async fn run(state: AppState) {
         .and_then(|seconds| i64::try_from(seconds).ok())
         .map_or(watch_scan::QUIET_FINISHED, TimeDelta::seconds);
     let mut watches = WatchMemory::new(quiet);
+    let mut owners = OwnerMemory::default();
     let log = state.home.compaction_log_path();
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -83,6 +86,7 @@ pub(super) async fn run(state: AppState) {
         }
         // after the idle compactions, so a watch reads a size they already changed
         watch_scan::scan(&state, &mut watches, Utc::now()).await;
+        service_api::scan(&state, &mut owners).await;
     }
 }
 

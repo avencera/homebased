@@ -691,6 +691,40 @@ pub(crate) async fn deliver_watch_event(
     Ok(Some(outcome))
 }
 
+/// Send a service's `SERVICE_EXITED` line to its owner
+///
+/// `None` means a send check suppressed it, which a service event never has
+pub(crate) async fn deliver_service_event(
+    home: &Home,
+    service: &crate::service::Service,
+    line: String,
+    callback: &ActorRef<CallbackMsg>,
+) -> Result<Option<DeliveryOutcome>, AppError> {
+    let dir = home.service_paths(service.id).delivery;
+    std::fs::create_dir_all(&dir)?;
+    let attempt = OriginAttempt {
+        context: service.callback.clone(),
+        thread: service.owner,
+        line,
+        paths: CallbackPaths {
+            callback_log: dir.join("callback.log"),
+            delivery_lock: dir.join("delivery.lock"),
+        },
+        // a service sends one event, so one pending file covers it
+        pending: PendingT3Send::new(dir.join("t3-pending")),
+        before_send: None,
+    };
+    let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
+        return Ok(None);
+    };
+    if matches!(outcome, DeliveryOutcome::Delivered) {
+        let _ = callback.cast(CallbackMsg::Delivered {
+            thread: service.owner,
+        });
+    }
+    Ok(Some(outcome))
+}
+
 /// One reserved attempt on a saved origin route
 struct OriginAttempt {
     context: CallbackContext,

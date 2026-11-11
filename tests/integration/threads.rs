@@ -27,7 +27,7 @@ impl Harness {
     }
 
     /// T3's state database with the tables homebased reads, empty
-    fn t3_state(&self) -> rusqlite::Connection {
+    pub(super) fn t3_state(&self) -> rusqlite::Connection {
         let userdata = self.user_home.join(".t3/userdata");
         fs::create_dir_all(&userdata).unwrap();
         let db = rusqlite::Connection::open(userdata.join("statev2.sqlite")).unwrap();
@@ -83,7 +83,7 @@ impl Harness {
     }
 
     /// A T3 thread whose active provider thread is the Codex thread `session`
-    fn t3_thread(&self, thread: &str, title: &str, session: Option<&str>) {
+    pub(super) fn t3_thread(&self, thread: &str, title: &str, session: Option<&str>) {
         let db = self.t3_state();
         db.execute(
             "INSERT INTO orchestration_v2_projection_threads (thread_id, title) VALUES (?1, ?2)",
@@ -96,7 +96,7 @@ impl Harness {
     }
 
     /// Make the Codex thread `session` the one T3 runs `thread` in next
-    fn t3_session(&self, thread: &str, session: &str) {
+    pub(super) fn t3_session(&self, thread: &str, session: &str) {
         let id = format!("provider-thread:{session}");
         let payload = json!({ "nativeThreadRef": { "driver": "codex", "nativeId": session } });
         let db = self.t3_state();
@@ -115,7 +115,7 @@ impl Harness {
         .unwrap();
     }
 
-    fn delete_t3_thread(&self, thread: &str) {
+    pub(super) fn delete_t3_thread(&self, thread: &str) {
         self.t3_state()
             .execute(
                 "UPDATE orchestration_v2_projection_threads SET deleted_at = '2026-10-03T00:00:00Z'
@@ -194,7 +194,7 @@ impl Harness {
     }
 
     /// Settle `thread` in T3's sidebar, or unsettle it
-    fn settle_t3_thread(&self, thread: &str, settled: bool) {
+    pub(super) fn settle_t3_thread(&self, thread: &str, settled: bool) {
         let state = if settled { "settled" } else { "unsettled" };
         self.t3_state()
             .execute(
@@ -206,7 +206,7 @@ impl Harness {
             .unwrap();
     }
 
-    fn archive_t3_thread(&self, thread: &str) {
+    pub(super) fn archive_t3_thread(&self, thread: &str) {
         self.t3_state()
             .execute(
                 "UPDATE orchestration_v2_projection_threads SET archived_at = '2026-10-03T00:00:00Z'
@@ -252,7 +252,7 @@ impl Harness {
     }
 
     /// A Codex rollout for `session` in `cwd`, whose last request carried `tokens`
-    fn codex_session(&self, session: &str, cwd: &std::path::Path, tokens: u64) {
+    pub(super) fn codex_session(&self, session: &str, cwd: &std::path::Path, tokens: u64) {
         let day = self.user_home.join(".codex/sessions/2026/10/02");
         fs::create_dir_all(&day).unwrap();
         let at = (Utc::now() - ChronoDuration::minutes(10)).to_rfc3339();

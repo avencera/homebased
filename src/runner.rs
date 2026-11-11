@@ -45,7 +45,7 @@ const CANCELLATION_POLL: Duration = Duration::from_millis(250);
 const DESCENDANT_POLL: Duration = Duration::from_secs(1);
 /// Lock wait for the worker's connection. A worker that cannot claim its row
 /// leaves the task lost, and nothing waits on it, so it outlasts slow daemon commits
-const WORKER_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const WORKER_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy)]
 enum ChildCancellationCause {
@@ -154,7 +154,8 @@ pub(crate) fn task_run_executable() -> Result<std::path::PathBuf, AppError> {
     })
 }
 
-fn prepare_worker(fd: RawFd) -> io::Result<()> {
+/// `pre_exec` of a worker: its own session, and the inherited lock kept across exec
+pub(crate) fn prepare_worker(fd: RawFd) -> io::Result<()> {
     setsid().map_err(io::Error::from)?;
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     let flags = fcntl(borrowed, FcntlArg::F_GETFD).map_err(io::Error::from)?;
@@ -605,7 +606,9 @@ async fn stop_leftovers(id: TaskId, store: &Store, descendants: Option<Descendan
 }
 
 /// A Unix wait status is either an exit code or a terminating signal
-fn status_to_reason(status: io::Result<std::process::ExitStatus>) -> Result<ExitReason, AppError> {
+pub(crate) fn status_to_reason(
+    status: io::Result<std::process::ExitStatus>,
+) -> Result<ExitReason, AppError> {
     let status = match status {
         Ok(status) => status,
         Err(err) => {
@@ -696,7 +699,10 @@ impl ChildStop<'_> {
     }
 }
 
-async fn cancel_child_group(
+/// Stop the child's whole process group with one shared TERM grace, then
+/// KILL, and return the evidence with the child's own exit when it ended
+/// before any signal
+pub(crate) async fn cancel_child_group(
     child: &mut tokio::process::Child,
     child_pgid: i32,
 ) -> (ProcessGroupExitEvidence, Option<ExitReason>) {
@@ -739,7 +745,7 @@ async fn cancel_child_group(
 }
 
 /// Terminate remaining members of the child process group and confirm the result
-async fn cleanup_process_group(child_pgid: i32) -> ProcessGroupExitEvidence {
+pub(crate) async fn cleanup_process_group(child_pgid: i32) -> ProcessGroupExitEvidence {
     cleanup_process_group_with(
         child_pgid,
         || process_group_probe(child_pgid),

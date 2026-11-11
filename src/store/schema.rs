@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 14;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 13] = [
+const MIGRATIONS: [Migration; 14] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -33,6 +33,7 @@ const MIGRATIONS: [Migration; 13] = [
     add_gpu_summaries,
     add_watch_conditions,
     add_lease_idle_trips,
+    add_services,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -167,6 +168,39 @@ fn add_watch_conditions(conn: &Connection) -> Result<(), rusqlite::Error> {
          WHERE json_valid(watch_json) AND json_type(watch_json, '$.threshold') = 'object';",
     )
 }
+
+/// Version 15: long-lived services that agents start and do not wait on
+fn add_services(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(SERVICES_TABLE)
+}
+
+/// One row per service, live or ended
+///
+/// `service_json` is fixed at start. The worker writes the process columns
+/// and `ending_json`; the daemon writes `stop_request` and may end a service
+/// whose worker is gone. `event_due` marks an end that owes the owner its one
+/// `SERVICE_EXITED` event, which settles like a watch event
+const SERVICES_TABLE: &str = "
+CREATE TABLE services (
+    id TEXT PRIMARY KEY,
+    owner_thread TEXT NOT NULL,
+    service_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    worker_pid INTEGER,
+    child_json TEXT,
+    started_at TEXT,
+    ready_at TEXT,
+    stop_request TEXT CHECK (stop_request IN ('stopped', 'owner_done')),
+    ended_at TEXT,
+    ending_json TEXT CHECK ((ended_at IS NULL) = (ending_json IS NULL)),
+    event_due INTEGER NOT NULL DEFAULT 0 CHECK (event_due IN (0, 1)),
+    event_settled_at TEXT,
+    event_delivery TEXT CHECK ((event_settled_at IS NULL) = (event_delivery IS NULL)),
+    CHECK (event_due = 0 OR ended_at IS NOT NULL)
+);
+CREATE INDEX services_live ON services (owner_thread) WHERE ended_at IS NULL;
+CREATE INDEX services_events ON services (ended_at) WHERE event_due = 1 AND event_settled_at IS NULL;
+";
 
 /// The worker's whole-attempt Netdata read, saved just before the exit
 /// commit, and the summary that commit computes once; the summary is never
@@ -409,6 +443,7 @@ fn schema() -> String {
         .replace("{OPERATION_KINDS}", OPERATION_KINDS)
         .replace("{GPU_IDLE_TABLES}", GPU_IDLE_TABLES)
         .replace("{LEASE_IDLE_TABLE}", LEASE_IDLE_TABLE)
+        .replace("{SERVICES_TABLE}", SERVICES_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -750,7 +785,8 @@ CREATE TABLE resource_job_delivery (
 {THREAD_WATCH_TABLES}
 {DETECTED_GPUS_TABLE}
 {GPU_IDLE_TABLES}
-{LEASE_IDLE_TABLE}";
+{LEASE_IDLE_TABLE}
+{SERVICES_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -866,6 +902,7 @@ mod tests {
             .replace(&format!(",\n    {}", super::JOB_ORIGIN_PROTOCOL), "")
             .replace(super::GPU_IDLE_TABLES, "")
             .replace(super::LEASE_IDLE_TABLE, "")
+            .replace(super::SERVICES_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -899,6 +936,7 @@ mod tests {
             "resource_operations",
             "resource_gpu_idle_attempts",
             "resource_gpu_idle_controls",
+            "services",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
@@ -934,8 +972,9 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // version 12 had no lease guard table
-        conn.execute_batch("DROP TABLE lease_idle_trips").unwrap();
+        // version 12 had no lease guard or services table
+        conn.execute_batch("DROP TABLE lease_idle_trips; DROP TABLE services")
+            .unwrap();
         conn.pragma_update(None, "user_version", 12).unwrap();
         // the shape version 12 saved: `threshold` where `condition` is now
         let old = serde_json::json!({
