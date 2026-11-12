@@ -9,9 +9,11 @@ use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::fleet::protocol::{
-    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL, SUPPORTED_PROTOCOLS,
+    CI_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL,
+    SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
+use crate::queue::ci::{ClassOffer, Drain, JobClass, JobTiming, MachineOffer, SlotCapacity};
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
 use crate::queue::lease_guard::LeaseIdleTrip;
@@ -68,6 +70,10 @@ pub enum QueueRequest {
         origin: MachineId,
         /// Canonical accepted spec
         spec: Box<JobSpec>,
+        /// When the origin took a CI job, which starts its wait; cluster
+        /// protocol 6 and later
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submitted_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Idempotent queue placement
     Move {
@@ -102,6 +108,27 @@ pub enum QueueRequest {
         /// What to do
         control: GpuIdleControl,
     },
+    /// The machine's CI offer and slots; the daemon answers it, since the
+    /// offer reads load and disk. Cluster protocol 6 and later
+    CiStatus,
+    /// Set one class's slot count; cluster protocol 6 and later
+    CiCapacity {
+        /// Class to change
+        class: JobClass,
+        /// New slot count; 0 stops the machine taking the class
+        capacity: SlotCapacity,
+    },
+    /// Drain the machine for CI jobs, or reopen it; cluster protocol 6 and
+    /// later
+    CiDrain {
+        /// Why it is drained; `None` reopens it
+        reason: Option<String>,
+    },
+    /// Timings of CI jobs the machine accepted; cluster protocol 6 and later
+    CiTimings {
+        /// Earliest end to include; jobs that have not ended are always included
+        since: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl QueueRequest {
@@ -110,6 +137,10 @@ impl QueueRequest {
     pub fn min_protocol(&self) -> ClusterProtocolVersion {
         match self {
             Self::GpuIdle { .. } => GPU_IDLE_PROTOCOL,
+            Self::CiStatus
+            | Self::CiCapacity { .. }
+            | Self::CiDrain { .. }
+            | Self::CiTimings { .. } => CI_PROTOCOL,
             Self::Submit { spec, .. } => submit_protocol(spec),
             _ => SUPPORTED_PROTOCOLS.min(),
         }
@@ -118,13 +149,74 @@ impl QueueRequest {
 
 /// Lowest cluster protocol whose authorities accept `spec`
 ///
-/// An older authority refuses a spec with `gpu_idle` as an unknown field
+/// An older authority refuses a spec with `gpu_idle` or `ci` as an unknown
+/// field
 #[must_use]
 pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
-    if spec.gpu_idle.is_some() {
+    if spec.ci.is_some() {
+        CI_PROTOCOL
+    } else if spec.gpu_idle.is_some() {
         GPU_IDLE_PROTOCOL
     } else {
         SUPPORTED_PROTOCOLS.min()
+    }
+}
+
+/// One machine's CI slots, its drain, and per class its capacity, busy
+/// slots, and queued jobs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CiSlotList {
+    /// Machine the slots are on
+    pub machine: MachineId,
+    /// Its drain, if any
+    pub drain: Option<Drain>,
+    /// Per-class counts
+    pub classes: Vec<ClassOffer>,
+    /// Every slot with its run, retired ones included
+    pub slots: Vec<ResourceRecord>,
+}
+
+/// `ci_status`: what placement reads, and the slots behind it
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CiStatus {
+    /// Admission, load, disk, and per-class counts
+    pub offer: MachineOffer,
+    /// Every slot with its run, retired ones included
+    pub slots: Vec<ResourceRecord>,
+}
+
+/// CI job timings one machine recorded
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CiTimingList {
+    /// Machine that accepted the jobs
+    pub machine: MachineId,
+    /// One per job, by submit time
+    pub timings: Vec<JobTiming>,
+}
+
+impl Store {
+    /// Resources of the GPU queue; CI slots show in `ci slots` instead
+    fn gpu_resources_on(&self, machine: MachineId) -> Result<Vec<ResourceRecord>, AppError> {
+        let mut resources = self.resources_on(machine)?;
+        resources.retain(|record| record.resource.slot.is_none());
+        Ok(resources)
+    }
+
+    /// Non-terminal jobs of the GPU queue; CI jobs run on CI slots
+    fn gpu_machine_queue(&self, machine: MachineId) -> Result<Vec<JobRecord>, AppError> {
+        let mut jobs = self.machine_queue(machine)?;
+        jobs.retain(|job| job.spec.ci.is_none());
+        Ok(jobs)
+    }
+
+    /// The CI slots, drain, and class counts of `machine`
+    pub fn ci_slot_list(&self, machine: MachineId) -> Result<CiSlotList, AppError> {
+        Ok(CiSlotList {
+            machine,
+            drain: self.ci_drain(machine)?,
+            classes: self.ci_class_offers(machine)?,
+            slots: self.ci_slots(machine)?,
+        })
     }
 }
 
@@ -246,10 +338,10 @@ impl Store {
         let mut result = match request {
             QueueRequest::Resources => serde_json::to_value(ResourceList {
                 machine,
-                resources: self.resources_on(machine)?,
+                resources: self.gpu_resources_on(machine)?,
             })?,
             QueueRequest::Jobs => {
-                let jobs = self.machine_queue(machine)?;
+                let jobs = self.gpu_machine_queue(machine)?;
                 serde_json::to_value(JobList {
                     machine,
                     lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
@@ -257,10 +349,10 @@ impl Store {
                 })?
             }
             QueueRequest::Overview => {
-                let jobs = self.machine_queue(machine)?;
+                let jobs = self.gpu_machine_queue(machine)?;
                 serde_json::to_value(QueueOverview {
                     machine,
-                    resources: self.resources_on(machine)?,
+                    resources: self.gpu_resources_on(machine)?,
                     lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
                     jobs,
                 })?
@@ -319,16 +411,20 @@ impl Store {
             QueueRequest::Label { resource, label } => {
                 serde_json::to_value(self.set_resource_label(machine, resource, label.as_ref())?)?
             }
-            QueueRequest::Submit { job, origin, spec } => {
-                serde_json::to_value(self.submit_job(&NewJob {
-                    id: *job,
-                    machine,
-                    origin: *origin,
-                    spec: *spec.clone(),
-                    env: env.clone(),
-                    origin_protocol: protocol,
-                })?)?
-            }
+            QueueRequest::Submit {
+                job,
+                origin,
+                spec,
+                submitted_at,
+            } => serde_json::to_value(self.submit_job(&NewJob {
+                id: *job,
+                machine,
+                origin: *origin,
+                spec: *spec.clone(),
+                env: env.clone(),
+                origin_protocol: protocol,
+                submitted_at: *submitted_at,
+            })?)?,
             QueueRequest::Move {
                 operation,
                 job,
@@ -357,6 +453,27 @@ impl Store {
                 control,
                 chrono::Utc::now(),
             )?)?,
+            QueueRequest::CiStatus => {
+                return Err(AppError::Internal {
+                    message: "the daemon answers ci_status, not the store".into(),
+                });
+            }
+            QueueRequest::CiCapacity { class, capacity } => {
+                self.set_ci_capacity(machine, class, *capacity)?;
+                serde_json::to_value(self.ci_slot_list(machine)?)?
+            }
+            QueueRequest::CiDrain { reason } => {
+                let drain = reason.clone().map(|reason| Drain {
+                    reason,
+                    since: chrono::Utc::now(),
+                });
+                self.set_ci_drain(machine, drain)?;
+                serde_json::to_value(self.ci_slot_list(machine)?)?
+            }
+            QueueRequest::CiTimings { since } => serde_json::to_value(CiTimingList {
+                machine,
+                timings: self.ci_timings(*since)?,
+            })?,
         };
         if let Some(object) = result.as_object_mut() {
             object.insert("api_version".into(), json!(API_VERSION));

@@ -254,6 +254,7 @@ async fn settle_jobs(
 ) -> Result<(), AppError> {
     let routes = call(&state.store, |reply| StoreMsg::HeldJobRoutes { reply }).await?;
     retries.retain(|job, _| routes.iter().any(|route| route.job == *job));
+    let mut placing = Vec::new();
     for route in routes {
         let job = route.job;
         if backing_off(retries, job) {
@@ -285,6 +286,11 @@ async fn settle_jobs(
                         .await?;
                         continue;
                     }
+                    // placement picks a CI job's machine once a slot is free
+                    HeldDecision::Release if route.spec.ci.is_some() => {
+                        placing.push(route);
+                        continue;
+                    }
                     HeldDecision::Release => {
                         call(&state.store, |reply| StoreMsg::ReleaseHeldJob {
                             job,
@@ -299,6 +305,9 @@ async fn settle_jobs(
         };
         let sent = queue_api::send_job(state, route).await.map(|_| ());
         record_attempt(retries, job, sent, "held job send deferred");
+    }
+    for (job, sent) in super::ci_api::place_ready(state, &placing).await? {
+        record_attempt(retries, job, sent, "CI job send deferred");
     }
     Ok(())
 }

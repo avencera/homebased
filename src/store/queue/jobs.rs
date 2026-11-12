@@ -69,9 +69,20 @@ impl Store {
             let target = match &new.spec.resource {
                 None => Target::Any,
                 Some(selector) => {
-                    Target::Pinned(self.resolve_resource(new.machine, selector)?.resource.id)
+                    let record = self.resolve_resource(new.machine, selector)?;
+                    // a CI slot runs only its class's CI jobs
+                    if record.resource.slot.is_some() {
+                        return Err(QueueError::ResourceNotFound {
+                            resource: record.resource.name.to_string(),
+                        }
+                        .into());
+                    }
+                    Target::Pinned(record.resource.id)
                 }
             };
+            if let Some(ci) = &new.spec.ci {
+                self.check_class_offered(new.machine, &ci.class)?;
+            }
             let pinned = match target {
                 Target::Any => None,
                 Target::Pinned(resource) => Some(resource.to_string()),
@@ -102,6 +113,7 @@ impl Store {
                     new.origin_protocol.0,
                 ],
             )?;
+            self.open_ci_timing(new, Utc::now())?;
             Ok(accepted(&self.require_job(new.id)?))
         })
     }
@@ -628,6 +640,13 @@ impl Store {
             Some(run) => self.resource(run.resource)?.map(|record| record.resource),
             None => None,
         };
+        // a final event of a run the queue killed says so, and closes the
+        // CI job's timing
+        let timeout = match (&event, &run) {
+            (JobEventKind::JobFailed, Some(run)) => self.run_timeout(run.task)?,
+            _ => None,
+        };
+        self.close_ci_timing(job, event, timeout.is_some(), Utc::now())?;
         let event = JobEvent {
             job,
             seq: u64::try_from(seq).map_err(|_| corrupt("negative event sequence"))?,
@@ -643,6 +662,7 @@ impl Store {
             gpu_idle,
             gpu_summaries,
             lease_idle,
+            timeout,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)

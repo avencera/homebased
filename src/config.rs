@@ -117,6 +117,8 @@ pub struct Config {
     pub resource: ResourceConfig,
     /// Dashboard content-origin ports
     pub dashboard: Dashboard,
+    /// CI slot admission and checkouts, from `[ci]`
+    pub ci: crate::queue::ci::CiConfig,
 }
 
 /// Dashboard settings: the HTTPS proxy in front of it and the ports of its
@@ -241,6 +243,44 @@ struct RawConfig {
     resource: RawResource,
     #[serde(default)]
     dashboard: RawDashboard,
+    #[serde(default)]
+    ci: RawCi,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCi {
+    #[serde(default)]
+    checkout_root: Option<PathBuf>,
+    #[serde(default)]
+    max_load_per_core: Option<f64>,
+    #[serde(default)]
+    min_free_disk_gib: Option<u64>,
+}
+
+impl RawCi {
+    fn validate(self) -> Result<crate::queue::ci::CiConfig, String> {
+        let mut config = crate::queue::ci::CiConfig::default();
+        if let Some(root) = self.checkout_root {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "ci.checkout_root must be absolute, got {}",
+                    root.display()
+                ));
+            }
+            config.checkout_root = Some(root);
+        }
+        if let Some(limit) = self.max_load_per_core {
+            config.max_load_per_core =
+                crate::queue::ci::LoadLimit::parse(limit).map_err(|error| format!("ci.{error}"))?;
+        }
+        if let Some(gib) = self.min_free_disk_gib {
+            config.min_free_disk = gib
+                .checked_mul(1024 * 1024 * 1024)
+                .ok_or_else(|| format!("ci.min_free_disk_gib {gib} is too large"))?;
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -561,6 +601,7 @@ impl RawConfig {
         let waiting_tasks = self.power.waiting_tasks;
         let resource = self.resource.validate()?;
         let dashboard = self.dashboard.validate()?;
+        let ci = self.ci.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -589,6 +630,7 @@ impl RawConfig {
             waiting_tasks,
             resource,
             dashboard,
+            ci,
         })
     }
 }

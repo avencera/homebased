@@ -7,6 +7,7 @@ use super::{JobRecord, ResourceOrigin, ResourceRecord, corrupt, parse_uuid};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::queue::ci::{JobClass, SlotLane, SlotNumber};
 use crate::queue::gpu::GpuUuid;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
@@ -19,7 +20,7 @@ pub(super) const RESOURCE_SELECT: &str =
     "SELECT id, machine, name, device, run_job, run_task, run_number,
     run_step, run_phase, run_reserved_at, run_started_at, run_stop_cause,
     run_stop_requested_at, run_cleanup_attempt, run_attention_id, run_attention_failure, origin,
-    run_resume, label, gpu_uuid
+    run_resume, label, gpu_uuid, ci_class, ci_slot, ci_retired
  FROM resources";
 
 pub(super) const JOB_SELECT: &str = "SELECT id, machine, origin_machine, spec_json, spec_digest,
@@ -59,6 +60,9 @@ pub(super) struct RawResource {
     run_resume: Option<bool>,
     label: Option<String>,
     gpu_uuid: Option<String>,
+    ci_class: Option<String>,
+    ci_slot: Option<i64>,
+    ci_retired: bool,
 }
 
 impl RawResource {
@@ -84,7 +88,26 @@ impl RawResource {
             run_resume: row.get(17)?,
             label: row.get(18)?,
             gpu_uuid: row.get(19)?,
+            ci_class: row.get(20)?,
+            ci_slot: row.get(21)?,
+            ci_retired: row.get(22)?,
         })
+    }
+
+    /// The CI slot this resource is, from its `ci_` columns
+    fn slot(&self) -> Result<Option<SlotLane>, QueueError> {
+        let (Some(class), Some(slot)) = (&self.ci_class, self.ci_slot) else {
+            return Ok(None);
+        };
+        let slot = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| SlotNumber::try_from(slot).ok())
+            .ok_or_else(|| corrupt(format!("bad slot number {slot}")))?;
+        Ok(Some(SlotLane {
+            class: JobClass::parse(class).map_err(|_| corrupt(format!("bad class {class:?}")))?,
+            slot,
+            retired: self.ci_retired,
+        }))
     }
 
     /// The active run's phase from `run_phase` and its phase-specific columns
@@ -146,6 +169,7 @@ impl RawResource {
                 .map(GpuUuid::parse)
                 .transpose()
                 .map_err(corrupt)?,
+            slot: self.slot()?,
         };
         let machine: MachineId = self.machine.parse()?;
         let run = match (

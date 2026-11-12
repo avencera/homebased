@@ -314,6 +314,7 @@ fn netdata_idle_alerts_respect_snooze_recovery_and_old_origins() {
             spec: JobSpec::parse_value(&old_spec).unwrap(),
             env: TaskEnv::capture(),
             origin_protocol: homebased::fleet::protocol::ClusterProtocolVersion(3),
+            submitted_at: None,
         })
         .unwrap();
     restart_with_gpus(&mut h, &bin, port);

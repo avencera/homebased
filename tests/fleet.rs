@@ -510,6 +510,8 @@ fn gate_command(gate: &Path) -> String {
 
 #[path = "fleet/cancellation.rs"]
 mod cancellation;
+#[path = "fleet/ci_queue.rs"]
+mod ci_queue;
 #[path = "fleet/dependencies.rs"]
 mod dependencies;
 #[path = "fleet/events.rs"]

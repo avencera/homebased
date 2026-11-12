@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 
+use super::ci::CheckoutRun;
 use super::rows::{RESOURCE_SELECT, RawResource};
 use super::{JobRecord, corrupt, event_run, failed_run, parse_uuid, stale, stop_cause};
 use crate::domain::{
@@ -55,9 +56,28 @@ impl Store {
         binary: PathBuf,
         now: DateTime<Utc>,
     ) -> Result<ActiveRun, AppError> {
-        self.immediate(|| self.reserve_run_inner(machine, job, resource, task, binary, now))
+        self.immediate(|| self.reserve_run_inner(machine, job, resource, task, binary, None, now))
     }
 
+    /// Reserve a run of a CI job with `git` that runs `checkout` instead of
+    /// its step as submitted
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_checkout_run(
+        &self,
+        machine: MachineId,
+        job: JobId,
+        resource: ResourceId,
+        task: TaskId,
+        binary: PathBuf,
+        checkout: &CheckoutRun,
+        now: DateTime<Utc>,
+    ) -> Result<ActiveRun, AppError> {
+        self.immediate(|| {
+            self.reserve_run_inner(machine, job, resource, task, binary, Some(checkout), now)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn reserve_run_inner(
         &self,
         machine: MachineId,
@@ -65,6 +85,7 @@ impl Store {
         resource: ResourceId,
         task: TaskId,
         binary: PathBuf,
+        checkout: Option<&CheckoutRun>,
         now: DateTime<Utc>,
     ) -> Result<ActiveRun, AppError> {
         let record = self.require_machine_job(machine, job)?;
@@ -130,8 +151,8 @@ impl Store {
             id: task,
             name: record.spec.name.clone(),
             thread: record.spec.thread,
-            workload: step.to_workload(),
-            cwd: record.spec.cwd.clone(),
+            workload: checkout.map_or_else(|| step.to_workload(), |run| run.workload.clone()),
+            cwd: checkout.map_or_else(|| record.spec.cwd.clone(), |run| run.cwd.clone()),
             timeout: record.spec.timeout,
             env: self.job_env(job)?,
             binary,
@@ -202,7 +223,15 @@ impl Store {
                 StepWorkload::Task(workload) => workload.command.program().to_owned(),
                 StepWorkload::Container(_) => "docker".into(),
             };
-            self.reserve_run_inner(machine, job, resource, task, PathBuf::from(program), now)?;
+            self.reserve_run_inner(
+                machine,
+                job,
+                resource,
+                task,
+                PathBuf::from(program),
+                None,
+                now,
+            )?;
             self.commit_terminal(
                 task,
                 ProcessStatus::Queued,
@@ -227,6 +256,9 @@ impl Store {
     ) -> Result<ActiveRun, AppError> {
         self.immediate(|| {
             let mut run = self.require_run(resource, task)?;
+            // a CI job's run time starts when its child does, so a launch that
+            // never spawned reports no run time
+            self.start_ci_timing(run.job, started_at)?;
             run.phase = match run.phase {
                 RunPhase::Launching { .. } => RunPhase::Executing { started_at },
                 RunPhase::Stopping {
@@ -620,6 +652,15 @@ impl Store {
                 run.step,
                 JobEventKind::JobFailed,
             ),
+            // the queue stopped a CI run past its `kill_after`, which fails
+            // the job rather than cancelling it
+            Some(JobTransition::Cancelled) if self.run_timeout(run.task)?.is_some() => {
+                JobAfterRun::ended(
+                    JobState::Failed { run: run.task },
+                    run.step,
+                    JobEventKind::JobFailed,
+                )
+            }
             Some(JobTransition::Cancelled) => {
                 JobAfterRun::ended(JobState::Cancelled, run.step, JobEventKind::JobCancelled)
             }

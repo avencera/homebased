@@ -24,6 +24,7 @@ use crate::fleet::protocol::{
     CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
+use crate::queue::ci::MachineChoice;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::gpu_idle::GpuIdleControl;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
@@ -328,11 +329,21 @@ async fn submit(
             })
             .await?;
             // unknown, failed, and run tasks are refused before anything is saved
-            let held = match &body.after {
+            let waits = match &body.after {
                 Some(after) => super::dependencies::must_wait(&state, after).await?,
                 None => false,
             };
-            if held {
+            // a CI job waits on its origin until placement picks a machine,
+            // and is refused now when no machine it may use offers its class
+            let ci = body.spec.ci.is_some();
+            let held = waits || ci;
+            if ci {
+                let choice = match body.spec.machine {
+                    Some(_) => MachineChoice::Pinned(authority),
+                    None => MachineChoice::Any,
+                };
+                super::ci_api::check_offered(&state, &body.spec, choice).await?;
+            } else if held {
                 check_held_authority(&state, authority, &body.spec).await?;
             }
             let route = JobRoute {
@@ -355,6 +366,7 @@ async fn submit(
                 },
                 after: body.after,
                 owes_final_event: held,
+                submitted_at: ci.then(chrono::Utc::now),
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),
@@ -386,6 +398,7 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
         job: route.job,
         origin: route.origin,
         spec: Box::new(route.spec.clone()),
+        submitted_at: route.submitted_at,
     };
     let result = if route.authority == state.machine.identity.machine {
         execute(state, request, route.callback.env.clone()).await
@@ -435,6 +448,7 @@ fn definite_refusal(error: &AppError) -> bool {
             | "executable_missing"
             | "resource_not_found"
             | "job_conflict"
+            | "class_not_offered"
     )
 }
 
@@ -581,7 +595,7 @@ async fn job_authority(
     Ok(state.machine.identity.machine)
 }
 
-async fn resolve_machine(
+pub(super) async fn resolve_machine(
     state: &AppState,
     selector: Option<&MachineSelector>,
 ) -> Result<MachineId, AppError> {
@@ -721,7 +735,13 @@ async fn execute_at(
     env: TaskEnv,
     protocol: ClusterProtocolVersion,
 ) -> Result<Value, AppError> {
-    if let QueueRequest::Submit { job, origin, spec } = &request {
+    if matches!(request, QueueRequest::CiStatus) {
+        return super::ci_api::status(state).await;
+    }
+    if let QueueRequest::Submit {
+        job, origin, spec, ..
+    } = &request
+    {
         let stored = call(&state.store, |reply| StoreMsg::QueueJob { id: *job, reply }).await?;
         match stored {
             Some(record)

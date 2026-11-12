@@ -12,17 +12,23 @@ use crate::cleanup::{self, CleanupTiming, GroupOutcome, SweepOutcome};
 use crate::daemon::actors::supervisor::SupervisorMsg;
 use crate::daemon::actors::task::stop_run_task;
 use crate::daemon::actors::{StoreMsg, call};
+use crate::daemon::ci_gauge::{checkout_root, read_gauge};
 use crate::domain::{
-    ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, WorkExitEvidence, Workload,
+    ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskWorkload, WorkExitEvidence,
+    Workload,
 };
 use crate::error::AppError;
 use crate::home::Home;
+use crate::invocation::CommandLine;
 use crate::invocation::{resolve_docker_binary, resolve_executable};
 use crate::machine::MachineId;
-use crate::queue::schedule::{NoticeThresholds, decide};
+use crate::queue::ci::{Admission, CiConfig};
+use crate::queue::schedule::{NoticeThresholds, QueuedState, decide};
 use crate::queue::{
-    ActiveRun, CleanupFailure, JobId, ResourceId, RunPhase, StepWorkload, StopCause,
+    ActiveRun, CleanupFailure, JobId, QueueError, ResourceId, RunPhase, StepWorkload, StopCause,
 };
+use crate::store::queue::JobRecord;
+use crate::store::queue::ci::CheckoutRun;
 
 /// A reserved worker has this long to claim its task before the launch is abandoned
 pub(crate) const LAUNCH_CONFIRMATION_BOUND: Duration = Duration::from_secs(10);
@@ -58,6 +64,8 @@ pub(crate) struct QueueArgs {
     pub supervisor: ActorRef<SupervisorMsg>,
     /// Blocked notice settings from config.toml
     pub thresholds: NoticeThresholds,
+    /// CI admission and checkout settings from config.toml
+    pub ci: CiConfig,
 }
 
 /// Only timers and cleanup handles are transient; all domain state is in the store
@@ -221,6 +229,72 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
             );
         }
     }
+
+    // ci runs last and only logs, so a CI fault never skips GPU preemption
+    // or blocked-job notices
+    if let Err(error) = schedule_ci(&state.args).await {
+        tracing::warn!("ci schedule: {error}");
+    }
+    Ok(())
+}
+
+/// Kill CI runs past their limit, then start CI jobs on free slots while the
+/// machine admits them
+///
+/// Each class is its own pool, so `decide` sees only that class's slots and
+/// jobs. A pool starts at most its room, which a capacity cut lowers while
+/// retired slots still finish their runs. CI jobs only `wait`, so `decide`
+/// never asks to preempt one, and CI jobs have no blocked notices
+async fn schedule_ci(args: &QueueArgs) -> Result<(), AppError> {
+    let expired = call(&args.store, |reply| StoreMsg::CiExpire {
+        machine: args.machine,
+        now: Utc::now(),
+        reply,
+    })
+    .await?;
+    for run in expired {
+        if let RunPhase::Stopping { cause, .. } = run.phase {
+            tracing::info!(job = %run.job, task = %run.task, "CI run passed its kill_after");
+            enact_stop(args, run.task, cause).await?;
+        }
+    }
+
+    let pools = call(&args.store, |reply| StoreMsg::CiPools {
+        machine: args.machine,
+        now: Utc::now(),
+        reply,
+    })
+    .await?;
+    let waiting = pools.iter().any(|pool| {
+        pool.room() > 0
+            && pool
+                .snapshot
+                .queue
+                .iter()
+                .any(|job| job.state == QueuedState::Queued)
+    });
+    if !waiting {
+        return Ok(());
+    }
+    let drain = call(&args.store, |reply| StoreMsg::CiSlotList {
+        machine: args.machine,
+        reply,
+    })
+    .await?
+    .drain;
+    let root = checkout_root(&args.home, &args.ci);
+    let gauge = read_gauge(&root);
+    let admission = Admission::decide(drain.as_ref(), &gauge, &args.ci);
+    if !admission.is_open() {
+        tracing::debug!("CI admission closed: {}", admission.describe());
+        return Ok(());
+    }
+    for pool in pools {
+        let room = pool.room();
+        for launch in decide(&pool.snapshot).launches.into_iter().take(room) {
+            launch_job(args, launch.job, launch.resource).await?;
+        }
+    }
     Ok(())
 }
 
@@ -315,13 +389,31 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
         .ok_or_else(|| AppError::Internal {
             message: format!("scheduled job {job} has no next step"),
         })?;
-    let binary = match step {
-        StepWorkload::Task(workload) => {
+    let task = TaskId::new();
+    let checkout = match checkout_run(args, &record, step, resource).await {
+        Ok(checkout) => checkout,
+        Err(error) => {
+            return call(&args.store, |reply| StoreMsg::QueueLaunchFailed {
+                machine: args.machine,
+                job,
+                resource,
+                task,
+                message: error.to_string(),
+                now: Utc::now(),
+                reply,
+            })
+            .await;
+        }
+    };
+    let binary = match (step, &checkout) {
+        (_, Some(checkout)) => {
+            resolve_workload_binary(&checkout.workload, &env.path, &checkout.cwd)
+        }
+        (StepWorkload::Task(workload), None) => {
             resolve_executable(workload.command.program(), &env.path, &record.spec.cwd)
         }
-        StepWorkload::Container(_) => resolve_docker_binary(&env.path, &record.spec.cwd),
+        (StepWorkload::Container(_), None) => resolve_docker_binary(&env.path, &record.spec.cwd),
     };
-    let task = TaskId::new();
     let binary = match binary {
         Ok(binary) => binary,
         Err(error) => {
@@ -343,6 +435,7 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
         resource,
         task,
         binary,
+        checkout,
         now: Utc::now(),
         reply,
     })
@@ -362,6 +455,67 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
         reply,
     })
     .await
+}
+
+/// The checkout wrapper of a CI job with `git`, run from the slot's own
+/// clone, which this creates so the worker can start in it
+async fn checkout_run(
+    args: &QueueArgs,
+    record: &JobRecord,
+    step: &StepWorkload,
+    resource: ResourceId,
+) -> Result<Option<CheckoutRun>, AppError> {
+    let Some(git) = record.spec.ci.as_ref().and_then(|ci| ci.git.as_ref()) else {
+        return Ok(None);
+    };
+    let StepWorkload::Task(workload) = step else {
+        return Err(QueueError::Invariant {
+            message: format!("CI job {} has a container step", record.id),
+        }
+        .into());
+    };
+    let lane = call(&args.store, |reply| StoreMsg::QueueResources {
+        machine: args.machine,
+        reply,
+    })
+    .await?
+    .into_iter()
+    .find(|record| record.resource.id == resource)
+    .ok_or_else(|| QueueError::ResourceNotFound {
+        resource: resource.to_string(),
+    })?
+    .resource
+    .name;
+    let workdir = record
+        .spec
+        .checkout_workdir()
+        .ok_or_else(|| QueueError::Invariant {
+            message: format!("CI job {} has no checkout directory", record.id),
+        })?;
+    let clone = git.clone_dir(&checkout_root(&args.home, &args.ci), &lane);
+    tokio::fs::create_dir_all(&clone).await?;
+    let command = CommandLine::try_from_argv(git.wrap(&clone, &workdir, &workload.command))
+        .map_err(|error| AppError::Internal {
+            message: format!("checkout wrapper: {error}"),
+        })?;
+    Ok(Some(CheckoutRun {
+        workload: Workload::Task(TaskWorkload { command }),
+        cwd: clone,
+    }))
+}
+
+/// The executable of a checkout wrapper, which is a plain command
+fn resolve_workload_binary(
+    workload: &Workload,
+    path: &str,
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, AppError> {
+    match workload {
+        Workload::Task(task) => resolve_executable(task.command.program(), path, cwd),
+        _ => Err(AppError::Internal {
+            message: "a checkout wrapper is always a task command".into(),
+        }),
+    }
 }
 
 async fn start_cleanup(

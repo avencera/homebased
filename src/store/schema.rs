@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 15;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 14] = [
+const MIGRATIONS: [Migration; 15] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -34,6 +34,7 @@ const MIGRATIONS: [Migration; 14] = [
     add_watch_conditions,
     add_lease_idle_trips,
     add_services,
+    add_ci_slots,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -200,6 +201,64 @@ CREATE TABLE services (
 );
 CREATE INDEX services_live ON services (owner_thread) WHERE ended_at IS NULL;
 CREATE INDEX services_events ON services (ended_at) WHERE event_due = 1 AND event_settled_at IS NULL;
+";
+
+/// Version 16: CI slot lanes, drains, run timeouts, and job timings
+fn add_ci_slots(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE resources ADD COLUMN {RESOURCE_CI_CLASS};
+         ALTER TABLE resources ADD COLUMN {RESOURCE_CI_SLOT};
+         ALTER TABLE resources ADD COLUMN {RESOURCE_CI_RETIRED};
+         {CI_TABLES}"
+    ))
+}
+
+/// Class of a CI slot lane; a slot lane has no device and no GPU, so neither
+/// GPU guard ever watches it
+const RESOURCE_CI_CLASS: &str =
+    "ci_class TEXT CHECK (ci_class IS NULL OR (device IS NULL AND gpu_uuid IS NULL))";
+
+/// Slot number of a CI slot lane, set exactly when `ci_class` is
+const RESOURCE_CI_SLOT: &str = "ci_slot INTEGER \
+    CHECK ((ci_slot IS NULL) = (ci_class IS NULL) AND (ci_slot IS NULL OR ci_slot BETWEEN 1 AND 32))";
+
+/// A slot lane above its class's current capacity: it finishes its run and
+/// takes no new one
+const RESOURCE_CI_RETIRED: &str = "ci_retired INTEGER NOT NULL DEFAULT 0 \
+    CHECK (ci_retired IN (0, 1) AND (ci_retired = 0 OR ci_class IS NOT NULL))";
+
+/// Drained machines, run timeouts, and job timings of the CI queue
+///
+/// A timeout row is written in the transaction that stops the run, so the
+/// run's end reads it to fail the job instead of cancelling it. A timing row
+/// is written when the authority accepts a CI job and closed by its final
+/// event
+const CI_TABLES: &str = "
+CREATE TABLE ci_drain (
+    machine TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    since TEXT NOT NULL
+);
+CREATE TABLE ci_run_timeouts (
+    task_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    limit_secs INTEGER NOT NULL CHECK (limit_secs >= 1),
+    ran_secs INTEGER NOT NULL CHECK (ran_secs >= 0),
+    requested_at TEXT NOT NULL
+);
+CREATE INDEX ci_run_timeouts_job ON ci_run_timeouts (job_id);
+CREATE TABLE ci_job_timings (
+    job_id TEXT PRIMARY KEY,
+    machine TEXT NOT NULL,
+    class TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    outcome TEXT CHECK (outcome IN ('succeeded', 'failed', 'timed_out', 'cancelled')),
+    CHECK ((ended_at IS NULL) = (outcome IS NULL))
+);
+CREATE INDEX ci_job_timings_ended ON ci_job_timings (ended_at);
 ";
 
 /// The worker's whole-attempt Netdata read, saved just before the exit
@@ -444,6 +503,10 @@ fn schema() -> String {
         .replace("{GPU_IDLE_TABLES}", GPU_IDLE_TABLES)
         .replace("{LEASE_IDLE_TABLE}", LEASE_IDLE_TABLE)
         .replace("{SERVICES_TABLE}", SERVICES_TABLE)
+        .replace("{RESOURCE_CI_CLASS}", RESOURCE_CI_CLASS)
+        .replace("{RESOURCE_CI_SLOT}", RESOURCE_CI_SLOT)
+        .replace("{RESOURCE_CI_RETIRED}", RESOURCE_CI_RETIRED)
+        .replace("{CI_TABLES}", CI_TABLES)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -662,6 +725,9 @@ CREATE TABLE resources (
     run_attention_failure TEXT,
     {RESOURCE_LABEL},
     {RESOURCE_GPU_UUID},
+    {RESOURCE_CI_CLASS},
+    {RESOURCE_CI_SLOT},
+    {RESOURCE_CI_RETIRED},
     UNIQUE (machine, name),
     UNIQUE (id, machine),
     FOREIGN KEY (run_job, machine) REFERENCES resource_jobs(id, machine),
@@ -786,7 +852,8 @@ CREATE TABLE resource_job_delivery (
 {DETECTED_GPUS_TABLE}
 {GPU_IDLE_TABLES}
 {LEASE_IDLE_TABLE}
-{SERVICES_TABLE}";
+{SERVICES_TABLE}
+{CI_TABLES}";
 
 #[cfg(test)]
 mod tests {
@@ -903,6 +970,10 @@ mod tests {
             .replace(super::GPU_IDLE_TABLES, "")
             .replace(super::LEASE_IDLE_TABLE, "")
             .replace(super::SERVICES_TABLE, "")
+            .replace(&format!(",\n    {}", super::RESOURCE_CI_CLASS), "")
+            .replace(&format!(",\n    {}", super::RESOURCE_CI_SLOT), "")
+            .replace(&format!(",\n    {}", super::RESOURCE_CI_RETIRED), "")
+            .replace(super::CI_TABLES, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -972,9 +1043,15 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // version 12 had no lease guard or services table
-        conn.execute_batch("DROP TABLE lease_idle_trips; DROP TABLE services")
-            .unwrap();
+        // version 12 had no lease guard, services, or CI slots
+        conn.execute_batch(
+            "DROP TABLE lease_idle_trips; DROP TABLE services;
+             DROP TABLE ci_drain; DROP TABLE ci_run_timeouts; DROP TABLE ci_job_timings;
+             ALTER TABLE resources DROP COLUMN ci_retired;
+             ALTER TABLE resources DROP COLUMN ci_slot;
+             ALTER TABLE resources DROP COLUMN ci_class;",
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 12).unwrap();
         // the shape version 12 saved: `threshold` where `condition` is now
         let old = serde_json::json!({

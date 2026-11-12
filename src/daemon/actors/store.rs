@@ -149,6 +149,20 @@ pub(crate) enum StoreMsg {
         job: crate::queue::JobId,
         reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
     },
+    /// Send a CI job held for placement to a machine
+    PlaceHeldJob {
+        job: crate::queue::JobId,
+        authority: MachineId,
+        reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
+    },
+    /// Change a held CI job's machine choice or level
+    MoveHeldCiJob {
+        job: crate::queue::JobId,
+        machine: Option<crate::queue::spec::MachineSelector>,
+        authority: MachineId,
+        priority: Option<crate::queue::Priority>,
+        reply: RpcReplyPort<Result<crate::queue::delivery::JobRoute, AppError>>,
+    },
     /// Record the authority's definite refusal of a sent route
     RefuseJob {
         job: crate::queue::JobId,
@@ -265,8 +279,27 @@ pub(crate) enum StoreMsg {
         resource: crate::queue::ResourceId,
         task: TaskId,
         binary: PathBuf,
+        /// The checkout wrapper of a CI job with `git`
+        checkout: Option<crate::store::queue::ci::CheckoutRun>,
         now: chrono::DateTime<chrono::Utc>,
         reply: RpcReplyPort<Result<crate::queue::ActiveRun, AppError>>,
+    },
+    /// Each CI class's slots and jobs on the machine
+    CiPools {
+        machine: MachineId,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<Vec<crate::store::queue::ci::CiPool>, AppError>>,
+    },
+    /// Stop CI runs past their `kill_after`
+    CiExpire {
+        machine: MachineId,
+        now: chrono::DateTime<chrono::Utc>,
+        reply: RpcReplyPort<Result<Vec<crate::queue::ActiveRun>, AppError>>,
+    },
+    /// The machine's drain, per-class counts, and slots
+    CiSlotList {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<crate::store::queue::interface::CiSlotList, AppError>>,
     },
     /// Typed queue store operation
     QueueStop {
@@ -892,6 +925,21 @@ impl Actor for StoreActor {
             StoreMsg::ReleaseHeldJob { job, reply } => {
                 send_reply(reply, state.release_held_job(job));
             }
+            StoreMsg::PlaceHeldJob {
+                job,
+                authority,
+                reply,
+            } => send_reply(reply, state.place_held_job(job, authority)),
+            StoreMsg::MoveHeldCiJob {
+                job,
+                machine,
+                authority,
+                priority,
+                reply,
+            } => send_reply(
+                reply,
+                state.move_held_ci_job(job, machine, authority, priority),
+            ),
             StoreMsg::RefuseJob {
                 job,
                 refusal,
@@ -969,12 +1017,30 @@ impl Actor for StoreActor {
                 resource,
                 task,
                 binary,
+                checkout,
                 now,
                 reply,
             } => send_reply(
                 reply,
-                state.reserve_run(machine, job, resource, task, binary, now),
+                match &checkout {
+                    Some(checkout) => state
+                        .reserve_checkout_run(machine, job, resource, task, binary, checkout, now),
+                    None => state.reserve_run(machine, job, resource, task, binary, now),
+                },
             ),
+            StoreMsg::CiPools {
+                machine,
+                now,
+                reply,
+            } => send_reply(reply, state.ci_pools(machine, now)),
+            StoreMsg::CiExpire {
+                machine,
+                now,
+                reply,
+            } => send_reply(reply, state.expire_ci_runs(machine, now)),
+            StoreMsg::CiSlotList { machine, reply } => {
+                send_reply(reply, state.ci_slot_list(machine));
+            }
             StoreMsg::QueueStop { stop, now, reply } => {
                 send_reply(reply, state.commit_preemption(stop, now))
             }
