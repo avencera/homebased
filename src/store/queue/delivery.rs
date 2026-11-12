@@ -6,8 +6,10 @@ use rusqlite::{OptionalExtension, params};
 use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
+use crate::machine::MachineId;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
-use crate::queue::{JobEvent, JobEventKind, JobId, QueueError, Target};
+use crate::queue::spec::MachineSelector;
+use crate::queue::{JobEvent, JobEventKind, JobId, MoveRefusal, Priority, QueueError, Target};
 use crate::store::Store;
 
 /// Sequence cursors of one job's origin inbox
@@ -76,7 +78,7 @@ impl Store {
                 JobSubmission::Unknown | JobSubmission::Held
             )
             || matches!(route.submission, JobSubmission::Held)
-                && (route.after.is_none() || !route.owes_final_event)
+                && ((route.after.is_none() && route.spec.ci.is_none()) || !route.owes_final_event)
             || route.target.is_some()
         {
             return Err(QueueError::Invariant {
@@ -144,6 +146,82 @@ impl Store {
             }
             Ok(route)
         })
+    }
+
+    /// Send a CI job held for placement to `authority`: mark it sent there,
+    /// so a lost reply is resent under the same job id
+    ///
+    /// Returns `None` when the route is no longer held for placement, such as
+    /// after a cancel
+    pub fn place_held_job(
+        &self,
+        job: JobId,
+        authority: MachineId,
+    ) -> Result<Option<JobRoute>, AppError> {
+        self.immediate(|| {
+            let Some(mut route) = self.job_route(job)? else {
+                return Ok(None);
+            };
+            if !matches!(route.submission, JobSubmission::Held) || route.spec.ci.is_none() {
+                return Ok(None);
+            }
+            route.authority = authority;
+            route.submission = JobSubmission::Unknown;
+            self.save_route(&route)?;
+            Ok(Some(route))
+        })
+    }
+
+    /// Change where and at what level a CI job held for placement may run
+    ///
+    /// `authority` is the pinned machine, or the origin when any machine may
+    /// take it. Only the origin's route changes, since the job has not
+    /// reached any queue
+    pub fn move_held_ci_job(
+        &self,
+        job: JobId,
+        machine: Option<MachineSelector>,
+        authority: MachineId,
+        priority: Option<Priority>,
+    ) -> Result<JobRoute, AppError> {
+        self.immediate(|| {
+            let mut route = self
+                .job_route(job)?
+                .ok_or(QueueError::JobNotFound { job })?;
+            if route.spec.ci.is_none() {
+                return Err(QueueError::MoveRefused {
+                    job,
+                    reason: MoveRefusal::NotCi { job },
+                }
+                .into());
+            }
+            if !matches!(route.submission, JobSubmission::Held) {
+                return Err(QueueError::MoveRefused {
+                    job,
+                    reason: MoveRefusal::Sent {
+                        job,
+                        machine: route.authority,
+                    },
+                }
+                .into());
+            }
+            route.spec.machine = machine;
+            if let Some(priority) = priority {
+                route.spec.priority = priority;
+            }
+            route.authority = authority;
+            route.digest = route.spec.digest()?;
+            self.save_route(&route)?;
+            Ok(route)
+        })
+    }
+
+    fn save_route(&self, route: &JobRoute) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE resource_job_routes SET route_json=?2 WHERE job_id=?1",
+            params![route.job.to_string(), serde_json::to_string(route)?],
+        )?;
+        Ok(())
     }
 
     /// End a held job before it joins the queue, committing its terminal
@@ -236,6 +314,7 @@ impl Store {
                     gpu_idle: None,
                     gpu_summaries: Vec::new(),
                     lease_idle: None,
+                    timeout: None,
                 },
             };
             route.submission = JobSubmission::Ended { ending };

@@ -381,6 +381,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
                 home: h.user_home.display().to_string(),
             },
             origin_protocol: homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
+            submitted_at: None,
         })
         .unwrap();
     store
@@ -444,6 +445,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
         submission: homebased::queue::delivery::JobSubmission::Unknown,
         after: None,
         owes_final_event: false,
+        submitted_at: None,
     };
     store.insert_job_route(&route).unwrap();
     store

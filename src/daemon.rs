@@ -4,6 +4,8 @@ pub mod actors;
 pub mod api;
 mod cancel_delivery;
 mod chains;
+pub mod ci_api;
+pub(crate) mod ci_gauge;
 pub mod cluster;
 pub(crate) mod compaction_log;
 pub mod content;
@@ -100,6 +102,8 @@ pub struct AppState {
     pub(crate) waiters: WaiterRegistry,
     /// Flips to `true` when the daemon starts shutting down; open streams end then
     pub(crate) shutdown: watch::Receiver<bool>,
+    /// CI admission and checkout settings from config.toml
+    pub ci: crate::queue::ci::CiConfig,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -155,7 +159,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         std::env::var(crate::domain::AgentKind::Codex.binary_env()).ok(),
     )
     .with_notifications(notifier.clone(), machine.name.to_string())
-    .with_queue_thresholds(config.resource.notify_blocked_after);
+    .with_queue_thresholds(config.resource.notify_blocked_after)
+    .with_ci(config.ci.clone());
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await
         .map_err(|err| AppError::Internal {
@@ -188,6 +193,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         thread_titles: TitleSources::from_env(),
         waiters,
         shutdown: shutdown_rx.clone(),
+        ci: config.ci.clone(),
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),

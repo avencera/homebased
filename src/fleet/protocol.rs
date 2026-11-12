@@ -21,7 +21,7 @@ impl fmt::Display for ClusterProtocolVersion {
 }
 
 /// Version this build speaks by default
-pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(5);
+pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(6);
 
 /// First version whose origins parse `JOB_GPU_IDLE`; a queue sends the event
 /// only to origins that submitted at this version or later
@@ -31,11 +31,15 @@ pub const GPU_IDLE_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(4);
 /// the field only for origins that submitted at this version or later
 pub const LEASE_IDLE_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(5);
 
+/// First version whose authorities run CI jobs: specs with `ci`, the `ci_*`
+/// queue commands, and `submitted_at` on a submit
+pub const CI_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(6);
+
 /// Range this build accepts
 ///
 /// Version 3 differs only in lacking `JOB_GPU_IDLE` and the `gpu_idle` queue
-/// command, and version 4 only in lacking `lease_idle` on job events, so
-/// peers on earlier releases keep working
+/// command, version 4 only in lacking `lease_idle` on job events, and version
+/// 5 only in lacking CI jobs, so peers on earlier releases keep working
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {
     min: ClusterProtocolVersion(3),
     max: CLUSTER_PROTOCOL_VERSION,

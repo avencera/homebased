@@ -7,6 +7,7 @@
 //! the machine queue. The terminal commit of a run task classifies the run's
 //! end and moves its job in the same transaction
 
+pub mod ci;
 mod delivery;
 mod gpu_idle;
 pub mod interface;
@@ -31,9 +32,7 @@ use uuid::Uuid;
 use crate::domain::{TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::queue::schedule::{
-    JobView, NoticeThresholds, QueuedState, ResourceView, Snapshot, StoredEpisode,
-};
+use crate::queue::schedule::{NoticeThresholds, ResourceView, Snapshot, StoredEpisode};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
     ActiveRun, AttentionId, EventRun, JobId, JobState, Priority, QueueError, Resource, ResourceId,
@@ -136,6 +135,9 @@ pub struct NewJob {
     pub env: TaskEnv,
     /// Cluster protocol of the submit request; this build's for a local submit
     pub origin_protocol: crate::fleet::protocol::ClusterProtocolVersion,
+    /// When the origin took a CI job, which starts its wait; `None` for
+    /// other jobs and for origins that did not send it
+    pub submitted_at: Option<DateTime<Utc>>,
 }
 
 /// Submit response: the job and its slot now
@@ -263,9 +265,11 @@ impl Store {
         now: DateTime<Utc>,
         thresholds: NoticeThresholds,
     ) -> Result<Snapshot, AppError> {
+        // the GPU pool: CI slots and CI jobs are scheduled in their own pools
         let resources = self
             .resources_on(machine)?
             .into_iter()
+            .filter(|record| record.resource.slot.is_none())
             .map(|record| ResourceView {
                 id: record.resource.id,
                 name: record.resource.name,
@@ -274,17 +278,9 @@ impl Store {
             .collect();
         let queue = self
             .machine_queue(machine)?
-            .into_iter()
-            .map(|job| JobView {
-                id: job.id,
-                priority: job.priority,
-                target: job.target,
-                preempt: job.spec.preempt,
-                state: match job.state {
-                    JobState::Active { resource } => QueuedState::Active(resource),
-                    _ => QueuedState::Queued,
-                },
-            })
+            .iter()
+            .filter(|job| job.spec.ci.is_none())
+            .map(ci::job_view)
             .collect();
         Ok(Snapshot {
             now,

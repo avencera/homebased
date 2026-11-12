@@ -130,6 +130,7 @@ pub(crate) struct SupervisorArgs {
     notifier: Option<Arc<Notifier>>,
     machine_name: String,
     thresholds: crate::queue::schedule::NoticeThresholds,
+    ci: crate::queue::ci::CiConfig,
 }
 
 impl SupervisorArgs {
@@ -145,7 +146,14 @@ impl SupervisorArgs {
             notifier: None,
             machine_name: "this machine".into(),
             thresholds: crate::queue::schedule::NoticeThresholds::default(),
+            ci: crate::queue::ci::CiConfig::default(),
         }
+    }
+
+    /// Set CI admission and checkout settings from the daemon configuration
+    pub(crate) fn with_ci(mut self, ci: crate::queue::ci::CiConfig) -> Self {
+        self.ci = ci;
+        self
     }
 
     /// Set the blocked notice thresholds from the daemon configuration
@@ -183,6 +191,7 @@ impl Actor for SupervisorActor {
             notifier,
             machine_name,
             thresholds,
+            ci,
         }: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         let (store, _store_handle) = StoreActor::spawn_linked(
@@ -235,6 +244,7 @@ impl Actor for SupervisorActor {
                 store: state.store.clone(),
                 supervisor: myself.clone(),
                 thresholds,
+                ci,
             },
             myself.get_cell(),
         )

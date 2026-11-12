@@ -201,6 +201,7 @@ fn new_job(id: JobId, machine: MachineId, spec: Value) -> NewJob {
             home: "/tmp".into(),
         },
         origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
+        submitted_at: None,
     }
 }
 
@@ -2235,6 +2236,7 @@ async fn notice_ends_during_callback_preparation() {
         submission: JobSubmission::Unknown,
         after: None,
         owes_final_event: false,
+        submitted_at: None,
     };
     f.store.insert_job_route(&route).unwrap();
     let notice = RoutedJobEvent {

@@ -23,6 +23,7 @@ use crate::domain::{TaskId, TaskWorkload, Workload};
 
 pub mod build_hint;
 pub mod checkpoint;
+pub mod ci;
 pub mod classify;
 pub mod delivery;
 mod error;
@@ -507,6 +508,20 @@ pub struct Resource {
     // a peer on an older release sends none
     #[serde(default)]
     pub gpu_uuid: Option<gpu::GpuUuid>,
+    /// Present when the resource is one slot of a CI class rather than a GPU
+    /// lane; a slot has no `device` and no `gpu_uuid`
+    // the store refuses a slot with either, and a peer on an older release
+    // has no slots
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<ci::SlotLane>,
+}
+
+impl Resource {
+    /// Class this resource serves, or `None` for a GPU lane
+    #[must_use]
+    pub fn class(&self) -> Option<&ci::JobClass> {
+        self.slot.as_ref().map(|slot| &slot.class)
+    }
 }
 
 /// A resource named in a job spec or command, by UUID or by name
@@ -1154,6 +1169,11 @@ pub struct JobEvent {
     // storing the event and then refuse a retry that still carries it
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_summaries: Vec<gpu_idle::GpuSummary>,
+    /// Present on the `JOB_FAILED` of a CI job whose run the queue killed at
+    /// its `kill_after` limit
+    // only CI jobs carry it, and only an origin that can submit them
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<ci::RunTimeout>,
 }
 
 #[cfg(test)]

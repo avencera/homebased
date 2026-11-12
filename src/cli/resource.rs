@@ -367,9 +367,9 @@ fn silence_label(silence: &Silence) -> String {
 
 /// Submit overrides
 #[derive(Debug, Clone, Copy)]
-struct SubmitFlags {
-    allow_other_thread: bool,
-    allow_build: bool,
+pub(super) struct SubmitFlags {
+    pub(super) allow_other_thread: bool,
+    pub(super) allow_build: bool,
 }
 
 async fn submit(
@@ -380,8 +380,20 @@ async fn submit(
     flags: SubmitFlags,
     after_flags: Vec<DependencyId>,
 ) -> Result<(), AppError> {
+    let value = crate::spec::read_spec_value(spec_path)?;
+    submit_value(ctx, client, job_id, value, flags, after_flags).await
+}
+
+/// Submit a spec already read as JSON; `ci run` builds its spec this way
+pub(super) async fn submit_value(
+    ctx: &Ctx,
+    client: &Client,
+    job_id: JobId,
+    mut value: Value,
+    flags: SubmitFlags,
+    after_flags: Vec<DependencyId>,
+) -> Result<(), AppError> {
     let origin = SubmitOrigin::capture(&ctx.home)?;
-    let mut value = crate::spec::read_spec_value(spec_path)?;
     if let Some(thread) = origin.default_thread()? {
         crate::spec::fill_missing_thread(&mut value, thread);
     }
@@ -390,7 +402,12 @@ async fn submit(
     origin.check(spec.thread, flags.allow_other_thread)?;
     // a build holds the GPU idle while other jobs wait; refuse it before
     // anything is sent, unless the submitter says the build needs the GPU
-    let warnings = build_warnings(&spec);
+    // CI slots are where builds belong
+    let warnings = if spec.ci.is_some() {
+        Vec::new()
+    } else {
+        build_warnings(&spec)
+    };
     if !warnings.is_empty() && !flags.allow_build {
         return Err(AppError::InvalidSpec {
             pointer: "/steps".into(),
@@ -418,6 +435,7 @@ async fn submit(
         value["warnings"] = json!(warnings);
     }
     let action = match value["held"]["state"].as_str() {
+        Some("held") if spec.ci.is_some() => "waiting for a CI slot:",
         Some("held") => "held until its after entries succeed:",
         Some(_) => "ended before it queued:",
         None => "submitted",
@@ -477,7 +495,7 @@ fn print_result(ctx: &Ctx, value: &Value, action: &str, id: &str) -> Result<(), 
 }
 
 /// Decode a daemon response into the typed shape the daemon serialized
-fn decode<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
+pub(super) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
     serde_json::from_value(value).map_err(|error| AppError::Internal {
         message: format!("unexpected queue response: {error}"),
     })

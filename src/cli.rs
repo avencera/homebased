@@ -1,5 +1,6 @@
 //! Clap tree, `--json`/`--quiet` output, error shape
 
+pub mod ci;
 pub mod config;
 pub mod daemon;
 pub mod fleet;
@@ -102,6 +103,12 @@ pub enum Command {
         /// Task subcommand
         #[command(subcommand)]
         command: task::TaskCommand,
+    },
+    /// Queue build and test jobs by class across Fleet machines, and manage CI slots
+    Ci {
+        /// CI subcommand
+        #[command(subcommand)]
+        command: ci::CiCommand,
     },
     /// Manage exclusive resources and priority jobs
     Resource {
@@ -344,6 +351,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
+        Command::Ci { command } => ci::run(&ctx, command).await,
         Command::Service { command } => service::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Thread { command } => thread::run(&ctx, command).await,

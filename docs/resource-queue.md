@@ -28,6 +28,8 @@ homebased --json resource list
 homebased --json resource jobs
 ```
 
+CI slots and CI jobs share the queue machinery but not these views: `resource list`, `resource jobs`, and the GPU queue dashboard leave them out. Use `homebased ci slots`; see [CI queue](ci-queue.md).
+
 Use human output for a quick view. Use `--json` for scripts and Attention IDs.
 
 | Output | Meaning |

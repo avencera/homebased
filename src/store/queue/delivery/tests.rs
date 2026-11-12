@@ -40,6 +40,7 @@ fn route_for(thread: &str) -> JobRoute {
         submission: JobSubmission::Unknown,
         after: None,
         owes_final_event: false,
+        submitted_at: None,
     }
 }
 
@@ -63,6 +64,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             gpu_idle: None,
             gpu_summaries: Vec::new(),
             lease_idle: None,
+            timeout: None,
         },
     }
 }

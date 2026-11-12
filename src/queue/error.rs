@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::ci::JobClass;
 use super::{AttentionId, JobId, OperationId, Priority, ResourceId, ResourceName};
+use crate::machine::MachineId;
 
 /// Why a queue request was refused, or stored queue data could not be read
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +65,24 @@ pub enum QueueError {
     InvalidStepCount {
         /// Number of steps given
         count: usize,
+    },
+    /// A CI value breaks its rule
+    #[error("invalid {what} {value:?}: it {reason}")]
+    InvalidCiInput {
+        /// Field or argument
+        what: &'static str,
+        /// Refused value
+        value: String,
+        /// Rule it breaks
+        reason: String,
+    },
+    /// No reachable machine offers the class a CI job needs
+    #[error("no reachable machine offers class {class}{}", offered_list(offered))]
+    ClassNotOffered {
+        /// Class the job needs
+        class: JobClass,
+        /// Classes reachable machines do offer
+        offered: Vec<JobClass>,
     },
     /// No job with this id in the machine queue
     #[error("job not found: {job}")]
@@ -172,6 +192,22 @@ pub enum MoveRefusal {
         /// Terminal target
         target: JobId,
     },
+    /// The job is not a CI job, so it has no class or machine choice to change
+    #[error("job {job} is not a CI job; use resource job move")]
+    NotCi {
+        /// Job named by the move
+        job: JobId,
+    },
+    /// The CI job already left its origin for a machine's queue
+    #[error(
+        "job {job} was already sent to machine {machine}; move it there with resource job move"
+    )]
+    Sent {
+        /// Job named by the move
+        job: JobId,
+        /// Machine whose queue holds it
+        machine: MachineId,
+    },
     /// `--priority` beside `--before` or `--after` names another level than the target's
     #[error("target job {target} is {actual}, not {requested}")]
     LevelMismatch {
@@ -195,7 +231,9 @@ impl QueueError {
             | Self::InvalidRestartWindow { .. }
             | Self::InvalidResourceName { .. }
             | Self::InvalidResourceLabel { .. }
-            | Self::InvalidStepCount { .. } => Some(QueueCode::InvalidQueueInput),
+            | Self::InvalidStepCount { .. }
+            | Self::InvalidCiInput { .. } => Some(QueueCode::InvalidQueueInput),
+            Self::ClassNotOffered { .. } => Some(QueueCode::ClassNotOffered),
             Self::JobNotFound { .. } => Some(QueueCode::JobNotFound),
             Self::JobTerminal { .. } => Some(QueueCode::JobTerminal),
             Self::JobConflict { .. } => Some(QueueCode::JobConflict),
@@ -255,6 +293,10 @@ impl QueueError {
                 json!({ "value": value })
             }
             Self::InvalidStepCount { count } => json!({ "count": count }),
+            Self::InvalidCiInput { what, value, .. } => json!({ "what": what, "value": value }),
+            Self::ClassNotOffered { class, offered } => {
+                json!({ "class": class, "offered": offered })
+            }
             Self::JobNotFound { job } | Self::JobConflict { job } => json!({ "job": job }),
             Self::JobTerminal { job, state } => json!({ "job": job, "state": state }),
             Self::OperationConflict { operation } => json!({ "operation": operation }),
@@ -299,6 +341,8 @@ pub enum QueueCode {
     AttentionNotFound,
     /// Run or cleanup identity changed
     StaleRun,
+    /// No reachable machine offers a CI class
+    ClassNotOffered,
 }
 
 impl QueueCode {
@@ -316,6 +360,7 @@ impl QueueCode {
             Self::ResourceConflict => "resource_conflict",
             Self::AttentionNotFound => "attention_not_found",
             Self::StaleRun => "stale_run",
+            Self::ClassNotOffered => "class_not_offered",
         }
     }
 
@@ -324,7 +369,10 @@ impl QueueCode {
     pub const fn exit_code(self) -> u8 {
         match self {
             Self::InvalidQueueInput | Self::MoveRefused => 2,
-            Self::JobNotFound | Self::ResourceNotFound | Self::AttentionNotFound => 3,
+            Self::JobNotFound
+            | Self::ResourceNotFound
+            | Self::AttentionNotFound
+            | Self::ClassNotOffered => 3,
             Self::JobTerminal
             | Self::JobConflict
             | Self::OperationConflict
@@ -332,4 +380,13 @@ impl QueueCode {
             | Self::StaleRun => 5,
         }
     }
+}
+
+/// `; offered: rust, xcode`, or nothing when no class is offered
+fn offered_list(offered: &[JobClass]) -> String {
+    if offered.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = offered.iter().map(JobClass::as_str).collect();
+    format!("; offered: {}", names.join(", "))
 }

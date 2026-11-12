@@ -26,6 +26,7 @@ use crate::spec::{
     cwd_problem, default_timeout, escape_token, invalid_spec_from_de, workload_content,
 };
 
+use super::ci::{CiSpec, InnerPath};
 use super::gpu_idle::GpuIdleSpec;
 use super::{Preemption, Priority, ResourceSelector, StepWorkload, Steps};
 
@@ -128,6 +129,10 @@ pub struct JobSpec {
     // saved before this field existed do not change
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_idle: Option<GpuIdleSpec>,
+    /// Present for a CI job: its class, kill limit, and checkout
+    // left out when absent, so GPU job digests do not change
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiSpec>,
 }
 
 impl JobSpec {
@@ -212,7 +217,7 @@ impl JobSpec {
                     .unwrap_or(Value::Null);
                 invalid(pointer, value, error.message)
             })?;
-        Ok(Self {
+        let spec = Self {
             api_version: API_VERSION,
             thread: wire.thread,
             machine: wire.machine,
@@ -224,7 +229,73 @@ impl JobSpec {
             resource: wire.resource,
             steps,
             gpu_idle,
-        })
+            ci: wire.ci,
+        };
+        spec.check_ci()?;
+        Ok(spec)
+    }
+
+    /// Refuse what a CI job may not have: more than one step, a container,
+    /// a pinned resource, GPU idle settings, or a preemption mode other than
+    /// plain `wait`; and check its `cwd` against its checkout
+    ///
+    /// Placement sends a CI job only to a free slot, so it never needs to
+    /// stop another run, and slots have no GPU to watch
+    fn check_ci(&self) -> Result<(), AppError> {
+        let Some(ci) = &self.ci else {
+            return Ok(());
+        };
+        if self.steps.count() != 1 || !matches!(self.steps.as_slice(), [StepWorkload::Task(_)]) {
+            return Err(invalid(
+                "/steps",
+                Value::Null,
+                "a CI job has exactly one task step",
+            ));
+        }
+        if self.preempt
+            != (Preemption::Wait {
+                restart_within: None,
+            })
+        {
+            return Err(invalid(
+                "/preempt",
+                json!({ "mode": self.preempt.mode() }),
+                "a CI job waits for its slot and is never preempted; use {\"mode\": \"wait\"}",
+            ));
+        }
+        if let Some(resource) = &self.resource {
+            return Err(invalid(
+                "/resource",
+                json!(resource.to_string()),
+                "a CI job runs on any slot of its class; pin a machine with machine instead",
+            ));
+        }
+        if self.gpu_idle.is_some() {
+            return Err(invalid(
+                "/gpu_idle",
+                Value::Null,
+                "a CI job has no GPU to watch",
+            ));
+        }
+        if ci.git.is_some() {
+            InnerPath::parse("cwd", &self.cwd).map_err(|error| {
+                invalid(
+                    "/cwd",
+                    json!(self.cwd),
+                    format!("{error}; with git, cwd is a path inside the checkout"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The CI job's working directory inside its checkout, when it has a
+    /// git checkout
+    #[must_use]
+    pub fn checkout_workdir(&self) -> Option<InnerPath> {
+        self.ci.as_ref()?.git.as_ref()?;
+        // parse_value checked it
+        InnerPath::parse("cwd", &self.cwd).ok()
     }
 
     /// Canonical JSON, the stored form of the spec
@@ -250,6 +321,16 @@ impl JobSpec {
     ///
     /// Pointers follow the canonical form, where steps are always a list
     pub fn check_on_authority(&self, env_path: &str) -> Result<(), AppError> {
+        // a git checkout and its cwd exist only once a slot's run fetched them,
+        // so only the entry point's name can be checked now
+        if self.checkout_workdir().is_some() {
+            for (index, step) in self.steps.as_slice().iter().enumerate() {
+                if let StepWorkload::Task(task) = step {
+                    check_escape_name(&task.command, &Self::step_pointer(index))?;
+                }
+            }
+            return Ok(());
+        }
         if let Some(problem) = cwd_problem(&self.cwd) {
             return Err(AppError::InvalidCwd {
                 path: self.cwd.clone(),
@@ -330,6 +411,10 @@ struct JobSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "gpu_idle_schema")]
     gpu_idle: Option<Value>,
+    /// Makes the job a CI job: its class, hard kill limit, and optional git
+    /// checkout. Submit CI jobs with `homebased ci run`
+    #[serde(default)]
+    ci: Option<CiSpec>,
 }
 
 fn gpu_idle_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -568,6 +653,26 @@ fn check_entry_point(
         )),
         None => Ok(()),
     }
+}
+
+/// Refuse an entry point named like one of [`ESCAPE_ENTRY_POINTS`] without
+/// resolving it, for a step whose directory does not exist yet
+fn check_escape_name(command: &CommandLine, pointer: &str) -> Result<(), AppError> {
+    let name = Path::new(command.program())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if ESCAPE_ENTRY_POINTS.contains(&name) {
+        return Err(invalid(
+            format!("{pointer}/command/0"),
+            json!(command.program()),
+            format!(
+                "{name} hands work to a long-lived server outside the run, which cleanup cannot \
+                 attribute; run the work directly"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Move a pointer under `/workload` to the step's own pointer

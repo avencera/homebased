@@ -173,6 +173,10 @@ pub struct JobRoute {
     /// the route is saved, and kept by every later send
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owes_final_event: bool,
+    /// When the origin took a CI job, which starts its wait; sent with the
+    /// submit so the authority's timing counts the wait on the origin
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The authority's definite refusal of a submit
