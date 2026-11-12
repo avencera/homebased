@@ -25,12 +25,12 @@ The run sees `HOMEBASED_RESOURCE` set to its slot, such as `rust-3`, and `HOMEBA
 
 ## Events
 
-A CI job is a queue job. It sends `JOB_STARTED` when it starts on a machine, then one final event: `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. A `JOB_FAILED` with a `timeout` object (`limit`, `ran_secs`, `at`) means the run passed `--kill-after`. Read the log with `homebased task log <run-task> --tail 100`, where `resource job show <job>` names the run task. Then fix the hang or raise the limit; do not resubmit unchanged.
+A CI job is a queue job and sends one final event: `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. `resource job show <job>` shows whether it is still held or already running. A `JOB_FAILED` with a `timeout` object (`limit`, `ran_secs`, `at`) means the run passed `--kill-after`. Read the log with `homebased task log <run-task> --tail 100`, where `resource job show <job>` names the run task. Then fix the hang or raise the limit; do not resubmit unchanged.
 
 ## While it waits
 
 - `homebased resource job show <job>` shows `held` while the job waits on this machine for a slot.
-- `homebased ci move <job> --machine <name>`, `--any`, or `--priority <level>` changes a waiting job. A job already sent to a machine is refused; use `resource job move --machine <name>` there.
+- `homebased ci move <job> --machine <name>`, `--any`, or `--priority <level>` changes a waiting job. A job already sent to a machine is refused and stays there: `resource job move <job> --priority <level>` reorders it in that machine's queue, and to run it elsewhere, cancel it and submit again.
 - `homebased resource job cancel <job>` cancels it, waiting or running.
 
 ## Operate

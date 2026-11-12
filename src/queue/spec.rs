@@ -321,12 +321,20 @@ impl JobSpec {
     ///
     /// Pointers follow the canonical form, where steps are always a list
     pub fn check_on_authority(&self, env_path: &str) -> Result<(), AppError> {
-        // a git checkout and its cwd exist only once a slot's run fetched them,
-        // so only the entry point's name can be checked now
+        // a git checkout and its cwd exist only once a slot's run fetched
+        // them, so a checkout-relative entry point can be checked by name only;
+        // one on PATH or at an absolute path is resolved like any other
         if self.checkout_workdir().is_some() {
             for (index, step) in self.steps.as_slice().iter().enumerate() {
-                if let StepWorkload::Task(task) = step {
-                    check_escape_name(&task.command, &Self::step_pointer(index))?;
+                let StepWorkload::Task(task) = step else {
+                    continue;
+                };
+                let pointer = Self::step_pointer(index);
+                let program = Path::new(task.command.program());
+                if program.is_relative() && program.components().count() > 1 {
+                    check_escape_name(&task.command, &pointer)?;
+                } else {
+                    check_entry_point(&task.command, env_path, &self.cwd, &pointer)?;
                 }
             }
             return Ok(());

@@ -38,7 +38,7 @@ homebased ci run --class rust --repo git@github.com:me/app.git --commit "$sha" -
 
 Without `--git` or `--repo`, the job runs in the current directory, which must exist at the same path on whichever machine runs it. Pin such a job with `--machine`.
 
-A job waits on the machine that submitted it until a machine that offers its class has a free slot, then runs there. Its events reach the submitting thread like any queue job's: `JOB_STARTED`, then `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. `homebased wait --next <job>` waits on it, `resource job show <job>` shows it, and `resource job cancel <job>` cancels it, whether it is still waiting or already running.
+A job waits on the machine that submitted it until a machine that offers its class has a free slot, then runs there. Its final event reaches the submitting thread like any queue job's: `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`. `homebased wait --next <job>` waits on it, `resource job show <job>` shows it, and `resource job cancel <job>` cancels it, whether it is still waiting or already running.
 
 ### Placement
 
@@ -81,7 +81,7 @@ homebased ci move "$job" --machine code
 homebased ci move "$job" --any --priority high
 ```
 
-`ci move` changes the machine choice or level of a job that is still waiting on its origin. It runs on the machine that submitted the job. A job already sent to a machine's queue is refused with `move_refused`; reorder it there with `resource job move --machine <name>`.
+`ci move` changes the machine choice or level of a job that is still waiting on its origin. It runs on the machine that submitted the job. A job already sent to a machine's queue is refused with `move_refused`. It stays on that machine: `resource job move <job> --priority <level>` (or `--front`, `--before <job>`) reorders it in that machine's queue, and to run it elsewhere, cancel it and submit it again.
 
 ## Hard kill timeout
 

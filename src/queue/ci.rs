@@ -334,7 +334,33 @@ impl GitRemote {
         if raw.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
             return Err(invalid("must not contain whitespace or control characters"));
         }
+        // the remote is stored in the job spec, which any reader of the job
+        // can see, so a token in it would leak; keep credentials in git's
+        // credential helper or ssh keys instead
+        if let Some(redacted) = Self::redact_credentials(raw) {
+            return Err(QueueError::InvalidCiInput {
+                what: "git.remote",
+                value: redacted,
+                reason: "must not carry credentials; use a credential helper or ssh key".to_owned(),
+            });
+        }
         Ok(Self(raw.to_owned()))
+    }
+
+    /// `raw` with its user info replaced when it may hold a credential: any
+    /// user info in an http(s) URL, where a token is the usual login, or a
+    /// `user:password` pair in any other URL. Scp-like `git@host:path` and
+    /// `ssh://git@host` name only a user, so they pass
+    fn redact_credentials(raw: &str) -> Option<String> {
+        let (scheme, rest) = raw.split_once("://")?;
+        let authority = rest.split('/').next().unwrap_or_default();
+        let (userinfo, host) = authority.rsplit_once('@')?;
+        let http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+        if !http && !userinfo.contains(':') {
+            return None;
+        }
+        let path = &rest[authority.len()..];
+        Some(format!("{scheme}://***@{host}{path}"))
     }
 
     /// Validated remote
@@ -344,7 +370,7 @@ impl GitRemote {
     }
 
     /// Directory name for this remote's clones: its last path segment, then
-    /// 8 hex digits of its digest, so two remotes never share a clone
+    /// 16 hex digits of its digest, so two remotes never share a clone
     #[must_use]
     pub fn clone_key(&self) -> String {
         let segment = self
@@ -364,7 +390,7 @@ impl GitRemote {
             name.insert_str(0, "repo");
         }
         let digest = super::sha256_hex(self.0.as_bytes());
-        format!("{name}-{}", &digest[..8])
+        format!("{name}-{}", &digest[..16])
     }
 }
 
@@ -496,13 +522,19 @@ impl GitCheckout {
             .collect();
 
         // a slot runs one job at a time, so any git lock in its clone was left
-        // by a killed run and would fail every later run on the slot
+        // by a killed run and would fail every later run on the slot. clean
+        // gets -ff so a nested repository a run created goes too, and the
+        // workdir gets ./ so a name such as `-` is never read as a cd operand
+        let format = match self.commit.as_str().len() {
+            64 => " --object-format=sha256",
+            _ => "",
+        };
         let script = format!(
             "set -eu\n\
              dir={dir}\n\
              commit={commit}\n\
              remote={remote}\n\
-             if [ ! -d \"$dir/.git\" ]; then mkdir -p \"$dir\" && git init -q \"$dir\"; fi\n\
+             if [ ! -d \"$dir/.git\" ]; then mkdir -p \"$dir\" && git init -q{format} \"$dir\"; fi\n\
              cd \"$dir\"\n\
              find .git -name '*.lock' -type f -delete\n\
              if ! git cat-file -e \"$commit^{{commit}}\" 2>/dev/null; then\n\
@@ -510,13 +542,13 @@ impl GitCheckout {
              || git fetch -q --no-tags \"$remote\" '+refs/heads/*:refs/remotes/homebased-ci/*'\n\
              fi\n\
              git -c advice.detachedHead=false checkout -q --detach -f \"$commit\"\n\
-             git clean -fdq{excludes}\n\
+             git clean -ffdq{excludes}\n\
              cd {workdir}\n\
              exec \"$@\"\n",
             dir = shell_quote(&clone.display().to_string()),
             commit = shell_quote(self.commit.as_str()),
             remote = shell_quote(self.remote.as_str()),
-            workdir = shell_quote(&workdir.as_path().display().to_string()),
+            workdir = shell_quote(&format!("./{}", workdir.as_path().display())),
         );
         let mut argv = vec![
             "sh".to_owned(),
@@ -1206,9 +1238,52 @@ mod tests {
         let argv = checkout.wrap(&clone, &InnerPath::top(), &command);
         assert_eq!(argv[..2], ["sh", "-c"]);
         assert!(argv[2].contains(r"remote='https://example.com/o'\''brien/cove.git'"));
-        assert!(argv[2].contains("git clean -fdq -e 'rust/target'"));
+        assert!(argv[2].contains("git clean -ffdq -e 'rust/target'"));
+        assert!(argv[2].contains("git init -q \"$dir\""));
         assert!(argv[2].ends_with("exec \"$@\"\n"));
         assert_eq!(argv[3..], ["homebased-ci", "cargo", "test", "a b"]);
+    }
+
+    #[test]
+    fn remotes_with_credentials_are_refused_redacted() {
+        for good in [
+            "git@github.com:me/app.git",
+            "ssh://git@github.com/me/app.git",
+            "https://github.com/me/app.git",
+            "/srv/git/app.git",
+        ] {
+            assert!(GitRemote::parse(good).is_ok(), "{good}");
+        }
+        for (bad, shown) in [
+            (
+                "https://ghp_secret@github.com/me/app.git",
+                "https://***@github.com/me/app.git",
+            ),
+            (
+                "https://me:ghp_secret@github.com/me/app.git",
+                "https://***@github.com/me/app.git",
+            ),
+            ("ssh://me:hunter2@host/app.git", "ssh://***@host/app.git"),
+        ] {
+            let Err(QueueError::InvalidCiInput { value, .. }) = GitRemote::parse(bad) else {
+                panic!("{bad} was accepted");
+            };
+            assert_eq!(value, shown);
+        }
+    }
+
+    #[test]
+    fn sha256_commits_get_a_sha256_clone_and_workdirs_are_never_cd_options() {
+        let checkout = GitCheckout {
+            remote: GitRemote::parse("/srv/git/app.git").unwrap(),
+            commit: CommitId::parse(&"b".repeat(64)).unwrap(),
+            keep: Vec::new(),
+        };
+        let command = CommandLine::try_from_argv(vec!["true".into()]).unwrap();
+        let workdir = InnerPath::parse("workdir", Path::new("-")).unwrap();
+        let argv = checkout.wrap(Path::new("/ci/app/rust-1"), &workdir, &command);
+        assert!(argv[2].contains("git init -q --object-format=sha256 \"$dir\""));
+        assert!(argv[2].contains("cd './-'\n"));
     }
 
     #[test]

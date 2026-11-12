@@ -284,7 +284,9 @@ fn head_checkout(
         })
         .unwrap_or_else(|| "origin".to_owned()),
     };
-    let url = git(cwd, &["remote", "get-url", &remote])?;
+    // parse before any message names the url, so a credential in it is
+    // refused redacted instead of printed
+    let url = GitRemote::parse(&git(cwd, &["remote", "get-url", &remote])?)?;
     let containing = git(
         cwd,
         &[
@@ -299,7 +301,8 @@ fn head_checkout(
     if containing.is_empty() {
         return Err(AppError::Usage {
             message: format!(
-                "HEAD {commit} is not on any branch of {remote} as last fetched; push it first, since the CI slot fetches it from {url}"
+                "HEAD {commit} is not on any branch of {remote} as last fetched; push it first, since the CI slot fetches it from {}",
+                url.as_str()
             ),
         });
     }
@@ -311,7 +314,7 @@ fn head_checkout(
         Err(_) => PathBuf::from("."),
     };
     Ok((
-        json!({ "remote": url, "commit": commit, "keep": keep }),
+        json!({ "remote": url.as_str(), "commit": commit, "keep": keep }),
         workdir,
     ))
 }

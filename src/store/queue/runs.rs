@@ -191,7 +191,6 @@ impl Store {
         };
         // the attempt keeps the GPU it launched on, even if a later detection
         // finds another card at the resource's index
-        self.start_ci_timing(job, now)?;
         self.conn.execute(
             "INSERT INTO resource_run_history(task_id,resource_id,gpu_uuid)
              SELECT ?1, id, gpu_uuid FROM resources WHERE id = ?2",
@@ -257,6 +256,9 @@ impl Store {
     ) -> Result<ActiveRun, AppError> {
         self.immediate(|| {
             let mut run = self.require_run(resource, task)?;
+            // a CI job's run time starts when its child does, so a launch that
+            // never spawned reports no run time
+            self.start_ci_timing(run.job, started_at)?;
             run.phase = match run.phase {
                 RunPhase::Launching { .. } => RunPhase::Executing { started_at },
                 RunPhase::Stopping {
