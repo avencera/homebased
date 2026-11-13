@@ -12,7 +12,7 @@ use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-use super::{Environment, ProcessIdentity, ProcessInfo, ProcessStartTime, Read};
+use super::{Environment, ProcessIdentity, ProcessInfo, ProcessName, ProcessStartTime, Read};
 
 /// A pidfd pins the process, so a signal sent through it cannot reach a later
 /// process that reused the PID
@@ -35,7 +35,7 @@ pub(super) fn list_pids() -> io::Result<Vec<Pid>> {
     Ok(pids)
 }
 
-/// Start time, parent, group, and state from `/proc/<pid>/stat`, owner from `/proc/<pid>`
+/// Name, start time, parent, group, and state from `/proc/<pid>/stat`, owner from `/proc/<pid>`
 pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let directory = format!("/proc/{pid}");
     let stat = match fs::read_to_string(format!("{directory}/stat")) {
@@ -46,21 +46,24 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
         Ok(metadata) => metadata.uid(),
         Err(error) => return read_error(&error),
     };
-    match parse_stat(&stat) {
-        // an unreaped zombie keeps its stat entry, so report its exit with the
-        // identity it ran under, as the macOS reader does
-        Some(('Z' | 'X', _, _, start)) => Read::Exited(ProcessIdentity {
+    let Some(stat) = parse_stat(&stat) else {
+        return Read::Refused(Errno::EBADMSG);
+    };
+    // an unreaped zombie keeps its stat entry, so report its exit with the
+    // identity it ran under, as the macOS reader does
+    if matches!(stat.state, 'Z' | 'X') {
+        return Read::Exited(ProcessIdentity {
             pid,
-            start: ProcessStartTime(start),
-        }),
-        Some((_, ppid, pgid, start)) => Read::Found(ProcessInfo {
-            start: ProcessStartTime(start),
-            ppid: Pid::from_raw(ppid),
-            pgid: Pid::from_raw(pgid),
-            uid,
-        }),
-        None => Read::Refused(Errno::EBADMSG),
+            start: ProcessStartTime(stat.start),
+        });
     }
+    Read::Found(ProcessInfo {
+        start: ProcessStartTime(stat.start),
+        ppid: Pid::from_raw(stat.ppid),
+        pgid: Pid::from_raw(stat.pgid),
+        uid,
+        name: ProcessName::new(stat.name.as_bytes()),
+    })
 }
 
 /// The executable a live process runs, or `None` when the read fails
@@ -76,18 +79,35 @@ pub(super) fn executable_path(pid: Pid) -> Option<PathBuf> {
     })
 }
 
-/// State (field 3), parent (field 4), process group (field 5), and start time (field 22)
-///
-/// The command name in field 2 may hold spaces and parentheses, so fields are
-/// counted from the last `)`
-fn parse_stat(stat: &str) -> Option<(char, i32, i32, u64)> {
-    let after_name = &stat[stat.rfind(')')? + 1..];
-    let fields: Vec<&str> = after_name.split_whitespace().collect();
-    let state = fields.first()?.chars().next()?;
-    let ppid = fields.get(1)?.parse().ok()?;
-    let pgid = fields.get(2)?.parse().ok()?;
-    let start = fields.get(19)?.parse().ok()?;
-    Some((state, ppid, pgid, start))
+/// The fields of `/proc/<pid>/stat` that cleanup reads
+#[derive(Debug, PartialEq, Eq)]
+struct Stat<'a> {
+    /// Command name (field 2)
+    name: &'a str,
+    /// State (field 3)
+    state: char,
+    /// Parent (field 4)
+    ppid: i32,
+    /// Process group (field 5)
+    pgid: i32,
+    /// Start time in clock ticks since boot (field 22)
+    start: u64,
+}
+
+/// The command name in field 2 may hold spaces and parentheses, so it runs
+/// from the first `(` to the last `)`, and later fields are counted from there
+fn parse_stat(stat: &str) -> Option<Stat<'_>> {
+    let name_start = stat.find('(')? + 1;
+    let name_end = stat.rfind(')')?;
+    let name = stat.get(name_start..name_end)?;
+    let fields: Vec<&str> = stat[name_end + 1..].split_whitespace().collect();
+    Some(Stat {
+        name,
+        state: fields.first()?.chars().next()?,
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        start: fields.get(19)?.parse().ok()?,
+    })
 }
 
 fn read_error<T>(error: &io::Error) -> Read<T> {
@@ -150,12 +170,21 @@ pub(super) fn send(pidfd: &SignalHandle, signal: Signal) -> Result<(), Errno> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stat;
+    use super::{Stat, parse_stat};
 
     #[test]
     fn stat_fields_count_from_the_last_parenthesis() {
         let stat = "4242 (odd ) name) S 1 4240 4240 0 -1 4194560 120 0 0 0 1 2 0 0 20 0 1 0 987654 1000 200";
-        assert_eq!(parse_stat(stat), Some(('S', 1, 4240, 987_654)));
+        assert_eq!(
+            parse_stat(stat),
+            Some(Stat {
+                name: "odd ) name",
+                state: 'S',
+                ppid: 1,
+                pgid: 4240,
+                start: 987_654,
+            })
+        );
         assert_eq!(parse_stat("4242 (short) S 1"), None);
     }
 }

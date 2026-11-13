@@ -11,7 +11,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use super::{Environment, ProcessIdentity, ProcessInfo, ProcessStartTime, Read};
+use super::{Environment, ProcessIdentity, ProcessInfo, ProcessName, ProcessStartTime, Read};
 
 /// macOS has no pidfd, so a signal goes to the PID after the identity check
 pub(crate) type SignalHandle = Pid;
@@ -43,7 +43,7 @@ pub(super) fn list_pids() -> io::Result<Vec<Pid>> {
     }
 }
 
-/// Start time, parent, group, and owner from `PROC_PIDTBSDINFO`; a zombie is `Exited`
+/// Name, start time, parent, group, and owner from `PROC_PIDTBSDINFO`; a zombie is `Exited`
 pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
     let Ok(size) = c_int::try_from(mem::size_of::<libc::proc_bsdinfo>()) else {
         return Read::Refused(Errno::EOVERFLOW);
@@ -87,6 +87,8 @@ pub(super) fn process_info(pid: Pid) -> Read<ProcessInfo> {
         ppid: Pid::from_raw(ppid),
         pgid: Pid::from_raw(pgid),
         uid: info.pbi_uid,
+        // c_char is i8 on some targets; the cast keeps each byte's bits
+        name: ProcessName::new(&info.pbi_comm.map(|byte| byte as u8)),
     })
 }
 

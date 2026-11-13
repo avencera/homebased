@@ -18,9 +18,9 @@ use nix::unistd::{Pid, setsid};
 
 use super::{
     CleanupFailure, CleanupTiming, DescendantTracker, Environment, GroupAttribution, GroupOutcome,
-    ProcessIdentity, ProcessInfo, ProcessSource, ProcessStartTime, Read, SweepOutcome,
-    SystemProcesses, cleanup_lost_group_with, process_identity, sweep_marker, sweep_marker_with,
-    sweep_run,
+    Lineage, NamedProcess, ProcessIdentity, ProcessInfo, ProcessName, ProcessSource,
+    ProcessStartTime, Read, Suspect, SweepOutcome, SystemProcesses, cleanup_lost_group_with,
+    process_identity, sweep_marker, sweep_marker_with, sweep_run,
 };
 use crate::domain::TaskId;
 use crate::run_env;
@@ -52,6 +52,9 @@ const FAST: CleanupTiming = CleanupTiming {
 ///   100 ms, recording each, until killed
 /// - `group-leader`: start a `sleep` helper in this process group, record it, and live
 /// - `group-orphan`: like `group-leader`, but exit after two seconds
+/// - `undumpable`: hide this process's environment from same-user readers, as
+///   a sandboxed browser renderer does, and live until killed
+/// - `sandbox-parent`: start an `undumpable` helper, record it, and live
 #[test]
 fn helper_process() {
     let Ok(mode) = std::env::var(HELPER_MODE) else {
@@ -97,6 +100,18 @@ fn helper_process() {
                 Duration::from_secs(2)
             };
             std::thread::sleep(lifetime);
+        }
+        #[cfg(target_os = "linux")]
+        "undumpable" => {
+            // SAFETY: restoring the default disposition installs no handler
+            unsafe { signal(Signal::SIGTERM, SigHandler::SigDfl) }.unwrap();
+            nix::sys::prctl::set_dumpable(false).unwrap();
+            std::thread::sleep(HELPER_LIFETIME);
+        }
+        "sandbox-parent" => {
+            let child = helper_command("undumpable", None).spawn().unwrap();
+            record(pidfile.as_deref(), child);
+            std::thread::sleep(HELPER_LIFETIME);
         }
         other => panic!("unknown helper mode {other}"),
     }
@@ -591,6 +606,7 @@ impl ProcessSource for RefusedEnvironment {
             ppid: Pid::from_raw(1),
             pgid: self.identity.pid,
             uid: self.uid,
+            name: ProcessName::default(),
         })
     }
 
@@ -653,6 +669,10 @@ fn unreadable_environment_rules_use_run_start_and_user() {
                 pid: Pid::from_raw(12345),
                 start: ProcessStartTime(start),
             };
+            let process = NamedProcess {
+                identity,
+                name: None,
+            };
             let mut source = RefusedEnvironment {
                 identity,
                 uid,
@@ -665,8 +685,15 @@ fn unreadable_environment_rules_use_run_start_and_user() {
             expected.push((
                 name,
                 if suspect {
+                    // its parent is init, so the walk finds no readable ancestor
                     SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects {
-                        suspects: vec![identity],
+                        suspects: vec![Suspect {
+                            process: process.clone(),
+                            lineage: Some(Lineage::Orphaned {
+                                adopter: None,
+                                root: process,
+                            }),
+                        }],
                     })
                 } else {
                     SweepOutcome::Completed { signalled: vec![] }
@@ -690,6 +717,20 @@ fn unreadable_environment_rules_use_run_start_and_user() {
     assert_eq!(
         serde_json::from_value::<crate::queue::CleanupFailure>(encoded).unwrap(),
         queue_failure
+    );
+
+    // an attention stored before suspects carried names and lineage still loads
+    let stored = serde_json::json!({
+        "kind": "processes",
+        "failure": {
+            "kind": "unreadable_suspects",
+            "suspects": [{ "pid": 12345, "start": 101 }],
+        },
+    });
+    let old = serde_json::from_value::<crate::queue::CleanupFailure>(stored).unwrap();
+    assert_eq!(
+        old.to_string(),
+        "could not read run markers; check same-user processes; pid 12345 started 101"
     );
 }
 
@@ -722,38 +763,95 @@ fn unreadable_suspect_exit_requires_two_new_empty_scans() {
     );
 }
 
-/// A process table where one same-user process refuses its environment and
-/// its ancestors are readable only through `info`
-struct Ancestry {
-    suspect: Pid,
-    table: BTreeMap<Pid, ProcessInfo>,
+/// How a process in an [`Ancestry`] table answers an environment read
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Env {
+    /// Refused, as for a sandboxed renderer or another user's process
+    Hidden,
+    /// Readable, without the run marker
+    Unmarked,
+    /// Readable, with the run marker
+    Marked,
+    /// Readable but empty, as for an Apple platform binary
+    Empty,
 }
 
+/// One process in an [`Ancestry`] chain
+#[derive(Debug, Clone, Copy)]
+struct Link {
+    uid: u32,
+    start: u64,
+    env: Env,
+    name: &'static str,
+}
+
+fn own(start: u64, env: Env, name: &'static str) -> Link {
+    let uid = nix::unistd::geteuid().as_raw();
+    Link {
+        uid,
+        start,
+        env,
+        name,
+    }
+}
+
+fn other(start: u64, name: &'static str) -> Link {
+    Link {
+        uid: nix::unistd::geteuid().as_raw().wrapping_add(1),
+        start,
+        env: Env::Hidden,
+        name,
+    }
+}
+
+/// A process table holding one chain, from an unreadable same-user suspect
+/// up to its oldest listed ancestor, whose parent is `top`
+struct Ancestry {
+    marker: TaskId,
+    pids: Vec<Pid>,
+    table: BTreeMap<Pid, (ProcessInfo, Env)>,
+}
+
+/// Fake PIDs, far above any this test process is likely to have
+const ANCESTRY_BASE: i32 = 3_000_000;
+
 impl Ancestry {
-    /// `chain` runs from the suspect up to its oldest listed ancestor, as
-    /// `(uid, start)`; the last one's parent is init
-    fn new(chain: &[(u32, u64)]) -> Self {
+    fn new(marker: TaskId, chain: &[Link], top: Pid) -> Self {
         let pids: Vec<_> = (0..chain.len())
-            .map(|index| Pid::from_raw(1000 + index as i32))
+            .map(|index| Pid::from_raw(ANCESTRY_BASE + i32::try_from(index).unwrap()))
             .collect();
         let table = chain
             .iter()
             .enumerate()
-            .map(|(index, &(uid, start))| {
-                let ppid = pids.get(index + 1).copied().unwrap_or(Pid::from_raw(1));
+            .map(|(index, link)| {
                 let info = ProcessInfo {
-                    start: ProcessStartTime(start),
-                    ppid,
+                    start: ProcessStartTime(link.start),
+                    ppid: pids.get(index + 1).copied().unwrap_or(top),
                     pgid: pids[index],
-                    uid,
+                    uid: link.uid,
+                    name: ProcessName::new(link.name.as_bytes()),
                 };
-                (pids[index], info)
+                (pids[index], (info, link.env))
             })
             .collect();
 
         Self {
-            suspect: pids[0],
+            marker,
+            pids,
             table,
+        }
+    }
+
+    /// The listed process at `index` in the chain, as a report names it
+    fn named(&self, index: usize) -> NamedProcess {
+        let pid = self.pids[index];
+        let (info, _) = self.table[&pid];
+        NamedProcess {
+            identity: ProcessIdentity {
+                pid,
+                start: info.start,
+            },
+            name: Some(info.name.to_string()),
         }
     }
 }
@@ -768,29 +866,36 @@ impl ProcessSource for Ancestry {
     fn info(&mut self, pid: Pid) -> Read<ProcessInfo> {
         self.table
             .get(&pid)
-            .copied()
-            .map_or(Read::Gone, Read::Found)
+            .map_or(Read::Gone, |(info, _)| Read::Found(*info))
     }
 
     fn environment(&mut self, pid: Pid) -> Read<Environment> {
-        // only the suspect hides its environment; same-user ancestors read
-        // as unmarked, and other-user reads are refused as on a real machine
-        let own_uid = nix::unistd::geteuid().as_raw();
         match self.table.get(&pid) {
-            Some(info) if pid != self.suspect && info.uid == own_uid => {
-                Read::Found(Environment::default())
-            }
-            Some(_) => Read::Refused(Errno::EACCES),
+            Some((_, Env::Hidden)) => Read::Refused(Errno::EACCES),
+            Some((_, Env::Unmarked)) => Read::Found(Environment(b"PATH=/usr/bin\0".to_vec())),
+            Some((_, Env::Empty)) => Read::Found(Environment::default()),
+            Some((_, Env::Marked)) => Read::Found(Environment(
+                format!("{}={}\0", run_env::TASK_ID, self.marker).into_bytes(),
+            )),
             None => Read::Gone,
         }
     }
 
-    fn pin(&mut self, _: Pid) -> Read<Pid> {
-        panic!("an unreadable process must never be a signal target")
+    fn pin(&mut self, pid: Pid) -> Read<Pid> {
+        // only a marked ancestor may be pinned; the suspect never is
+        assert_ne!(
+            pid, self.pids[0],
+            "an unreadable process must never be a signal target"
+        );
+        Read::Found(pid)
     }
 
-    fn send(&mut self, _: &Pid, _: Signal) -> Result<(), Errno> {
-        panic!("an unreadable process must never be signalled")
+    fn send(&mut self, pid: &Pid, _: Signal) -> Result<(), Errno> {
+        assert_ne!(
+            *pid, self.pids[0],
+            "an unreadable process must never be signalled"
+        );
+        Ok(())
     }
 
     fn send_group(&mut self, _: Pid, _: Signal) -> Result<(), Errno> {
@@ -798,61 +903,470 @@ impl ProcessSource for Ancestry {
     }
 }
 
+/// What a case expects of the suspect at index 0
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// Not run work; cleanup completes
+    Clear,
+    /// The ancestor at this index carries the marker
+    RunWork(usize),
+    /// Init adopted the tree whose topmost listed process is at this index
+    OrphanedByInit(usize),
+    /// The adopter at index `.1` adopted the tree topped by index `.0`
+    OrphanedBy(usize, usize),
+    /// The walk stopped at the ancestor at this index
+    Unknown(usize),
+}
+
+struct AncestryCase {
+    name: &'static str,
+    chain: Vec<Link>,
+    /// Indexes of ancestors that are protected workers
+    protected: Vec<usize>,
+    /// Indexes of the unreadable processes that hold cleanup, all with the
+    /// lineage `expect` gives; an unreadable ancestor started during the run
+    /// is a suspect too
+    held: Vec<usize>,
+    expect: Expect,
+}
+
 #[test]
-fn unreadable_process_under_an_older_daemon_does_not_hold_cleanup() {
-    let own = nix::unistd::geteuid().as_raw();
-    let root = own.wrapping_add(1);
+fn unreadable_suspect_is_judged_by_its_nearest_readable_ancestor() {
+    use Env::{Empty, Hidden, Marked, Unmarked};
+
     let run_start = 100;
+    let case = |name, chain, expect| AncestryCase {
+        name,
+        chain,
+        protected: vec![],
+        held: vec![0],
+        expect,
+    };
     let cases = [
-        // user sshd-session, root sshd-session monitor, root sshd listener
-        (
+        // the Nov 13 stall: agent-browser's headless Chrome, started by an
+        // agent during a GPU run, behind its setuid sandbox
+        case(
+            "sandboxed browser under an unmarked browser started during the run",
+            vec![
+                own(160, Hidden, "chrome"),
+                own(150, Hidden, "chrome-sandbox"),
+                own(140, Unmarked, "chrome"),
+                own(130, Unmarked, "agent-browser"),
+            ],
+            Expect::Clear,
+        ),
+        case(
+            "unreadable child of a marked parent",
+            vec![own(150, Hidden, "renderer"), own(140, Marked, "train")],
+            Expect::RunWork(1),
+        ),
+        case(
+            "parent started after its child, so its PID was reused",
+            vec![own(150, Hidden, "renderer"), own(170, Unmarked, "reused")],
+            Expect::Unknown(1),
+        ),
+        case(
+            "unreadable parent PID reused under a readable grandparent",
+            vec![
+                own(150, Hidden, "renderer"),
+                own(170, Hidden, "reused"),
+                own(140, Unmarked, "chrome"),
+            ],
+            Expect::Unknown(1),
+        ),
+        // macOS shows a run's `/bin/bash` with an empty environment
+        case(
+            "unreadable child of an empty-environment shell under marked run work",
+            vec![
+                own(150, Hidden, "tool"),
+                own(140, Empty, "bash"),
+                own(130, Marked, "train"),
+            ],
+            Expect::RunWork(2),
+        ),
+        case(
+            "unreadable child of an empty-environment shell from before the run",
+            vec![own(150, Hidden, "tool"), own(50, Empty, "bash")],
+            Expect::Clear,
+        ),
+        case(
             "ssh login during the run",
-            vec![(own, 150), (root, 150), (root, 50)],
-            false,
+            vec![
+                own(150, Hidden, "sshd-session"),
+                other(150, "sshd-session"),
+                other(50, "sshd"),
+            ],
+            Expect::Clear,
         ),
-        // run shell ran `sudo -u` back to this user
-        (
-            "sudo from the run",
-            vec![(own, 150), (root, 150), (own, 120)],
-            true,
+        case(
+            "same-user sandbox that predates the run",
+            vec![own(150, Hidden, "renderer"), own(50, Hidden, "zygote")],
+            Expect::Clear,
         ),
-        (
+        case(
+            "sudo from a marked run shell",
+            vec![
+                own(150, Hidden, "tool"),
+                other(150, "sudo"),
+                own(120, Marked, "bash"),
+            ],
+            Expect::RunWork(2),
+        ),
+        case(
             "other-user parent adopted by init",
-            vec![(own, 150), (root, 150)],
-            true,
+            vec![own(150, Hidden, "tool"), other(150, "helper")],
+            Expect::OrphanedByInit(1),
         ),
-        ("orphan adopted by init", vec![(own, 150)], true),
+        case(
+            "orphan adopted by init",
+            vec![own(150, Hidden, "renderer")],
+            Expect::OrphanedByInit(0),
+        ),
+        AncestryCase {
+            protected: vec![2],
+            held: vec![0, 1],
+            ..case(
+                "orphaned tree adopted by a worker",
+                vec![
+                    own(150, Hidden, "renderer"),
+                    own(140, Hidden, "zygote"),
+                    own(10, Unmarked, "homebased"),
+                ],
+                Expect::OrphanedBy(1, 2),
+            )
+        },
     ];
 
     let mut actual = Vec::new();
     let mut expected = Vec::new();
-    for (name, chain, suspect) in cases {
-        let mut source = Ancestry::new(&chain);
-        let identity = ProcessIdentity {
-            pid: source.suspect,
-            start: ProcessStartTime(chain[0].1),
+    for case in cases {
+        let marker = TaskId::new();
+        let mut source = Ancestry::new(marker, &case.chain, Pid::from_raw(1));
+        let protected: BTreeSet<_> = case
+            .protected
+            .iter()
+            .map(|&index| source.pids[index])
+            .collect();
+        let lineage = match case.expect {
+            Expect::Clear => None,
+            Expect::RunWork(ancestor) => Some(Lineage::RunWork {
+                ancestor: source.named(ancestor),
+            }),
+            Expect::OrphanedByInit(root) => Some(Lineage::Orphaned {
+                adopter: None,
+                root: source.named(root),
+            }),
+            Expect::OrphanedBy(root, adopter) => Some(Lineage::Orphaned {
+                adopter: Some(source.named(adopter)),
+                root: source.named(root),
+            }),
+            Expect::Unknown(at) => Some(Lineage::Unknown {
+                at: source.pids[at],
+                reason: "started after its child; PID reused".into(),
+            }),
         };
-        let outcome = sweep_marker_with(
-            &mut source,
-            TaskId::new(),
-            Some(ProcessStartTime(run_start)),
-            &BTreeSet::new(),
-            REFUSAL_TIMING,
-        );
-        actual.push((name, outcome));
         expected.push((
-            name,
-            if suspect {
-                SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects {
-                    suspects: vec![identity],
-                })
-            } else {
-                SweepOutcome::Completed { signalled: vec![] }
+            case.name,
+            match lineage {
+                None => SweepOutcome::Completed { signalled: vec![] },
+                Some(lineage) => SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects {
+                    suspects: case
+                        .held
+                        .iter()
+                        .map(|&index| Suspect {
+                            process: source.named(index),
+                            lineage: Some(lineage.clone()),
+                        })
+                        .collect(),
+                }),
             },
         ));
+
+        let outcome = sweep_marker_with(
+            &mut source,
+            marker,
+            Some(ProcessStartTime(run_start)),
+            &protected,
+            REFUSAL_TIMING,
+        );
+        // a marked ancestor is a target in its own right, which
+        // the fake never lets exit; only the suspect's verdict matters here
+        let outcome = match outcome {
+            SweepOutcome::Completed { .. } => SweepOutcome::Completed { signalled: vec![] },
+            outcome => outcome,
+        };
+        actual.push((case.name, outcome));
     }
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn daemon_ancestors_adopt_orphans_and_clear_nothing() {
+    // a tree orphaned under `systemd --user`, the daemon's own parent, was
+    // started by a readable process that is gone, so it may be run work
+    let marker = TaskId::new();
+    let mut source = Ancestry::new(
+        marker,
+        &[
+            own(150, Env::Hidden, "renderer"),
+            own(5, Env::Unmarked, "systemd"),
+        ],
+        Pid::from_raw(1),
+    );
+    let session = source.pids[1];
+    let this = ProcessInfo {
+        start: ProcessStartTime(10),
+        ppid: session,
+        pgid: Pid::this(),
+        uid: nix::unistd::geteuid().as_raw(),
+        name: ProcessName::new(b"homebased"),
+    };
+    source.table.insert(Pid::this(), (this, Env::Unmarked));
+
+    let outcome = sweep_marker_with(
+        &mut source,
+        marker,
+        Some(ProcessStartTime(100)),
+        &BTreeSet::new(),
+        REFUSAL_TIMING,
+    );
+    let SweepOutcome::Incomplete(failure) = outcome else {
+        panic!("an orphan under the daemon's session manager must hold cleanup: {outcome:?}");
+    };
+    assert_eq!(
+        failure,
+        CleanupFailure::UnreadableSuspects {
+            suspects: vec![Suspect {
+                process: source.named(0),
+                lineage: Some(Lineage::Orphaned {
+                    adopter: Some(source.named(1)),
+                    root: source.named(0),
+                }),
+            }],
+        }
+    );
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "could not read run markers; check same-user processes; pid {suspect} (renderer) \
+             started 150: orphaned tree of pid {suspect} (renderer), adopted by pid {session} (systemd)",
+            suspect = source.pids[0],
+        )
+    );
+}
+
+#[test]
+fn other_user_daemon_ancestors_adopt_nothing() {
+    // a daemon run by hand inside an ssh login sits under root `sshd`, which
+    // adopts no orphans, so a later ssh login under that listener is no suspect
+    let marker = TaskId::new();
+    let mut source = Ancestry::new(
+        marker,
+        &[
+            own(150, Env::Hidden, "sshd-session"),
+            other(150, "sshd-session"),
+            other(5, "sshd"),
+        ],
+        Pid::from_raw(1),
+    );
+    let this = ProcessInfo {
+        start: ProcessStartTime(10),
+        ppid: source.pids[2],
+        pgid: Pid::this(),
+        uid: nix::unistd::geteuid().as_raw(),
+        name: ProcessName::new(b"homebased"),
+    };
+    source.table.insert(Pid::this(), (this, Env::Unmarked));
+
+    let outcome = sweep_marker_with(
+        &mut source,
+        marker,
+        Some(ProcessStartTime(100)),
+        &BTreeSet::new(),
+        REFUSAL_TIMING,
+    );
+    assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
+}
+
+#[test]
+fn attention_names_each_suspect_tree_once() {
+    let marker = TaskId::new();
+    let mut source = Ancestry::new(
+        marker,
+        &[
+            own(160, Env::Hidden, "chrome"),
+            own(150, Env::Hidden, "chrome-sandbox"),
+            own(140, Env::Marked, "chrome"),
+        ],
+        Pid::from_raw(1),
+    );
+    let outcome = sweep_marker_with(
+        &mut source,
+        marker,
+        Some(ProcessStartTime(100)),
+        &BTreeSet::new(),
+        REFUSAL_TIMING,
+    );
+    let SweepOutcome::Incomplete(failure) = outcome else {
+        panic!("a sandbox under marked run work must hold cleanup: {outcome:?}");
+    };
+    let [renderer, sandbox, browser] = [0, 1, 2].map(|index| source.pids[index]);
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "could not read run markers; check same-user processes; pid {renderer} (chrome) \
+             started 160, pid {sandbox} (chrome-sandbox) started 150: under pid {browser} \
+             (chrome), which carries the run marker"
+        )
+    );
+}
+
+/// An undumpable helper under a readable parent, started as a run's workload
+///
+/// Returns the parent and the undumpable child. The child hides its
+/// environment the way Chrome's sandboxed processes do on Linux: same owner,
+/// environment read refused
+#[cfg(target_os = "linux")]
+fn sandboxed_tree(
+    spawned: &mut Spawned,
+    pidfile: &Path,
+    marker: Option<TaskId>,
+) -> [ProcessIdentity; 2] {
+    let parent = spawned.start(&mut helper_command("sandbox-parent", Some(pidfile)), marker);
+    let [pid] = wait_for_pids(pidfile, 1)[..] else {
+        panic!("sandbox parent records one child");
+    };
+    // the child hides its environment soon after exec, so a refused read,
+    // not the helper mode that `wait_for_identity` reads, shows it started
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut source = SystemProcesses::new().unwrap();
+    while !matches!(source.environment(pid), Read::Refused(_)) {
+        assert!(
+            Instant::now() < until,
+            "helper {pid} never hid its environment"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let child = process_identity(pid).unwrap();
+    spawned.track(&[child]);
+    [parent, child]
+}
+
+/// One short round, for a sweep expected to end with its suspect still held;
+/// a sweep that must confirm an empty real process table uses [`FAST`],
+/// which allows for a loaded machine
+#[cfg(target_os = "linux")]
+const SANDBOX_TIMING: CleanupTiming = CleanupTiming {
+    term_grace: Duration::from_millis(500),
+    kill_grace: Duration::from_millis(500),
+    rounds: 1,
+    ..FAST
+};
+
+/// The real process table, listing only one test's processes
+///
+/// A whole-machine sweep would also see other suites' undumpable helpers,
+/// which come and go and keep its empty scans from settling. Ancestry and
+/// environment reads still go to the real table
+#[cfg(target_os = "linux")]
+struct Scoped {
+    system: SystemProcesses,
+    pids: BTreeSet<Pid>,
+}
+
+#[cfg(target_os = "linux")]
+impl Scoped {
+    fn new(processes: &[ProcessIdentity]) -> Self {
+        Self {
+            system: SystemProcesses::new().unwrap(),
+            pids: processes.iter().map(|process| process.pid).collect(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessSource for Scoped {
+    type Handle = <SystemProcesses as ProcessSource>::Handle;
+
+    fn list(&mut self) -> io::Result<Vec<Pid>> {
+        let mut pids = self.system.list()?;
+        pids.retain(|pid| self.pids.contains(pid));
+        Ok(pids)
+    }
+
+    fn info(&mut self, pid: Pid) -> Read<ProcessInfo> {
+        self.system.info(pid)
+    }
+
+    fn environment(&mut self, pid: Pid) -> Read<Environment> {
+        self.system.environment(pid)
+    }
+
+    fn pin(&mut self, pid: Pid) -> Read<Self::Handle> {
+        self.system.pin(pid)
+    }
+
+    fn send(&mut self, handle: &Self::Handle, signal: Signal) -> Result<(), Errno> {
+        self.system.send(handle, signal)
+    }
+
+    fn send_group(&mut self, pgid: Pid, signal: Signal) -> Result<(), Errno> {
+        self.system.send_group(pgid, signal)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_sandboxed_child_of_an_unmarked_parent_does_not_hold_cleanup() {
+    let (mut spawned, pidfile) = Spawned::new();
+    let [parent, child] = sandboxed_tree(&mut spawned, &pidfile, None);
+
+    let outcome = sweep_marker_with(
+        &mut Scoped::new(&[parent, child]),
+        TaskId::new(),
+        Some(parent.start),
+        &BTreeSet::new(),
+        FAST,
+    );
+    assert_eq!(outcome, SweepOutcome::Completed { signalled: vec![] });
+    assert!(
+        is_alive(parent) && is_alive(child),
+        "unrelated processes are never signalled"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_sandboxed_child_of_a_marked_parent_holds_cleanup() {
+    let marker = TaskId::new();
+    let (mut spawned, pidfile) = Spawned::new();
+    let [parent, child] = sandboxed_tree(&mut spawned, &pidfile, Some(marker));
+
+    let outcome = sweep_marker_with(
+        &mut Scoped::new(&[parent, child]),
+        marker,
+        Some(parent.start),
+        &BTreeSet::new(),
+        SANDBOX_TIMING,
+    );
+    let SweepOutcome::Incomplete(CleanupFailure::UnreadableSuspects { suspects }) = &outcome else {
+        panic!("a sandboxed child of marked run work must hold cleanup: {outcome:?}");
+    };
+    let [suspect] = &suspects[..] else {
+        panic!("one suspect expected: {suspects:?}");
+    };
+    assert_eq!(suspect.process.identity, child);
+    // the sweep stops the marked parent, so the child is held either as run
+    // work or, once it is reparented, as an orphan whose origin is lost
+    assert!(
+        matches!(
+            &suspect.lineage,
+            Some(Lineage::RunWork { ancestor }) if ancestor.identity == parent
+        ) || matches!(&suspect.lineage, Some(Lineage::Orphaned { root, .. }) if root.identity == child),
+        "{suspect:?}"
+    );
+    assert!(is_alive(child), "an unreadable process is never signalled");
 }
 
 #[test]
@@ -1021,6 +1535,7 @@ impl ProcessSource for ForkThenExit {
             ppid: Pid::from_raw(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
+            name: ProcessName::default(),
         })
     }
 
@@ -1108,6 +1623,7 @@ impl ProcessSource for ForkChain {
             ppid: Pid::from_raw(1),
             pgid: pid,
             uid: nix::unistd::geteuid().as_raw(),
+            name: ProcessName::default(),
         })
     }
 

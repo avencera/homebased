@@ -7,10 +7,15 @@
 //! that also dropped the marker is tied to the run only by the descendants its
 //! worker recorded while the run was alive, see [`DescendantTracker`]
 //!
-//! Same-user processes with unreadable environments that started at or after
-//! the workload start hold cleanup for a machine check, but are never signalled.
-//! One that another user's older daemon started, such as an ssh login's
-//! `sshd-session`, is not run work and does not hold cleanup
+//! A same-user process with an unreadable environment that started at or after
+//! the workload start is judged by its ancestry, see [`Sweeper::lineage`].
+//! Environments are inherited, so it is run work only if its nearest readable
+//! ancestor is: one that carries the marker holds cleanup for a machine check,
+//! as does a chain that ends at a process that adopts orphans or cannot be
+//! read. A suspect is never signalled. One under a
+//! readable unmarked process, such as a sandboxed browser renderer, or under
+//! an older process, such as an ssh login's `sshd-session`, is not run work
+//! and does not hold cleanup
 //!
 //! Cleanup reports whether attributable cleanup completed. It is not proof
 //! that a GPU is free: a process with a cleared environment, another user's
@@ -196,10 +201,11 @@ pub enum CleanupFailure {
         /// Remaining targets
         survivors: Vec<ProcessIdentity>,
     },
-    /// Same-user processes started during the run, but their markers could not be read
+    /// Same-user processes started during the run, but their markers could not
+    /// be read and their ancestry did not clear them
     UnreadableSuspects {
-        /// Processes to check by PID and kernel start time
-        suspects: Vec<ProcessIdentity>,
+        /// Processes to check, with the ancestry that held each
+        suspects: Vec<Suspect>,
     },
     /// A protected process, such as the daemon or a task worker, carried the
     /// marker; it was never signalled
@@ -263,6 +269,130 @@ mod pids_serde {
     }
 }
 
+/// Short command name the kernel keeps for a process: `comm` on Linux and
+/// `p_comm` on macOS, both at most 16 bytes
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ProcessName {
+    bytes: [u8; 16],
+    len: u8,
+}
+
+impl ProcessName {
+    /// The name up to its first NUL, cut to 16 bytes
+    pub(crate) fn new(raw: &[u8]) -> Self {
+        let raw = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+        let mut name = Self::default();
+        let len = raw.len().min(name.bytes.len());
+        name.bytes[..len].copy_from_slice(&raw[..len]);
+        name.len = u8::try_from(len).unwrap_or(u8::MAX);
+        name
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl fmt::Display for ProcessName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&String::from_utf8_lossy(self.as_bytes()))
+    }
+}
+
+impl fmt::Debug for ProcessName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", String::from_utf8_lossy(self.as_bytes()))
+    }
+}
+
+/// A process named in a cleanup report
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct NamedProcess {
+    /// PID and kernel start time
+    #[serde(flatten)]
+    pub identity: ProcessIdentity,
+    /// Kernel command name, absent in reports written before names were kept
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl NamedProcess {
+    fn new(identity: ProcessIdentity, name: ProcessName) -> Self {
+        Self {
+            identity,
+            name: (!name.as_bytes().is_empty()).then(|| name.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for NamedProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "pid {} ({name})", self.identity.pid),
+            None => write!(f, "pid {}", self.identity.pid),
+        }
+    }
+}
+
+/// An unreadable same-user process that holds cleanup
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Suspect {
+    /// The process
+    #[serde(flatten)]
+    pub process: NamedProcess,
+    /// What its ancestry showed, absent in reports written before it was kept
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+}
+
+/// Why an unreadable suspect's ancestry ties it to the run, or cannot clear it
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Lineage {
+    /// The nearest readable ancestor carries the run marker, so the suspect
+    /// inherited the run's environment
+    RunWork {
+        /// That ancestor
+        ancestor: NamedProcess,
+    },
+    /// The chain reaches init, the daemon, a worker, or one of the daemon's
+    /// own ancestors before a readable process, so the tree was orphaned there
+    /// and its origin is lost
+    Orphaned {
+        /// The adopting process; `None` for init
+        adopter: Option<NamedProcess>,
+        /// The topmost process of the orphaned tree
+        root: NamedProcess,
+    },
+    /// An ancestor could not be read, or its start time shows its PID was reused
+    Unknown {
+        /// PID of the ancestor the walk stopped at
+        #[serde(with = "pid_serde")]
+        at: Pid,
+        /// What went wrong
+        reason: String,
+    },
+}
+
+impl fmt::Display for Lineage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunWork { ancestor } => {
+                write!(f, "under {ancestor}, which carries the run marker")
+            }
+            Self::Orphaned {
+                adopter: Some(adopter),
+                root,
+            } => write!(f, "orphaned tree of {root}, adopted by {adopter}"),
+            Self::Orphaned {
+                adopter: None,
+                root,
+            } => write!(f, "orphaned tree of {root}, adopted by init"),
+            Self::Unknown { at, reason } => write!(f, "ancestry unknown at pid {at}: {reason}"),
+        }
+    }
+}
+
 impl fmt::Display for CleanupFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -275,8 +405,32 @@ impl fmt::Display for CleanupFailure {
             }
             Self::UnreadableSuspects { suspects } => {
                 write!(f, "could not read run markers; check same-user processes")?;
+                // a sandboxed tree holds many suspects with one lineage, so
+                // each lineage is named once after the processes it holds
+                let mut groups: Vec<(Option<&Lineage>, Vec<&Suspect>)> = Vec::new();
                 for suspect in suspects {
-                    write!(f, "; {suspect}")?;
+                    let lineage = suspect.lineage.as_ref();
+                    match groups.iter_mut().find(|(seen, _)| *seen == lineage) {
+                        Some((_, members)) => members.push(suspect),
+                        None => groups.push((lineage, vec![suspect])),
+                    }
+                }
+
+                for (lineage, members) in groups {
+                    let mut separator = "; ";
+                    for suspect in members {
+                        let process = &suspect.process;
+                        write!(
+                            f,
+                            "{separator}{process} started {}",
+                            process.identity.start.0
+                        )?;
+                        separator = ", ";
+                    }
+
+                    if let Some(lineage) = lineage {
+                        write!(f, ": {lineage}")?;
+                    }
                 }
 
                 Ok(())
@@ -484,6 +638,19 @@ pub(crate) struct ProcessInfo {
     pub(crate) ppid: Pid,
     pub(crate) pgid: Pid,
     pub(crate) uid: u32,
+    pub(crate) name: ProcessName,
+}
+
+impl ProcessInfo {
+    fn named(&self, pid: Pid) -> NamedProcess {
+        NamedProcess::new(
+            ProcessIdentity {
+                pid,
+                start: self.start,
+            },
+            self.name,
+        )
+    }
 }
 
 /// A process's environment block: `KEY=VALUE` entries, each ending in NUL
@@ -499,6 +666,11 @@ impl Environment {
         self.0
             .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
+    }
+
+    /// Whether the block has no entries, as an Apple platform binary's does
+    fn is_empty(&self) -> bool {
+        self.entries().next().is_none()
     }
 
     /// Whether any `HOMEBASED_TASK_ID` entry names `marker`
@@ -583,11 +755,11 @@ impl ProcessSource for SystemProcesses {
 }
 
 /// What a live process's environment establishes about the run
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Observation {
     /// The process carries the marker or is an adopted descendant
     Marked(ProcessIdentity),
-    Suspect(ProcessIdentity),
+    Suspect(Suspect),
     /// The process exited between enumeration and inspection, so a child it
     /// forked first may be missing from this scan's PID list
     Vanished,
@@ -597,7 +769,7 @@ enum Observation {
 #[derive(Debug, Default)]
 struct Scan {
     targets: BTreeMap<Pid, ProcessIdentity>,
-    suspects: BTreeSet<ProcessIdentity>,
+    suspects: BTreeMap<ProcessIdentity, Suspect>,
     /// A listed process exited before it was inspected
     unsettled: bool,
     confirmed_empty: bool,
@@ -627,6 +799,9 @@ struct Sweeper<'a, S> {
     protected_hits: BTreeSet<Pid>,
     /// Same-user refusals already logged, so rescans do not repeat the warning
     warned: BTreeSet<Pid>,
+    /// Processes whose adoption of an orphan says nothing about its origin:
+    /// this process and its ancestors, read on first use
+    adopters: Option<BTreeSet<ProcessIdentity>>,
     /// Start of the current run of consecutive empty scans, and its length
     empty_since: Option<Instant>,
     empty_scans: u32,
@@ -658,6 +833,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             signalled: BTreeSet::new(),
             protected_hits: BTreeSet::new(),
             warned: BTreeSet::new(),
+            adopters: None,
             empty_since: None,
             empty_scans: 0,
             settled_since: None,
@@ -702,7 +878,7 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         }
         if !scan.suspects.is_empty() {
             return Err(CleanupFailure::UnreadableSuspects {
-                suspects: scan.suspects.iter().copied().collect(),
+                suspects: scan.suspects.into_values().collect(),
             });
         }
         if scan.targets.is_empty() {
@@ -778,8 +954,8 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
         for pid in pids {
             let identity = match self.observe(pid) {
                 Some(Observation::Marked(identity)) => identity,
-                Some(Observation::Suspect(identity)) => {
-                    scan.suspects.insert(identity);
+                Some(Observation::Suspect(suspect)) => {
+                    scan.suspects.insert(suspect.process.identity, suspect);
                     continue;
                 }
                 Some(Observation::Vanished) => {
@@ -876,62 +1052,185 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
     }
 
     /// Warn once per same-user refusal and identify suspects within the run bound
-    fn note_refusal(
-        &mut self,
-        pid: Pid,
-        info: ProcessInfo,
-        errno: Errno,
-    ) -> Option<ProcessIdentity> {
+    fn note_refusal(&mut self, pid: Pid, info: ProcessInfo, errno: Errno) -> Option<Suspect> {
         // a refused environment read can also mean the process vanished
         if !self.still_same(pid, info) || info.uid != self.own_uid {
             return None;
         }
-        if self.warned.insert(pid) {
-            warn!(marker = %self.marker, %pid, "Same-user environment read refused: {errno}");
-        }
+        let first = self.warned.insert(pid);
 
         // older processes cannot be run descendants; long-lived agents may
         // deny environment reads, so they must not hold a later run's resource
-        let run_start = self.run_start.filter(|start| info.start >= *start)?;
-        if self.started_by_older_daemon(info.ppid, run_start) {
+        let Some(run_start) = self.run_start.filter(|start| info.start >= *start) else {
+            if first {
+                warn!(marker = %self.marker, %pid, "Same-user environment read refused: {errno}");
+            }
             return None;
-        }
+        };
 
-        Some(ProcessIdentity {
-            pid,
-            start: info.start,
-        })
+        let process = info.named(pid);
+        match self.lineage(pid, info, run_start) {
+            Verdict::Hold(lineage) => {
+                if first {
+                    warn!(marker = %self.marker, %process, "Unreadable process may be run work ({errno}): {lineage}");
+                }
+
+                Some(Suspect {
+                    process,
+                    lineage: Some(lineage),
+                })
+            }
+            // a sandboxed browser has many such processes, so this stays quiet
+            Verdict::Clear(reason) => {
+                if first {
+                    info!(marker = %self.marker, %process, "Unreadable process is not run work: {reason}");
+                }
+
+                None
+            }
+        }
     }
 
-    /// Whether another user's process from before the run started this one
+    /// Whether an unreadable same-user process may be run work, from its ancestry
     ///
-    /// An ssh login makes a same-user `sshd-session` that hides its environment,
-    /// under a root `sshd-session` monitor that the older root `sshd` listener
-    /// forked. The walk climbs other-user ancestors until one predates the run.
-    /// Work a run hands to such a daemon, as with `ssh localhost`, is already
-    /// outside what cleanup can attribute. A same-user ancestor, init, or an
-    /// unreadable link keeps the process a suspect, so `sudo -u` from the run
-    /// and orphans adopted by init still hold the resource
-    fn started_by_older_daemon(&mut self, mut ancestor: Pid, run_start: ProcessStartTime) -> bool {
+    /// Environments are inherited, so the suspect is judged by its nearest
+    /// readable ancestor: run work only if that ancestor carries the marker.
+    /// Chrome's sandboxed zygote and renderers, and
+    /// other setuid or namespace sandboxes, hide their environment under a
+    /// readable browser process, which is how an unrelated headless browser
+    /// held a GPU. Unreadable links are climbed: other users' processes, as
+    /// an ssh login's root `sshd-session` monitor, and same-user sandboxes.
+    /// Any link that started before the run clears the suspect, since run
+    /// descendants all start after the workload child and only adopters
+    /// predate it
+    ///
+    /// Init, this daemon, a protected worker, and the daemon's same-user
+    /// ancestors, such as `systemd --user`, hold the suspect: they adopt orphaned run
+    /// work, so reaching one means the readable process that started the tree
+    /// is gone. A link that cannot be read, or that started after its child
+    /// and so is a later process that reused the parent's PID, holds it too
+    ///
+    /// Residual risks, which add no machinery because neither is likely:
+    /// - run work that handed a launch to an unrelated readable daemon, such
+    ///   as a browser automation server started outside the run, or that
+    ///   dropped the marker but kept other entries, reads as unmarked. The
+    ///   marker sweep has no recorded descendants and already cannot attribute
+    ///   such readable work, so its sandboxed children are treated the same; a
+    ///   GPU job has no reason to do either
+    /// - the adopters are this process's current ancestors. The installed
+    ///   daemon always runs under its systemd or launchd unit, which also
+    ///   adopts orphaned run work, even across daemon restarts. Only a daemon
+    ///   run by hand under a different parent than the run's worker had would
+    ///   miss that adopter and could clear an orphaned tree
+    fn lineage(&mut self, suspect: Pid, info: ProcessInfo, run_start: ProcessStartTime) -> Verdict {
+        let mut child = info.named(suspect);
+        let mut parent = info.ppid;
         for _ in 0..MAX_ANCESTRY {
-            // init adopts orphaned run work, so it attributes nothing
-            if ancestor.as_raw() <= 1 {
-                return false;
+            // init adopts orphaned run work, so it attributes nothing; macOS
+            // reports PID 0 as the parent of launchd
+            if parent.as_raw() <= 1 {
+                return Verdict::Hold(Lineage::Orphaned {
+                    adopter: None,
+                    root: child,
+                });
             }
 
-            let Read::Found(info) = self.source.info(ancestor) else {
-                return false;
+            let info = match self.source.info(parent) {
+                Read::Found(info) => info,
+                Read::Exited(_) | Read::Gone => return Verdict::unknown(parent, "exited"),
+                Read::Refused(errno) => {
+                    return Verdict::unknown(parent, format!("read refused: {errno}"));
+                }
             };
-            if info.uid == self.own_uid {
-                return false;
+            let ancestor = info.named(parent);
+            // a parent always starts no later than its child
+            if info.start > child.identity.start {
+                return Verdict::unknown(parent, "started after its child; PID reused");
             }
-            if info.start < run_start {
-                return true;
+            if self.adopts_orphans(ancestor.identity) {
+                return Verdict::Hold(Lineage::Orphaned {
+                    adopter: Some(ancestor),
+                    root: child,
+                });
             }
-            ancestor = info.ppid;
+
+            let older = info.start < run_start;
+            if info.uid != self.own_uid {
+                if older {
+                    return Verdict::Clear(Cleared::Older(ancestor));
+                }
+                child = ancestor;
+                parent = info.ppid;
+                continue;
+            }
+
+            // an empty block says nothing about what was inherited: macOS
+            // shows one for platform binaries such as a run's `/bin/bash`, and
+            // `env -i` makes one, so it is climbed like a refused read
+            let environment = match self.source.environment(parent) {
+                Read::Found(environment) if !environment.is_empty() => Some(environment),
+                Read::Found(_) | Read::Refused(_) => None,
+                Read::Exited(_) | Read::Gone => return Verdict::unknown(parent, "exited"),
+            };
+            let Some(environment) = environment else {
+                if older {
+                    return Verdict::Clear(Cleared::Older(ancestor));
+                }
+                child = ancestor;
+                parent = info.ppid;
+                continue;
+            };
+            if !self.still_same(parent, info) {
+                return Verdict::unknown(parent, "exited");
+            }
+            if environment.carries(&self.marker_value) {
+                return Verdict::Hold(Lineage::RunWork { ancestor });
+            }
+            return Verdict::Clear(Cleared::Unmarked(ancestor));
         }
 
-        false
+        Verdict::unknown(parent, format!("ancestry deeper than {MAX_ANCESTRY}"))
+    }
+
+    /// Whether `ancestor` is a protected process or this process's same-user ancestor
+    fn adopts_orphans(&mut self, ancestor: ProcessIdentity) -> bool {
+        if self.protected.contains(&ancestor.pid) {
+            return true;
+        }
+        if self.adopters.is_none() {
+            self.adopters = Some(self.own_ancestry());
+        }
+
+        self.adopters
+            .as_ref()
+            .is_some_and(|adopters| adopters.contains(&ancestor))
+    }
+
+    /// This process and its live same-user ancestors below init
+    ///
+    /// Other users' ancestors are left out: a daemon run by hand inside an ssh
+    /// login sits under root `sshd`, which adopts no orphans, and counting it
+    /// would hold every ssh login made during a run
+    fn own_ancestry(&mut self) -> BTreeSet<ProcessIdentity> {
+        let mut ancestry = BTreeSet::new();
+        let mut pid = Pid::this();
+        for _ in 0..MAX_ANCESTRY {
+            if pid.as_raw() <= 1 {
+                break;
+            }
+            let Read::Found(info) = self.source.info(pid) else {
+                break;
+            };
+            if info.uid == self.own_uid {
+                ancestry.insert(ProcessIdentity {
+                    pid,
+                    start: info.start,
+                });
+            }
+            pid = info.ppid;
+        }
+
+        ancestry
     }
 
     fn lost_group(&mut self, leader: ProcessIdentity) -> Result<GroupAttribution, CleanupFailure> {
@@ -1015,6 +1314,44 @@ impl<'a, S: ProcessSource> Sweeper<'a, S> {
             }
             if Instant::now() >= until {
                 return Ok(false);
+            }
+        }
+    }
+}
+
+/// What an unreadable suspect's ancestry established
+#[derive(Debug)]
+enum Verdict {
+    /// The suspect may be run work
+    Hold(Lineage),
+    /// The suspect is not run work
+    Clear(Cleared),
+}
+
+impl Verdict {
+    fn unknown(at: Pid, reason: impl Into<String>) -> Self {
+        Self::Hold(Lineage::Unknown {
+            at,
+            reason: reason.into(),
+        })
+    }
+}
+
+/// Why an unreadable suspect is not run work
+#[derive(Debug)]
+enum Cleared {
+    /// An ancestor that adopts no orphans started before the run
+    Older(NamedProcess),
+    /// The nearest readable ancestor does not carry the marker
+    Unmarked(NamedProcess),
+}
+
+impl fmt::Display for Cleared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Older(ancestor) => write!(f, "under {ancestor}, which predates the run"),
+            Self::Unmarked(ancestor) => {
+                write!(f, "under {ancestor}, which does not carry the run marker")
             }
         }
     }

@@ -1231,7 +1231,6 @@ impl AppError {
     }
 
     /// Convert to a process exit code
-    #[must_use]
     pub fn to_exit_code(&self) -> ExitCode {
         ExitCode::from(self.exit_code())
     }
