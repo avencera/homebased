@@ -51,7 +51,7 @@ struct Harness {
 
 impl Harness {
     fn new(threshold: &str) -> Self {
-        crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
+        crate::runner::set_task_run_executable_for_tests(crate::test_support::homebased_binary());
         let directory = tempfile::tempdir().unwrap();
         let home = Home::resolve(Some(directory.path().join("state"))).unwrap();
         home.ensure().unwrap();
@@ -84,7 +84,7 @@ impl Harness {
 
     fn start(&mut self) {
         let log = fs::File::create(self.directory.path().join("daemon.log")).unwrap();
-        let mut command = Command::new(assert_cmd::cargo::cargo_bin("homebased"));
+        let mut command = Command::new(crate::test_support::homebased_binary());
         crate::run_env::scrub(&mut command);
         let child = command
             .args(["daemon", "serve", "--home"])
@@ -111,7 +111,7 @@ impl Harness {
             if !self.home.sock_path().exists() {
                 return false;
             }
-            Command::new(assert_cmd::cargo::cargo_bin("homebased"))
+            Command::new(crate::test_support::homebased_binary())
                 .args(["--json", "daemon", "status", "--home"])
                 .arg(self.home.root())
                 .env(

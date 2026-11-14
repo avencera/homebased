@@ -547,17 +547,22 @@ fn wait_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
 }
 
 fn process_is_live(pid: i32) -> bool {
-    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-        return stat
-            .split_whitespace()
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() && !is_zombie(pid)
+}
+
+/// A zombie still answers signal 0 until its parent reaps it
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.split_whitespace()
             .nth(2)
-            .is_some_and(|state| state != "Z");
-    }
-    true
+            .is_none_or(|state| state == "Z")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_zombie(_pid: i32) -> bool {
+    false
 }
 
 fn event_json(line: &str) -> Value {

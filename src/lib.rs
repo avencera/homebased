@@ -44,5 +44,7 @@ pub mod waiting;
 
 #[cfg(test)]
 mod dispatcher_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use domain::API_VERSION;
