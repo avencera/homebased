@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
+use crate::daemon::actors::memory::MemoryMsg;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
     ContainerDetail, DependencyView, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList,
@@ -200,6 +201,8 @@ pub(super) struct SubmitBody {
     pub(super) after: Option<Dependencies>,
     /// Origin-only request to hold the task while its machine is unreachable
     pub(super) machine_wait: Option<MachineWait>,
+    /// Origin-only peak that holds the task until it fits under the memory bar
+    pub(super) mem_peak: Option<crate::memory::MemPeak>,
 }
 
 impl SubmitBody {
@@ -208,6 +211,7 @@ impl SubmitBody {
         ReleaseTerms {
             after: self.after.clone(),
             machine_wait: self.machine_wait.clone(),
+            mem_peak: self.mem_peak,
         }
     }
 }
@@ -232,6 +236,8 @@ struct SubmitEnvelope {
     wait_for_machine: bool,
     #[serde(default)]
     coalesce: Option<String>,
+    #[serde(default)]
+    mem_peak: Option<crate::memory::MemPeak>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -270,6 +276,7 @@ where
             callback_cwd: envelope.callback_cwd,
             after,
             machine_wait,
+            mem_peak: envelope.mem_peak,
         }))
     }
 }
@@ -531,9 +538,10 @@ pub(super) async fn local_task_summaries(
     let unlaunched = call(&state.store, |reply| StoreMsg::UnlaunchedTasks { reply }).await?;
     for task in unlaunched {
         let after = crate::daemon::dependencies::views(state, task.held.after.as_ref()).await?;
-        if let Some(summary) = TaskSummary::from_unlaunched(&task, after)
+        if let Some(mut summary) = TaskSummary::from_unlaunched(&task, after)
             && filter.matches(summary.status, summary.thread)
         {
+            summary.memory_wait = memory_wait(state, &summary).await?;
             tasks.push(summary);
         }
     }
@@ -544,6 +552,18 @@ pub(super) async fn local_task_summaries(
     }
     tasks.sort_by_key(|task| task.id.0);
     Ok(tasks)
+}
+
+/// Why a held task with a peak waits for memory, from the last release pass
+pub(crate) async fn memory_wait(
+    state: &AppState,
+    summary: &TaskSummary,
+) -> Result<Option<crate::memory::MemoryWait>, AppError> {
+    if summary.mem_peak.is_none() {
+        return Ok(None);
+    }
+    let task = summary.id;
+    call(&state.memory, |reply| MemoryMsg::TaskWait { task, reply }).await
 }
 
 async fn list(

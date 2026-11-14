@@ -261,6 +261,7 @@ pub(super) fn park_on(
         cwd: route.spec.cwd.clone(),
         machine: None,
         timeout: route.spec.timeout,
+        gpu: route.spec.gpu,
         workload: NormalizedWorkload::Agent(NormalizedAgentWorkload {
             agent: agent.agent,
             model: agent.model.clone(),

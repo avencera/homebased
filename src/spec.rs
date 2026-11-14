@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
 use crate::machine_wait::{CoalesceKey, MachineWait};
+use crate::memory::MemPeak;
 
 mod host;
 #[cfg(test)]
@@ -179,6 +180,18 @@ struct SubmitSpecWire {
     #[serde(default)]
     #[schemars(schema_with = "coalesce_schema")]
     coalesce: Option<String>,
+    /// Whether a host workload's child sees this machine's GPUs. Default
+    /// `hidden` sets `CUDA_VISIBLE_DEVICES` empty, so CUDA finds no device;
+    /// GPU work belongs in the GPU queue
+    #[serde(default)]
+    gpu: GpuAccess,
+    /// Peak host memory of the task in GiB. The task is held on this daemon
+    /// until the machine's memory in use, plus the room promised to work
+    /// started or waiting ahead of it, plus this peak, stays under its memory
+    /// bar (default 40 GiB). Only for a task that runs on this machine. Omit
+    /// for no memory check
+    #[serde(default)]
+    mem_peak: Option<MemPeak>,
     /// Workload variant. Parsed from `Value` after the envelope so nested
     /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
@@ -380,6 +393,12 @@ pub struct SubmitSpec {
     ///
     /// Origin-only, like `after`: it travels beside the normalized spec
     pub machine_wait: Option<MachineWait>,
+    /// Whether the child sees this machine's GPUs
+    pub gpu: GpuAccess,
+    /// Hold the task until its peak fits under the memory bar
+    ///
+    /// Origin-only, like `after`: it travels beside the normalized spec
+    pub mem_peak: Option<MemPeak>,
     /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
@@ -448,8 +467,37 @@ pub struct NormalizedSpec {
     /// Output-inactivity timeout
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Whether the child sees this machine's GPUs
+    // omitted when hidden so executors that predate the field still accept the spec
+    #[serde(default, skip_serializing_if = "GpuAccess::is_hidden")]
+    pub gpu: GpuAccess,
     /// Workload variant
     pub workload: NormalizedWorkload,
+}
+
+/// Whether a task's child sees the GPUs of the machine that runs it
+///
+/// A plain task is CPU work: a GPU it can see lets a library such as PyTorch
+/// open a CUDA context on it, which takes device memory from GPU queue jobs.
+/// GPU queue runs never read this; their resource decides what they see
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuAccess {
+    /// `CUDA_VISIBLE_DEVICES` is set empty
+    #[default]
+    Hidden,
+    /// `CUDA_VISIBLE_DEVICES` is unset, so the child sees every GPU
+    Visible,
+}
+
+impl GpuAccess {
+    /// Whether the child is kept from every GPU
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden)
+    }
 }
 
 /// Read a spec from a file path, or stdin for `-`, as JSON
@@ -514,6 +562,8 @@ struct NormalizedSpecEnvelope {
     machine: Option<MachineName>,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
+    #[serde(default)]
+    gpu: GpuAccess,
     workload: Value,
 }
 
@@ -538,6 +588,7 @@ pub fn parse_normalized_value(value: &Value) -> Result<NormalizedSpec, AppError>
         cwd: envelope.cwd,
         machine: envelope.machine,
         timeout: envelope.timeout,
+        gpu: envelope.gpu,
         workload,
     })
 }
@@ -683,6 +734,8 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         timeout: wire.timeout,
         after,
         machine_wait,
+        gpu: wire.gpu,
+        mem_peak: wire.mem_peak,
         workload,
     })
 }
@@ -926,6 +979,7 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
         cwd: spec.cwd.clone(),
         machine: spec.machine.clone(),
         timeout: spec.timeout,
+        gpu: spec.gpu,
         workload,
     })
 }

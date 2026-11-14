@@ -138,6 +138,9 @@ pub struct NewJob {
     /// When the origin took a CI job, which starts its wait; `None` for
     /// other jobs and for origins that did not send it
     pub submitted_at: Option<DateTime<Utc>>,
+    /// Slot to take instead of the back of its level, applied only when the
+    /// job is first stored
+    pub placement: Option<crate::queue::EntryPlacement>,
 }
 
 /// Submit response: the job and its slot now
@@ -155,6 +158,10 @@ pub struct JobAccepted {
     pub priority: Priority,
     /// Current position; `None` once terminal
     pub position: Option<u32>,
+    /// Where the submit's entry placement put the job; only on the answer
+    /// that stored it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entered: Option<crate::queue::EntryOutcome>,
 }
 
 /// Result of a move
@@ -303,6 +310,8 @@ impl Store {
             queue,
             episode: self.blocked_episode(machine)?,
             thresholds,
+            // the queue actor reads memory only when a job declared a peak
+            memory: None,
         })
     }
 }

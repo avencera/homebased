@@ -10,6 +10,7 @@ use crate::dependency::{Dependencies, HeldCancellation, ReleaseRule};
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
+use crate::memory::MemPeak;
 use crate::spec::NormalizedSpec;
 
 /// The executable saved for callbacks owned by the origin
@@ -195,13 +196,15 @@ pub struct ReleaseTerms {
     pub after: Option<Dependencies>,
     /// Hold the route while its execution machine is unreachable
     pub machine_wait: Option<MachineWait>,
+    /// Hold the route until its peak fits under this machine's memory bar
+    pub mem_peak: Option<MemPeak>,
 }
 
 impl ReleaseTerms {
     /// Whether a route with these terms may start held instead of launching
     #[must_use]
     pub fn may_hold(&self) -> bool {
-        self.after.is_some() || self.machine_wait.is_some()
+        self.after.is_some() || self.machine_wait.is_some() || self.mem_peak.is_some()
     }
 }
 
@@ -221,6 +224,8 @@ pub struct DependentRoute {
     pub rule: ReleaseRule,
     /// Submitted with `wait_for_machine`, so its executor is asked before the send
     pub waits_for_machine: bool,
+    /// Submitted with `mem_peak`, so it launches only when the memory gate admits it
+    pub mem_peak: Option<MemPeak>,
 }
 
 /// Exact identity and origin-owned context used to create a held route

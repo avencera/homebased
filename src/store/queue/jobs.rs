@@ -17,9 +17,9 @@ use crate::machine::MachineId;
 use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
 use crate::queue::schedule::{NoticeThresholds, manual_preempt};
 use crate::queue::{
-    AttentionId, BlockedNotice, EventRun, JobEvent, JobEventKind, JobId, JobState, LevelEnd,
-    MoveRefusal, OperationId, Placement, PreemptRefusal, Priority, QueueError, ResourceId, Side,
-    StopCause, Target, sha256_hex,
+    AttentionId, BlockedNotice, EntryOutcome, EntryPlacement, EventRun, JobEvent, JobEventKind,
+    JobId, JobState, LevelEnd, MoveRefusal, OperationId, Placement, PreemptRefusal, Priority,
+    QueueError, ResourceId, Side, StopCause, Target, sha256_hex,
 };
 use crate::store::{Store, fmt_time};
 
@@ -115,8 +115,61 @@ impl Store {
                 ],
             )?;
             self.open_ci_timing(new, Utc::now())?;
-            Ok(accepted(&self.require_job(new.id)?))
+            let entered = match new.placement {
+                Some(placement) => Some(self.enter(new.machine, new.id, placement)?),
+                None => None,
+            };
+            Ok(JobAccepted {
+                entered,
+                ..accepted(&self.require_job(new.id)?)
+            })
         })
+    }
+
+    /// Move a job just stored at the back of its level to its entry placement
+    fn enter(
+        &self,
+        machine: MachineId,
+        id: JobId,
+        placement: EntryPlacement,
+    ) -> Result<EntryOutcome, AppError> {
+        let (outcome, slot) = match placement {
+            EntryPlacement::Front => (
+                EntryOutcome::Front,
+                Placement::Edge {
+                    priority: None,
+                    end: LevelEnd::Front,
+                },
+            ),
+            EntryPlacement::Next { anchor, side } => {
+                let Some(record) = self
+                    .job(anchor)?
+                    .filter(|record| record.machine == machine && record.id != id)
+                else {
+                    return Ok(EntryOutcome::AnchorMissing { anchor });
+                };
+                if record.state.is_terminal() {
+                    (
+                        EntryOutcome::AnchorEnded { anchor },
+                        Placement::Edge {
+                            priority: Some(record.priority),
+                            end: LevelEnd::Front,
+                        },
+                    )
+                } else {
+                    (
+                        EntryOutcome::Next { anchor, side },
+                        Placement::Relative {
+                            target: anchor,
+                            side,
+                            expect: None,
+                        },
+                    )
+                }
+            }
+        };
+        self.apply_move(machine, id, slot)?;
+        Ok(outcome)
     }
 
     /// One job by id, on any machine
@@ -765,6 +818,7 @@ fn accepted(job: &JobRecord) -> JobAccepted {
         state: job.state.as_str().to_owned(),
         priority: job.priority,
         position: job.position,
+        entered: None,
     }
 }
 

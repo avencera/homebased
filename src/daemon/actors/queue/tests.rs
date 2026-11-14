@@ -198,6 +198,7 @@ impl Harness {
                 env: TaskEnv::capture(),
                 origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
                 submitted_at: None,
+                placement: None,
             })
             .unwrap();
         id
@@ -1279,6 +1280,7 @@ fn missing_executable_fails_once_and_does_not_block_the_queue() {
             env: TaskEnv::capture(),
             origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
             submitted_at: None,
+            placement: None,
         })
         .unwrap();
     fs::remove_file(executable).unwrap();

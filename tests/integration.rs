@@ -692,6 +692,8 @@ mod gpu_idle;
 mod lease_guard;
 #[path = "integration/lifecycle.rs"]
 mod lifecycle;
+#[path = "integration/memory_admission.rs"]
+mod memory_admission;
 #[path = "integration/reports.rs"]
 mod reports;
 #[path = "integration/resource_jobs.rs"]

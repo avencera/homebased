@@ -6,11 +6,13 @@
 //! head drives the notice timer. Nothing here performs I/O
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::TaskId;
+use crate::memory::{MemPeak, MemoryWait, Room};
 
 use super::{
     ActiveRun, AttentionId, JobId, PreemptRefusal, PreemptStop, Preemption, Priority, ResourceId,
@@ -50,6 +52,8 @@ pub struct JobView {
     pub preempt: Preemption,
     /// Whether it waits or runs
     pub state: QueuedState,
+    /// Host memory its runs may use at their peak; `None` skips the memory check
+    pub mem_peak: Option<MemPeak>,
 }
 
 /// Notice thresholds from `[resource.notify_blocked_after]`
@@ -98,6 +102,9 @@ pub struct Snapshot {
     pub episode: Option<StoredEpisode>,
     /// Notice thresholds
     pub thresholds: NoticeThresholds,
+    /// Host memory left for jobs with a peak; `None` when it was not read,
+    /// which starts none of them
+    pub memory: Option<Room>,
 }
 
 /// Start `job` on `resource`
@@ -173,6 +180,9 @@ pub struct Decisions {
     pub preemption: Option<Preempt>,
     /// The blocked head; `None` ends any open episode
     pub blocked: Option<BlockedHead>,
+    /// Jobs that have a free resource but wait for host memory, each holding
+    /// that resource and reserving its peak
+    pub memory_waits: BTreeMap<JobId, MemoryWait>,
 }
 
 /// Decide launches, at most one preemption, and the blocked head
@@ -183,7 +193,10 @@ pub struct Decisions {
 ///    busy is skipped, so it never blocks a job behind it from another
 ///    resource. A job whose previous run is still being cleaned up, on any
 ///    resource, waits for that cleanup, since leftovers of that run may still
-///    write to its job directory
+///    write to its job directory. A job with a memory peak starts only when
+///    the peak fits the room left; one that does not fit keeps the free
+///    resource it would take and reserves its peak, so no job behind it takes
+///    either while it waits for memory
 /// 2. Walk the jobs still queued in serving order and preempt for the first
 ///    with an executing run of a strictly lower level on an allowed resource
 ///    whose mode allows a stop now. No new preemption starts while any resource
@@ -200,6 +213,10 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
 
     let mut launches = Vec::new();
     let mut waiting = Vec::new();
+    let mut memory = snapshot.memory.clone().unwrap_or(Room::Unreadable {
+        error: "memory was not read".into(),
+    });
+    let mut memory_waits = BTreeMap::new();
     for job in snapshot.queue.iter().filter(|job| startable(snapshot, job)) {
         let Some(index) = free
             .iter()
@@ -209,6 +226,12 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
             continue;
         };
         let resource = free.remove(index);
+        if let Some(peak) = job.mem_peak
+            && let Err(wait) = memory.admit(peak)
+        {
+            memory_waits.insert(job.id, wait);
+            continue;
+        }
         launches.push(Launch {
             job: job.id,
             resource: resource.id,
@@ -227,6 +250,7 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
         launches,
         preemption,
         blocked,
+        memory_waits,
     }
 }
 

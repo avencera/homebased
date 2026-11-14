@@ -7,6 +7,9 @@ use std::sync::Arc;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
 use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, CallbackMsg};
+use crate::daemon::actors::memory::{
+    MEMORY_NAME, MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg,
+};
 use crate::daemon::actors::queue::{QUEUE_NAME, QueueActor, QueueArgs, QueueMsg};
 use crate::daemon::actors::task::{TaskActor, TaskMsg, cancel_task};
 use crate::daemon::actors::{StoreActor, StoreMsg, WaiterRegistry, call, send_reply};
@@ -51,6 +54,10 @@ pub(crate) enum SupervisorMsg {
     /// Store ref for `AppState` reads
     GetStore {
         reply: RpcReplyPort<Result<ActorRef<StoreMsg>, AppError>>,
+    },
+    /// Memory admission actor for `AppState`
+    GetMemory {
+        reply: RpcReplyPort<Result<ActorRef<MemoryMsg>, AppError>>,
     },
     /// Registry of `homebased wait` streams for `AppState`
     GetWaiters {
@@ -116,6 +123,7 @@ pub(crate) struct SupervisorState {
     store: ActorRef<StoreMsg>,
     callback: ActorRef<CallbackMsg>,
     waiters: WaiterRegistry,
+    memory: ActorRef<MemoryMsg>,
     tasks: HashMap<TaskId, ActorRef<TaskMsg>>,
     queue: Option<ActorRef<QueueMsg>>,
 }
@@ -131,6 +139,7 @@ pub(crate) struct SupervisorArgs {
     machine_name: String,
     thresholds: crate::queue::schedule::NoticeThresholds,
     ci: crate::queue::ci::CiConfig,
+    memory: MemoryLimits,
 }
 
 impl SupervisorArgs {
@@ -147,7 +156,14 @@ impl SupervisorArgs {
             machine_name: "this machine".into(),
             thresholds: crate::queue::schedule::NoticeThresholds::default(),
             ci: crate::queue::ci::CiConfig::default(),
+            memory: MemoryLimits::new(&crate::config::MemoryConfig::default()),
         }
+    }
+
+    /// Set the memory bar and gauge from the daemon configuration
+    pub(crate) fn with_memory(mut self, memory: MemoryLimits) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Set CI admission and checkout settings from the daemon configuration
@@ -192,6 +208,7 @@ impl Actor for SupervisorActor {
             machine_name,
             thresholds,
             ci,
+            memory,
         }: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         let (store, _store_handle) = StoreActor::spawn_linked(
@@ -203,6 +220,17 @@ impl Actor for SupervisorActor {
         .await?;
         let machine = load_or_create_machine_id(&home)?;
         let waiters = WaiterRegistry::spawn(Some(myself.get_cell())).await?;
+        let (memory, _) = MemoryActor::spawn_linked(
+            Some(MEMORY_NAME.into()),
+            MemoryActor,
+            MemoryArgs {
+                limits: memory,
+                store: store.clone(),
+                machine,
+            },
+            myself.get_cell(),
+        )
+        .await?;
         let (callback, _callback_handle) = CallbackActor::spawn_linked(
             Some(CALLBACK_NAME.into()),
             CallbackActor,
@@ -224,6 +252,7 @@ impl Actor for SupervisorActor {
             store,
             callback,
             waiters,
+            memory,
             tasks: HashMap::new(),
             queue: None,
         };
@@ -245,6 +274,7 @@ impl Actor for SupervisorActor {
                 supervisor: myself.clone(),
                 thresholds,
                 ci,
+                memory: state.memory.clone(),
             },
             myself.get_cell(),
         )
@@ -291,6 +321,7 @@ impl Actor for SupervisorActor {
             }
             SupervisorMsg::GetCallback { reply } => send_reply(reply, Ok(state.callback.clone())),
             SupervisorMsg::GetStore { reply } => send_reply(reply, Ok(state.store.clone())),
+            SupervisorMsg::GetMemory { reply } => send_reply(reply, Ok(state.memory.clone())),
             SupervisorMsg::GetWaiters { reply } => send_reply(reply, Ok(state.waiters.clone())),
             SupervisorMsg::Launch {
                 row,
@@ -334,7 +365,7 @@ impl Actor for SupervisorActor {
                 // restart `serve` (DEC-20)
                 if matches!(
                     name.as_deref(),
-                    Some(STORE_NAME | CALLBACK_NAME | QUEUE_NAME)
+                    Some(STORE_NAME | CALLBACK_NAME | QUEUE_NAME | MEMORY_NAME)
                 ) {
                     tracing::error!(actor = ?name, "daemon actor failed; stopping serve: {err}");
                     return Err(err);

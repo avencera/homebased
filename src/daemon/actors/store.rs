@@ -252,6 +252,11 @@ pub(crate) enum StoreMsg {
         thresholds: crate::queue::schedule::NoticeThresholds,
         reply: RpcReplyPort<Result<crate::queue::schedule::Snapshot, AppError>>,
     },
+    /// Started tasks and runs that declared a memory peak
+    MemoryClaims {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::memory::Claim>, AppError>>,
+    },
     /// Typed queue store operation
     QueueResources {
         machine: MachineId,
@@ -1003,6 +1008,9 @@ impl Actor for StoreActor {
                 thresholds,
                 reply,
             } => send_reply(reply, state.queue_snapshot(machine, now, thresholds)),
+            StoreMsg::MemoryClaims { machine, reply } => {
+                send_reply(reply, state.memory_claims(machine));
+            }
             StoreMsg::QueueResources { machine, reply } => {
                 send_reply(reply, state.resources_on(machine))
             }

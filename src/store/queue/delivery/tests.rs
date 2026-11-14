@@ -41,6 +41,7 @@ fn route_for(thread: &str) -> JobRoute {
         after: None,
         owes_final_event: false,
         submitted_at: None,
+        placement: None,
     }
 }
 

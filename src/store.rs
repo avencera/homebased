@@ -19,6 +19,7 @@ mod dependency;
 mod events;
 mod identity;
 mod lifecycle;
+mod memory;
 mod message;
 mod presentation;
 pub mod queue;

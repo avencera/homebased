@@ -12,6 +12,7 @@ use crate::domain::{
     TaskId, TaskName, TaskReport, TaskRow, TaskStatus, ThreadId, Workload,
 };
 use crate::machine::MachineId;
+use crate::memory::{MemPeak, MemoryWait};
 use crate::store::{TaskPresentation, UnlaunchedTask};
 use crate::submission::{HeldPhase, SubmissionState};
 use crate::waiting::ChainView;
@@ -100,6 +101,12 @@ pub struct TaskSummary {
     /// whole chain's state, so a parked run reads `waiting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainView>,
+    /// Peak host memory of a held task submitted with `mem_peak`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_peak: Option<MemPeak>,
+    /// Why a held task with a peak is not started yet, once nothing else holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_wait: Option<MemoryWait>,
 }
 
 /// One entry of a task's or a held job's `after` list.
@@ -205,6 +212,8 @@ impl TaskSummary {
             updated_at: row.updated_at,
             after: None,
             chain: presentation.and_then(|presentation| presentation.chain.clone()),
+            mem_peak: None,
+            memory_wait: None,
         }
     }
 
@@ -264,6 +273,8 @@ impl TaskSummary {
             // a task that waits only for its machine has no `after`
             after: task.held.after.as_ref().map(|_| after),
             chain: task.chain.clone(),
+            mem_peak: task.held.mem_peak,
+            memory_wait: None,
         })
     }
 }

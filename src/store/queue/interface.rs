@@ -9,18 +9,20 @@ use crate::dependency::TaskOutcome;
 use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::fleet::protocol::{
-    CI_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL,
-    PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
+    ADMISSION_PROTOCOL, CI_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion,
+    GPU_IDLE_PROTOCOL, PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
+use crate::memory::MemoryWait;
 use crate::queue::ci::{ClassOffer, Drain, JobClass, JobTiming, MachineOffer, SlotCapacity};
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
 use crate::queue::lease_guard::LeaseIdleTrip;
 use crate::queue::spec::JobSpec;
 use crate::queue::{
-    ActiveRun, AttentionId, CleanupFailure, JobEvent, JobId, OperationId, Placement, QueueError,
-    Resource, ResourceId, ResourceLabel, ResourceName, ResourceSelector, StopCause, Target,
+    ActiveRun, AttentionId, CleanupFailure, EntryPlacement, JobEvent, JobId, OperationId,
+    Placement, QueueError, Resource, ResourceId, ResourceLabel, ResourceName, ResourceSelector,
+    StopCause, Target,
 };
 use crate::store::Store;
 
@@ -74,6 +76,10 @@ pub enum QueueRequest {
         /// protocol 6 and later
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Slot the job takes when stored, instead of the back of its level;
+        /// cluster protocol 8 and later
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement: Option<EntryPlacement>,
     },
     /// Idempotent queue placement
     Move {
@@ -150,7 +156,12 @@ impl QueueRequest {
             | Self::CiCapacity { .. }
             | Self::CiDrain { .. }
             | Self::CiTimings { .. } => CI_PROTOCOL,
-            Self::Submit { spec, .. } => submit_protocol(spec),
+            Self::Submit {
+                spec, placement, ..
+            } => match placement {
+                Some(_) => submit_protocol(spec).max(ADMISSION_PROTOCOL),
+                None => submit_protocol(spec),
+            },
             _ => SUPPORTED_PROTOCOLS.min(),
         }
     }
@@ -158,11 +169,13 @@ impl QueueRequest {
 
 /// Lowest cluster protocol whose authorities accept `spec`
 ///
-/// An older authority refuses a spec with `hold`, `gpu_idle`, or `ci` as an
-/// unknown field
+/// An older authority refuses a spec with `mem_peak`, `hold`, `gpu_idle`, or
+/// `ci` as an unknown field
 #[must_use]
 pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
-    if spec.preempt.hold {
+    if spec.mem_peak.is_some() {
+        ADMISSION_PROTOCOL
+    } else if spec.preempt.hold {
         PREEMPT_PROTOCOL
     } else if spec.ci.is_some() {
         CI_PROTOCOL
@@ -175,14 +188,21 @@ pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
 
 /// Drop the spec fields a requester on `protocol` cannot decode from job reads
 ///
-/// A peer on an older release refuses unknown keys in `preempt`, so one held
-/// job would fail its whole queue listing. Only the response changes; the
-/// stored spec and its digest stay as accepted, and reads never check the digest
+/// A peer on an older release refuses unknown keys in a spec and in its
+/// `preempt`, so one job with a newer field would fail its whole queue
+/// listing. Only the response changes; the stored spec and its digest stay as
+/// accepted, and reads never check the digest
 fn downgrade_specs(result: &mut Value, protocol: ClusterProtocolVersion) {
-    if protocol >= PREEMPT_PROTOCOL {
+    if protocol >= ADMISSION_PROTOCOL {
         return;
     }
-    let drop_hold = |job: &mut Value| {
+    let downgrade = |job: &mut Value| {
+        if let Some(spec) = job.pointer_mut("/spec").and_then(Value::as_object_mut) {
+            spec.remove("mem_peak");
+        }
+        if protocol >= PREEMPT_PROTOCOL {
+            return;
+        }
         if let Some(preempt) = job
             .pointer_mut("/spec/preempt")
             .and_then(Value::as_object_mut)
@@ -191,10 +211,10 @@ fn downgrade_specs(result: &mut Value, protocol: ClusterProtocolVersion) {
         }
     };
     if let Some(jobs) = result.get_mut("jobs").and_then(Value::as_array_mut) {
-        jobs.iter_mut().for_each(drop_hold);
+        jobs.iter_mut().for_each(downgrade);
     }
     if let Some(job) = result.get_mut("job") {
-        drop_hold(job);
+        downgrade(job);
     }
 }
 
@@ -276,6 +296,10 @@ pub struct JobList {
     // an older peer sends none
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lease_notes: BTreeMap<JobId, JobLeaseNote>,
+    /// Why each job with a free resource waits for host memory; the
+    /// authority's memory gate adds these after the store read
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memory_waits: BTreeMap<JobId, MemoryWait>,
 }
 
 /// One machine's resources and non-terminal jobs from a single store read
@@ -291,6 +315,9 @@ pub struct QueueOverview {
     // an older peer sends none
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lease_notes: BTreeMap<JobId, JobLeaseNote>,
+    /// Why each job with a free resource waits for host memory
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memory_waits: BTreeMap<JobId, MemoryWait>,
 }
 
 /// One job with its active run, every attempt, and its events
@@ -382,6 +409,7 @@ impl Store {
                     machine,
                     lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
                     jobs,
+                    memory_waits: BTreeMap::new(),
                 })?
             }
             QueueRequest::Overview => {
@@ -391,6 +419,7 @@ impl Store {
                     resources: self.gpu_resources_on(machine)?,
                     lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
                     jobs,
+                    memory_waits: BTreeMap::new(),
                 })?
             }
             QueueRequest::Show { job } => {
@@ -452,6 +481,7 @@ impl Store {
                 origin,
                 spec,
                 submitted_at,
+                placement,
             } => serde_json::to_value(self.submit_job(&NewJob {
                 id: *job,
                 machine,
@@ -460,6 +490,7 @@ impl Store {
                 env: env.clone(),
                 origin_protocol: protocol,
                 submitted_at: *submitted_at,
+                placement: *placement,
             })?)?,
             QueueRequest::Move {
                 operation,

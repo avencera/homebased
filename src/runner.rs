@@ -31,7 +31,9 @@ use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
 use crate::queue::gpu_idle::summary::EndReading;
 use crate::report::REPORT_TRAILER;
 use crate::run_env;
+use crate::spec::GpuAccess;
 use crate::store::{self, Store};
+use crate::submission::ExecutorIdentity;
 use crate::usage;
 
 mod container;
@@ -396,6 +398,22 @@ fn parse_codex_worker_thread(log: &[u8]) -> Option<ThreadId> {
         })
 }
 
+/// The GPU access a task was submitted with, from its accepted spec
+///
+/// Every launched task that is not a queue run has an accepted identity; one
+/// without it is hidden from the GPUs, like a spec that does not opt in
+fn task_gpu_access(store: &Store, id: TaskId) -> Result<GpuAccess, AppError> {
+    let identity = store
+        .executor_identity(id)
+        .map_err(|error| AppError::Internal {
+            message: format!("read accepted spec of task {id}: {error}"),
+        })?;
+    Ok(match identity {
+        Some(ExecutorIdentity::Accepted(record)) => record.spec.gpu,
+        _ => GpuAccess::Hidden,
+    })
+}
+
 async fn run_child(
     invocation: &ChildInvocation,
     row: &TaskRow,
@@ -432,6 +450,10 @@ async fn run_child(
         for (key, value) in checkpoint.host_environment(home) {
             cmd.env(key, value);
         }
+    } else if task_gpu_access(store, id)?.is_hidden() {
+        // an empty list hides every device, so a CPU task cannot open a CUDA
+        // context that takes memory from a GPU queue job
+        cmd.env(run_env::CUDA_VISIBLE_DEVICES, "");
     }
     match invocation.stdin {
         StdinPolicy::PromptFeed => {

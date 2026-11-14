@@ -335,6 +335,7 @@ fn save_held_local_route(home: &Home, row: &TaskRow, spec: &NormalizedSpec) -> R
             &crate::submission::ReleaseTerms {
                 after: Some(after.clone()),
                 machine_wait: None,
+                mem_peak: None,
             },
         )
         .unwrap();

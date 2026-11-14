@@ -25,7 +25,7 @@ homebased task run --name "release build" --timeout 2h -- cargo build --release
 homebased task run --name "eval on code" --machine code --cwd ~/code/project -- just eval
 ```
 
-It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--dry-run`, and `--request-id` work as for `task submit`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
+It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--dry-run`, and `--request-id` work as for `task submit`; `--mem-peak <GiB>` sets `mem_peak` and `--gpu-visible` sets `"gpu": "visible"`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
 
 ## 2. Choose the workload
 
@@ -140,6 +140,8 @@ GitHub CI watcher as a normal task:
 | `after` | no | Array of task or GPU queue job UUIDs that must succeed before this task starts. 1 to 16 entries, no duplicates. Each must be a task or job submitted through this daemon, local or remote, including one that is itself held. See [Start after other tasks](#start-after-other-tasks). |
 | `wait_for_machine` | no | `true` holds a remote task on this daemon until `machine` answers and takes it, instead of failing with `machine_unavailable`. Needs `machine`. See [Wait for an offline machine](#wait-for-an-offline-machine). |
 | `coalesce` | no | With `wait_for_machine`: a key of 1 to 64 ASCII letters, digits, `.`, `_`, `-`, or `:`. Once this task is accepted, older tasks with the same key and machine that still wait on this daemon are cancelled. |
+| `mem_peak` | no | Most host memory the task holds, in GiB (`17`, `2.5`). Holds the task on this daemon until memory in use plus this peak fits under the memory bar (40 GiB by default). Local tasks on Linux only; not with `machine`. See [Wait for host memory](#wait-for-host-memory). |
+| `gpu` | no | `"hidden"` (default) runs `task` and `agent` workloads with `CUDA_VISIBLE_DEVICES` empty, so CPU work never takes GPU memory. `"visible"` leaves `CUDA_VISIBLE_DEVICES` unset, so the child sees every GPU. Put GPU work in the [resource queue](resource-queue.md) instead. |
 | `workload` | yes | Internally tagged enum: `type` is `agent`, `task`, or `container`. |
 
 Agent-only fields under `workload`:
@@ -248,6 +250,15 @@ Add `coalesce` when only the newest request matters, such as an update. Once a s
 - `wait_for_machine` and `coalesce` stay on this daemon, like `after`, and are part of the request identity: a retry with the same request UUID must repeat them.
 - A waiting task shows as `held` in `task list` here; `task show` adds `wait_for_machine` and `coalesce`. `task cancel` cancels it before it starts.
 - Only this daemon knows the task, so the same key submitted through two daemons sends both tasks.
+
+### Wait for host memory
+
+Set `mem_peak` (or `task run --mem-peak`) on memory-heavy CPU work, such as data packing or a large evaluation, instead of a shell gate that polls free memory. The daemon holds the task as `held` and starts it once memory in use, plus room promised to work started or waiting ahead of it, plus its peak fits under the bar. Memory in use is the daemon's cgroup plus each `run-*.scope` beside it, less reclaimable page cache. Started work counts at its declared peak until it grows that large. GPU queue jobs with `mem_peak` come first, in serving order, then tasks in submit order, and a waiting item keeps its room, so smaller work behind it cannot start ahead of it.
+
+- `task list` and `task show` print `waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json` gives it as `memory_wait` with `reason` `room` (`peak`, `free`, `bar`, the last two in bytes) or `unreadable` (`error`).
+- Submit refuses a peak over the bar, `mem_peak` with `machine`, and `mem_peak` on a daemon outside a cgroup v2 memory controller, such as on a Mac, with `invalid_spec`.
+- Work without `mem_peak` is never held for memory.
+- `mem_peak` is part of the request identity, like `after`.
 
 ## 6. End the turn
 

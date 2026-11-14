@@ -21,8 +21,9 @@ use crate::queue::gpu_idle::{
 use crate::queue::lease_guard::{YIELD_OVERDUE, yield_overdue};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
-    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
-    ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase, StopCause, Target,
+    AttentionId, EntryOutcome, EntryPlacement, JobId, MoveFlags, OperationId, Placement, Priority,
+    QueueError, Resource, ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase,
+    StopCause, Target,
 };
 use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
 use crate::store::queue::{JobLeaseNote, ResourceRecord};
@@ -114,6 +115,20 @@ pub enum JobCommand {
         /// other way
         #[arg(long = "after", value_name = "TASK_OR_JOB")]
         after: Vec<DependencyId>,
+        /// Enter the queue at the front of the job's level instead of the back.
+        /// Applies when the job enters the queue: at submit, or at release
+        /// with `--after`
+        #[arg(long, conflicts_with_all = ["place_before", "place_after"])]
+        place_front: bool,
+        /// Enter the queue just ahead of this job, taking its level. If it has
+        /// ended by then, enter at the front of its level; if this queue never
+        /// held it, at the back of the job's own level
+        #[arg(long, value_name = "JOB", conflicts_with = "place_after")]
+        place_before: Option<JobId>,
+        /// Enter the queue just behind this job, taking its level, with the
+        /// same fallbacks as `--place-before`
+        #[arg(long, value_name = "JOB")]
+        place_after: Option<JobId>,
     },
     /// Show a job, its progress, and every run task for logs
     Show {
@@ -301,10 +316,25 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             allow_other_thread,
             allow_build,
             after,
+            place_front,
+            place_before,
+            place_after,
         } => {
+            let placement = EntryPlacement::from_flags(place_front, place_before, place_after)
+                .map_err(|refusal| AppError::Usage {
+                    message: refusal.to_string(),
+                })?;
+            if let Some(EntryPlacement::Next { anchor, .. }) = placement
+                && anchor == job_id
+            {
+                return Err(AppError::Usage {
+                    message: "a job cannot be placed next to itself".into(),
+                });
+            }
             let flags = SubmitFlags {
                 allow_other_thread,
                 allow_build,
+                placement,
             };
             submit(ctx, client, job_id, &spec, flags, after).await
         }
@@ -402,6 +432,8 @@ fn silence_label(silence: &Silence) -> String {
 pub(super) struct SubmitFlags {
     pub(super) allow_other_thread: bool,
     pub(super) allow_build: bool,
+    /// Slot the job takes when it enters the queue
+    pub(super) placement: Option<EntryPlacement>,
 }
 
 async fn submit(
@@ -452,13 +484,16 @@ pub(super) async fn submit_value(
     }
     // advice only, never a refusal
     warnings.extend(spec.legacy_preempt_warning());
-    let body = json!({
+    let mut body = json!({
         "job_id": job_id,
         "spec": spec,
         "env": TaskEnv::capture(),
         "callback_cwd": std::env::current_dir()?,
         "after": after,
     });
+    if let Some(placement) = flags.placement {
+        body["placement"] = json!(placement);
+    }
     let mut value = post_retry(client, "/v1/resource/jobs", &body).await?;
     // printed only once the submit succeeds, so a refusal's stderr stays the
     // one structured error that `--json` promises
@@ -475,6 +510,12 @@ pub(super) async fn submit_value(
         None => "submitted",
     };
     print_result(ctx, &value, action, &job_id.to_string())?;
+    if ctx.output == OutputMode::Human
+        && let Some(entered) = value.get("entered")
+    {
+        let entered: EntryOutcome = decode(entered.clone())?;
+        println!("{entered}");
+    }
     super::task::print_t3_wait_hint(&job_id.to_string(), spec.thread);
     Ok(())
 }
@@ -637,6 +678,9 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let target = target_label(job.target, &[]);
         let name = &job.spec.name;
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
+        if let Some(wait) = list.memory_waits.get(&id) {
+            println!("  {wait}");
+        }
         if let Some(note) = list.lease_notes.get(&id) {
             for line in lease_note_lines(note, chrono::Utc::now()) {
                 println!("  ! {line}");

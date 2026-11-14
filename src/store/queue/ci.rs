@@ -443,6 +443,7 @@ fn empty_snapshot(now: DateTime<Utc>) -> Snapshot {
         queue: Vec::new(),
         episode: None,
         thresholds: NoticeThresholds::default(),
+        memory: None,
     }
 }
 
@@ -457,6 +458,7 @@ pub(super) fn job_view(job: &JobRecord) -> JobView {
             JobState::Active { resource } => QueuedState::Active(resource),
             _ => QueuedState::Queued,
         },
+        mem_peak: job.spec.mem_peak,
     }
 }
 

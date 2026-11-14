@@ -254,9 +254,10 @@ async fn unlaunched_detail(state: &AppState, id: TaskId) -> Result<Option<Value>
         return Ok(None);
     };
     let after = crate::daemon::dependencies::views(state, task.held.after.as_ref()).await?;
-    let Some(summary) = TaskSummary::from_unlaunched(&task, after) else {
+    let Some(mut summary) = TaskSummary::from_unlaunched(&task, after) else {
         return Ok(None);
     };
+    summary.memory_wait = crate::daemon::api::memory_wait(state, &summary).await?;
     let route = &task.held.route;
     let last_event = call(&state.store, |reply| StoreMsg::InboundEvents { id, reply })
         .await?

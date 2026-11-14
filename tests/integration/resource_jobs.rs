@@ -464,6 +464,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
             },
             origin_protocol: homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
             submitted_at: None,
+            placement: None,
         })
         .unwrap();
     store
@@ -528,6 +529,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
         after: None,
         owes_final_event: false,
         submitted_at: None,
+        placement: None,
     };
     store.insert_job_route(&route).unwrap();
     store

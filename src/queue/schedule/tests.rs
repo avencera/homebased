@@ -72,6 +72,7 @@ impl Machine {
             target,
             preempt,
             state: QueuedState::Queued,
+            mem_peak: None,
         });
         id
     }
@@ -93,6 +94,7 @@ impl Machine {
             target: Target::Any,
             preempt,
             state: QueuedState::Active(resource),
+            mem_peak: None,
         });
         self.set_run(resource, job, task, phase);
         (job, task)
@@ -125,6 +127,7 @@ impl Machine {
             queue,
             episode: self.episode,
             thresholds: NoticeThresholds::default(),
+            memory: None,
         }
     }
 }
