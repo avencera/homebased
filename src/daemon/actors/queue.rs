@@ -185,6 +185,9 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
     }
     let decisions = decide(&snapshot);
     let mut memory_waits = decisions.memory_waits.clone();
+    // a job refused below keeps its place, so jobs behind it in this pass
+    // cannot start into its room
+    let mut held_back = 0;
     for launch in &decisions.launches {
         let Some(&peak) = peaks.get(&launch.job) else {
             launch_job(args, launch.job, launch.resource).await?;
@@ -194,10 +197,12 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
         let granted = call(&args.memory, |reply| MemoryMsg::GrantJob {
             job: launch.job,
             peak,
+            held_back,
             reply,
         })
         .await?;
         if let Err(wait) = granted {
+            held_back += peak.bytes();
             memory_waits.insert(launch.job, wait);
             continue;
         }

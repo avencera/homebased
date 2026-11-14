@@ -22,7 +22,8 @@ use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
 use crate::fleet::protocol::{
-    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+    ADMISSION_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange,
+    SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
 use crate::queue::ci::MachineChoice;
@@ -356,7 +357,7 @@ async fn submit(
                 };
                 super::ci_api::check_offered(&state, &body.spec, choice).await?;
             } else if held {
-                check_held_authority(&state, authority, &body.spec).await?;
+                check_held_authority(&state, authority, &body.spec, body.placement).await?;
             }
             let route = JobRoute {
                 job: body.job_id,
@@ -750,18 +751,27 @@ fn require_protocol(
 }
 
 /// Refuse a job held for its `after` entries now, rather than once they
-/// succeeded, when its queue machine is reachable and too old for its spec
+/// succeeded, when this machine is its queue and cannot admit its peak, or its
+/// queue machine is reachable and too old for its spec or placement
 ///
-/// An unreachable queue machine is checked again when the job is sent
+/// An unreachable queue machine is checked again when the job is sent, and a
+/// remote queue's memory bar only then
 async fn check_held_authority(
     state: &AppState,
     authority: MachineId,
     spec: &JobSpec,
+    placement: Option<crate::queue::EntryPlacement>,
 ) -> Result<(), AppError> {
     if authority == state.machine.identity.machine {
-        return Ok(());
+        return spec
+            .mem_peak
+            .map_or(Ok(()), |peak| state.memory_limits.check_peak(peak));
     }
-    let needed = submit_protocol(spec);
+    let needed = if placement.is_some() {
+        submit_protocol(spec).max(ADMISSION_PROTOCOL)
+    } else {
+        submit_protocol(spec)
+    };
     if needed <= SUPPORTED_PROTOCOLS.min() {
         return Ok(());
     }

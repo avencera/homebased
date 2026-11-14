@@ -295,6 +295,9 @@ pub struct TaskFollowupSource {
     pub report_trailer: bool,
     /// Whether the source task saved its Claude session. Always false for Codex.
     pub persist_session: bool,
+    /// Whether the source task saw this machine's GPUs, which its follow-up keeps
+    #[serde(default, skip_serializing_if = "crate::spec::GpuAccess::is_hidden")]
+    pub gpu: crate::spec::GpuAccess,
 }
 
 /// `GET /v1/tasks`.

@@ -721,6 +721,15 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
     check_timeout(wire.timeout, "/timeout")?;
     let after = wire.after.as_ref().map(parse_after).transpose()?;
     let workload = parse_submit_workload(&wire.workload)?;
+    // a container's GPUs come from its own `gpus` field
+    if !wire.gpu.is_hidden() && matches!(workload, SubmitWorkloadValidated::Container(_)) {
+        return Err(AppError::InvalidSpec {
+            pointer: "/gpu".into(),
+            value: json!(wire.gpu),
+            message: "gpu applies to task and agent workloads; a container sets workload.gpus"
+                .into(),
+        });
+    }
     let agent = matches!(workload, SubmitWorkloadValidated::Agent(_));
     let thread = submit_thread(wire.thread, agent)?;
     let machine_wait =

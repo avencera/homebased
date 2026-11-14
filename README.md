@@ -888,8 +888,10 @@ gives it as `memory_wait` on a task and under `memory_waits` by job id. When
 memory in use cannot be read, items with a peak wait and say why. Submit
 refuses a peak over the bar, a `mem_peak` on a machine whose daemon runs
 outside a cgroup v2 memory controller, and `mem_peak` together with
-`machine`, since only the local daemon measures its own memory. Set the bar,
-or the cgroup to read, in the daemon's config:
+`machine` on a task, since only the local daemon measures its own memory. A
+GPU job's queue machine checks its peak; for a job held for `after` whose
+queue is another machine, that happens when the job is sent. Set the bar, or
+the cgroup to read, in the daemon's config:
 
 ```toml
 [memory]

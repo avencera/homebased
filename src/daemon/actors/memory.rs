@@ -101,10 +101,12 @@ pub(crate) enum MemoryMsg {
     JobRoom {
         reply: RpcReplyPort<Result<Room, AppError>>,
     },
-    /// Grant a job's peak against the room now, or say why it waits
+    /// Grant a job's peak against the room now, less `held_back` for jobs
+    /// ahead of it in this pass that were refused, or say why it waits
     GrantJob {
         job: JobId,
         peak: MemPeak,
+        held_back: u64,
         reply: RpcReplyPort<Result<Result<(), MemoryWait>, AppError>>,
     },
     /// The queue pass's waiting jobs, which hold their peaks back from tasks
@@ -174,8 +176,13 @@ impl Actor for MemoryActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             MemoryMsg::JobRoom { reply } => send_reply(reply, state.room().await),
-            MemoryMsg::GrantJob { job, peak, reply } => {
-                send_reply(reply, state.grant_job(job, peak).await);
+            MemoryMsg::GrantJob {
+                job,
+                peak,
+                held_back,
+                reply,
+            } => {
+                send_reply(reply, state.grant_job(job, peak, held_back).await);
             }
             MemoryMsg::JobsWaiting { waits } => state.job_waits = waits,
             MemoryMsg::AdmitTasks { ready, reply } => {
@@ -219,8 +226,10 @@ impl MemoryState {
         &mut self,
         job: JobId,
         peak: MemPeak,
+        held_back: u64,
     ) -> Result<Result<(), MemoryWait>, AppError> {
         let mut room = self.room().await?;
+        room.reserve(held_back);
         let granted = room.admit(peak);
         if granted.is_ok() {
             self.grants.insert(Grant::Job(job), (peak, Instant::now()));

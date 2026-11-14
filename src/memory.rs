@@ -383,32 +383,35 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-/// A process's anonymous plus shared-memory resident bytes
+/// A process's share of its anonymous and shared-memory resident bytes
 ///
-/// File-backed pages are left out: the gauge already subtracts the
-/// reclaimable ones, and a smaller count here only keeps more room promised
+/// Proportional counts split a page among every process that maps it, so
+/// forked workers that still share their parent's pages are not counted once
+/// each, which would leave too little room promised. Kernels without the
+/// proportional fields fall back to resident counts. File-backed pages are
+/// left out: the gauge already subtracts the reclaimable ones, and a smaller
+/// count here only keeps more room promised
 fn resident_bytes(pid: u32) -> u64 {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let kib = |key: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|value| {
-                value
-                    .trim()
-                    .trim_end_matches("kB")
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .unwrap_or(0)
-    };
-    (kib("RssAnon:") + kib("RssShmem:")) * 1024
+    let proportional = fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|text| Some(kib(&text, "Pss_Anon:")? + kib(&text, "Pss_Shmem:")?));
+    let kib_total = proportional.unwrap_or_else(|| {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        kib(&status, "RssAnon:").unwrap_or(0) + kib(&status, "RssShmem:").unwrap_or(0)
+    });
+    kib_total * 1024
+}
+
+/// The kB value of the `key` line of a procfs file
+fn kib(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Claim, MemPeak, MemoryWait, Room, outstanding};
+    use super::{Claim, MemPeak, MemoryWait, Room, kib, outstanding};
 
     fn gib(value: f64) -> MemPeak {
         MemPeak::from_gib(value).unwrap()
@@ -462,5 +465,16 @@ mod tests {
             root: None,
         }];
         assert_eq!(outstanding(&claims), 3 << 30);
+    }
+
+    #[test]
+    fn proportional_fields_are_read_from_smaps_rollup_text() {
+        let rollup = "Rss:             2048 kB\nPss:             1100 kB\n\
+                      Pss_Anon:         900 kB\nPss_File:         150 kB\n\
+                      Pss_Shmem:         50 kB\n";
+        assert_eq!(kib(rollup, "Pss_Anon:"), Some(900));
+        assert_eq!(kib(rollup, "Pss_Shmem:"), Some(50));
+        // an older kernel without the split fields falls back to the status counts
+        assert_eq!(kib("Pss: 1100 kB\n", "Pss_Anon:"), None);
     }
 }

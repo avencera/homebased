@@ -13,6 +13,7 @@ use crate::client::Client;
 use crate::dependency::{Dependencies, DependencyId};
 use crate::domain::TaskEnv;
 use crate::error::AppError;
+use crate::memory::MemPeak;
 use crate::queue::build_hint::build_warnings;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{
@@ -115,6 +116,12 @@ pub enum JobCommand {
         /// other way
         #[arg(long = "after", value_name = "TASK_OR_JOB")]
         after: Vec<DependencyId>,
+        /// Peak host memory of the job's steps in GiB, such as `17` or `2.5`,
+        /// as `mem_peak` in the spec. With its resource free, the job starts
+        /// only once memory in use plus this peak fits under the queue
+        /// machine's memory bar (default 40 GiB)
+        #[arg(long, value_name = "GIB")]
+        mem_peak: Option<MemPeak>,
         /// Enter the queue at the front of the job's level instead of the back.
         /// Applies when the job enters the queue: at submit, or at release
         /// with `--after`
@@ -316,6 +323,7 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             allow_other_thread,
             allow_build,
             after,
+            mem_peak,
             place_front,
             place_before,
             place_after,
@@ -335,6 +343,7 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
                 allow_other_thread,
                 allow_build,
                 placement,
+                mem_peak,
             };
             submit(ctx, client, job_id, &spec, flags, after).await
         }
@@ -434,6 +443,8 @@ pub(super) struct SubmitFlags {
     pub(super) allow_build: bool,
     /// Slot the job takes when it enters the queue
     pub(super) placement: Option<EntryPlacement>,
+    /// `--mem-peak`, which must agree with a `mem_peak` in the spec
+    pub(super) mem_peak: Option<MemPeak>,
 }
 
 async fn submit(
@@ -448,6 +459,23 @@ async fn submit(
     submit_value(ctx, client, job_id, value, flags, after_flags).await
 }
 
+/// Put `--mem-peak` into the spec, refusing a spec that names another peak
+fn set_mem_peak(value: &mut Value, peak: MemPeak) -> Result<(), AppError> {
+    let flag = json!(peak);
+    match value.get("mem_peak") {
+        Some(spec) if *spec != flag => Err(AppError::Usage {
+            message: format!("--mem-peak {peak} disagrees with the spec's mem_peak {spec}"),
+        }),
+        _ => {
+            // a spec that is not an object fails its parse right after
+            if let Some(object) = value.as_object_mut() {
+                object.insert("mem_peak".into(), flag);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Submit a spec already read as JSON; `ci run` builds its spec this way
 pub(super) async fn submit_value(
     ctx: &Ctx,
@@ -460,6 +488,9 @@ pub(super) async fn submit_value(
     let origin = SubmitOrigin::capture(&ctx.home)?;
     if let Some(thread) = origin.default_thread()? {
         crate::spec::fill_missing_thread(&mut value, thread);
+    }
+    if let Some(peak) = flags.mem_peak {
+        set_mem_peak(&mut value, peak)?;
     }
     let (spec, after) = JobSpec::parse_submission(&value)?;
     let after = merge_after(after, after_flags)?;

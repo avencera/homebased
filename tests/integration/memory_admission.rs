@@ -109,14 +109,13 @@ fn memory_admission_serves_in_order_and_holds_room_for_started_and_waiting_work(
     let mut jobs = Jobs::new(&h);
 
     // the GPU job heads the order, needs 9 GiB, and waits on its free resource
-    let mut big = spec(
-        &h,
-        "medium",
-        "restart",
-        "while [ ! -f finish ]; do sleep 0.1; done",
+    let big = JobId::new();
+    let script = "while [ ! -f finish ]; do sleep 0.1; done";
+    jobs.submit_with(
+        big,
+        &spec(&h, "medium", "restart", script),
+        &["--mem-peak", "9"],
     );
-    big["mem_peak"] = json!(9);
-    let big = jobs.submit(&big);
     eventually("the big job never reported its memory wait", || {
         job_memory_wait(&h, big)["reason"] == "room"
     });

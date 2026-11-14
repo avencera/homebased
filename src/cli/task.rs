@@ -661,6 +661,11 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
     {
         workload.insert("persist_session".into(), Value::Bool(true));
     }
+    if !source.gpu.is_hidden()
+        && let Some(object) = submit_spec.as_object_mut()
+    {
+        object.insert("gpu".into(), json!(source.gpu));
+    }
     if local_machine == execution_machine
         && let Some(object) = submit_spec.as_object_mut()
     {
@@ -988,8 +993,11 @@ fn print_dependencies(value: &Value) {
             None => println!("  waits for its machine"),
         }
     }
-    if let Some(peak) = value.get("mem_peak").and_then(Value::as_f64) {
-        println!("  mem peak {peak}G");
+    if let Some(peak) = value
+        .get("mem_peak")
+        .and_then(|peak| serde_json::from_value::<MemPeak>(peak.clone()).ok())
+    {
+        println!("  mem peak {peak}");
     }
     if let Some(wait) = memory_wait_line(value) {
         println!("  {wait}");

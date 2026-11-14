@@ -249,6 +249,7 @@ async fn submit(ctx: &Ctx, client: &Client, args: RunArgs) -> Result<(), AppErro
         allow_other_thread: args.allow_other_thread,
         allow_build: true,
         placement: None,
+        mem_peak: None,
     };
     let job = args.job_id.unwrap_or_default();
     submit_value(ctx, client, job, spec, flags, args.after).await

@@ -34,9 +34,9 @@ use crate::files::{
 };
 use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
 use crate::machine_wait::MachineWait;
-use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
+use crate::spec::{self, GpuAccess, NormalizedSpec, NormalizedWorkload};
 use crate::store::CancelResult;
-use crate::submission::{ReleaseTerms, RequestId};
+use crate::submission::{ExecutorIdentity, ReleaseTerms, RequestId};
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -108,6 +108,15 @@ async fn followup_source(
         let Workload::Agent(agent) = &row.workload else {
             return Err(followup_unavailable(id, FollowupBlocker::UnsupportedAgent));
         };
+        let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {
+            id,
+            reply,
+        })
+        .await?;
+        let gpu = match identity {
+            Some(ExecutorIdentity::Accepted(record)) => record.spec.gpu,
+            _ => GpuAccess::Hidden,
+        };
         return followup_source_for(
             id,
             FollowupAgent {
@@ -116,6 +125,7 @@ async fn followup_source(
                 extra_args: &agent.extra_args,
                 report_trailer: agent.report_trailer,
                 persist_session: agent.persist_session,
+                gpu,
             },
         )
         .map(Json);
@@ -134,6 +144,7 @@ async fn followup_source(
             extra_args: &agent.extra_args,
             report_trailer: agent.report_trailer,
             persist_session: agent.persist_session,
+            gpu: route.spec.gpu,
         },
     )
     .map(Json)
@@ -146,6 +157,7 @@ struct FollowupAgent<'a> {
     extra_args: &'a [String],
     report_trailer: bool,
     persist_session: bool,
+    gpu: GpuAccess,
 }
 
 fn followup_source_for(
@@ -170,6 +182,7 @@ fn followup_source_for(
         extra_args: agent.extra_args.to_vec(),
         report_trailer: agent.report_trailer,
         persist_session: agent.persist_session,
+        gpu: agent.gpu,
     })
 }
 

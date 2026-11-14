@@ -256,7 +256,7 @@ Add `coalesce` when only the newest request matters, such as an update. Once a s
 Set `mem_peak` (or `task run --mem-peak`) on memory-heavy CPU work, such as data packing or a large evaluation, instead of a shell gate that polls free memory. The daemon holds the task as `held` and starts it once memory in use, plus room promised to work started or waiting ahead of it, plus its peak fits under the bar. Memory in use is the daemon's cgroup plus each `run-*.scope` beside it, less reclaimable page cache. Started work counts at its declared peak until it grows that large. GPU queue jobs with `mem_peak` come first, in serving order, then tasks in submit order, and a waiting item keeps its room, so smaller work behind it cannot start ahead of it.
 
 - `task list` and `task show` print `waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json` gives it as `memory_wait` with `reason` `room` (`peak`, `free`, `bar`, the last two in bytes) or `unreadable` (`error`).
-- Submit refuses a peak over the bar, `mem_peak` with `machine`, and `mem_peak` on a daemon outside a cgroup v2 memory controller, such as on a Mac, with `invalid_spec`.
+- Submit refuses a peak over the bar, and `mem_peak` on a daemon outside a cgroup v2 memory controller, such as on a Mac, with `invalid_spec`; `mem_peak` with `machine` fails with `usage`.
 - Work without `mem_peak` is never held for memory.
 - `mem_peak` is part of the request identity, like `after`.
 
