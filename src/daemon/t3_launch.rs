@@ -362,7 +362,7 @@ async fn launch_here(machine: MachineId, launch: LaunchSpec) -> Result<LaunchedT
 async fn projects_here() -> Result<(Vec<T3Project>, Option<Vec<ProviderInstance>>), AppError> {
     tokio::task::spawn_blocking(|| {
         let env = T3Env::from_env();
-        projects(&env).map(|projects| (projects, Some(providers(&env))))
+        projects(&env).map(|projects| (projects, providers(&env)))
     })
     .await
     .map_err(|error| AppError::Internal {
