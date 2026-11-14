@@ -1,5 +1,6 @@
 //! Agent workers that park on other tasks and continue once those tasks end
 
+use super::memory_admission::{FakeCgroup, with_memory_gate};
 use super::{Harness, THREAD, event_json, wait_until};
 use homebased::domain::{TaskEnv, TaskId};
 use homebased::machine::MachineId;
@@ -155,7 +156,10 @@ fn refusal(out: &Output) -> (String, i32) {
 
 #[test]
 fn codex_worker_resumes_its_thread_after_a_failed_target_and_releases_its_dependent() {
-    let h = Harness::new();
+    let mut h = Harness::new();
+    // the worker's memory peak needs a gauge on every platform
+    let cgroup = FakeCgroup::new(&h);
+    with_memory_gate(&mut h, &cgroup, &[]);
     let worker_thread = "01a0e487-b877-76e2-9dc2-806bff0bf685";
     h.set_control("stdout", &format!("session id: {worker_thread}\n"));
     let target = h.submit(&h.gated_target("gpu-run", 3));
@@ -165,7 +169,9 @@ fn codex_worker_resumes_its_thread_after_a_failed_target_and_releases_its_depend
     );
     h.set_control("report", "succeeded\nFinished after the GPU run.");
     h.set_control("sleep", "1");
-    let worker = h.submit(&Harness::spec("codex", "train the model"));
+    let mut worker_spec = Harness::spec("codex", "train the model");
+    worker_spec["mem_peak"] = json!(1);
+    let worker = h.submit(&worker_spec);
     let dependent = h.submit(&after(Harness::task_spec(&["true"]), &[&worker]));
 
     let parked = h.delivered(&worker, "TASK_WAITING");
@@ -187,6 +193,16 @@ fn codex_worker_resumes_its_thread_after_a_failed_target_and_releases_its_depend
     assert_eq!(held["status"], "held");
     assert_eq!(held["name"], "test agent (continued)");
     assert_eq!(held["chain"]["run"], 2);
+    // the continuation is admitted against the worker's memory peak
+    let listed = h.cmd().args(["--json", "task", "list"]).output().unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let held_listed = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == continuation.as_str())
+        .unwrap();
+    assert_eq!(held_listed["mem_peak"], 1.0, "{held_listed}");
     // parking is not an outcome, so the task held after the worker stays held
     assert_eq!(h.show(&dependent)["status"], "held");
 

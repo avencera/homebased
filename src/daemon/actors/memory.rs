@@ -5,14 +5,16 @@
 //! itself. Each asks this actor for a grant, which it checks against the room
 //! it sees now and records in the same message, so two passes never spend the
 //! same room. A grant counts against the room until its launch settles; by
-//! then the started item is a durable claim in the store, or it never started
+//! then the started item is a durable claim in the store, or it never started.
+//! A task launch that timed out has not settled, so its grant lasts while the
+//! task is still held, until a later release attempt gets an answer
 //!
 //! The order is the GPU queue's serving order, then tasks by submit order. A
 //! GPU job that waits for memory reserves its peak for every task, and a task
 //! that waits reserves its peak for every later task. A job whose resources
 //! are busy reserves nothing, since it cannot start anyway
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
@@ -27,8 +29,9 @@ use crate::queue::JobId;
 
 pub(crate) const MEMORY_NAME: &str = "homebased.memory";
 
-// a lost settle must not hold room for good, and a launch writes its durable
-// claim within seconds, far inside this bound
+// a lost job settle must not hold room for good, and a run writes its durable
+// claim within seconds, far inside this bound; task grants are cleared by the
+// release passes instead
 const GRANT_BOUND: Duration = Duration::from_secs(120);
 
 /// The bar and the gauge, fixed for the daemon's life
@@ -216,8 +219,13 @@ impl MemoryState {
             Ok(used) => Room::new(limits.bar, used, outstanding(&claims)),
             Err(error) => Room::Unreadable { error },
         };
-        self.grants
-            .retain(|_, (_, granted)| granted.elapsed() < GRANT_BOUND);
+        // a task grant ends only by a settle or the next release pass, which
+        // drops it once the task is no longer ready; a timed-out launch may
+        // still run after any bound
+        self.grants.retain(|grant, (_, granted)| match grant {
+            Grant::Job(_) => granted.elapsed() < GRANT_BOUND,
+            Grant::Task(_) => true,
+        });
         room.reserve(self.grants.values().map(|(peak, _)| peak.bytes()).sum());
         Ok(room)
     }
@@ -238,12 +246,31 @@ impl MemoryState {
     }
 
     async fn admit_tasks(&mut self, ready: Vec<TaskCandidate>) -> Result<Vec<TaskId>, AppError> {
+        // a task grant outlives its pass only when its launch timed out and may
+        // still run. Its row and its released route commit in one transaction,
+        // so a task no longer in `ready` holds a claim or never will, and its
+        // grant goes. One still in `ready` keeps its grant until a release
+        // attempt gets an answer and settles it; the supervisor answers in
+        // order, so that answer comes after the timed-out launch
+        let ready_tasks: HashSet<TaskId> = ready.iter().map(|candidate| candidate.task).collect();
+        self.grants.retain(|grant, _| match grant {
+            Grant::Task(task) => ready_tasks.contains(task),
+            Grant::Job(_) => true,
+        });
         let mut waits = HashMap::new();
         let mut admitted = Vec::new();
         if !ready.is_empty() {
             let mut room = self.room().await?;
             room.reserve(self.job_waits.values().map(reserved_bytes).sum());
             for candidate in ready {
+                // a pending launch's grant is already in the room, and its
+                // retry needs no more
+                if self.grants.contains_key(&Grant::Task(candidate.task)) {
+                    if !candidate.backing_off {
+                        admitted.push(candidate.task);
+                    }
+                    continue;
+                }
                 if candidate.backing_off {
                     room.reserve(candidate.peak.bytes());
                     continue;
@@ -272,5 +299,111 @@ fn reserved_bytes(wait: &MemoryWait) -> u64 {
     match wait {
         MemoryWait::Room { peak, .. } => peak.bytes(),
         MemoryWait::Unreadable { .. } => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use ractor::Actor;
+    use tempfile::tempdir;
+
+    use super::{MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg, TaskCandidate};
+    use crate::daemon::actors::{StoreActor, call};
+    use crate::domain::TaskId;
+    use crate::machine::MachineId;
+    use crate::memory::{Gauge, MemPeak, MemoryWait, Room};
+
+    const GIB: u64 = 1 << 30;
+
+    fn candidate(task: TaskId, gib: &str, backing_off: bool) -> TaskCandidate {
+        TaskCandidate {
+            task,
+            peak: MemPeak::parse(gib).unwrap(),
+            backing_off,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_task_launch_keeps_its_room_once_until_the_task_leaves_the_ready_list() {
+        let dir = tempdir().unwrap();
+        let cgroup = dir.path().join("homebased.service");
+        fs::create_dir(&cgroup).unwrap();
+        fs::write(cgroup.join("memory.current"), "0\n").unwrap();
+        fs::write(cgroup.join("memory.stat"), "file 0\nshmem 0\n").unwrap();
+        let (store, _) = Actor::spawn(None, StoreActor, dir.path().join("homebased.db"))
+            .await
+            .unwrap();
+        let (memory, _) = Actor::spawn(
+            None,
+            MemoryActor,
+            MemoryArgs {
+                limits: MemoryLimits {
+                    bar: 10 * GIB,
+                    gauge: Gauge::new(Some(cgroup)),
+                },
+                store,
+                machine: MachineId::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let admit = |ready: Vec<TaskCandidate>| {
+            let memory = memory.clone();
+            async move {
+                call(&memory, |reply| MemoryMsg::AdmitTasks { ready, reply })
+                    .await
+                    .unwrap()
+            }
+        };
+        let job_room = || async {
+            call(&memory, |reply| MemoryMsg::JobRoom { reply })
+                .await
+                .unwrap()
+        };
+        let known = |free: u64| Room::Known {
+            free: i128::from(free),
+            bar: 10 * GIB,
+        };
+        let (timed_out, behind) = (TaskId::new(), TaskId::new());
+
+        // granted, then its launch timed out, so nothing settles the grant
+        assert_eq!(
+            admit(vec![candidate(timed_out, "6", false)]).await,
+            [timed_out]
+        );
+        assert_eq!(job_room().await, known(4 * GIB));
+
+        // still held and backing off: its grant holds the room, counted once
+        let next = vec![
+            candidate(timed_out, "6", true),
+            candidate(behind, "6", false),
+        ];
+        assert!(admit(next).await.is_empty());
+        let wait = call(&memory, |reply| MemoryMsg::TaskWait {
+            task: behind,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(wait, Some(MemoryWait::Room { free, .. }) if free == 4 * GIB),
+            "{wait:?}"
+        );
+        assert_eq!(job_room().await, known(4 * GIB));
+
+        // its backoff ends while the launch is still queued: the retry keeps
+        // the grant and takes no new room, so nothing behind it fits yet
+        let retry = vec![
+            candidate(timed_out, "6", false),
+            candidate(behind, "6", false),
+        ];
+        assert_eq!(admit(retry).await, [timed_out]);
+        assert_eq!(job_room().await, known(4 * GIB));
+
+        // launched: its row is a claim now, so the grant goes
+        assert_eq!(admit(vec![candidate(behind, "6", false)]).await, [behind]);
+        assert_eq!(job_room().await, known(4 * GIB));
     }
 }

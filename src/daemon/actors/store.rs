@@ -10,7 +10,7 @@ use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
 };
 use crate::daemon::actors::send_reply;
-use crate::dependency::{Dependencies, DependencyId, DependencyLookup, HeldCancellation};
+use crate::dependency::{DependencyId, DependencyLookup, HeldCancellation};
 use crate::domain::{
     ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
@@ -523,9 +523,9 @@ pub(crate) enum StoreMsg {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
     /// Read the dependencies saved with one origin route
-    RouteDependencies {
+    RouteReleaseTerms {
         id: TaskId,
-        reply: RpcReplyPort<Result<Option<Dependencies>, AppError>>,
+        reply: RpcReplyPort<Result<Option<ReleaseTerms>, AppError>>,
     },
     /// Read the retained origin inbox of one task in sequence order
     InboundEvents {
@@ -1233,8 +1233,8 @@ impl Actor for StoreActor {
                 reply,
                 state.coalesced_waiting_routes(&key, execution_machine, newer),
             ),
-            StoreMsg::RouteDependencies { id, reply } => {
-                send_reply(reply, state.route_dependencies(id));
+            StoreMsg::RouteReleaseTerms { id, reply } => {
+                send_reply(reply, state.route_release_terms(id));
             }
             StoreMsg::InboundEvents { id, reply } => {
                 send_reply(reply, state.inbound_events(id).map_err(event_error));

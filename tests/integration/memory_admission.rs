@@ -11,10 +11,10 @@ use std::time::Duration;
 const GIB: u64 = 1 << 30;
 
 /// A cgroup directory the daemon's memory gauge reads instead of its own
-struct FakeCgroup(PathBuf);
+pub(super) struct FakeCgroup(PathBuf);
 
 impl FakeCgroup {
-    fn new(h: &Harness) -> Self {
+    pub(super) fn new(h: &Harness) -> Self {
         let dir = h.dir.path().join("cgroup/homebased.service");
         fs::create_dir_all(&dir).unwrap();
         let cgroup = Self(dir);
@@ -51,7 +51,7 @@ impl FakeCgroup {
 }
 
 /// Restart the daemon with a 10 GiB bar over `cgroup`
-fn with_memory_gate(h: &mut Harness, cgroup: &FakeCgroup, env: &[(&str, &str)]) {
+pub(super) fn with_memory_gate(h: &mut Harness, cgroup: &FakeCgroup, env: &[(&str, &str)]) {
     let config = h.dir.path().join("config.toml");
     fs::write(
         &config,
@@ -214,6 +214,41 @@ fn a_peak_over_the_bar_is_refused_at_submit() {
     assert!(!task.status.success());
     let stderr = String::from_utf8_lossy(&task.stderr);
     assert!(stderr.contains("memory bar"), "{stderr}");
+}
+
+#[test]
+fn a_task_retry_with_another_memory_peak_is_a_conflict() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    with_memory_gate(&mut h, &cgroup, &[]);
+    let request = uuid::Uuid::now_v7().to_string();
+    let run = |peak: &str| {
+        h.cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["--json", "task", "run", "--request-id", &request])
+            .args(["--mem-peak", peak, "--", "true"])
+            .output()
+            .unwrap()
+    };
+
+    let first = run("2");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first["id"].is_string(), "{first}");
+
+    let changed = run("3");
+    assert!(!changed.status.success());
+    let error: Value = serde_json::from_slice(&changed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "submission_conflict", "{error}");
+
+    let repeated = run("2");
+    assert!(repeated.status.success());
+    let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["id"], first["id"], "{repeated}");
 }
 
 /// Ids of queued jobs, in serving order

@@ -554,12 +554,25 @@ async fn release_by_memory(
         if !admitted.contains(&task) {
             continue;
         }
-        retry_release(state, retries, unreachable, route, false).await;
+        // a supervisor that did not answer in time may still launch the task,
+        // so its grant holds the room until the next pass sees how it went
+        if retry_release(state, retries, unreachable, route, false).await == Release::Pending {
+            continue;
+        }
         state.memory.cast(MemoryMsg::Settle {
             grant: Grant::Task(task),
         })?;
     }
     Ok(())
+}
+
+/// How a release attempt left its task
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// Launched, refused for good, deferred, or not tried this pass
+    Settled,
+    /// The launch timed out and may still run
+    Pending,
 }
 
 /// Launch one ready route unless its last attempt failed too recently
@@ -572,11 +585,11 @@ async fn retry_release(
     unreachable: &mut HashSet<MachineId>,
     route: OriginRoute,
     waits_for_machine: bool,
-) {
+) -> Release {
     let task = route.task;
     let machine = route.execution_machine;
     if backing_off(retries, task) || unreachable.contains(&machine) {
-        return;
+        return Release::Settled;
     }
     let released = if route.origin_machine == machine {
         local_submit::release(state, route).await
@@ -586,7 +599,13 @@ async fn retry_release(
     if matches!(released, Err(AppError::MachineUnavailable { .. })) {
         unreachable.insert(machine);
     }
+    let outcome = if matches!(released, Err(AppError::DaemonBusy)) {
+        Release::Pending
+    } else {
+        Release::Settled
+    };
     record_attempt(retries, task, released, "held task launch deferred");
+    outcome
 }
 
 /// Start the worker of a released local task unless its last attempt failed too recently

@@ -223,19 +223,6 @@ pub enum HeldCancel {
 }
 
 impl Store {
-    /// Dependencies saved with a route, or `None` for a route submitted without `after`
-    pub fn route_dependencies(&self, task: TaskId) -> Result<Option<Dependencies>, AppError> {
-        let saved: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT after_json FROM origin_routes WHERE task_id=?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        decode_after(saved.flatten().as_deref())
-    }
-
     /// Routes that still wait for dependencies or for their remote launch to be answered
     pub fn held_routes(&self) -> Result<Vec<DependentRoute>, AppError> {
         self.dependent_routes(
@@ -691,7 +678,10 @@ mod tests {
                 .insert_origin_route_with(&retry, &after_terms(self::after()))
                 .is_err()
         );
-        assert_eq!(store.route_dependencies(route.task).unwrap(), Some(after));
+        assert_eq!(
+            store.route_release_terms(route.task).unwrap(),
+            Some(after_terms(after))
+        );
         assert_eq!(
             store.dependency_states(&[route.task.into()]).unwrap(),
             vec![(

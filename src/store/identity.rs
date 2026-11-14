@@ -206,6 +206,11 @@ fn storage(error: rusqlite::Error) -> IdentityError {
 }
 
 impl Store {
+    /// Release terms saved with a route, or `None` when no route has the task
+    pub fn route_release_terms(&self, task: TaskId) -> Result<Option<ReleaseTerms>, AppError> {
+        release_terms_on(&self.conn, task).map_err(|error| error.into_task_error(task))
+    }
+
     /// Origin threads that still wait for a task or queue job callback
     ///
     /// An accepted, unconfirmed, or held task submission calls back until its

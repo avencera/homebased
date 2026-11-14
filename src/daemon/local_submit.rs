@@ -8,12 +8,12 @@ use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::SubmitBody;
 use super::origin_submit::conflict;
-use crate::dependency::Dependencies;
 use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus};
 use crate::error::AppError;
 use crate::invocation::{persist_workload, resolve_workload_binary};
 use crate::spec::{self, NormalizedSpec};
 use crate::store::{self, LocalAdmission, NewTask};
+use crate::submission::ReleaseTerms;
 use crate::submission::{HeldPhase, OriginRoute, RequestId, SubmissionState};
 
 /// Accept a local task once per request UUID
@@ -21,6 +21,7 @@ pub(super) async fn submit(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, TaskStatus), AppError> {
+    let terms = body.terms();
     let spec = body.spec;
     if spec.machine.is_some() {
         return Err(AppError::Usage {
@@ -31,13 +32,13 @@ pub(super) async fn submit(
     let request = body.request;
     let _request_guard = state.locks.origin_submissions.lock(request).await;
     if let Some(route) = saved_route(state, request).await? {
-        return resume(state, route, &spec, body.after.as_ref()).await;
+        return resume(state, route, &spec, &terms).await;
     }
 
     let id = TaskId::new();
     let admission = LocalAdmission::Submitted {
         request,
-        after: body.after.clone(),
+        after: terms.after.clone(),
     };
     let launched = launch_row(state, id, &spec, body.env, admission).await;
     match launched {
@@ -51,9 +52,7 @@ pub(super) async fn submit(
         Err(error) => {
             // an earlier attempt of this request may have committed while this one was queued
             match saved_route(state, request).await? {
-                Some(route) if route.task != id => {
-                    resume(state, route, &spec, body.after.as_ref()).await
-                }
+                Some(route) if route.task != id => resume(state, route, &spec, &terms).await,
                 _ => Err(error),
             }
         }
@@ -174,7 +173,7 @@ async fn resume(
     state: &AppState,
     route: OriginRoute,
     spec: &NormalizedSpec,
-    after: Option<&Dependencies>,
+    terms: &ReleaseTerms,
 ) -> Result<(TaskId, TaskStatus), AppError> {
     let local = state.machine.identity.machine;
     if route.origin_machine != local || route.execution_machine != local {
@@ -189,13 +188,17 @@ async fn resume(
             "request UUID has different normalized content",
         ));
     }
-    let saved_after = call(&state.store, |reply| StoreMsg::RouteDependencies {
+    // a retry that changes its dependencies or memory peak is another request
+    let saved_terms = call(&state.store, |reply| StoreMsg::RouteReleaseTerms {
         id: route.task,
         reply,
     })
     .await?;
-    if saved_after.as_ref() != after {
-        return Err(conflict(&route, "request UUID has different dependencies"));
+    if saved_terms.as_ref() != Some(terms) {
+        return Err(conflict(
+            &route,
+            "request UUID has different dependencies or memory peak",
+        ));
     }
     match &route.submission {
         SubmissionState::Accepted => {}

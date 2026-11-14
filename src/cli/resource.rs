@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Subcommand};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -460,19 +461,24 @@ async fn submit(
 }
 
 /// Put `--mem-peak` into the spec, refusing a spec that names another peak
+///
+/// The two compare as peaks in whole MiB, so a spec's integer `17` agrees with
+/// the flag's `17`, which serializes as the float `17.0`
 fn set_mem_peak(value: &mut Value, peak: MemPeak) -> Result<(), AppError> {
-    let flag = json!(peak);
-    match value.get("mem_peak") {
-        Some(spec) if *spec != flag => Err(AppError::Usage {
-            message: format!("--mem-peak {peak} disagrees with the spec's mem_peak {spec}"),
-        }),
-        _ => {
-            // a spec that is not an object fails its parse right after
-            if let Some(object) = value.as_object_mut() {
-                object.insert("mem_peak".into(), flag);
-            }
-            Ok(())
+    // a null peak reads as none, so the flag fills it
+    let Some(spec) = value.get("mem_peak").filter(|spec| !spec.is_null()) else {
+        // a spec that is not an object fails its parse right after
+        if let Some(object) = value.as_object_mut() {
+            object.insert("mem_peak".into(), json!(peak));
         }
+        return Ok(());
+    };
+    match MemPeak::deserialize(spec) {
+        Ok(stated) if stated != peak => Err(AppError::Usage {
+            message: format!("--mem-peak {peak} disagrees with the spec's mem_peak {stated}"),
+        }),
+        // an invalid spec peak fails the spec's own parse, which names the field
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 
@@ -826,5 +832,31 @@ fn print_gpu_idle(idle: &GpuIdleDetail) {
             control.action,
             control.at.to_rfc3339()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::set_mem_peak;
+    use crate::memory::MemPeak;
+
+    #[test]
+    fn mem_peak_flag_agrees_with_an_equal_spec_peak_in_any_number_form() {
+        let peak = MemPeak::parse("17").unwrap();
+        for stated in [json!(17), json!(17.0)] {
+            let mut spec = json!({ "mem_peak": stated });
+            set_mem_peak(&mut spec, peak).unwrap();
+            assert_eq!(spec["mem_peak"], stated);
+        }
+
+        for mut absent in [json!({}), json!({ "mem_peak": null })] {
+            set_mem_peak(&mut absent, peak).unwrap();
+            assert_eq!(absent["mem_peak"], json!(17.0));
+        }
+
+        let error = set_mem_peak(&mut json!({ "mem_peak": 18 }), peak).unwrap_err();
+        assert!(error.to_string().contains("disagrees"), "{error}");
     }
 }
