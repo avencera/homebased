@@ -215,18 +215,7 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
         });
     }
 
-    let preemption_in_flight = snapshot.resources.iter().any(|resource| {
-        resource.run.as_ref().is_some_and(|run| {
-            matches!(
-                run.phase,
-                RunPhase::Stopping {
-                    cause: StopCause::Yield | StopCause::Restart,
-                    ..
-                }
-            )
-        })
-    });
-    let preemption = if preemption_in_flight {
+    let preemption = if preemption_in_flight(snapshot) {
         None
     } else {
         waiting.iter().find_map(|job| preempt_for(snapshot, job))
@@ -273,6 +262,9 @@ pub fn manual_preempt(snapshot: &Snapshot, job: JobId) -> Result<Preempt, Preemp
     // added. Turning that yield into a kill would race a run that already exits
     // 75, which classifies as a failure under `Restart`
     let cause = match run.phase {
+        RunPhase::Executing { .. } if preemption_in_flight(snapshot) => {
+            return Err(PreemptRefusal::PreemptionPending);
+        }
         RunPhase::Executing { .. } => StopCause::Restart,
         RunPhase::Stopping {
             cause: cause @ (StopCause::Yield | StopCause::Restart),
@@ -305,6 +297,24 @@ pub fn manual_preempt(snapshot: &Snapshot, job: JobId) -> Result<Preempt, Preemp
         job,
         task: run.task,
         cause,
+    })
+}
+
+/// Whether some run is already stopping for higher-priority work
+///
+/// One such stop runs at a time: the resource it frees may be all the waiting
+/// work needs, so a second stop would throw away another run's progress
+fn preemption_in_flight(snapshot: &Snapshot) -> bool {
+    snapshot.resources.iter().any(|resource| {
+        resource.run.as_ref().is_some_and(|run| {
+            matches!(
+                run.phase,
+                RunPhase::Stopping {
+                    cause: StopCause::Yield | StopCause::Restart,
+                    ..
+                }
+            )
+        })
     })
 }
 

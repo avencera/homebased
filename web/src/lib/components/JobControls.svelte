@@ -157,5 +157,6 @@
 >
 	The running step is killed and the job goes back to the front of {job.priority}. The waiting
 	higher-priority job takes its resource, and this job runs again next, from the start of the step
-	it was on. Completed steps do not run again.
+	it was on. Completed steps do not run again. A run already asked to yield for higher-priority work
+	keeps yielding at its checkpoint instead of being killed.
 </ConfirmDialog>

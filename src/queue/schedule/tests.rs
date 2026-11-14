@@ -440,6 +440,37 @@ fn a_manual_preempt_restarts_a_held_run_only_for_higher_waiting_work() {
 }
 
 #[test]
+fn a_manual_preempt_stops_one_run_at_a_time() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let (first, first_task) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    let (second, _) = machine.running("gpu1", Priority::Medium, HELD, executing(t0()));
+    machine.queued(Priority::High, Target::Any, YIELD);
+    let gpu0 = machine.resource("gpu0");
+    machine.set_run(
+        gpu0,
+        first,
+        first_task,
+        RunPhase::Stopping {
+            started_at: Some(t0()),
+            cause: StopCause::Restart,
+            requested_at: at(60),
+        },
+    );
+
+    // the one high job only needs the resource the first stop frees
+    let snapshot = machine.snapshot(at(120));
+    assert_eq!(
+        manual_preempt(&snapshot, second),
+        Err(PreemptRefusal::PreemptionPending)
+    );
+    assert_eq!(
+        manual_preempt(&snapshot, first).map(|stop| stop.cause),
+        Ok(StopCause::Restart),
+        "the stopping run itself is still joined"
+    );
+}
+
+#[test]
 fn a_manual_preempt_waits_for_higher_work_that_can_start() {
     let mut machine = Machine::new(&["gpu0", "gpu1"]);
     let (fiber, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));

@@ -987,8 +987,9 @@ export function cancelJob(id: string, machine: string, operationId: string): Pro
 
 /**
  * `POST /v1/resource/jobs/{job}/preempt`. Kills the running job's run, whatever its preempt mode,
- * and requeues it at the front of its level. The daemon refuses unless a waiting job of a higher
- * level can use the freed resource.
+ * and requeues it at the front of its level; a run already asked to yield keeps yielding at its
+ * checkpoint instead. The daemon refuses unless a waiting job of a higher level can start on the
+ * freed resource, or while another run is stopping for higher-priority work.
  */
 export function preemptJob(
 	id: string,

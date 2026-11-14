@@ -128,12 +128,12 @@ export function stopCauseLabel(cause: StopCause): string {
 }
 
 /**
- * How the run stops for higher-priority work, such as `yield · hold`. A `wait` spec stops like
- * `restart`, so it shows as one.
+ * How the run stops for higher-priority work, such as `yield · hold`. A `wait` spec from an earlier
+ * release keeps its stored mode: current releases stop it like `restart`, but a queue machine not
+ * yet updated still lets it finish, and the dashboard cannot tell which applies.
  */
 export function preemptionLabel(preempt: Preemption): string {
-	const stop = preempt.mode === 'yield' ? 'yield' : 'restart';
-	return preempt.hold ? `${stop} · hold` : stop;
+	return preempt.hold ? `${preempt.mode} · hold` : preempt.mode;
 }
 
 /** Resource name of a target, `any` for an unpinned job. */

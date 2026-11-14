@@ -140,8 +140,10 @@ pub enum JobCommand {
     ///
     /// Works whatever the job's preempt mode, so a `hold` job past 30 minutes
     /// can make way for higher-priority work. The current step runs again from the start;
-    /// completed steps do not. Refused unless a waiting job of a higher level
-    /// can use the freed resource
+    /// completed steps do not. A run already asked to yield for higher-priority
+    /// work keeps yielding at its checkpoint instead. Refused unless a waiting job
+    /// of a higher level can start on the freed resource, or while another run
+    /// is stopping for higher-priority work
     Preempt {
         /// Job UUID
         job: JobId,

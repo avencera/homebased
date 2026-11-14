@@ -238,6 +238,10 @@ pub enum PreemptRefusal {
     /// The run has not started its command yet
     #[error("its run is still launching; try again once it is executing")]
     Launching,
+    /// Another run is already stopping for higher-priority work, and the
+    /// resource it frees may be all the waiting work needs
+    #[error("another run is already stopping for higher-priority work; try again once it has")]
+    PreemptionPending,
     /// The run is already being cancelled
     #[error("its run is already being cancelled")]
     Cancelling,
