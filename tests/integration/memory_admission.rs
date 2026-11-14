@@ -22,13 +22,20 @@ impl FakeCgroup {
         cgroup
     }
 
-    /// Report `bytes` in use, a quarter of it as reclaimable page cache
+    /// Report `bytes` in use on top of reclaimable page cache, a quarter of
+    /// the in-use bytes being tmpfs that reclaim cannot free
     fn set_used(&self, bytes: u64) {
-        let cache = GIB / 4;
-        fs::write(self.0.join("memory.current"), (bytes + cache).to_string()).unwrap();
+        let (active, inactive) = (3 * GIB, GIB / 4);
+        let shmem = bytes / 4;
+        let file = active + inactive + shmem;
+        let current = bytes - shmem + file;
+        fs::write(self.0.join("memory.current"), current.to_string()).unwrap();
         fs::write(
             self.0.join("memory.stat"),
-            format!("anon {bytes}\ninactive_file {cache}\n"),
+            format!(
+                "anon {}\nfile {file}\nshmem {shmem}\nactive_file {active}\ninactive_file {inactive}\n",
+                bytes - shmem
+            ),
         )
         .unwrap();
     }

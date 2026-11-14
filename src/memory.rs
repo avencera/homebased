@@ -295,11 +295,14 @@ impl Gauge {
         self.cgroup.as_deref()
     }
 
-    /// Bytes in use: `memory.current` less `inactive_file` for the cgroup and
-    /// each `run-*.scope` beside it
+    /// Bytes in use: `memory.current` less its file pages other than shmem,
+    /// for the cgroup and each `run-*.scope` beside it
     ///
-    /// Inactive page cache is reclaimed before anything is OOM-killed, so
-    /// counting it would hold work back for memory that is free in practice
+    /// The kernel reclaims page cache, active or inactive, before it
+    /// OOM-kills anything under the cgroup's cap, so counting it would hold
+    /// work back for memory that is free in practice; data reads can fill
+    /// most of the cgroup with active cache. Shmem (tmpfs) is file-backed
+    /// but cannot be reclaimed, so it stays counted
     pub fn read(&self) -> Result<u64, String> {
         let cgroup = self
             .cgroup
@@ -333,12 +336,16 @@ fn cgroup_used(dir: &Path) -> Result<u64, String> {
         .trim()
         .parse()
         .map_err(|error| format!("parse {}/memory.current: {error}", dir.display()))?;
-    let inactive = read("memory.stat")?
-        .lines()
-        .find_map(|line| line.strip_prefix("inactive_file "))
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    Ok(current.saturating_sub(inactive))
+    let stat = read("memory.stat")?;
+    let field = |key: &str| {
+        stat.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    // `file` counts shmem too, which reclaim cannot free
+    let reclaimable = field("file").saturating_sub(field("shmem"));
+    Ok(current.saturating_sub(reclaimable))
 }
 
 /// The daemon's cgroup v2 directory, when it has one with a memory controller
@@ -411,7 +418,7 @@ fn kib(text: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Claim, MemPeak, MemoryWait, Room, kib, outstanding};
+    use super::{Claim, MemPeak, MemoryWait, Room, cgroup_used, kib, outstanding};
 
     fn gib(value: f64) -> MemPeak {
         MemPeak::from_gib(value).unwrap()
@@ -476,5 +483,27 @@ mod tests {
         assert_eq!(kib(rollup, "Pss_Shmem:"), Some(50));
         // an older kernel without the split fields falls back to the status counts
         assert_eq!(kib("Pss: 1100 kB\n", "Pss_Anon:"), None);
+    }
+
+    #[test]
+    fn use_leaves_out_active_and_inactive_page_cache_but_keeps_shmem() {
+        let dir = tempfile::tempdir().unwrap();
+        let gib = 1u64 << 30;
+        // the 11-14 reading: 31 GiB charged, 25.5 GiB of it active cache
+        std::fs::write(dir.path().join("memory.current"), (31 * gib).to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\nfile_mapped 0\nactive_file {}\ninactive_file {}\n",
+                9 * gib,
+                22 * gib,
+                gib,
+                19 * gib,
+                2 * gib,
+            ),
+        )
+        .unwrap();
+        // 31 less the 21 GiB of file pages that are not shmem
+        assert_eq!(cgroup_used(dir.path()).unwrap(), 10 * gib);
     }
 }
