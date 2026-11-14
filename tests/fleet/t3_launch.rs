@@ -146,8 +146,11 @@ fn install_t3(home: &Path, origin: &str) {
     fs::write(userdata.join("environment-id"), "executor-env\n").unwrap();
     fs::write(
         userdata.join("settings.json"),
-        json!({ "defaultModelSelection": { "instanceId": "codex", "model": "gpt-6.1-sol" } })
-            .to_string(),
+        json!({
+            "defaultModelSelection": { "instanceId": "codex", "model": "gpt-6.1-sol" },
+            "providerInstances": { "claudeAgent": { "driver": "claudeAgent", "enabled": false } }
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -305,6 +308,16 @@ fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route_only_when_a
     assert_eq!(
         listed["projects"][0]["default_model"]["model"],
         "gpt-6.1-sol"
+    );
+    let providers: Vec<&str> = listed["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|provider| provider["id"].as_str())
+        .collect();
+    assert_eq!(
+        providers,
+        ["antigravity", "codex", "cursor", "grok", "opencode"]
     );
 
     let (code, missing) = run_json(

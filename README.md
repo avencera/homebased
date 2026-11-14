@@ -557,7 +557,8 @@ the project setup script, and starts the first message.
 
 - `--project` takes a T3 project id, the project's workspace root on that
   machine (absolute or `~/`), or its exact title. `t3 projects` lists them with
-  the model a launch uses by default.
+  the model a launch uses by default, and lists the provider instances that
+  machine's T3 has enabled under `providers`.
 - `t3 project add <path>` adds an existing directory on that machine as a T3
   project, through that machine's own `t3 project add`, so the running T3 shows
   it at once. A relative path resolves against the current directory, then
@@ -572,9 +573,13 @@ the project setup script, and starts the first message.
   checks that a Lucide name is kebab-case but not that the icon exists, so an
   unknown name shows a blank icon. A machine whose homebased predates icons
   refuses the request instead of ignoring the icon.
-- Without `--provider` and `--model`, the thread runs the default model from
-  that machine's T3 settings. When neither the settings nor the project name
-  one, the launch fails and asks for both.
+- Without `--provider` and `--model`, the thread runs the project's default
+  model from that machine's T3 settings. When neither the settings nor the
+  project name one, the launch fails and asks for both. `--provider` is an
+  instance id on that machine, such as `claude`, not a driver name: a launch
+  whose instance is disabled or missing there, explicit or from the default,
+  fails with `t3_launch_refused` before T3 is contacted and lists the enabled
+  instances. T3 itself would accept it and fail the new thread later.
 - The thread runs `full-access` unless `--runtime-mode` says otherwise, since
   nobody on that machine is there to approve its actions. `--plan` starts it
   in plan mode.

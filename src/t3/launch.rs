@@ -16,6 +16,14 @@
 //!   `projectSettingsOverrides`, then the project's
 //!   `default_model_selection_json`, then `defaultModelSelection`. That order is
 //!   homebased's choice; T3 documents none
+//! - Provider instances come from `providerInstances` in `settings.json` on
+//!   top of one default instance per built-in driver, whose id is the driver id
+//!   (`deriveProviderInstanceConfigMap` in
+//!   `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts`).
+//!   An entry replaces the default of the same id, and `enabled: false` on the
+//!   entry or its `config` disables it. T3 accepts a launch on a disabled
+//!   instance and fails the thread when its session starts, so homebased
+//!   refuses one before contacting T3
 //! - `t3 project add` creates a project through the running server's
 //!   `orchestration.dispatch` HTTP route, or in the state database when no
 //!   server answers (`apps/server/src/cli/project.ts`). It refuses a root that
@@ -57,6 +65,17 @@ const PROJECT_MUTATE_PATH: &str = "/api/projects/mutate";
 const PROJECT_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 // enough of T3's schema error to name the bad field
 const REFUSAL_DETAIL_CHARS: usize = 500;
+// T3's built-in drivers, each with a default instance of the same id
+// (`apps/server/src/provider/builtInDrivers.ts`); a driver T3 adds later is
+// reachable through a `providerInstances` entry until this list names it
+const BUILT_IN_DRIVERS: [&str; 6] = [
+    "codex",
+    "claudeAgent",
+    "cursor",
+    "grok",
+    "opencode",
+    "antigravity",
+];
 
 /// Where a launched thread works
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +135,8 @@ pub enum InteractionMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelChoice {
-    /// T3 provider instance id, such as `claudeAgent` or `codex`
+    /// T3 provider instance id, such as `claude` or `codex`; instances are
+    /// named per machine, so a driver name such as `claudeAgent` may be disabled
     pub provider: String,
     /// Model id, such as `claude-opus-5-5`
     pub model: String,
@@ -270,6 +290,18 @@ pub struct T3Project {
     pub workspace_root: String,
     /// Model a launch uses when it names none; `None` means a launch must name one
     pub default_model: Option<Value>,
+}
+
+/// An enabled provider instance, which a launch names with `--provider`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInstance {
+    /// Instance id, such as `claude` or `codex`
+    pub id: String,
+    /// Driver the instance runs, such as `claudeAgent` or `codex`
+    pub driver: String,
+    /// Name T3 shows for the instance, when settings give one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// A checkout to add as a T3 project, independent of the machine that adds it
@@ -463,7 +495,7 @@ pub fn projects(env: &T3Env) -> Result<Vec<T3Project>, LaunchError> {
             "T3 has no state database on this machine".into(),
         ));
     }
-    let settings = read_json(&userdata.join("settings.json"));
+    let settings = read_settings(env);
 
     let db = state_connection(&state)
         .map_err(|_| LaunchError::Unavailable("statev2.sqlite cannot be read".into()))?;
@@ -494,6 +526,11 @@ pub fn projects(env: &T3Env) -> Result<Vec<T3Project>, LaunchError> {
             }
         })
         .collect())
+}
+
+/// Enabled provider instances of T3 on this machine, by id
+pub fn providers(env: &T3Env) -> Vec<ProviderInstance> {
+    enabled_providers(&read_settings(env))
 }
 
 /// Add a directory on this machine as a T3 project, then apply the spec's icon
@@ -629,7 +666,7 @@ pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, L
     spec.validate().map_err(LaunchError::Refused)?;
     let projects = projects(env)?;
     let project = find_project(&projects, &spec.project, &env.home)?;
-    let model = model_selection(spec, project)?;
+    let model = model_selection(spec, project, &providers(env))?;
 
     let userdata = env.userdata();
     let server = connect(&userdata)?;
@@ -875,8 +912,13 @@ fn expand_home(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// The explicit model, else the project default, with the caller's options applied
-fn model_selection(spec: &LaunchSpec, project: &T3Project) -> Result<Value, LaunchError> {
+/// The explicit model, else the project default, with the caller's options
+/// applied, on an instance that `providers` has enabled
+fn model_selection(
+    spec: &LaunchSpec,
+    project: &T3Project,
+    providers: &[ProviderInstance],
+) -> Result<Value, LaunchError> {
     let mut selection = match &spec.model {
         Some(choice) => json!({ "instanceId": choice.provider, "model": choice.model }),
         None => project.default_model.clone().ok_or_else(|| {
@@ -886,6 +928,18 @@ fn model_selection(spec: &LaunchSpec, project: &T3Project) -> Result<Value, Laun
             ))
         })?,
     };
+    let instance = selection
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !providers.iter().any(|provider| provider.id == instance) {
+        return Err(LaunchError::Refused(provider_refusal(
+            instance,
+            spec.model.is_none(),
+            &project.title,
+            providers,
+        )));
+    }
     if spec.model_options.is_empty() {
         return Ok(selection);
     }
@@ -907,6 +961,66 @@ fn model_selection(spec: &LaunchSpec, project: &T3Project) -> Result<Value, Laun
     }
     selection["options"] = Value::Array(options);
     Ok(selection)
+}
+
+/// Why `instance` cannot run a thread, naming the instances that can
+fn provider_refusal(
+    instance: &str,
+    from_default: bool,
+    project: &str,
+    providers: &[ProviderInstance],
+) -> String {
+    let source = if from_default {
+        format!("the default model of project {project} uses")
+    } else {
+        "--provider names".to_owned()
+    };
+    let enabled = providers
+        .iter()
+        .map(|provider| format!("{} ({})", provider.id, provider.driver))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{source} provider instance {instance}, which is disabled or missing in T3 on this machine; \
+         pass --provider with an enabled instance id: {enabled}"
+    )
+}
+
+/// Instances T3 runs: the built-in defaults, replaced or added to by settings,
+/// without the disabled ones
+fn enabled_providers(settings: &Value) -> Vec<ProviderInstance> {
+    let configured = settings.get("providerInstances").and_then(Value::as_object);
+    let defaults = BUILT_IN_DRIVERS
+        .into_iter()
+        .filter(|driver| configured.is_none_or(|entries| !entries.contains_key(*driver)))
+        .map(|driver| ProviderInstance {
+            id: driver.to_owned(),
+            driver: driver.to_owned(),
+            display_name: None,
+        });
+    let entries = configured
+        .into_iter()
+        .flatten()
+        .filter(|(_, entry)| instance_enabled(entry))
+        .filter_map(|(id, entry)| {
+            let text = |key| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+            Some(ProviderInstance {
+                id: id.clone(),
+                driver: text("driver")?,
+                display_name: text("displayName"),
+            })
+        });
+
+    let mut providers: Vec<ProviderInstance> = defaults.chain(entries).collect();
+    providers.sort_by(|a, b| a.id.cmp(&b.id));
+    providers
+}
+
+/// T3 enables an instance unless its entry or the entry's `config` says
+/// `enabled: false` (`resolveEntryEnabled` in `ProviderInstanceRegistryLive.ts`)
+fn instance_enabled(entry: &Value) -> bool {
+    let disabled = |value: Option<&Value>| value.and_then(Value::as_bool) == Some(false);
+    !disabled(entry.get("enabled")) && !disabled(entry.pointer("/config/enabled"))
 }
 
 /// The first usable default model among the settings and the project's own
@@ -937,6 +1051,10 @@ fn is_model_selection(value: &Value) -> bool {
     named("instanceId") && named("model")
 }
 
+fn read_settings(env: &T3Env) -> Value {
+    read_json(&env.userdata().join("settings.json"))
+}
+
 /// JSON in a file, or null when it is missing or invalid
 fn read_json(path: &Path) -> Value {
     fs::read_to_string(path)
@@ -958,7 +1076,7 @@ mod tests {
     use super::{
         IconChange, IconColor, InteractionMode, LaunchError, LaunchIds, LaunchSpec, ModelChoice,
         ModelOption, OptionValue, ProjectIcon, ProjectSpec, RuntimeMode, Workspace, add_project,
-        launch_thread, projects,
+        launch_thread, projects, providers,
     };
 
     fn curl_available() -> bool {
@@ -1161,6 +1279,75 @@ mod tests {
             json!({ "instanceId": "codex", "model": "gpt-6.1-sol" })
         );
         assert_eq!(fixture.revocations(), ["fake-session"]);
+    }
+
+    #[test]
+    fn a_launch_on_a_disabled_or_missing_instance_contacts_no_t3_and_lists_the_enabled_ones() {
+        let server = FakeT3Server::start(Some(2), Vec::new());
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        let disabled_default = json!({ "instanceId": "claudeAgent", "model": "claude-opus-5-5" });
+        fixture
+            .v2_state()
+            .launch_project("project-app", "app", "/srv/app", None)
+            .launch_project("project-old", "old", "/srv/old", Some(&disabled_default));
+        // the built-in claudeAgent is replaced by a disabled entry, cursor by one
+        // disabled in its config, and claude is a user-defined instance
+        write_settings(
+            &fixture,
+            &json!({
+                "defaultModelSelection": { "instanceId": "claude", "model": "claude-opus-5-5" },
+                "providerInstances": {
+                    "claudeAgent": { "driver": "claudeAgent", "displayName": "Legacy", "enabled": false },
+                    "cursor": { "driver": "cursor", "config": { "enabled": false } },
+                    "claude": { "driver": "claudeAgent", "displayName": "Claude", "enabled": true },
+                    "codexProxy": { "driver": "codex" }
+                }
+            }),
+        );
+
+        let ids: Vec<String> = providers(&fixture.env)
+            .into_iter()
+            .map(|provider| provider.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "antigravity",
+                "claude",
+                "codex",
+                "codexProxy",
+                "grok",
+                "opencode"
+            ]
+        );
+
+        let mut explicit = spec("app");
+        explicit.model = Some(ModelChoice {
+            provider: "claudeAgent".into(),
+            model: "claude-opus-5-5".into(),
+        });
+        let named = launch_thread(&fixture.env, &explicit);
+        let defaulted = launch_thread(&fixture.env, &spec("old"));
+
+        assert!(server.requests().is_empty());
+        assert!(fixture.revocations().is_empty());
+        let enabled = "antigravity (antigravity), claude (claudeAgent), codex (codex), \
+                       codexProxy (codex), grok (grok), opencode (opencode)";
+        assert_eq!(
+            named,
+            Err(LaunchError::Refused(format!(
+                "--provider names provider instance claudeAgent, which is disabled or missing \
+                 in T3 on this machine; pass --provider with an enabled instance id: {enabled}"
+            )))
+        );
+        assert_eq!(
+            defaulted,
+            Err(LaunchError::Refused(format!(
+                "the default model of project old uses provider instance claudeAgent, which is \
+                 disabled or missing in T3 on this machine; pass --provider with an enabled \
+                 instance id: {enabled}"
+            )))
+        );
     }
 
     #[test]
