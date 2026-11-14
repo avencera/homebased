@@ -304,7 +304,7 @@ fn netdata_idle_alerts_respect_snooze_recovery_and_old_origins() {
     h.stop_daemon();
     let store = h.store();
     let old_origin = JobId::new();
-    let mut old_spec = spec(&h, "low", "wait", RUN_UNTIL_FINISH);
+    let mut old_spec = spec(&h, "low", "restart", RUN_UNTIL_FINISH);
     old_spec["resource"] = json!("gpu1");
     store
         .submit_job(&NewJob {
@@ -320,7 +320,7 @@ fn netdata_idle_alerts_respect_snooze_recovery_and_old_origins() {
     restart_with_gpus(&mut h, &bin, port);
 
     let mut jobs = Jobs::new(&h);
-    let job = jobs.submit(&spec(&h, "low", "wait", RUN_UNTIL_FINISH));
+    let job = jobs.submit(&spec(&h, "low", "restart", RUN_UNTIL_FINISH));
     assert!(wait_until(Duration::from_secs(15), || {
         attempt(&h, job)["busy_buckets"].as_u64() >= Some(4)
     }));
@@ -449,7 +449,7 @@ fn nvidia_smi_fallback_counts_missing_readings_as_unknown_and_alerts_never_busy_
     restart_with_gpus(&mut h, &bin, closed);
 
     let mut jobs = Jobs::new(&h);
-    let job = jobs.submit(&spec(&h, "low", "wait", RUN_UNTIL_FINISH));
+    let job = jobs.submit(&spec(&h, "low", "restart", RUN_UNTIL_FINISH));
     assert!(wait_until(Duration::from_secs(20), || {
         attempt(&h, job)["unknown_buckets"].as_u64() >= Some(10)
     }));
@@ -556,7 +556,7 @@ fn final_callbacks_carry_netdata_summaries_of_every_attempt() {
     restart_with_gpus(&mut h, &bin, port);
 
     let mut jobs = Jobs::new(&h);
-    let mut steps = spec(&h, "low", "wait", "exit 0");
+    let mut steps = spec(&h, "low", "restart", "exit 0");
     steps.as_object_mut().unwrap().remove("workload");
     steps["steps"] = json!([
         { "type": "task", "command": ["/bin/sh", "-c", "sleep 4; exit 0"] },
@@ -620,7 +620,7 @@ fn final_callbacks_carry_netdata_summaries_of_every_attempt() {
     );
 
     // an agent that stops answering at the end costs at most the read's budget
-    let held = jobs.submit(&spec(&h, "low", "wait", &run_until("finish-held")));
+    let held = jobs.submit(&spec(&h, "low", "restart", &run_until("finish-held")));
     assert!(wait_until(Duration::from_secs(30), || {
         attempt(&h, held)["busy_buckets"].as_u64() >= Some(3)
     }));
@@ -655,7 +655,7 @@ fn an_unreachable_netdata_gives_unavailable_summaries_and_never_delays_the_end()
     restart_with_config(&mut h, &bin, closed, "source = \"netdata\"\n");
 
     let mut jobs = Jobs::new(&h);
-    let job = jobs.submit(&spec(&h, "low", "wait", RUN_UNTIL_FINISH));
+    let job = jobs.submit(&spec(&h, "low", "restart", RUN_UNTIL_FINISH));
     assert!(wait_until(Duration::from_secs(20), || {
         attempt(&h, job)["unknown_buckets"].as_u64() >= Some(3)
     }));

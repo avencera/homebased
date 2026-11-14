@@ -186,7 +186,7 @@ impl Harness {
             "n=0; while [ ! -f '{}' ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done; exit 0",
             gate.display()
         );
-        jobs.submit(&spec(self, "medium", "wait", &script))
+        jobs.submit(&spec(self, "medium", "restart", &script))
     }
 
     /// Last job event settled in the origin inbox
@@ -554,7 +554,7 @@ fn long_wait_outside_a_t3_claude_session_is_refused() {
 fn job_waiter_on_a_delivered_job_exits_without_output() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let job = jobs.submit(&spec(&h, "medium", "wait", "exit 0"));
+    let job = jobs.submit(&spec(&h, "medium", "restart", "exit 0"));
     assert_eq!(wait_callbacks(&h, job, 1)[0]["event"], "JOB_SUCCEEDED");
 
     let (code, lines) = h.spawn_wait(THREAD, &[&job.to_string()]).finish();
@@ -601,7 +601,7 @@ fn an_id_that_names_both_a_task_and_a_job_is_refused() {
     // job ids are chosen by the submitter, so one can reuse a task's id
     let job = jobs.submit_as(
         JobId::from_uuid(task.parse().unwrap()),
-        &spec(&h, "medium", "wait", "exit 0"),
+        &spec(&h, "medium", "restart", "exit 0"),
     );
     assert_eq!(job.to_string(), task);
 

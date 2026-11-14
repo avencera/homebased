@@ -41,7 +41,7 @@ Use human output for a quick view. Use `--json` for scripts and Attention IDs.
 | Job `PRIORITY`, `POSITION` | Level and slot within that level. High serves before medium, then low. |
 | Job `STATE`, `TARGET / NAME` | Job state, pinned resource or `any`, and submitted label. |
 
-New jobs join the back of their level. Only higher-priority work can preempt. Equal-priority work waits. A pinned job waiting for a busy resource does not stop other jobs from using free resources.
+New jobs join the back of their level. Only higher-priority work can preempt. Equal-priority work waits. Any run is preempted for a waiting job of a higher level, at any age, unless its job sets `"hold": true` in `preempt`; a held run keeps its resource once it is 30 minutes old. `resource job preempt` stops a held run by hand. A spec from an earlier release that says `"mode": "wait"` stops like `restart`, and its `restart_within` is ignored. A pinned job waiting for a busy resource does not stop other jobs from using free resources.
 
 Registration is local and socket-only. Add a lane only for a separate exclusive resource. Do not register another lane for a GPU that already has one. Names and device indices must be unique.
 
@@ -62,14 +62,15 @@ homebased resource label gpu0 --clear
 
 Name the resource by name or UUID. Add `--machine <Fleet-name-or-UUID>` to label a resource on another machine. A peer on an older release refuses the request. In the dashboard, hover a resource name on the queue page and click the pencil. Press Enter to save or Escape to cancel. Saving an empty field clears the label.
 
-## Inspect, move, or cancel
+## Inspect, move, preempt, or cancel
 
-Set `job` to the full job UUID. Job show lists every run task UUID, with the GPU UUID each attempt launched on (`gpu_uuid` in `--json`). Set `task` to one of these to read its output. Set `move` and `cancel` to separate new UUIDs before the first action. Save them for retries.
+Set `job` to the full job UUID. Job show lists every run task UUID, with the GPU UUID each attempt launched on (`gpu_uuid` in `--json`). Set `task` to one of these to read its output. Set `move`, `preempt`, and `cancel` to separate new UUIDs before the first action. Save them for retries.
 
 ```sh
 homebased --json resource job show "$job"
 homebased task log "$task" --tail 200
 homebased --json resource job move "$job" --priority high --front --operation-id "$move"
+homebased --json resource job preempt "$job" --operation-id "$preempt"
 homebased --json resource job cancel "$job" --operation-id "$cancel"
 ```
 
@@ -77,13 +78,15 @@ Retry an action with the same operation UUID and unchanged arguments after a los
 
 Use `--front` or `--back` within a level. Add `--priority low`, `medium`, or `high` to change levels. Priority alone joins the new level's back. `--before <job>` and `--after <job>` take the target's level. Do not combine placement flags. Moving a job does not let equal-priority work preempt.
 
+Preempt kills a running job's run, even a held one, and moves the job to the front of its level. It sends `JOB_PREEMPTED`, and the waiting higher-priority job takes the freed resource once cleanup finishes. The preempted job runs next at its level, ahead of jobs that were in front of it. Its current step runs again from the start, and completed steps do not. Preempt is refused with `preempt_refused` (exit 5) when the job is not executing, is being cancelled, is a CI job, another run is already stopping for higher-priority work, or no waiting job of a higher level can start on its resource; the job would only take the resource straight back. A job already asked to yield for higher-priority work keeps yielding at its checkpoint and still moves to the front. To let a same-level job go first, raise that job's priority, then preempt. The dashboard offers Preempt in a running job's menu.
+
 A job submitted with `--after <task-or-job>`, or with `after` in its spec, waits on the machine that submitted it until each of those tasks and jobs succeeds; a job succeeds at `JOB_SUCCEEDED`, and `JOB_PREEMPTED` does not end it. Only then does it reach the queue. Until then, `resource jobs` and the dashboard queue page do not list it. `resource job show` on the submitting machine reports it as `held`, with each dependency's state. If a dependency ends any other way, the job is cancelled with a `JOB_CANCELLED` event, and it never takes a resource. A task's `after` takes job UUIDs too, so a CPU task can wait for a GPU job. Only jobs this machine submitted count: their events come back here from whichever machine queued them. Cancelling a held job ends it on the submitting machine. Run `show` and `cancel` there; a `--machine` that names that machine or the job's queue machine still finds the held job.
 
 Cancellation stops queued work directly. For an active job, it requests a stop and cleanup. The response does not prove that cleanup has finished. Check job show and resource list.
 
-Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, cancel, and gpu-idle use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.
+Add `--machine <Fleet-name-or-UUID>` to inspect another machine. Show, move, preempt, cancel, and gpu-idle use the saved job authority when machine is absent. For a job submitted from another origin, specify its authority. Resource list, resource jobs, and release default to local.
 
-The web listener serves queue reads and move, cancel, gpu-idle, and release. `GET /v1/fleet/queues` and the dashboard's `/queue` page show the resources and jobs of every Fleet machine. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
+The web listener serves queue reads and move, preempt, cancel, gpu-idle, and release. `GET /v1/fleet/queues` and the dashboard's `/queue` page show the resources and jobs of every Fleet machine. Job submit and resource registration require the socket. Read the [agent queue guide](../.agents/skills/homebased/references/resource-queue.md) for specs, submission, events, and all CLI flags.
 
 ## Clear Attention after a machine check
 
@@ -107,7 +110,7 @@ A stale UUID cannot release a newer Attention. If `attention_not_found` occurs, 
 
 ## Configure blocked notices
 
-The first blocked queued job gets one `JOB_BLOCKED` notice per blocking episode, but only when a run of a lower level or an Attention holds it up. Waiting behind runs of its own level or higher is normal queue order and sends nothing. The default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention, counted from the start of the episode. The notice goes to the blocked job's thread. It never stops a run.
+The first blocked queued job gets one `JOB_BLOCKED` notice per blocking episode, but only when a run of a lower level or an Attention holds it up. Waiting behind runs of its own level or higher is normal queue order and sends nothing. The default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower held runs and Attention, counted from the start of the episode. The notice goes to the blocked job's thread. It never stops a run.
 
 Put this table in `~/.config/homebased/config.toml`, or the file selected by `--config` or `HOMEBASED_CONFIG`. Values must be positive duration strings.
 
@@ -133,11 +136,11 @@ A trip releases the lease by the job's preemption mode:
 | --- | --- | --- |
 | `yield` | asked to yield; the job queues again and resumes | the step stops cleanly at its next checkpoint. If it is still running after `yield_grace` (10 minutes), it never reads `HOMEBASED_YIELD_FILE`, and the job is cancelled |
 | `restart` | killed and queued again | the spec declared the step safe to repeat, and a later attempt may get past a stall |
-| `wait` | cancelled | the spec promised the step is never killed for other work, so repeating it may not be safe; the owner reruns the CPU part as a task |
+| `wait` (from an earlier release) | killed and queued again | it stops like `restart` |
 
 A job that already tripped once is cancelled on its next trip, whatever its mode, so CPU work in a lease cannot loop. The trip is stored on the queue machine. The event that ends the attempt (`JOB_PREEMPTED` or `JOB_CANCELLED`) carries it as `lease_idle`, with a `reason` that says what to do instead. Each step runs as its own attempt, so a step that tripped and then finished ends with no event; the job's final event carries its latest trip instead. `resource jobs` prints the reason under the job, `resource job show` lists every trip, and the web UI marks the job. The queue owner gets an ntfy notice when `[notify.ntfy]` is set. Origins on an older release get the event without `lease_idle`.
 
-`resource jobs` also flags a yield request that has been pending for 10 minutes or more while the step keeps running. Homebased cannot see whether a step reads the yield file, so the flag says the step may not poll it: fix the step, or submit it as `wait`.
+`resource jobs` also flags a yield request that has been pending for 10 minutes or more while the step keeps running. Homebased cannot see whether a step reads the yield file, so the flag says the step may not poll it: fix the step, or submit it as `restart`.
 
 ```toml
 [resource.lease_guard]

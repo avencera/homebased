@@ -277,7 +277,11 @@ mod tests {
     fn incompatible_probe_keeps_identity_even_with_new_shape() {
         let probed = decode_advertisement(
             &body(
-                json!({"min":7,"max":9}),
+                // a range wholly above this build's
+                json!({
+                    "min": CLUSTER_PROTOCOL_VERSION.0 + 1,
+                    "max": CLUSTER_PROTOCOL_VERSION.0 + 3
+                }),
                 json!({"capabilities": "a newer shape", "addresses": 3}),
             ),
             SUPPORTED_PROTOCOLS,

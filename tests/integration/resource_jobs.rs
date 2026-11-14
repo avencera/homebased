@@ -112,6 +112,12 @@ pub(super) fn spec(h: &Harness, priority: &str, mode: &str, script: &str) -> Val
         "workload": { "type": "task", "command": ["/bin/sh", "-c", script] } })
 }
 
+/// `spec` turned into one whose run keeps its resource once older than `HOLD_AFTER`
+pub(super) fn held(mut spec: Value) -> Value {
+    spec["preempt"] = json!({ "mode": "restart", "hold": true });
+    spec
+}
+
 fn cli(h: &Harness, args: &[&str]) -> Value {
     let output = h.cmd().arg("--json").args(args).output().unwrap();
     assert!(
@@ -168,7 +174,7 @@ fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     let h = Harness::new();
     cli(&h, &["resource", "label", "gpu0", "RTX 5090"]);
     let mut jobs = Jobs::new(&h);
-    let mut steps = spec(&h, "medium", "wait", "exit 0");
+    let mut steps = spec(&h, "medium", "restart", "exit 0");
     steps.as_object_mut().unwrap().remove("workload");
     steps["steps"] = json!([
         { "type": "task", "command": ["/bin/sh", "-c", "echo first > first; exit 0"] },
@@ -248,7 +254,7 @@ fn yield_callbacks_are_ordered_and_keep_each_thread() {
         .exists()));
     let thread = uuid::Uuid::now_v7().to_string();
     register_thread(&h.user_home, &thread);
-    let mut high_spec = spec(&h, "high", "wait", "exit 0");
+    let mut high_spec = spec(&h, "high", "restart", "exit 0");
     high_spec["thread"] = json!(thread);
     let high = jobs.submit(&high_spec);
     wait_state(&h, high, "succeeded");
@@ -273,11 +279,13 @@ fn yield_callbacks_are_ordered_and_keep_each_thread() {
 fn cli_queue_moves_replay_stored_results_and_cancel() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "medium", "wait", WAIT_FOR_FINISH));
+    // held past the bound, so moving `c` to high leaves it running
+    let active = jobs.submit(&held(spec(&h, "medium", "restart", WAIT_FOR_FINISH)));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
         .exists()));
+    h.backdate_run_past_hold("gpu0");
     cli(&h, &["resource", "register", "--name", "manual"]);
     let resources = cli(&h, &["resource", "list"]);
     let names = resources["resources"]
@@ -287,8 +295,8 @@ fn cli_queue_moves_replay_stored_results_and_cancel() {
         .map(|r| r["resource"]["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(names.contains(&"gpu0") && names.contains(&"manual"));
-    let b = jobs.submit(&spec(&h, "low", "wait", "exit 0"));
-    let c = jobs.submit(&spec(&h, "low", "wait", "exit 0"));
+    let b = jobs.submit(&spec(&h, "low", "restart", "exit 0"));
+    let c = jobs.submit(&spec(&h, "low", "restart", "exit 0"));
     let operation = OperationId::new().to_string();
     let args = [
         "resource",
@@ -354,6 +362,80 @@ fn cli_queue_moves_replay_stored_results_and_cancel() {
     assert_eq!(wait_callbacks(&h, active, 1)[0]["event"], "JOB_CANCELLED");
 }
 
+/// Append `name` to the shared `order` file, so the test reads the run order
+fn record_run(name: &str, rest: &str) -> String {
+    format!("echo {name} >> order; {rest}")
+}
+
+#[test]
+fn a_young_held_run_is_preempted_for_high_work_and_a_manual_preempt_needs_it() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let mut fiber_spec = spec(
+        &h,
+        "medium",
+        "restart",
+        &record_run("fiber", WAIT_FOR_FINISH),
+    );
+    fiber_spec["preempt"]["hold"] = json!(true);
+    let fiber = jobs.submit(&fiber_spec);
+    // the script can report ready before the launch commits, and a preempt
+    // of a launching run is refused for that reason instead
+    assert!(wait_until(Duration::from_secs(10), || {
+        h.store()
+            .resources_on(machine(&h))
+            .unwrap()
+            .iter()
+            .filter_map(|record| record.run.as_ref())
+            .any(|run| run.job == fiber && matches!(run.phase, RunPhase::Executing { .. }))
+    }));
+
+    // nothing higher waits, so a manual preempt would only throw the step away
+    let refused = h
+        .cmd()
+        .args(["--json", "resource", "job", "preempt", &fiber.to_string()])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(5));
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "preempt_refused", "{error}");
+    assert_eq!(
+        error["error"]["input"]["reason"]["kind"], "nothing_waiting",
+        "{error}"
+    );
+
+    // a spec written for an earlier release gets a warning, and its `wait` no
+    // longer keeps a resource
+    let other = JobId::new();
+    let other_spec = spec(&h, "medium", "wait", &record_run("other", "exit 0"));
+    let (_, stderr) = jobs.submit_with(other, &other_spec, &[]);
+    assert!(stderr.contains("from earlier releases"), "{stderr}");
+    cli(
+        &h,
+        &["resource", "job", "move", &other.to_string(), "--front"],
+    );
+
+    // the held run is younger than 30 minutes, so the high job takes its GPU
+    let urgent = jobs.submit(&spec(
+        &h,
+        "high",
+        "restart",
+        &record_run("urgent", "exit 0"),
+    ));
+    wait_state(&h, urgent, "succeeded");
+    fs::write(h.home.join("finish"), "").unwrap();
+    wait_state(&h, fiber, "succeeded");
+    wait_state(&h, other, "succeeded");
+    // an automatic preemption keeps the job's slot, behind the job moved ahead of it
+    let order = fs::read_to_string(h.home.join("order")).unwrap();
+    assert_eq!(order, "fiber\nurgent\nother\nfiber\n");
+    let events: Vec<Value> = wait_callbacks(&h, fiber, 2)
+        .iter()
+        .map(|event| event["event"].clone())
+        .collect();
+    assert_eq!(events, [json!("JOB_PREEMPTED"), json!("JOB_SUCCEEDED")]);
+}
+
 #[test]
 fn attention_release_refuses_stale_identity_and_replays() {
     let mut h = Harness::new();
@@ -375,7 +457,7 @@ fn attention_release_refuses_stale_identity_and_replays() {
             id: job,
             machine,
             origin: machine,
-            spec: JobSpec::parse_value(&spec(&h, "low", "wait", "exit 0")).unwrap(),
+            spec: JobSpec::parse_value(&spec(&h, "low", "restart", "exit 0")).unwrap(),
             env: TaskEnv {
                 path: "/bin".into(),
                 home: h.user_home.display().to_string(),
@@ -486,12 +568,14 @@ fn attention_release_refuses_stale_identity_and_replays() {
 fn blocked_and_check_due_callbacks_only_reach_the_affected_job() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "low", "wait", WAIT_FOR_FINISH));
+    // held past the bound, so the high job waits behind it
+    let active = jobs.submit(&held(spec(&h, "low", "restart", WAIT_FOR_FINISH)));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
         .exists()));
-    let mut high_spec = spec(&h, "high", "wait", "exit 0");
+    h.backdate_run_past_hold("gpu0");
+    let mut high_spec = spec(&h, "high", "restart", "exit 0");
     let high_thread = uuid::Uuid::now_v7().to_string();
     register_thread(&h.user_home, &high_thread);
     high_spec["thread"] = json!(high_thread);
@@ -590,6 +674,12 @@ fn web_serves_only_guarded_queue_controls() {
     let huge = format!("{{\"operation_id\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
     assert!(request(&cancel, &same, &huge).contains("invalid_spec"));
 
+    // the dashboard's preempt sits behind the same browser write guard
+    let preempt = format!("/v1/resource/jobs/{}/preempt", JobId::new());
+    assert!(request(&preempt, "http://other.example", &body).starts_with("HTTP/1.1 403"));
+    let allowed = request(&preempt, &same, &body);
+    assert!(allowed.contains("job_not_found"), "{allowed}");
+
     let resources = super::http_get(&addr, "/v1/resources");
     assert_eq!(resources.status, 200);
 
@@ -625,7 +715,7 @@ fn job_submit_checks_worker_parent_thread_and_accepts_stdin() {
     let mut jobs = Jobs::new(&h);
     let job = JobId::new();
     jobs.ids.push(job);
-    let mut spec = spec(&h, "low", "wait", "exit 0");
+    let mut spec = spec(&h, "low", "restart", "exit 0");
     let other = uuid::Uuid::now_v7().to_string();
     register_thread(&h.user_home, &other);
     spec["thread"] = json!(other);
@@ -692,12 +782,12 @@ fn cli_transport_retry_keeps_generated_operation_identity() {
 
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let active = jobs.submit(&spec(&h, "medium", "wait", WAIT_FOR_FINISH));
+    let active = jobs.submit(&spec(&h, "medium", "restart", WAIT_FOR_FINISH));
     assert!(wait_until(Duration::from_secs(10), || h
         .home
         .join("ready")
         .exists()));
-    let queued = jobs.submit(&spec(&h, "low", "wait", "exit 0"));
+    let queued = jobs.submit(&spec(&h, "low", "restart", "exit 0"));
     let proxy_home = h.dir.path().join("proxy");
     fs::create_dir_all(&proxy_home).unwrap();
     let listener = UnixListener::bind(proxy_home.join("homebased.sock")).unwrap();
@@ -792,7 +882,7 @@ fn cli_transport_retry_keeps_generated_operation_identity() {
 fn cli_failure_reports_the_job_and_run_without_task_callbacks() {
     let h = Harness::new();
     let mut jobs = Jobs::new(&h);
-    let mut failing = spec(&h, "medium", "wait", "exit 0");
+    let mut failing = spec(&h, "medium", "restart", "exit 0");
     failing.as_object_mut().unwrap().remove("workload");
     failing["steps"] = json!([
         { "type": "task", "command": ["/bin/sh", "-c", "echo failed-output; exit 9"] },
@@ -917,7 +1007,7 @@ fn a_job_held_for_its_build_task_joins_the_queue_once_the_build_succeeds() {
     let job = JobId::new();
     let (held, _) = jobs.submit_with(
         job,
-        &spec(&h, "medium", "wait", "exit 0"),
+        &spec(&h, "medium", "restart", "exit 0"),
         &["--after", &build],
     );
     assert_eq!(held["held"]["state"], "held", "{held}");
@@ -953,7 +1043,7 @@ fn a_job_held_for_a_build_that_fails_is_cancelled_before_it_queues() {
     let mut jobs = Jobs::new(&h);
     let build = h.submit(&h.gated_target("build-fails", 1));
     // `after` in the spec file holds the job the same way as the flag
-    let mut held_spec = spec(&h, "medium", "wait", "exit 0");
+    let mut held_spec = spec(&h, "medium", "restart", "exit 0");
     held_spec["after"] = json!([build]);
     let job = JobId::new();
     let (held, _) = jobs.submit_with(job, &held_spec, &[]);
@@ -963,7 +1053,7 @@ fn a_job_held_for_a_build_that_fails_is_cancelled_before_it_queues() {
     let cancelled = JobId::new();
     jobs.submit_with(
         cancelled,
-        &spec(&h, "medium", "wait", "exit 0"),
+        &spec(&h, "medium", "restart", "exit 0"),
         &["--after", &build],
     );
     // naming this machine still means the job held here, which its queue never saw
@@ -1012,7 +1102,7 @@ fn a_build_step_is_refused_at_submit_unless_allowed() {
     let build_step = spec(
         &h,
         "medium",
-        "wait",
+        "restart",
         "true || ./scripts/build-ptx.sh sm_120",
     );
     let path = h.home.join("build-step.json");

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 16;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 15] = [
+const MIGRATIONS: [Migration; 16] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -35,6 +35,7 @@ const MIGRATIONS: [Migration; 15] = [
     add_lease_idle_trips,
     add_services,
     add_ci_slots,
+    add_preempt_operations,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -110,21 +111,30 @@ fn add_gpu_uuids(conn: &Connection) -> Result<(), rusqlite::Error> {
 fn add_gpu_idle(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&format!(
         "ALTER TABLE resource_jobs ADD COLUMN {JOB_ORIGIN_PROTOCOL};
-         CREATE TABLE resource_operations_v11 (
+         {}
+         {GPU_IDLE_TABLES}",
+        rebuild_operations("'move', 'cancel', 'release', 'gpu_idle'")
+    ))
+}
+
+/// Rebuild `resource_operations` with a new CHECK on its kinds, which SQLite
+/// cannot change in place; nothing references the table
+fn rebuild_operations(kinds: &str) -> String {
+    format!(
+        "CREATE TABLE resource_operations_next (
              id TEXT PRIMARY KEY,
              machine TEXT NOT NULL,
-             kind TEXT NOT NULL CHECK (kind IN ({OPERATION_KINDS})),
+             kind TEXT NOT NULL CHECK (kind IN ({kinds})),
              content_digest TEXT NOT NULL,
              result_json TEXT NOT NULL,
              created_at TEXT NOT NULL
          );
-         INSERT INTO resource_operations_v11
+         INSERT INTO resource_operations_next
              SELECT id, machine, kind, content_digest, result_json, created_at
              FROM resource_operations;
          DROP TABLE resource_operations;
-         ALTER TABLE resource_operations_v11 RENAME TO resource_operations;
-         {GPU_IDLE_TABLES}"
-    ))
+         ALTER TABLE resource_operations_next RENAME TO resource_operations;"
+    )
 }
 
 /// Version 12: each run attempt's GPU usage summary and its end-of-attempt read
@@ -203,6 +213,11 @@ CREATE INDEX services_live ON services (owner_thread) WHERE ended_at IS NULL;
 CREATE INDEX services_events ON services (ended_at) WHERE event_due = 1 AND event_settled_at IS NULL;
 ";
 
+/// Version 17: manual preempts are replayable queue operations
+fn add_preempt_operations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&rebuild_operations(OPERATION_KINDS))
+}
+
 /// Version 16: CI slot lanes, drains, run timeouts, and job timings
 fn add_ci_slots(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&format!(
@@ -271,7 +286,7 @@ const RUN_GPU_SUMMARY: &str = "gpu_end_json TEXT,\n    gpu_summary_json TEXT";
 const JOB_ORIGIN_PROTOCOL: &str = "origin_protocol INTEGER CHECK (origin_protocol >= 1)";
 
 /// Kinds of replayable queue operation
-const OPERATION_KINDS: &str = "'move', 'cancel', 'release', 'gpu_idle'";
+const OPERATION_KINDS: &str = "'move', 'cancel', 'release', 'gpu_idle', 'preempt'";
 
 /// Idle accounting of each watched attempt, and each job's agent controls
 ///
@@ -1034,7 +1049,14 @@ mod tests {
                 [],
             )
             .is_err()
-        );
+        ); // the rebuilt operations table takes a manual preempt
+        old.execute(
+            "INSERT INTO resource_operations
+                 (id,machine,kind,content_digest,result_json,created_at)
+             VALUES ('o','m','preempt','d','{}','x')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

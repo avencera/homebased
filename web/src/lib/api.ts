@@ -419,14 +419,16 @@ export type LogTail = typeof LogTailSchema.Type;
 const PrioritySchema = Schema.Literal('high', 'medium', 'low');
 export type Priority = typeof PrioritySchema.Type;
 
-/** How a running job gives up its resource to higher-priority work. */
-const PreemptionSchema = Schema.Union(
-	Schema.Struct({ mode: Schema.Literal('restart') }),
-	Schema.Struct({
-		mode: Schema.Literal('wait', 'yield'),
-		restart_within: Schema.optional(Schema.String)
-	})
-);
+/**
+ * How a running job gives up its resource to higher-priority work. `wait` comes from specs for
+ * earlier releases and stops like `restart`; `restart_within` is ignored.
+ */
+const PreemptionSchema = Schema.Struct({
+	mode: Schema.Literal('restart', 'yield', 'wait'),
+	restart_within: Schema.optional(Schema.String),
+	/** Keeps the resource once the run is 30 minutes old; older daemons send none. */
+	hold: Schema.optional(Schema.Boolean)
+});
 export type Preemption = typeof PreemptionSchema.Type;
 
 /** Resources a job may run on: any free one, or one pinned resource by ID. */
@@ -551,7 +553,9 @@ const JobSpecViewSchema = Schema.Struct({
 	preempt: PreemptionSchema,
 	/** Resource name or ID the submitter pinned, if any. */
 	resource: Schema.optional(Schema.NullOr(Schema.String)),
-	steps: Schema.Array(StepViewSchema)
+	steps: Schema.Array(StepViewSchema),
+	/** Present for a CI job, which is never preempted; only its presence is read. */
+	ci: Schema.optional(Schema.NullOr(Schema.Unknown))
 });
 export type JobSpecView = typeof JobSpecViewSchema.Type;
 
@@ -687,6 +691,19 @@ const MoveResultSchema = Schema.Struct({
 	position: Schema.Finite
 });
 export type MoveResult = typeof MoveResultSchema.Type;
+
+/** `POST /v1/resource/jobs/{job}/preempt`. */
+const PreemptResultSchema = Schema.Struct({
+	api_version: ApiVersionSchema,
+	job: Schema.String,
+	/** Resource the killed run frees. */
+	resource: Schema.String,
+	task: Schema.String,
+	priority: PrioritySchema,
+	/** Its position at its level afterwards: the front. */
+	position: Schema.Finite
+});
+export type PreemptResult = typeof PreemptResultSchema.Type;
 
 /** `POST /v1/resource/jobs/{job}/cancel`. */
 const CancelResultSchema = Schema.Union(
@@ -965,6 +982,24 @@ export function cancelJob(id: string, machine: string, operationId: string): Pro
 		`/resource/jobs/${encodeURIComponent(id)}/cancel${machineQuery(machine)}`,
 		{ operation_id: operationId },
 		CancelResultSchema
+	);
+}
+
+/**
+ * `POST /v1/resource/jobs/{job}/preempt`. Kills the running job's run, whatever its preempt mode,
+ * and requeues it at the front of its level; a run already asked to yield keeps yielding at its
+ * checkpoint instead. The daemon refuses unless a waiting job of a higher level can start on the
+ * freed resource, or while another run is stopping for higher-priority work.
+ */
+export function preemptJob(
+	id: string,
+	machine: string,
+	operationId: string
+): Promise<PreemptResult> {
+	return postJson(
+		`/resource/jobs/${encodeURIComponent(id)}/preempt${machineQuery(machine)}`,
+		{ operation_id: operationId },
+		PreemptResultSchema
 	);
 }
 

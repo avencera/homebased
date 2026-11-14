@@ -28,7 +28,7 @@ use crate::spec::{
 
 use super::ci::{CiSpec, InnerPath};
 use super::gpu_idle::GpuIdleSpec;
-use super::{Preemption, Priority, ResourceSelector, StepWorkload, Steps};
+use super::{HOLD_AFTER, PreemptMode, Preemption, Priority, ResourceSelector, StepWorkload, Steps};
 
 /// Container path under which the authority mounts the job and run directories
 pub const RESERVED_MOUNT_ROOT: &str = "/homebased";
@@ -136,6 +136,39 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// A warning when the spec spells preemption the way earlier releases
+    /// did, whose meaning changed
+    ///
+    /// Earlier releases never stopped a `wait` run outside its
+    /// `restart_within`. Now every run is preempted for higher-priority work
+    /// unless `hold` keeps it once [`HOLD_AFTER`] old, so a submitter that
+    /// relied on `wait` should add `hold`. CI jobs name `wait` and are never
+    /// preempted, so they get no warning
+    #[must_use]
+    pub fn legacy_preempt_warning(&self) -> Option<String> {
+        if self.ci.is_some() {
+            return None;
+        }
+        let wait = self.preempt.mode == PreemptMode::Wait;
+        let window = self.preempt.restart_within.is_some();
+        if !wait && !window {
+            return None;
+        }
+        let hold = if self.preempt.hold {
+            String::new()
+        } else {
+            format!(
+                "; add \"hold\": true to keep the resource once the run is {} old",
+                humantime::format_duration(HOLD_AFTER)
+            )
+        };
+        Some(format!(
+            "preempt {{\"mode\": \"wait\"}} and restart_within are from earlier releases: \
+             wait now stops like restart, and restart_within is ignored. Any run is preempted for \
+             higher-priority work{hold}"
+        ))
+    }
+
     /// Parse spec bytes, attaching a JSON pointer on failure
     pub fn parse_bytes(bytes: &[u8]) -> Result<Self, AppError> {
         let value: Value = serde_json::from_slice(bytes).map_err(|err| AppError::InvalidSpec {
@@ -252,11 +285,7 @@ impl JobSpec {
                 "a CI job has exactly one task step",
             ));
         }
-        if self.preempt
-            != (Preemption::Wait {
-                restart_within: None,
-            })
-        {
+        if self.preempt != Preemption::new(PreemptMode::Wait) {
             return Err(invalid(
                 "/preempt",
                 json!({ "mode": self.preempt.mode() }),
@@ -442,28 +471,34 @@ fn timeout_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
 }
 
 fn preempt_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let hold = json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Keep the resource against higher-priority work once the run is 30 minutes old. Without it, any run is preempted at any age."
+    });
     let window = json!({
         "type": "string",
-        "description": "Humantime duration from 1m through 24h. A run younger than this is killed and requeued instead."
+        "description": "Accepted from specs for earlier releases and ignored."
     });
     schemars::json_schema!({
-        "description": "How a run gives up its GPU to higher-priority work. Use wait only when the job cannot checkpoint.",
+        "description": "How a run gives up its resource to higher-priority work. Any run is preempted for a waiting job of a higher level, unless hold keeps it once 30 minutes old. Use yield when the step checkpoints, otherwise restart.",
         "oneOf": [
             {
                 "type": "object",
-                "properties": { "mode": { "const": "restart" } },
+                "properties": { "mode": { "const": "restart" }, "hold": hold },
                 "required": ["mode"],
                 "additionalProperties": false
             },
             {
                 "type": "object",
-                "properties": { "mode": { "const": "wait" }, "restart_within": window },
+                "properties": { "mode": { "const": "yield" }, "hold": hold, "restart_within": window },
                 "required": ["mode"],
                 "additionalProperties": false
             },
             {
                 "type": "object",
-                "properties": { "mode": { "const": "yield" }, "restart_within": window },
+                "description": "From earlier releases; stops like restart. CI jobs use it.",
+                "properties": { "mode": { "const": "wait" }, "hold": hold, "restart_within": window },
                 "required": ["mode"],
                 "additionalProperties": false
             }

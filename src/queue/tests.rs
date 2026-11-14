@@ -4,8 +4,9 @@ use chrono::{TimeZone, Utc};
 use serde_json::json;
 
 use super::{
-    JobId, LevelEnd, MoveFlags, MoveRefusal, Placement, PreemptStop, Preemption, Priority,
-    QueueError, ResourceName, ResourceSelector, RestartWindow, Side, StopCause,
+    HOLD_AFTER, JobId, LevelEnd, MoveFlags, MoveRefusal, Placement, PreemptMode, PreemptStop,
+    Preemption, Priority, QueueError, ResourceName, ResourceSelector, RestartWindow, Side,
+    StopCause,
 };
 
 fn minutes(count: u64) -> Duration {
@@ -31,86 +32,24 @@ fn restart_window_accepts_only_one_minute_through_a_day() {
 }
 
 #[test]
-fn a_run_is_inside_its_window_only_while_younger_than_it() {
-    let window = RestartWindow::try_from(minutes(5)).unwrap();
+fn only_a_held_run_past_thirty_minutes_keeps_its_resource() {
     let start = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
     let at = |seconds: i64| start + chrono::Duration::seconds(seconds);
-    assert!(window.contains(start, at(0)));
-    assert!(window.contains(start, at(299)));
-    assert!(
-        !window.contains(start, at(300)),
-        "at the bound the run is outside"
-    );
-    assert!(!window.contains(start, at(301)));
-    // a clock that went backwards counts as age zero
-    assert!(window.contains(start, at(-10)));
-}
-
-#[test]
-fn preemption_stop_follows_mode_and_window() {
-    let start = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
-    let before = start + chrono::Duration::seconds(299);
-    let at = start + chrono::Duration::seconds(300);
-    let after = start + chrono::Duration::seconds(301);
-    let window = Some(RestartWindow::try_from(minutes(5)).unwrap());
+    let bound = i64::try_from(HOLD_AFTER.as_secs()).unwrap();
+    let restart = Preemption::new(PreemptMode::Restart);
+    let yields = Preemption::new(PreemptMode::Yield);
+    let wait = Preemption::new(PreemptMode::Wait);
     let cases = [
-        (Preemption::Restart, after, Some(PreemptStop::Restart)),
-        (
-            Preemption::Wait {
-                restart_within: None,
-            },
-            before,
-            None,
-        ),
-        (
-            Preemption::Wait {
-                restart_within: window,
-            },
-            before,
-            Some(PreemptStop::Restart),
-        ),
-        (
-            Preemption::Wait {
-                restart_within: window,
-            },
-            at,
-            None,
-        ),
-        (
-            Preemption::Wait {
-                restart_within: window,
-            },
-            after,
-            None,
-        ),
-        (
-            Preemption::Yield {
-                restart_within: None,
-            },
-            before,
-            Some(PreemptStop::Yield),
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window,
-            },
-            before,
-            Some(PreemptStop::Restart),
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window,
-            },
-            at,
-            Some(PreemptStop::Yield),
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window,
-            },
-            after,
-            Some(PreemptStop::Yield),
-        ),
+        (restart, at(bound * 10), Some(PreemptStop::Restart)),
+        (yields, at(bound * 10), Some(PreemptStop::Yield)),
+        // `wait` from an earlier release no longer keeps its resource
+        (wait, at(bound * 10), Some(PreemptStop::Restart)),
+        (restart.held(), at(bound - 1), Some(PreemptStop::Restart)),
+        (yields.held(), at(bound - 1), Some(PreemptStop::Yield)),
+        (restart.held(), at(bound), None),
+        (yields.held(), at(bound + 1), None),
+        // a clock that went backwards counts as age zero
+        (restart.held(), at(-10), Some(PreemptStop::Restart)),
     ];
     for (mode, now, expected) in cases {
         assert_eq!(mode.stop_at(start, now), expected, "{mode:?} at {now}");
@@ -119,32 +58,27 @@ fn preemption_stop_follows_mode_and_window() {
 
 #[test]
 fn preempt_forms_parse_and_refuse() {
-    let five = Some(RestartWindow::try_from(minutes(5)).unwrap());
     let ten = Some(RestartWindow::try_from(minutes(10)).unwrap());
     let accepted = [
-        (json!({"mode": "restart"}), Preemption::Restart),
         (
-            json!({"mode": "wait"}),
-            Preemption::Wait {
-                restart_within: None,
-            },
+            json!({"mode": "restart"}),
+            Preemption::new(PreemptMode::Restart),
         ),
         (
-            json!({"mode": "wait", "restart_within": "10m"}),
-            Preemption::Wait {
-                restart_within: ten,
-            },
+            json!({"mode": "restart", "hold": true}),
+            Preemption::new(PreemptMode::Restart).held(),
         ),
         (
             json!({"mode": "yield"}),
-            Preemption::Yield {
-                restart_within: None,
-            },
+            Preemption::new(PreemptMode::Yield),
         ),
+        (json!({"mode": "wait"}), Preemption::new(PreemptMode::Wait)),
+        // an earlier release's window is kept, so the spec digest stays the same
         (
-            json!({"mode": "yield", "restart_within": "5m"}),
-            Preemption::Yield {
-                restart_within: five,
+            json!({"mode": "wait", "restart_within": "10m"}),
+            Preemption {
+                restart_within: ten,
+                ..Preemption::new(PreemptMode::Wait)
             },
         ),
     ];
@@ -153,12 +87,18 @@ fn preempt_forms_parse_and_refuse() {
         assert_eq!(parsed, expected, "{value}");
         assert_eq!(serde_json::to_value(parsed).unwrap(), value, "round trip");
     }
+    // `hold: false` is the default, so it is not written back
+    let unheld: Preemption =
+        serde_json::from_value(json!({"mode": "yield", "hold": false})).unwrap();
+    assert_eq!(
+        serde_json::to_value(unheld).unwrap(),
+        json!({"mode": "yield"})
+    );
     let refused = [
         json!({"mode": "restart", "restart_within": "5m"}),
-        json!({"mode": "yield", "restart_within": "0s"}),
         json!({"mode": "yield", "restart_within": "30s"}),
         json!({"mode": "wait", "restart_within": "25h"}),
-        json!({"mode": "yield", "restart_within": "soon"}),
+        json!({"mode": "yield", "hold": "yes"}),
         json!({"mode": "watch"}),
         json!({"mode": "yield", "extra": true}),
         json!({}),

@@ -341,7 +341,7 @@ fn gated_job(h: &Harness, gate: &str, code: i32) -> Value {
     super::resource_jobs::spec(
         h,
         "medium",
-        "wait",
+        "restart",
         &format!(
             "while [ ! -f '{}' ]; do sleep 0.1; done; exit {code}",
             gate.display()
@@ -369,7 +369,7 @@ fn a_task_and_a_job_held_after_a_job_start_once_it_succeeds() {
     let next = homebased::queue::JobId::new();
     let (held, _) = jobs.submit_with(
         next,
-        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &super::resource_jobs::spec(&h, "medium", "restart", "exit 0"),
         &["--after", &train],
     );
     assert_eq!(held["held"]["state"], "held", "{held}");
@@ -429,7 +429,7 @@ fn work_after_a_job_that_ends_without_success_is_cancelled_before_it_starts() {
     let after_failing = homebased::queue::JobId::new();
     jobs.submit_with(
         after_failing,
-        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &super::resource_jobs::spec(&h, "medium", "restart", "exit 0"),
         &["--after", &failing.to_string()],
     );
     h.open_gate("failing");

@@ -188,6 +188,21 @@ pub enum CancelResult {
     },
 }
 
+/// Result of a manual preempt
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PreemptResult {
+    /// Preempted job
+    pub job: JobId,
+    /// Resource its run frees once the kill and cleanup finish
+    pub resource: ResourceId,
+    /// Run task being killed
+    pub task: TaskId,
+    /// Its level, unchanged
+    pub priority: Priority,
+    /// Its position at that level after the preempt, which is the front
+    pub position: u32,
+}
+
 /// Result of releasing an `Attention`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ReleaseResult {

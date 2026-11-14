@@ -97,20 +97,21 @@ fn the_guard_releases_leases_with_no_cuda_context_by_preemption_mode() {
     restart_with_guard(&mut h, &bin);
     let mut jobs = Jobs::new(&h);
 
-    // a wait job that holds a context longer than the threshold is left
-    // alone; once it drops the context, the guard cancels it
+    // a restart job that holds a context longer than the threshold is left
+    // alone; once it drops the context, the guard kills and requeues it, and
+    // the second attempt's trip cancels it
     let holds = format!(
         "echo \"{GPU0}, $$\" > {apps}; sleep 5; : > {apps}; touch dropped; sleep 60",
         apps = apps.display()
     );
-    let job = jobs.submit(&spec(&h, "low", "wait", &holds));
-    let cancelled = wait_events(&h, job, "JOB_CANCELLED", 1).remove(0);
+    let job = jobs.submit(&spec(&h, "low", "restart", &holds));
+    let preempted = wait_events(&h, job, "JOB_PREEMPTED", 1).remove(0);
     assert!(
         h.home.join("dropped").exists(),
-        "tripped while the run held a context: {cancelled}"
+        "tripped while the run held a context: {preempted}"
     );
-    let trip = &cancelled["lease_idle"];
-    assert_eq!(trip["action"], "cancel", "{cancelled}");
+    let trip = &preempted["lease_idle"];
+    assert_eq!(trip["action"], "restart", "{preempted}");
     assert_eq!(trip["gpu_uuid"], GPU0);
     assert_eq!(trip["trip"], 1);
     assert!(
@@ -119,7 +120,10 @@ fn the_guard_releases_leases_with_no_cuda_context_by_preemption_mode() {
             .is_some_and(|reason| reason.contains("CUDA context") && reason.contains("--after")),
         "{trip}"
     );
-    assert_eq!(show(&h, job)["lease_idle"][0]["action"], "cancel");
+    let cancelled = wait_events(&h, job, "JOB_CANCELLED", 1).remove(0);
+    assert_eq!(cancelled["lease_idle"]["action"], "cancel", "{cancelled}");
+    assert_eq!(cancelled["lease_idle"]["trip"], 2);
+    assert_eq!(show(&h, job)["lease_idle"][0]["action"], "restart");
 
     // a yield job that honors the yield queues again, and its second trip
     // cancels it, so CPU work in the lease cannot loop

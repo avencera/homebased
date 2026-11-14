@@ -29,8 +29,8 @@ use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission,
 use crate::queue::gpu_idle::GpuIdleControl;
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
-    AttentionId, JobId, OperationId, Placement, QueueError, ResourceLabel, ResourceName,
-    ResourceSelector,
+    AttentionId, JobId, OperationId, Placement, PreemptRefusal, QueueError, ResourceLabel,
+    ResourceName, ResourceSelector,
 };
 use crate::store::queue::JobAccepted;
 use crate::store::queue::interface::{QueueRequest, submit_protocol};
@@ -79,6 +79,7 @@ pub fn control_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/resource/jobs/{job}/move", post(move_job))
         .route("/v1/resource/jobs/{job}/cancel", post(cancel))
+        .route("/v1/resource/jobs/{job}/preempt", post(preempt))
         .route("/v1/resource/jobs/{job}/gpu-idle", post(gpu_idle))
         .route("/v1/resource/release", post(release))
         .route("/v1/resource/label", post(label))
@@ -502,6 +503,39 @@ async fn cancel(
         &state,
         machine,
         QueueRequest::Cancel {
+            operation: body.operation_id,
+            job,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+async fn preempt(
+    State(state): State<AppState>,
+    Path(job): Path<JobId>,
+    Query(query): Query<MachineQuery>,
+    QueueJson(body): QueueJson<OperationBody>,
+) -> Result<Json<Value>, AppError> {
+    {
+        // a held job never reached its queue, so it has no run to stop
+        let _guard = state.locks.job_submissions.lock(job).await;
+        if local_held_view(&state, job, query.machine.as_ref())
+            .await?
+            .is_some()
+        {
+            return Err(QueueError::PreemptRefused {
+                job,
+                reason: PreemptRefusal::NotRunning,
+            }
+            .into());
+        }
+    }
+    let machine = job_authority(&state, job, query.machine.as_ref()).await?;
+    forward(
+        &state,
+        machine,
+        QueueRequest::Preempt {
             operation: body.operation_id,
             job,
         },

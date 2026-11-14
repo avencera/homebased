@@ -53,7 +53,7 @@ fn command_task_row(id: TaskId, spec: &NormalizedSpec, path: String, binary: &st
 }
 
 fn configure_task_runner() {
-    crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
+    crate::runner::set_task_run_executable_for_tests(crate::test_support::homebased_binary());
 }
 
 async fn acquire_runner_lock_after_task_exit(home: &Home, task_id: TaskId) -> std::fs::File {

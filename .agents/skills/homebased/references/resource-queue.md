@@ -12,14 +12,16 @@ Use the resource queue for any GPU work on a machine. Never run GPU work outside
 
 New jobs join the back of their level. Only a strictly higher level can preempt a run. Equal levels never preempt. A preempted job keeps its queue slot. Each machine has one queue and one exclusive lane per resource. A busy pinned resource does not stop jobs from using other free resources.
 
+Every run can be preempted for a waiting job of a higher level, at any age, unless its job sets `"hold": true`. A held run keeps its resource once it is 30 minutes old; younger held runs are preempted like any other. Set `hold` only on a low or medium job whose step loses too much work if it is stopped late; high jobs are never preempted. When a person or decision is blocked behind a held run, run `resource job preempt` (see [Command reference](#command-reference)) instead of waiting or cancelling it.
+
 Choose in this order:
 
-1. Split the work into `steps`. Each successful step is a checkpoint. Use `wait` if a step cannot yield.
-2. Use `yield` only when the command polls `HOMEBASED_YIELD_FILE` between units of work and saves progress. A step labelled `yield` that never reads the file holds its GPU while higher-priority work waits; label it `wait` instead.
-3. Use `restart` for short, idempotent work whose current step can safely run again from the start.
-4. Use `wait` when none of these choices works. Higher-priority work waits for the step to finish.
+1. Split the work into `steps`. Each successful step is a checkpoint, so a preemption repeats only the current step.
+2. Use `yield` when the command polls `HOMEBASED_YIELD_FILE` between units of work and saves progress. A preempted `yield` run is asked to stop at its next checkpoint and resumes from it. A step labelled `yield` that never reads the file holds its GPU while higher-priority work waits; label it `restart` instead.
+3. Use `restart` for everything else. A preempted `restart` run is killed and its current step runs again from the start.
+4. Add `"hold": true` to keep the resource once the run is 30 minutes old.
 
-`preempt` is an object with `mode`: `yield`, `restart`, or `wait`. For `yield` and `wait`, optional `restart_within` lets Homebased stop and repeat a young run for higher-priority work. Set it to the maximum amount of work you can safely discard, from `1m` through `24h`. Run age must be less than that duration. After the window, `yield` requests a checkpoint and `wait` waits. `restart` always permits restart and refuses this field. The window is permission to restart, not a timer that stops work.
+`preempt` is an object with `mode`, `yield` or `restart`, and optional `hold`. Specs written for earlier releases may say `wait` or set `restart_within`: `wait` now stops like `restart`, `restart_within` is ignored, and submit prints a warning for both. A CI job still uses `{"mode": "wait"}` and is never preempted. A queue machine on an older release refuses a spec with `hold`: the submit fails with `cluster_protocol_incompatible`.
 
 ## Checkpoint contract
 
@@ -93,7 +95,7 @@ Save this example as `job.json`. `/tmp` must exist on the target machine.
   "cwd": "/tmp",
   "timeout": "1h",
   "priority": "low",
-  "preempt": {"mode": "wait", "restart_within": "1m"},
+  "preempt": {"mode": "restart"},
   "steps": [
     {"type": "task", "command": ["sh", "-c", "printf 'first\\n' > \"$HOMEBASED_JOB_DIR/result\""]},
     {"type": "task", "command": ["sh", "-c", "cat \"$HOMEBASED_JOB_DIR/result\""]}
@@ -142,9 +144,9 @@ homebased --json task run --name "score checkpoint" --after "$job" -- ./eval.sh
 
 ### The lease guard
 
-The queue machine checks every 5 seconds whether any process of a running GPU task step holds a CUDA context on its GPU (NVML compute processes, not utilization). Container steps are not watched. After 5 minutes with none, it releases the lease: a `yield` job is asked to yield and is cancelled if still running 10 minutes later, a `restart` job is killed and queued again, and a `wait` job is cancelled. A job's second trip always cancels it. The ending event (`JOB_PREEMPTED` or `JOB_CANCELLED`, or the job's final event when the tripped step finished anyway) carries `lease_idle` with a `reason`. When you get one, move the CPU work into its own task, chain the GPU job with `--after`, and resubmit. Startup that compiles or loads for a minute or two before the first CUDA call is fine.
+The queue machine checks every 5 seconds whether any process of a running GPU task step holds a CUDA context on its GPU (NVML compute processes, not utilization). Container steps are not watched. After 5 minutes with none, it releases the lease: a `yield` job is asked to yield and is cancelled if still running 10 minutes later, and a `restart` job, or one from an earlier release that says `wait`, is killed and queued again. A job's second trip always cancels it. The ending event (`JOB_PREEMPTED` or `JOB_CANCELLED`, or the job's final event when the tripped step finished anyway) carries `lease_idle` with a `reason`. When you get one, move the CPU work into its own task, chain the GPU job with `--after`, and resubmit. Startup that compiles or loads for a minute or two before the first CUDA call is fine.
 
-`resource jobs` flags a yield request pending for 10 minutes or more: the step is not polling `HOMEBASED_YIELD_FILE`. Fix the step or resubmit it as `wait`.
+`resource jobs` flags a yield request pending for 10 minutes or more: the step is not polling `HOMEBASED_YIELD_FILE`. Fix the step or resubmit it as `restart`.
 
 ### Handle a `JOB_GPU_IDLE` alert
 
@@ -202,15 +204,16 @@ Use `homebased --json` before each command and parse the result. All results car
 | `resource job submit --job-id <uuid> --spec <file>` | Use `--spec -` for stdin. Optional `--allow-other-thread`, and `--after <task-or-job-uuid>` (repeatable) to hold the job until those tasks and jobs succeed. A held job's result has `held` in place of the queue's answer. Machine comes from the spec. No dry-run flag. |
 | `resource job show <job>` | Optional `--machine <name-or-uuid>`. Job, slot, progress, events, active run, run history with the `gpu_uuid` each attempt launched on, and `resources`: the pinned resource and each one a run held, with names and labels. A job held for its `after` entries, or ended before it queued, shows `held` instead: `state` (`held`, `cancelled`, or `failed`), each `after` entry as `{"task", "state"}`, plus `"kind": "job"` for a job, and the `reason` it ended. |
 | `resource job move <job>` | Placement flags below. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. |
+| `resource job preempt <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Kill the running job's run, even a held one, and requeue it at the front of its level; it sends `JOB_PREEMPTED` and reruns its current step after the waiting higher-priority job. Refused with `preempt_refused` (exit 5) unless the run is executing (or already stopping for preemption, which it joins without changing how the run stops) and a waiting job of a higher level can start on its resource; `input.reason.kind` is `not_running`, `launching`, `preemption_pending` (another run is already stopping for higher-priority work; retry once it has), `cancelling`, `ci`, or `nothing_waiting`. Refused by a queue machine on an older release. |
 | `resource job cancel <job>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Cancel queued work or stop and clean up the active run. |
 | `resource job gpu-idle <job>` | Exactly one of `--snooze <duration>`, `--off`, or `--clear`. `--snooze` and `--off` require `--reason <text>`. Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Snooze for any positive duration, or turn this job's GPU idle alerts off; `--clear` restores the spec's setting. The latest control wins. Never stops the job. Refused for a job still held for its `after` entries, and by a queue machine on an older release. |
 | `resource release --attention <uuid>` | Optional `--operation-id <uuid>` and `--machine <name-or-uuid>`. Check the machine first. |
 
 Move with `--front`, `--back`, or `--priority <low-or-medium-or-high>`. Front and back can include priority. Priority alone joins the new level's back. `--before <job>` and `--after <job>` take the target's level. An optional priority must match that level. Do not combine two placement flags or move relative to the same job.
 
-Machine reads and release default to local. Show, move, cancel, and gpu-idle use the saved job authority when machine is absent. If you submitted from another origin, give the authority explicitly.
+Machine reads and release default to local. Show, move, preempt, cancel, and gpu-idle use the saved job authority when machine is absent. If you submitted from another origin, give the authority explicitly.
 
-For scripts, save an operation UUID before move, cancel, gpu-idle, or release. Retry the exact command with the same `--operation-id`. New content needs a new operation UUID. Without the flag, the CLI makes one UUID for its own transport retries. A later CLI invocation makes a new one.
+For scripts, save an operation UUID before move, preempt, cancel, gpu-idle, or release. Retry the exact command with the same `--operation-id`. New content needs a new operation UUID. Without the flag, the CLI makes one UUID for its own transport retries. A later CLI invocation makes a new one.
 
 Get a run task UUID from job show, then read its log:
 
@@ -254,7 +257,7 @@ Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callba
 | `gpu_summaries` | On `JOB_SUCCEEDED`, `JOB_FAILED`, and `JOB_CANCELLED`, one summary per attempt on a GPU resource; on `JOB_PREEMPTED`, the attempt it ended. Absent when no attempt ran on one, or when the job came from a machine on the previous release. Each has `attempt` (run task), `run_number`, `step`, `status` (`ok` or `unavailable` with `reason`), `gpu_uuid`, `source` (`netdata`, `nvidia-smi`, or `mixed`), `attempt_secs`, `util_avg`, `power_pct_avg` (percent of the power limit), `mem_peak_mib`, `mem_total_mib`, `idle_pct`, `first_busy_after_secs`, `idle_alerts`, `snoozes` (each control in force during the attempt: `action`, `reason`, `at`, `until`), and `brief`, one line of the same. Each measured field is `{value, covered_secs, coverage_pct, source}` and is absent without samples. See [Read the GPU summary](#read-the-gpu-summary). |
 | `held_ending` | Only when a job held for its `after` entries ended before it queued. `reason` is `dependency` (with the `task` or `job` and its `outcome`), `requested` (cancelled while held), or `refused` (with the queue's `code` and `message`; the event is `JOB_FAILED`). |
 
-Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower `wait` runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.
+Each blocker has `kind`. A `run` blocker has `resource`, `job`, and `task`. An `attention` blocker has `resource` and `attention`. The first blocked queued job gets one notice per blocking episode, only when a lower-level run or an Attention holds it up; waiting behind runs of its own level or higher sends nothing. Default delay is 15 minutes behind a requested yield, or 30 minutes behind other blockers, including lower held runs and Attention. These delays never stop a run. See the [runbook](../../../../docs/resource-queue.md) for configuration.
 
 ## Attention and cleanup limits
 

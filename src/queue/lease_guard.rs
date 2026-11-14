@@ -23,8 +23,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::TaskId;
-use crate::queue::Preemption;
 use crate::queue::gpu::GpuUuid;
+use crate::queue::{PreemptStop, Preemption};
 
 /// The `[resource.lease_guard]` settings
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,23 +72,20 @@ impl TripAction {
     /// The action for a run of a job in `preempt` that tripped `earlier`
     /// times before this attempt
     ///
-    /// A `yield` job can stop safely at a checkpoint and a `restart` job
-    /// declared its step safe to repeat, so both are released and queue
-    /// again: the idle stretch may have been a stall that a later attempt
-    /// passes. A `wait` job promised it is never killed for other work, so a
-    /// requeue would repeat a step that may not be safe to repeat; it is
-    /// cancelled, and its owner reruns the CPU part as a task. Any job that
-    /// already tripped is cancelled, so CPU work in the lease costs at most
-    /// two thresholds instead of looping
+    /// The run is released the way higher-priority work would stop it: a
+    /// `yield` job at a checkpoint, any other killed and requeued, since every
+    /// step may be restarted for preemption. The job queues again because the
+    /// idle stretch may have been a stall that a later attempt passes. Any job
+    /// that already tripped is cancelled, so CPU work in the lease costs at
+    /// most two thresholds instead of looping
     #[must_use]
     pub const fn for_job(preempt: Preemption, earlier: u32) -> Self {
         if earlier > 0 {
             return Self::Cancel;
         }
-        match preempt {
-            Preemption::Yield { .. } => Self::Yield,
-            Preemption::Restart => Self::Restart,
-            Preemption::Wait { .. } => Self::Cancel,
+        match preempt.stop() {
+            PreemptStop::Yield => Self::Yield,
+            PreemptStop::Restart => Self::Restart,
         }
     }
 

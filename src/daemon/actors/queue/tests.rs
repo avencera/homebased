@@ -18,7 +18,8 @@ use crate::home::Home;
 use crate::machine::{MachineId, load_or_create_machine_id};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
-    JobEventKind, JobId, JobState, OperationId, ResourceId, ResourceName, RunPhase, StopCause,
+    HOLD_AFTER, JobEventKind, JobId, JobState, LevelEnd, OperationId, Placement, ResourceId,
+    ResourceName, RunPhase, StopCause,
 };
 use crate::store::Store;
 use crate::store::queue::{JobRecord, NewJob};
@@ -50,7 +51,7 @@ struct Harness {
 
 impl Harness {
     fn new(threshold: &str) -> Self {
-        crate::runner::set_task_run_executable_for_tests(assert_cmd::cargo::cargo_bin("homebased"));
+        crate::runner::set_task_run_executable_for_tests(crate::test_support::homebased_binary());
         let directory = tempfile::tempdir().unwrap();
         let home = Home::resolve(Some(directory.path().join("state"))).unwrap();
         home.ensure().unwrap();
@@ -83,7 +84,7 @@ impl Harness {
 
     fn start(&mut self) {
         let log = fs::File::create(self.directory.path().join("daemon.log")).unwrap();
-        let mut command = Command::new(assert_cmd::cargo::cargo_bin("homebased"));
+        let mut command = Command::new(crate::test_support::homebased_binary());
         crate::run_env::scrub(&mut command);
         let child = command
             .args(["daemon", "serve", "--home"])
@@ -110,7 +111,7 @@ impl Harness {
             if !self.home.sock_path().exists() {
                 return false;
             }
-            Command::new(assert_cmd::cargo::cargo_bin("homebased"))
+            Command::new(crate::test_support::homebased_binary())
                 .args(["--json", "daemon", "status", "--home"])
                 .arg(self.home.root())
                 .env(
@@ -133,6 +134,21 @@ impl Harness {
 
     fn restart(&mut self) {
         self.stop();
+        self.start();
+    }
+
+    /// Move the start of `resource`'s executing run back past the hold, with
+    /// the daemon stopped so it reads the earlier start from the store
+    fn backdate_past_hold(&mut self, resource: &str) {
+        self.stop();
+        let started = Utc::now() - chrono::Duration::from_std(HOLD_AFTER).unwrap();
+        rusqlite::Connection::open(self.home.db_path())
+            .unwrap()
+            .execute(
+                "UPDATE resources SET run_started_at = ?1 WHERE id = ?2",
+                rusqlite::params![started.to_rfc3339(), self.resource(resource).to_string()],
+            )
+            .unwrap();
         self.start();
     }
 
@@ -361,6 +377,14 @@ fn wait_mode() -> Value {
     json!({"mode": "wait"})
 }
 
+fn restart_mode() -> Value {
+    json!({"mode": "restart"})
+}
+
+fn held_mode() -> Value {
+    json!({"mode": "restart", "hold": true})
+}
+
 #[test]
 fn launch_steps_failure_and_checkpoint_environment() {
     let h = Harness::new("30m");
@@ -459,7 +483,7 @@ fn yield_resumes_same_directory_without_overlap() {
 }
 
 #[test]
-fn restart_and_wait_window_preserve_run_age() {
+fn hold_keeps_only_an_old_run_and_a_manual_preempt_requeues_it_first() {
     let mut h = Harness::new("30m");
     let ready = h.path("ready");
     let body = format!(
@@ -470,7 +494,7 @@ fn restart_and_wait_window_preserve_run_age() {
     h.executing(low);
     wait(|| ready.exists());
     let first = h.task(low);
-    let high = h.submit("high", wait_mode(), &script("exit 0"), None);
+    let high = h.submit("high", restart_mode(), &script("exit 0"), None);
     h.ended(high, "succeeded");
     h.ended(low, "succeeded");
     assert_eq!(
@@ -479,60 +503,78 @@ fn restart_and_wait_window_preserve_run_age() {
     );
     assert_eq!(fs::read_to_string(&ready).unwrap(), "0:1\n0:2\n");
 
-    let early = h.submit(
-        "low",
+    // a held run younger than the hold, and a spec from an earlier release
+    // that relied on `wait`, are both preempted
+    for preempt in [
+        json!({"mode":"restart", "hold": true}),
         json!({"mode":"wait", "restart_within":"1m"}),
-        &script("if [ \"$HOMEBASED_RUN_NUMBER\" = 1 ]; then while :; do sleep 0.02; done; fi"),
-        None,
-    );
-    h.executing(early);
-    let high = h.submit("high", wait_mode(), &script("exit 0"), None);
-    h.ended(high, "succeeded");
-    h.ended(early, "succeeded");
-    assert!(h.events(early).contains(&JobEventKind::JobPreempted));
+    ] {
+        let young = h.submit(
+            "low",
+            preempt,
+            &script("if [ \"$HOMEBASED_RUN_NUMBER\" = 1 ]; then while :; do sleep 0.02; done; fi"),
+            None,
+        );
+        h.executing(young);
+        let high = h.submit("high", restart_mode(), &script("exit 0"), None);
+        h.ended(high, "succeeded");
+        h.ended(young, "succeeded");
+        assert!(h.events(young).contains(&JobEventKind::JobPreempted));
+    }
 
-    // reserve with a historical start to exercise the bound without a minute's sleep
-    h.stop();
+    // a held run past the hold, without a half-hour sleep
     let old = h.submit(
-        "low",
-        json!({"mode":"wait", "restart_within":"1m"}),
-        &script("while [ ! -e done ]; do sleep 0.02; done"),
+        "medium",
+        held_mode(),
+        &script(
+            "echo \"old $HOMEBASED_RUN_NUMBER\" >> runs; while [ ! -e done ]; do sleep 0.02; done",
+        ),
         None,
     );
-    let task = TaskId::new();
-    let resource = h.resource("gpu0");
+    h.executing(old);
+    let task = h.task(old);
+    h.backdate_past_hold("gpu0");
+
+    // a medium job moved ahead of the held one, then a high job it holds off
+    let other = h.submit(
+        "medium",
+        restart_mode(),
+        &script("echo other >> runs"),
+        None,
+    );
+    let front = Placement::Edge {
+        priority: None,
+        end: LevelEnd::Front,
+    };
     h.store()
-        .reserve_run(h.machine, old, resource, task, "/bin/sh".into(), Utc::now())
+        .move_job(h.machine, OperationId::new(), other, front)
         .unwrap();
-    let cp = h.store().run_checkpoint(task).unwrap().unwrap();
-    cp.prepare(&h.home).unwrap();
-    let lock = crate::runner::lock_before_spawn(&h.home.task_paths(task)).unwrap();
-    let pid = crate::runner::spawn_task_run(&h.home, task, lock).unwrap();
-    wait(|| h.store().require_task(task).unwrap().child.is_some());
-    // keep this fixture's historical clock in the store, not in actor memory
-    let connection = rusqlite::Connection::open(h.home.db_path()).unwrap();
-    connection
-        .execute(
-            "UPDATE resources SET run_started_at = ?1 WHERE id = ?2",
-            rusqlite::params![
-                (Utc::now() - chrono::Duration::minutes(2)).to_rfc3339(),
-                resource.to_string()
-            ],
-        )
-        .unwrap();
-    h.store().set_pid(task, pid as i32).unwrap();
-    h.start();
-    let high = h.submit("high", wait_mode(), &script("exit 0"), None);
+    let high = h.submit("high", restart_mode(), &script("echo high >> runs"), None);
     thread::sleep(Duration::from_millis(600));
     assert!(matches!(h.job(high).state, JobState::Queued { .. }));
     assert_eq!(
         h.store().require_task(task).unwrap().status(),
         ProcessStatus::Running
     );
+
+    let preempted = h
+        .store()
+        .preempt_job(h.machine, OperationId::new(), old, Utc::now())
+        .unwrap();
+    assert_eq!((preempted.task, preempted.position), (task, 1));
+    h.ended(high, "succeeded");
     fs::write(h.path("done"), "").unwrap();
     h.ended(old, "succeeded");
-    h.ended(high, "succeeded");
-    assert_eq!(h.job(old).runs, 1);
+    h.ended(other, "succeeded");
+    assert_eq!(
+        fs::read_to_string(h.path("runs")).unwrap(),
+        "old 1\nhigh\nold 2\nother\n",
+        "the high job runs first, then the preempted job ahead of its level"
+    );
+    assert_eq!(
+        h.events(old),
+        vec![JobEventKind::JobPreempted, JobEventKind::JobSucceeded]
+    );
     h.restart();
 }
 
@@ -558,17 +600,19 @@ fn cancel_active_and_queued() {
 
 #[test]
 fn two_resources_pinning_and_device_environment() {
-    let h = Harness::new("30m");
+    let mut h = Harness::new("30m");
     h.store()
         .register_resource(h.machine, ResourceName::parse("gpu1").unwrap(), Some(7))
         .unwrap();
     let low = h.submit(
         "low",
-        wait_mode(),
+        held_mode(),
         &script("while [ ! -e done ]; do sleep 0.02; done"),
         Some("gpu0"),
     );
     h.executing(low);
+    // past the hold, so the pinned high job waits for gpu0
+    h.backdate_past_hold("gpu0");
     let pin = h.submit("high", wait_mode(), &script("exit 0"), Some("gpu0"));
     let body = "test \"$HOMEBASED_RESOURCE\" = gpu1 && test \"$CUDA_VISIBLE_DEVICES\" = 7 && test \"$CUDA_DEVICE_ORDER\" = PCI_BUS_ID || exit 1; while [ ! -e done ]; do sleep 0.02; done";
     let any = h.submit("medium", wait_mode(), &script(body), None);
@@ -727,11 +771,13 @@ fn notices_fire_once_per_episode_and_survive_restart() {
     let mut h = Harness::new("500ms");
     let low = h.submit(
         "low",
-        wait_mode(),
+        held_mode(),
         &script("while :; do sleep 0.02; done"),
         None,
     );
     h.executing(low);
+    // past the hold, so it blocks the high job instead of yielding to it
+    h.backdate_past_hold("gpu0");
     let high = h.submit("high", wait_mode(), &script("exit 0"), None);
     wait(|| h.store().blocked_episode(h.machine).unwrap().is_some());
     h.stop();

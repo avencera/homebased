@@ -17,9 +17,9 @@ use crate::queue::gpu::DetectedResource;
 use crate::queue::schedule::{NoticeThresholds, QueuedState, decide};
 use crate::queue::spec::JobSpec;
 use crate::queue::{
-    ActiveRun, CleanupFailure, JobEventKind, JobId, JobState, LevelEnd, MoveRefusal, OperationId,
-    Placement, Priority, QueueError, ResourceId, ResourceName, RunPhase, Side, StepIndex,
-    StopCause, Target,
+    ActiveRun, CleanupFailure, HOLD_AFTER, JobEventKind, JobId, JobState, LevelEnd, MoveRefusal,
+    OperationId, Placement, Priority, QueueError, ResourceId, ResourceName, RunPhase, Side,
+    StepIndex, StopCause, Target,
 };
 use crate::store::Store;
 
@@ -1068,6 +1068,74 @@ fn queue_responses_decode_into_their_typed_shapes() {
 }
 
 #[test]
+fn job_reads_drop_hold_for_peers_on_an_older_protocol() {
+    use super::interface::QueueRequest;
+    use crate::fleet::protocol::{CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion};
+
+    let fixture = Fixture::new();
+    let mut held_spec = spec(Priority::Low, 1);
+    held_spec["preempt"] = json!({ "mode": "restart", "hold": true });
+    let job = fixture.submit_spec(held_spec);
+    let env = TaskEnv {
+        path: "/bin".into(),
+        home: "/tmp".into(),
+    };
+    let read = |request: QueueRequest, protocol| {
+        fixture
+            .store
+            .queue_request_at(fixture.machine, &request, &env, protocol)
+            .unwrap()
+    };
+
+    let old = ClusterProtocolVersion(6);
+    let held = json!({ "mode": "restart", "hold": true });
+    let plain = json!({ "mode": "restart" });
+    for (protocol, expected) in [(old, &plain), (CLUSTER_PROTOCOL_VERSION, &held)] {
+        let jobs = read(QueueRequest::Jobs, protocol);
+        assert_eq!(&jobs["jobs"][0]["spec"]["preempt"], expected);
+        let overview = read(QueueRequest::Overview, protocol);
+        assert_eq!(&overview["jobs"][0]["spec"]["preempt"], expected);
+        let detail = read(QueueRequest::Show { job }, protocol);
+        assert_eq!(&detail["job"]["spec"]["preempt"], expected);
+    }
+    // the stored spec and the digest it was accepted under are unchanged
+    let record = fixture.job(job);
+    assert!(record.spec.preempt.hold);
+    assert_eq!(record.digest, record.spec.digest().unwrap());
+}
+
+#[test]
+fn a_manual_preempt_joins_an_automatic_yield_and_moves_the_job_first() {
+    let fixture = Fixture::new();
+    let mut yield_spec = spec(Priority::Low, 1);
+    yield_spec["preempt"] = json!({ "mode": "yield" });
+    yield_spec["resource"] = json!("gpu0");
+    let job = fixture.submit_spec(yield_spec);
+    let ahead = fixture.submit(Priority::Low);
+    let run = fixture.start(job, "gpu0", Utc::now());
+    fixture.submit(Priority::High);
+    fixture
+        .store
+        .commit_stop(run.resource, run.task, StopCause::Yield, Utc::now())
+        .unwrap();
+
+    let result = fixture
+        .store
+        .preempt_job(fixture.machine, OperationId::new(), job, Utc::now())
+        .unwrap();
+    assert_eq!(result.task, run.task);
+    assert_eq!(result.position, 1);
+    assert!(fixture.job(ahead).position > Some(result.position));
+    assert!(matches!(
+        fixture.run_on("gpu0").unwrap().phase,
+        RunPhase::Stopping {
+            cause: StopCause::Yield,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn cancel_queued_and_terminal_jobs() {
     let fixture = Fixture::new();
     let queued = fixture.submit(Priority::Low);
@@ -1662,10 +1730,12 @@ fn preemption_rechecks_the_first_job_with_an_eligible_victim() {
         "preemption in flight",
     ] {
         let fixture = Fixture::new();
-        let mut wait_spec = spec(Priority::Low, 1);
-        wait_spec["preempt"] = json!({ "mode": "wait" });
-        let wait = fixture.submit_spec(wait_spec);
-        fixture.start(wait, "gpu0", Utc::now());
+        // a held run past the hold is never a victim
+        let mut held_spec = spec(Priority::Low, 1);
+        held_spec["preempt"] = json!({ "mode": "restart", "hold": true });
+        let held = fixture.submit_spec(held_spec);
+        let past_hold = Utc::now() - chrono::Duration::from_std(HOLD_AFTER).unwrap();
+        fixture.start(held, "gpu0", past_hold);
         let low = fixture.submit(Priority::Low);
         let victim = fixture.start(low, "gpu1", Utc::now());
         let mut pinned_spec = spec(Priority::High, 1);

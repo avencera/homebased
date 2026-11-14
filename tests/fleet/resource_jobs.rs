@@ -53,7 +53,7 @@ fn spec(origin: &Daemon, executor: &Daemon, script: &str) -> Value {
     let thread = ThreadId(uuid::Uuid::now_v7());
     register_thread(&origin.user_home, &thread.to_string());
     json!({ "api_version": 1, "thread": thread, "machine": "remote-executor", "name": "Fleet job",
-        "cwd": executor.home, "priority": "medium", "preempt": { "mode": "wait" },
+        "cwd": executor.home, "priority": "medium", "preempt": { "mode": "restart" },
         "resource": "gpu0", "workload": { "type": "task", "command": ["/bin/sh", "-c", script] } })
 }
 
