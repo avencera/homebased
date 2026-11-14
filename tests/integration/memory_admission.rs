@@ -148,7 +148,7 @@ fn memory_admission_serves_in_order_and_holds_room_for_started_and_waiting_work(
     );
 
     // work without a peak is not gated
-    let plain = h.submit(&Harness::task_spec(&["/bin/true"]));
+    let plain = h.submit(&Harness::task_spec(&["true"]));
     h.wait_status(&plain, "succeeded");
     assert_eq!(task(&h, &small)["status"], "held");
 
