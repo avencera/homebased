@@ -10,7 +10,7 @@ use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::fleet::protocol::{
     CI_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, GPU_IDLE_PROTOCOL,
-    SUPPORTED_PROTOCOLS,
+    PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
 use crate::queue::ci::{ClassOffer, Drain, JobClass, JobTiming, MachineOffer, SlotCapacity};
@@ -91,6 +91,14 @@ pub enum QueueRequest {
         /// Job to cancel
         job: JobId,
     },
+    /// Idempotent manual preempt: restart the job's run and move it to the
+    /// front of its level; cluster protocol 7 and later
+    Preempt {
+        /// Operation replay identity
+        operation: OperationId,
+        /// Running job to preempt
+        job: JobId,
+    },
     /// Release an exact Attention, never a later run
     Release {
         /// Operation replay identity
@@ -137,6 +145,7 @@ impl QueueRequest {
     pub fn min_protocol(&self) -> ClusterProtocolVersion {
         match self {
             Self::GpuIdle { .. } => GPU_IDLE_PROTOCOL,
+            Self::Preempt { .. } => PREEMPT_PROTOCOL,
             Self::CiStatus
             | Self::CiCapacity { .. }
             | Self::CiDrain { .. }
@@ -149,16 +158,43 @@ impl QueueRequest {
 
 /// Lowest cluster protocol whose authorities accept `spec`
 ///
-/// An older authority refuses a spec with `gpu_idle` or `ci` as an unknown
-/// field
+/// An older authority refuses a spec with `hold`, `gpu_idle`, or `ci` as an
+/// unknown field
 #[must_use]
 pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
-    if spec.ci.is_some() {
+    if spec.preempt.hold {
+        PREEMPT_PROTOCOL
+    } else if spec.ci.is_some() {
         CI_PROTOCOL
     } else if spec.gpu_idle.is_some() {
         GPU_IDLE_PROTOCOL
     } else {
         SUPPORTED_PROTOCOLS.min()
+    }
+}
+
+/// Drop the spec fields a requester on `protocol` cannot decode from job reads
+///
+/// A peer on an older release refuses unknown keys in `preempt`, so one held
+/// job would fail its whole queue listing. Only the response changes; the
+/// stored spec and its digest stay as accepted, and reads never check the digest
+fn downgrade_specs(result: &mut Value, protocol: ClusterProtocolVersion) {
+    if protocol >= PREEMPT_PROTOCOL {
+        return;
+    }
+    let drop_hold = |job: &mut Value| {
+        if let Some(preempt) = job
+            .pointer_mut("/spec/preempt")
+            .and_then(Value::as_object_mut)
+        {
+            preempt.remove("hold");
+        }
+    };
+    if let Some(jobs) = result.get_mut("jobs").and_then(Value::as_array_mut) {
+        jobs.iter_mut().for_each(drop_hold);
+    }
+    if let Some(job) = result.get_mut("job") {
+        drop_hold(job);
     }
 }
 
@@ -436,6 +472,12 @@ impl Store {
                 *job,
                 chrono::Utc::now(),
             )?)?,
+            QueueRequest::Preempt { operation, job } => serde_json::to_value(self.preempt_job(
+                machine,
+                *operation,
+                *job,
+                chrono::Utc::now(),
+            )?)?,
             QueueRequest::Release {
                 operation,
                 attention,
@@ -475,6 +517,7 @@ impl Store {
                 timings: self.ci_timings(*since)?,
             })?,
         };
+        downgrade_specs(&mut result, protocol);
         if let Some(object) = result.as_object_mut() {
             object.insert("api_version".into(), json!(API_VERSION));
         }

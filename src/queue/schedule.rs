@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use crate::domain::TaskId;
 
 use super::{
-    ActiveRun, AttentionId, JobId, PreemptStop, Preemption, Priority, ResourceId, ResourceName,
-    RunPhase, StopCause, Target,
+    ActiveRun, AttentionId, JobId, PreemptRefusal, PreemptStop, Preemption, Priority, ResourceId,
+    ResourceName, RunPhase, StopCause, Target,
 };
 
 /// One resource and its active run, if any
@@ -239,6 +239,73 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
         preemption,
         blocked,
     }
+}
+
+/// Stop `job`'s executing run by hand, whatever its preemption mode, so a
+/// waiting job of a higher level takes its resource
+///
+/// An executing run is killed and its current step runs again from the start
+/// when the job resumes. A run already stopping for automatic preemption keeps
+/// that stop, so a yielding run still checkpoints. The caller moves the job to the
+/// front of its level, so it runs again before every other job of that level.
+/// Refused unless some queued job of a strictly higher level may use the
+/// resource, since the job would otherwise win it straight back and the kill
+/// would only throw away the step's progress
+pub fn manual_preempt(snapshot: &Snapshot, job: JobId) -> Result<Preempt, PreemptRefusal> {
+    // CI jobs live in their own pools, outside this snapshot
+    let view = snapshot
+        .queue
+        .iter()
+        .find(|view| view.id == job)
+        .ok_or(PreemptRefusal::Ci)?;
+    let QueuedState::Active(resource) = view.state else {
+        return Err(PreemptRefusal::NotRunning);
+    };
+    let run = snapshot
+        .resources
+        .iter()
+        .find(|view| view.id == resource)
+        .and_then(|view| view.run.as_ref())
+        .filter(|run| run.job == job)
+        .ok_or(PreemptRefusal::NotRunning)?;
+    // an automatic stop may have committed first; joining it keeps its cause,
+    // so a yielding run still checkpoints, and only the move to the front is
+    // added. Turning that yield into a kill would race a run that already exits
+    // 75, which classifies as a failure under `Restart`
+    let cause = match run.phase {
+        RunPhase::Executing { .. } => StopCause::Restart,
+        RunPhase::Stopping {
+            cause: cause @ (StopCause::Yield | StopCause::Restart),
+            ..
+        } => cause,
+        RunPhase::Launching { .. } => return Err(PreemptRefusal::Launching),
+        RunPhase::Stopping {
+            cause: StopCause::UserCancel,
+            ..
+        } => return Err(PreemptRefusal::Cancelling),
+        RunPhase::Cleaning { .. } | RunPhase::Attention { .. } => {
+            return Err(PreemptRefusal::NotRunning);
+        }
+    };
+
+    // a job still cleaning up an earlier run cannot take the resource yet
+    let higher_waits = snapshot.queue.iter().any(|waiting| {
+        startable(snapshot, waiting)
+            && waiting.priority > view.priority
+            && waiting.target.allows(resource)
+    });
+    if !higher_waits {
+        return Err(PreemptRefusal::NothingWaiting {
+            level: view.priority,
+        });
+    }
+
+    Ok(Preempt {
+        resource,
+        job,
+        task: run.task,
+        cause,
+    })
 }
 
 /// A queued job whose previous run has finished its cleanup

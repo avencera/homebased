@@ -136,6 +136,22 @@ pub enum JobCommand {
         #[command(flatten)]
         machine: MachineArgs,
     },
+    /// Kill a running job's run and requeue it at the front of its level
+    ///
+    /// Works whatever the job's preempt mode, so a `hold` job past 30 minutes
+    /// can make way for higher-priority work. The current step runs again from the start;
+    /// completed steps do not. Refused unless a waiting job of a higher level
+    /// can use the freed resource
+    Preempt {
+        /// Job UUID
+        job: JobId,
+        /// Replay identity; generated once when omitted
+        #[arg(long)]
+        operation_id: Option<OperationId>,
+        /// Queue authority when submitted from another origin
+        #[command(flatten)]
+        machine: MachineArgs,
+    },
     /// Snooze, turn off, or restore a job's GPU idle alerts
     ///
     /// Alerts only notify; they never stop the job. The latest control wins
@@ -334,6 +350,20 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             .await?;
             print_result(ctx, &value, "cancel requested for", &job.to_string())
         }
+        JobCommand::Preempt {
+            job,
+            operation_id,
+            machine,
+        } => {
+            let operation_id = operation_id.unwrap_or_default();
+            let value = post_retry(
+                client,
+                &path(&format!("/v1/resource/jobs/{job}/preempt"), &machine),
+                &json!({ "operation_id": operation_id }),
+            )
+            .await?;
+            print_result(ctx, &value, "preempt requested for", &job.to_string())
+        }
         JobCommand::GpuIdle(args) => {
             let control = args.control();
             control
@@ -403,7 +433,7 @@ pub(super) async fn submit_value(
     // a build holds the GPU idle while other jobs wait; refuse it before
     // anything is sent, unless the submitter says the build needs the GPU
     // CI slots are where builds belong
-    let warnings = if spec.ci.is_some() {
+    let mut warnings = if spec.ci.is_some() {
         Vec::new()
     } else {
         build_warnings(&spec)
@@ -418,6 +448,8 @@ pub(super) async fn submit_value(
             ),
         });
     }
+    // advice only, never a refusal
+    warnings.extend(spec.legacy_preempt_warning());
     let body = json!({
         "job_id": job_id,
         "spec": spec,
@@ -626,7 +658,7 @@ fn lease_note_lines(note: &JobLeaseNote, now: chrono::DateTime<chrono::Utc>) -> 
         let minutes = (now - requested).num_minutes();
         lines.push(format!(
             "yield requested {minutes}m ago and the step is still running: it may not poll \
-             HOMEBASED_YIELD_FILE; fix the step or submit it with preempt `wait`"
+             HOMEBASED_YIELD_FILE; fix the step or submit it with preempt `restart`"
         ));
     }
     lines

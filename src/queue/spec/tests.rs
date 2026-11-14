@@ -6,7 +6,9 @@ use tempfile::tempdir;
 
 use super::{JobSpec, schema_json};
 use crate::error::AppError;
-use crate::queue::{Preemption, Priority, ResourceSelector, RestartWindow, StepWorkload};
+use crate::queue::{
+    PreemptMode, Preemption, Priority, ResourceSelector, RestartWindow, StepWorkload,
+};
 
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -73,10 +75,11 @@ fn a_two_step_spec_parses() {
     assert_eq!(spec.priority, Priority::Medium);
     assert_eq!(
         spec.preempt,
-        Preemption::Yield {
+        Preemption {
             restart_within: Some(
                 RestartWindow::try_from(std::time::Duration::from_secs(300)).unwrap()
-            )
+            ),
+            ..Preemption::new(PreemptMode::Yield)
         }
     );
     assert_eq!(spec.steps.count(), 2);

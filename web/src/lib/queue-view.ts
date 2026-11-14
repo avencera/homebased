@@ -127,10 +127,13 @@ export function stopCauseLabel(cause: StopCause): string {
 	}
 }
 
-/** Preemption mode and restart window, such as `yield · restart 5m`. */
+/**
+ * How the run stops for higher-priority work, such as `yield · hold`. A `wait` spec stops like
+ * `restart`, so it shows as one.
+ */
 export function preemptionLabel(preempt: Preemption): string {
-	if (preempt.mode === 'restart' || !preempt.restart_within) return preempt.mode;
-	return `${preempt.mode} · restart ${preempt.restart_within}`;
+	const stop = preempt.mode === 'yield' ? 'yield' : 'restart';
+	return preempt.hold ? `${stop} · hold` : stop;
 }
 
 /** Resource name of a target, `any` for an unpinned job. */

@@ -340,6 +340,26 @@ impl Harness {
         assert_eq!(n, 1, "backdate missed task {id}");
     }
 
+    /// Make the run on resource `name` look older than `HOLD_AFTER`, so a held
+    /// job keeps the resource; the next decision reads the stored start
+    ///
+    /// The run's script can start before its launch commits a start time, so
+    /// this waits for one
+    fn backdate_run_past_hold(&self, name: &str) {
+        let started = Utc::now() - ChronoDuration::from_std(homebased::queue::HOLD_AFTER).unwrap();
+        let started = started.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let conn = rusqlite::Connection::open(self.home.join(homebased::home::DB_NAME)).unwrap();
+        let backdated = wait_until(Duration::from_secs(10), || {
+            conn.execute(
+                "UPDATE resources SET run_started_at = ?1 WHERE name = ?2 AND run_started_at IS NOT NULL",
+                rusqlite::params![started, name],
+            )
+            .unwrap()
+                == 1
+        });
+        assert!(backdated, "no started run on {name} to backdate");
+    }
+
     fn output_log(&self, id: &str) -> PathBuf {
         self.home.join("tasks").join(id).join("output.log")
     }

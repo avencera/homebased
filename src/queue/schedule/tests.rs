@@ -4,13 +4,14 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
     Blocker, JobView, Launch, NoticeThresholds, Preempt, QueuedState, ResourceView, Snapshot,
-    StoredEpisode, decide,
+    StoredEpisode, decide, manual_preempt,
 };
 use crate::cleanup::CleanupFailure as ProcessCleanupFailure;
 use crate::domain::TaskId;
 use crate::queue::{
-    ActiveRun, AttentionId, CleanupFailure, JobId, Preemption, Priority, ResourceId, ResourceName,
-    RestartWindow, RunNumber, RunPhase, StepIndex, StopCause, Target,
+    ActiveRun, AttentionId, CleanupFailure, HOLD_AFTER, JobId, PreemptMode, PreemptRefusal,
+    Preemption, Priority, ResourceId, ResourceName, RunNumber, RunPhase, StepIndex, StopCause,
+    Target,
 };
 
 fn t0() -> DateTime<Utc> {
@@ -21,15 +22,14 @@ fn at(seconds: i64) -> DateTime<Utc> {
     t0() + chrono::Duration::seconds(seconds)
 }
 
-const YIELD: Preemption = Preemption::Yield {
-    restart_within: None,
-};
-const WAIT: Preemption = Preemption::Wait {
-    restart_within: None,
-};
+const YIELD: Preemption = Preemption::new(PreemptMode::Yield);
+const RESTART: Preemption = Preemption::new(PreemptMode::Restart);
+/// Keeps its resource once its run is `HOLD_AFTER` old
+const HELD: Preemption = Preemption::new(PreemptMode::Restart).held();
 
-fn window(minutes: u64) -> Option<RestartWindow> {
-    Some(RestartWindow::try_from(Duration::from_secs(minutes * 60)).unwrap())
+/// A start long enough before `t0` that a `HELD` run keeps its resource
+fn past_hold() -> DateTime<Utc> {
+    t0() - chrono::Duration::from_std(HOLD_AFTER).unwrap()
 }
 
 /// A test machine: resources by name and jobs in serving order
@@ -159,7 +159,7 @@ fn two_resources_run_two_jobs() {
 #[test]
 fn an_any_job_takes_the_free_resource_with_the_lowest_name() {
     let mut machine = Machine::new(&["gpu2", "gpu0", "gpu1"]);
-    machine.running("gpu0", Priority::Low, WAIT, executing(t0()));
+    machine.running("gpu0", Priority::Low, HELD, executing(t0()));
     let job = machine.queued(Priority::Low, Target::Any, YIELD);
     let decisions = decide(&machine.snapshot(t0()));
     assert_eq!(
@@ -174,7 +174,7 @@ fn an_any_job_takes_the_free_resource_with_the_lowest_name() {
 #[test]
 fn a_pinned_job_waits_while_an_any_job_behind_it_starts_elsewhere() {
     let mut machine = Machine::new(&["gpu0", "gpu1"]);
-    machine.running("gpu0", Priority::Medium, WAIT, executing(t0()));
+    machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
     let pinned = machine.queued(
         Priority::Medium,
         Target::Pinned(machine.resource("gpu0")),
@@ -277,7 +277,7 @@ fn victims_go_lowest_level_then_cheapest_stop_then_most_recent_start() {
         Case {
             name: "lowest level first",
             runs: vec![
-                ("gpu0", Priority::Medium, Preemption::Restart, at(0)),
+                ("gpu0", Priority::Medium, RESTART, at(0)),
                 ("gpu1", Priority::Low, YIELD, at(0)),
             ],
             victim: "gpu1",
@@ -287,23 +287,16 @@ fn victims_go_lowest_level_then_cheapest_stop_then_most_recent_start() {
             name: "restart mode before yield at one level",
             runs: vec![
                 ("gpu0", Priority::Low, YIELD, at(3000)),
-                ("gpu1", Priority::Low, Preemption::Restart, at(0)),
+                ("gpu1", Priority::Low, RESTART, at(0)),
             ],
             victim: "gpu1",
             cause: StopCause::Restart,
         },
         Case {
-            name: "inside a restart window before yield",
+            name: "a held run younger than the hold restarts before yield",
             runs: vec![
                 ("gpu0", Priority::Low, YIELD, at(3500)),
-                (
-                    "gpu1",
-                    Priority::Low,
-                    Preemption::Wait {
-                        restart_within: window(10),
-                    },
-                    at(3300),
-                ),
+                ("gpu1", Priority::Low, HELD, at(3300)),
             ],
             victim: "gpu1",
             cause: StopCause::Restart,
@@ -319,9 +312,9 @@ fn victims_go_lowest_level_then_cheapest_stop_then_most_recent_start() {
             cause: StopCause::Yield,
         },
         Case {
-            name: "a wait run outside its window is never chosen",
+            name: "a held run past the hold is never chosen",
             runs: vec![
-                ("gpu0", Priority::Low, WAIT, at(3599)),
+                ("gpu0", Priority::Low, HELD, at(0)),
                 ("gpu1", Priority::Medium, YIELD, at(0)),
             ],
             victim: "gpu1",
@@ -350,68 +343,140 @@ fn victims_go_lowest_level_then_cheapest_stop_then_most_recent_start() {
 }
 
 #[test]
-fn equal_levels_never_preempt_and_wait_runs_outside_a_window_are_left_alone() {
+fn equal_levels_never_preempt_and_held_runs_past_the_hold_are_left_alone() {
     let mut machine = Machine::new(&["gpu0"]);
-    machine.running("gpu0", Priority::High, Preemption::Restart, executing(t0()));
+    machine.running("gpu0", Priority::High, RESTART, executing(t0()));
     machine.queued(Priority::High, Target::Any, YIELD);
     assert_eq!(decide(&machine.snapshot(at(10))).preemption, None);
 
     let mut machine = Machine::new(&["gpu0"]);
-    machine.running("gpu0", Priority::Low, WAIT, executing(t0()));
+    machine.running("gpu0", Priority::Low, HELD, executing(past_hold()));
     machine.queued(Priority::High, Target::Any, YIELD);
     let decisions = decide(&machine.snapshot(at(10)));
     assert_eq!(decisions.preemption, None);
     assert_eq!(
         decisions.blocked.unwrap().threshold,
         Duration::from_secs(30 * 60),
-        "behind a wait run the longer threshold applies"
+        "behind a held run the longer threshold applies"
     );
 }
 
 #[test]
-fn restart_window_decisions_before_at_and_after_the_bound() {
+fn a_manual_preempt_restarts_a_held_run_only_for_higher_waiting_work() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let (fiber, task) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    machine.running("gpu1", Priority::Low, HELD, executing(t0()));
+    let now = at(3600);
+
+    // nothing higher waits, so the job would only win its resource back
+    let refused = Err(PreemptRefusal::NothingWaiting {
+        level: Priority::Medium,
+    });
+    assert_eq!(manual_preempt(&machine.snapshot(now), fiber), refused);
+    machine.queued(Priority::Medium, Target::Any, YIELD);
+    assert_eq!(manual_preempt(&machine.snapshot(now), fiber), refused);
+    let gpu1 = machine.resource("gpu1");
+    machine.queued(Priority::High, Target::Pinned(gpu1), YIELD);
+    assert_eq!(
+        manual_preempt(&machine.snapshot(now), fiber),
+        refused,
+        "a high job pinned elsewhere cannot use the freed resource"
+    );
+
+    let urgent = machine.queued(Priority::High, Target::Any, YIELD);
+    let snapshot = machine.snapshot(now);
+    assert_eq!(
+        decide(&snapshot).preemption,
+        None,
+        "a held run past the hold is never preempted automatically"
+    );
+    assert_eq!(
+        manual_preempt(&snapshot, fiber),
+        Ok(Preempt {
+            resource: machine.resource("gpu0"),
+            job: fiber,
+            task,
+            cause: StopCause::Restart,
+        })
+    );
+    assert_eq!(
+        manual_preempt(&snapshot, urgent),
+        Err(PreemptRefusal::NotRunning)
+    );
+    assert_eq!(
+        manual_preempt(&snapshot, JobId::new()),
+        Err(PreemptRefusal::Ci),
+        "a job outside the GPU pool is a CI job"
+    );
+
+    let gpu0 = machine.resource("gpu0");
+    machine.set_run(gpu0, fiber, task, RunPhase::Launching { reserved_at: t0() });
+    assert_eq!(
+        manual_preempt(&machine.snapshot(now), fiber),
+        Err(PreemptRefusal::Launching)
+    );
+    let stopping = RunPhase::Stopping {
+        started_at: Some(t0()),
+        cause: StopCause::UserCancel,
+        requested_at: at(60),
+    };
+    machine.set_run(gpu0, fiber, task, stopping);
+    assert_eq!(
+        manual_preempt(&machine.snapshot(now), fiber),
+        Err(PreemptRefusal::Cancelling)
+    );
+
+    // an automatic yield that committed first is joined as a yield
+    let yielding = RunPhase::Stopping {
+        started_at: Some(t0()),
+        cause: StopCause::Yield,
+        requested_at: at(60),
+    };
+    machine.set_run(gpu0, fiber, task, yielding);
+    assert_eq!(
+        manual_preempt(&machine.snapshot(now), fiber).map(|stop| stop.cause),
+        Ok(StopCause::Yield)
+    );
+}
+
+#[test]
+fn a_manual_preempt_waits_for_higher_work_that_can_start() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let (fiber, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    let urgent = machine.queued(Priority::High, Target::Any, YIELD);
+    let gpu1 = machine.resource("gpu1");
+    machine.set_run(
+        gpu1,
+        urgent,
+        TaskId::new(),
+        RunPhase::Cleaning { attempt: 1 },
+    );
+
+    // the high job still cleans up its earlier run, so it could not take gpu0
+    assert_eq!(
+        manual_preempt(&machine.snapshot(at(60)), fiber),
+        Err(PreemptRefusal::NothingWaiting {
+            level: Priority::Medium
+        })
+    );
+}
+
+#[test]
+fn hold_decisions_before_at_and_after_the_bound() {
+    let bound = i64::try_from(HOLD_AFTER.as_secs()).unwrap();
     for (preempt, age, expected) in [
+        (HELD, bound - 1, Some(StopCause::Restart)),
+        (HELD, bound, None),
+        (HELD, bound + 1, None),
+        (YIELD.held(), bound - 1, Some(StopCause::Yield)),
+        (YIELD.held(), bound, None),
+        (RESTART, bound * 10, Some(StopCause::Restart)),
+        (YIELD, bound * 10, Some(StopCause::Yield)),
+        // `wait` from an earlier release stops like restart at any age
         (
-            Preemption::Wait {
-                restart_within: window(5),
-            },
-            299,
+            Preemption::new(PreemptMode::Wait),
+            bound * 10,
             Some(StopCause::Restart),
-        ),
-        (
-            Preemption::Wait {
-                restart_within: window(5),
-            },
-            300,
-            None,
-        ),
-        (
-            Preemption::Wait {
-                restart_within: window(5),
-            },
-            301,
-            None,
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window(5),
-            },
-            299,
-            Some(StopCause::Restart),
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window(5),
-            },
-            300,
-            Some(StopCause::Yield),
-        ),
-        (
-            Preemption::Yield {
-                restart_within: window(5),
-            },
-            301,
-            Some(StopCause::Yield),
         ),
     ] {
         let mut machine = Machine::new(&["gpu0"]);
@@ -441,7 +506,7 @@ fn at_most_one_preemption_is_in_flight_for_the_head() {
             requested_at: at(60),
         },
     );
-    machine.running("gpu1", Priority::Low, Preemption::Restart, executing(t0()));
+    machine.running("gpu1", Priority::Low, RESTART, executing(t0()));
     machine.queued(Priority::High, Target::Any, YIELD);
     let decisions = decide(&machine.snapshot(at(120)));
     assert_eq!(decisions.preemption, None);
@@ -456,8 +521,8 @@ fn at_most_one_preemption_is_in_flight_for_the_head() {
 #[test]
 fn preemption_looks_only_at_the_heads_allowed_resources() {
     let mut machine = Machine::new(&["gpu0", "gpu1"]);
-    machine.running("gpu0", Priority::Medium, WAIT, executing(t0()));
-    machine.running("gpu1", Priority::Low, Preemption::Restart, executing(t0()));
+    machine.running("gpu0", Priority::Medium, HELD, executing(past_hold()));
+    machine.running("gpu1", Priority::Low, RESTART, executing(t0()));
     let head = machine.queued(
         Priority::High,
         Target::Pinned(machine.resource("gpu0")),
@@ -484,17 +549,17 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
     }
     let cases = [
         Case {
-            name: "pinned wait head does not block a later any job's restart",
-            head_run: WAIT,
-            other_run: Preemption::Restart,
+            name: "pinned held head does not block a later any job's restart",
+            head_run: HELD,
+            other_run: RESTART,
             other_priority: Priority::Low,
             stopping: None,
             any_target: true,
             victim: Some(("gpu1", StopCause::Restart)),
         },
         Case {
-            name: "pinned wait head does not block a later any job's yield",
-            head_run: WAIT,
+            name: "pinned held head does not block a later any job's yield",
+            head_run: HELD,
             other_run: YIELD,
             other_priority: Priority::Low,
             stopping: None,
@@ -504,7 +569,7 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
         Case {
             name: "head wins even when the later job has a cheaper lower level victim",
             head_run: YIELD,
-            other_run: Preemption::Restart,
+            other_run: RESTART,
             other_priority: Priority::Low,
             stopping: None,
             any_target: true,
@@ -512,8 +577,8 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
         },
         Case {
             name: "equal levels never preempt",
-            head_run: WAIT,
-            other_run: Preemption::Restart,
+            head_run: HELD,
+            other_run: RESTART,
             other_priority: Priority::High,
             stopping: None,
             any_target: true,
@@ -522,7 +587,7 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
         Case {
             name: "yield in flight outside queued targets blocks another preemption",
             head_run: YIELD,
-            other_run: Preemption::Restart,
+            other_run: RESTART,
             other_priority: Priority::Low,
             stopping: Some(StopCause::Yield),
             any_target: false,
@@ -531,7 +596,7 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
         Case {
             name: "restart in flight outside queued targets blocks another preemption",
             head_run: YIELD,
-            other_run: Preemption::Restart,
+            other_run: RESTART,
             other_priority: Priority::Low,
             stopping: Some(StopCause::Restart),
             any_target: false,
@@ -540,7 +605,7 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
         Case {
             name: "user cancellation is not a preemption in flight",
             head_run: YIELD,
-            other_run: Preemption::Restart,
+            other_run: RESTART,
             other_priority: Priority::Low,
             stopping: Some(StopCause::UserCancel),
             any_target: false,
@@ -549,16 +614,17 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
     ];
     for case in cases {
         let mut machine = Machine::new(&["gpu0", "gpu1", "gpu2"]);
-        machine.running("gpu0", Priority::Medium, case.head_run, executing(t0()));
+        let head_started = executing(past_hold());
+        machine.running("gpu0", Priority::Medium, case.head_run, head_started);
         machine.running("gpu1", case.other_priority, case.other_run, executing(t0()));
         let phase = case
             .stopping
-            .map_or(executing(t0()), |cause| RunPhase::Stopping {
+            .map_or(executing(past_hold()), |cause| RunPhase::Stopping {
                 started_at: Some(t0()),
                 cause,
                 requested_at: at(30),
             });
-        machine.running("gpu2", Priority::Low, WAIT, phase);
+        machine.running("gpu2", Priority::Low, HELD, phase);
         let head = machine.queued(
             Priority::High,
             Target::Pinned(machine.resource("gpu0")),
@@ -605,7 +671,7 @@ fn preemption_serves_the_first_queued_job_with_an_eligible_victim() {
 #[test]
 fn blocked_notice_timing_follows_the_stored_episode() {
     let mut machine = Machine::new(&["gpu0"]);
-    machine.running("gpu0", Priority::Low, WAIT, executing(t0()));
+    machine.running("gpu0", Priority::Low, HELD, executing(past_hold()));
     let head = machine.queued(Priority::High, Target::Any, YIELD);
 
     // a new head starts an episode now
@@ -659,7 +725,7 @@ fn blocked_notice_timing_follows_the_stored_episode() {
 #[test]
 fn waiting_behind_an_equal_or_higher_run_never_falls_due() {
     let mut machine = Machine::new(&["gpu0", "gpu1"]);
-    let (running, task) = machine.running("gpu0", Priority::Medium, WAIT, executing(t0()));
+    let (running, task) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
     machine.set_run(
         machine.resource("gpu1"),
         JobId::new(),

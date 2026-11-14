@@ -4,7 +4,7 @@
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
 	import Check from '@lucide/svelte/icons/check';
 	import Ellipsis from '@lucide/svelte/icons/ellipsis';
-	import { cancelJob, moveJob, type JobRecord, type Placement } from '$lib/api';
+	import { cancelJob, moveJob, preemptJob, type JobRecord, type Placement } from '$lib/api';
 	import type { QueueControl } from '$lib/daemon.svelte';
 	import { PRIORITIES, nudgePlacement, type LevelGroup } from '$lib/queue-view';
 	import { cn } from '$lib/utils';
@@ -21,12 +21,19 @@
 	let { job, control, groups, class: className }: Props = $props();
 
 	let confirmingCancel = $state(false);
+	let confirmingPreempt = $state(false);
+	// CI jobs are never preempted, so only a running GPU job offers it
+	const preemptable = $derived(job.state.state === 'active' && !job.spec.ci);
 	const busy = $derived(control.pending !== null);
 	const up = $derived(groups ? nudgePlacement(groups, job.id, 'up') : null);
 	const down = $derived(groups ? nudgePlacement(groups, job.id, 'down') : null);
 
 	function move(placement: Placement) {
 		void control.run(job.id, (operationId) => moveJob(job.id, job.machine, operationId, placement));
+	}
+
+	function preempt() {
+		void control.run(job.id, (operationId) => preemptJob(job.id, job.machine, operationId));
 	}
 
 	function cancel() {
@@ -110,6 +117,14 @@
 					{/each}
 				</DropdownMenu.Group>
 				<DropdownMenu.Separator class="my-1 h-px bg-border" />
+				{#if preemptable}
+					<DropdownMenu.Item
+						class={cn(item, 'text-amber-700 dark:text-amber-300')}
+						onSelect={() => (confirmingPreempt = true)}
+					>
+						Preempt…
+					</DropdownMenu.Item>
+				{/if}
 				<DropdownMenu.Item
 					class={cn(item, 'text-red-700 dark:text-red-300')}
 					onSelect={() => (confirmingCancel = true)}
@@ -132,4 +147,15 @@
 	{:else}
 		The job leaves the queue.
 	{/if}
+</ConfirmDialog>
+
+<ConfirmDialog
+	bind:open={confirmingPreempt}
+	title={`Preempt ${job.spec.name}?`}
+	confirmLabel="Preempt job"
+	onConfirm={preempt}
+>
+	The running step is killed and the job goes back to the front of {job.priority}. The waiting
+	higher-priority job takes its resource, and this job runs again next, from the start of the step
+	it was on. Completed steps do not run again.
 </ConfirmDialog>

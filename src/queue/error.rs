@@ -118,6 +118,14 @@ pub enum QueueError {
         /// Why the placement was refused
         reason: MoveRefusal,
     },
+    /// A manual preempt was refused
+    #[error("cannot preempt job {job}: {reason}")]
+    PreemptRefused {
+        /// Job named by the preempt
+        job: JobId,
+        /// Why its run cannot be stopped for other work now
+        reason: PreemptRefusal,
+    },
     /// No resource with this name or id on the machine
     #[error("resource not found: {resource}")]
     ResourceNotFound {
@@ -220,6 +228,35 @@ pub enum MoveRefusal {
     },
 }
 
+/// Why a manual preempt was refused
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, thiserror::Error)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreemptRefusal {
+    /// The job waits in the queue; it holds no resource to free
+    #[error("it is not running")]
+    NotRunning,
+    /// The run has not started its command yet
+    #[error("its run is still launching; try again once it is executing")]
+    Launching,
+    /// The run is already being cancelled
+    #[error("its run is already being cancelled")]
+    Cancelling,
+    /// CI jobs never preempt each other
+    #[error("it is a CI job, and CI jobs are never preempted")]
+    Ci,
+    /// No waiting job of a higher level may use its resource, so the job
+    /// would win it back at once and the kill would only throw away the
+    /// current step's progress
+    #[error(
+        "no waiting job of a higher level than {level} can use its resource; raise the waiting \
+         job's priority first"
+    )]
+    NothingWaiting {
+        /// The job's level
+        level: Priority,
+    },
+}
+
 impl QueueError {
     /// The public code of a refusal; `None` for an internal error
     #[must_use]
@@ -239,6 +276,7 @@ impl QueueError {
             Self::JobConflict { .. } => Some(QueueCode::JobConflict),
             Self::OperationConflict { .. } => Some(QueueCode::OperationConflict),
             Self::MoveRefused { .. } => Some(QueueCode::MoveRefused),
+            Self::PreemptRefused { .. } => Some(QueueCode::PreemptRefused),
             Self::ResourceNotFound { .. } => Some(QueueCode::ResourceNotFound),
             Self::ResourceNameTaken { .. } | Self::DeviceTaken { .. } => {
                 Some(QueueCode::ResourceConflict)
@@ -301,6 +339,7 @@ impl QueueError {
             Self::JobTerminal { job, state } => json!({ "job": job, "state": state }),
             Self::OperationConflict { operation } => json!({ "operation": operation }),
             Self::MoveRefused { job, reason } => json!({ "job": job, "reason": reason }),
+            Self::PreemptRefused { job, reason } => json!({ "job": job, "reason": reason }),
             Self::ResourceNotFound { resource } => json!({ "resource": resource }),
             Self::ResourceNameTaken { name } => json!({ "name": name }),
             Self::DeviceTaken { device, resource } => {
@@ -333,6 +372,8 @@ pub enum QueueCode {
     OperationConflict,
     /// Invalid placement
     MoveRefused,
+    /// The run cannot be preempted by hand now
+    PreemptRefused,
     /// Missing resource
     ResourceNotFound,
     /// Resource name or device already registered
@@ -356,6 +397,7 @@ impl QueueCode {
             Self::JobConflict => "job_conflict",
             Self::OperationConflict => "operation_conflict",
             Self::MoveRefused => "move_refused",
+            Self::PreemptRefused => "preempt_refused",
             Self::ResourceNotFound => "resource_not_found",
             Self::ResourceConflict => "resource_conflict",
             Self::AttentionNotFound => "attention_not_found",
@@ -377,7 +419,8 @@ impl QueueCode {
             | Self::JobConflict
             | Self::OperationConflict
             | Self::ResourceConflict
-            | Self::StaleRun => 5,
+            | Self::StaleRun
+            | Self::PreemptRefused => 5,
         }
     }
 }

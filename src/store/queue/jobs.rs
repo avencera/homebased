@@ -8,17 +8,18 @@ use rusqlite::{OptionalExtension, params};
 
 use super::rows::{JOB_SELECT, RawJob};
 use super::{
-    CancelResult, JobAccepted, JobRecord, MoveResult, NewJob, ReleaseResult, SERVING_ORDER,
-    corrupt, failed_run, parse_uuid,
+    CancelResult, JobAccepted, JobRecord, MoveResult, NewJob, PreemptResult, ReleaseResult,
+    SERVING_ORDER, corrupt, failed_run, parse_uuid,
 };
 use crate::domain::{ExitReason, TaskEnv};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
+use crate::queue::schedule::{NoticeThresholds, manual_preempt};
 use crate::queue::{
     AttentionId, BlockedNotice, EventRun, JobEvent, JobEventKind, JobId, JobState, LevelEnd,
-    MoveRefusal, OperationId, Placement, Priority, QueueError, ResourceId, Side, StopCause, Target,
-    sha256_hex,
+    MoveRefusal, OperationId, Placement, PreemptRefusal, Priority, QueueError, ResourceId, Side,
+    StopCause, Target, sha256_hex,
 };
 use crate::store::{Store, fmt_time};
 
@@ -401,6 +402,70 @@ impl Store {
                 })
             }
         }
+    }
+
+    /// Preempt a running job by hand, whatever its preemption mode
+    ///
+    /// In one transaction this commits `Stopping { Restart }` for the job's
+    /// executing run and moves the job to the front of its level. The queue
+    /// actor then kills the run, the job's `JOB_PREEMPTED` follows, the freed
+    /// resource goes to the higher-level job that waits for it, and the job
+    /// runs its current step again before every other job of its level.
+    /// Refused, storing nothing, when [`manual_preempt`] refuses. A replay of
+    /// `operation` returns its stored result
+    pub fn preempt_job(
+        &self,
+        machine: MachineId,
+        operation: OperationId,
+        job: JobId,
+        now: DateTime<Utc>,
+    ) -> Result<PreemptResult, AppError> {
+        let content = serde_json::json!({ "job": job });
+        self.immediate(|| {
+            self.with_operation(machine, operation, "preempt", &content, || {
+                self.apply_preempt(machine, job, now)
+            })
+        })
+    }
+
+    fn apply_preempt(
+        &self,
+        machine: MachineId,
+        id: JobId,
+        now: DateTime<Utc>,
+    ) -> Result<PreemptResult, AppError> {
+        let job = self.require_machine_job(machine, id)?;
+        if job.state.is_terminal() {
+            return Err(QueueError::JobTerminal {
+                job: id,
+                state: job.state.as_str(),
+            }
+            .into());
+        }
+        if job.spec.ci.is_some() {
+            return Err(QueueError::PreemptRefused {
+                job: id,
+                reason: PreemptRefusal::Ci,
+            }
+            .into());
+        }
+
+        let snapshot = self.queue_snapshot(machine, now, NoticeThresholds::default())?;
+        let stop = manual_preempt(&snapshot, id)
+            .map_err(|reason| QueueError::PreemptRefused { job: id, reason })?;
+        let run = self.request_stop(stop.resource, Some(stop.task), stop.cause, now)?;
+        let front = Placement::Edge {
+            priority: None,
+            end: LevelEnd::Front,
+        };
+        let placed = self.apply_move(machine, id, front)?;
+        Ok(PreemptResult {
+            job: id,
+            resource: stop.resource,
+            task: run.task,
+            priority: placed.priority,
+            position: placed.position,
+        })
     }
 
     /// Return a resource in `Attention` to the queue after a person checked

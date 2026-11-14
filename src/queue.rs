@@ -33,7 +33,7 @@ pub mod lease_guard;
 pub mod schedule;
 pub mod spec;
 
-pub use error::{MoveRefusal, QueueCode, QueueError};
+pub use error::{MoveRefusal, PreemptRefusal, QueueCode, QueueError};
 
 /// Lowercase hex SHA-256, the stored form of job spec and operation digests
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -212,8 +212,15 @@ impl FromStr for Priority {
     }
 }
 
-/// Span from a run's start during which preemption kills and requeues it
+/// Run age from which a `hold` job keeps its resource against higher-priority
+/// work; younger runs are preempted whatever their spec says
+pub const HOLD_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// A `restart_within` from a spec written for an earlier release
 ///
+/// Preemption ignores it: [`HOLD_AFTER`] replaced per-job windows. It is
+/// still parsed and written back unchanged, because stored routes and retried
+/// submits compare spec digests, and dropping it would change them.
 /// Constructed only through `TryFrom<Duration>`, which accepts 1m through 24h
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RestartWindow(Duration);
@@ -223,16 +230,6 @@ impl RestartWindow {
     pub const MIN: Duration = Duration::from_secs(60);
     /// Longest accepted window
     pub const MAX: Duration = Duration::from_secs(24 * 60 * 60);
-
-    /// Whether a run that started at `started_at` is still inside the window
-    ///
-    /// A run is inside while it is younger than the window, so at exactly the
-    /// bound it is outside. A clock that went backwards counts as age zero
-    #[must_use]
-    pub fn contains(self, started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-        let age = (now - started_at).to_std().unwrap_or(Duration::ZERO);
-        age < self.0
-    }
 }
 
 impl TryFrom<Duration> for RestartWindow {
@@ -267,59 +264,74 @@ impl<'de> Deserialize<'de> for RestartWindow {
     }
 }
 
-/// How the running job gives up its resource to higher-priority work
+/// How a run stops when higher-priority work takes its resource
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", try_from = "PreemptionWire")]
-pub enum Preemption {
-    /// Killed and requeued at any age; the step restarts from scratch
+#[serde(rename_all = "snake_case")]
+pub enum PreemptMode {
+    /// Killed and requeued; the step restarts from scratch
     Restart,
-    /// Higher-priority work waits for the step to finish, unless the run is
-    /// younger than `restart_within`
-    Wait {
-        /// Age below which a preemption kills and requeues the run
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        restart_within: Option<RestartWindow>,
-    },
-    /// Asked to stop at its next checkpoint through the yield file, unless the
-    /// run is younger than `restart_within`
-    Yield {
-        /// Age below which a preemption kills and requeues the run
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        restart_within: Option<RestartWindow>,
-    },
+    /// Asked to stop at its next checkpoint through the yield file, then
+    /// resumed from it
+    Yield,
+    /// The mode earlier releases used for "never stop this step"; it now
+    /// stops like `restart`, and a job keeps its resource only with `hold`.
+    /// CI jobs, which are never preempted, still name it
+    Wait,
+}
+
+impl PreemptMode {
+    /// Stable mode name
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Yield => "yield",
+            Self::Wait => "wait",
+        }
+    }
+}
+
+/// How the running job gives up its resource to higher-priority work
+///
+/// Any run is preempted for a waiting job of a strictly higher level, except
+/// a `hold` run at least [`HOLD_AFTER`] old
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "PreemptionWire")]
+pub struct Preemption {
+    /// How the run stops
+    pub mode: PreemptMode,
+    /// Ignored window from an earlier release's spec, kept for its digest
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_within: Option<RestartWindow>,
+    /// Keep the resource once the run is [`HOLD_AFTER`] old; opt-in
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
 }
 
 /// Wire shape of `preempt`; unknown keys and a window on `restart` fail here
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreemptionWire {
-    mode: PreemptionMode,
+    mode: PreemptMode,
     #[serde(default)]
     restart_within: Option<RestartWindow>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PreemptionMode {
-    Restart,
-    Wait,
-    Yield,
+    #[serde(default)]
+    hold: bool,
 }
 
 impl TryFrom<PreemptionWire> for Preemption {
     type Error = String;
 
     fn try_from(wire: PreemptionWire) -> Result<Self, Self::Error> {
-        let restart_within = wire.restart_within;
-        match wire.mode {
-            PreemptionMode::Restart if restart_within.is_some() => Err(
-                "restart_within applies only to wait and yield; restart mode always restarts"
-                    .into(),
-            ),
-            PreemptionMode::Restart => Ok(Self::Restart),
-            PreemptionMode::Wait => Ok(Self::Wait { restart_within }),
-            PreemptionMode::Yield => Ok(Self::Yield { restart_within }),
+        // earlier releases refused this too, so no stored spec has it
+        if wire.mode == PreemptMode::Restart && wire.restart_within.is_some() {
+            return Err("restart_within does not apply to restart mode".into());
         }
+        Ok(Self {
+            mode: wire.mode,
+            restart_within: wire.restart_within,
+            hold: wire.hold,
+        })
     }
 }
 
@@ -333,33 +345,48 @@ pub enum PreemptStop {
 }
 
 impl Preemption {
+    /// A mode with no `hold`
+    #[must_use]
+    pub const fn new(mode: PreemptMode) -> Self {
+        Self {
+            mode,
+            restart_within: None,
+            hold: false,
+        }
+    }
+
+    /// The same mode with `hold` set
+    #[must_use]
+    pub const fn held(self) -> Self {
+        Self { hold: true, ..self }
+    }
+
+    /// How a stop happens, whatever the run's age
+    #[must_use]
+    pub const fn stop(self) -> PreemptStop {
+        match self.mode {
+            PreemptMode::Yield => PreemptStop::Yield,
+            PreemptMode::Restart | PreemptMode::Wait => PreemptStop::Restart,
+        }
+    }
+
     /// How a run in this mode that started at `started_at` may be stopped at
-    /// `now`, or `None` when higher-priority work must wait for it
+    /// `now` for higher-priority work, or `None` when that work must wait
+    ///
+    /// A clock that went backwards counts as age zero
     #[must_use]
     pub fn stop_at(self, started_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<PreemptStop> {
-        let inside = |window: Option<RestartWindow>| {
-            window.is_some_and(|window| window.contains(started_at, now))
-        };
-        match self {
-            Self::Restart => Some(PreemptStop::Restart),
-            Self::Wait { restart_within } | Self::Yield { restart_within }
-                if inside(restart_within) =>
-            {
-                Some(PreemptStop::Restart)
-            }
-            Self::Yield { .. } => Some(PreemptStop::Yield),
-            Self::Wait { .. } => None,
+        let age = (now - started_at).to_std().unwrap_or(Duration::ZERO);
+        if self.hold && age >= HOLD_AFTER {
+            return None;
         }
+        Some(self.stop())
     }
 
     /// Stable mode name
     #[must_use]
     pub const fn mode(self) -> &'static str {
-        match self {
-            Self::Restart => "restart",
-            Self::Wait { .. } => "wait",
-            Self::Yield { .. } => "yield",
-        }
+        self.mode.as_str()
     }
 }
 

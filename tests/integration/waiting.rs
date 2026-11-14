@@ -483,7 +483,7 @@ fn a_waiting_report_needs_a_local_agent_known_targets_and_no_cycle() {
     let job = homebased::queue::JobId::new();
     let (held_job, _) = jobs.submit_with(
         job,
-        &super::resource_jobs::spec(&h, "medium", "wait", "exit 0"),
+        &super::resource_jobs::spec(&h, "medium", "restart", "exit 0"),
         &["--after", &first],
     );
     assert_eq!(held_job["held"]["state"], "held", "{held_job}");
