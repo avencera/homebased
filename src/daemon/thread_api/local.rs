@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 
 use crate::callback::destination::claude_session_ids;
-use crate::callback::stale_context::{CodexRollouts, ContextUse};
+use crate::callback::stale_context::{CodexRollouts, ContextUse, Resumption};
 use crate::domain::ThreadId;
 use crate::machine::MachineId;
 use crate::store::WorkerThread;
@@ -36,6 +36,8 @@ pub(crate) struct LocalSources {
     pub(crate) workers: Vec<WorkerThread>,
     /// Threads that homebased tasks or jobs still owe events
     pub(crate) waiting: HashSet<ThreadId>,
+    /// Threads a sleep holds work for, which its final event or an alert wakes
+    pub(crate) sleeping: HashSet<ThreadId>,
     /// Stores that title sessions outside T3
     pub(crate) titles: Option<TitleSources>,
 }
@@ -50,6 +52,8 @@ pub(crate) struct LocalIndex {
     /// T3 threads here whose earlier session homebased work still owes
     /// events, as for a thread imported with a session it no longer runs
     owed_earlier: HashSet<String>,
+    /// T3 threads here whose current or earlier session a sleep holds work for
+    sleeping: HashSet<String>,
     // walking every Codex session or Claude project is skipped unless a lookup needs it
     rollouts: OnceLock<CodexRollouts>,
     claude: OnceLock<Vec<ThreadId>>,
@@ -84,10 +88,24 @@ impl LocalIndex {
             .filter(|session| !current.contains(session))
             .filter_map(|session| owning_thread(&sources.env, *session))
             .collect();
+        let sleeping = sources
+            .sleeping
+            .iter()
+            .filter_map(|session| {
+                let current = t3
+                    .iter()
+                    .find(|thread| thread.session.map(ProviderThread::id) == Some(*session));
+                match current {
+                    Some(thread) => Some(thread.id.clone()),
+                    None => owning_thread(&sources.env, *session),
+                }
+            })
+            .collect();
         Ok(Self {
             environment: environment_id(&sources.env),
             delegate_wakes: completion_wakes_due(&sources.env),
             owed_earlier,
+            sleeping,
             sources,
             t3,
             rollouts: OnceLock::new(),
@@ -325,7 +343,8 @@ impl LocalIndex {
     /// user is. A settled or archived thread, and a delegate whose task ended,
     /// rarely runs again, so a compaction would cost more than the cache
     /// rewrite it might save. Its transcript or rollout must then show it idle
-    /// inside the window [`ContextUse::idle_compaction_due`] allows
+    /// inside the window [`ContextUse::idle_compaction_due`] allows, at the
+    /// lower size of a thread a sleep holds work for
     pub(crate) fn idle_compaction_due(&self) -> Vec<(ProviderThread, ContextUse)> {
         self.t3
             .iter()
@@ -334,17 +353,22 @@ impl LocalIndex {
                 ThreadState::Idle => !t3.task_finished,
                 _ => false,
             })
-            .filter_map(|t3| t3.session)
-            .filter_map(|session| {
+            .filter_map(|t3| Some((t3.session?, self.resumption(t3))))
+            .filter_map(|(session, resumption)| {
                 let usage = match session {
                     ProviderThread::Claude(id) => ContextUse::read_claude(self.home(), id),
                     ProviderThread::Codex(id) => self.rollouts().context(id),
                 }?;
                 usage
-                    .idle_compaction_due(self.now)
+                    .idle_compaction_due(self.now, resumption)
                     .then_some((session, usage))
             })
             .collect()
+    }
+
+    /// How sure it is that T3 thread `t3` runs again
+    fn resumption(&self, t3: &T3Thread) -> Resumption {
+        Resumption::of(self.sleeping.contains(&t3.id))
     }
 
     fn context(&self, found: Found) -> ThreadContext {
@@ -590,6 +614,7 @@ mod tests {
                 provider: crate::thread_ref::Provider::Codex,
             }],
             waiting: HashSet::from([SESSION_A.parse::<ThreadId>().unwrap()]),
+            sleeping: HashSet::new(),
             titles: None,
         }
     }

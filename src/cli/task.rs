@@ -542,8 +542,9 @@ fn claude_session_caller(thread: ThreadId, session: Option<ThreadId>, worker: bo
 /// is registered with `t3_background_wait`, and agents kept skipping that step.
 /// A background command rather than a Monitor, because a Monitor expires after
 /// 30 minutes and wakes the thread each time, which a queued GPU job turns into
-/// hours of empty turns. A worker parks with `waiting` instead, and only the
-/// submitting session can wait on the work
+/// hours of empty turns. Long work sleeps instead, since restarting the wait
+/// every 55 minutes wakes the thread for nothing. A worker parks with
+/// `waiting` instead, and only the submitting session can wait on the work
 fn t3_wait_hint(
     env: &T3Env,
     id: &str,
@@ -559,9 +560,8 @@ fn t3_wait_hint(
     // the wait picks its own deadline, so the Bash timeout is Claude Code's
     // maximum and only has to stay out of its way
     Some(format!(
-        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after the next events, or after {cache} minutes with none, inside the hour-long prompt cache; handle its output and run the command it prints to start it again, until the final event. For work expected to take over 4 hours, add `--long`, which compacts this thread once the turn ends and waits up to {long} minutes",
+        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after the next events, or after {cache} minutes with none, inside the hour-long prompt cache; handle its output and run the command it prints to start it again, until the final event. For work expected to take over an hour, run `homebased wait --long {id}` as an ordinary command instead and end the turn: it exits at once, and the daemon wakes this thread with the final event, which lists the progress events it held, or with an alert",
         cache = super::wait::CACHE_LIMIT.as_secs() / 60,
-        long = super::wait::LONG_LIMIT.as_secs() / 60,
     ))
 }
 
@@ -1232,6 +1232,10 @@ mod tests {
         assert!(hint.contains("t3_background_wait"));
         assert!(hint.contains("timeout 7200000"), "{hint}");
         assert!(hint.contains("after 55 minutes"), "{hint}");
+        // long work sleeps rather than waiting in a background command
+        assert!(hint.contains("`homebased wait --long task-1`"), "{hint}");
+        assert!(hint.contains("over an hour"), "{hint}");
+        assert!(!hint.contains("compact"), "{hint}");
 
         // a worker parks with `waiting`, and another session cannot wait on the task
         assert_eq!(

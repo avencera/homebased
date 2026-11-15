@@ -23,6 +23,7 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 | `continuation` | Present only on `TASK_WAITING`: the held task that continues the work once every `waiting_on` task ended. |
 | `reason` | Present only when the event alone does not say why: `"no_report"` on a `TASK_FAILED` for an agent that exited 0 without reporting. |
 | `usage` | Present only on the terminal event of a Claude worker that ran on the machine that submitted it: the tokens and list-price cost it spent, per model, as in `task usage` ([inspect.md](inspect.md)). `complete: false` marks a worker stopped before Claude Code's final accounting. |
+| `held_events` | Present only on the final event of a task or job that this thread sleeps on with `homebased wait --long`: what the sleep held instead of waking the thread, as described in [Held events](#held-events). |
 | `cancel_reason` | Present only when the origin cancelled a held task before it started: `{"type":"dependency_ended","dependency":"<uuid>","outcome":"failed"}`, `{"type":"requested"}` after `task cancel`, or `{"type":"superseded","by":"<uuid>"}` when a newer task with the same `coalesce` key and machine replaced it. `dependency` is a task or GPU queue job UUID. `outcome` is `failed`, `blocked`, `cancelled`, `lost`, or `unknown` when the dependency ended but no record says how. |
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.
@@ -85,6 +86,12 @@ A worker that needs a long command submits it as its own task, reports `waiting`
 - Leave the waited tasks to the continuation. Their `TASK_FAILED` or `TASK_SUCCEEDED` events still arrive, but do not resubmit or fix them yourself unless the user asks.
 - The runs of one unit of work form a chain. A task held `after` any of its runs waits for the chain's last run and starts only if that run succeeds; parking is not an outcome.
 - `task cancel` on any run of a chain cancels the run that owns the work now: the held continuation, or the running one. The response names that run.
+
+## Held events
+
+After `homebased wait --long` ([t3.md](t3.md#sleeping-on-long-work)), progress events of the held tasks and jobs settle without waking the thread: `TASK_REPORTED`, `TASK_WAITING`, `JOB_PREEMPTED`, and `JOB_GPU_IDLE` reminders. Alerts still wake it: `JOB_ATTENTION`, `JOB_BLOCKED`, `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, and the first `JOB_GPU_IDLE` of an idle episode. The task's or job's final event, a `TASK_*` terminal event or `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`, wakes it and ends the sleep, and its line carries `held_events`: one entry per held event, oldest first, each `{"event", "seq", "at", "summary"}`, where `at` is when a job event happened or when the daemon held a task event. A held task event also has `task`, which differs from the final event's `task` when the work parked and continued in another run. `summary` is one short line, such as `report 2 (succeeded): tests pass`, `parked; continues as task <uuid>`, or `run 3 preempted on gpu0; requeued`. `[]` means nothing was held. A connected `homebased wait` that printed the final event prints the same line.
+
+Read `held_events` before acting on the final event: the reports and preemptions it lists are the progress you did not see. A final event carries the whole `reports` list as usual.
 
 ## Duplicates
 

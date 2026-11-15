@@ -143,12 +143,17 @@ pub(in crate::daemon) async fn local_sources(state: &AppState) -> Result<LocalSo
         .await?
         .into_iter()
         .collect();
+    let sleeping = call(&state.store, |reply| StoreMsg::SleepingThreads { reply })
+        .await?
+        .into_iter()
+        .collect();
     Ok(LocalSources {
         env: T3Env::from_env(),
         machine: state.machine.identity.machine,
         machine_name: state.machine.name.to_string(),
         workers,
         waiting,
+        sleeping,
         titles: state.thread_titles.clone(),
     })
 }

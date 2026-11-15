@@ -378,6 +378,41 @@ pub(crate) fn owning_thread(env: &T3Env, thread: ThreadId) -> Option<String> {
     .find_map(|candidate| find_thread(&userdata, candidate).ok().flatten())
 }
 
+/// Whether T3 runs a compaction now in the T3 thread that owns `thread`
+///
+/// T3 refuses to steer a message into a compaction, so a message for such a
+/// thread waits for it. T3's state shows the run while it lasts, whoever
+/// started it, while the transcript shows a compaction only once it finished.
+/// An unreadable state answers `false`, which leaves routing to the
+/// transcript's idle time
+pub(crate) fn compaction_running(env: &T3Env, thread: ProviderThread) -> bool {
+    let userdata = env.userdata();
+    let Ok(Some(t3_thread)) = find_thread(&userdata, thread) else {
+        return false;
+    };
+    v2::compaction_running(&state_path(&userdata), &t3_thread, COMPACT_COMMAND).unwrap_or_else(
+        |detail| {
+            tracing::debug!(%detail, "T3 compaction run cannot be read");
+            false
+        },
+    )
+}
+
+/// Whether T3 thread `t3_thread` runs a task another thread delegated to it,
+/// as `delegate_task` children do
+///
+/// T3 reports such a thread to its parent when its turn ends, so the turn
+/// must not end before the work does. An unreadable state answers `false`
+pub(crate) fn runs_delegated_task(env: &T3Env, t3_thread: &str) -> bool {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return false;
+    }
+    v2::thread_rows(&state)
+        .inspect_err(|detail| tracing::debug!(%detail, "T3 threads cannot be read"))
+        .is_ok_and(|rows| rows.iter().any(|row| row.id == t3_thread && row.delegate))
+}
+
 /// Whether T3's state maps a T3 thread to `thread`, without asking the T3
 /// server, so the answer holds while the server is slow or restarting
 pub(crate) fn maps_session(env: &T3Env, thread: ProviderThread) -> bool {
@@ -1361,7 +1396,7 @@ mod tests {
     use super::{
         NextSession, ProbeStatus, ProviderThread, PullRequest, T3Cli, T3Env, ThreadDetails,
         TurnStart, WakeOutcome, compact_thread, deterministic_id, load_runtime, next_session,
-        open_threads, owner, probe, wake_thread_checked,
+        open_threads, owner, probe, runs_delegated_task, wake_thread_checked,
     };
     use crate::domain::ThreadId;
 
@@ -1627,6 +1662,30 @@ mod tests {
                 ..ThreadDetails::default()
             }
         );
+    }
+
+    #[test]
+    fn only_a_subagent_thread_runs_a_delegated_task() {
+        let fixture = Fixture::empty(None, live_pid());
+        fixture
+            .v2_state()
+            .thread("parent", "Plan the release", false)
+            .thread("delegate", "Port the renderer", false)
+            .payload(
+                "delegate",
+                &json!({ "lineage": { "parentThreadId": "parent", "relationshipToParent": "subagent" } }),
+            )
+            // a thread started from another one reports to nobody
+            .thread("spawned", "Fix the build", false)
+            .payload(
+                "spawned",
+                &json!({ "lineage": { "parentThreadId": "parent" } }),
+            );
+
+        let delegated = ["parent", "delegate", "spawned", "missing"]
+            .map(|thread| runs_delegated_task(&fixture.env, thread));
+
+        assert_eq!(delegated, [false, true, false, false]);
     }
 
     #[test]

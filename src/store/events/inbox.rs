@@ -13,6 +13,7 @@ use crate::events::{
     DeliveryOutcome, DeliveryState, EventAcceptance, EventError, EventPayload, FailedInboxEvent,
     InboxEvent, THREAD_WAIT_LIMIT, TaskEvent, WaitingInboxEvent,
 };
+use crate::store::sleep::settle_task_hold;
 use crate::store::{Store, dependency, fmt_time};
 use crate::submission::{HeldPhase, SubmissionState};
 
@@ -122,6 +123,27 @@ impl Store {
         seq: NonZeroU64,
         outcome: DeliveryOutcome,
     ) -> Result<InboxEvent, EventError> {
+        self.settle_inbox(task, seq, Settlement::Attempt(outcome))
+    }
+
+    /// Settle the earliest inbox event into a sleep's hold on its task
+    /// without waking the origin thread
+    ///
+    /// Only a progress event can be held, and only while a sleep holds the task
+    pub fn hold_inbox_event(
+        &mut self,
+        task: TaskId,
+        seq: NonZeroU64,
+    ) -> Result<InboxEvent, EventError> {
+        self.settle_inbox(task, seq, Settlement::Held)
+    }
+
+    fn settle_inbox(
+        &mut self,
+        task: TaskId,
+        seq: NonZeroU64,
+        settlement: Settlement,
+    ) -> Result<InboxEvent, EventError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -156,46 +178,15 @@ impl Store {
                 message: "inbox settlement is out of order".into(),
             });
         }
-        let delivery = match outcome {
-            DeliveryOutcome::Delivered if attempts > 0 => DeliveryState::Delivered {
-                attempts,
-                last_error,
-            },
-            DeliveryOutcome::Deferred(reason) if attempts > 0 => {
-                let since = waiting_since.unwrap_or_else(Utc::now);
-                let attempts = attempts.saturating_sub(1);
-                if Utc::now() - since >= THREAD_WAIT_LIMIT {
-                    DeliveryState::DeliveryFailed {
-                        attempts,
-                        last_error: format!(
-                            "gave up after waiting {} days for the origin thread: {reason}",
-                            THREAD_WAIT_LIMIT.num_days()
-                        ),
-                    }
-                } else {
-                    DeliveryState::AwaitingThread {
-                        attempts,
-                        since,
-                        reason,
-                    }
-                }
-            }
-            DeliveryOutcome::Retryable(error) if attempts >= 3 => DeliveryState::DeliveryFailed {
-                attempts,
-                last_error: error,
-            },
-            DeliveryOutcome::Retryable(error) => DeliveryState::PendingDelivery {
-                attempts,
-                last_error: Some(error),
-            },
-            DeliveryOutcome::Permanent(error) => DeliveryState::DeliveryFailed {
-                attempts,
-                last_error: error,
-            },
-            DeliveryOutcome::Delivered | DeliveryOutcome::Deferred(_) => {
+        let delivery = match settlement {
+            Settlement::Held if attempts > 0 => DeliveryState::Held { attempts },
+            Settlement::Held => {
                 return Err(EventError::Invalid {
-                    message: "delivery outcome without a reserved attempt".into(),
+                    message: "held event without a reserved attempt".into(),
                 });
+            }
+            Settlement::Attempt(outcome) => {
+                attempt_delivery(outcome, attempts, last_error, waiting_since)?
             }
         };
         let settled = !delivery.is_unsettled();
@@ -213,24 +204,31 @@ impl Store {
             ],
         )
         .map_err(storage)?;
-        if matches!(delivery, DeliveryState::Delivered { .. }) {
-            let event: TaskEvent = decode(&event_json)?;
-            if let EventPayload::Callback {
-                event: callback, ..
-            } = event.payload
-                && callback.event == EventKind::TaskReported
-                && let Some(report) = callback.reports.first()
-            {
-                tx.execute(
-                    "UPDATE reports SET notified_at=?1 WHERE task_id=?2 AND seq=?3",
-                    params![
-                        chrono::Utc::now().to_rfc3339(),
-                        task.to_string(),
-                        report.seq
-                    ],
-                )
-                .map_err(storage)?;
-            }
+        let event: TaskEvent = decode(&event_json)?;
+        let callback = match &event.payload {
+            EventPayload::Callback { event, .. } => Some(event.as_ref()),
+            EventPayload::State { .. } | EventPayload::Report { .. } => None,
+        };
+        // the hold changes with the settlement, so a restart sees both or neither
+        if settled && let Some(callback) = callback {
+            let now = Utc::now();
+            settle_task_hold(&tx, task, seq.get(), callback, &delivery, now)
+                .map_err(EventError::Storage)?;
+        }
+        if matches!(delivery, DeliveryState::Delivered { .. })
+            && let Some(callback) = callback
+            && callback.event == EventKind::TaskReported
+            && let Some(report) = callback.reports.first()
+        {
+            tx.execute(
+                "UPDATE reports SET notified_at=?1 WHERE task_id=?2 AND seq=?3",
+                params![
+                    chrono::Utc::now().to_rfc3339(),
+                    task.to_string(),
+                    report.seq
+                ],
+            )
+            .map_err(storage)?;
         }
         if settled {
             let mut cursor = route.last_settled_seq;
@@ -256,10 +254,7 @@ impl Store {
             .map_err(storage)?;
         }
         tx.commit().map_err(storage)?;
-        Ok(InboxEvent {
-            event: decode(&event_json)?,
-            delivery,
-        })
+        Ok(InboxEvent { event, delivery })
     }
 
     /// List durable callback failures without changing task process status
@@ -470,4 +465,63 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// How the earliest inbox event settles
+enum Settlement {
+    /// A reserved delivery attempt ended with this outcome
+    Attempt(DeliveryOutcome),
+    /// A sleep holds the event instead of delivering it
+    Held,
+}
+
+/// Delivery state after one reserved attempt that ended with `outcome`
+fn attempt_delivery(
+    outcome: DeliveryOutcome,
+    attempts: u8,
+    last_error: Option<String>,
+    waiting_since: Option<chrono::DateTime<Utc>>,
+) -> Result<DeliveryState, EventError> {
+    Ok(match outcome {
+        DeliveryOutcome::Delivered if attempts > 0 => DeliveryState::Delivered {
+            attempts,
+            last_error,
+        },
+        DeliveryOutcome::Deferred(reason) if attempts > 0 => {
+            let since = waiting_since.unwrap_or_else(Utc::now);
+            let attempts = attempts.saturating_sub(1);
+            if Utc::now() - since >= THREAD_WAIT_LIMIT {
+                DeliveryState::DeliveryFailed {
+                    attempts,
+                    last_error: format!(
+                        "gave up after waiting {} days for the origin thread: {reason}",
+                        THREAD_WAIT_LIMIT.num_days()
+                    ),
+                }
+            } else {
+                DeliveryState::AwaitingThread {
+                    attempts,
+                    since,
+                    reason,
+                }
+            }
+        }
+        DeliveryOutcome::Retryable(error) if attempts >= 3 => DeliveryState::DeliveryFailed {
+            attempts,
+            last_error: error,
+        },
+        DeliveryOutcome::Retryable(error) => DeliveryState::PendingDelivery {
+            attempts,
+            last_error: Some(error),
+        },
+        DeliveryOutcome::Permanent(error) => DeliveryState::DeliveryFailed {
+            attempts,
+            last_error: error,
+        },
+        DeliveryOutcome::Delivered | DeliveryOutcome::Deferred(_) => {
+            return Err(EventError::Invalid {
+                message: "delivery outcome without a reserved attempt".into(),
+            });
+        }
+    })
 }

@@ -11,6 +11,8 @@ use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission,
 use crate::queue::spec::MachineSelector;
 use crate::queue::{JobEvent, JobEventKind, JobId, MoveRefusal, Priority, QueueError, Target};
 use crate::store::Store;
+use crate::store::sleep::{append_held, end_hold};
+use crate::task_wait::{EventClass, HeldEvent, HoldTarget};
 
 /// Sequence cursors of one job's origin inbox
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,9 +530,45 @@ impl Store {
     }
 
     /// Settle a callback only after delivery; a crash before this commit may repeat it
+    ///
+    /// A final event also ends a sleep's hold on the job
     pub fn settle_job_event(&self, job: JobId, seq: u64) -> Result<(), AppError> {
         let sql_seq = sql_seq(seq)?;
-        self.immediate(|| self.settle_job_event_inner(job, seq, sql_seq))
+        self.immediate(|| {
+            let event = self.job_inbox_event(job, sql_seq)?;
+            if EventClass::job(event.event, event.gpu_idle.as_ref()).is_final() {
+                end_hold(&self.conn, HoldTarget::Job(job))?;
+            }
+            self.settle_job_event_inner(job, seq, sql_seq)
+        })
+    }
+
+    /// Settle job event `seq` into a sleep's hold on the job without waking
+    /// its thread
+    ///
+    /// Only a progress event can be held, and only while a sleep holds the job
+    pub fn hold_job_event(&self, job: JobId, seq: u64) -> Result<(), AppError> {
+        let sql_seq = sql_seq(seq)?;
+        self.immediate(|| {
+            let event = self.job_inbox_event(job, sql_seq)?;
+            if EventClass::job(event.event, event.gpu_idle.as_ref()) != EventClass::Progress {
+                return Err(QueueError::Invariant {
+                    message: format!("job {job} event {seq} is not a progress event to hold"),
+                }
+                .into());
+            }
+            append_held(&self.conn, HoldTarget::Job(job), &HeldEvent::job(&event))?;
+            self.settle_job_event_inner(job, seq, sql_seq)
+        })
+    }
+
+    fn job_inbox_event(&self, job: JobId, sql_seq: i64) -> Result<JobEvent, AppError> {
+        let json: String = self.conn.query_row(
+            "SELECT event_json FROM resource_job_inbox WHERE job_id = ?1 AND seq = ?2",
+            params![job.to_string(), sql_seq],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str::<RoutedJobEvent>(&json)?.event)
     }
 
     /// Whether one job's origin inbox already holds an event after `seq` that

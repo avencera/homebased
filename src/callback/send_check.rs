@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use super::stale_context::Resumption;
+
 /// A send can fail without suppressing the numbered notice
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SendFailure {
@@ -36,6 +38,9 @@ pub(crate) struct SendGate<'a> {
     ///
     /// Only inbox events can wait; a direct message answers its sender now
     pub(crate) hold: bool,
+    /// How sure it is that the thread runs again, which sets the context size
+    /// at which an idle compaction is due and the line queues behind it
+    pub(crate) resumption: Resumption,
 }
 
 impl SendGate<'_> {

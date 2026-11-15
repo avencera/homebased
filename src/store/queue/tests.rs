@@ -2244,8 +2244,11 @@ async fn notice_ends_during_callback_preparation() {
         return;
     }
     use crate::callback::send_check::{SendCheck, SendFailure};
+    use crate::callback::stale_context::Resumption;
     use crate::daemon::actors::StoreActor;
-    use crate::daemon::actors::callback::{CallbackActor, CallbackArgs, deliver_job_event};
+    use crate::daemon::actors::callback::{
+        CallbackActor, CallbackArgs, JobSend, deliver_job_event, job_event_line,
+    };
     use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
     use crate::submission::{CallbackContext, CallbackExecutable};
     use ractor::Actor;
@@ -2383,7 +2386,12 @@ async fn notice_ends_during_callback_preparation() {
         assert!(std::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let pending = deliver_job_event(&home, &route, &notice.event, &callback, Some(check));
+    let send = JobSend {
+        before_send: Some(check),
+        resumption: Resumption::Likely,
+    };
+    let line = job_event_line(&route, &notice.event).unwrap();
+    let pending = deliver_job_event(&home, &route, line, &notice.event, &callback, send);
     tokio::pin!(pending);
     // poll preparation while the sender cannot pass the held delivery lock
     assert!(
@@ -2414,7 +2422,12 @@ async fn notice_ends_during_callback_preparation() {
         .await
         .unwrap();
     assert_eq!(f.store.pending_job_inbox().unwrap()[0].1.event.seq, 2);
-    let outcome = deliver_job_event(&home, &route, &success.event, &callback, None)
+    let send = JobSend {
+        before_send: None,
+        resumption: Resumption::Likely,
+    };
+    let line = job_event_line(&route, &success.event).unwrap();
+    let outcome = deliver_job_event(&home, &route, line, &success.event, &callback, send)
         .await
         .unwrap();
     crate::daemon::event_sender::jobs::settle_callback(&store_actor, head, 2, outcome)
@@ -2431,6 +2444,184 @@ async fn notice_ends_during_callback_preparation() {
     assert_eq!(f.store.job_route_cursors(head).unwrap().unwrap().settled, 2);
     assert!(f.store.pending_job_inbox().unwrap().is_empty());
     assert_eq!(f.store.job_events(head).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sleeping_thread_wakes_for_job_alerts_and_the_final_event_only() {
+    use crate::daemon::actors::callback::{CallbackActor, CallbackArgs};
+    use crate::daemon::actors::{StoreActor, WaiterRegistry};
+    use crate::daemon::event_sender::jobs::JobOrigin;
+    use crate::queue::JobEvent;
+    use crate::queue::delivery::{JobRoute, JobSubmission, RoutedJobEvent};
+    use crate::submission::{CallbackContext, CallbackExecutable};
+    use crate::task_wait::{HoldTarget, SleepOutcome};
+    use ractor::Actor;
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let home = crate::home::Home::resolve(Some(f._dir.path().join("state"))).unwrap();
+    home.ensure().unwrap();
+    let id = f.submit(Priority::Low);
+    let binary = f._dir.path().join("codex");
+    let received = f._dir.path().join("received");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            received.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = f.job(id);
+    let route = JobRoute {
+        job: id,
+        origin: f.machine,
+        authority: f.machine,
+        thread: job.spec.thread,
+        callback: CallbackContext {
+            env: TaskEnv {
+                path: "/usr/bin:/bin".into(),
+                home: f._dir.path().to_string_lossy().into_owned(),
+            },
+            cwd: f._dir.path().to_path_buf(),
+            codex: CallbackExecutable::available(binary),
+        },
+        digest: job.spec.digest().unwrap(),
+        spec: job.spec,
+        target: None,
+        submission: JobSubmission::Unknown,
+        after: None,
+        owes_final_event: false,
+        submitted_at: None,
+        placement: None,
+    };
+    f.store.insert_job_route(&route).unwrap();
+    assert_eq!(
+        f.store.hold_job(id, route.thread, Utc::now()).unwrap(),
+        SleepOutcome::Held
+    );
+    let idle = |episode: u32, reminder: u32| {
+        json!({
+            "attempt": TaskId::new(),
+            "episode": episode,
+            "reminder": reminder,
+            "never_busy": false,
+            "gpu_uuid": "GPU-0",
+            "idle_since": Utc::now(),
+            "idle_secs": 1800,
+            "window_secs": 1800,
+            "idle_buckets": 30,
+            "known_buckets": 30,
+            "util_below": 5,
+            "util_peak_pct": 1,
+            "power_peak_watts": 80,
+            "power_peak_pct": 20,
+            "memory_used_mib": 1024,
+            "memory_total_mib": 24576,
+            "last_output_at": null,
+            "process": null,
+            "source": "nvidia_smi",
+            "next_steps": "check the run"
+        })
+    };
+    let events: Vec<JobEvent> = [
+        json!({ "event": "JOB_GPU_IDLE", "gpu_idle": idle(1, 0) }),
+        json!({ "event": "JOB_GPU_IDLE", "gpu_idle": idle(1, 1) }),
+        json!({ "event": "JOB_PREEMPTED" }),
+        json!({ "event": "JOB_SUCCEEDED" }),
+    ]
+    .into_iter()
+    .zip(1..)
+    .map(|(mut event, seq): (Value, u64)| {
+        event["job"] = json!(id);
+        event["seq"] = json!(seq);
+        event["at"] = json!(Utc::now());
+        serde_json::from_value(event).unwrap()
+    })
+    .collect();
+    let (store, store_handle) = Actor::spawn(None, StoreActor, f._dir.path().join("db"))
+        .await
+        .unwrap();
+    let waiters = WaiterRegistry::spawn(None).await.unwrap();
+    let (callback, callback_handle) = Actor::spawn(
+        None,
+        CallbackActor,
+        CallbackArgs {
+            store: store.clone(),
+            home: home.clone(),
+            notifier: None,
+            machine_name: "test".into(),
+            claude_sessions: None,
+            waiters: waiters.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let origin = JobOrigin {
+        store: &store,
+        home: &home,
+        callback: &callback,
+        waiters: &waiters,
+    };
+    let sent = || {
+        std::fs::read_to_string(&received)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let held = || {
+        f.store
+            .sleep_hold(HoldTarget::Job(id))
+            .unwrap()
+            .map(|hold| hold.held.len())
+    };
+    let mut seen = Vec::new();
+    for event in &events {
+        f.store
+            .accept_job_event(&RoutedJobEvent {
+                origin: f.machine,
+                authority: f.machine,
+                digest: route.digest.clone(),
+                event: event.clone(),
+            })
+            .unwrap();
+        origin
+            .deliver(&route, event, None, || async { Some(true) })
+            .await
+            .unwrap();
+        seen.push((sent().len(), held()));
+    }
+
+    callback.stop(None);
+    callback_handle.await.unwrap();
+    store.stop(None);
+    store_handle.await.unwrap();
+    // the first idle alert wakes the thread and keeps the hold; the reminder
+    // and the preemption settle into it; the final event wakes it once and
+    // ends the sleep
+    assert_eq!(seen, [(1, Some(0)), (1, Some(1)), (1, Some(2)), (2, None)]);
+    let sent = sent();
+    assert!(sent[0].contains("JOB_GPU_IDLE"), "{}", sent[0]);
+    assert!(!sent[0].contains("held_events"), "{}", sent[0]);
+    assert!(sent[1].contains("JOB_SUCCEEDED"), "{}", sent[1]);
+    let line = sent[1].split_once("HOMEBASED_EVENT ").unwrap().1;
+    let payload: Value = serde_json::from_str(line).unwrap();
+    let held: Vec<(&str, u64)> = payload["held_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|held| {
+            (
+                held["event"].as_str().unwrap(),
+                held["seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(held, [("JOB_GPU_IDLE", 2), ("JOB_PREEMPTED", 3)]);
+    assert_eq!(f.store.job_route_cursors(id).unwrap().unwrap().settled, 4);
+    assert!(f.store.pending_job_inbox().unwrap().is_empty());
 }
 
 #[test]

@@ -61,14 +61,18 @@ The list can be incomplete. When a reachable Fleet machine does not answer, the 
 
 Asks T3 to compact a T3 thread on whichever machine runs it. The result `outcome` is `started`, `queued`, `not_found`, `refused` (T3 would not compact now), or `unavailable`.
 
-- A thread running a turn answers `queued`: T3 compacts it once that turn ends. That includes the calling thread, so run `homebased thread compact` mid-turn to compact yourself after the turn, for example before a long wait, which `homebased wait --next --long` does for you. Asking again during the same turn queues no second compaction.
+- A thread running a turn answers `queued`: T3 compacts it once that turn ends. That includes the calling thread, so run `homebased thread compact` mid-turn to compact yourself after the turn. A thread that sleeps with `homebased wait --long` needs none: idle compaction takes care of it, as below. Asking again during the same turn queues no second compaction.
 - Nothing wakes a thread after a queued compaction. To resume right after it with no wait running, watch yourself with `--action compact --once` and end the turn instead.
 
 - Only T3 threads can be compacted. Any other thread fails with `compact_unsupported_host` (exit 5); tell that session to run `/compact` instead.
 - A T3 thread with no session yet fails with `thread_not_found` (exit 3).
 - A peer that predates the command fails with a usage error; run `homebased update` there.
 
+### Idle compaction
+
 The daemon's own idle compaction is separate: after about 55 idle minutes, at 175K tokens or more, it compacts any T3 thread that is not archived, runs no turn, and will likely run again. That is one a homebased task or a delegated task's report will wake, or one that is neither settled nor a finished delegate, such as an idle root or a thread waiting on the user.
+
+A thread that sleeps with `homebased wait --long` ([t3.md](t3.md#sleeping-on-long-work)) is certain to run again hours later, after its cache lapsed, so its limit is 60K tokens instead. An event that arrives for a thread due such a compaction, or while T3 runs a `/compact` turn in it, waits behind the compaction instead of steering into it.
 
 ## `thread watch`
 

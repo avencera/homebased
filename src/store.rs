@@ -25,6 +25,7 @@ mod presentation;
 pub mod queue;
 mod schema;
 mod service;
+mod sleep;
 mod task;
 #[cfg(test)]
 mod tests;

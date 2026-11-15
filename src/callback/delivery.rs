@@ -22,14 +22,14 @@ use tracing::warn;
 
 use super::claude_inbox::{ClaudeInbox, ClaudeSession};
 use super::send_check::{SendFailure, SendGate};
-use super::stale_context::ContextUse;
+use super::stale_context::{ContextUse, Resumption};
 use crate::daemon::compaction_log::{self, Trigger};
 use crate::domain::{TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 use crate::t3::{
-    NextSession, ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, next_session,
-    owner, wake_thread_checked,
+    NextSession, ProviderThread, T3Env, TurnStart, WakeOutcome, compact_thread, compaction_running,
+    next_session, owner, wake_thread_checked,
 };
 
 /// Per-attempt bound for one `codex queue` child, including cleanup.
@@ -341,10 +341,13 @@ pub(crate) fn send_saved_queue_attempt(
     delivery_lock: &Path,
     pending: &PendingT3Send,
 ) -> Result<(), String> {
+    // a direct message's sender waits for the answer, so only the 175K limit
+    // may hold it behind a compaction, whether or not the recipient sleeps
     let gate = SendGate {
         path: delivery_lock,
         check: None,
         hold: false,
+        resumption: Resumption::Likely,
     };
     send_direct_message(context, thread, line, log_path, pending, gate)
         .map_err(|error| error.to_string())
@@ -608,17 +611,32 @@ fn turn_start(
         NextSession::Resumes(next) => next,
         NextSession::Other => return Ok(TurnStart::Auto),
     };
+    // T3's run records show a compaction while it runs, whoever started it,
+    // and the transcript's idle time covers one T3 has not recorded yet
+    let running = || compaction_running(&env, provider_thread);
     let Some(usage) = ContextUse::read(Path::new(&context.env.home), provider_thread) else {
-        return Ok(TurnStart::Auto);
+        return Ok(if running() {
+            TurnStart::AfterActive
+        } else {
+            TurnStart::Auto
+        });
     };
     let now = Utc::now();
-    if !usage.cold_compaction_due(now) {
+    let resumption = gate.resumption;
+    let start = || {
+        if running() {
+            TurnStart::AfterActive
+        } else {
+            usage.turn_start(now, resumption)
+        }
+    };
+    if !usage.cold_compaction_due(now, resumption) {
         pending.end_hold();
-        return Ok(usage.turn_start(now));
+        return Ok(start());
     }
     // a line that may no longer be sent must not start a compaction either
     if gate.check().is_err() {
-        return Ok(usage.turn_start(now));
+        return Ok(start());
     }
     let held_since = pending.hold_since();
     if held_since.is_some_and(|since| now - since >= COMPACTION_HOLD_LIMIT) {
@@ -626,7 +644,7 @@ fn turn_start(
             log_path,
             "t3 compaction did not finish in time; sending the event behind it",
         );
-        return Ok(usage.turn_start(now));
+        return Ok(start());
     }
 
     let outcome = compact_thread(&env, provider_thread, &usage.compaction_key());
@@ -650,7 +668,7 @@ fn turn_start(
         WakeOutcome::NotT3Thread | WakeOutcome::ApiChanged(_) => false,
     };
     if !(compacting && gate.hold) {
-        return Ok(usage.turn_start(now));
+        return Ok(start());
     }
     if held_since.is_none() {
         pending.start_hold(now);

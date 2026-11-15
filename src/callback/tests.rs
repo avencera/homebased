@@ -10,6 +10,7 @@ fn run_unconditionally(
             path: delivery_lock,
             check: None,
             hold: false,
+            resumption: crate::callback::stale_context::Resumption::Likely,
         },
     )?
     .ok_or_else(|| "unconditional callback was suppressed".into())

@@ -300,36 +300,6 @@ async fn compact(client: &Client, request: &CompactRequest) -> Result<CompactRes
     client.post_json("/v1/threads/compact", request).await
 }
 
-/// Compact the calling thread: now when it is idle, or once its running turn
-/// ends, which is how a thread compacts itself mid-turn
-pub(super) async fn compact_self(client: &Client) -> Result<CompactResponse, AppError> {
-    let caller = Caller::from_env()?;
-    let mut threads = selectors(Vec::new(), None, None, &caller)?;
-    let request = CompactRequest {
-        api_version: API_VERSION,
-        thread: threads.remove(0),
-        machine: None,
-        carried_by: caller.t3_thread,
-    };
-    compact(client, &request).await
-}
-
-/// The calling thread's context size in tokens, when its session reports one
-pub(super) async fn own_context_tokens(client: &Client) -> Result<Option<u64>, AppError> {
-    let caller = Caller::from_env()?;
-    let request = ThreadContextRequest {
-        api_version: API_VERSION,
-        threads: selectors(Vec::new(), None, None, &caller)?,
-        children_of: None,
-        live: false,
-        machine: None,
-        prefixes: false,
-        carried_by: caller.t3_thread,
-    };
-    let response: ThreadContextResponse = client.post_json("/v1/threads/context", &request).await?;
-    Ok(response.threads.first().and_then(|thread| thread.tokens))
-}
-
 /// The threads a command names: `--task`, `--worker`, the references, or the caller
 fn selectors(
     refs: Vec<String>,

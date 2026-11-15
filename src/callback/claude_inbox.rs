@@ -477,6 +477,7 @@ mod tests {
                     path: &home.path().join("delivery.lock"),
                     check: None,
                     hold: false,
+                    resumption: crate::callback::stale_context::Resumption::Likely,
                 },
             )
             .unwrap();
@@ -590,6 +591,7 @@ mod tests {
                 path: &lock,
                 check: Some(&check),
                 hold: false,
+                resumption: crate::callback::stale_context::Resumption::Likely,
             },
         );
         assert!(matches!(result, Err(SendFailure::Suppressed)));

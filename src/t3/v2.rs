@@ -152,6 +152,16 @@ const ACTIVE_RUN_SQL: &str = "
     SELECT run_id FROM orchestration_v2_projection_runs
     WHERE thread_id = ?1 AND status IN ('preparing', 'starting', 'running', 'waiting')
     ORDER BY ordinal DESC LIMIT 1";
+// a compaction run is one whose user message is the compact command, whether
+// homebased or T3's own idle compaction dispatched it
+const COMPACTION_RUN_SQL: &str = "
+    SELECT 1 FROM orchestration_v2_projection_runs r
+    JOIN orchestration_v2_projection_messages m
+      ON m.message_id = json_extract(r.payload_json, '$.userMessageId')
+    WHERE r.thread_id = ?1 AND r.status IN ('preparing', 'starting', 'running', 'waiting')
+      AND json_valid(r.payload_json) AND json_valid(m.payload_json)
+      AND json_extract(m.payload_json, '$.text') = ?2
+    LIMIT 1";
 const REQUIRED_STATE_SQL: &str = "
     SELECT p.thread_id, p.provider, p.driver, p.payload_json, p.updated_at,
            t.thread_id, t.title, t.archived_at, t.deleted_at
@@ -456,6 +466,20 @@ pub(super) fn active_run(path: &Path, t3_thread: &str) -> Result<Option<String>,
     db.query_row(ACTIVE_RUN_SQL, [t3_thread], |row| row.get(0))
         .optional()
         .map_err(|_| "statev2.sqlite active run lookup failed".to_string())
+}
+
+/// Whether T3 thread `t3_thread` runs a compaction now, a run whose message
+/// is `command`
+pub(super) fn compaction_running(
+    path: &Path,
+    t3_thread: &str,
+    command: &str,
+) -> Result<bool, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    db.query_row(COMPACTION_RUN_SQL, [t3_thread, command], |_| Ok(()))
+        .optional()
+        .map(|run| run.is_some())
+        .map_err(|_| "statev2.sqlite compaction run lookup failed".to_string())
 }
 
 /// Active provider thread of every thread that is not deleted, as in [`active_thread`]

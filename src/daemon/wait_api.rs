@@ -14,6 +14,10 @@
 //! A request that names bare ids has each one resolved to a task, a job, or a
 //! thread watch here, and the `Open` frame reports the result so the client's reconnects
 //! name typed targets and never resolve again
+//!
+//! `POST /v1/tasks/sleep` registers a sleep instead: the same targets, checked
+//! the same way, each held so its progress events settle without waking the
+//! thread until a final event or an alert does
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -42,8 +46,9 @@ use crate::events::EventPayload;
 use crate::queue::delivery::JobSubmission;
 use crate::queue::{JobEventKind, JobId, QueueError};
 use crate::task_wait::{
-    RequestedTargets, WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys,
-    WaitRequest, WaitSet,
+    RequestedTargets, SLEEP_ROUTE, SleepOutcome, SleepRequest, SleepResponse, SleepTarget,
+    WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys, WaitRequest,
+    WaitSet,
 };
 use crate::thread_watch::{WatchId, line_ends_watch};
 
@@ -64,6 +69,85 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(WAIT_ROUTE, post(wait))
         .route(WAIT_ACK_ROUTE, post(ack))
+        .route(SLEEP_ROUTE, post(sleep))
+}
+
+/// Hold each live task and job a sleeping thread names
+///
+/// The store reads the settled events and writes the hold in one transaction,
+/// so an event that settles meanwhile is either read or settles into the
+/// hold. A task's unsettled events are then dispatched again, so each is held
+/// or delivered as a new one would be; the job event sender rescans pending
+/// job events several times a second on its own
+async fn sleep(
+    State(state): State<AppState>,
+    Json(request): Json<SleepRequest>,
+) -> Result<Json<SleepResponse>, AppError> {
+    let ids = request.ids().map_err(|error| AppError::Usage {
+        message: error.to_string(),
+    })?;
+    let targets = resolve(&state, &ids).await?;
+    let thread = request.thread;
+    for key in targets.keys() {
+        match *key {
+            WaitKey::Task(task) => check_target(&state, thread, task).await?,
+            WaitKey::Job(job) => check_job(&state, thread, job).await?,
+            WaitKey::Watch(watch) => check_watch(&state, thread, watch).await?,
+        }
+    }
+
+    let mut outcomes = Vec::with_capacity(targets.keys().len());
+    for target in targets.keys().iter().copied() {
+        let outcome = match target {
+            WaitKey::Task(task) => hold_task(&state, thread, task).await?,
+            WaitKey::Job(job) => {
+                call(&state.store, |reply| StoreMsg::HoldJob {
+                    job,
+                    thread,
+                    reply,
+                })
+                .await?
+            }
+            WaitKey::Watch(id) => {
+                let ended = call(&state.store, |reply| StoreMsg::GetWatch { id, reply })
+                    .await?
+                    .is_none_or(|record| record.ended_at.is_some());
+                if ended {
+                    SleepOutcome::AlreadyEnded
+                } else {
+                    SleepOutcome::Watched
+                }
+            }
+        };
+        outcomes.push(SleepTarget { target, outcome });
+    }
+    Ok(Json(SleepResponse { targets: outcomes }))
+}
+
+/// Hold task chain `task` and dispatch the held run's unsettled events again
+async fn hold_task(
+    state: &AppState,
+    thread: ThreadId,
+    task: TaskId,
+) -> Result<SleepOutcome, AppError> {
+    let outcome = call(&state.store, |reply| StoreMsg::HoldTask {
+        task,
+        thread,
+        reply,
+    })
+    .await?;
+    let held = match outcome {
+        SleepOutcome::Held => task,
+        SleepOutcome::FollowedTo(continuation) => continuation,
+        SleepOutcome::AlreadyEnded | SleepOutcome::Watched => return Ok(outcome),
+    };
+    state
+        .supervisor
+        .cast(SupervisorMsg::DispatchInbox { id: held })
+        .map_err(|error| AppError::Internal {
+            message: format!("wake inbox worker: {error}"),
+        })?;
+    Ok(outcome)
 }
 
 /// The client printed one event; the sender that handed it off may settle it

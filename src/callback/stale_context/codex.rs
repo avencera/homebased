@@ -248,6 +248,7 @@ mod tests {
 
     use super::test_support::{rollout, token_count};
     use super::*;
+    use crate::callback::stale_context::Resumption;
     use crate::t3::TurnStart;
 
     const THREAD: &str = "01a1b66a-67fb-7641-994a-c2b3d199eb4b";
@@ -303,7 +304,7 @@ mod tests {
         assert!(!found.tokens_estimated());
         assert_eq!(found.context_window(), Some(258_400));
         assert_eq!(found.last_active(), at(56));
-        assert!(found.idle_compaction_due(now()));
+        assert!(found.idle_compaction_due(now(), Resumption::Likely));
     }
 
     #[test]
@@ -328,13 +329,16 @@ mod tests {
         }])
         .unwrap();
         assert_eq!(running.tokens(), 256_690);
-        assert!(running.cold_compaction_due(now()));
-        assert_eq!(running.turn_start(now()), TurnStart::AfterActive);
+        assert!(running.cold_compaction_due(now(), Resumption::Likely));
+        assert_eq!(
+            running.turn_start(now(), Resumption::Likely),
+            TurnStart::AfterActive
+        );
 
         let landed = context(&[before[0].clone(), compacted.clone(), estimate.clone()]).unwrap();
         assert_eq!(landed.tokens(), 24_740);
         assert!(landed.tokens_estimated());
-        assert!(!landed.cold_compaction_due(now()));
+        assert!(!landed.cold_compaction_due(now(), Resumption::Likely));
 
         let measured = context(&[
             before[0].clone(),
