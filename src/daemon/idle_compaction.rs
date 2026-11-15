@@ -67,6 +67,10 @@ pub(super) async fn run(state: AppState) {
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
+        // before the idle compactions, so no compaction adds a run ahead of a
+        // child's settle, and before the watches, so a child it settles ends
+        // its watch this scan
+        child_threads::scan(&state, &mut children).await;
         match local_sources(&state).await {
             Ok(sources) => {
                 let log = log.clone();
@@ -87,8 +91,6 @@ pub(super) async fn run(state: AppState) {
             }
             Err(error) => warn!("idle compaction scan: {error}"),
         }
-        // before the watches, so a child it settles ends its watch this scan
-        child_threads::scan(&state, &mut children).await;
         // after the idle compactions, so a watch reads a size they already changed
         watch_scan::scan(&state, &mut watches, Utc::now()).await;
         service_api::scan(&state, &mut owners).await;

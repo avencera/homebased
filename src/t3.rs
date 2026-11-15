@@ -403,7 +403,9 @@ pub(crate) fn compaction_running(env: &T3Env, thread: ProviderThread) -> bool {
 /// as `delegate_task` children do
 ///
 /// T3 reports such a thread to its parent when its turn ends, so the turn
-/// must not end before the work does. An unreadable state answers `false`
+/// must not end before the work does. A state file that exists but cannot be
+/// read answers `true`: a bounded wait is safe for any thread, while a sleep
+/// would end a subagent's turn before its work
 pub(crate) fn runs_delegated_task(env: &T3Env, t3_thread: &str) -> bool {
     let state = state_path(&env.userdata());
     if !state.is_file() {
@@ -411,7 +413,9 @@ pub(crate) fn runs_delegated_task(env: &T3Env, t3_thread: &str) -> bool {
     }
     v2::thread_rows(&state)
         .inspect_err(|detail| tracing::debug!(%detail, "T3 threads cannot be read"))
-        .is_ok_and(|rows| rows.iter().any(|row| row.id == t3_thread && row.delegate))
+        .map_or(true, |rows| {
+            rows.iter().any(|row| row.id == t3_thread && row.delegate)
+        })
 }
 
 /// Whether T3's state maps a T3 thread to `thread`, without asking the T3
