@@ -9,6 +9,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
 };
+use crate::child_thread::{Lineage, LinkEnd, LinkId, LinkView, ReportStage, ThreadReport};
 use crate::daemon::actors::send_reply;
 use crate::dependency::{DependencyId, DependencyLookup, HeldCancellation};
 use crate::domain::{
@@ -30,7 +31,7 @@ use crate::message::{
 };
 use crate::spec::NormalizedSpec;
 use crate::store::{
-    CancelResult, HeldCancel, IdentityError, LocalAdmission, Store, TaskPresentation,
+    CancelResult, HeldCancel, IdentityError, LocalAdmission, OwedTarget, Store, TaskPresentation,
     UnlaunchedTask,
 };
 use crate::submission::{
@@ -631,6 +632,50 @@ pub(crate) enum StoreMsg {
     /// Read origin threads that still wait for a task or queue job callback
     WaitingThreads {
         reply: RpcReplyPort<Result<Vec<ThreadId>, AppError>>,
+    },
+    /// Read each task and queue job that still owes a thread events
+    OwedTargets {
+        reply: RpcReplyPort<Result<Vec<OwedTarget>, AppError>>,
+    },
+    /// Save the link a `t3 launch --child` made
+    InsertLineage {
+        lineage: Lineage,
+        reply: RpcReplyPort<Result<Lineage, AppError>>,
+    },
+    /// Read the link that names a thread as its child
+    LineageOfChild {
+        child: LinkEnd,
+        reply: RpcReplyPort<Result<Option<Lineage>, AppError>>,
+    },
+    /// Read every child-thread link this machine holds
+    ThreadLinks {
+        reply: RpcReplyPort<Result<Vec<LinkView>, AppError>>,
+    },
+    /// Close a link whose child was put away without a report
+    CloseLink {
+        id: LinkId,
+        now: DateTime<Utc>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Save a child thread's report, or read the one already saved
+    BeginReport {
+        report: Box<ThreadReport>,
+        reply: RpcReplyPort<Result<(ThreadReport, bool), AppError>>,
+    },
+    /// Read the report a child thread saved
+    ThreadReport {
+        id: LinkId,
+        reply: RpcReplyPort<Result<Option<ThreadReport>, AppError>>,
+    },
+    /// Read reports whose send or settle is unfinished
+    OpenReports {
+        reply: RpcReplyPort<Result<Vec<ThreadReport>, AppError>>,
+    },
+    /// Move a report on to its next stage
+    AdvanceReport {
+        id: LinkId,
+        next: ReportStage,
+        reply: RpcReplyPort<Result<ThreadReport, AppError>>,
     },
     /// Read routes that wait for dependencies or for their launch to be answered
     HeldRoutes {
@@ -1243,6 +1288,23 @@ impl Actor for StoreActor {
                 send_reply(reply, state.inbound_events(id).map_err(event_error));
             }
             StoreMsg::WaitingThreads { reply } => send_reply(reply, state.waiting_threads()),
+            StoreMsg::OwedTargets { reply } => send_reply(reply, state.owed_targets()),
+            StoreMsg::InsertLineage { lineage, reply } => {
+                send_reply(reply, state.insert_lineage(&lineage));
+            }
+            StoreMsg::LineageOfChild { child, reply } => {
+                send_reply(reply, state.lineage_of_child(&child));
+            }
+            StoreMsg::ThreadLinks { reply } => send_reply(reply, state.thread_links()),
+            StoreMsg::CloseLink { id, now, reply } => send_reply(reply, state.close_link(id, now)),
+            StoreMsg::BeginReport { report, reply } => {
+                send_reply(reply, state.begin_report(&report));
+            }
+            StoreMsg::ThreadReport { id, reply } => send_reply(reply, state.thread_report(id)),
+            StoreMsg::OpenReports { reply } => send_reply(reply, state.open_reports()),
+            StoreMsg::AdvanceReport { id, next, reply } => {
+                send_reply(reply, state.advance_report(id, next));
+            }
             StoreMsg::UpsertWatch { watch, reply } => send_reply(reply, state.upsert_watch(&watch)),
             StoreMsg::GetWatch { id, reply } => send_reply(reply, state.watch_record(id)),
             StoreMsg::ListWatches {

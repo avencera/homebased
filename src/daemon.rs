@@ -4,6 +4,7 @@ pub mod actors;
 pub mod api;
 mod cancel_delivery;
 mod chains;
+mod child_threads;
 pub mod ci_api;
 pub(crate) mod ci_gauge;
 pub mod cluster;

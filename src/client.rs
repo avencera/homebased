@@ -525,6 +525,20 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             selector: decode_field(input, "selector").unwrap_or_default(),
             projects: decode_field(input, "projects").unwrap_or_default(),
         },
+        "not_child_thread" => decode_field(input, "thread")
+            .map_or(AppError::Internal { message }, |thread| {
+                AppError::NotChildThread { thread }
+            }),
+        "thread_report_refused" => decode_field(input, "open")
+            .map_or(AppError::Internal { message }, |open| {
+                AppError::ThreadReportRefused { open }
+            }),
+        "thread_report_conflict" => {
+            match (decode_field(input, "link"), decode_field(input, "stage")) {
+                (Some(link), Some(stage)) => AppError::ThreadReportConflict { link, stage },
+                _ => AppError::Internal { message },
+            }
+        }
         "t3_launch_refused" => AppError::T3LaunchRefused {
             message: decode_field(input, "message").unwrap_or(message),
         },
@@ -737,6 +751,26 @@ mod tests {
                 task: crate::domain::TaskId::new(),
                 origin_machine: crate::machine::MachineId::new(),
                 execution_machine: crate::machine::MachineId::new(),
+            },
+            AppError::NotChildThread {
+                thread: "thread_root".into(),
+            },
+            AppError::ThreadReportRefused {
+                open: vec![
+                    crate::child_thread::OpenWork::Task {
+                        id: uuid::Uuid::now_v7(),
+                    },
+                    crate::child_thread::OpenWork::Child {
+                        child: crate::child_thread::LinkEnd {
+                            machine: crate::machine::MachineId::new(),
+                            t3_thread: "grandchild".into(),
+                        },
+                    },
+                ],
+            },
+            AppError::ThreadReportConflict {
+                link: crate::child_thread::LinkId::from_launch(uuid::Uuid::now_v7()),
+                stage: crate::child_thread::ReportStageKind::Sent,
             },
         ];
 

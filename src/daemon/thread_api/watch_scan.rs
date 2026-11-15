@@ -13,7 +13,8 @@
 //! stays finished, settled or idle after its delegated task ended, for
 //! [`QUIET_FINISHED`] without activity, and when the T3 thread that receives
 //! its events, always on this machine, is archived or deleted or stays
-//! finished as long. A finished thread never fires, so a watch never compacts
+//! finished as long. A child thread that has reported and settled ends its
+//! watches at once. A finished thread never fires, so a watch never compacts
 //! a thread whose work is done, whether the watch names it or its session. A thread found gone ends its watch only after
 //! [`GONE_SCANS`] scans in a row, so one bad read does not. The counts and
 //! clocks live in memory: a restart starts them over, which only delays an end
@@ -369,6 +370,11 @@ fn decide<'a>(
     // a session watch of a T3 thread follows the same rule. Only T3 records a
     // thread as done
     let finished = thread.done();
+    // a child thread that reported and settled is done for good: its machine
+    // settles it only once its reporting run has ended with nothing after
+    if finished && reported(thread) {
+        return Decision::End(WatchEndReason::Finished, Some(thread));
+    }
     if track.quiet_for(thread, finished, clock) {
         return Decision::End(WatchEndReason::Finished, Some(thread));
     }
@@ -412,13 +418,23 @@ fn context_decision(
     }
 }
 
+/// Whether `thread` is a child thread whose parent has its report
+fn reported(thread: &ThreadContext) -> bool {
+    thread
+        .child_thread
+        .as_ref()
+        .is_some_and(|child| child.reported)
+}
+
 /// [`decide`] for a stall watch, once its thread is known to be there
 ///
 /// A thread stalls when it is idle, its work is not done, and its last
 /// activity is older than the grace. `idle` already leaves out a thread that
-/// homebased work or a T3 delegated task still owes a wake, which shows as
-/// `waiting`. A fired watch re-arms only on activity: a turn, a wait, or new
-/// session activity within the grace, so one stall fires once
+/// homebased work, a T3 delegated task, or a child thread still owes a wake,
+/// which shows as `waiting`. A child thread that has sent its report is done
+/// with what its parent waits for, so it never stalls. A fired watch re-arms
+/// only on activity: a turn, a wait, or new session activity within the
+/// grace, so one stall fires once
 ///
 /// Waiting writes nothing to the session, so after a long wait `last_active`
 /// is old. The wake that ends a wait lands a moment after the thread stops
@@ -444,7 +460,10 @@ fn stall_decision<'a>(
         // a settled thread is finished, and an unknown one tells nothing
         ThreadState::Settled | ThreadState::Archived | ThreadState::Unknown => false,
     };
-    let stalled = !finished && thread.state == ThreadState::Idle && recent == Some(false);
+    let stalled = !finished
+        && !reported(thread)
+        && thread.state == ThreadState::Idle
+        && recent == Some(false);
 
     match armed {
         true if stalled => Decision::Fire(thread),
@@ -843,6 +862,7 @@ mod tests {
             cache_warm: None,
             compacted_at: None,
             parent_t3_thread: None,
+            child_thread: None,
             details: ThreadDetails::default(),
         }
     }

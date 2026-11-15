@@ -46,7 +46,7 @@ pub use launch::{
     AddedProject, IconChange, IconColor, InteractionMode, LaunchError, LaunchSpec, LaunchedThread,
     MESSAGE_MAX_BYTES as LAUNCH_MESSAGE_MAX_BYTES, ModelChoice, ModelOption, OptionValue,
     ProjectIcon, ProjectSpec, ProviderInstance, RuntimeMode, T3Project, Workspace, add_project,
-    launch_thread, projects, providers,
+    launch_thread, launch_thread_id, projects, providers,
 };
 
 use std::ffi::OsString;
@@ -59,6 +59,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -662,6 +663,91 @@ pub(crate) fn thread_put_away(env: &T3Env, thread_id: &str) -> Option<bool> {
         .ok()
 }
 
+/// The run active in the T3 thread `t3_thread` now, if any
+///
+/// # Errors
+///
+/// When there is no T3 state or it cannot be read
+pub(crate) fn active_run_of(env: &T3Env, t3_thread: &str) -> Result<Option<String>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Err("this machine has no T3 state".into());
+    }
+    v2::active_run(&state, t3_thread)
+}
+
+/// What a child thread's deferred settle reads from T3, see [`SettleState::due`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettleState {
+    /// Archived or deleted, or gone from T3's state
+    pub(crate) put_away: bool,
+    /// Settled in T3's sidebar already
+    pub(crate) settled: bool,
+    /// Newest run of the thread, whatever its status
+    pub(crate) latest_run: Option<String>,
+    /// Whether that run is queued or has not finished
+    pub(crate) run_active: bool,
+    /// Whether a user message reached the thread after the report was saved
+    pub(crate) later_message: bool,
+}
+
+/// What a deferred settle should do next
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleDue {
+    /// The reporting run has not ended
+    Wait,
+    /// Settle now, guarded by the reporting run
+    Settle,
+    /// Settled or put away already, so nothing is left to do
+    AlreadyDone,
+    /// A later run or user message keeps the thread active
+    Skip,
+}
+
+impl SettleState {
+    /// Decide the next step for a report made during `run`
+    pub(crate) fn due(&self, run: &str) -> SettleDue {
+        if self.put_away || self.settled {
+            return SettleDue::AlreadyDone;
+        }
+        if self.later_message || self.latest_run.as_deref() != Some(run) {
+            return SettleDue::Skip;
+        }
+        if self.run_active {
+            return SettleDue::Wait;
+        }
+        SettleDue::Settle
+    }
+}
+
+/// Read what the deferred settle of `t3_thread` needs, for a report saved at
+/// `since`
+///
+/// # Errors
+///
+/// When there is no T3 state or it cannot be read, so the settle waits
+pub(crate) fn settle_state(
+    env: &T3Env,
+    t3_thread: &str,
+    since: DateTime<Utc>,
+) -> Result<SettleState, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Err("this machine has no T3 state".into());
+    }
+    let since = since.to_rfc3339_opts(SecondsFormat::Millis, true);
+    v2::settle_state(&state, t3_thread, &since)
+}
+
+/// Settle the T3 thread `t3_thread` once `run` has ended, which T3 refuses
+/// when a later run started
+pub(crate) fn settle_thread(env: &T3Env, t3_thread: &str, run: &str) -> WakeOutcome {
+    with_t3_thread(env, t3_thread.to_string(), |owner| {
+        v2::settle(owner.origin, owner.thread, run, owner.token)
+    })
+    .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
 /// The T3 threads here that this machine's T3 is due to wake with the report
 /// of a delegated task they started
 ///
@@ -757,12 +843,20 @@ fn with_owner(
     provider_thread: ProviderThread,
     action: impl FnOnce(Owner<'_>) -> Result<(), ApiFailure>,
 ) -> Result<WakeOutcome, SendFailure> {
+    match find_thread(&env.userdata(), provider_thread) {
+        Ok(Some(t3_thread)) => with_t3_thread(env, t3_thread, action),
+        Ok(None) => Ok(WakeOutcome::NotT3Thread),
+        Err(detail) => Ok(WakeOutcome::Unavailable(detail)),
+    }
+}
+
+/// Run `action` against the T3 thread `t3_thread`, as [`with_owner`] does
+fn with_t3_thread(
+    env: &T3Env,
+    t3_thread: String,
+    action: impl FnOnce(Owner<'_>) -> Result<(), ApiFailure>,
+) -> Result<WakeOutcome, SendFailure> {
     let userdata = env.userdata();
-    let t3_thread = match find_thread(&userdata, provider_thread) {
-        Ok(Some(t3_thread)) => t3_thread,
-        Ok(None) => return Ok(WakeOutcome::NotT3Thread),
-        Err(detail) => return Ok(WakeOutcome::Unavailable(detail)),
-    };
     let server = match connect(&userdata) {
         Ok(server) => server,
         Err(failure) => return Ok(failure.into_wake_outcome()),

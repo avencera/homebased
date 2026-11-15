@@ -724,6 +724,12 @@ pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, L
     })
 }
 
+/// T3 thread id a launch with request id `request` makes, known before it runs
+#[must_use]
+pub fn launch_thread_id(request: Uuid) -> String {
+    LaunchIds::new(request).thread
+}
+
 /// T3 ids for one launch, all fixed by the request id so a retry repeats them
 struct LaunchIds {
     command: String,

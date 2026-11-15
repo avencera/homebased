@@ -1,10 +1,13 @@
 //! `homebased thread`: context size, compaction, and watches of agent threads
-//! anywhere in the Fleet
+//! anywhere in the Fleet, and the report a child thread sends its parent
 
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Subcommand;
 
+use crate::child_thread::{ReportStageKind, ThreadReportRequest, ThreadReportResponse};
 use crate::client::Client;
 use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
@@ -42,9 +45,11 @@ pub enum ThreadCommand {
         /// Thread references; the calling thread when none is given
         #[arg(value_name = "REF")]
         refs: Vec<String>,
-        /// List the calling thread's T3 subagents too, finished ones included,
-        /// to rebuild a list of delegates; forks are left out. A child whose
-        /// delegated task ended reads as `finished` while it is idle
+        /// List the calling thread's T3 subagents, and the child threads it
+        /// launched with `t3 launch --child` on any Fleet machine, finished
+        /// ones included, to rebuild a list of delegates; forks are left out.
+        /// A subagent whose delegated task ended reads as `finished` while it
+        /// is idle
         #[arg(long)]
         children: bool,
         /// With --children, leave out archived children, and settled ones or
@@ -69,8 +74,10 @@ pub enum ThreadCommand {
     /// the limit, and again only after the context drops below it. With
     /// --stalled-after, sends `THREAD_STALLED` once the thread has sat `idle`
     /// that long: no turn running, no homebased task or job owing it events,
-    /// and no T3 delegated task due to report to it. It fires again only after
-    /// the thread is active and stalls again. A stall watch on a top-level
+    /// no T3 delegated task due to report to it, and no child thread owing it
+    /// a report. It fires again only after the thread is active and stalls
+    /// again. A child thread that has sent its `thread report` never stalls,
+    /// and its watch ends once it settles. A stall watch on another top-level
     /// thread cannot tell a stall from a thread that sent its last report, so
     /// unwatch it when that report arrives; a delegate's watch ends on its own.
     /// The calling thread receives the events like task callbacks; `homebased
@@ -108,8 +115,9 @@ pub enum ThreadCommand {
         /// and no `THREAD_WATCH_ENDED` follows
         #[arg(long)]
         once: bool,
-        /// Watch the calling thread's live T3 subagents too: those not
-        /// settled, archived, or done with their delegated task, never forks
+        /// Watch the calling thread's live T3 subagents and launched child
+        /// threads too: those not settled, archived, or done with their
+        /// delegated task, never forks
         #[arg(long)]
         children: bool,
         /// Look only on this machine name or UUID; with --children, list
@@ -140,6 +148,25 @@ pub enum ThreadCommand {
     Unwatch {
         /// Watch id that `thread watch` printed
         id: WatchId,
+    },
+    /// Report back once from a child thread, then settle it
+    ///
+    /// Runs in a thread that `homebased t3 launch --child` started. Refuses
+    /// while the thread still has open work: a homebased task or queue job
+    /// without its final event, a T3 subagent due to report to it, or a
+    /// child thread of its own that has neither reported nor been archived or
+    /// settled. Sends the report to the parent thread as a
+    /// `HOMEBASED_MESSAGE`, then settles this thread once the turn that ran
+    /// the command has ended, unless a later run or message keeps it active.
+    /// A retry, or a daemon restart, finishes the same report and never sends
+    /// a second one; a retry with other text is refused.
+    Report {
+        /// The report: what was done, what was found, and what is left
+        #[arg(long)]
+        summary: String,
+        /// Append this file's text to the report, or stdin with `-`
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Ask T3 to compact a T3 thread on whichever machine runs it
     ///
@@ -259,6 +286,20 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 )
                 .await?;
             print_watches(ctx, &response, "no watch")
+        }
+        ThreadCommand::Report { summary, file } => {
+            let body = match file {
+                Some(path) => format!("{summary}\n\n{}", read_text(&path)?),
+                None => summary,
+            };
+            let request = ThreadReportRequest {
+                api_version: API_VERSION,
+                caller: Caller::from_env()?,
+                body,
+            };
+            let response: ThreadReportResponse =
+                client.post_json("/v1/threads/report", &request).await?;
+            print_report(ctx, &response)
         }
         ThreadCommand::Compact {
             reference,
@@ -394,6 +435,44 @@ fn child_line(child: &ThreadContext) -> String {
         })
         .unwrap_or_default();
     format!("{provider}{}", child.human_line())
+}
+
+/// The text of `path`, or stdin for `-`
+fn read_text(path: &Path) -> Result<String, AppError> {
+    if path.as_os_str() == "-" {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path).map_err(|error| AppError::FileNotFound {
+        message: format!("read report file {}: {error}", path.display()),
+    })
+}
+
+fn print_report(ctx: &Ctx, response: &ThreadReportResponse) -> Result<ExitCode, AppError> {
+    let report = &response.report;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(serde_json::to_value(response)?)?,
+        OutputMode::Quiet => println!("{}", report.message_id),
+        OutputMode::Human => {
+            let verb = if response.resumed {
+                "already reported"
+            } else {
+                "reported"
+            };
+            let next = match report.stage {
+                ReportStageKind::Sending => "the send is unfinished; homebased retries it",
+                ReportStageKind::SettlePending => "this thread settles once this turn ends",
+                ReportStageKind::Sent => "this thread stays active",
+                ReportStageKind::Settled => "this thread is settled",
+            };
+            println!(
+                "{verb} to thread_{} on machine {} as message {}; {next}",
+                report.parent.t3_thread, report.parent.machine, report.message_id
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_watches(ctx: &Ctx, response: &WatchesResponse, empty: &str) -> Result<ExitCode, AppError> {

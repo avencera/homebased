@@ -15,6 +15,7 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::child_thread::ChildThreadInfo;
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -442,6 +443,11 @@ pub struct ThreadContext {
     pub compacted_at: Option<DateTime<Utc>>,
     /// T3 thread that started this one, for a child
     pub parent_t3_thread: Option<String>,
+    /// The link to the thread that launched this one with `t3 launch
+    /// --child`; `None` for any other thread, and from a peer that predates
+    /// the field
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread: Option<ChildThreadInfo>,
     /// Project, branch, model, and other context T3 records
     #[serde(flatten)]
     pub details: ThreadDetails,

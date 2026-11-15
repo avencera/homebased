@@ -386,6 +386,7 @@ fn idle_index(route: &OriginRoute, waiting: impl IntoIterator<Item = ThreadId>) 
         workers: Vec::new(),
         waiting: waiting.into_iter().collect(),
         titles: None,
+        links: Vec::new(),
     };
     LocalIndex::load(sources, chrono::Utc::now()).unwrap()
 }
