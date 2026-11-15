@@ -353,6 +353,8 @@ fn relative_prompt_file_resolves_against_cwd() {
         timeout: default_timeout(),
         after: None,
         machine_wait: None,
+        gpu: crate::spec::GpuAccess::Hidden,
+        mem_peak: None,
         workload: SubmitWorkloadValidated::Agent(SubmitAgent {
             agent: AgentKind::Claude,
             model: None,

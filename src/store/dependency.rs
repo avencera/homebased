@@ -223,19 +223,6 @@ pub enum HeldCancel {
 }
 
 impl Store {
-    /// Dependencies saved with a route, or `None` for a route submitted without `after`
-    pub fn route_dependencies(&self, task: TaskId) -> Result<Option<Dependencies>, AppError> {
-        let saved: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT after_json FROM origin_routes WHERE task_id=?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        decode_after(saved.flatten().as_deref())
-    }
-
     /// Routes that still wait for dependencies or for their remote launch to be answered
     pub fn held_routes(&self) -> Result<Vec<DependentRoute>, AppError> {
         self.dependent_routes(
@@ -309,8 +296,9 @@ impl Store {
     /// Routes that may be held: those with dependencies, and those that wait for their machine
     fn dependent_routes(&self, filter: &str) -> Result<Vec<DependentRoute>, AppError> {
         let sql = format!(
-            "SELECT task_id,route_json,after_json,after_rule,wait_for_machine FROM origin_routes
-             WHERE (after_json IS NOT NULL OR wait_for_machine = 1)
+            "SELECT task_id,route_json,after_json,after_rule,wait_for_machine,mem_peak_mib
+             FROM origin_routes
+             WHERE (after_json IS NOT NULL OR wait_for_machine = 1 OR mem_peak_mib IS NOT NULL)
                AND json_valid(route_json) AND {filter}
              ORDER BY task_id"
         );
@@ -323,26 +311,31 @@ impl Store {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, bool>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(task, route_json, after_json, rule, waits_for_machine)| {
-                let route = decode_route(&route_json)?;
-                if route.task.to_string() != task {
-                    return Err(AppError::ClusterTaskConflict { task: route.task });
-                }
-                let after = decode_after(after_json.as_deref())?;
-                let rule = ReleaseRule::from_storage(&rule).ok_or_else(|| AppError::Internal {
-                    message: format!("unknown release rule {rule} for {task}"),
-                })?;
-                Ok(DependentRoute {
-                    route,
-                    after,
-                    rule,
-                    waits_for_machine,
-                })
-            })
+            .map(
+                |(task, route_json, after_json, rule, waits_for_machine, mem_peak)| {
+                    let route = decode_route(&route_json)?;
+                    if route.task.to_string() != task {
+                        return Err(AppError::ClusterTaskConflict { task: route.task });
+                    }
+                    let after = decode_after(after_json.as_deref())?;
+                    let rule =
+                        ReleaseRule::from_storage(&rule).ok_or_else(|| AppError::Internal {
+                            message: format!("unknown release rule {rule} for {task}"),
+                        })?;
+                    Ok(DependentRoute {
+                        route,
+                        after,
+                        rule,
+                        waits_for_machine,
+                        mem_peak: super::identity::stored_mem_peak(mem_peak)?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -644,6 +637,7 @@ mod tests {
         ReleaseTerms {
             after: Some(after),
             machine_wait: None,
+            mem_peak: None,
         }
     }
 
@@ -684,7 +678,10 @@ mod tests {
                 .insert_origin_route_with(&retry, &after_terms(self::after()))
                 .is_err()
         );
-        assert_eq!(store.route_dependencies(route.task).unwrap(), Some(after));
+        assert_eq!(
+            store.route_release_terms(route.task).unwrap(),
+            Some(after_terms(after))
+        );
         assert_eq!(
             store.dependency_states(&[route.task.into()]).unwrap(),
             vec![(
@@ -700,6 +697,7 @@ mod tests {
             machine_wait: Some(MachineWait {
                 coalesce: coalesce.map(|key| CoalesceKey::new(key.into()).unwrap()),
             }),
+            mem_peak: None,
         }
     }
 

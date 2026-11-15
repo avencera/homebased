@@ -26,8 +26,8 @@ use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse, DEFAULT_MAX_BODY};
 use crate::machine::{MachineId, MachineName};
 use crate::t3::{
-    AddedProject, LaunchError, LaunchSpec, LaunchedThread, ProjectSpec, T3Env, T3Project,
-    add_project, launch_thread, projects,
+    AddedProject, LaunchError, LaunchSpec, LaunchedThread, ProjectSpec, ProviderInstance, T3Env,
+    T3Project, add_project, launch_thread, projects, providers,
 };
 
 const CLUSTER_LAUNCH_PATH: &str = "/v1/cluster/t3/launch";
@@ -37,6 +37,9 @@ const CLUSTER_PROJECT_ADD_PATH: &str = "/v1/cluster/t3/projects/add";
 // the peer issues a token, waits up to 30 seconds for T3, and revokes the token
 const LAUNCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const PROJECTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// provider discovery asks the running T3, so it gets a share of the listing
+// deadline and the projects go back without it when T3 is slow
+const PROVIDERS_BUDGET: Duration = Duration::from_secs(4);
 // the peer runs `t3 project add`, which has its own 10 second deadline
 const PROJECT_ADD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -90,6 +93,9 @@ pub struct T3ProjectsBody {
     pub machine: MachineId,
     /// Projects, by title
     pub projects: Vec<T3Project>,
+    /// Enabled provider instances, by id; absent from a peer that predates them
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<ProviderInstance>>,
 }
 
 /// `POST /v1/t3/projects/add` body
@@ -237,7 +243,7 @@ async fn list_projects(
 ) -> Result<Json<T3ProjectsBody>, AppError> {
     check_api_version(body.api_version)?;
     let destination = destination(&state, body.machine.as_deref()).await?;
-    let projects = if destination == state.machine.identity.machine {
+    let (projects, providers) = if destination == state.machine.identity.machine {
         projects_here().await?
     } else {
         let fleet = state
@@ -258,13 +264,14 @@ async fn list_projects(
                 message: error.to_string(),
             })?;
         let body: T3ProjectsBody = peer_body(destination, &response)?;
-        body.projects
+        (body.projects, body.providers)
     };
 
     Ok(Json(T3ProjectsBody {
         api_version: API_VERSION,
         machine: destination,
         projects,
+        providers,
     }))
 }
 
@@ -277,10 +284,12 @@ async fn cluster_projects(
         .identity
         .check_destination(query.destination_machine)?;
     check_api_version(query.api_version)?;
+    let (projects, providers) = projects_here().await?;
     Ok(Json(T3ProjectsBody {
         api_version: API_VERSION,
         machine: state.machine.identity.machine,
-        projects: projects_here().await?,
+        projects,
+        providers,
     }))
 }
 
@@ -352,14 +361,25 @@ async fn launch_here(machine: MachineId, launch: LaunchSpec) -> Result<LaunchedT
         })
 }
 
-async fn projects_here() -> Result<Vec<T3Project>, AppError> {
-    tokio::task::spawn_blocking(|| projects(&T3Env::from_env()))
+/// Projects and enabled provider instances of T3 on this machine
+///
+/// Providers are `None` when T3 cannot say within [`PROVIDERS_BUDGET`]; the
+/// discovery left running then finishes, and revokes its token, on its own
+async fn projects_here() -> Result<(Vec<T3Project>, Option<Vec<ProviderInstance>>), AppError> {
+    let discovery = tokio::task::spawn_blocking(|| providers(&T3Env::from_env()));
+    let projects = tokio::task::spawn_blocking(|| projects(&T3Env::from_env()))
         .await
         .map_err(|error| AppError::Internal {
             message: format!("T3 project worker failed: {error}"),
         })?
         // reading projects sends nothing to T3, so its outcome is never unknown
-        .map_err(|error| t3_error(error, |message| AppError::T3Unavailable { message }))
+        .map_err(|error| t3_error(error, |message| AppError::T3Unavailable { message }))?;
+    let providers = tokio::time::timeout(PROVIDERS_BUDGET, discovery)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    Ok((projects, providers))
 }
 
 async fn add_here(spec: ProjectSpec) -> Result<AddedProject, AppError> {

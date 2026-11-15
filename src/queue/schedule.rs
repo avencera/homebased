@@ -6,11 +6,13 @@
 //! head drives the notice timer. Nothing here performs I/O
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::TaskId;
+use crate::memory::{MemPeak, MemoryWait, Room};
 
 use super::{
     ActiveRun, AttentionId, JobId, PreemptRefusal, PreemptStop, Preemption, Priority, ResourceId,
@@ -50,6 +52,8 @@ pub struct JobView {
     pub preempt: Preemption,
     /// Whether it waits or runs
     pub state: QueuedState,
+    /// Host memory its runs may use at their peak; `None` skips the memory check
+    pub mem_peak: Option<MemPeak>,
 }
 
 /// Notice thresholds from `[resource.notify_blocked_after]`
@@ -98,6 +102,9 @@ pub struct Snapshot {
     pub episode: Option<StoredEpisode>,
     /// Notice thresholds
     pub thresholds: NoticeThresholds,
+    /// Host memory left for jobs with a peak; `None` when it was not read,
+    /// which starts none of them
+    pub memory: Option<Room>,
 }
 
 /// Start `job` on `resource`
@@ -173,6 +180,9 @@ pub struct Decisions {
     pub preemption: Option<Preempt>,
     /// The blocked head; `None` ends any open episode
     pub blocked: Option<BlockedHead>,
+    /// Jobs that have a free resource but wait for host memory, each holding
+    /// that resource and reserving its peak
+    pub memory_waits: BTreeMap<JobId, MemoryWait>,
 }
 
 /// Decide launches, at most one preemption, and the blocked head
@@ -183,12 +193,21 @@ pub struct Decisions {
 ///    busy is skipped, so it never blocks a job behind it from another
 ///    resource. A job whose previous run is still being cleaned up, on any
 ///    resource, waits for that cleanup, since leftovers of that run may still
-///    write to its job directory
+///    write to its job directory. A job with a memory peak starts only when
+///    the peak fits the room left; one that does not fit keeps the free
+///    resource it would take and reserves its peak, so no job behind it takes
+///    either while it waits for memory
 /// 2. Walk the jobs still queued in serving order and preempt for the first
 ///    with an executing run of a strictly lower level on an allowed resource
 ///    whose mode allows a stop now. No new preemption starts while any resource
-///    is stopping for preemption. The lowest level goes first, then the cheapest
-///    stop, then the most recent start. The first queued job remains the notice head
+///    is stopping for preemption. A job with a memory peak preempts only a run
+///    whose stop leaves room for it: the room left at its place in serving
+///    order, less the peaks of jobs behind it that launch in step 1, plus the
+///    victim job's own peak, since a victim without one frees an unknown
+///    amount. A job behind it that only waits for memory reserves nothing
+///    from it. Otherwise the victim would lose its step while the GPU sits idle.
+///    The lowest level goes first, then the cheapest stop, then the most recent
+///    start. The first queued job remains the notice head
 #[must_use]
 pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut free: Vec<&ResourceView> = snapshot
@@ -199,16 +218,32 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     free.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut launches = Vec::new();
-    let mut waiting = Vec::new();
+    // each busy job keeps the room at its place in serving order, so a job
+    // behind it that only waits for memory never holds back its preemption
+    let mut waiting: Vec<(&JobView, Room)> = Vec::new();
+    let mut memory = room(snapshot);
+    let mut memory_waits = BTreeMap::new();
     for job in snapshot.queue.iter().filter(|job| startable(snapshot, job)) {
         let Some(index) = free
             .iter()
             .position(|resource| job.target.allows(resource.id))
         else {
-            waiting.push(job);
+            waiting.push((job, memory.clone()));
             continue;
         };
         let resource = free.remove(index);
+        if let Some(peak) = job.mem_peak
+            && let Err(wait) = memory.admit(peak)
+        {
+            memory_waits.insert(job.id, wait);
+            continue;
+        }
+        // a launch behind a busy job does take its memory
+        if let Some(peak) = job.mem_peak {
+            for (_, room) in &mut waiting {
+                room.reserve(peak.bytes());
+            }
+        }
         launches.push(Launch {
             job: job.id,
             resource: resource.id,
@@ -218,15 +253,18 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     let preemption = if preemption_in_flight(snapshot) {
         None
     } else {
-        waiting.iter().find_map(|job| preempt_for(snapshot, job))
+        waiting
+            .iter()
+            .find_map(|(job, room)| preempt_for(snapshot, job, room))
     };
     let blocked = waiting
         .first()
-        .map(|head| blocked_head(snapshot, head, preemption.as_ref()));
+        .map(|(head, _)| blocked_head(snapshot, head, preemption.as_ref()));
     Decisions {
         launches,
         preemption,
         blocked,
+        memory_waits,
     }
 }
 
@@ -239,7 +277,9 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
 /// front of its level, so it runs again before every other job of that level.
 /// Refused unless some queued job of a strictly higher level may use the
 /// resource, since the job would otherwise win it straight back and the kill
-/// would only throw away the step's progress
+/// would only throw away the step's progress. A waiting job with a memory peak
+/// counts only when the peak fits the snapshot's room plus this job's peak, as
+/// for an automatic preemption
 pub fn manual_preempt(snapshot: &Snapshot, job: JobId) -> Result<Preempt, PreemptRefusal> {
     // CI jobs live in their own pools, outside this snapshot
     let view = snapshot
@@ -281,23 +321,33 @@ pub fn manual_preempt(snapshot: &Snapshot, job: JobId) -> Result<Preempt, Preemp
     };
 
     // a job still cleaning up an earlier run cannot take the resource yet
-    let higher_waits = snapshot.queue.iter().any(|waiting| {
+    let higher = snapshot.queue.iter().filter(|waiting| {
         startable(snapshot, waiting)
             && waiting.priority > view.priority
             && waiting.target.allows(resource)
     });
-    if !higher_waits {
-        return Err(PreemptRefusal::NothingWaiting {
-            level: view.priority,
-        });
+    let memory = room(snapshot);
+    let mut refusal = PreemptRefusal::NothingWaiting {
+        level: view.priority,
+    };
+    for waiting in higher {
+        let Some(peak) = memory_short(&memory, waiting, view) else {
+            return Ok(Preempt {
+                resource,
+                job,
+                task: run.task,
+                cause,
+            });
+        };
+        // the first job in serving order names the refusal
+        if matches!(refusal, PreemptRefusal::NothingWaiting { .. }) {
+            refusal = PreemptRefusal::NoMemory {
+                job: waiting.id,
+                peak,
+            };
+        }
     }
-
-    Ok(Preempt {
-        resource,
-        job,
-        task: run.task,
-        cause,
-    })
+    Err(refusal)
 }
 
 /// Whether some run is already stopping for higher-priority work
@@ -318,6 +368,23 @@ fn preemption_in_flight(snapshot: &Snapshot) -> bool {
     })
 }
 
+/// The room the snapshot read, or none when it was not read
+fn room(snapshot: &Snapshot) -> Room {
+    snapshot.memory.clone().unwrap_or(Room::Unreadable {
+        error: "memory was not read".into(),
+    })
+}
+
+/// The peak of `waiting` when it would not fit in host memory even once
+/// `victim`'s run stops
+///
+/// A victim without a peak frees an unknown amount, so it counts nothing
+fn memory_short(memory: &Room, waiting: &JobView, victim: &JobView) -> Option<MemPeak> {
+    let peak = waiting.mem_peak?;
+    let freed = victim.mem_peak.map_or(0, MemPeak::bytes);
+    (!memory.fits_after(peak, freed)).then_some(peak)
+}
+
 /// A queued job whose previous run has finished its cleanup
 fn startable(snapshot: &Snapshot, job: &JobView) -> bool {
     job.state == QueuedState::Queued
@@ -328,7 +395,7 @@ fn startable(snapshot: &Snapshot, job: &JobView) -> bool {
             .any(|run| run.job == job.id)
 }
 
-fn preempt_for(snapshot: &Snapshot, waiting: &JobView) -> Option<Preempt> {
+fn preempt_for(snapshot: &Snapshot, waiting: &JobView, memory: &Room) -> Option<Preempt> {
     let candidates = snapshot
         .resources
         .iter()
@@ -339,7 +406,7 @@ fn preempt_for(snapshot: &Snapshot, waiting: &JobView) -> Option<Preempt> {
                 return None;
             };
             let job = snapshot.queue.iter().find(|job| job.id == run.job)?;
-            if job.priority >= waiting.priority {
+            if job.priority >= waiting.priority || memory_short(memory, waiting, job).is_some() {
                 return None;
             }
             let stop = job.preempt.stop_at(started_at, snapshot.now)?;

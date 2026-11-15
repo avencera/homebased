@@ -119,6 +119,32 @@ pub struct Config {
     pub dashboard: Dashboard,
     /// CI slot admission and checkouts, from `[ci]`
     pub ci: crate::queue::ci::CiConfig,
+    /// Host memory admission of work with a declared peak, from `[memory]`
+    pub memory: MemoryConfig,
+}
+
+/// Host memory admission settings
+///
+/// A task or GPU queue job submitted with `mem_peak` starts only while the
+/// memory in use plus the room promised to started and earlier waiting items
+/// plus its peak stays at or under `bar`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryConfig {
+    /// The bar in bytes, from `bar_gib`. Default 40 GiB, which leaves 8 GiB
+    /// of a 48 GiB `MemoryMax` for work started without a peak
+    pub bar: u64,
+    /// The cgroup v2 directory whose use, with every `run-*.scope` beside it,
+    /// counts; the daemon's own cgroup when unset
+    pub cgroup: Option<PathBuf>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            bar: 40 << 30,
+            cgroup: None,
+        }
+    }
 }
 
 /// Dashboard settings: the HTTPS proxy in front of it and the ports of its
@@ -245,6 +271,39 @@ struct RawConfig {
     dashboard: RawDashboard,
     #[serde(default)]
     ci: RawCi,
+    #[serde(default)]
+    memory: RawMemory,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMemory {
+    #[serde(default)]
+    bar_gib: Option<f64>,
+    #[serde(default)]
+    cgroup: Option<PathBuf>,
+}
+
+impl RawMemory {
+    fn validate(self) -> Result<MemoryConfig, String> {
+        let mut config = MemoryConfig::default();
+        if let Some(gib) = self.bar_gib {
+            let bar = crate::memory::MemPeak::from_gib(gib).map_err(|_| {
+                format!("memory.bar_gib must be more than 0 and at most 1024, not {gib}")
+            })?;
+            config.bar = bar.bytes();
+        }
+        if let Some(cgroup) = self.cgroup {
+            if !cgroup.is_absolute() {
+                return Err(format!(
+                    "memory.cgroup must be an absolute path, not {}",
+                    cgroup.display()
+                ));
+            }
+            config.cgroup = Some(cgroup);
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -602,6 +661,7 @@ impl RawConfig {
         let resource = self.resource.validate()?;
         let dashboard = self.dashboard.validate()?;
         let ci = self.ci.validate()?;
+        let memory = self.memory.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -631,6 +691,7 @@ impl RawConfig {
             resource,
             dashboard,
             ci,
+            memory,
         })
     }
 }

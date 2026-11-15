@@ -9,6 +9,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::AbortHandle;
 
 use crate::cleanup::{self, CleanupTiming, GroupOutcome, SweepOutcome};
+use crate::daemon::actors::memory::{Grant, MemoryMsg};
 use crate::daemon::actors::supervisor::SupervisorMsg;
 use crate::daemon::actors::task::stop_run_task;
 use crate::daemon::actors::{StoreMsg, call};
@@ -22,6 +23,7 @@ use crate::home::Home;
 use crate::invocation::CommandLine;
 use crate::invocation::{resolve_docker_binary, resolve_executable};
 use crate::machine::MachineId;
+use crate::memory::MemPeak;
 use crate::queue::ci::{Admission, CiConfig};
 use crate::queue::schedule::{NoticeThresholds, QueuedState, decide};
 use crate::queue::{
@@ -66,6 +68,8 @@ pub(crate) struct QueueArgs {
     pub thresholds: NoticeThresholds,
     /// CI admission and checkout settings from config.toml
     pub ci: CiConfig,
+    /// Owner of host memory admission, shared with the task release loop
+    pub memory: ActorRef<MemoryMsg>,
 }
 
 /// Only timers and cleanup handles are transient; all domain state is in the store
@@ -163,17 +167,54 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
     }
 
     let args = &state.args;
-    let snapshot = call(&args.store, |reply| StoreMsg::QueueSnapshot {
+    let mut snapshot = call(&args.store, |reply| StoreMsg::QueueSnapshot {
         machine: args.machine,
         now: Utc::now(),
         thresholds: args.thresholds,
         reply,
     })
     .await?;
-    let decisions = decide(&snapshot);
-    for launch in &decisions.launches {
-        launch_job(args, launch.job, launch.resource).await?;
+    let peaks: HashMap<JobId, MemPeak> = snapshot
+        .queue
+        .iter()
+        .filter(|job| job.state == QueuedState::Queued)
+        .filter_map(|job| Some((job.id, job.mem_peak?)))
+        .collect();
+    if !peaks.is_empty() {
+        snapshot.memory = Some(call(&args.memory, |reply| MemoryMsg::JobRoom { reply }).await?);
     }
+    let decisions = decide(&snapshot);
+    let mut memory_waits = decisions.memory_waits.clone();
+    // a job refused below keeps its place, so jobs behind it in this pass
+    // cannot start into its room
+    let mut held_back = 0;
+    for launch in &decisions.launches {
+        let Some(&peak) = peaks.get(&launch.job) else {
+            launch_job(args, launch.job, launch.resource).await?;
+            continue;
+        };
+        // a task may have taken room since the read, so the grant checks again
+        let granted = call(&args.memory, |reply| MemoryMsg::GrantJob {
+            job: launch.job,
+            peak,
+            held_back,
+            reply,
+        })
+        .await?;
+        if let Err(wait) = granted {
+            held_back += peak.bytes();
+            memory_waits.insert(launch.job, wait);
+            continue;
+        }
+        let launched = launch_job(args, launch.job, launch.resource).await;
+        args.memory.cast(MemoryMsg::Settle {
+            grant: Grant::Job(launch.job),
+        })?;
+        launched?;
+    }
+    args.memory.cast(MemoryMsg::JobsWaiting {
+        waits: memory_waits,
+    })?;
     if let Some(stop) = decisions.preemption {
         let committed = call(&args.store, |reply| StoreMsg::QueueStop {
             stop,

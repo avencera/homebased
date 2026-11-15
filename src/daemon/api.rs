@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
+use crate::daemon::actors::memory::MemoryMsg;
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::api::views::{
     ContainerDetail, DependencyView, LogTail, StatusBody, TaskDetail, TaskFollowupSource, TaskList,
@@ -33,9 +34,9 @@ use crate::files::{
 };
 use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
 use crate::machine_wait::MachineWait;
-use crate::spec::{self, NormalizedSpec, NormalizedWorkload};
+use crate::spec::{self, GpuAccess, NormalizedSpec, NormalizedWorkload};
 use crate::store::CancelResult;
-use crate::submission::{ReleaseTerms, RequestId};
+use crate::submission::{ExecutorIdentity, ReleaseTerms, RequestId};
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -107,6 +108,15 @@ async fn followup_source(
         let Workload::Agent(agent) = &row.workload else {
             return Err(followup_unavailable(id, FollowupBlocker::UnsupportedAgent));
         };
+        let identity = call(&state.store, |reply| StoreMsg::ExecutorIdentity {
+            id,
+            reply,
+        })
+        .await?;
+        let gpu = match identity {
+            Some(ExecutorIdentity::Accepted(record)) => record.spec.gpu,
+            _ => GpuAccess::Hidden,
+        };
         return followup_source_for(
             id,
             FollowupAgent {
@@ -115,6 +125,7 @@ async fn followup_source(
                 extra_args: &agent.extra_args,
                 report_trailer: agent.report_trailer,
                 persist_session: agent.persist_session,
+                gpu,
             },
         )
         .map(Json);
@@ -133,6 +144,7 @@ async fn followup_source(
             extra_args: &agent.extra_args,
             report_trailer: agent.report_trailer,
             persist_session: agent.persist_session,
+            gpu: route.spec.gpu,
         },
     )
     .map(Json)
@@ -145,6 +157,7 @@ struct FollowupAgent<'a> {
     extra_args: &'a [String],
     report_trailer: bool,
     persist_session: bool,
+    gpu: GpuAccess,
 }
 
 fn followup_source_for(
@@ -169,6 +182,7 @@ fn followup_source_for(
         extra_args: agent.extra_args.to_vec(),
         report_trailer: agent.report_trailer,
         persist_session: agent.persist_session,
+        gpu: agent.gpu,
     })
 }
 
@@ -200,6 +214,8 @@ pub(super) struct SubmitBody {
     pub(super) after: Option<Dependencies>,
     /// Origin-only request to hold the task while its machine is unreachable
     pub(super) machine_wait: Option<MachineWait>,
+    /// Origin-only peak that holds the task until it fits under the memory bar
+    pub(super) mem_peak: Option<crate::memory::MemPeak>,
 }
 
 impl SubmitBody {
@@ -208,6 +224,7 @@ impl SubmitBody {
         ReleaseTerms {
             after: self.after.clone(),
             machine_wait: self.machine_wait.clone(),
+            mem_peak: self.mem_peak,
         }
     }
 }
@@ -232,6 +249,8 @@ struct SubmitEnvelope {
     wait_for_machine: bool,
     #[serde(default)]
     coalesce: Option<String>,
+    #[serde(default)]
+    mem_peak: Option<crate::memory::MemPeak>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -270,6 +289,7 @@ where
             callback_cwd: envelope.callback_cwd,
             after,
             machine_wait,
+            mem_peak: envelope.mem_peak,
         }))
     }
 }
@@ -531,9 +551,10 @@ pub(super) async fn local_task_summaries(
     let unlaunched = call(&state.store, |reply| StoreMsg::UnlaunchedTasks { reply }).await?;
     for task in unlaunched {
         let after = crate::daemon::dependencies::views(state, task.held.after.as_ref()).await?;
-        if let Some(summary) = TaskSummary::from_unlaunched(&task, after)
+        if let Some(mut summary) = TaskSummary::from_unlaunched(&task, after)
             && filter.matches(summary.status, summary.thread)
         {
+            summary.memory_wait = memory_wait(state, &summary).await?;
             tasks.push(summary);
         }
     }
@@ -544,6 +565,18 @@ pub(super) async fn local_task_summaries(
     }
     tasks.sort_by_key(|task| task.id.0);
     Ok(tasks)
+}
+
+/// Why a held task with a peak waits for memory, from the last release pass
+pub(crate) async fn memory_wait(
+    state: &AppState,
+    summary: &TaskSummary,
+) -> Result<Option<crate::memory::MemoryWait>, AppError> {
+    if summary.mem_peak.is_none() {
+        return Ok(None);
+    }
+    let task = summary.id;
+    call(&state.memory, |reply| MemoryMsg::TaskWait { task, reply }).await
 }
 
 async fn list(

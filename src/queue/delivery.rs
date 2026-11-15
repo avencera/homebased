@@ -177,6 +177,10 @@ pub struct JobRoute {
     /// submit so the authority's timing counts the wait on the origin
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Slot the job takes when it enters its queue, sent with every submit;
+    /// the authority applies it only when it first stores the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::queue::EntryPlacement>,
 }
 
 /// The authority's definite refusal of a submit

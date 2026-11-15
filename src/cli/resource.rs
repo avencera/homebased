@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Subcommand};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -13,6 +14,7 @@ use crate::client::Client;
 use crate::dependency::{Dependencies, DependencyId};
 use crate::domain::TaskEnv;
 use crate::error::AppError;
+use crate::memory::MemPeak;
 use crate::queue::build_hint::build_warnings;
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{
@@ -21,8 +23,9 @@ use crate::queue::gpu_idle::{
 use crate::queue::lease_guard::{YIELD_OVERDUE, yield_overdue};
 use crate::queue::spec::{JobSpec, MachineSelector, schema_json};
 use crate::queue::{
-    AttentionId, JobId, MoveFlags, OperationId, Placement, Priority, QueueError, Resource,
-    ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase, StopCause, Target,
+    AttentionId, EntryOutcome, EntryPlacement, JobId, MoveFlags, OperationId, Placement, Priority,
+    QueueError, Resource, ResourceId, ResourceLabel, ResourceName, ResourceSelector, RunPhase,
+    StopCause, Target,
 };
 use crate::store::queue::interface::{JobDetail, JobList, ResourceList};
 use crate::store::queue::{JobLeaseNote, ResourceRecord};
@@ -114,6 +117,26 @@ pub enum JobCommand {
         /// other way
         #[arg(long = "after", value_name = "TASK_OR_JOB")]
         after: Vec<DependencyId>,
+        /// Peak host memory of the job's steps in GiB, such as `17` or `2.5`,
+        /// as `mem_peak` in the spec. With its resource free, the job starts
+        /// only once memory in use plus this peak fits under the queue
+        /// machine's memory bar (default 40 GiB)
+        #[arg(long, value_name = "GIB")]
+        mem_peak: Option<MemPeak>,
+        /// Enter the queue at the front of the job's level instead of the back.
+        /// Applies when the job enters the queue: at submit, or at release
+        /// with `--after`
+        #[arg(long, conflicts_with_all = ["place_before", "place_after"])]
+        place_front: bool,
+        /// Enter the queue just ahead of this job, taking its level. If it has
+        /// ended by then, enter at the front of its level; if this queue never
+        /// held it, at the back of the job's own level
+        #[arg(long, value_name = "JOB", conflicts_with = "place_after")]
+        place_before: Option<JobId>,
+        /// Enter the queue just behind this job, taking its level, with the
+        /// same fallbacks as `--place-before`
+        #[arg(long, value_name = "JOB")]
+        place_after: Option<JobId>,
     },
     /// Show a job, its progress, and every run task for logs
     Show {
@@ -301,10 +324,27 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             allow_other_thread,
             allow_build,
             after,
+            mem_peak,
+            place_front,
+            place_before,
+            place_after,
         } => {
+            let placement = EntryPlacement::from_flags(place_front, place_before, place_after)
+                .map_err(|refusal| AppError::Usage {
+                    message: refusal.to_string(),
+                })?;
+            if let Some(EntryPlacement::Next { anchor, .. }) = placement
+                && anchor == job_id
+            {
+                return Err(AppError::Usage {
+                    message: "a job cannot be placed next to itself".into(),
+                });
+            }
             let flags = SubmitFlags {
                 allow_other_thread,
                 allow_build,
+                placement,
+                mem_peak,
             };
             submit(ctx, client, job_id, &spec, flags, after).await
         }
@@ -402,6 +442,10 @@ fn silence_label(silence: &Silence) -> String {
 pub(super) struct SubmitFlags {
     pub(super) allow_other_thread: bool,
     pub(super) allow_build: bool,
+    /// Slot the job takes when it enters the queue
+    pub(super) placement: Option<EntryPlacement>,
+    /// `--mem-peak`, which must agree with a `mem_peak` in the spec
+    pub(super) mem_peak: Option<MemPeak>,
 }
 
 async fn submit(
@@ -416,6 +460,28 @@ async fn submit(
     submit_value(ctx, client, job_id, value, flags, after_flags).await
 }
 
+/// Put `--mem-peak` into the spec, refusing a spec that names another peak
+///
+/// The two compare as peaks in whole MiB, so a spec's integer `17` agrees with
+/// the flag's `17`, which serializes as the float `17.0`
+fn set_mem_peak(value: &mut Value, peak: MemPeak) -> Result<(), AppError> {
+    // a null peak reads as none, so the flag fills it
+    let Some(spec) = value.get("mem_peak").filter(|spec| !spec.is_null()) else {
+        // a spec that is not an object fails its parse right after
+        if let Some(object) = value.as_object_mut() {
+            object.insert("mem_peak".into(), json!(peak));
+        }
+        return Ok(());
+    };
+    match MemPeak::deserialize(spec) {
+        Ok(stated) if stated != peak => Err(AppError::Usage {
+            message: format!("--mem-peak {peak} disagrees with the spec's mem_peak {stated}"),
+        }),
+        // an invalid spec peak fails the spec's own parse, which names the field
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
 /// Submit a spec already read as JSON; `ci run` builds its spec this way
 pub(super) async fn submit_value(
     ctx: &Ctx,
@@ -428,6 +494,9 @@ pub(super) async fn submit_value(
     let origin = SubmitOrigin::capture(&ctx.home)?;
     if let Some(thread) = origin.default_thread()? {
         crate::spec::fill_missing_thread(&mut value, thread);
+    }
+    if let Some(peak) = flags.mem_peak {
+        set_mem_peak(&mut value, peak)?;
     }
     let (spec, after) = JobSpec::parse_submission(&value)?;
     let after = merge_after(after, after_flags)?;
@@ -452,13 +521,16 @@ pub(super) async fn submit_value(
     }
     // advice only, never a refusal
     warnings.extend(spec.legacy_preempt_warning());
-    let body = json!({
+    let mut body = json!({
         "job_id": job_id,
         "spec": spec,
         "env": TaskEnv::capture(),
         "callback_cwd": std::env::current_dir()?,
         "after": after,
     });
+    if let Some(placement) = flags.placement {
+        body["placement"] = json!(placement);
+    }
     let mut value = post_retry(client, "/v1/resource/jobs", &body).await?;
     // printed only once the submit succeeds, so a refusal's stderr stays the
     // one structured error that `--json` promises
@@ -475,6 +547,12 @@ pub(super) async fn submit_value(
         None => "submitted",
     };
     print_result(ctx, &value, action, &job_id.to_string())?;
+    if ctx.output == OutputMode::Human
+        && let Some(entered) = value.get("entered")
+    {
+        let entered: EntryOutcome = decode(entered.clone())?;
+        println!("{entered}");
+    }
     super::task::print_t3_wait_hint(&job_id.to_string(), spec.thread);
     Ok(())
 }
@@ -637,6 +715,9 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         let target = target_label(job.target, &[]);
         let name = &job.spec.name;
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
+        if let Some(wait) = list.memory_waits.get(&id) {
+            println!("  {wait}");
+        }
         if let Some(note) = list.lease_notes.get(&id) {
             for line in lease_note_lines(note, chrono::Utc::now()) {
                 println!("  ! {line}");
@@ -751,5 +832,31 @@ fn print_gpu_idle(idle: &GpuIdleDetail) {
             control.action,
             control.at.to_rfc3339()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::set_mem_peak;
+    use crate::memory::MemPeak;
+
+    #[test]
+    fn mem_peak_flag_agrees_with_an_equal_spec_peak_in_any_number_form() {
+        let peak = MemPeak::parse("17").unwrap();
+        for stated in [json!(17), json!(17.0)] {
+            let mut spec = json!({ "mem_peak": stated });
+            set_mem_peak(&mut spec, peak).unwrap();
+            assert_eq!(spec["mem_peak"], stated);
+        }
+
+        for mut absent in [json!({}), json!({ "mem_peak": null })] {
+            set_mem_peak(&mut absent, peak).unwrap();
+            assert_eq!(absent["mem_peak"], json!(17.0));
+        }
+
+        let error = set_mem_peak(&mut json!({ "mem_peak": 18 }), peak).unwrap_err();
+        assert!(error.to_string().contains("disagrees"), "{error}");
     }
 }

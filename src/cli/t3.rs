@@ -155,7 +155,7 @@ pub struct LaunchArgs {
     /// Work in this existing git worktree of the project, a path on that machine
     #[arg(long)]
     existing_worktree: Option<String>,
-    /// Provider instance, such as claudeAgent or codex
+    /// Provider instance id on that machine, listed under `providers` by `t3 projects`
     #[arg(long, requires = "model")]
     provider: Option<String>,
     /// Model id, such as claude-opus-5-5; the project's T3 default when omitted
@@ -366,6 +366,13 @@ async fn list_projects(ctx: &Ctx, machine: Option<String>) -> Result<ExitCode, A
                     "{}  {}  {}  {model}",
                     project.title, project.workspace_root, project.id
                 );
+            }
+            if let Some(providers) = &body.providers {
+                let ids: Vec<&str> = providers
+                    .iter()
+                    .map(|provider| provider.id.as_str())
+                    .collect();
+                println!("enabled providers: {}", ids.join(", "));
             }
         }
     }

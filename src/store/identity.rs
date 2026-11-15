@@ -8,6 +8,7 @@ use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::{CoalesceKey, MachineWait};
+use crate::memory::MemPeak;
 use crate::queue::delivery::JobRoute;
 use crate::submission::{
     ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute, PreAcceptanceRejection,
@@ -95,17 +96,32 @@ fn release_terms_on(
     conn: &Connection,
     task: TaskId,
 ) -> Result<Option<ReleaseTerms>, IdentityError> {
-    let saved: Option<(Option<String>, bool, Option<String>)> = conn
+    let saved = conn
         .query_row(
-            "SELECT after_json,wait_for_machine,coalesce_key FROM origin_routes WHERE task_id=?1",
+            "SELECT after_json,wait_for_machine,coalesce_key,mem_peak_mib FROM origin_routes
+             WHERE task_id=?1",
             [task.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(SavedTerms {
+                    after: row.get(0)?,
+                    wait_for_machine: row.get(1)?,
+                    coalesce: row.get(2)?,
+                    mem_peak: row.get(3)?,
+                })
+            },
         )
         .optional()
         .map_err(storage)?;
-    let Some((after, wait_for_machine, coalesce)) = saved else {
+    let Some(SavedTerms {
+        after,
+        wait_for_machine,
+        coalesce,
+        mem_peak,
+    }) = saved
+    else {
         return Ok(None);
     };
+    let mem_peak = stored_mem_peak(mem_peak).map_err(IdentityError::Storage)?;
     let after = after.as_deref().map(decode).transpose()?;
     let coalesce = coalesce
         .map(CoalesceKey::new)
@@ -119,7 +135,27 @@ fn release_terms_on(
     Ok(Some(ReleaseTerms {
         after,
         machine_wait,
+        mem_peak,
     }))
+}
+
+/// The release columns of one origin route, as stored
+struct SavedTerms {
+    after: Option<String>,
+    wait_for_machine: bool,
+    coalesce: Option<String>,
+    mem_peak: Option<i64>,
+}
+
+/// A route's saved `mem_peak_mib`
+pub(super) fn stored_mem_peak(mib: Option<i64>) -> Result<Option<MemPeak>, AppError> {
+    mib.map(|mib| {
+        u64::try_from(mib)
+            .map_err(|_| format!("a memory peak of {mib} MiB is out of range"))
+            .and_then(MemPeak::from_mib)
+    })
+    .transpose()
+    .map_err(|message| AppError::Internal { message })
 }
 
 fn same_route_identity(left: &OriginRoute, right: &OriginRoute) -> bool {
@@ -170,6 +206,11 @@ fn storage(error: rusqlite::Error) -> IdentityError {
 }
 
 impl Store {
+    /// Release terms saved with a route, or `None` when no route has the task
+    pub fn route_release_terms(&self, task: TaskId) -> Result<Option<ReleaseTerms>, AppError> {
+        release_terms_on(&self.conn, task).map_err(|error| error.into_task_error(task))
+    }
+
     /// Origin threads that still wait for a task or queue job callback
     ///
     /// An accepted, unconfirmed, or held task submission calls back until its
@@ -290,8 +331,9 @@ impl Store {
             .map(CoalesceKey::as_str);
         tx.execute(
             "INSERT INTO origin_routes
-                 (request_id,task_id,route_json,after_json,wait_for_machine,coalesce_key)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+                 (request_id,task_id,route_json,after_json,wait_for_machine,coalesce_key,
+                  mem_peak_mib)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 route.request.0.to_string(),
                 route.task.to_string(),
@@ -299,6 +341,7 @@ impl Store {
                 after_json,
                 terms.machine_wait.is_some(),
                 coalesce,
+                terms.mem_peak.map(MemPeak::stored),
             ],
         )
         .map_err(storage)?;

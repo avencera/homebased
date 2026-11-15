@@ -16,8 +16,8 @@ use tungstenite::Message;
 
 use super::{Daemon, add_peer};
 
-/// T3 server that answers the environment, ticket, and launch requests, and
-/// records each launch payload
+/// T3 server that answers the environment, ticket, config, and launch
+/// requests, and records each launch payload
 struct FakeT3 {
     origin: String,
     /// Close each launch socket without a reply, as if the reply were lost
@@ -114,6 +114,20 @@ fn serve_launch(stream: TcpStream, launches: &Mutex<Vec<Value>>, drop_reply: boo
         return;
     };
     let request: Value = serde_json::from_str(text.as_str()).unwrap();
+    if request["tag"] == "server.getConfig" {
+        let providers = json!([
+            { "instanceId": "codex", "driver": "codex", "enabled": true },
+            { "instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": false }
+        ]);
+        let exit = json!({
+            "_tag": "Exit",
+            "requestId": "1",
+            "exit": { "_tag": "Success", "value": { "providers": providers } }
+        });
+        let _ = socket.send(Message::text(exit.to_string()));
+        while socket.read().is_ok() {}
+        return;
+    }
     let thread = request["payload"]["threadId"].clone();
     launches.lock().unwrap().push(request);
     if drop_reply {
@@ -306,6 +320,13 @@ fn launch_starts_a_t3_thread_on_the_named_machine_with_a_reply_route_only_when_a
         listed["projects"][0]["default_model"]["model"],
         "gpt-6.1-sol"
     );
+    let providers: Vec<&str> = listed["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|provider| provider["id"].as_str())
+        .collect();
+    assert_eq!(providers, ["codex"]);
 
     let (code, missing) = run_json(
         &origin,

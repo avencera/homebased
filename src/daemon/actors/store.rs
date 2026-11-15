@@ -10,7 +10,7 @@ use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
 };
 use crate::daemon::actors::send_reply;
-use crate::dependency::{Dependencies, DependencyId, DependencyLookup, HeldCancellation};
+use crate::dependency::{DependencyId, DependencyLookup, HeldCancellation};
 use crate::domain::{
     ExitReason, ProcessStatus, TaskEnv, TaskExitEvidence, TaskId, TaskReport, TaskRow, ThreadId,
 };
@@ -86,6 +86,8 @@ pub(crate) enum StoreMsg {
         env: crate::domain::TaskEnv,
         /// Cluster protocol the request arrived with
         protocol: crate::fleet::protocol::ClusterProtocolVersion,
+        /// Host memory room, read for a preempt
+        memory: Option<crate::memory::Room>,
         reply: RpcReplyPort<Result<serde_json::Value, AppError>>,
     },
     /// Running attempts the GPU idle watcher samples
@@ -251,6 +253,11 @@ pub(crate) enum StoreMsg {
         now: chrono::DateTime<chrono::Utc>,
         thresholds: crate::queue::schedule::NoticeThresholds,
         reply: RpcReplyPort<Result<crate::queue::schedule::Snapshot, AppError>>,
+    },
+    /// Started tasks and runs that declared a memory peak
+    MemoryClaims {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::memory::Claim>, AppError>>,
     },
     /// Typed queue store operation
     QueueResources {
@@ -518,9 +525,9 @@ pub(crate) enum StoreMsg {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },
     /// Read the dependencies saved with one origin route
-    RouteDependencies {
+    RouteReleaseTerms {
         id: TaskId,
-        reply: RpcReplyPort<Result<Option<Dependencies>, AppError>>,
+        reply: RpcReplyPort<Result<Option<ReleaseTerms>, AppError>>,
     },
     /// Read the retained origin inbox of one task in sequence order
     InboundEvents {
@@ -882,10 +889,11 @@ impl Actor for StoreActor {
                 request,
                 env,
                 protocol,
+                memory,
                 reply,
             } => send_reply(
                 reply,
-                state.queue_request_at(machine, &request, &env, protocol),
+                state.queue_request_at(machine, &request, &env, protocol, memory),
             ),
             StoreMsg::GpuIdleTargets {
                 machine,
@@ -1003,6 +1011,9 @@ impl Actor for StoreActor {
                 thresholds,
                 reply,
             } => send_reply(reply, state.queue_snapshot(machine, now, thresholds)),
+            StoreMsg::MemoryClaims { machine, reply } => {
+                send_reply(reply, state.memory_claims(machine));
+            }
             StoreMsg::QueueResources { machine, reply } => {
                 send_reply(reply, state.resources_on(machine))
             }
@@ -1225,8 +1236,8 @@ impl Actor for StoreActor {
                 reply,
                 state.coalesced_waiting_routes(&key, execution_machine, newer),
             ),
-            StoreMsg::RouteDependencies { id, reply } => {
-                send_reply(reply, state.route_dependencies(id));
+            StoreMsg::RouteReleaseTerms { id, reply } => {
+                send_reply(reply, state.route_release_terms(id));
             }
             StoreMsg::InboundEvents { id, reply } => {
                 send_reply(reply, state.inbound_events(id).map_err(event_error));

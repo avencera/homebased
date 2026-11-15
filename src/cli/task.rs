@@ -19,7 +19,8 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
-use crate::spec;
+use crate::memory::{MemPeak, MemoryWait};
+use crate::spec::{self, GpuAccess};
 use crate::store::Store;
 use crate::submission::RequestId;
 use crate::t3::{ProviderThread, T3Env};
@@ -77,6 +78,15 @@ pub enum TaskCommand {
         /// Hold the task while `--machine` is unreachable instead of failing
         #[arg(long, requires = "machine")]
         wait_for_machine: bool,
+        /// Let the command see this machine's GPUs. By default a task runs with
+        /// `CUDA_VISIBLE_DEVICES` empty; GPU work belongs in the GPU queue
+        #[arg(long)]
+        gpu_visible: bool,
+        /// Peak host memory in GiB, such as `17` or `2.5`. Holds the task until
+        /// memory in use, plus room promised to work started or waiting ahead
+        /// of it, plus this peak, fits under the memory bar (default 40 GiB)
+        #[arg(long, value_name = "GIB")]
+        mem_peak: Option<MemPeak>,
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
@@ -216,6 +226,8 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             machine,
             after,
             wait_for_machine,
+            gpu_visible,
+            mem_peak,
             dry_run,
             request_id,
             allow_other_thread,
@@ -228,6 +240,8 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
                 machine,
                 after,
                 wait_for_machine,
+                gpu_visible,
+                mem_peak,
                 command,
             })?;
             submit_value(ctx, value, dry_run, request_id, allow_other_thread).await
@@ -302,6 +316,7 @@ async fn submit_value(
         spec: normalized,
         after: spec.after,
         machine_wait: spec.machine_wait,
+        mem_peak: spec.mem_peak,
     };
     submit_normalized(
         ctx,
@@ -322,6 +337,8 @@ struct RunOptions {
     machine: Option<String>,
     after: Vec<DependencyId>,
     wait_for_machine: bool,
+    gpu_visible: bool,
+    mem_peak: Option<MemPeak>,
     command: Vec<String>,
 }
 
@@ -334,6 +351,8 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
         machine,
         after,
         wait_for_machine,
+        gpu_visible,
+        mem_peak,
         command,
     } = options;
     let cwd = match cwd {
@@ -364,6 +383,12 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
     }
     if wait_for_machine {
         spec["wait_for_machine"] = json!(true);
+    }
+    if gpu_visible {
+        spec["gpu"] = json!(GpuAccess::Visible);
+    }
+    if let Some(peak) = mem_peak {
+        spec["mem_peak"] = json!(peak);
     }
     Ok(spec)
 }
@@ -400,6 +425,7 @@ struct Submission {
     spec: crate::spec::NormalizedSpec,
     after: Option<Dependencies>,
     machine_wait: Option<MachineWait>,
+    mem_peak: Option<MemPeak>,
 }
 
 async fn submit_normalized(
@@ -414,6 +440,7 @@ async fn submit_normalized(
         spec: normalized,
         after,
         machine_wait,
+        mem_peak,
     } = submission;
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
@@ -438,6 +465,9 @@ async fn submit_normalized(
         if let Some(key) = wait.coalesce {
             body["coalesce"] = json!(key);
         }
+    }
+    if let Some(peak) = mem_peak {
+        body["mem_peak"] = json!(peak);
     }
 
     let client = Client::new(ctx.home.sock_path());
@@ -631,6 +661,11 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
     {
         workload.insert("persist_session".into(), Value::Bool(true));
     }
+    if !source.gpu.is_hidden()
+        && let Some(object) = submit_spec.as_object_mut()
+    {
+        object.insert("gpu".into(), json!(source.gpu));
+    }
     if local_machine == execution_machine
         && let Some(object) = submit_spec.as_object_mut()
     {
@@ -641,6 +676,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         spec: spec::normalize(&parsed)?,
         after: None,
         machine_wait: None,
+        mem_peak: None,
     };
     submit_normalized(
         ctx,
@@ -860,6 +896,9 @@ async fn list(
                         workload_label(t),
                         t.get("thread").and_then(Value::as_str).unwrap_or("-"),
                     );
+                    if let Some(wait) = memory_wait_line(t) {
+                        println!("  {wait}");
+                    }
                 }
             }
         }
@@ -954,12 +993,27 @@ fn print_dependencies(value: &Value) {
             None => println!("  waits for its machine"),
         }
     }
+    if let Some(peak) = value
+        .get("mem_peak")
+        .and_then(|peak| serde_json::from_value::<MemPeak>(peak.clone()).ok())
+    {
+        println!("  mem peak {peak}");
+    }
+    if let Some(wait) = memory_wait_line(value) {
+        println!("  {wait}");
+    }
     let Some(after) = value.get("after").and_then(Value::as_array) else {
         return;
     };
     for dependency in after {
         println!("  after {}", dependency_line(dependency));
     }
+}
+
+/// Why a held task waits for memory, for people
+fn memory_wait_line(task: &Value) -> Option<String> {
+    let wait: MemoryWait = serde_json::from_value(task.get("memory_wait")?.clone()).ok()?;
+    Some(wait.to_string())
 }
 
 /// One line per callback that waits for its origin thread and when the wait ends

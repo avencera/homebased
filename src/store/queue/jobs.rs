@@ -14,12 +14,13 @@ use super::{
 use crate::domain::{ExitReason, TaskEnv};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::memory::Room;
 use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
 use crate::queue::schedule::{NoticeThresholds, manual_preempt};
 use crate::queue::{
-    AttentionId, BlockedNotice, EventRun, JobEvent, JobEventKind, JobId, JobState, LevelEnd,
-    MoveRefusal, OperationId, Placement, PreemptRefusal, Priority, QueueError, ResourceId, Side,
-    StopCause, Target, sha256_hex,
+    AttentionId, BlockedNotice, EntryOutcome, EntryPlacement, EventRun, JobEvent, JobEventKind,
+    JobId, JobState, LevelEnd, MoveRefusal, OperationId, Placement, PreemptRefusal, Priority,
+    QueueError, ResourceId, Side, StopCause, Target, sha256_hex,
 };
 use crate::store::{Store, fmt_time};
 
@@ -115,8 +116,61 @@ impl Store {
                 ],
             )?;
             self.open_ci_timing(new, Utc::now())?;
-            Ok(accepted(&self.require_job(new.id)?))
+            let entered = match new.placement {
+                Some(placement) => Some(self.enter(new.machine, new.id, placement)?),
+                None => None,
+            };
+            Ok(JobAccepted {
+                entered,
+                ..accepted(&self.require_job(new.id)?)
+            })
         })
+    }
+
+    /// Move a job just stored at the back of its level to its entry placement
+    fn enter(
+        &self,
+        machine: MachineId,
+        id: JobId,
+        placement: EntryPlacement,
+    ) -> Result<EntryOutcome, AppError> {
+        let (outcome, slot) = match placement {
+            EntryPlacement::Front => (
+                EntryOutcome::Front,
+                Placement::Edge {
+                    priority: None,
+                    end: LevelEnd::Front,
+                },
+            ),
+            EntryPlacement::Next { anchor, side } => {
+                let Some(record) = self
+                    .job(anchor)?
+                    .filter(|record| record.machine == machine && record.id != id)
+                else {
+                    return Ok(EntryOutcome::AnchorMissing { anchor });
+                };
+                if record.state.is_terminal() {
+                    (
+                        EntryOutcome::AnchorEnded { anchor },
+                        Placement::Edge {
+                            priority: Some(record.priority),
+                            end: LevelEnd::Front,
+                        },
+                    )
+                } else {
+                    (
+                        EntryOutcome::Next { anchor, side },
+                        Placement::Relative {
+                            target: anchor,
+                            side,
+                            expect: None,
+                        },
+                    )
+                }
+            }
+        };
+        self.apply_move(machine, id, slot)?;
+        Ok(outcome)
     }
 
     /// One job by id, on any machine
@@ -411,7 +465,8 @@ impl Store {
     /// actor then kills the run, the job's `JOB_PREEMPTED` follows, the freed
     /// resource goes to the higher-level job that waits for it, and the job
     /// runs its current step again before every other job of its level.
-    /// Refused, storing nothing, when [`manual_preempt`] refuses. A replay of
+    /// Refused, storing nothing, when [`manual_preempt`] refuses, which
+    /// checks waiting jobs' memory peaks against `memory`. A replay of
     /// `operation` returns its stored result
     pub fn preempt_job(
         &self,
@@ -419,11 +474,12 @@ impl Store {
         operation: OperationId,
         job: JobId,
         now: DateTime<Utc>,
+        memory: Option<Room>,
     ) -> Result<PreemptResult, AppError> {
         let content = serde_json::json!({ "job": job });
         self.immediate(|| {
             self.with_operation(machine, operation, "preempt", &content, || {
-                self.apply_preempt(machine, job, now)
+                self.apply_preempt(machine, job, now, memory.clone())
             })
         })
     }
@@ -433,6 +489,7 @@ impl Store {
         machine: MachineId,
         id: JobId,
         now: DateTime<Utc>,
+        memory: Option<Room>,
     ) -> Result<PreemptResult, AppError> {
         let job = self.require_machine_job(machine, id)?;
         if job.state.is_terminal() {
@@ -450,7 +507,8 @@ impl Store {
             .into());
         }
 
-        let snapshot = self.queue_snapshot(machine, now, NoticeThresholds::default())?;
+        let mut snapshot = self.queue_snapshot(machine, now, NoticeThresholds::default())?;
+        snapshot.memory = memory;
         let stop = manual_preempt(&snapshot, id)
             .map_err(|reason| QueueError::PreemptRefused { job: id, reason })?;
         let run = self.request_stop(stop.resource, Some(stop.task), stop.cause, now)?;
@@ -765,6 +823,7 @@ fn accepted(job: &JobRecord) -> JobAccepted {
         state: job.state.as_str().to_owned(),
         priority: job.priority,
         position: job.position,
+        entered: None,
     }
 }
 

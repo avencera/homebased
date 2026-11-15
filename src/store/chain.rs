@@ -261,6 +261,7 @@ pub(super) fn park_on(
         cwd: route.spec.cwd.clone(),
         machine: None,
         timeout: route.spec.timeout,
+        gpu: route.spec.gpu,
         workload: NormalizedWorkload::Agent(NormalizedAgentWorkload {
             agent: agent.agent,
             model: agent.model.clone(),
@@ -282,15 +283,20 @@ pub(super) fn park_on(
     let after = Dependencies::of_tasks(waiting.on.tasks()).map_err(|error| AppError::Internal {
         message: format!("waiting targets are not a dependency list: {error}"),
     })?;
+    // the continuation keeps the parked run's memory peak, so its release
+    // waits for room and its run holds that room like the first one did
     conn.execute(
-        "INSERT INTO origin_routes (request_id, task_id, route_json, after_json, after_rule)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO origin_routes
+             (request_id, task_id, route_json, after_json, after_rule, mem_peak_mib)
+         VALUES (?1, ?2, ?3, ?4, ?5,
+                 (SELECT mem_peak_mib FROM origin_routes WHERE task_id = ?6))",
         params![
             held.request.0.to_string(),
             continuation.to_string(),
             serde_json::to_string(&held)?,
             serde_json::to_string(&after)?,
             ReleaseRule::Ended.as_str(),
+            row.id.to_string(),
         ],
     )?;
     add_run_on(conn, chain.id, continuation, chain.runs + 1)?;

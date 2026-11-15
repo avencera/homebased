@@ -202,6 +202,7 @@ fn new_job(id: JobId, machine: MachineId, spec: Value) -> NewJob {
         },
         origin_protocol: crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
         submitted_at: None,
+        placement: None,
     }
 }
 
@@ -1083,7 +1084,7 @@ fn job_reads_drop_hold_for_peers_on_an_older_protocol() {
     let read = |request: QueueRequest, protocol| {
         fixture
             .store
-            .queue_request_at(fixture.machine, &request, &env, protocol)
+            .queue_request_at(fixture.machine, &request, &env, protocol, None)
             .unwrap()
     };
 
@@ -1121,7 +1122,7 @@ fn a_manual_preempt_joins_an_automatic_yield_and_moves_the_job_first() {
 
     let result = fixture
         .store
-        .preempt_job(fixture.machine, OperationId::new(), job, Utc::now())
+        .preempt_job(fixture.machine, OperationId::new(), job, Utc::now(), None)
         .unwrap();
     assert_eq!(result.task, run.task);
     assert_eq!(result.position, 1);
@@ -2307,6 +2308,7 @@ async fn notice_ends_during_callback_preparation() {
         after: None,
         owes_final_event: false,
         submitted_at: None,
+        placement: None,
     };
     f.store.insert_job_route(&route).unwrap();
     let notice = RoutedJobEvent {

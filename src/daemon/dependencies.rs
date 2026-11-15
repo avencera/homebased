@@ -38,6 +38,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use super::AppState;
+use super::actors::memory::{Grant, MemoryMsg, TaskCandidate};
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::SubmitBody;
 use super::api::views::DependencyView;
@@ -54,6 +55,7 @@ use crate::error::AppError;
 use crate::invocation::resolve_workload_binary;
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
+use crate::memory::MemPeak;
 use crate::queue::JobId;
 use crate::queue::delivery::{HeldJobEnding, JobSubmission};
 use crate::spec::{self, NormalizedSpec};
@@ -86,6 +88,17 @@ async fn admit_or_hold(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, TaskStatus), AppError> {
+    if let Some(peak) = body.mem_peak {
+        // this machine's gate can only measure this machine's memory
+        if body.spec.machine.is_some() {
+            return Err(AppError::Usage {
+                message: "mem_peak holds a task until it fits this machine's memory, so it \
+                          needs a task that runs here; drop --machine or mem_peak"
+                    .into(),
+            });
+        }
+        state.memory_limits.check_peak(peak)?;
+    }
     if !body.terms().may_hold() {
         return launch(state, body).await;
     }
@@ -103,6 +116,10 @@ async fn admit_or_hold(
     if let Some(after) = &body.after
         && let Admission::Pending = admit(state, after).await?
     {
+        return hold(state, body).await;
+    }
+    // the release loop admits it in submit order, behind the work ahead of it
+    if body.mem_peak.is_some() {
         return hold(state, body).await;
     }
     if body.machine_wait.is_none() {
@@ -392,6 +409,7 @@ async fn hold(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatus)
         callback_cwd,
         after: _,
         machine_wait: _,
+        mem_peak: _,
     } = body;
     let (execution_machine, callback) = match &spec.machine {
         Some(name) => (
@@ -468,11 +486,14 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
         let mut cancelled = false;
         // a sleeping machine costs a probe timeout per attempt, so one pass asks it once
         let mut unreachable = HashSet::new();
+        // in task UUID order, which is submit order
+        let mut memory = Vec::new();
         for DependentRoute {
             route,
             after,
             rule,
             waits_for_machine,
+            mem_peak,
         } in routes
         {
             match &route.submission {
@@ -487,6 +508,7 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             }
             match decide(known_states(state, after.as_ref()).await?, rule) {
                 HeldDecision::Wait => {}
+                HeldDecision::Release if let Some(peak) = mem_peak => memory.push((route, peak)),
                 HeldDecision::Release => {
                     retry_release(state, retries, &mut unreachable, route, waits_for_machine).await;
                 }
@@ -498,9 +520,59 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             }
         }
         if !cancelled {
-            return Ok(());
+            return release_by_memory(state, retries, &mut unreachable, memory).await;
         }
     }
+}
+
+/// Launch the ready tasks with a memory peak that fit, in submit order
+///
+/// The memory actor grants each one that fits after the GPU queue's waiting
+/// jobs and the tasks ahead of it, and records why the rest wait. A task
+/// backing off after a failed launch keeps its place and its room
+async fn release_by_memory(
+    state: &AppState,
+    retries: &mut HashMap<TaskId, Retry>,
+    unreachable: &mut HashSet<MachineId>,
+    ready: Vec<(OriginRoute, MemPeak)>,
+) -> Result<(), AppError> {
+    let candidates = ready
+        .iter()
+        .map(|(route, peak)| TaskCandidate {
+            task: route.task,
+            peak: *peak,
+            backing_off: backing_off(retries, route.task),
+        })
+        .collect();
+    let admitted = call(&state.memory, |reply| MemoryMsg::AdmitTasks {
+        ready: candidates,
+        reply,
+    })
+    .await?;
+    for (route, _) in ready {
+        let task = route.task;
+        if !admitted.contains(&task) {
+            continue;
+        }
+        // a supervisor that did not answer in time may still launch the task,
+        // so its grant holds the room until the next pass sees how it went
+        if retry_release(state, retries, unreachable, route, false).await == Release::Pending {
+            continue;
+        }
+        state.memory.cast(MemoryMsg::Settle {
+            grant: Grant::Task(task),
+        })?;
+    }
+    Ok(())
+}
+
+/// How a release attempt left its task
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// Launched, refused for good, deferred, or not tried this pass
+    Settled,
+    /// The launch timed out and may still run
+    Pending,
 }
 
 /// Launch one ready route unless its last attempt failed too recently
@@ -513,11 +585,11 @@ async fn retry_release(
     unreachable: &mut HashSet<MachineId>,
     route: OriginRoute,
     waits_for_machine: bool,
-) {
+) -> Release {
     let task = route.task;
     let machine = route.execution_machine;
     if backing_off(retries, task) || unreachable.contains(&machine) {
-        return;
+        return Release::Settled;
     }
     let released = if route.origin_machine == machine {
         local_submit::release(state, route).await
@@ -527,7 +599,13 @@ async fn retry_release(
     if matches!(released, Err(AppError::MachineUnavailable { .. })) {
         unreachable.insert(machine);
     }
+    let outcome = if matches!(released, Err(AppError::DaemonBusy)) {
+        Release::Pending
+    } else {
+        Release::Settled
+    };
     record_attempt(retries, task, released, "held task launch deferred");
+    outcome
 }
 
 /// Start the worker of a released local task unless its last attempt failed too recently

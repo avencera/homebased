@@ -16,7 +16,7 @@ Homebased keeps task status and logs. An optional web dashboard lets you inspect
 
 ## GPU priority queue
 
-Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority. A run is preempted for higher-priority work at any age, unless its job sets `hold`, which keeps the GPU once the run is 30 minutes old; a job can yield at checkpoints instead of being killed. Each resource runs one attempt at a time. A job holds its GPU from first step to last, so keep it to GPU work: run builds, data prep, CPU evaluation, reports, and uploads as CPU tasks chained with `--after`. A job submitted `--after` a prep task is held under its id until the prep succeeds, and cancelled without taking a GPU if it fails; a task submitted `--after` a job starts at `JOB_SUCCEEDED`. When a running job's GPU sits near idle for 5 minutes, its thread gets a `JOB_GPU_IDLE` alert from Netdata or `nvidia-smi` samples; the owner can snooze it or turn it off with a reason (`resource job gpu-idle`), and any agent may cancel a job whose GPU sits near 0% for 20 minutes or more with no snooze or off switch. Final job callbacks carry a GPU summary of each attempt: average utilization and power, peak memory, idle share, and time to first busy. Submit refuses a step that itself runs a build tool such as `cargo build`, `build-ptx.sh`, or `pip install` unless given `--allow-build`, and the lease guard yields, requeues, or cancels a job whose processes hold no CUDA context on its GPU for 5 minutes. `resource job preempt`, or Preempt on the dashboard, stops a running job, even one whose spec holds the GPU, for waiting higher-priority work and requeues it at the front of its level. See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, preemption, cancellation, and cleanup.
+Run GPU commands and containers through the resource queue. Jobs use `high`, `medium`, or `low` priority. A run is preempted for higher-priority work at any age, unless its job sets `hold`, which keeps the GPU once the run is 30 minutes old; a job can yield at checkpoints instead of being killed. Each resource runs one attempt at a time. A job holds its GPU from first step to last, so keep it to GPU work: run builds, data prep, CPU evaluation, reports, and uploads as CPU tasks chained with `--after`. A job submitted `--after` a prep task is held under its id until the prep succeeds, and cancelled without taking a GPU if it fails; a task submitted `--after` a job starts at `JOB_SUCCEEDED`. When a running job's GPU sits near idle for 5 minutes, its thread gets a `JOB_GPU_IDLE` alert from Netdata or `nvidia-smi` samples; the owner can snooze it or turn it off with a reason (`resource job gpu-idle`), and any agent may cancel a job whose GPU sits near 0% for 20 minutes or more with no snooze or off switch. Final job callbacks carry a GPU summary of each attempt: average utilization and power, peak memory, idle share, and time to first busy. Submit refuses a step that itself runs a build tool such as `cargo build`, `build-ptx.sh`, or `pip install` unless given `--allow-build`, and the lease guard yields, requeues, or cancels a job whose processes hold no CUDA context on its GPU for 5 minutes. `resource job preempt`, or Preempt on the dashboard, stops a running job, even one whose spec holds the GPU, for waiting higher-priority work and requeues it at the front of its level. `--place-front`, `--place-before <job>`, or `--place-after <job>` on `resource job submit` choose where the job enters the queue, at submit or, with `--after`, when its prep succeeds. `--mem-peak <GiB>` holds a job with a free GPU until its host memory fits, as for [tasks](#wait-for-host-memory). See the [resource queue runbook](docs/resource-queue.md) for inspection, moves, preemption, cancellation, and cleanup.
 
 ## CI build queue
 
@@ -557,7 +557,9 @@ the project setup script, and starts the first message.
 
 - `--project` takes a T3 project id, the project's workspace root on that
   machine (absolute or `~/`), or its exact title. `t3 projects` lists them with
-  the model a launch uses by default.
+  the model a launch uses by default, and lists the provider instances that
+  machine's running T3 has enabled under `providers`, which is absent when T3
+  is not running there.
 - `t3 project add <path>` adds an existing directory on that machine as a T3
   project, through that machine's own `t3 project add`, so the running T3 shows
   it at once. A relative path resolves against the current directory, then
@@ -572,9 +574,13 @@ the project setup script, and starts the first message.
   checks that a Lucide name is kebab-case but not that the icon exists, so an
   unknown name shows a blank icon. A machine whose homebased predates icons
   refuses the request instead of ignoring the icon.
-- Without `--provider` and `--model`, the thread runs the default model from
-  that machine's T3 settings. When neither the settings nor the project name
-  one, the launch fails and asks for both.
+- Without `--provider` and `--model`, the thread runs the project's default
+  model from that machine's T3 settings. When neither the settings nor the
+  project name one, the launch fails and asks for both. `--provider` is an
+  instance id on that machine, such as `claude`, not a driver name. T3
+  refuses an instance that is disabled or missing there, explicit or from the
+  default, and the `t3_launch_refused` error adds the instances it has
+  enabled.
 - The thread runs `full-access` unless `--runtime-mode` says otherwise, since
   nobody on that machine is there to approve its actions. `--plan` starts it
   in plan mode.
@@ -679,7 +685,8 @@ homebased --json task submit --spec "$spec"            # submit to the local mac
 `task run` builds a `task` spec from its flags: it runs the command after `--`
 in the current directory (`--cwd` overrides), names it after the command unless
 `--name` is given, and takes `--timeout`, `--machine`, `--after`,
-`--wait-for-machine`, `--dry-run`, and `--request-id`.
+`--wait-for-machine`, `--mem-peak`, `--gpu-visible`, `--dry-run`, and
+`--request-id`.
 
 Always pass `--json` on data commands. Every JSON object carries `api_version: 1`. `--request-id` is an optional CLI flag for a stable retry identity; it is not a task field.
 
@@ -855,6 +862,50 @@ began is left alone.
 `task show` adds `wait_for_machine` and `coalesce`. `task cancel` cancels a
 waiting task before it starts. Only the submitting daemon holds the task, so
 two machines that each submit with the same key both send theirs.
+
+### GPUs are hidden from tasks
+
+A `task` or `agent` runs with `CUDA_VISIBLE_DEVICES` set to empty, so a CPU
+step that imports a CUDA library cannot take GPU memory from the GPU queue.
+Set `"gpu": "visible"` in the spec, or pass `task run --gpu-visible`, to run
+the command with `CUDA_VISIBLE_DEVICES` unset, so it sees every GPU. GPU queue
+jobs are unchanged: each run sees the GPU its resource names.
+
+### Wait for host memory
+
+Set `mem_peak` to the most host memory, in GiB, that a task will hold, or pass
+`task run --mem-peak 17`. The daemon holds the task until memory in use plus
+this peak fits under the machine's memory bar, 40 GiB by default. GPU queue
+jobs take the same field and `resource job submit --mem-peak`.
+
+Memory in use is the daemon's cgroup (`homebased.service`) plus each
+`run-*.scope` beside it, such as commands started with `systemd-run`, each
+less its page cache, active or inactive, which the kernel reclaims under the
+cgroup's cap; shmem (tmpfs) and unevictable (mlocked) pages stay counted, and
+a configured cgroup that is itself a scope counts once. Work already started counts at its
+declared peak until it grows that large, so two items that each fit alone
+cannot both start into the same room. Items wait in a fixed order: GPU queue jobs in
+serving order, then tasks in submit order. A waiting item keeps its room, so
+smaller work behind it cannot start ahead of it and keep it waiting. A job
+whose GPU is busy keeps no room until the GPU is free. Work without
+`mem_peak` starts as before and is counted only through memory in use.
+
+`task list`, `task show`, and `resource jobs` print why an item waits, such as
+`waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json`
+gives it as `memory_wait` on a task and under `memory_waits` by job id. When
+memory in use cannot be read, items with a peak wait and say why. Submit
+refuses a peak over the bar, a `mem_peak` on a machine whose daemon runs
+outside a cgroup v2 memory controller, and `mem_peak` together with
+`machine` on a task, since only the local daemon measures its own memory. A
+GPU job's queue machine checks its peak; for a job held for `after` whose
+queue is another machine, that happens when the job is sent. Set the bar, or
+the cgroup to read, in the daemon's config:
+
+```toml
+[memory]
+bar_gib = 40
+# cgroup = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/homebased.service"
+```
 
 ### Long commands inside an agent worker
 

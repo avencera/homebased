@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 17;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 16] = [
+const MIGRATIONS: [Migration; 17] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -36,6 +36,7 @@ const MIGRATIONS: [Migration; 16] = [
     add_services,
     add_ci_slots,
     add_preempt_operations,
+    add_route_mem_peaks,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -217,6 +218,18 @@ CREATE INDEX services_events ON services (ended_at) WHERE event_due = 1 AND even
 fn add_preempt_operations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&rebuild_operations(OPERATION_KINDS))
 }
+
+/// Version 18: the memory peak a task was submitted with
+fn add_route_mem_peaks(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE origin_routes ADD COLUMN {ROUTE_MEM_PEAK};"
+    ))
+}
+
+/// Peak host memory of a task in MiB, submitted with `mem_peak`; the route is
+/// held until the memory gate admits it, and its task is a claim while it runs
+const ROUTE_MEM_PEAK: &str =
+    "mem_peak_mib INTEGER CHECK (mem_peak_mib IS NULL OR mem_peak_mib > 0)";
 
 /// Version 16: CI slot lanes, drains, run timeouts, and job timings
 fn add_ci_slots(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -503,6 +516,7 @@ fn schema() -> String {
         .replace("{ROUTE_AFTER_RULE}", ROUTE_AFTER_RULE)
         .replace("{ROUTE_WAIT_FOR_MACHINE}", ROUTE_WAIT_FOR_MACHINE)
         .replace("{ROUTE_COALESCE_KEY}", ROUTE_COALESCE_KEY)
+        .replace("{ROUTE_MEM_PEAK}", ROUTE_MEM_PEAK)
         .replace("{ROUTE_COALESCE_INDEX}", ROUTE_COALESCE_INDEX)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{RESOURCE_LABEL}", RESOURCE_LABEL)
@@ -626,7 +640,8 @@ CREATE TABLE origin_routes (
         CHECK (outcome IN ('succeeded', 'failed', 'blocked', 'cancelled', 'lost', 'preempted')),
     {ROUTE_AFTER_RULE},
     {ROUTE_WAIT_FOR_MACHINE},
-    {ROUTE_COALESCE_KEY}
+    {ROUTE_COALESCE_KEY},
+    {ROUTE_MEM_PEAK}
 );
 {ROUTE_COALESCE_INDEX}
 
@@ -967,6 +982,7 @@ mod tests {
 
         // version 1 is the current schema without what version 2 added
         let v1 = schema()
+            .replace(&format!(",\n    {}", super::ROUTE_MEM_PEAK), "")
             .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
             .replace(&format!(",\n    {}", super::ROUTE_WAIT_FOR_MACHINE), "")
@@ -1065,9 +1081,10 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // version 12 had no lease guard, services, or CI slots
+        // version 12 had no lease guard, services, CI slots, or memory peaks
         conn.execute_batch(
-            "DROP TABLE lease_idle_trips; DROP TABLE services;
+            "ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
+             DROP TABLE lease_idle_trips; DROP TABLE services;
              DROP TABLE ci_drain; DROP TABLE ci_run_timeouts; DROP TABLE ci_job_timings;
              ALTER TABLE resources DROP COLUMN ci_retired;
              ALTER TABLE resources DROP COLUMN ci_slot;

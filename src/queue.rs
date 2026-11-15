@@ -1021,6 +1021,104 @@ pub enum Placement {
     },
 }
 
+/// Where a job takes its slot when it enters its queue
+///
+/// It applies once, when the authority stores the job: at submit, or at
+/// release for a job held by `after`. The anchor is read at that moment, so a
+/// held job can name a job that will still be queued when it is released
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EntryPlacement {
+    /// Front of the job's own level
+    Front,
+    /// Beside another job of the same queue, taking its level
+    Next {
+        /// The job to enter beside
+        anchor: JobId,
+        /// Which side of it
+        side: Side,
+    },
+}
+
+impl EntryPlacement {
+    /// The one entry placement the `--place-*` flags name, if any
+    pub fn from_flags(
+        front: bool,
+        before: Option<JobId>,
+        after: Option<JobId>,
+    ) -> Result<Option<Self>, MoveRefusal> {
+        match (front, before, after) {
+            (false, None, None) => Ok(None),
+            (true, None, None) => Ok(Some(Self::Front)),
+            (false, Some(anchor), None) => Ok(Some(Self::Next {
+                anchor,
+                side: Side::Before,
+            })),
+            (false, None, Some(anchor)) => Ok(Some(Self::Next {
+                anchor,
+                side: Side::After,
+            })),
+            _ => Err(MoveRefusal::ConflictingFlags),
+        }
+    }
+}
+
+/// Where an entry placement put a job
+///
+/// An anchor that is queued or running has a slot, so the job enters beside
+/// it. One that ended has none: the job enters at the front of the anchor's
+/// level, the slot the anchor left when it started. One this queue never held,
+/// such as a job still held on its origin, leaves the job at the back of its
+/// own level, where a submit without a placement goes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EntryOutcome {
+    /// Front of its own level, as asked
+    Front,
+    /// Beside the anchor, as asked
+    Next {
+        /// The anchor
+        anchor: JobId,
+        /// Which side of it
+        side: Side,
+    },
+    /// The anchor had ended, so the job entered at the front of its level
+    AnchorEnded {
+        /// The anchor
+        anchor: JobId,
+    },
+    /// The anchor is not a job of this queue, so the job entered at the back of its level
+    AnchorMissing {
+        /// The anchor
+        anchor: JobId,
+    },
+}
+
+impl fmt::Display for EntryOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Front => f.write_str("entered at the front of its level"),
+            Self::Next {
+                anchor,
+                side: Side::Before,
+            } => write!(f, "entered before {anchor}"),
+            Self::Next {
+                anchor,
+                side: Side::After,
+            } => write!(f, "entered after {anchor}"),
+            Self::AnchorEnded { anchor } => {
+                write!(f, "{anchor} had ended; entered at the front of its level")
+            }
+            Self::AnchorMissing { anchor } => {
+                write!(
+                    f,
+                    "{anchor} is not in this queue; entered at the back of its level"
+                )
+            }
+        }
+    }
+}
+
 /// The placement flags of `resource job move`, before they are checked
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MoveFlags {

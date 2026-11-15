@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::AppState;
+use super::actors::memory::MemoryMsg;
 use super::actors::{StoreMsg, SupervisorMsg, call};
 use super::api::views::DependencyView;
 use crate::dependency::Dependencies;
@@ -21,7 +22,8 @@ use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::ClusterClient;
 use crate::fleet::protocol::{
-    CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange, SUPPORTED_PROTOCOLS,
+    ADMISSION_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion, ProtocolRange,
+    SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
 use crate::queue::ci::MachineChoice;
@@ -116,6 +118,9 @@ struct SubmitBody {
     /// Tasks on this origin that must succeed before the job is sent
     #[serde(default)]
     after: Option<Dependencies>,
+    /// Slot the job takes when it enters its queue
+    #[serde(default)]
+    placement: Option<crate::queue::EntryPlacement>,
 }
 
 /// A job the origin holds for its `after` tasks, or ended before it queued
@@ -315,6 +320,7 @@ async fn submit(
             if route.origin != state.machine.identity.machine
                 || route.digest != body.spec.digest()?
                 || route.after != body.after
+                || route.placement != body.placement
             {
                 return Err(QueueError::JobConflict { job: body.job_id }.into());
             }
@@ -337,6 +343,12 @@ async fn submit(
             // a CI job waits on its origin until placement picks a machine,
             // and is refused now when no machine it may use offers its class
             let ci = body.spec.ci.is_some();
+            if ci && body.placement.is_some() {
+                return Err(AppError::Usage {
+                    message: "a CI job runs on CI slots, which have no queue order to place it in"
+                        .into(),
+                });
+            }
             let held = waits || ci;
             if ci {
                 let choice = match body.spec.machine {
@@ -345,7 +357,7 @@ async fn submit(
                 };
                 super::ci_api::check_offered(&state, &body.spec, choice).await?;
             } else if held {
-                check_held_authority(&state, authority, &body.spec).await?;
+                check_held_authority(&state, authority, &body.spec, body.placement).await?;
             }
             let route = JobRoute {
                 job: body.job_id,
@@ -368,6 +380,7 @@ async fn submit(
                 after: body.after,
                 owes_final_event: held,
                 submitted_at: ci.then(chrono::Utc::now),
+                placement: body.placement,
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),
@@ -400,6 +413,7 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
         origin: route.origin,
         spec: Box::new(route.spec.clone()),
         submitted_at: route.submitted_at,
+        placement: route.placement,
     };
     let result = if route.authority == state.machine.identity.machine {
         execute(state, request, route.callback.env.clone()).await
@@ -411,6 +425,9 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
             let accepted: JobAccepted = serde_json::from_value(value.clone())?;
             if accepted.machine != route.authority || accepted.job_id != route.job {
                 return Err(QueueError::JobConflict { job: route.job }.into());
+            }
+            if let Some(entered) = accepted.entered {
+                tracing::info!(job = %route.job, "job {entered}");
             }
             call(&state.store, |reply| StoreMsg::ResolveJobRoute {
                 job: route.job,
@@ -441,6 +458,11 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
     }
 }
 
+/// Whether an authority's answer settles a job it may never have taken
+///
+/// A queue machine too old for the spec or placement is one: the hold-time
+/// check refuses it when the machine is reachable, and a send after an
+/// unreachable hold must too, or the route stays unknown and retries forever
 fn definite_refusal(error: &AppError) -> bool {
     matches!(
         error.code(),
@@ -450,6 +472,7 @@ fn definite_refusal(error: &AppError) -> bool {
             | "resource_not_found"
             | "job_conflict"
             | "class_not_offered"
+            | "cluster_protocol_incompatible"
     )
 }
 
@@ -734,18 +757,27 @@ fn require_protocol(
 }
 
 /// Refuse a job held for its `after` entries now, rather than once they
-/// succeeded, when its queue machine is reachable and too old for its spec
+/// succeeded, when this machine is its queue and cannot admit its peak, or its
+/// queue machine is reachable and too old for its spec or placement
 ///
-/// An unreachable queue machine is checked again when the job is sent
+/// An unreachable queue machine is checked again when the job is sent, and a
+/// remote queue's memory bar only then
 async fn check_held_authority(
     state: &AppState,
     authority: MachineId,
     spec: &JobSpec,
+    placement: Option<crate::queue::EntryPlacement>,
 ) -> Result<(), AppError> {
     if authority == state.machine.identity.machine {
-        return Ok(());
+        return spec
+            .mem_peak
+            .map_or(Ok(()), |peak| state.memory_limits.check_peak(peak));
     }
-    let needed = submit_protocol(spec);
+    let needed = if placement.is_some() {
+        submit_protocol(spec).max(ADMISSION_PROTOCOL)
+    } else {
+        submit_protocol(spec)
+    };
     if needed <= SUPPORTED_PROTOCOLS.min() {
         return Ok(());
     }
@@ -786,17 +818,40 @@ async fn execute_at(
                 return Err(QueueError::JobConflict { job: *job }.into());
             }
             Some(_) => {}
-            None => spec.check_on_authority(&env.path)?,
+            None => {
+                spec.check_on_authority(&env.path)?;
+                if let Some(peak) = spec.mem_peak {
+                    state.memory_limits.check_peak(peak)?;
+                }
+            }
         }
     }
-    call(&state.store, |reply| StoreMsg::QueueInterface {
+    let listing = matches!(request, QueueRequest::Jobs | QueueRequest::Overview);
+    // a preempt checks that the waiting job's memory peak fits once the run
+    // stops, and the store cannot read memory
+    let memory = match request {
+        QueueRequest::Preempt { .. } => {
+            Some(call(&state.memory, |reply| MemoryMsg::JobRoom { reply }).await?)
+        }
+        _ => None,
+    };
+    let mut value = call(&state.store, |reply| StoreMsg::QueueInterface {
         machine: state.machine.identity.machine,
         request: Box::new(request),
         env,
         protocol,
+        memory,
         reply,
     })
-    .await
+    .await?;
+    // the memory actor keeps why jobs wait for memory, so the store cannot list it
+    if listing {
+        let waits = call(&state.memory, |reply| MemoryMsg::JobWaits { reply }).await?;
+        if !waits.is_empty() {
+            value["memory_waits"] = json!(waits);
+        }
+    }
+    Ok(value)
 }
 
 async fn cluster_request(

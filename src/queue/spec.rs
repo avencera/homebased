@@ -29,6 +29,7 @@ use crate::spec::{
 use super::ci::{CiSpec, InnerPath};
 use super::gpu_idle::GpuIdleSpec;
 use super::{HOLD_AFTER, PreemptMode, Preemption, Priority, ResourceSelector, StepWorkload, Steps};
+use crate::memory::MemPeak;
 
 /// Container path under which the authority mounts the job and run directories
 pub const RESERVED_MOUNT_ROOT: &str = "/homebased";
@@ -133,6 +134,11 @@ pub struct JobSpec {
     // left out when absent, so GPU job digests do not change
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiSpec>,
+    /// Host memory each run may use at its peak; a run starts only while it
+    /// fits under the machine's memory bar. No memory check when absent
+    // left out when absent, so the digests of earlier specs do not change
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_peak: Option<MemPeak>,
 }
 
 impl JobSpec {
@@ -263,6 +269,7 @@ impl JobSpec {
             steps,
             gpu_idle,
             ci: wire.ci,
+            mem_peak: wire.mem_peak,
         };
         spec.check_ci()?;
         Ok(spec)
@@ -304,6 +311,13 @@ impl JobSpec {
                 "/gpu_idle",
                 Value::Null,
                 "a CI job has no GPU to watch",
+            ));
+        }
+        if let Some(peak) = self.mem_peak {
+            return Err(invalid(
+                "/mem_peak",
+                json!(peak),
+                "a CI job is admitted by its slot's load and disk, not by memory",
             ));
         }
         if ci.git.is_some() {
@@ -452,6 +466,12 @@ struct JobSpecWire {
     /// checkout. Submit CI jobs with `homebased ci run`
     #[serde(default)]
     ci: Option<CiSpec>,
+    /// Peak host memory of each run in GiB. A run starts only while the
+    /// machine's memory in use, plus the room promised to work started or
+    /// waiting ahead of it, plus this peak, stays under its memory bar
+    /// (default 40 GiB). Omit for no memory check
+    #[serde(default)]
+    mem_peak: Option<MemPeak>,
 }
 
 fn gpu_idle_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {

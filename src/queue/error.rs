@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use super::ci::JobClass;
 use super::{AttentionId, JobId, OperationId, Priority, ResourceId, ResourceName};
 use crate::machine::MachineId;
+use crate::memory::MemPeak;
 
 /// Why a queue request was refused, or stored queue data could not be read
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -258,6 +259,19 @@ pub enum PreemptRefusal {
     NothingWaiting {
         /// The job's level
         level: Priority,
+    },
+    /// Every waiting job of a higher level that may use its resource has a
+    /// memory peak that would not fit even once this run stops, so the
+    /// resource would sit idle while that job waits for memory
+    #[error(
+        "waiting job {job} needs {peak} of host memory, which would not fit even once this run \
+         stops"
+    )]
+    NoMemory {
+        /// The first such waiting job in serving order
+        job: JobId,
+        /// Its peak
+        peak: MemPeak,
     },
 }
 

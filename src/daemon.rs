@@ -104,6 +104,10 @@ pub struct AppState {
     pub(crate) shutdown: watch::Receiver<bool>,
     /// CI admission and checkout settings from config.toml
     pub ci: crate::queue::ci::CiConfig,
+    /// Owner of host memory admission, shared with the queue actor
+    pub(crate) memory: ActorRef<actors::memory::MemoryMsg>,
+    /// Memory bar and gauge, for refusing a peak at submit
+    pub(crate) memory_limits: actors::memory::MemoryLimits,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -154,13 +158,15 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         None => (None, None),
     };
     let notifier = Notifier::from_config(&config).map(Arc::new);
+    let memory_limits = actors::memory::MemoryLimits::new(&config.memory);
     let supervisor_args = SupervisorArgs::new(
         home.clone(),
         std::env::var(crate::domain::AgentKind::Codex.binary_env()).ok(),
     )
     .with_notifications(notifier.clone(), machine.name.to_string())
     .with_queue_thresholds(config.resource.notify_blocked_after)
-    .with_ci(config.ci.clone());
+    .with_ci(config.ci.clone())
+    .with_memory(memory_limits.clone());
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await
         .map_err(|err| AppError::Internal {
@@ -168,6 +174,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         })?;
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply }).await?;
     let waiters = call(&supervisor, |reply| SupervisorMsg::GetWaiters { reply }).await?;
+    let memory = call(&supervisor, |reply| SupervisorMsg::GetMemory { reply }).await?;
     let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
     let fleet = fleet_runtime
         .as_ref()
@@ -194,6 +201,8 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         waiters,
         shutdown: shutdown_rx.clone(),
         ci: config.ci.clone(),
+        memory,
+        memory_limits,
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),
