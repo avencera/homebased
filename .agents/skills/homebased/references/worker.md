@@ -18,24 +18,28 @@ Never wait in the foreground for a long command (a GPU run, a release build, a b
 
 Hand the command to homebased and park instead. You do not need permission in the prompt for this.
 
-1. Submit the command with `homebased --quiet task run --name "<goal>" -- <program> <args...>` (or a spec for an agent). Note the task id it prints. Submit as many as you need.
-2. Report `waiting` on those tasks with notes for the next run, then exit 0 at once:
+1. Submit the command with `homebased --quiet task run --name "<goal>" -- <program> <args...>` (or a spec for an agent), or submit GPU work as a queue job with `homebased --json resource job submit --job-id <uuid> --spec <file>` ([resource-queue.md](resource-queue.md)). Note each task id and job id. Submit as many as you need.
+2. Report `waiting` on those tasks and jobs with notes for the next run, then exit 0 at once:
 
 ```bash
-homebased task report --outcome waiting --on <task-id> [--on <task-id> ...] \
+homebased task report --outcome waiting --on <task-or-job-id> [--on <task-or-job-id> ...] \
   --summary "<what is running and why>" --notes-file - <<'NOTES'
-<what each outcome of each task means, and the exact next steps for each>
+<what each outcome of each task or job means, and the exact next steps for each>
 NOTES
 ```
 
-The orchestrator gets `TASK_WAITING`. Homebased holds a continuation task until every task you named has ended, whether it succeeded, failed, or was cancelled, then starts it on its own. A Codex continuation resumes the run's thread when one is known and receives only the block below. If no thread is known, it starts a fresh session with your original prompt followed by the block. Other agents always start a fresh session with your original prompt followed by the block:
+Name a GPU job by its job id directly. Do not hold a placeholder task `--after` the job to park on it.
+
+The orchestrator gets `TASK_WAITING`. Homebased holds a continuation task until every task you named has ended and every job you named has sent its final event (`JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`), however each one ended, then starts it on its own. `JOB_PREEMPTED` is not an ending: the job queues again and the continuation keeps waiting. A Codex continuation resumes the run's thread when one is known and receives only the block below. If no thread is known, it starts a fresh session with your original prompt followed by the block. Other agents always start a fresh session with your original prompt followed by the block:
 
 ```text
 --- homebased continuation ---
-You are continuing task <your task id>. You reported waiting on <task ids>.
-Those tasks have now ended. Read each outcome with:
+You are continuing task <your task id>. You reported waiting on task <id>, job <id>.
+Those have now ended. Read each outcome with:
   homebased --json task show <task id>
   homebased task log <task id> --tail 200
+  homebased --json resource job show <job id>
+  then homebased task log <run task> --tail 200 for its last run
 Your notes from before you stopped:
 <your notes>
 Continue the task from these notes. Do not redo completed work.
@@ -43,7 +47,12 @@ Continue the task from these notes. Do not redo completed work.
 
 - The notes are the only memory the next run has besides the repository. Write everything it needs into them: what is already done and verified, what each outcome means, and what to do next. Do not write a `RESUME.md` or any other handoff file into the repository.
 - The continuation is a new task with your name plus ` (continued)`, the same `cwd`, agent, model, `extra_args`, and parent thread. It reports like any worker, and may park again.
-- Name 1 to 16 tasks, each once. Each must be a task on this machine that was submitted here, not a GPU queue run, and not a task that already waits on you, directly or through held tasks and GPU jobs. Errors: `unknown_dependency`, `waiting_target_unsupported`, `waiting_remote_unsupported`, `waiting_cycle`. Only agent workers can park (`waiting_unsupported_workload`), and only on the machine that submitted them.
+- The block lists the two task lines for each task and the two job lines for each job you named, in your order.
+- Name 1 to 16 tasks and jobs, each once. Each task must be on this machine and submitted here. Each job must be submitted from this machine; it may queue on another one. No target may already wait on you, directly or through held tasks and held GPU jobs, such as a job submitted `--after` you. Errors:
+  - `unknown_dependency`: the id names no task or job here.
+  - `waiting_target_unsupported`: the id is a run task of a GPU queue job, which can end while its job runs again. `input.job` names the job; wait on that id instead.
+  - `waiting_remote_unsupported`: a task runs on or reports to another machine (`input.task`), or a job was submitted from another machine (`input.job`).
+  - `waiting_cycle`: the target, `input.task` or `input.job`, waits on you. Only agent workers can park (`waiting_unsupported_workload`), and only on the machine that submitted them.
 - One unit of work has at most 20 runs. On the last one, `waiting` fails with `too_many_continuations`; report `blocked` instead.
 - The last report wins. If you report `waiting` and then decide to finish the work yourself, report `succeeded` or `failed` before you exit. A waiting report followed by a non-zero exit is `TASK_FAILED`, and nothing continues.
 

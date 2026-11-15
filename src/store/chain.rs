@@ -1,4 +1,5 @@
-//! Chains of agent runs that park on other tasks and continue when they end
+//! Chains of agent runs that park on other tasks or GPU queue jobs and
+//! continue when they end
 //!
 //! A chain is created when a run first parks and is advanced in the
 //! transaction that ends one of its runs, so its state and the run rows never
@@ -16,7 +17,7 @@ use super::Store;
 use super::dependency::dependent_route_on;
 use super::fmt_time;
 use super::lifecycle::reports_from;
-use crate::dependency::{Dependencies, DependencyId, ReleaseRule, TaskOutcome};
+use crate::dependency::{Dependencies, Dependency, DependencyId, ReleaseRule, TaskOutcome};
 use crate::domain::{API_VERSION, AgentKind, ReportOutcome, TaskId, TaskRow, ThreadId, Workload};
 use crate::error::AppError;
 use crate::queue::JobId;
@@ -28,7 +29,7 @@ use crate::waiting::{
     continuation_block, continuation_name,
 };
 
-/// Most nodes the cycle check visits; every node is a local task or chain
+/// Most nodes the cycle check visits; every node is a local task, chain, or job
 const CYCLE_SEARCH_LIMIT: usize = 10_000;
 
 /// One run's chain as saved
@@ -280,9 +281,12 @@ pub(super) fn park_on(
         callback: route.callback.clone(),
         spec,
     });
-    let after = Dependencies::of_tasks(waiting.on.tasks()).map_err(|error| AppError::Internal {
-        message: format!("waiting targets are not a dependency list: {error}"),
-    })?;
+    // a job target is an `after` entry like a task, so the release loop reads
+    // its final event from this origin's job inbox
+    let after =
+        Dependencies::new(waiting.on.ids().collect()).map_err(|error| AppError::Internal {
+            message: format!("waiting targets are not a dependency list: {error}"),
+        })?;
     // the continuation keeps the parked run's memory peak, so its release
     // waits for room and its run holds that room like the first one did
     conn.execute(
@@ -415,13 +419,9 @@ fn pending_wait_on(conn: &Connection, task: TaskId) -> Result<Vec<DependencyId>,
     }
     let reports = reports_from(conn, task)?;
     Ok(match reports.last().map(|report| &report.outcome) {
-        Some(ReportOutcome::Waiting(waiting)) => task_entries(waiting.on.tasks()),
+        Some(ReportOutcome::Waiting(waiting)) => waiting.on.ids().collect(),
         _ => Vec::new(),
     })
-}
-
-fn task_entries(tasks: &[TaskId]) -> Vec<DependencyId> {
-    tasks.iter().copied().map(DependencyId::from).collect()
 }
 
 /// Entries a held route still waits on, tasks and jobs alike
@@ -454,7 +454,7 @@ fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<DependencyId>, A
         WaitNode::Chain(chain) => {
             let state = chain_of_on(conn, chain)?.map(|chain| chain.state);
             match state {
-                Some(ChainState::Waiting { on, .. }) => Ok(task_entries(on.tasks())),
+                Some(ChainState::Waiting { on, .. }) => Ok(on.ids().collect()),
                 Some(ChainState::Running { current }) => {
                     let mut waits = held_after_on(conn, current)?;
                     waits.extend(pending_wait_on(conn, current)?);
@@ -467,10 +467,25 @@ fn waits_of_on(conn: &Connection, node: WaitNode) -> Result<Vec<DependencyId>, A
     }
 }
 
+/// The node a wait target starts from
+///
+/// A job target is a node of its own even when it is not held, so a held
+/// job's `after` list is walked and any other job ends the walk
+fn target_node_on(conn: &Connection, target: Dependency) -> Result<WaitNode, AppError> {
+    match target {
+        Dependency::Task(task) => node_on(conn, task),
+        Dependency::Job(job) => Ok(WaitNode::Job(job)),
+    }
+}
+
 /// Whether `target` leads back to `worker` through the wait graph
-fn leads_back_on(conn: &Connection, worker: WaitNode, target: TaskId) -> Result<bool, AppError> {
+fn leads_back_on(
+    conn: &Connection,
+    worker: WaitNode,
+    target: Dependency,
+) -> Result<bool, AppError> {
     let mut seen = HashSet::new();
-    let mut stack = vec![node_on(conn, target)?];
+    let mut stack = vec![target_node_on(conn, target)?];
     while let Some(node) = stack.pop() {
         if node == worker {
             return Ok(true);
@@ -497,7 +512,8 @@ fn local_route_on(conn: &Connection, task: TaskId) -> Result<Option<OriginRoute>
         .filter(|route| route.origin_machine == route.execution_machine))
 }
 
-fn is_queue_run_on(conn: &Connection, task: TaskId) -> Result<bool, AppError> {
+/// The job a GPU queue run belongs to, or `None` for any other task
+fn queue_run_job_on(conn: &Connection, task: TaskId) -> Result<Option<JobId>, AppError> {
     let job: Option<Option<String>> = conn
         .query_row(
             "SELECT resource_job_id FROM tasks WHERE id = ?1",
@@ -505,7 +521,75 @@ fn is_queue_run_on(conn: &Connection, task: TaskId) -> Result<bool, AppError> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(job.flatten().is_some())
+    job.flatten()
+        .map(|job| {
+            job.parse().map_err(|_| AppError::Internal {
+                message: format!("invalid job id {job} on queue run {task}"),
+            })
+        })
+        .transpose()
+}
+
+/// Whether this machine submitted `job`, so its events reach this origin
+fn job_route_exists_on(conn: &Connection, job: JobId) -> Result<bool, AppError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resource_job_routes WHERE job_id = ?1)",
+        [job.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether this machine's queue holds `job`, wherever it was submitted
+fn queued_here_on(conn: &Connection, job: JobId) -> Result<bool, AppError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resource_jobs WHERE id = ?1)",
+        [job.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// What a `--on` id names: a task wins over a job, as in dependency lookups
+///
+/// A job this machine only queues resolves too, so the check that follows
+/// can say it was submitted elsewhere
+fn resolve_target_on(conn: &Connection, id: DependencyId) -> Result<Dependency, AppError> {
+    if task_exists_on(conn, id.as_task())? {
+        return Ok(Dependency::Task(id.as_task()));
+    }
+    let job = id.as_job();
+    if job_route_exists_on(conn, job)? || queued_here_on(conn, job)? {
+        return Ok(Dependency::Job(job));
+    }
+    Err(WaitingRejection::UnknownTarget { id }.into())
+}
+
+/// Refuse a target task that the continuation could not wait on
+fn check_task_target_on(conn: &Connection, worker: TaskId, task: TaskId) -> Result<(), AppError> {
+    let target = Dependency::Task(task);
+    if task == worker {
+        return Err(WaitingRejection::Cycle { target }.into());
+    }
+    if !task_exists_on(conn, task)? {
+        return Err(WaitingRejection::UnknownTarget { id: target.id() }.into());
+    }
+    if let Some(job) = queue_run_job_on(conn, task)? {
+        return Err(WaitingRejection::QueueRun { task, job }.into());
+    }
+    if local_route_on(conn, task)?.is_none() {
+        return Err(WaitingRejection::Remote { task }.into());
+    }
+    Ok(())
+}
+
+/// Refuse a target job whose final event would never reach this origin
+fn check_job_target_on(conn: &Connection, job: JobId) -> Result<(), AppError> {
+    if job_route_exists_on(conn, job)? {
+        return Ok(());
+    }
+    if queued_here_on(conn, job)? {
+        return Err(WaitingRejection::RemoteJob { job }.into());
+    }
+    Err(WaitingRejection::UnknownTarget { id: job.into() }.into())
 }
 
 fn task_exists_on(conn: &Connection, task: TaskId) -> Result<bool, AppError> {
@@ -524,7 +608,7 @@ pub(super) fn check_waiting_on(
     targets: &WaitTargets,
 ) -> Result<(), AppError> {
     let worker = row.id;
-    if !matches!(row.workload, Workload::Agent(_)) || is_queue_run_on(conn, worker)? {
+    if !matches!(row.workload, Workload::Agent(_)) || queue_run_job_on(conn, worker)?.is_some() {
         return Err(WaitingRejection::UnsupportedWorkload.into());
     }
     if local_route_on(conn, worker)?.is_none() {
@@ -536,31 +620,44 @@ pub(super) fn check_waiting_on(
         return Err(WaitingRejection::TooManyContinuations { runs }.into());
     }
 
-    for &task in targets.tasks() {
-        if task == worker {
-            return Err(WaitingRejection::Cycle { task }.into());
-        }
-        if !task_exists_on(conn, task)? {
-            return Err(WaitingRejection::UnknownTarget { task }.into());
-        }
-        if is_queue_run_on(conn, task)? {
-            return Err(WaitingRejection::TargetUnsupported { task }.into());
-        }
-        if local_route_on(conn, task)?.is_none() {
-            return Err(WaitingRejection::Remote { task }.into());
+    for &target in targets.targets() {
+        match target {
+            Dependency::Task(task) => check_task_target_on(conn, worker, task)?,
+            Dependency::Job(job) => check_job_target_on(conn, job)?,
         }
     }
 
     let node = node_on(conn, worker)?;
-    for &task in targets.tasks() {
-        if leads_back_on(conn, node, task)? {
-            return Err(WaitingRejection::Cycle { task }.into());
+    for &target in targets.targets() {
+        if leads_back_on(conn, node, target)? {
+            return Err(WaitingRejection::Cycle { target }.into());
         }
     }
     Ok(())
 }
 
 impl Store {
+    /// Resolve the ids a waiting report names to tasks and jobs, in order
+    ///
+    /// The report's own check then refuses targets the continuation could
+    /// not wait on
+    ///
+    /// # Errors
+    ///
+    /// A usage error for an empty, repeated, or oversized list, and
+    /// `unknown_dependency` for an id that names no task or job here
+    pub fn wait_targets(&self, ids: Vec<DependencyId>) -> Result<WaitTargets, AppError> {
+        let usage = |error: crate::waiting::WaitTargetsError| AppError::Usage {
+            message: error.to_string(),
+        };
+        WaitTargets::check_ids(&ids).map_err(usage)?;
+        let targets = ids
+            .into_iter()
+            .map(|id| resolve_target_on(&self.conn, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        WaitTargets::new(targets).map_err(usage)
+    }
+
     /// Chain of each task that belongs to one, for task views
     pub fn chain_view(&self, task: TaskId) -> Result<Option<ChainView>, AppError> {
         Ok(chain_of_on(&self.conn, task)?.map(|chain| chain.view()))

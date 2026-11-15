@@ -153,7 +153,7 @@ impl Dependencies {
         Ok(Self(ids))
     }
 
-    /// A list of tasks, such as the targets of a parked worker
+    /// A list of tasks only
     ///
     /// # Errors
     ///
