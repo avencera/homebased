@@ -250,23 +250,35 @@ pub struct Claim {
     pub root: Option<u32>,
 }
 
-/// Bytes of their peaks that started items have not allocated yet
+/// Memory in use, and the room started items still need, from one measurement
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// Bytes in use, as [`Gauge::read`] counts them
+    pub used: u64,
+    /// Bytes of their peaks that started items have not allocated yet
+    pub outstanding: u64,
+}
+
+/// Bytes of their peaks that started items have not allocated yet, given
+/// what each one's process tree holds
 ///
 /// The gauge sees only what an item has allocated, so an item that just
 /// started still needs most of its peak. Each item counts its peak less what
-/// its child's process tree holds now, never less than zero
-#[must_use]
-pub fn outstanding(claims: &[Claim]) -> u64 {
-    if claims.is_empty() {
-        return 0;
-    }
+/// it holds, never less than zero
+fn outstanding(claims: &[Claim], held: &[u64]) -> u64 {
     claims
         .iter()
-        .map(|claim| {
-            let held = claim.root.map_or(0, tree_resident);
-            claim.peak.bytes().saturating_sub(held)
-        })
+        .zip(held)
+        .map(|(claim, held)| claim.peak.bytes().saturating_sub(*held))
         .sum()
+}
+
+/// What each claim's process tree holds now; one without a process holds nothing
+fn held_by(claims: &[Claim]) -> Vec<u64> {
+    claims
+        .iter()
+        .map(|claim| claim.root.map_or(0, tree_resident))
+        .collect()
 }
 
 /// Where the memory in use is read
@@ -293,6 +305,27 @@ impl Gauge {
     #[must_use]
     pub fn cgroup(&self) -> Option<&Path> {
         self.cgroup.as_deref()
+    }
+
+    /// Memory in use and the room `claims` still need, read together
+    ///
+    /// The cgroup and each claim's process tree cannot be read at one
+    /// instant. Each claim's residence is read before and after the cgroup,
+    /// and the lower one counts, so memory a worker allocates or frees between
+    /// the reads is at worst counted twice, never missed
+    pub fn measure(&self, claims: &[Claim]) -> Result<Usage, String> {
+        let before = held_by(claims);
+        let used = self.read()?;
+        let after = held_by(claims);
+        let held: Vec<u64> = before
+            .into_iter()
+            .zip(after)
+            .map(|(a, b)| a.min(b))
+            .collect();
+        Ok(Usage {
+            used,
+            outstanding: outstanding(claims, &held),
+        })
     }
 
     /// Bytes in use: `memory.current` less its file pages other than shmem,
@@ -479,7 +512,10 @@ mod tests {
             peak: gib(3.0),
             root: None,
         }];
-        assert_eq!(outstanding(&claims), 3 << 30);
+        assert_eq!(super::held_by(&claims), [0]);
+        assert_eq!(outstanding(&claims, &[0]), 3 << 30);
+        // a claim counts the lower of its two readings
+        assert_eq!(outstanding(&claims, &[1 << 30]), 2 << 30);
     }
 
     #[test]

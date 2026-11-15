@@ -24,7 +24,7 @@ use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::memory::{Gauge, Gib, MemPeak, MemoryWait, Room, outstanding};
+use crate::memory::{Gauge, Gib, MemPeak, MemoryWait, Room};
 use crate::queue::JobId;
 
 pub(crate) const MEMORY_NAME: &str = "homebased.memory";
@@ -215,8 +215,8 @@ impl MemoryState {
         })
         .await?;
         let limits = &self.args.limits;
-        let mut room = match limits.gauge.read() {
-            Ok(used) => Room::new(limits.bar, used, outstanding(&claims)),
+        let mut room = match limits.gauge.measure(&claims) {
+            Ok(usage) => Room::new(limits.bar, usage.used, usage.outstanding),
             Err(error) => Room::Unreadable { error },
         };
         // a task grant ends only by a settle or the next release pass, which
