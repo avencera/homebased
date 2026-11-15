@@ -500,6 +500,49 @@ fn a_job_preempts_only_when_its_memory_peak_fits_once_the_victim_stops() {
 }
 
 #[test]
+fn a_job_behind_that_waits_for_memory_holds_back_no_preemption() {
+    const GIB: u64 = 1 << 30;
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let gpu0 = machine.resource("gpu0");
+    let (victim, task) = machine.running("gpu0", Priority::Low, RESTART, executing(t0()));
+    let urgent = machine.queued(Priority::High, Target::Pinned(gpu0), YIELD);
+    let later = machine.queued(Priority::Low, Target::Any, YIELD);
+    machine.set_peak(victim, Some(8.0));
+    machine.set_peak(urgent, Some(12.0));
+    let with_free = |machine: &Machine, free_gib: u64| Snapshot {
+        memory: Some(Room::new(40 * GIB, (40 - free_gib) * GIB, 0)),
+        ..machine.snapshot(at(60))
+    };
+
+    // the 30 GiB job waits for memory on gpu1, and the 12 GiB job still fits
+    // in 10 GiB free plus the victim's 8
+    machine.set_peak(later, Some(30.0));
+    let decisions = decide(&with_free(&machine, 10));
+    assert!(decisions.memory_waits.contains_key(&later));
+    assert_eq!(
+        decisions.preemption,
+        Some(Preempt {
+            resource: gpu0,
+            job: victim,
+            task,
+            cause: StopCause::Restart,
+        })
+    );
+
+    // a 7 GiB job that launches on gpu1 does take the room
+    machine.set_peak(later, Some(7.0));
+    let decisions = decide(&with_free(&machine, 10));
+    assert_eq!(
+        decisions.launches,
+        vec![Launch {
+            job: later,
+            resource: machine.resource("gpu1")
+        }]
+    );
+    assert_eq!(decisions.preemption, None);
+}
+
+#[test]
 fn a_manual_preempt_stops_one_run_at_a_time() {
     let mut machine = Machine::new(&["gpu0", "gpu1"]);
     let (first, first_task) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));

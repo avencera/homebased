@@ -201,9 +201,11 @@ pub struct Decisions {
 ///    with an executing run of a strictly lower level on an allowed resource
 ///    whose mode allows a stop now. No new preemption starts while any resource
 ///    is stopping for preemption. A job with a memory peak preempts only a run
-///    whose stop leaves room for it: the room left after step 1 plus the
+///    whose stop leaves room for it: the room left at its place in serving
+///    order, less the peaks of jobs behind it that launch in step 1, plus the
 ///    victim job's own peak, since a victim without one frees an unknown
-///    amount. Otherwise the victim would lose its step while the GPU sits idle.
+///    amount. A job behind it that only waits for memory reserves nothing
+///    from it. Otherwise the victim would lose its step while the GPU sits idle.
 ///    The lowest level goes first, then the cheapest stop, then the most recent
 ///    start. The first queued job remains the notice head
 #[must_use]
@@ -216,7 +218,9 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     free.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut launches = Vec::new();
-    let mut waiting = Vec::new();
+    // each busy job keeps the room at its place in serving order, so a job
+    // behind it that only waits for memory never holds back its preemption
+    let mut waiting: Vec<(&JobView, Room)> = Vec::new();
     let mut memory = room(snapshot);
     let mut memory_waits = BTreeMap::new();
     for job in snapshot.queue.iter().filter(|job| startable(snapshot, job)) {
@@ -224,7 +228,7 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
             .iter()
             .position(|resource| job.target.allows(resource.id))
         else {
-            waiting.push(job);
+            waiting.push((job, memory.clone()));
             continue;
         };
         let resource = free.remove(index);
@@ -233,6 +237,12 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
         {
             memory_waits.insert(job.id, wait);
             continue;
+        }
+        // a launch behind a busy job does take its memory
+        if let Some(peak) = job.mem_peak {
+            for (_, room) in &mut waiting {
+                room.reserve(peak.bytes());
+            }
         }
         launches.push(Launch {
             job: job.id,
@@ -245,11 +255,11 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     } else {
         waiting
             .iter()
-            .find_map(|job| preempt_for(snapshot, job, &memory))
+            .find_map(|(job, room)| preempt_for(snapshot, job, room))
     };
     let blocked = waiting
         .first()
-        .map(|head| blocked_head(snapshot, head, preemption.as_ref()));
+        .map(|(head, _)| blocked_head(snapshot, head, preemption.as_ref()));
     Decisions {
         launches,
         preemption,
