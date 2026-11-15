@@ -51,8 +51,15 @@ export function isInFlight(status: ProcessStatus): boolean {
 const AgentKindSchema = Schema.Literal('codex', 'claude', 'grok', 'opencode');
 export type AgentKind = typeof AgentKindSchema.Type;
 
-/** Callback delivery state. Outlives the process state. */
-const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'waiting', 'sent', 'failed');
+/** Callback delivery state. Outlives the process state. `held` is kept back for a sleeping thread. */
+const CallbackStatusSchema = Schema.Literal(
+	'pending',
+	'sending',
+	'waiting',
+	'held',
+	'sent',
+	'failed'
+);
 export type CallbackStatus = typeof CallbackStatusSchema.Type;
 
 /** Worker-authored outcome of one report. `waiting` parks an agent worker on other tasks. */
