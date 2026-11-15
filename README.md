@@ -881,7 +881,8 @@ jobs take the same field and `resource job submit --mem-peak`.
 Memory in use is the daemon's cgroup (`homebased.service`) plus each
 `run-*.scope` beside it, such as commands started with `systemd-run`, each
 less its page cache, active or inactive, which the kernel reclaims under the
-cgroup's cap; shmem (tmpfs) stays counted. Work already started counts at its
+cgroup's cap; shmem (tmpfs) and unevictable (mlocked) pages stay counted, and
+a configured cgroup that is itself a scope counts once. Work already started counts at its
 declared peak until it grows that large, so two items that each fit alone
 cannot both start into the same room. Items wait in a fixed order: GPU queue jobs in
 serving order, then tasks in submit order. A waiting item keeps its room, so

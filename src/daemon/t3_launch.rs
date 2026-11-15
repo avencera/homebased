@@ -37,6 +37,9 @@ const CLUSTER_PROJECT_ADD_PATH: &str = "/v1/cluster/t3/projects/add";
 // the peer issues a token, waits up to 30 seconds for T3, and revokes the token
 const LAUNCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const PROJECTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// provider discovery asks the running T3, so it gets a share of the listing
+// deadline and the projects go back without it when T3 is slow
+const PROVIDERS_BUDGET: Duration = Duration::from_secs(4);
 // the peer runs `t3 project add`, which has its own 10 second deadline
 const PROJECT_ADD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -359,17 +362,24 @@ async fn launch_here(machine: MachineId, launch: LaunchSpec) -> Result<LaunchedT
 }
 
 /// Projects and enabled provider instances of T3 on this machine
+///
+/// Providers are `None` when T3 cannot say within [`PROVIDERS_BUDGET`]; the
+/// discovery left running then finishes, and revokes its token, on its own
 async fn projects_here() -> Result<(Vec<T3Project>, Option<Vec<ProviderInstance>>), AppError> {
-    tokio::task::spawn_blocking(|| {
-        let env = T3Env::from_env();
-        projects(&env).map(|projects| (projects, providers(&env)))
-    })
-    .await
-    .map_err(|error| AppError::Internal {
-        message: format!("T3 project worker failed: {error}"),
-    })?
-    // reading projects sends nothing to T3, so its outcome is never unknown
-    .map_err(|error| t3_error(error, |message| AppError::T3Unavailable { message }))
+    let discovery = tokio::task::spawn_blocking(|| providers(&T3Env::from_env()));
+    let projects = tokio::task::spawn_blocking(|| projects(&T3Env::from_env()))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("T3 project worker failed: {error}"),
+        })?
+        // reading projects sends nothing to T3, so its outcome is never unknown
+        .map_err(|error| t3_error(error, |message| AppError::T3Unavailable { message }))?;
+    let providers = tokio::time::timeout(PROVIDERS_BUDGET, discovery)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    Ok((projects, providers))
 }
 
 async fn add_here(spec: ProjectSpec) -> Result<AddedProject, AppError> {

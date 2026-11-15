@@ -458,6 +458,11 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
     }
 }
 
+/// Whether an authority's answer settles a job it may never have taken
+///
+/// A queue machine too old for the spec or placement is one: the hold-time
+/// check refuses it when the machine is reachable, and a send after an
+/// unreachable hold must too, or the route stays unknown and retries forever
 fn definite_refusal(error: &AppError) -> bool {
     matches!(
         error.code(),
@@ -467,6 +472,7 @@ fn definite_refusal(error: &AppError) -> bool {
             | "resource_not_found"
             | "job_conflict"
             | "class_not_offered"
+            | "cluster_protocol_incompatible"
     )
 }
 

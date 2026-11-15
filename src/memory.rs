@@ -301,8 +301,8 @@ impl Gauge {
     /// The kernel reclaims page cache, active or inactive, before it
     /// OOM-kills anything under the cgroup's cap, so counting it would hold
     /// work back for memory that is free in practice; data reads can fill
-    /// most of the cgroup with active cache. Shmem (tmpfs) is file-backed
-    /// but cannot be reclaimed, so it stays counted
+    /// most of the cgroup with active cache. Shmem (tmpfs) and unevictable
+    /// (mlocked) pages cannot be reclaimed, so they stay counted
     pub fn read(&self) -> Result<u64, String> {
         let cgroup = self
             .cgroup
@@ -316,6 +316,10 @@ impl Gauge {
             return Ok(used);
         };
         for entry in entries.flatten() {
+            // a configured cgroup that is itself a scope is counted above
+            if entry.path() == cgroup {
+                continue;
+            }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("run-") && name.ends_with(".scope") {
@@ -343,8 +347,12 @@ fn cgroup_used(dir: &Path) -> Result<u64, String> {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(0)
     };
-    // `file` counts shmem too, which reclaim cannot free
-    let reclaimable = field("file").saturating_sub(field("shmem"));
+    // `file` counts shmem too, which reclaim cannot free, and mlocked file
+    // pages; `unevictable` does not say which of its pages are file pages, so
+    // leaving all of it counted can only understate what reclaim frees
+    let reclaimable = field("file")
+        .saturating_sub(field("shmem"))
+        .saturating_sub(field("unevictable"));
     Ok(current.saturating_sub(reclaimable))
 }
 
@@ -418,7 +426,7 @@ fn kib(text: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Claim, MemPeak, MemoryWait, Room, cgroup_used, kib, outstanding};
+    use super::{Claim, Gauge, MemPeak, MemoryWait, Room, cgroup_used, kib, outstanding};
 
     fn gib(value: f64) -> MemPeak {
         MemPeak::from_gib(value).unwrap()
@@ -505,5 +513,36 @@ mod tests {
         .unwrap();
         // 31 less the 21 GiB of file pages that are not shmem
         assert_eq!(cgroup_used(dir.path()).unwrap(), 10 * gib);
+    }
+
+    #[test]
+    fn unevictable_pages_stay_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let gib = 1u64 << 30;
+        std::fs::write(dir.path().join("memory.current"), (10 * gib).to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("memory.stat"),
+            format!("file {}\nshmem {}\nunevictable {}\n", 6 * gib, gib, 2 * gib),
+        )
+        .unwrap();
+        // 10 less the 6 GiB of file pages, minus 1 of shmem and 2 locked
+        assert_eq!(cgroup_used(dir.path()).unwrap(), 7 * gib);
+    }
+
+    #[test]
+    fn a_configured_scope_is_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let gib = 1u64 << 30;
+        let write = |name: &str, used: u64| {
+            let scope = dir.path().join(name);
+            std::fs::create_dir(&scope).unwrap();
+            std::fs::write(scope.join("memory.current"), used.to_string()).unwrap();
+            std::fs::write(scope.join("memory.stat"), "file 0\n").unwrap();
+            scope
+        };
+        let measured = write("run-example.scope", 25 * gib);
+        write("run-sibling.scope", gib);
+
+        assert_eq!(Gauge::new(Some(measured)).read().unwrap(), 26 * gib);
     }
 }
