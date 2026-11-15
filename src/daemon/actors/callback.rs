@@ -10,6 +10,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tracing::warn;
 
 use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
+use crate::callback::stale_context::Resumption;
 use crate::callback::{
     CodexWakeError, HomebasedEvent, OriginSession, PendingRetry, PendingT3Send, ReachableOrigin,
     append_fallback, check_saved_callback, find_saved_inbox_origin, retry_pending_t3,
@@ -22,6 +23,7 @@ use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
 use crate::notify::{Notice, NoticePriority, Notifier};
 use crate::submission::CallbackContext;
+use crate::task_wait::{EventClass, HeldEvent, HoldTarget, SleepHold};
 use crate::thread_title::TitleSources;
 
 // a store call can time out on a loaded machine; the scan also restarts a
@@ -474,12 +476,24 @@ pub(crate) async fn dispatch_inbox(
             else {
                 return Ok(false);
             };
-            let line = entry
+            let EventPayload::Callback { event, .. } = &entry.event.payload else {
+                return Err(AppError::Internal {
+                    message: "pending inbox event has no callback payload".into(),
+                });
+            };
+            let class = EventClass::task(event.event);
+            let hold = sleep_hold(&store, route.thread, HoldTarget::Task(id)).await?;
+            let mut line = entry
                 .event
                 .callback_message_line()?
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
+            if let Some(held) = hold.as_ref().and_then(|hold| hold.listed_on_final())
+                && class.is_final()
+            {
+                line = with_held_events(&line, held)?;
+            }
             // a connected `homebased wait` stream prints the line for the agent that
             // armed it; waking the thread as well would wake the agent twice
             if waiters.hand_off(route.thread, &entry.event, &line).await {
@@ -487,7 +501,12 @@ pub(crate) async fn dispatch_inbox(
             } else if route.thread.is_detached() {
                 // no session can receive it; the inbox keeps the event for inspection
                 AttemptOutcome::Settle(DeliveryOutcome::Delivered)
+            } else if hold.as_ref().is_some_and(|hold| hold.holds(class)) {
+                // the sleeping thread reads it on the final event instead
+                call(&store, |reply| StoreMsg::HoldInboxEvent { id, seq, reply }).await?;
+                continue;
             } else {
+                let resumption = resumption(&store, route.thread).await?;
                 let paths = home.task_paths(id);
                 let pending =
                     PendingT3Send::new(paths.dir.join(format!("t3-pending-{}", seq.get())));
@@ -501,6 +520,7 @@ pub(crate) async fn dispatch_inbox(
                     },
                     pending,
                     before_send: None,
+                    resumption,
                 };
                 attempt.run(&callback).await?
             }
@@ -565,9 +585,48 @@ pub(crate) async fn dispatch_inbox(
             DeliveryState::PendingDelivery { .. } => {
                 tokio::time::sleep(Duration::from_millis(200 * u64::from(attempts + 1))).await;
             }
-            DeliveryState::NotRequired => {}
+            // only a hold settles an event as held, and it never sends one
+            DeliveryState::NotRequired | DeliveryState::Held { .. } => {}
         }
     }
+}
+
+/// The hold on `target`, unless its thread is detached and cannot sleep
+pub(crate) async fn sleep_hold(
+    store: &ActorRef<StoreMsg>,
+    thread: ThreadId,
+    target: HoldTarget,
+) -> Result<Option<SleepHold>, AppError> {
+    if thread.is_detached() {
+        return Ok(None);
+    }
+    call(store, |reply| StoreMsg::SleepHold { target, reply }).await
+}
+
+/// How sure it is that `thread` runs again: certain while a sleep holds
+/// work for it
+pub(crate) async fn resumption(
+    store: &ActorRef<StoreMsg>,
+    thread: ThreadId,
+) -> Result<Resumption, AppError> {
+    if thread.is_detached() {
+        return Ok(Resumption::Likely);
+    }
+    let sleeps = call(store, |reply| StoreMsg::ThreadSleeps { thread, reply }).await?;
+    Ok(Resumption::of(sleeps))
+}
+
+/// `line` with the progress events a sleep held, so the final event says
+/// what happened while the thread slept
+pub(crate) fn with_held_events(line: &str, held: &[HeldEvent]) -> Result<String, AppError> {
+    let json = line
+        .strip_prefix("HOMEBASED_EVENT ")
+        .ok_or_else(|| AppError::Internal {
+            message: "callback line is not a HOMEBASED_EVENT".into(),
+        })?;
+    let mut payload: serde_json::Value = serde_json::from_str(json)?;
+    payload["held_events"] = serde_json::to_value(held)?;
+    Ok(format!("HOMEBASED_EVENT {payload}"))
 }
 
 /// Callback evidence independent of task or job identity
@@ -622,9 +681,10 @@ pub(crate) fn job_event_line(
 pub(crate) async fn deliver_job_event(
     home: &Home,
     route: &crate::queue::delivery::JobRoute,
+    line: String,
     event: &crate::queue::JobEvent,
     callback: &ActorRef<CallbackMsg>,
-    before_send: Option<SendCheck>,
+    send: JobSend,
 ) -> Result<Option<DeliveryOutcome>, AppError> {
     let dir = home
         .root()
@@ -635,13 +695,16 @@ pub(crate) async fn deliver_job_event(
     let attempt = OriginAttempt {
         context: route.callback.clone(),
         thread: route.thread,
-        line: job_event_line(route, event)?,
+        line,
         paths: CallbackPaths {
             callback_log: dir.join("callback.log"),
             delivery_lock: dir.join("delivery.lock"),
         },
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
-        before_send: before_send.filter(|_| event.event.is_suppressible_notice()),
+        before_send: send
+            .before_send
+            .filter(|_| event.event.is_suppressible_notice()),
+        resumption: send.resumption,
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -662,6 +725,7 @@ pub(crate) async fn deliver_watch_event(
     watch: &crate::thread_watch::ThreadWatch,
     event: &crate::thread_watch::WatchEvent,
     callback: &ActorRef<CallbackMsg>,
+    resumption: Resumption,
 ) -> Result<Option<DeliveryOutcome>, AppError> {
     let dir = home
         .root()
@@ -679,6 +743,7 @@ pub(crate) async fn deliver_watch_event(
         },
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
         before_send: None,
+        resumption,
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -699,6 +764,7 @@ pub(crate) async fn deliver_service_event(
     service: &crate::service::Service,
     line: String,
     callback: &ActorRef<CallbackMsg>,
+    resumption: Resumption,
 ) -> Result<Option<DeliveryOutcome>, AppError> {
     let dir = home.service_paths(service.id).delivery;
     std::fs::create_dir_all(&dir)?;
@@ -713,6 +779,7 @@ pub(crate) async fn deliver_service_event(
         // a service sends one event, so one pending file covers it
         pending: PendingT3Send::new(dir.join("t3-pending")),
         before_send: None,
+        resumption,
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -725,6 +792,14 @@ pub(crate) async fn deliver_service_event(
     Ok(Some(outcome))
 }
 
+/// How one job event is sent, besides its line
+pub(crate) struct JobSend {
+    /// Recheck of a blocked or GPU idle notice under the delivery lock
+    pub(crate) before_send: Option<SendCheck>,
+    /// How sure it is that the job's thread runs again
+    pub(crate) resumption: Resumption,
+}
+
 /// One reserved attempt on a saved origin route
 struct OriginAttempt {
     context: CallbackContext,
@@ -733,6 +808,7 @@ struct OriginAttempt {
     paths: CallbackPaths,
     pending: PendingT3Send,
     before_send: Option<SendCheck>,
+    resumption: Resumption,
 }
 
 impl OriginAttempt {
@@ -741,6 +817,7 @@ impl OriginAttempt {
             path: &self.paths.delivery_lock,
             check: self.before_send.as_ref(),
             hold: true,
+            resumption: self.resumption,
         }
     }
 

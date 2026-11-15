@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::callback::destination::ThreadSuggestion;
+use crate::child_thread::{LinkId, OpenWork, ReportStageKind};
 use crate::dependency::{Dependency, DependencyId, DependencyOutcome};
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
@@ -540,6 +541,31 @@ pub enum AppError {
         /// Title and root of the projects T3 has, up to 50
         projects: Vec<String>,
     },
+    /// `thread report` ran in a thread that `t3 launch --child` did not start
+    #[error(
+        "{thread} is not a child thread; only a thread that `homebased t3 launch --child` started can run `homebased thread report`"
+    )]
+    NotChildThread {
+        /// The calling thread, as a reference
+        thread: String,
+    },
+    /// The child thread still has open work, so it cannot report yet
+    #[error("thread report refused: {}", open.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    ThreadReportRefused {
+        /// Each piece of open work, as the refusal names it
+        open: Vec<OpenWork>,
+    },
+    /// The child thread already saved a report with another body
+    #[error(
+        "this thread already saved a different report (link {link}, now {}); a child thread reports once, and a retry must repeat the same text",
+        stage.as_str()
+    )]
+    ThreadReportConflict {
+        /// The child's link
+        link: LinkId,
+        /// How far the saved report has got
+        stage: ReportStageKind,
+    },
     /// The thread cannot launch as requested, or T3 Code refused it
     #[error("T3 thread launch refused: {message}")]
     T3LaunchRefused {
@@ -815,6 +841,9 @@ impl AppError {
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
             Self::T3ProjectNotFound { .. } => "t3_project_not_found",
             Self::T3LaunchRefused { .. } => "t3_launch_refused",
+            Self::NotChildThread { .. } => "not_child_thread",
+            Self::ThreadReportRefused { .. } => "thread_report_refused",
+            Self::ThreadReportConflict { .. } => "thread_report_conflict",
             Self::T3ProjectRefused { .. } => "t3_project_refused",
             Self::T3Unavailable { .. } => "t3_unavailable",
             Self::T3LaunchOutcomeUnknown { .. } => "t3_launch_outcome_unknown",
@@ -907,6 +936,9 @@ impl AppError {
             Self::T3LaunchRefused { .. }
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => 5,
+            Self::NotChildThread { .. }
+            | Self::ThreadReportRefused { .. }
+            | Self::ThreadReportConflict { .. } => 5,
             Self::Queue(error) => error.exit_code(),
             Self::Waiting(WaitingRejection::UnknownTarget { .. }) => 3,
             Self::Waiting(_) => 5,
@@ -947,6 +979,9 @@ impl AppError {
             Self::T3LaunchRefused { .. }
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => http::StatusCode::CONFLICT,
+            Self::NotChildThread { .. }
+            | Self::ThreadReportRefused { .. }
+            | Self::ThreadReportConflict { .. } => http::StatusCode::CONFLICT,
             Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => {
                 http::StatusCode::SERVICE_UNAVAILABLE
             }
@@ -1120,6 +1155,9 @@ impl AppError {
                 machine,
                 message,
             } => json!({ "request_id": request, "machine": machine, "message": message }),
+            Self::NotChildThread { thread } => json!({ "thread": thread }),
+            Self::ThreadReportRefused { open } => json!({ "open": open }),
+            Self::ThreadReportConflict { link, stage } => json!({ "link": link, "stage": stage }),
             Self::InvalidCwd {
                 path,
                 problem,

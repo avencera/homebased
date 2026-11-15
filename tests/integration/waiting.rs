@@ -4,6 +4,7 @@ use super::memory_admission::{FakeCgroup, with_memory_gate};
 use super::{Harness, THREAD, event_json, wait_until};
 use homebased::domain::{TaskEnv, TaskId};
 use homebased::machine::MachineId;
+use homebased::queue::JobId;
 use homebased::store::{NewTask, new_queued_task};
 use serde_json::{Value, json};
 use std::fs;
@@ -134,6 +135,47 @@ impl Harness {
     }
 }
 
+/// A queue job on `gpu0` that waits until `gate` exists under the record directory, then exits with `code`
+fn gated_job(h: &Harness, gate: &str, code: i32) -> Value {
+    let gate = h.record.join(gate);
+    super::resource_jobs::spec(
+        h,
+        "medium",
+        "restart",
+        &format!(
+            "while [ ! -f '{}' ]; do sleep 0.1; done; exit {code}",
+            gate.display()
+        ),
+    )
+}
+
+/// Submit a job through the CLI without holding the harness, so the daemon can restart
+fn submit_job(h: &Harness, spec: &Value) -> JobId {
+    let job = JobId::new();
+    let path = h.home.join(format!("job-{job}.json"));
+    fs::write(&path, serde_json::to_vec(spec).unwrap()).unwrap();
+    let out = h
+        .cmd()
+        .args(["--json", "resource", "job", "submit", "--job-id"])
+        .arg(job.to_string())
+        .arg("--spec")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    job
+}
+
+/// The error object of a refused CLI call
+fn refusal_error(out: &Output) -> Value {
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    error["error"].clone()
+}
+
 fn after(mut spec: Value, tasks: &[&str]) -> Value {
     spec["after"] = json!(tasks);
     spec
@@ -176,7 +218,7 @@ fn codex_worker_resumes_its_thread_after_a_failed_target_and_releases_its_depend
 
     let parked = h.delivered(&worker, "TASK_WAITING");
     assert_eq!(parked["next_action"], "none");
-    assert_eq!(parked["waiting_on"], json!([target]));
+    assert_eq!(parked["waiting_on"], json!([{ "task": target }]));
     assert_eq!(parked["process"], json!({"kind": "exit", "code": 0}));
     assert_eq!(parked["reports"][0]["outcome"], "waiting");
     let continuation = parked["continuation"].as_str().unwrap().to_string();
@@ -693,4 +735,206 @@ fn a_parked_codex_chain_reserves_its_thread() {
     let error: Value = serde_json::from_slice(&followup.stderr).unwrap();
     assert_eq!(error["error"]["input"]["task"], continuation);
     h.cancel(&continuation);
+}
+
+#[test]
+fn a_worker_parked_on_a_job_continues_after_any_final_event() {
+    let h = Harness::new();
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+    h.set_control("report", "succeeded\nRead the job.");
+    for (gate, code, ending) in [
+        ("job-succeeds", 0, "JOB_SUCCEEDED"),
+        ("job-fails", 1, "JOB_FAILED"),
+        ("job-cancelled", 0, "JOB_CANCELLED"),
+    ] {
+        let job = jobs.submit(&gated_job(&h, gate, code));
+        h.set_control(
+            "waiting",
+            &format!("{job}\nIf {job} failed, shrink the batch.\n"),
+        );
+        let worker = h.submit(&Harness::spec("claude", "train on the GPU"));
+        let parked = h.delivered(&worker, "TASK_WAITING");
+        assert_eq!(parked["waiting_on"], json!([{ "job": job }]), "{parked}");
+        assert_eq!(h.show(&worker)["chain"]["on"], json!([{ "job": job }]));
+        let continuation = parked["continuation"].as_str().unwrap().to_string();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(h.show(&continuation)["status"], "held", "{ending}");
+
+        if ending == "JOB_CANCELLED" {
+            let out = h
+                .cmd()
+                .args(["resource", "job", "cancel", &job.to_string()])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            h.release_gate(gate);
+        }
+        h.delivered(&continuation, "TASK_SUCCEEDED");
+        let events = super::resource_jobs::callbacks(&h, job);
+        assert!(
+            events.iter().any(|event| event["event"] == ending),
+            "{ending}: {events:?}"
+        );
+
+        let feed = h.agent_stdin(&continuation);
+        assert!(
+            feed.contains(&format!("You reported waiting on job {job}.")),
+            "{feed}"
+        );
+        assert!(
+            feed.contains(&format!("homebased --json resource job show {job}\n")),
+            "{feed}"
+        );
+        assert!(!feed.contains(&format!("task show {job}")), "{feed}");
+        assert!(feed.contains("shrink the batch"), "{feed}");
+        assert_eq!(h.wait_chain(&worker, "ended")["outcome"], "succeeded");
+    }
+    h.release_gate("job-cancelled");
+}
+
+#[test]
+fn a_continuation_on_a_task_and_a_job_waits_for_both() {
+    let h = Harness::new();
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+    let task = h.submit(&h.gated_target("mixed-task", 0));
+    let job = jobs.submit(&gated_job(&h, "mixed-job", 0));
+    h.set_control("waiting", &format!("{task} {job}\nCompare both.\n"));
+    h.set_control("report", "succeeded\nCompared.");
+    let worker = h.submit(&Harness::spec("claude", "compare runs"));
+    let parked = h.delivered(&worker, "TASK_WAITING");
+    assert_eq!(
+        parked["waiting_on"],
+        json!([{ "task": task }, { "job": job }])
+    );
+    let continuation = parked["continuation"].as_str().unwrap().to_string();
+
+    // the job ending alone does not release the continuation
+    h.release_gate("mixed-job");
+    super::resource_jobs::wait_callbacks(&h, job, 1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(h.show(&continuation)["status"], "held");
+
+    h.release_gate("mixed-task");
+    h.delivered(&continuation, "TASK_SUCCEEDED");
+    let feed = h.agent_stdin(&continuation);
+    assert!(
+        feed.contains(&format!("homebased --json task show {task}")),
+        "{feed}"
+    );
+    assert!(
+        feed.contains(&format!("homebased --json resource job show {job}")),
+        "{feed}"
+    );
+}
+
+#[test]
+fn a_waiting_report_on_a_job_needs_a_job_this_machine_submitted_and_no_cycle() {
+    let h = Harness::new();
+    let mut jobs = super::resource_jobs::Jobs::new(&h);
+    h.set_control("sleep", "60");
+    let worker = h.submit(&Harness::spec("claude", "parks on jobs"));
+    h.wait_running(&worker);
+
+    let unknown = JobId::new().to_string();
+    let out = h.report_waiting(&worker, &[&unknown], Some("notes"));
+    assert_eq!(refusal(&out), ("unknown_dependency".into(), 3));
+
+    // a job another machine submitted, queued here, never reports to this origin
+    let foreign = JobId::new();
+    h.store()
+        .submit_job(&homebased::store::queue::NewJob {
+            id: foreign,
+            machine: super::resource_jobs::machine(&h),
+            origin: MachineId::new(),
+            spec: homebased::queue::spec::JobSpec::parse_value(&super::resource_jobs::spec(
+                &h, "low", "restart", "exit 0",
+            ))
+            .unwrap(),
+            env: TaskEnv {
+                path: "/bin".into(),
+                home: "/tmp".into(),
+            },
+            origin_protocol: homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION,
+            submitted_at: None,
+            placement: None,
+        })
+        .unwrap();
+    let out = h.report_waiting(&worker, &[&foreign.to_string()], Some("foreign"));
+    assert_eq!(refusal(&out), ("waiting_remote_unsupported".into(), 5));
+    assert_eq!(refusal_error(&out)["input"]["job"], foreign.to_string());
+
+    // a job held after the worker waits on the worker's own chain
+    let held = JobId::new();
+    let (submitted, _) = jobs.submit_with(
+        held,
+        &super::resource_jobs::spec(&h, "medium", "restart", "exit 0"),
+        &["--after", &worker],
+    );
+    assert_eq!(submitted["held"]["state"], "held", "{submitted}");
+    let out = h.report_waiting(&worker, &[&held.to_string()], Some("cycle"));
+    assert_eq!(refusal(&out), ("waiting_cycle".into(), 5));
+    let error = refusal_error(&out);
+    assert_eq!(error["input"]["job"], held.to_string(), "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("job {held}")),
+        "{error}"
+    );
+
+    // a run of a job is refused, and the error names the job to wait on instead
+    let ran = jobs.submit(&super::resource_jobs::spec(
+        &h, "medium", "restart", "exit 0",
+    ));
+    super::resource_jobs::wait_callbacks(&h, ran, 1);
+    let run = h.store().job_runs(ran).unwrap()[0].task.to_string();
+    let out = h.report_waiting(&worker, &[&run], Some("a run"));
+    assert_eq!(refusal(&out), ("waiting_target_unsupported".into(), 5));
+    let error = refusal_error(&out);
+    assert_eq!(error["input"]["task"], run.as_str());
+    assert_eq!(error["input"]["job"], ran.to_string());
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--on {ran}")),
+        "{error}"
+    );
+
+    // the job itself is a valid target
+    let out = h.report_waiting(&worker, &[&ran.to_string()], Some("the job"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.cancel(&worker);
+}
+
+#[test]
+fn a_continuation_held_on_a_job_survives_a_daemon_restart() {
+    let mut h = Harness::new();
+    let job = submit_job(&h, &gated_job(&h, "restart-job", 0));
+    h.set_control("waiting", &format!("{job}\nCarry on after the job.\n"));
+    h.set_control("report", "succeeded\nCarried on.");
+    let worker = h.submit(&Harness::spec("claude", "parks across a restart"));
+    let continuation = h.delivered(&worker, "TASK_WAITING")["continuation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    h.restart_daemon();
+    assert_eq!(h.show(&continuation)["status"], "held");
+    assert_eq!(h.show(&worker)["chain"]["on"], json!([{ "job": job }]));
+    h.release_gate("restart-job");
+    h.delivered(&continuation, "TASK_SUCCEEDED");
+    h.wait_callback_sent(&continuation);
+    assert_eq!(h.agent_runs(&continuation), 1);
+    assert_eq!(h.wait_chain(&worker, "ended")["outcome"], "succeeded");
 }

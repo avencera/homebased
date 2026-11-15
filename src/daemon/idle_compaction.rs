@@ -8,8 +8,9 @@
 //! tasks, and an interactive thread waiting on the user alike. A terminal
 //! session has no T3 thread to send `/compact` to, so it compacts itself
 //!
-//! The same loop then checks every `homebased thread watch`, and stops the
-//! services whose owner's T3 thread is done
+//! The same loop then finishes child-thread reports and their settles, checks
+//! every `homebased thread watch`, and stops the services whose owner's T3
+//! thread is done
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use super::AppState;
+use super::child_threads::{self, ChildScanMemory};
 use super::compaction_log::{self, Trigger};
 use super::service_api::{self, OwnerMemory};
 use super::thread_api::local::LocalIndex;
@@ -59,11 +61,16 @@ pub(super) async fn run(state: AppState) {
         .map_or(watch_scan::QUIET_FINISHED, TimeDelta::seconds);
     let mut watches = WatchMemory::new(quiet);
     let mut owners = OwnerMemory::default();
+    let mut children = ChildScanMemory::default();
     let log = state.home.compaction_log_path();
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
+        // before the idle compactions, so no compaction adds a run ahead of a
+        // child's settle, and before the watches, so a child it settles ends
+        // its watch this scan
+        child_threads::scan(&state, &mut children).await;
         match local_sources(&state).await {
             Ok(sources) => {
                 let log = log.clone();

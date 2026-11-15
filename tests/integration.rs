@@ -676,6 +676,8 @@ fn submit_error(h: &Harness, spec: &Value, args: &[&str], worker: Option<&str>) 
     (out.status.code().unwrap(), error)
 }
 
+#[path = "integration/child_threads.rs"]
+mod child_threads;
 #[path = "integration/containers.rs"]
 mod containers;
 #[path = "integration/dashboard.rs"]
@@ -687,6 +689,8 @@ mod dependencies;
 #[path = "integration/gpu_idle.rs"]
 mod gpu_idle;
 // the lease guard only runs on Linux
+#[path = "support/fake_t3.rs"]
+mod fake_t3;
 #[cfg(target_os = "linux")]
 #[path = "integration/lease_guard.rs"]
 mod lease_guard;

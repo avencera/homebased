@@ -51,8 +51,15 @@ export function isInFlight(status: ProcessStatus): boolean {
 const AgentKindSchema = Schema.Literal('codex', 'claude', 'grok', 'opencode');
 export type AgentKind = typeof AgentKindSchema.Type;
 
-/** Callback delivery state. Outlives the process state. */
-const CallbackStatusSchema = Schema.Literal('pending', 'sending', 'waiting', 'sent', 'failed');
+/** Callback delivery state. Outlives the process state. `held` is kept back for a sleeping thread. */
+const CallbackStatusSchema = Schema.Literal(
+	'pending',
+	'sending',
+	'waiting',
+	'held',
+	'sent',
+	'failed'
+);
 export type CallbackStatus = typeof CallbackStatusSchema.Type;
 
 /** Worker-authored outcome of one report. `waiting` parks an agent worker on other tasks. */
@@ -147,9 +154,21 @@ const ChainRunFields = {
 	runs: Schema.Finite
 };
 
+/** One target a parked run waits on: a task, or a GPU queue job by its job id. */
+const WaitTargetSchema = Schema.Union(
+	Schema.Struct({ task: Schema.String }),
+	Schema.Struct({ job: Schema.String })
+);
+export type WaitTarget = typeof WaitTargetSchema.Type;
+
+/** A wait target as `task <id>` or `job <id>`. */
+export function waitTargetLabel(target: WaitTarget): string {
+	return 'task' in target ? `task ${target.task}` : `job ${target.job}`;
+}
+
 /**
  * Chain of an agent run that parked or continues parked work. `waiting` means the run in
- * `current` parked on the tasks in `on`, and `continuation` starts once they all ended.
+ * `current` parked on the tasks and jobs in `on`, and `continuation` starts once they all ended.
  */
 const ChainSchema = Schema.Union(
 	Schema.Struct({ ...ChainRunFields, state: Schema.Literal('running'), current: Schema.String }),
@@ -157,7 +176,7 @@ const ChainSchema = Schema.Union(
 		...ChainRunFields,
 		state: Schema.Literal('waiting'),
 		current: Schema.String,
-		on: Schema.Array(Schema.String),
+		on: Schema.Array(WaitTargetSchema),
 		continuation: Schema.String
 	}),
 	Schema.Struct({ ...ChainRunFields, state: Schema.Literal('ended'), outcome: Schema.String })

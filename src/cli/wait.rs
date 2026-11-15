@@ -11,14 +11,15 @@ use crate::cli::Ctx;
 use crate::client::{Client, LineStream};
 use crate::domain::ThreadId;
 use crate::error::AppError;
+use crate::t3::T3Env;
 use crate::task_wait::{
-    WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame, WaitIds, WaitKey, WaitKeys, WaitRequest,
-    WaitSet, WaiterId, wakes_final_only,
+    SLEEP_ROUTE, SleepRequest, SleepResponse, WAIT_ACK_ROUTE, WAIT_ROUTE, WaitAck, WaitFrame,
+    WaitIds, WaitKey, WaitKeys, WaitRequest, WaitSet, WaiterId, wakes_final_only,
 };
-use crate::thread_watch::{CompactOutcome, line_ends_watch};
+use crate::thread_ref::Caller;
+use crate::thread_watch::line_ends_watch;
 
 use super::task::{is_t3_claude_caller, select_thread};
-use super::thread::{compact_self, own_context_tokens};
 
 // a daemon update restarts the socket within seconds; a longer outage is a failure
 const RECONNECT_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -46,18 +47,12 @@ const NEXT_GATHER: Duration = Duration::from_secs(1);
 /// Opus input at 150K tokens, and starting the wait again costs about $0.13
 pub(super) const CACHE_LIMIT: Duration = Duration::from_secs(55 * 60);
 
-/// How long a `--long` wait runs with no event, under Claude Code's 2-hour
-/// Bash timeout so the wait exits on its own first
+/// How long a `--long` wait of a T3 subagent runs with no event, under Claude
+/// Code's 2-hour Bash timeout so the wait exits on its own first
 ///
-/// Past about 4 hours of work, compacting once costs less than starting the
-/// wait again every 55 minutes, and each later wake-up rebuilds only the
-/// compacted context
-pub(super) const LONG_LIMIT: Duration = Duration::from_secs(115 * 60);
-
-// below this a cold wake-up costs little, and compacting a context that was
-// already compacted mostly loses detail, so a `--long` wait started again
-// after its limit does not compact the summary over and over
-const LONG_COMPACT_ABOVE: u64 = 60_000;
+/// T3 reports a subagent's task to its parent when its turn ends, so such a
+/// thread cannot sleep, and waits in the turn instead
+const LONG_LIMIT: Duration = Duration::from_secs(115 * 60);
 
 /// Arguments of `homebased wait`
 #[derive(Debug, Args)]
@@ -82,11 +77,44 @@ pub struct WaitArgs {
     /// hour-long prompt cache; elsewhere the wait has no limit
     #[arg(long, value_parser = humantime::parse_duration)]
     timeout: Option<Duration>,
-    /// For work expected to take over 4 hours in a Claude session that a T3
-    /// thread owns: compact this thread once the turn ends, then wait up to
-    /// 115m instead of 55m
+    /// For work expected to take over an hour: hold the targets and exit at
+    /// once, so the turn can end. The daemon then wakes this thread only with
+    /// each target's final event, which lists the progress events it held, or
+    /// with an alert. A T3 subagent, which T3 reports done when its turn
+    /// ends, waits up to 115m instead
     #[arg(long, conflicts_with = "timeout")]
     long: bool,
+}
+
+/// What `--long` does for the calling thread
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongWait {
+    /// Hold the targets and exit, so the turn ends and the daemon wakes the
+    /// thread for a final event or an alert
+    Sleep,
+    /// Wait in the turn for up to [`LONG_LIMIT`], as a T3 subagent must
+    Bounded,
+}
+
+impl LongWait {
+    /// How `--long` waits for the caller, the session `thread`
+    ///
+    /// # Errors
+    ///
+    /// Refuses a homebased worker, whose run ends with its turn
+    fn of(thread: ThreadId) -> Result<Self, AppError> {
+        if std::env::var_os("HOMEBASED_TASK_ID").is_some() {
+            return Err(AppError::Usage {
+                message: "--long ends the turn, which ends a homebased worker's run; park with `homebased task report --outcome waiting --on <id>` instead".into(),
+            });
+        }
+        let env = T3Env::from_env();
+        let t3_thread =
+            Caller::t3_thread_from_env().or_else(|| crate::t3::owning_thread(&env, thread));
+        let subagent =
+            t3_thread.is_some_and(|t3_thread| crate::t3::runs_delegated_task(&env, &t3_thread));
+        Ok(if subagent { Self::Bounded } else { Self::Sleep })
+    }
 }
 
 /// When a `--next` wait exits
@@ -192,7 +220,16 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
     })?;
     let thread = select_thread(args.thread, crate::domain::session_thread()?)?;
     let client = Client::new(ctx.home.sock_path());
-    let limit = limit(&client, &args, thread).await?;
+    if args.long {
+        match LongWait::of(thread)? {
+            LongWait::Sleep => return sleep(&client, thread, &ids).await,
+            LongWait::Bounded => eprintln!(
+                "homebased wait: --long cannot sleep in a T3 subagent, which T3 reports done to its parent when the turn ends, so this waits up to {} minutes. Long work belongs in a child thread (`homebased t3 launch --child`), not a T3 subagent",
+                LONG_LIMIT.as_secs() / 60
+            ),
+        }
+    }
+    let limit = limit(&args, thread);
     let deadline = limit.map(|limit| Instant::now() + limit);
     let mut targets = Targets::Named(ids);
     let next = args.next.then_some(if args.final_only {
@@ -255,61 +292,34 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
 
 /// How long the wait may run with no event that wakes it, `None` for no limit
 ///
-/// A `--long` wait queues the compaction first. When that fails, the wait
-/// keeps the 55-minute limit, since a cold wake-up of the full context would
-/// cost more than starting the wait again
-async fn limit(
-    client: &Client,
-    args: &WaitArgs,
-    thread: ThreadId,
-) -> Result<Option<Duration>, AppError> {
+/// Only a T3 subagent reaches here with `--long`
+fn limit(args: &WaitArgs, thread: ThreadId) -> Option<Duration> {
     if let Some(timeout) = args.timeout {
-        return Ok(Some(timeout));
+        return Some(timeout);
     }
-    if !is_t3_claude_caller(thread) {
-        if args.long {
-            return Err(AppError::Usage {
-                message: "--long is for a Claude session that a T3 thread owns".into(),
-            });
-        }
-        return Ok(None);
+    if args.long {
+        return Some(LONG_LIMIT);
     }
-    if !args.long {
-        return Ok(Some(CACHE_LIMIT));
-    }
-    let compacting = compact_for_long_wait(client).await;
-    Ok(Some(if compacting { LONG_LIMIT } else { CACHE_LIMIT }))
+    is_t3_claude_caller(thread).then_some(CACHE_LIMIT)
 }
 
-/// Compact the calling thread once its turn ends, and say on stderr what
-/// happened; whether the long limit is safe to use
-async fn compact_for_long_wait(client: &Client) -> bool {
-    let tokens = own_context_tokens(client).await.ok().flatten();
-    if let Some(tokens) = tokens.filter(|tokens| *tokens < LONG_COMPACT_ABOVE) {
-        eprintln!("homebased wait: not compacting, the context is only {tokens} tokens");
-        return true;
+/// Hold `ids` for `thread` and exit, saying on stderr what each one became
+///
+/// Only event lines go to stdout, and nothing here is one
+async fn sleep(client: &Client, thread: ThreadId, ids: &WaitIds) -> Result<ExitCode, AppError> {
+    let request = SleepRequest::new(thread, ids);
+    let response: SleepResponse = client.post_json(SLEEP_ROUTE, &request).await?;
+    for target in &response.targets {
+        eprintln!("homebased wait: {}: {}", target.target, target.outcome);
     }
-
-    let failed = |detail: &str| {
-        let minutes = CACHE_LIMIT.as_secs() / 60;
+    if response.holds_any() {
         eprintln!(
-            "homebased wait: could not compact this thread ({detail}), so waiting at most {minutes} minutes"
+            "homebased wait: end the turn now. The daemon wakes this thread with each held target's final event, which lists the progress events it held under `held_events`, or with an alert: JOB_ATTENTION, JOB_BLOCKED, TASK_CHECK_DUE, JOB_CHECK_DUE, or the first JOB_GPU_IDLE of an idle episode. After an alert the hold stays, so end the turn again without starting another wait"
         );
-        false
-    };
-    match compact_self(client).await {
-        Ok(response) => match response.outcome {
-            CompactOutcome::Started | CompactOutcome::Queued => {
-                eprintln!(
-                    "homebased wait: compaction {}, this thread compacts once the turn ends",
-                    response.outcome.as_str()
-                );
-                true
-            }
-            outcome => failed(response.detail.as_deref().unwrap_or(outcome.as_str())),
-        },
-        Err(error) => failed(&error.to_string()),
+    } else {
+        eprintln!("homebased wait: every target already ended, so nothing is held");
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// End a wait that reached its limit, telling the agent on stderr how to wait again

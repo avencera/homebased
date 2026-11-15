@@ -66,6 +66,38 @@ const QUEUE_MARGIN: TimeDelta = TimeDelta::minutes(1);
 /// the middle of that range
 pub(crate) const MIN_IDLE_CONTEXT_TOKENS: u64 = 175_000;
 
+/// Smallest context worth an idle compaction for a thread a sleep will wake
+///
+/// The [`MIN_IDLE_CONTEXT_TOKENS`] limit allows for threads that never resume,
+/// while a sleeping thread certainly does, usually hours after the cache
+/// lapsed. Below this size a cold wake-up costs little, and compacting a
+/// context that was already compacted mostly loses detail
+pub(crate) const MIN_SLEEPING_CONTEXT_TOKENS: u64 = 60_000;
+
+/// How sure homebased is that an idle thread will take another turn
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resumption {
+    /// It may never run again, so only a large context is worth compacting
+    Likely,
+    /// A sleep holds work for it, whose final event or alert will wake it
+    Certain,
+}
+
+impl Resumption {
+    /// Resumption of a thread that has a sleep hold when `sleeps`
+    pub(crate) fn of(sleeps: bool) -> Self {
+        if sleeps { Self::Certain } else { Self::Likely }
+    }
+
+    /// Smallest context worth a compaction for such a thread
+    pub(crate) fn min_tokens(self) -> u64 {
+        match self {
+            Self::Likely => MIN_IDLE_CONTEXT_TOKENS,
+            Self::Certain => MIN_SLEEPING_CONTEXT_TOKENS,
+        }
+    }
+}
+
 /// Transcript or rollout suffix scanned for the last request
 ///
 /// The final assistant line of a turn is usually short text, so this only
@@ -173,10 +205,11 @@ impl ContextUse {
     ///
     /// A thread due an idle compaction may be running one, which T3 refuses to
     /// steer into, so the message waits for the active run. The transcript
-    /// shows a compaction only once it finishes
-    pub(crate) fn turn_start(&self, now: DateTime<Utc>) -> TurnStart {
+    /// shows a compaction only once it finishes. `resumption` sets the size
+    /// at which the idle scan compacts, so both read the same threshold
+    pub(crate) fn turn_start(&self, now: DateTime<Utc>, resumption: Resumption) -> TurnStart {
         let idle = now - self.last_active;
-        if idle >= IDLE_COMPACTION_AFTER - QUEUE_MARGIN && self.tokens >= MIN_IDLE_CONTEXT_TOKENS {
+        if idle >= IDLE_COMPACTION_AFTER - QUEUE_MARGIN && self.tokens >= resumption.min_tokens() {
             TurnStart::AfterActive
         } else {
             TurnStart::Auto
@@ -184,16 +217,16 @@ impl ContextUse {
     }
 
     /// Whether to compact an idle session at `now`, while its cache is warm
-    pub(crate) fn idle_compaction_due(&self, now: DateTime<Utc>) -> bool {
+    pub(crate) fn idle_compaction_due(&self, now: DateTime<Utc>, resumption: Resumption) -> bool {
         let idle = now - self.last_active;
-        self.tokens >= MIN_IDLE_CONTEXT_TOKENS
+        self.tokens >= resumption.min_tokens()
             && idle >= IDLE_COMPACTION_AFTER
             && idle < CACHE_LIFETIME
     }
 
     /// Whether to compact before a callback at `now`, after the cache lapsed
-    pub(crate) fn cold_compaction_due(&self, now: DateTime<Utc>) -> bool {
-        self.tokens >= MIN_IDLE_CONTEXT_TOKENS && !self.cache_warm(now)
+    pub(crate) fn cold_compaction_due(&self, now: DateTime<Utc>, resumption: Resumption) -> bool {
+        self.tokens >= resumption.min_tokens() && !self.cache_warm(now)
     }
 
     /// Key naming this idle period for a compaction request
@@ -462,7 +495,7 @@ mod tests {
         let metadata = json!({ "type": "last-prompt", "lastPrompt": "hi" });
         let idle = context(&[assistant(56, 250_000), metadata]).unwrap();
         assert_eq!(idle.tokens(), 251_302);
-        assert!(idle.idle_compaction_due(now()));
+        assert!(idle.idle_compaction_due(now(), Resumption::Likely));
 
         // a later user line is activity even before a reply has usage
         let answered = context(&[
@@ -470,7 +503,7 @@ mod tests {
             json!({ "type": "user", "timestamp": at(5), "message": { "content": "go" } }),
         ])
         .unwrap();
-        assert!(!answered.idle_compaction_due(now()));
+        assert!(!answered.idle_compaction_due(now(), Resumption::Likely));
 
         // an API error line has zero usage and hides nothing
         let errored = context(&[assistant(56, 250_000), {
@@ -488,7 +521,7 @@ mod tests {
             line
         }])
         .unwrap();
-        assert!(sidechain.idle_compaction_due(now()));
+        assert!(sidechain.idle_compaction_due(now(), Resumption::Likely));
     }
 
     #[test]
@@ -507,25 +540,46 @@ mod tests {
     #[test]
     fn idle_compaction_runs_between_55_minutes_and_the_cache_lapse() {
         let large = |minutes_ago| context(&[assistant(minutes_ago, 250_000)]).unwrap();
+        let likely = Resumption::Likely;
 
-        assert!(!large(50).idle_compaction_due(now()));
-        assert!(large(56).idle_compaction_due(now()));
-        assert!(!large(61).idle_compaction_due(now()));
+        assert!(!large(50).idle_compaction_due(now(), likely));
+        assert!(large(56).idle_compaction_due(now(), likely));
+        assert!(!large(61).idle_compaction_due(now(), likely));
         assert!(
             context(&[assistant(56, 175_000)])
                 .unwrap()
-                .idle_compaction_due(now())
+                .idle_compaction_due(now(), likely)
         );
         let medium = context(&[assistant(56, 172_000)]).unwrap();
-        assert!(!medium.idle_compaction_due(now()));
+        assert!(!medium.idle_compaction_due(now(), likely));
 
         // a message arriving mid-compaction queues instead of steering into it
-        assert_eq!(large(56).turn_start(now()), TurnStart::AfterActive);
-        assert_eq!(large(54).turn_start(now()), TurnStart::AfterActive);
-        assert_eq!(large(50).turn_start(now()), TurnStart::Auto);
+        assert_eq!(large(56).turn_start(now(), likely), TurnStart::AfterActive);
+        assert_eq!(large(54).turn_start(now(), likely), TurnStart::AfterActive);
+        assert_eq!(large(50).turn_start(now(), likely), TurnStart::Auto);
         // the compaction may still run once the window closed
-        assert_eq!(large(90).turn_start(now()), TurnStart::AfterActive);
-        assert_eq!(medium.turn_start(now()), TurnStart::Auto);
+        assert_eq!(large(90).turn_start(now(), likely), TurnStart::AfterActive);
+        assert_eq!(medium.turn_start(now(), likely), TurnStart::Auto);
+    }
+
+    #[test]
+    fn a_sleeping_thread_compacts_and_queues_from_60k_tokens() {
+        let certain = Resumption::Certain;
+        let medium = context(&[assistant(56, 100_000)]).unwrap();
+        let small = context(&[assistant(56, 50_000)]).unwrap();
+
+        // the idle scan and the callback route read the same threshold, so a
+        // final event never steers into the compaction the scan started
+        assert!(medium.idle_compaction_due(now(), certain));
+        assert_eq!(medium.turn_start(now(), certain), TurnStart::AfterActive);
+        assert!(!medium.idle_compaction_due(now(), Resumption::Likely));
+        assert_eq!(
+            medium.turn_start(now(), Resumption::Likely),
+            TurnStart::Auto
+        );
+
+        assert!(!small.idle_compaction_due(now(), certain));
+        assert_eq!(small.turn_start(now(), certain), TurnStart::Auto);
     }
 
     #[test]
@@ -540,7 +594,10 @@ mod tests {
         let compacted = context(&[assistant(200, 700_000), boundary.clone()]).unwrap();
         assert_eq!(compacted.tokens(), 14_131 + PROMPT_OVERHEAD_TOKENS);
         assert!(compacted.tokens_estimated());
-        assert_eq!(compacted.turn_start(now()), TurnStart::Auto);
+        assert_eq!(
+            compacted.turn_start(now(), Resumption::Likely),
+            TurnStart::Auto
+        );
 
         let measured = context(&[assistant(200, 700_000), boundary, assistant(5, 40_000)]).unwrap();
         assert_eq!(measured.tokens(), 41_302);

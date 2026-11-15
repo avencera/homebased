@@ -18,6 +18,13 @@
 //! clients and daemons from either side of a change still understand each other
 //! while `homebased update` restarts the daemon under a connected waiter
 
+mod sleep;
+
+pub use sleep::{
+    HeldEvent, HeldKind, HoldRole, HoldTarget, SLEEP_ROUTE, SleepHold, SleepOutcome, SleepRequest,
+    SleepResponse, SleepTarget,
+};
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +32,7 @@ use uuid::Uuid;
 
 use crate::callback::EventKind;
 use crate::domain::{TaskId, ThreadId};
+use crate::queue::gpu_idle::GpuIdleNotice;
 use crate::queue::{JobEventKind, JobId};
 use crate::thread_watch::{WatchEventKind, WatchId};
 use crate::waiting::MAX_WAIT_TARGETS;
@@ -376,43 +384,75 @@ pub enum WaitFrame {
     Done,
 }
 
-/// Whether an event ends the wait for its task
+/// What one event means to a thread that waits or sleeps on its target
 ///
-/// `TASK_REPORTED` and `TASK_CHECK_DUE` leave the task running. `TASK_WAITING`
-/// parks the work but hands it to a continuation run. Every other event is final,
-/// including `TASK_PREEMPTED`: a preempted queue run has no origin route, so its
-/// job continues under new runs that report through `JOB_*` events, not here
-#[must_use]
-pub fn ends_wait(kind: EventKind) -> bool {
-    match kind {
-        EventKind::TaskReported | EventKind::TaskCheckDue | EventKind::TaskWaiting => false,
-        EventKind::TaskCancelled
-        | EventKind::TaskLost
-        | EventKind::TaskBlocked
-        | EventKind::TaskFailed
-        | EventKind::TaskSucceeded
-        | EventKind::TaskPreempted => true,
-    }
+/// Final events end a wait, a `--final-only` wait wakes on nothing else, and a
+/// sleeping thread wakes on final events and alerts only. Progress events wait
+/// with the sleep's hold and are listed on the final event
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventClass {
+    /// The target reached its outcome
+    Final,
+    /// The work still runs and needs the thread now
+    Alert,
+    /// The work still runs and needs nothing from the thread
+    Progress,
 }
 
-/// Whether an event ends the wait for its job
-///
-/// Every way a job ends records one of `JOB_SUCCEEDED`, `JOB_FAILED`, and
-/// `JOB_CANCELLED`. `JOB_PREEMPTED` requeues the job, and `JOB_BLOCKED`,
-/// `JOB_CHECK_DUE`, and `JOB_GPU_IDLE` are notices about a job that is still
-/// queued or running.
-/// `JOB_ATTENTION` reports a failed cleanup of one run's resource and says
-/// nothing about the job; when it follows the final event of the job's last
-/// run, the wait has already ended and normal delivery carries it
-#[must_use]
-pub fn job_ends_wait(kind: JobEventKind) -> bool {
-    match kind {
-        JobEventKind::JobPreempted
-        | JobEventKind::JobAttention
-        | JobEventKind::JobBlocked
-        | JobEventKind::JobCheckDue
-        | JobEventKind::JobGpuIdle => false,
-        JobEventKind::JobSucceeded | JobEventKind::JobFailed | JobEventKind::JobCancelled => true,
+impl EventClass {
+    /// Class of a task event
+    ///
+    /// `TASK_REPORTED` is progress and `TASK_CHECK_DUE` asks the thread to look
+    /// at a silent worker. `TASK_WAITING` parks the work but hands it to a
+    /// continuation run, so the work goes on. Every other event is final,
+    /// including `TASK_PREEMPTED`: a preempted queue run has no origin route, so
+    /// its job continues under new runs that report through `JOB_*` events, not
+    /// here
+    #[must_use]
+    pub fn task(kind: EventKind) -> Self {
+        match kind {
+            EventKind::TaskReported | EventKind::TaskWaiting => Self::Progress,
+            EventKind::TaskCheckDue => Self::Alert,
+            EventKind::TaskCancelled
+            | EventKind::TaskLost
+            | EventKind::TaskBlocked
+            | EventKind::TaskFailed
+            | EventKind::TaskSucceeded
+            | EventKind::TaskPreempted => Self::Final,
+        }
+    }
+
+    /// Class of a job event, given its GPU idle notice on `JOB_GPU_IDLE`
+    ///
+    /// Every way a job ends records one of `JOB_SUCCEEDED`, `JOB_FAILED`, and
+    /// `JOB_CANCELLED`. `JOB_PREEMPTED` requeues the job, so the work goes on.
+    /// `JOB_BLOCKED` and `JOB_CHECK_DUE` are notices about a job that is still
+    /// queued or running, and `JOB_ATTENTION` reports a failed cleanup of one
+    /// run's resource; when it follows the final event of the job's last run,
+    /// the wait has already ended and normal delivery carries it. The first
+    /// `JOB_GPU_IDLE` of an idle episode is an alert and its reminders are
+    /// progress; a notice without its GPU idle details counts as a first alert
+    #[must_use]
+    pub fn job(kind: JobEventKind, gpu_idle: Option<&GpuIdleNotice>) -> Self {
+        match kind {
+            JobEventKind::JobSucceeded | JobEventKind::JobFailed | JobEventKind::JobCancelled => {
+                Self::Final
+            }
+            JobEventKind::JobAttention | JobEventKind::JobBlocked | JobEventKind::JobCheckDue => {
+                Self::Alert
+            }
+            JobEventKind::JobGpuIdle if gpu_idle.is_some_and(|notice| notice.reminder > 0) => {
+                Self::Progress
+            }
+            JobEventKind::JobGpuIdle => Self::Alert,
+            JobEventKind::JobPreempted => Self::Progress,
+        }
+    }
+
+    /// Whether the event ends a wait on its target
+    #[must_use]
+    pub fn is_final(self) -> bool {
+        self == Self::Final
     }
 }
 
@@ -423,8 +463,8 @@ pub fn job_ends_wait(kind: JobEventKind) -> bool {
 #[must_use]
 pub fn wakes_final_only(frame: &WaitFrame) -> bool {
     match frame {
-        WaitFrame::Event { kind, .. } => ends_wait(*kind),
-        WaitFrame::JobEvent { kind, .. } => job_ends_wait(*kind),
+        WaitFrame::Event { kind, .. } => EventClass::task(*kind).is_final(),
+        WaitFrame::JobEvent { kind, .. } => EventClass::job(*kind, None).is_final(),
         WaitFrame::WatchEvent { .. } => true,
         WaitFrame::Open { .. } | WaitFrame::Ping | WaitFrame::Restart | WaitFrame::Done => false,
     }
@@ -488,7 +528,7 @@ impl WaitSet {
             self.pending[index] = WaitKey::Task(next);
             return Some(next);
         }
-        if ends_wait(kind) || kind == EventKind::TaskWaiting {
+        if EventClass::task(kind).is_final() || kind == EventKind::TaskWaiting {
             self.pending.remove(index);
         }
         None
@@ -496,7 +536,7 @@ impl WaitSet {
 
     /// Account for one job event; a final event ends the wait for its job
     pub fn apply_job(&mut self, job: JobId, kind: JobEventKind) {
-        if job_ends_wait(kind) {
+        if EventClass::job(kind, None).is_final() {
             self.pending.retain(|pending| *pending != WaitKey::Job(job));
         }
     }

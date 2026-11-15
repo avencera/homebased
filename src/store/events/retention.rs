@@ -95,7 +95,7 @@ impl Store {
                      FROM origin_inbox i
                      JOIN origin_routes r ON r.task_id=i.task_id
                      WHERE i.settled_at <= ?1
-                       AND json_extract(i.delivery_json,'$.type') IN ('not_required','delivered')
+                       AND json_extract(i.delivery_json,'$.type') IN ('not_required','delivered','held')
                        AND i.seq <= json_extract(r.route_json,'$.last_settled_seq')
                      ORDER BY i.settled_at,i.task_id,i.seq LIMIT ?2",
                 )
@@ -118,7 +118,9 @@ impl Store {
             let delivery: DeliveryState = decode(delivery_json)?;
             if !matches!(
                 &delivery,
-                DeliveryState::NotRequired | DeliveryState::Delivered { .. }
+                DeliveryState::NotRequired
+                    | DeliveryState::Delivered { .. }
+                    | DeliveryState::Held { .. }
             ) {
                 return Err(EventError::Storage(AppError::Internal {
                     message: "inbox retention query selected an unsettled result".into(),
@@ -141,7 +143,7 @@ impl Store {
                 .execute(
                     "DELETE FROM origin_inbox
                      WHERE task_id=?1 AND seq=?2
-                       AND json_extract(delivery_json,'$.type') IN ('not_required','delivered')",
+                       AND json_extract(delivery_json,'$.type') IN ('not_required','delivered','held')",
                     params![task, seq],
                 )
                 .map_err(storage)?;

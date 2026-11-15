@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 18;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 19] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -37,6 +37,8 @@ const MIGRATIONS: [Migration; 17] = [
     add_ci_slots,
     add_preempt_operations,
     add_route_mem_peaks,
+    add_sleep_holds,
+    add_thread_lineage,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -225,6 +227,74 @@ fn add_route_mem_peaks(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE origin_routes ADD COLUMN {ROUTE_MEM_PEAK};"
     ))
 }
+
+/// Version 19: `homebased wait --long` holds progress events for its thread
+fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(SLEEP_HOLDS_TABLE)
+}
+
+/// One row per task chain or job a sleeping thread waits on
+///
+/// A task row names the chain's current run and moves to the continuation
+/// when that run parks. `held_json` lists the `HeldEvent`s settled without
+/// waking the thread; the final event's settlement deletes the row. A row
+/// with `parked_under` is a task or job that run of a held chain parked on:
+/// its events, the final one too, join that run's `held_json` instead
+const SLEEP_HOLDS_TABLE: &str = "
+CREATE TABLE sleep_holds (
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('task', 'job')),
+    target_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    parked_under TEXT,
+    created_at TEXT NOT NULL,
+    held_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (target_kind, target_id)
+);
+CREATE INDEX sleep_holds_thread ON sleep_holds (thread_id);
+CREATE INDEX sleep_holds_parked ON sleep_holds (parked_under) WHERE parked_under IS NOT NULL;
+";
+
+/// Version 20: child-thread links and the one report each child sends
+fn add_thread_lineage(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(THREAD_LINEAGE_TABLES)
+}
+
+/// Links that `t3 launch --child` makes, and the reports of child threads
+///
+/// The launching daemon saves a link, and a child on another machine gets
+/// the same row there, so each machine reads the links it is part of.
+/// `report_message_id` is derived from the link, so the parent's machine
+/// counts the child reported once `message_receipts` has that id.
+/// `closed_at` is the parent's machine seeing a child on another machine put
+/// away without a report. A report row lives on the child's machine: its
+/// body and run are fixed when it is saved, and only `stage` moves on
+const THREAD_LINEAGE_TABLES: &str = "
+CREATE TABLE thread_lineage (
+    id TEXT PRIMARY KEY,
+    parent_machine TEXT NOT NULL,
+    parent_thread TEXT NOT NULL,
+    child_machine TEXT NOT NULL,
+    child_thread TEXT NOT NULL,
+    report_message_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    closed_at TEXT,
+    UNIQUE (child_machine, child_thread)
+);
+CREATE INDEX thread_lineage_parent ON thread_lineage (parent_machine, parent_thread);
+
+CREATE TABLE thread_reports (
+    link_id TEXT PRIMARY KEY REFERENCES thread_lineage(id),
+    body TEXT NOT NULL,
+    source_session TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('sending', 'settle_pending', 'sent', 'settled')),
+    created_at TEXT NOT NULL,
+    sent_at TEXT CHECK ((stage = 'sending') = (sent_at IS NULL)),
+    settled_at TEXT CHECK ((stage = 'settled') = (settled_at IS NOT NULL))
+);
+CREATE INDEX thread_reports_open ON thread_reports (stage)
+    WHERE stage IN ('sending', 'settle_pending');
+";
 
 /// Peak host memory of a task in MiB, submitted with `mem_peak`; the route is
 /// held until the memory gate admits it, and its task is a claim while it runs
@@ -536,6 +606,8 @@ fn schema() -> String {
         .replace("{RESOURCE_CI_SLOT}", RESOURCE_CI_SLOT)
         .replace("{RESOURCE_CI_RETIRED}", RESOURCE_CI_RETIRED)
         .replace("{CI_TABLES}", CI_TABLES)
+        .replace("{SLEEP_HOLDS_TABLE}", SLEEP_HOLDS_TABLE)
+        .replace("{THREAD_LINEAGE_TABLES}", THREAD_LINEAGE_TABLES)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -883,7 +955,9 @@ CREATE TABLE resource_job_delivery (
 {GPU_IDLE_TABLES}
 {LEASE_IDLE_TABLE}
 {SERVICES_TABLE}
-{CI_TABLES}";
+{CI_TABLES}
+{SLEEP_HOLDS_TABLE}
+{THREAD_LINEAGE_TABLES}";
 
 #[cfg(test)]
 mod tests {
@@ -1005,6 +1079,8 @@ mod tests {
             .replace(&format!(",\n    {}", super::RESOURCE_CI_SLOT), "")
             .replace(&format!(",\n    {}", super::RESOURCE_CI_RETIRED), "")
             .replace(super::CI_TABLES, "")
+            .replace(super::SLEEP_HOLDS_TABLE, "")
+            .replace(super::THREAD_LINEAGE_TABLES, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -1039,6 +1115,7 @@ mod tests {
             "resource_gpu_idle_attempts",
             "resource_gpu_idle_controls",
             "services",
+            "sleep_holds",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
@@ -1081,9 +1158,12 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // version 12 had no lease guard, services, CI slots, or memory peaks
+        // version 12 had no lease guard, services, CI slots, memory peaks,
+        // sleep holds, or child-thread links
         conn.execute_batch(
-            "ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
+            "DROP TABLE thread_reports; DROP TABLE thread_lineage;
+             ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
+             DROP TABLE sleep_holds;
              DROP TABLE lease_idle_trips; DROP TABLE services;
              DROP TABLE ci_drain; DROP TABLE ci_run_timeouts; DROP TABLE ci_job_timings;
              ALTER TABLE resources DROP COLUMN ci_retired;

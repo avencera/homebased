@@ -6,6 +6,12 @@
 //! machine's T3. Each daemon reaches only its own T3 server, as with message
 //! delivery. Project listings and project adds take the same two hops
 //!
+//! A child launch (`--child`) saves the link between the calling T3 thread
+//! and the new one, see [`crate::child_thread`]. The child's machine saves it
+//! before T3 starts the child's first run, and the parent's machine once the
+//! launch succeeded; T3 fixes the new thread's id by the request id, so both
+//! know it in advance
+//!
 //! The routes need no protocol change: a peer that predates them answers 404,
 //! which is reported as an outdated homebased
 
@@ -18,17 +24,23 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use chrono::Utc;
+
 use super::AppState;
+use super::actors::{StoreMsg, call};
 use super::cluster::{ReadQuery, check_api_version, check_protocol};
 use super::message_sender::resolve_machine;
+use super::thread_api::caller_t3_thread;
+use crate::child_thread::{Lineage, LinkEnd, LinkId};
 use crate::domain::{API_VERSION, ThreadId};
 use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse, DEFAULT_MAX_BODY};
 use crate::machine::{MachineId, MachineName};
 use crate::t3::{
     AddedProject, LaunchError, LaunchSpec, LaunchedThread, ProjectSpec, ProviderInstance, T3Env,
-    T3Project, add_project, launch_thread, projects, providers,
+    T3Project, add_project, launch_thread, launch_thread_id, projects, providers,
 };
+use crate::thread_ref::Caller;
 
 const CLUSTER_LAUNCH_PATH: &str = "/v1/cluster/t3/launch";
 const CLUSTER_PROJECTS_PATH: &str = "/v1/cluster/t3/projects";
@@ -56,6 +68,11 @@ pub struct T3LaunchRequest {
     /// route for replies
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_thread: Option<ThreadId>,
+    /// The calling agent, when it launches a child thread: a thread that
+    /// reports back to the caller's T3 thread once with `homebased thread
+    /// report`. Its first message names that thread instead of `source_thread`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_of: Option<Caller>,
     /// What to launch
     pub launch: LaunchSpec,
 }
@@ -71,6 +88,9 @@ pub struct T3LaunchResponse {
     pub machine_name: MachineName,
     /// The launched thread
     pub thread: LaunchedThread,
+    /// Its link to the calling thread, for a child thread
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
 }
 
 /// `POST /v1/t3/projects` body
@@ -133,6 +153,10 @@ struct ClusterLaunch {
     destination_machine: MachineId,
     origin_machine: MachineId,
     launch: LaunchSpec,
+    /// The parent, on the origin machine, of a child thread; a peer that
+    /// predates child threads refuses the field
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<LinkEnd>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,23 +210,56 @@ async fn launch(
         .validate()
         .map_err(|message| AppError::Usage { message })?;
     let destination = destination(&state, body.machine.as_deref()).await?;
+    let local = state.machine.identity.machine;
 
     let mut launch = body.launch;
-    if let (Some(thread), Some(message)) = (body.source_thread, launch.message.as_mut()) {
-        message.push_str(&reply_route(&state.machine.name, thread));
+    let parent = match body.child_of {
+        Some(caller) => Some(child_parent(&state, caller, &launch).await?),
+        None => None,
+    };
+    let footer = match (&parent, body.source_thread) {
+        (Some(parent), _) => Some(child_route(&state.machine.name, &parent.t3_thread)),
+        (None, Some(thread)) => Some(reply_route(&state.machine.name, thread)),
+        (None, None) => None,
+    };
+    if let (Some(footer), Some(message)) = (footer, launch.message.as_mut()) {
+        message.push_str(&footer);
         // the route can push a message near the limit over it, which the peer would refuse
         launch
             .validate()
             .map_err(|message| AppError::Usage { message })?;
     }
-    let local = state.machine.identity.machine;
+    let lineage = parent.map(|parent| Lineage {
+        id: LinkId::from_launch(launch.request_id),
+        parent,
+        child: LinkEnd {
+            machine: destination,
+            t3_thread: launch_thread_id(launch.request_id),
+        },
+        created_at: Utc::now(),
+    });
+
     let (thread, machine_name) = if destination == local {
-        (
-            launch_here(local, launch).await?,
-            state.machine.name.clone(),
-        )
+        let thread = launch_linked(&state, local, lineage.clone(), launch).await?;
+        (thread, state.machine.name.clone())
     } else {
-        forward_launch(&state, destination, launch).await?
+        let request = launch.request_id;
+        let parent = lineage.as_ref().map(|lineage| lineage.parent.clone());
+        let launched = forward_launch(&state, destination, launch, parent).await?;
+        if let Some(lineage) = lineage.clone() {
+            // the child runs already, so a link this side failed to save
+            // leaves a launch only a retry with the same id can finish
+            save_lineage(&state, lineage).await.map_err(|error| {
+                AppError::T3LaunchOutcomeUnknown {
+                    request,
+                    machine: Some(destination),
+                    message: format!(
+                        "the child thread launched, but its link was not saved here: {error}"
+                    ),
+                }
+            })?;
+        }
+        launched
     };
 
     Ok(Json(T3LaunchResponse {
@@ -210,7 +267,67 @@ async fn launch(
         machine: destination,
         machine_name,
         thread,
+        lineage,
     }))
+}
+
+/// The parent end of a child launch: the caller's T3 thread here
+async fn child_parent(
+    state: &AppState,
+    caller: Caller,
+    launch: &LaunchSpec,
+) -> Result<LinkEnd, AppError> {
+    if launch.message.is_none() {
+        return Err(AppError::Usage {
+            message: "--child needs a first message, the work the child thread owns".into(),
+        });
+    }
+    let t3_thread = caller_t3_thread(state, caller)
+        .await?
+        .ok_or_else(|| AppError::Usage {
+            message:
+                "--child needs a calling T3 thread on this machine; run it from a T3 Code thread"
+                    .into(),
+        })?;
+    Ok(LinkEnd {
+        machine: state.machine.identity.machine,
+        t3_thread,
+    })
+}
+
+async fn save_lineage(state: &AppState, lineage: Lineage) -> Result<Lineage, AppError> {
+    call(&state.store, |reply| StoreMsg::InsertLineage {
+        lineage,
+        reply,
+    })
+    .await
+}
+
+/// Launch here, saving the link of a child thread first
+///
+/// The link must be there before the child's first run, which can report at
+/// once. A launch that T3 then refuses leaves a link to a thread that never
+/// existed, which lookups skip
+async fn launch_linked(
+    state: &AppState,
+    machine: MachineId,
+    lineage: Option<Lineage>,
+    launch: LaunchSpec,
+) -> Result<LaunchedThread, AppError> {
+    let Some(lineage) = lineage else {
+        return launch_here(machine, launch).await;
+    };
+    let lineage = save_lineage(state, lineage).await?;
+    let thread = launch_here(machine, launch).await?;
+    if thread.thread_id != lineage.child.t3_thread {
+        return Err(AppError::Internal {
+            message: format!(
+                "T3 launched thread {} where the link names {}",
+                thread.thread_id, lineage.child.t3_thread
+            ),
+        });
+    }
+    Ok(thread)
 }
 
 async fn cluster_launch(
@@ -228,7 +345,24 @@ async fn cluster_launch(
         .map_err(|message| AppError::Usage { message })?;
 
     let machine = state.machine.identity.machine;
-    let thread = launch_here(machine, body.launch).await?;
+    let lineage = match body.parent {
+        Some(parent) if parent.machine != body.origin_machine => {
+            return Err(AppError::Usage {
+                message: "a child thread's parent must be on the machine that launches it".into(),
+            });
+        }
+        Some(parent) => Some(Lineage {
+            id: LinkId::from_launch(body.launch.request_id),
+            parent,
+            child: LinkEnd {
+                machine,
+                t3_thread: launch_thread_id(body.launch.request_id),
+            },
+            created_at: Utc::now(),
+        }),
+        None => None,
+    };
+    let thread = launch_linked(&state, machine, lineage, body.launch).await?;
     Ok(Json(ClusterLaunchBody {
         api_version: API_VERSION,
         protocol_version: body.protocol_version,
@@ -431,6 +565,7 @@ async fn forward_launch(
     state: &AppState,
     destination: MachineId,
     launch: LaunchSpec,
+    parent: Option<LinkEnd>,
 ) -> Result<(LaunchedThread, MachineName), AppError> {
     let fleet = state
         .fleet
@@ -446,6 +581,7 @@ async fn forward_launch(
         destination_machine: destination,
         origin_machine: state.machine.identity.machine,
         launch,
+        parent,
     };
 
     // T3 launches once per request id, so any transport failure is safe to retry
@@ -464,6 +600,15 @@ async fn forward_launch(
         machine: Some(destination),
         message,
     };
+    // axum refuses a body with a field it does not know before the handler
+    // runs, and a peer from before child threads does not know `parent`
+    if wire.parent.is_some() && response.status == StatusCode::UNPROCESSABLE_ENTITY {
+        return Err(AppError::T3Incompatible {
+            message: format!(
+                "machine {destination} runs a homebased without child threads; run `homebased update` there"
+            ),
+        });
+    }
     let body: ClusterLaunchBody = match peer_body(destination, &response) {
         Ok(body) => body,
         Err(error @ AppError::MachineIdentityMismatch { .. }) => return Err(error),
@@ -565,6 +710,13 @@ fn t3_error(error: LaunchError, uncertain: impl FnOnce(String) -> AppError) -> A
         },
         LaunchError::Uncertain(message) => uncertain(message),
     }
+}
+
+/// Footer that tells a child thread where it reports, and how
+fn child_route(machine: &MachineName, parent: &str) -> String {
+    format!(
+        "\n\n---\nThis is a child thread of T3 thread `thread_{parent}` on machine `{machine}`, launched through homebased to own this work. Run long work as homebased tasks and jobs and sleep on them with `homebased wait --long <ids>`, then end the turn; the final event or an alert wakes this thread. When it is done and its homebased tasks, jobs and child threads have finished, report back once with:\n`homebased thread report --summary \"<report>\"`\nThat sends the report to the parent and settles this thread after the turn. To ask the parent something before then, run:\n`homebased message send --machine {machine} --thread thread_{parent} --message \"<message>\"`"
+    )
 }
 
 /// Footer that tells the launched agent how to answer the thread that asked

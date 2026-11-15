@@ -169,9 +169,25 @@ pub enum Command {
     /// In a Claude session that a T3 thread owns, a wait with no event that
     /// ends it exits 0 after 55 minutes, inside the session's hour-long prompt cache,
     /// and prints on stderr the command that waits again on the ids still
-    /// pending. `--long` compacts the thread once the turn ends and waits up to
-    /// 115 minutes instead, for work expected to take over 4 hours. Give the
-    /// background command a 2-hour timeout (7200000) so the wait ends first.
+    /// pending. Give the background command a 2-hour timeout (7200000) so the
+    /// wait ends first.
+    ///
+    /// For work expected to take over an hour, `--long` sleeps instead: run it
+    /// as an ordinary command, not in the background. It holds each live task
+    /// and job, prints on stderr whether each is `held`, `already_ended`, or
+    /// `followed_to <continuation>`, and exits 0 at once, so the turn can end.
+    /// The daemon then settles progress events (`TASK_REPORTED`, `TASK_WAITING`,
+    /// `JOB_PREEMPTED`, GPU idle reminders) without waking the thread, and wakes
+    /// it with the target's final event, whose line lists them under
+    /// `held_events`, or with an alert (`JOB_ATTENTION`, `JOB_BLOCKED`,
+    /// `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, the first `JOB_GPU_IDLE` of an idle
+    /// episode), after which the hold stays. When a held task parks, the hold
+    /// follows its continuation and keeps the tasks and jobs it parked on, so
+    /// only the chain's final event wakes the thread. A connected wait still
+    /// takes the events first. A sleeping thread compacts when idle from 60K
+    /// context tokens instead of 175K. A T3 subagent (a `delegate_task` child),
+    /// which T3 reports done when its turn ends, cannot sleep: `--long` waits up
+    /// to 115 minutes there, and long work belongs in a child thread.
     Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),

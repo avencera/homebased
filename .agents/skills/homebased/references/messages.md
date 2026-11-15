@@ -129,9 +129,10 @@ second copy another way.
 
 A Claude session or Codex thread that a T3 thread owns may be compacted while it idles.
 When it is not archived, runs no turn, and will likely run again (a task or queue job still runs
-for it, T3 owes it a delegated task's report, or it is unsettled and not a
-finished delegate), the daemon sends `/compact` to that thread after 55 idle minutes
-if the context has at least 175,000 tokens, while the prompt cache is still warm. A
+for it, T3 owes it a T3 subagent's report, a child thread owes it a report,
+or it is unsettled and not a finished T3 subagent), the daemon sends `/compact` to that thread after 55 idle minutes
+if the context has at least 175,000 tokens, while the prompt cache is still warm,
+or 60,000 tokens for a thread that sleeps on work with `homebased wait --long`. A
 message for such a session whose cache already lapsed, with at least 175,000 context
 tokens, sends `/compact` first.
 A message that arrives during a compaction waits behind it, so the agent reads
@@ -142,6 +143,10 @@ event waits in the homebased inbox until the compaction finishes, for at most
 `--reply-to <message-uuid>` links a reply to an earlier message. Use
 `--conversation <uuid>` to set a shared conversation UUID. By default, the
 conversation UUID is the message UUID.
+
+## Child-thread reports
+
+A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. Its message UUID comes from the link between the two threads, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
 
 ## Retry safely
 

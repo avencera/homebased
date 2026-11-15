@@ -4,6 +4,7 @@ use chrono::{TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, fmt_time};
+use crate::child_thread::OpenWork;
 use crate::domain::{TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
@@ -20,7 +21,7 @@ use crate::submission::{
 /// Nothing closes a route whose queue owner never reports an ending, such as a
 /// machine that left the fleet. GPU jobs can run for days, so this is longer
 /// than the task wait limit
-const JOB_WAIT_LIMIT: TimeDelta = TimeDelta::days(7);
+pub(super) const JOB_WAIT_LIMIT: TimeDelta = TimeDelta::days(7);
 
 /// A durable identity operation failed without changing its existing owner
 #[derive(Debug, thiserror::Error)]
@@ -201,6 +202,15 @@ pub(super) fn task_row_exists(conn: &Connection, task: TaskId) -> rusqlite::Resu
     )
 }
 
+/// A task or queue job that still owes a thread events
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedTarget {
+    /// Thread its events go to
+    pub thread: ThreadId,
+    /// The task or job, as [`OpenWork::Task`] or [`OpenWork::Job`]
+    pub work: OpenWork,
+}
+
 fn storage(error: rusqlite::Error) -> IdentityError {
     IdentityError::Storage(AppError::from(error))
 }
@@ -219,6 +229,18 @@ impl Store {
     /// continuation has a route of its own. A queue job waits until an ending
     /// event reached the thread, or until [`JOB_WAIT_LIMIT`] passes
     pub fn waiting_threads(&self) -> Result<Vec<ThreadId>, AppError> {
+        let mut threads: Vec<ThreadId> = Vec::new();
+        for owed in self.owed_targets()? {
+            if !threads.contains(&owed.thread) {
+                threads.push(owed.thread);
+            }
+        }
+        Ok(threads)
+    }
+
+    /// Each task and queue job that still owes its origin thread events, by
+    /// the rule of [`Self::waiting_threads`], tasks first
+    pub fn owed_targets(&self) -> Result<Vec<OwedTarget>, AppError> {
         let mut tasks = self.conn.prepare(
             "SELECT route_json FROM origin_routes
              WHERE outcome IS NULL AND json_valid(route_json)
@@ -251,22 +273,26 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut threads: Vec<ThreadId> = Vec::new();
-        let mut add = |thread: ThreadId| {
-            // no session waits on a task submitted without a thread
-            if !thread.is_detached() && !threads.contains(&thread) {
-                threads.push(thread);
-            }
-        };
+        let mut owed = Vec::new();
         for json in task_routes {
             let route: OriginRoute = serde_json::from_str(&json)?;
-            add(route.thread);
+            owed.push(OwedTarget {
+                thread: route.thread,
+                work: OpenWork::Task { id: route.task.0 },
+            });
         }
         for json in job_routes {
             let route: JobRoute = serde_json::from_str(&json)?;
-            add(route.thread);
+            owed.push(OwedTarget {
+                thread: route.thread,
+                work: OpenWork::Job {
+                    id: route.job.as_uuid(),
+                },
+            });
         }
-        Ok(threads)
+        // no session waits on a task submitted without a thread
+        owed.retain(|target| !target.thread.is_detached());
+        Ok(owed)
     }
 
     /// Insert an origin route once; an identical request returns the saved route

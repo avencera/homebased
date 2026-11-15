@@ -247,21 +247,27 @@ Codex's own compaction.
 
 The daemon checks this machine's T3 threads every minute. Once a thread's
 session has been idle for 55 minutes with at least 175,000 context tokens,
-homebased sends `/compact` to the thread. The cache is still warm, so the
+homebased sends `/compact` to the thread. A thread that sleeps on work with
+[`homebased wait --long`](#sleep-until-long-work-ends) is certain to run again
+hours later, after its cache lapsed, so for it the limit is 60,000 tokens; below
+that a cold wake-up costs little, and compacting again would lose detail. The cache is still warm, so the
 compaction costs a fraction of a cold read. A thread qualifies when it is not
 archived, runs no turn, and will likely run again: a homebased task or queue
-job, or a delegated task T3 will report, still owes it a wake, or it is
-unsettled and not a delegate whose task ended. That covers
-a root waiting on its delegated tasks, a thread waiting on you, and an idle
-interactive thread alike. A settled thread or a finished delegate rarely runs
-again, so compacting it would cost more than it saves. Any activity in the
+job, a T3 subagent's report, or a child thread's report still owes it a wake,
+or it is unsettled and not a T3 subagent whose task ended. That covers a root
+waiting on its T3 subagents or child threads, a thread waiting on you, and an
+idle interactive thread alike. A settled thread or a finished T3 subagent
+rarely runs again, so compacting it would cost more than it saves. Any activity in the
 thread moves the 55 minutes, and each idle period gets one attempt. A queue job
 counts until its ending event reaches the thread, or for at most seven days, in
-case its queue machine never reports one. A terminal session has no T3 thread
+case its queue machine never reports one; a sleep's hold on a job counts toward
+the 60,000-token limit for the same time. A terminal session has no T3 thread
 to compact, so it is left alone.
 
 An event or message for a session whose cache already lapsed, with at least
-175,000 context tokens, sends `/compact` first and then the event. The event's
+175,000 context tokens, sends `/compact` first and then the event. For a task
+or job event to a sleeping thread the limit is 60,000 tokens; a direct message
+keeps 175,000, since its sender waits for the answer. The event's
 turn would write the whole context back to the one-hour cache, while Claude
 Code's compaction request writes it at the cheaper five-minute rate, and every
 later request then reads the summary instead of the full context. Nothing
@@ -277,7 +283,9 @@ anyway. A direct message cannot wait, because its sender needs an answer, so
 it goes right after `/compact` and T3 holds it until the compaction finishes.
 
 From 54 idle minutes on, an event for such a session explicitly waits for the
-active run, because T3 refuses to steer into a running compaction.
+active run, because T3 refuses to steer into a running compaction. For the
+same reason an event or message waits for the active run whenever T3's state
+shows a `/compact` turn running in the thread, whatever the thread's size.
 
 Homebased reads idle time and context size from the session transcript in
 `~/.claude/projects/`, and for a Codex thread from its rollout in
@@ -335,8 +343,20 @@ After 3 days the event is marked failed and is written to
 
 ### Wait for tasks and jobs in a T3 thread
 
+These sections use a few terms for the agents that run work. A T3 subagent is
+a T3 `delegate_task` child: short work, typically under an hour, that T3
+reports done to its parent once a turn ends with no wait running, so it never
+waits on long work. A child thread is a top-level T3 thread launched with
+[`homebased t3 launch --child`](#launch-a-t3-thread-on-any-machine) to own a
+phase, an experiment, or long work; it reports to its parent thread once, and
+homebased then settles it. A worker is a headless agent that homebased runs as
+a task, which parks with `waiting`. Long work is a task, job, or chain expected
+to run or queue for over an hour; a thread sleeps on it with
+`homebased wait --long`.
+
 ```sh
 homebased wait [--next [--final-only]] <id> [<id> ...]
+homebased wait --long <id> [<id> ...]
 ```
 
 `homebased wait` takes task ids, GPU queue job ids, and thread watch ids alike
@@ -355,9 +375,9 @@ for up to 5 minutes. With `--next`, it exits 0 about a second after it prints
 the first event, together with any that arrived in that second. With
 `--next --final-only`, interim events such as `TASK_REPORTED` and
 `JOB_PREEMPTED` are printed and confirmed but do not end the command; it exits
-after a task's or job's final event or any watch event. A T3 `delegate_task`
-child uses it so that its interim events do not end its turn and wake its
-parent. It is meant
+after a task's or job's final event or any watch event. A T3 subagent (a
+`delegate_task` child) uses it so that its interim events do not end its turn
+and wake its parent. It is meant
 for a background Bash command with `--next` in a Claude Code session in a T3
 Code thread, which T3 shows as Waiting. A Claude Code `Monitor` is killed
 after at most 30 minutes and wakes the thread each time, while a background
@@ -367,10 +387,7 @@ session that a T3 thread owns, the wait exits after 55 minutes with no event,
 so each wake-up lands inside the session's hour-long prompt cache, while a
 wake-up after the cache expires rewrites the whole context. On that exit it
 prints, on stderr, the command that starts the wait again on the ids still
-pending; with `--final-only`, interim events may already be on stdout. For work expected to take over 4 hours, add
-`--long`: it compacts the thread once the turn ends, as `thread compact` does,
-and waits up to 115 minutes. It skips the compaction when the context is under
-60,000 tokens, and keeps the 55-minute limit when the compaction cannot start.
+pending; with `--final-only`, interim events may already be on stdout.
 `--timeout <duration>` sets the limit by hand; other callers have none unless
 they pass it. A task of another thread or machine and a
 job of another thread return `wait_unavailable`, and so do a task or job
@@ -385,6 +402,53 @@ for one that does not exist.
 A Codex thread cannot run a background command that wakes it, so each event starts a new turn, and
 T3 shows the thread as idle between events.
 
+#### Sleep until long work ends
+
+For long work, expected to run or queue for over an hour, the thread sleeps:
+run `homebased wait --long` as an ordinary command, not in the background, and
+end the turn. It checks the ids
+as `homebased wait` does, prints one result per target on stderr, and exits 0
+at once:
+
+- `held`: the daemon now holds the target for this thread
+- `already_ended`: its final event has already settled, so nothing is held
+- `followed_to <continuation>`: the task parked, and the hold is on the run
+  that continues it
+- `watched`: a thread watch, whose events all wake the thread anyway
+
+The hold is saved in the daemon's database, so it survives a daemon restart.
+While it lasts, the daemon sorts each event of the target:
+
+- A final event wakes the thread through normal delivery and ends the hold.
+  Its `HOMEBASED_EVENT` line gains `held_events`: the kind, `seq`, time, and a
+  short summary of each event the hold kept
+- An alert wakes the thread, and the hold stays: `JOB_ATTENTION`,
+  `JOB_BLOCKED`, `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, and the first
+  `JOB_GPU_IDLE` of an idle episode. End the turn again after handling it,
+  without starting another wait
+- Progress settles without waking the thread: `TASK_REPORTED`,
+  `JOB_PREEMPTED`, `JOB_GPU_IDLE` reminders, and `TASK_WAITING`, which moves
+  the hold to the continuation run so a chain stays held to its end. `task
+  show` reads `callback: held` for a run whose `TASK_WAITING` the hold kept
+
+When a held worker parks, the tasks and jobs it names with `--on` are held
+with its chain, provided their events go to the sleeping thread, as a
+worker's own submissions do. The continuation reports on them, so their final
+events count as progress of the chain too: those and their progress events
+join the chain's `held_events`, and only their alerts wake the thread. The
+thread then wakes on the chain's final event or an alert. `held_events`
+entries name their `task` or `job`, and a held `TASK_WAITING` summarizes as
+`parked on task <id>, job <id>; continues as task <id>`.
+
+A connected `homebased wait` on the same target still takes its events first.
+A sleeping thread compacts at 60,000 tokens instead of 175,000 (see
+[T3 Code wake](#t3-code-wake)). A hold is open work for `thread report`. In a
+T3 subagent, which T3 reports to its parent as soon as its turn ends, `--long`
+cannot sleep: it waits up to 115 minutes like a plain wait and says on stderr
+that long work belongs in a child thread. A homebased
+worker gets a `usage` error (exit 2) and parks with
+`homebased task report --outcome waiting --on <id>` instead.
+
 ### Thread context, compaction, and watches
 
 ```sh
@@ -394,6 +458,7 @@ homebased thread watch [<ref>...] --context-above <150k|80%> [--action compact] 
 homebased thread watch [<ref>...] --stalled-after <20m|1h> [--once] [--children]
 homebased thread watches [--all]
 homebased thread unwatch <watch-id>
+homebased thread report --summary <text> [--file <path>|-]
 ```
 
 A thread reference is T3 chip text (`[Thread: <title>; ref=<ref>]`),
@@ -432,13 +497,16 @@ pending.
 
 `thread context` prints each thread's host (`t3`, `worker`, or `terminal`),
 provider, session, T3 id and link, title, state (`waiting` when a homebased task
-or job still owes the thread events, or T3 is due to wake it with a delegated
-task's report), context tokens, context window
+or job still owes the thread events, T3 is due to wake it with a T3
+subagent's report, or a child thread it launched with `t3 launch --child` has not
+reported yet), context tokens, context window
 and percent (Codex only), last activity in US Central, whether the prompt cache
 is warm, and the last compaction, looked up as far as 4 MiB back in the
-transcript or rollout. `--children` adds every T3 thread the calling
-T3 thread started as a subagent, with the parent link read from T3's thread
-lineage. Forks of the calling thread are not children. A child whose newest
+transcript or rollout. `--children` adds every T3 subagent the calling
+T3 thread started with `delegate_task`, with the parent link read from T3's thread
+lineage, and every child thread it launched with `t3 launch --child`, on any
+machine, with a `child_thread` record of its link, its parent, and whether its
+report has arrived. Forks of the calling thread are not children. A child whose newest
 delegated task T3 records as ended, and that runs no turn, has
 `task_finished: true` and shows as `finished` while it is idle, and `settled`
 says whether T3 settled it. A child is done when it is settled or finished and
@@ -464,8 +532,8 @@ T3 fails with `compact_unsupported_host` (exit 5), and a T3 thread with no
 session to compact yet with `thread_not_found` (exit 3).
 
 `thread watch` keeps a watch on the calling machine and checks it every minute,
-right after the idle compaction scan, which keeps its 55-minute, 175,000-token
-rule. When the watched context climbs over the limit while the thread runs no
+right after the idle compaction scan, which keeps its own 55-minute rule and
+token limits. When the watched context climbs over the limit while the thread runs no
 turn, the caller gets one `THREAD_CONTEXT_OVER` event; the watch fires again
 only after a reading shows the context below the limit, so a missing reading
 never re-arms it. The same thread, limit, and action again is the existing
@@ -473,7 +541,7 @@ watch; another limit or action on the same thread is a second watch, and each
 fires on its own. `--action compact` compacts the
 T3 thread first, with trigger `watch`, and puts the outcome in the event, which
 wakes the caller only when the compaction did not start or the caller watches
-itself and no delegated task report from T3, homebased task, or job is still
+itself and no T3 subagent's report, homebased task, or job is still
 due to wake it; the
 watch is read again just before, so one removed meanwhile compacts nothing. A
 watched T3 thread that is done, settled or finished with its delegated task
@@ -484,13 +552,15 @@ limit, and once it is unsettled or takes a new task it fires as before.
 `--stalled-after <grace>` (5 minutes to 24 hours) watches for a stall instead:
 the caller gets one `THREAD_STALLED` once the thread has sat `idle` that long
 since its last activity, or since a scan last saw it running or waiting, with no turn running, no homebased task or job owing
-it events, and no T3 delegated task due to report to it. A done thread never
-fires. One idle stretch fires once; a turn, a wait, or new activity re-arms it.
+it events, no T3 subagent due to report to it, and no child thread that has
+not reported. A done thread never fires, and neither does a child thread that has reported. One idle stretch
+fires once; a turn, a wait, or new activity re-arms it.
 It only notifies, so `--action compact` is refused, and each watch takes one
 condition, so a context watch and a stall watch on one thread are two watches.
-A delegate's stall watch ends with `finished` an hour after its task ends. A
-top-level thread that sent its last report looks like a stalled one unless it
-is settled, so unwatch it when the report arrives. A `t3_background_wait` on a
+A T3 subagent's stall watch ends with `finished` an hour after its task ends,
+and a child thread's as soon as it has reported and is settled. A top-level
+thread that is not a child thread and sent its last report looks like a
+stalled one unless it is settled, so unwatch it when the report arrives. A `t3_background_wait` on a
 command outside homebased is invisible to homebased, so a thread that waits
 that way past the grace reads as stalled.
 
@@ -529,11 +599,31 @@ still go out. Events for a stopped Claude session wait until it runs again, for
 up to 3 days as task callbacks do. The skill's
 [threads.md](.agents/skills/homebased/references/threads.md) has the payload.
 
+`thread report` sends a child thread's one report to its parent, run in the
+child's T3 thread during a turn. It is refused with `thread_report_refused`
+(exit 5), naming each piece, while the child has open work: a homebased task
+or GPU queue job that owes it events, a sleep hold (`hold`, including what a
+held worker parked on), a T3 subagent due to report to it, or a child thread
+of its own that has not reported (one on a machine that does
+not answer counts as open). Otherwise it sends `--summary`, followed by the
+text of `--file` (`-` reads stdin), up to 16 KiB in all, to the parent as a
+`HOMEBASED_MESSAGE` whose body starts `Report from child thread thread_<id>:`.
+The report is saved first, under a message UUID derived from the link, so a
+retry or a daemon restart finishes the same report and never sends a second;
+a retry with other text fails with `thread_report_conflict`, and a thread no
+`--child` launch made fails with `not_child_thread`. Once the reporting turn
+ends, the child's daemon asks T3 to settle the child (`thread.settle`, bound
+to that run), unless a later run or a user message to the child came first or
+T3 refuses. The output's `stage` is `sending`, `settle_pending`, `sent`
+(delivered and left unsettled), or `settled`. A parent stops waiting on a
+child that is archived, deleted, or settled without a report; for a child on
+another machine, once a scan sees it so or misses it on two scans in a row.
+
 On the socket, `POST /v1/threads/context` resolves references and
 `GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both
 are also served on the dashboard port. `POST /v1/threads/compact`,
-`POST /v1/threads/watches`, and `POST /v1/threads/watches/{id}/unwatch` are
-socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
+`POST /v1/threads/watches`, `POST /v1/threads/watches/{id}/unwatch`, and
+`POST /v1/threads/report` are socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
 `POST /v1/cluster/threads/compact`.
 
 ### Launch a T3 thread on any machine
@@ -545,7 +635,8 @@ homebased t3 project add ~/code/app --machine code [--title app] \
 homebased t3 project icon ~/code/app --machine code --lucide captions --color sky
 homebased t3 launch --machine code --project ~/code/app \
   --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
-  [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high]
+  [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high] \
+  [--reply-route | --child]
 ```
 
 `t3 launch` starts an ordinary top-level T3 Code thread in the T3 on another
@@ -588,6 +679,19 @@ the project setup script, and starts the first message.
   launched it. `--reply-route` ends the first message with the calling thread
   and machine and the `homebased message send` command that reaches them, so
   the new agent can report back; `--source-thread <id>` names another thread.
+- `--child` launches a child thread of the calling T3 thread instead of a
+  hand-off, to own a phase, an experiment, or long work. Its first message
+  ends with a route back to the parent's T3 thread, tells the child to sleep
+  on its long work with `homebased wait --long`, and asks it to report once
+  with `homebased thread report`.
+  homebased records the link on both machines, so the parent lists the child
+  under `thread context --children` and shows `waiting` until it reports, and
+  the child's daemon settles it after its reporting turn ends. A child can
+  launch children of its own. `--child` needs `--message` or
+  `--message-file`, must run in a T3 thread on the calling machine, and cannot
+  be combined with `--source-thread`. A retried `--request-id` returns the
+  same thread and link. A machine whose homebased predates child threads
+  refuses a `--child` launch with `t3_incompatible`.
 - The output has the thread id and a `t3code://threads/<environment>/<thread>`
   link that opens it in T3 Code.
 - T3 launches once per `--request-id`, so repeating the command with the same
@@ -912,18 +1016,21 @@ bar_gib = 40
 An agent worker must not wait in the foreground for a long command or detach
 it: headless `claude -p` ends with its turn and kills what it started, so
 Claude workers run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`. The report
-trailer tells every worker to submit the command as its own task instead, then
-report `waiting` with notes for later and exit:
+trailer tells every worker to submit the command as its own task, or as a GPU
+queue job, instead, then report `waiting` with notes for later and exit:
 
 ```bash
-homebased task report --outcome waiting --on <task-id> \
+homebased task report --outcome waiting --on <task-or-job-id> \
   --summary "<what is running and why>" --notes-file - <<'NOTES'
 <what each outcome means and the next steps>
 NOTES
 ```
 
-The orchestrator gets `TASK_WAITING`. Homebased holds a continuation until
-every named task ends, with any outcome, then starts it with the notes: a
+The orchestrator gets `TASK_WAITING`, unless it sleeps on the worker (see
+[Sleep until long work ends](#sleep-until-long-work-ends)). Homebased holds a
+continuation until every named task ends and every named job sends its final
+event (`JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`), with any outcome,
+then starts it with the notes: a
 Codex continuation resumes the run's thread when one is known and receives
 only the continuation block. Otherwise it starts a fresh session with the
 original prompt plus the block. Other agents always start a fresh session
@@ -931,7 +1038,8 @@ with the original prompt plus the block. The runs of one unit of work
 form a chain of at most 20 runs. A task held `after` any run waits for the
 chain's last run, and `task cancel` on any run cancels the run that owns the
 work now. The worker, its origin, and every waited task must be on one
-machine.
+machine, and every waited job must be submitted from it; the job itself may
+queue on another machine. Name a job by its job id, not by a run's task id.
 
 `homebased task schema` prints the JSON Schema. The full field contract is in [`.agents/skills/homebased/references/submit.md`](.agents/skills/homebased/references/submit.md).
 
@@ -1016,7 +1124,7 @@ to ignore duplicates.
 | --- | --- |
 | `TASK_REPORTED` | Worker sent an interim report. The process is still running. |
 | `TASK_CHECK_DUE` | No output for the full inactivity timeout. The child is still live. |
-| `TASK_WAITING` | An agent worker submitted long tasks, reported `waiting` on them, and exited. Homebased continues the work in a new run, `continuation`, once every task in `waiting_on` ends. |
+| `TASK_WAITING` | An agent worker submitted long tasks or GPU queue jobs, reported `waiting` on them, and exited. Homebased continues the work in a new run, `continuation`, once every task and job in `waiting_on` ends. |
 | `TASK_SUCCEEDED` | Exit 0 and last report was `succeeded`, or exit 0 with no report from a task, a container, or an agent without the report trailer. |
 | `TASK_BLOCKED` | Last report was `blocked`. The process has exited. Answer and submit a new spec. There is no resume. |
 | `TASK_FAILED` | Failed report, non-zero exit, signal, or spawn failure. Also an agent with the report trailer that exited 0 without reporting (`reason: "no_report"`). |

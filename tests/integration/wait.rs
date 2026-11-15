@@ -6,7 +6,7 @@ use homebased::client::{Client, LineStream};
 use homebased::domain::TaskId;
 use homebased::queue::JobId;
 use homebased::store::Store;
-use homebased::task_wait::WAIT_ROUTE;
+use homebased::task_wait::{HoldTarget, WAIT_ROUTE};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
@@ -196,6 +196,23 @@ impl Harness {
             .job_route_cursors(job)
             .unwrap()
             .map_or(0, |cursors| cursors.settled)
+    }
+
+    /// Run `homebased wait --long` on `ids` from the harness thread, returning
+    /// its exit code and stderr
+    fn sleep(&self, ids: &[&str]) -> (i32, String) {
+        let output = self
+            .cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["wait", "--long"])
+            .args(ids)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+        (
+            output.status.code().unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 
     /// Callbacks that normal delivery sent for `id`
@@ -534,19 +551,294 @@ fn next_waiter_with_no_event_exits_at_its_timeout_and_says_how_to_wait_again() {
 }
 
 #[test]
-fn long_wait_outside_a_t3_claude_session_is_refused() {
+fn long_wait_holds_reports_and_the_final_event_lists_them() {
+    let h = Harness::new();
+    h.set_control("sleep", "2");
+    h.set_control("notify", "");
+    h.set_control("report", "succeeded\nfirst pass");
+    h.set_control("report2", "succeeded\nsecond pass");
+    let task = h.submit(&Harness::spec("codex", "train the model"));
+
+    let (code, stderr) = h.sleep(&[&task]);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains(&format!("task {task}: held")), "{stderr}");
+    assert!(stderr.contains("end the turn now"), "{stderr}");
+    let delivered = h.wait_for_event(&task, "TASK_SUCCEEDED");
+    let delivered: Vec<Value> = delivered
+        .iter()
+        .map(|line| event_json(line))
+        .filter(|event| event["task"] == task)
+        .collect();
+    // the reports settled without waking the thread
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let held = delivered[0]["held_events"].as_array().unwrap();
+    let held: Vec<(&str, &str)> = held
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str().unwrap(),
+                event["summary"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("TASK_REPORTED", "report 1 (succeeded): first pass"),
+            ("TASK_REPORTED", "report 2 (succeeded): second pass"),
+        ]
+    );
+}
+
+#[test]
+fn long_wait_follows_a_parked_task_and_holds_what_it_parks_on() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let target = h.gated("sleep-chain-target");
+    let job = h.gated_job(&mut jobs, "sleep-chain-job");
+    h.set_control("waiting", &format!("{target} {job}\nCheck the target.\n"));
+    h.set_control("report", "succeeded\nDone.");
+    h.set_control("sleep", "2");
+    let worker = h.submit(&Harness::spec("codex", "train the model"));
+
+    let (code, stderr) = h.sleep(&[&worker]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains(&format!("task {worker}: held")), "{stderr}");
+    // parking is progress: the hold moves to the continuation instead of
+    // waking the thread
+    assert!(
+        wait_until(Duration::from_secs(20), || h.show(&worker)["callback"]
+            == "held"),
+        "{}",
+        h.show(&worker)
+    );
+    assert_eq!(h.normally_delivered(&worker), Vec::<String>::new());
+
+    // sleeping again on the parked task names the run that now holds it
+    let (code, stderr) = h.sleep(&[&worker]);
+    assert_eq!(code, 0, "{stderr}");
+    let prefix = format!("task {worker}: followed_to ");
+    let continuation = stderr
+        .lines()
+        .find_map(|line| line.split_once(&prefix))
+        .map(|(_, continuation)| continuation.trim().to_owned())
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert_ne!(continuation, worker);
+
+    // the worker's own task and job report to this thread, and the
+    // continuation reports on them, so their final events are held too
+    h.release_gate("sleep-chain-target");
+    h.release_gate("sleep-chain-job");
+    let delivered = h.wait_for_event(&continuation, "TASK_SUCCEEDED");
+    let last = delivered
+        .iter()
+        .map(|line| event_json(line))
+        .find(|event| event["task"] == continuation.as_str())
+        .unwrap();
+    assert_eq!(last["event"], "TASK_SUCCEEDED");
+    let held = last["held_events"].as_array().unwrap();
+    assert_eq!(held.len(), 3, "{held:?}");
+    assert_eq!(held[0]["event"], "TASK_WAITING");
+    assert_eq!(held[0]["task"], worker.as_str());
+    assert_eq!(
+        held[0]["summary"],
+        format!("parked on task {target}, job {job}; continues as task {continuation}")
+    );
+    let mut ends: Vec<(&str, &str)> = held[1..]
+        .iter()
+        .map(|event| {
+            let id = event["task"].as_str().or(event["job"].as_str());
+            (event["event"].as_str().unwrap(), id.unwrap())
+        })
+        .collect();
+    ends.sort_unstable();
+    let job_id = job.to_string();
+    assert_eq!(
+        ends,
+        [
+            ("JOB_SUCCEEDED", job_id.as_str()),
+            ("TASK_SUCCEEDED", target.as_str())
+        ]
+    );
+    assert_eq!(h.normally_delivered(&worker), Vec::<String>::new());
+    assert_eq!(h.normally_delivered(&target), Vec::<String>::new());
+    assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+    // the line reaches the thread before its delivery settles, and the
+    // settlement ends the chain's hold in the same transaction
+    assert!(
+        wait_until(
+            Duration::from_secs(20),
+            || h.show(&continuation)["callback"] == "sent"
+        ),
+        "{}",
+        h.show(&continuation)
+    );
+    let store = Store::open(&h.home.join(homebased::home::DB_NAME)).unwrap();
+    assert_eq!(store.sleeping_threads().unwrap(), Vec::new());
+}
+
+#[test]
+fn long_wait_on_a_task_that_ended_holds_nothing() {
+    let h = Harness::new();
+    let task = h.submit(&Harness::task_spec(&["true"]));
+    h.wait_for_event(&task, "TASK_SUCCEEDED");
+    assert!(wait_until(
+        Duration::from_secs(10),
+        || h.show(&task)["callback"] == "sent"
+    ));
+
+    let (code, stderr) = h.sleep(&[&task]);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(&format!("task {task}: already_ended")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing is held"), "{stderr}");
+    assert!(!stderr.contains("end the turn now"), "{stderr}");
+}
+
+#[test]
+fn long_wait_reads_ends_and_parks_whose_events_retention_compacted() {
+    let mut h = Harness::new();
+    let ended = h.submit(&Harness::task_spec(&["true"]));
+    let target = h.gated("compacted-park-target");
+    h.set_control("waiting", &format!("{target}\nCheck the target.\n"));
+    h.set_control("report", "succeeded\nDone.");
+    let worker = h.submit(&Harness::spec("codex", "train the model"));
+    for task in [&ended, &worker] {
+        assert!(
+            wait_until(Duration::from_secs(20), || h.show(task)["callback"]
+                == "sent"),
+            "{}",
+            h.show(task)
+        );
+    }
+
+    // the daemon compacts settled events when it starts, and these settled
+    // past the retention window
+    let db = h.home.join(homebased::home::DB_NAME);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE origin_inbox SET settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-31 days')
+             WHERE task_id IN (?1, ?2)",
+            [&ended, &worker],
+        )
+        .unwrap();
+    h.restart_daemon();
+    let retained = || -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM origin_inbox WHERE task_id IN (?1, ?2)",
+                [&ended, &worker],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(wait_until(Duration::from_secs(20), || retained() == 0));
+
+    let (code, stderr) = h.sleep(&[&ended, &worker]);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(&format!("task {ended}: already_ended")),
+        "{stderr}"
+    );
+    let prefix = format!("task {worker}: followed_to ");
+    let continuation: TaskId = stderr
+        .lines()
+        .find_map(|line| line.split_once(&prefix))
+        .map(|(_, continuation)| continuation.trim().parse().unwrap())
+        .unwrap_or_else(|| panic!("{stderr}"));
+    let store = Store::open(&db).unwrap();
+    for task in [&ended, &worker] {
+        let hold = store
+            .sleep_hold(HoldTarget::Task(task.parse().unwrap()))
+            .unwrap();
+        assert_eq!(hold, None, "{task}");
+    }
+    assert!(
+        store
+            .sleep_hold(HoldTarget::Task(continuation))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_long_wait_hold_survives_a_daemon_restart() {
+    let mut h = Harness::new();
+    h.set_control("sleep", "4");
+    h.set_control("notify", "");
+    h.set_control("report", "succeeded\nafter the restart");
+    let task = h.submit(&Harness::spec("codex", "train the model"));
+    let (code, stderr) = h.sleep(&[&task]);
+    assert_eq!(code, 0, "{stderr}");
+
+    h.restart_daemon();
+
+    let delivered: Vec<Value> = h
+        .wait_for_event(&task, "TASK_SUCCEEDED")
+        .iter()
+        .map(|line| event_json(line))
+        .filter(|event| event["task"] == task)
+        .collect();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let held = delivered[0]["held_events"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["event"], "TASK_REPORTED");
+}
+
+#[test]
+fn a_connected_wait_takes_a_held_job_event_before_the_sleep() {
+    let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
+    let job = h.gated_job(&mut jobs, "sleep-job");
+    let (code, stderr) = h.sleep(&[&job.to_string()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains(&format!("job {job}: held")), "{stderr}");
+    let waiter = h.spawn_wait(THREAD, &[&job.to_string()]);
+
+    h.release_gate("sleep-job");
+    let (code, lines) = waiter.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["event"], "JOB_SUCCEEDED");
+    assert_eq!(lines[0]["held_events"], json!([]));
+    assert!(
+        wait_until(Duration::from_secs(10), || h.job_settled(job) == 1),
+        "the printed job event was not settled"
+    );
+    // the final event ended the sleep, and normal delivery stays quiet
+    let hold = Store::open(&h.home.join(homebased::home::DB_NAME))
+        .unwrap()
+        .sleep_hold(HoldTarget::Job(job))
+        .unwrap();
+    assert!(hold.is_none(), "{hold:?}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+}
+
+#[test]
+fn long_wait_in_a_homebased_worker_is_refused() {
     let h = Harness::new();
     let task = h.gated("long-task");
 
     let output = h
         .cmd()
         .env("CODEX_THREAD_ID", THREAD)
-        .args(["wait", "--next", "--long", &task])
+        .env("HOMEBASED_TASK_ID", &task)
+        .args(["wait", "--long", &task])
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--long"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--outcome waiting"), "{stderr}");
     h.release_gate("long-task");
 }
 

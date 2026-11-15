@@ -235,7 +235,7 @@ fn cli_steps_emit_only_one_final_job_callback_and_refuse_run_dependencies() {
     ));
 }
 
-fn machine(h: &Harness) -> MachineId {
+pub(super) fn machine(h: &Harness) -> MachineId {
     fs::read_to_string(h.home.join("machine-id"))
         .unwrap()
         .parse()

@@ -18,7 +18,7 @@ use tracing::warn;
 
 use super::Retry;
 use crate::daemon::AppState;
-use crate::daemon::actors::callback::deliver_service_event;
+use crate::daemon::actors::callback::{deliver_service_event, resumption};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, THREAD_WAIT_LIMIT};
@@ -173,7 +173,8 @@ async fn deliver(
         reply,
     })
     .await?;
-    match deliver_service_event(&state.home, service, line, &callback).await? {
+    let resumption = resumption(&state.store, service.owner).await?;
+    match deliver_service_event(&state.home, service, line, &callback, resumption).await? {
         Some(DeliveryOutcome::Delivered) => Ok(settle("delivered").await?),
         None => Ok(settle("suppressed").await?),
         Some(DeliveryOutcome::Permanent(message)) => {

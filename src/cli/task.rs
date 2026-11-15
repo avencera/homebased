@@ -185,9 +185,11 @@ pub enum TaskCommand {
         /// Summary file, or `-` for stdin.
         #[arg(long)]
         summary_file: Option<String>,
-        /// Task to wait on, repeated for each one. Required with `--outcome waiting`.
-        #[arg(long = "on", value_name = "TASK_ID")]
-        on: Vec<TaskId>,
+        /// Task, or GPU queue job, this machine submitted to wait on, repeated
+        /// for each one. Required with `--outcome waiting`. Name a job by its
+        /// job id, not by the id of one of its runs.
+        #[arg(long = "on", value_name = "TASK_OR_JOB_ID")]
+        on: Vec<DependencyId>,
         /// Notes for the continuation, or `-` for stdin. Required with `--outcome waiting`.
         #[arg(long)]
         notes_file: Option<String>,
@@ -542,8 +544,12 @@ fn claude_session_caller(thread: ThreadId, session: Option<ThreadId>, worker: bo
 /// is registered with `t3_background_wait`, and agents kept skipping that step.
 /// A background command rather than a Monitor, because a Monitor expires after
 /// 30 minutes and wakes the thread each time, which a queued GPU job turns into
-/// hours of empty turns. A worker parks with `waiting` instead, and only the
-/// submitting session can wait on the work
+/// hours of empty turns. Long work sleeps instead, since restarting the wait
+/// every 55 minutes wakes the thread for nothing. A T3 subagent cannot sleep,
+/// since T3 reports it done once a turn ends with no wait running, so it waits
+/// for final events only and is told that long work belongs in a child thread.
+/// A worker parks with `waiting` instead, and only the submitting session can
+/// wait on the work
 fn t3_wait_hint(
     env: &T3Env,
     id: &str,
@@ -556,12 +562,18 @@ fn t3_wait_hint(
     {
         return None;
     }
+    let cache = super::wait::CACHE_LIMIT.as_secs() / 60;
     // the wait picks its own deadline, so the Bash timeout is Claude Code's
     // maximum and only has to stay out of its way
+    let subagent = crate::t3::owning_thread(env, thread)
+        .is_some_and(|t3_thread| crate::t3::runs_delegated_task(env, &t3_thread));
+    if subagent {
+        return Some(format!(
+            "T3: run `homebased wait --next --final-only {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after a final event, or after {cache} minutes with none; handle its output and run the command it prints to start it again, until the final event, and keep a wait running whenever a turn ends before your final answer. This thread is a T3 subagent, which cannot sleep: work expected to take over an hour belongs in a child thread, launched with `homebased t3 launch --child`",
+        ));
+    }
     Some(format!(
-        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after the next events, or after {cache} minutes with none, inside the hour-long prompt cache; handle its output and run the command it prints to start it again, until the final event. For work expected to take over 4 hours, add `--long`, which compacts this thread once the turn ends and waits up to {long} minutes",
-        cache = super::wait::CACHE_LIMIT.as_secs() / 60,
-        long = super::wait::LONG_LIMIT.as_secs() / 60,
+        "T3: run `homebased wait --next {id}` as a background Bash command with timeout 7200000, pass its task id to t3_background_wait, and end the turn. It exits after the next events, or after {cache} minutes with none, inside the hour-long prompt cache; handle its output and run the command it prints to start it again, until the final event. For work expected to take over an hour, sleep instead: run `homebased wait --long {id}` as an ordinary command and end the turn. It exits at once, and the daemon wakes this thread only with the final event, which lists the progress events it held, or with an alert",
     ))
 }
 
@@ -1075,13 +1087,18 @@ struct ReportInput {
     outcome: ReportKind,
     summary: Option<String>,
     summary_file: Option<String>,
-    on: Vec<TaskId>,
+    on: Vec<DependencyId>,
     notes_file: Option<String>,
 }
 
 impl ReportInput {
     /// Read the summary and build the outcome with the data its kind needs
-    fn read(self) -> Result<(ReportOutcome, String), AppError> {
+    ///
+    /// `resolve` names each `--on` id as a task or a job
+    fn read(
+        self,
+        resolve: impl FnOnce(Vec<DependencyId>) -> Result<WaitTargets, AppError>,
+    ) -> Result<(ReportOutcome, String), AppError> {
         let usage = |message: &str| AppError::Usage {
             message: message.into(),
         };
@@ -1106,7 +1123,7 @@ impl ReportInput {
                 ));
             }
             (ReportKind::Waiting, _, Some(path)) => {
-                let on = WaitTargets::new(self.on).map_err(|error| usage(&error.to_string()))?;
+                let on = resolve(self.on)?;
                 let notes = WaitingNotes::new(read_summary(&path)?)
                     .map_err(|error| usage(&error.to_string()))?;
                 ReportOutcome::Waiting(WaitingReport { on, notes })
@@ -1138,8 +1155,8 @@ fn report(
             })?
             .parse()?,
     };
-    let (outcome, summary) = input.read()?;
     let store = Store::open(&ctx.home.db_path())?;
+    let (outcome, summary) = input.read(|ids| store.wait_targets(ids))?;
     let reports = store.append_report(id, &outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
     let row = store.require_task(id)?;
@@ -1215,7 +1232,7 @@ mod tests {
     use super::{retries_local_submit, t3_wait_hint};
     use crate::domain::{TaskId, ThreadId};
     use crate::error::AppError;
-    use crate::t3::test_support::{FakeT3Server, Fixture, SESSION_ID, live_pid};
+    use crate::t3::test_support::{FakeT3Server, Fixture, SESSION_ID, T3_THREAD_ID, live_pid};
 
     #[test]
     fn t3_wait_hint_names_the_task_only_for_the_owning_claude_session() {
@@ -1232,6 +1249,11 @@ mod tests {
         assert!(hint.contains("t3_background_wait"));
         assert!(hint.contains("timeout 7200000"), "{hint}");
         assert!(hint.contains("after 55 minutes"), "{hint}");
+        // long work sleeps rather than waiting in a background command
+        assert!(hint.contains("`homebased wait --long task-1`"), "{hint}");
+        assert!(hint.contains("over an hour"), "{hint}");
+        assert!(!hint.contains("compact"), "{hint}");
+        assert!(!hint.contains("subagent"), "{hint}");
 
         // a worker parks with `waiting`, and another session cannot wait on the task
         assert_eq!(
@@ -1246,6 +1268,35 @@ mod tests {
             t3_wait_hint(&fixture.env, "task-1", other, Some(other), false),
             None
         );
+    }
+
+    #[test]
+    fn t3_wait_hint_sends_a_subagent_s_long_work_to_a_child_thread() {
+        if which::which("curl").is_err() {
+            return;
+        }
+        let server = FakeT3Server::start(Some(2), vec![]);
+        let fixture = Fixture::empty(Some(&server), live_pid());
+        fixture
+            .v2_state()
+            .thread(T3_THREAD_ID, "Port the renderer", false)
+            .native("claudeAgent", SESSION_ID, T3_THREAD_ID)
+            .payload(
+                T3_THREAD_ID,
+                &serde_json::json!({ "lineage": { "parentThreadId": "root", "relationshipToParent": "subagent" } }),
+            );
+        let session: ThreadId = SESSION_ID.parse().unwrap();
+
+        let hint = t3_wait_hint(&fixture.env, "task-1", session, Some(session), false).unwrap();
+
+        // T3 reports a subagent done when its turn ends, so it cannot sleep
+        assert!(
+            hint.contains("`homebased wait --next --final-only task-1`"),
+            "{hint}"
+        );
+        assert!(hint.contains("t3_background_wait"), "{hint}");
+        assert!(!hint.contains("--long"), "{hint}");
+        assert!(hint.contains("`homebased t3 launch --child`"), "{hint}");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod callback;
 pub mod cancellation;
+pub mod child_thread;
 pub mod cleanup;
 pub mod cli;
 pub mod client;
