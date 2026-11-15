@@ -233,6 +233,15 @@ impl Room {
         }
     }
 
+    /// Whether an item of `peak` would fit once `freed` more bytes come back
+    #[must_use]
+    pub fn fits_after(&self, peak: MemPeak, freed: u64) -> bool {
+        match self {
+            Self::Known { free, .. } => i128::from(peak.bytes()) <= free + i128::from(freed),
+            Self::Unreadable { .. } => false,
+        }
+    }
+
     /// Remove room that items ahead of the caller's reserved
     pub fn reserve(&mut self, bytes: u64) {
         if let Self::Known { free, .. } = self {
@@ -369,11 +378,20 @@ fn cgroup_used(dir: &Path) -> Result<u64, String> {
         fs::read_to_string(dir.join(name))
             .map_err(|error| format!("read {}: {error}", dir.join(name).display()))
     };
-    let current: u64 = read("memory.current")?
-        .trim()
-        .parse()
-        .map_err(|error| format!("parse {}/memory.current: {error}", dir.display()))?;
+    let current = || -> Result<u64, String> {
+        read("memory.current")?
+            .trim()
+            .parse()
+            .map_err(|error| format!("parse {}/memory.current: {error}", dir.display()))
+    };
+
+    // the two files cannot be read at one instant, so `memory.current` is
+    // read on both sides of `memory.stat` and the higher reading kept: a
+    // burst between the reads can then only overcount, never let the
+    // reclaimable estimate cancel memory that `current` has not seen yet
+    let before = current()?;
     let stat = read("memory.stat")?;
+    let current = before.max(current()?);
     let field = |key: &str| {
         stat.lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))

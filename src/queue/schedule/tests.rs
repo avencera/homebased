@@ -8,6 +8,7 @@ use super::{
 };
 use crate::cleanup::CleanupFailure as ProcessCleanupFailure;
 use crate::domain::TaskId;
+use crate::memory::{MemPeak, Room};
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, HOLD_AFTER, JobId, PreemptMode, PreemptRefusal,
     Preemption, Priority, ResourceId, ResourceName, RunNumber, RunPhase, StepIndex, StopCause,
@@ -98,6 +99,11 @@ impl Machine {
         });
         self.set_run(resource, job, task, phase);
         (job, task)
+    }
+
+    fn set_peak(&mut self, job: JobId, gib: Option<f64>) {
+        let view = self.queue.iter_mut().find(|view| view.id == job).unwrap();
+        view.mem_peak = gib.map(|gib| MemPeak::from_gib(gib).unwrap());
     }
 
     fn set_run(&mut self, resource: ResourceId, job: JobId, task: TaskId, phase: RunPhase) {
@@ -440,6 +446,57 @@ fn a_manual_preempt_restarts_a_held_run_only_for_higher_waiting_work() {
         manual_preempt(&machine.snapshot(now), fiber).map(|stop| stop.cause),
         Ok(StopCause::Yield)
     );
+}
+
+#[test]
+fn a_job_preempts_only_when_its_memory_peak_fits_once_the_victim_stops() {
+    const GIB: u64 = 1 << 30;
+    let mut machine = Machine::new(&["gpu0"]);
+    let (victim, task) = machine.running("gpu0", Priority::Low, RESTART, executing(t0()));
+    let urgent = machine.queued(Priority::High, Target::Any, YIELD);
+    machine.set_peak(victim, Some(8.0));
+    machine.set_peak(urgent, Some(20.0));
+    let with_free = |machine: &Machine, free_gib: u64| Snapshot {
+        memory: Some(Room::new(40 * GIB, (40 - free_gib) * GIB, 0)),
+        ..machine.snapshot(at(60))
+    };
+    let stop = Preempt {
+        resource: machine.resource("gpu0"),
+        job: victim,
+        task,
+        cause: StopCause::Restart,
+    };
+
+    // 10 GiB free plus the victim's 8 leaves the 20 GiB job waiting with the GPU idle
+    let short = with_free(&machine, 10);
+    assert_eq!(decide(&short).preemption, None);
+    assert_eq!(
+        manual_preempt(&short, victim),
+        Err(PreemptRefusal::NoMemory {
+            job: urgent,
+            peak: MemPeak::from_gib(20.0).unwrap(),
+        })
+    );
+
+    let enough = with_free(&machine, 12);
+    assert_eq!(decide(&enough).preemption, Some(stop));
+    assert_eq!(manual_preempt(&enough, victim), Ok(stop));
+
+    // a victim without a peak frees an unknown amount, so it counts nothing
+    machine.set_peak(victim, None);
+    let unknown = with_free(&machine, 12);
+    assert_eq!(decide(&unknown).preemption, None);
+    assert!(matches!(
+        manual_preempt(&unknown, victim),
+        Err(PreemptRefusal::NoMemory { .. })
+    ));
+    assert_eq!(decide(&with_free(&machine, 20)).preemption, Some(stop));
+
+    // a store snapshot that read no memory refuses for a job with a peak
+    assert!(matches!(
+        manual_preempt(&machine.snapshot(at(60)), victim),
+        Err(PreemptRefusal::NoMemory { .. })
+    ));
 }
 
 #[test]

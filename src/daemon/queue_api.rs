@@ -827,11 +827,20 @@ async fn execute_at(
         }
     }
     let listing = matches!(request, QueueRequest::Jobs | QueueRequest::Overview);
+    // a preempt checks that the waiting job's memory peak fits once the run
+    // stops, and the store cannot read memory
+    let memory = match request {
+        QueueRequest::Preempt { .. } => {
+            Some(call(&state.memory, |reply| MemoryMsg::JobRoom { reply }).await?)
+        }
+        _ => None,
+    };
     let mut value = call(&state.store, |reply| StoreMsg::QueueInterface {
         machine: state.machine.identity.machine,
         request: Box::new(request),
         env,
         protocol,
+        memory,
         reply,
     })
     .await?;

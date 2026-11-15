@@ -86,6 +86,8 @@ pub(crate) enum StoreMsg {
         env: crate::domain::TaskEnv,
         /// Cluster protocol the request arrived with
         protocol: crate::fleet::protocol::ClusterProtocolVersion,
+        /// Host memory room, read for a preempt
+        memory: Option<crate::memory::Room>,
         reply: RpcReplyPort<Result<serde_json::Value, AppError>>,
     },
     /// Running attempts the GPU idle watcher samples
@@ -887,10 +889,11 @@ impl Actor for StoreActor {
                 request,
                 env,
                 protocol,
+                memory,
                 reply,
             } => send_reply(
                 reply,
-                state.queue_request_at(machine, &request, &env, protocol),
+                state.queue_request_at(machine, &request, &env, protocol, memory),
             ),
             StoreMsg::GpuIdleTargets {
                 machine,

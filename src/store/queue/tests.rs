@@ -1084,7 +1084,7 @@ fn job_reads_drop_hold_for_peers_on_an_older_protocol() {
     let read = |request: QueueRequest, protocol| {
         fixture
             .store
-            .queue_request_at(fixture.machine, &request, &env, protocol)
+            .queue_request_at(fixture.machine, &request, &env, protocol, None)
             .unwrap()
     };
 
@@ -1122,7 +1122,7 @@ fn a_manual_preempt_joins_an_automatic_yield_and_moves_the_job_first() {
 
     let result = fixture
         .store
-        .preempt_job(fixture.machine, OperationId::new(), job, Utc::now())
+        .preempt_job(fixture.machine, OperationId::new(), job, Utc::now(), None)
         .unwrap();
     assert_eq!(result.task, run.task);
     assert_eq!(result.position, 1);

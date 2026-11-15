@@ -14,6 +14,7 @@ use super::{
 use crate::domain::{ExitReason, TaskEnv};
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::memory::Room;
 use crate::queue::gpu_idle::{GpuIdleNotice, GpuSummary};
 use crate::queue::schedule::{NoticeThresholds, manual_preempt};
 use crate::queue::{
@@ -464,7 +465,8 @@ impl Store {
     /// actor then kills the run, the job's `JOB_PREEMPTED` follows, the freed
     /// resource goes to the higher-level job that waits for it, and the job
     /// runs its current step again before every other job of its level.
-    /// Refused, storing nothing, when [`manual_preempt`] refuses. A replay of
+    /// Refused, storing nothing, when [`manual_preempt`] refuses, which
+    /// checks waiting jobs' memory peaks against `memory`. A replay of
     /// `operation` returns its stored result
     pub fn preempt_job(
         &self,
@@ -472,11 +474,12 @@ impl Store {
         operation: OperationId,
         job: JobId,
         now: DateTime<Utc>,
+        memory: Option<Room>,
     ) -> Result<PreemptResult, AppError> {
         let content = serde_json::json!({ "job": job });
         self.immediate(|| {
             self.with_operation(machine, operation, "preempt", &content, || {
-                self.apply_preempt(machine, job, now)
+                self.apply_preempt(machine, job, now, memory.clone())
             })
         })
     }
@@ -486,6 +489,7 @@ impl Store {
         machine: MachineId,
         id: JobId,
         now: DateTime<Utc>,
+        memory: Option<Room>,
     ) -> Result<PreemptResult, AppError> {
         let job = self.require_machine_job(machine, id)?;
         if job.state.is_terminal() {
@@ -503,7 +507,8 @@ impl Store {
             .into());
         }
 
-        let snapshot = self.queue_snapshot(machine, now, NoticeThresholds::default())?;
+        let mut snapshot = self.queue_snapshot(machine, now, NoticeThresholds::default())?;
+        snapshot.memory = memory;
         let stop = manual_preempt(&snapshot, id)
             .map_err(|reason| QueueError::PreemptRefused { job: id, reason })?;
         let run = self.request_stop(stop.resource, Some(stop.task), stop.cause, now)?;

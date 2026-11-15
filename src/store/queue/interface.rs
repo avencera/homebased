@@ -13,7 +13,7 @@ use crate::fleet::protocol::{
     GPU_IDLE_PROTOCOL, PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
-use crate::memory::MemoryWait;
+use crate::memory::{MemoryWait, Room};
 use crate::queue::ci::{ClassOffer, Drain, JobClass, JobTiming, MachineOffer, SlotCapacity};
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
@@ -384,170 +384,172 @@ impl Store {
         request: &QueueRequest,
         env: &TaskEnv,
     ) -> Result<Value, AppError> {
-        self.queue_request_at(machine, request, env, CLUSTER_PROTOCOL_VERSION)
+        self.queue_request_at(machine, request, env, CLUSTER_PROTOCOL_VERSION, None)
     }
 
     /// Apply an operation that arrived over cluster protocol `protocol`
     ///
     /// A submit keeps the version, so the queue sends its origin only events
-    /// that version can parse
+    /// that version can parse. `memory` is the host memory room the memory
+    /// actor read, which only a preempt uses
     pub fn queue_request_at(
         &self,
         machine: MachineId,
         request: &QueueRequest,
         env: &TaskEnv,
         protocol: ClusterProtocolVersion,
+        memory: Option<Room>,
     ) -> Result<Value, AppError> {
-        let mut result = match request {
-            QueueRequest::Resources => serde_json::to_value(ResourceList {
-                machine,
-                resources: self.gpu_resources_on(machine)?,
-            })?,
-            QueueRequest::Jobs => {
-                let jobs = self.gpu_machine_queue(machine)?;
-                serde_json::to_value(JobList {
-                    machine,
-                    lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
-                    jobs,
-                    memory_waits: BTreeMap::new(),
-                })?
-            }
-            QueueRequest::Overview => {
-                let jobs = self.gpu_machine_queue(machine)?;
-                serde_json::to_value(QueueOverview {
+        let mut result =
+            match request {
+                QueueRequest::Resources => serde_json::to_value(ResourceList {
                     machine,
                     resources: self.gpu_resources_on(machine)?,
-                    lease_notes: self.job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
-                    jobs,
-                    memory_waits: BTreeMap::new(),
-                })?
-            }
-            QueueRequest::Show { job } => {
-                let record = self
-                    .job(*job)?
-                    .filter(|record| record.machine == machine)
-                    .ok_or(QueueError::JobNotFound { job: *job })?;
-                let active_run = self
-                    .resources_on(machine)?
-                    .into_iter()
-                    .filter_map(|resource| resource.run)
-                    .find(|run| run.job == *job);
-                let runs = self.job_runs(*job)?;
-                let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
-                let pinned = match record.target {
-                    Target::Pinned(resource) => Some(resource),
-                    Target::Any => None,
-                };
-                let mut ids = Vec::new();
-                let held = runs.iter().filter_map(|run| run.resource);
-                for id in pinned
-                    .into_iter()
-                    .chain(active_run.as_ref().map(|run| run.resource))
-                    .chain(held)
-                {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
+                })?,
+                QueueRequest::Jobs => {
+                    let jobs = self.gpu_machine_queue(machine)?;
+                    serde_json::to_value(JobList {
+                        machine,
+                        lease_notes: self
+                            .job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
+                        jobs,
+                        memory_waits: BTreeMap::new(),
+                    })?
                 }
-                let mut resources = Vec::new();
-                for id in ids {
-                    if let Some(record) = self.resource(id)? {
-                        resources.push(record.resource);
-                    }
+                QueueRequest::Overview => {
+                    let jobs = self.gpu_machine_queue(machine)?;
+                    serde_json::to_value(QueueOverview {
+                        machine,
+                        resources: self.gpu_resources_on(machine)?,
+                        lease_notes: self
+                            .job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
+                        jobs,
+                        memory_waits: BTreeMap::new(),
+                    })?
                 }
-                serde_json::to_value(JobDetail {
-                    job: record,
-                    active_run,
-                    runs,
-                    last_stop_cause,
-                    events: self.job_events(*job)?,
-                    resources,
-                    gpu_idle: Some(self.gpu_idle_detail(*job)?),
-                    lease_idle: self.lease_idle_trips(*job)?,
-                })?
-            }
-            QueueRequest::NoticeCurrent { job, seq } => {
-                self.require_machine_job(machine, *job)?;
-                json!({ "current": self.job_notice_is_current(*job, *seq)? })
-            }
-            QueueRequest::Register { name, device } => {
-                serde_json::to_value(self.register_resource(machine, name.clone(), *device)?)?
-            }
-            QueueRequest::Label { resource, label } => {
-                serde_json::to_value(self.set_resource_label(machine, resource, label.as_ref())?)?
-            }
-            QueueRequest::Submit {
-                job,
-                origin,
-                spec,
-                submitted_at,
-                placement,
-            } => serde_json::to_value(self.submit_job(&NewJob {
-                id: *job,
-                machine,
-                origin: *origin,
-                spec: *spec.clone(),
-                env: env.clone(),
-                origin_protocol: protocol,
-                submitted_at: *submitted_at,
-                placement: *placement,
-            })?)?,
-            QueueRequest::Move {
-                operation,
-                job,
-                placement,
-            } => serde_json::to_value(self.move_job(machine, *operation, *job, *placement)?)?,
-            QueueRequest::Cancel { operation, job } => serde_json::to_value(self.cancel_job(
-                machine,
-                *operation,
-                *job,
-                chrono::Utc::now(),
-            )?)?,
-            QueueRequest::Preempt { operation, job } => serde_json::to_value(self.preempt_job(
-                machine,
-                *operation,
-                *job,
-                chrono::Utc::now(),
-            )?)?,
-            QueueRequest::Release {
-                operation,
-                attention,
-            } => serde_json::to_value(
-                self.release_resource_attention(machine, *operation, *attention)?,
-            )?,
-            QueueRequest::GpuIdle {
-                operation,
-                job,
-                control,
-            } => serde_json::to_value(self.set_gpu_idle_control(
-                machine,
-                *operation,
-                *job,
-                control,
-                chrono::Utc::now(),
-            )?)?,
-            QueueRequest::CiStatus => {
-                return Err(AppError::Internal {
-                    message: "the daemon answers ci_status, not the store".into(),
-                });
-            }
-            QueueRequest::CiCapacity { class, capacity } => {
-                self.set_ci_capacity(machine, class, *capacity)?;
-                serde_json::to_value(self.ci_slot_list(machine)?)?
-            }
-            QueueRequest::CiDrain { reason } => {
-                let drain = reason.clone().map(|reason| Drain {
-                    reason,
-                    since: chrono::Utc::now(),
-                });
-                self.set_ci_drain(machine, drain)?;
-                serde_json::to_value(self.ci_slot_list(machine)?)?
-            }
-            QueueRequest::CiTimings { since } => serde_json::to_value(CiTimingList {
-                machine,
-                timings: self.ci_timings(*since)?,
-            })?,
-        };
+                QueueRequest::Show { job } => {
+                    let record = self
+                        .job(*job)?
+                        .filter(|record| record.machine == machine)
+                        .ok_or(QueueError::JobNotFound { job: *job })?;
+                    let active_run = self
+                        .resources_on(machine)?
+                        .into_iter()
+                        .filter_map(|resource| resource.run)
+                        .find(|run| run.job == *job);
+                    let runs = self.job_runs(*job)?;
+                    let last_stop_cause = runs.iter().rev().find_map(|run| run.stop_cause);
+                    let pinned = match record.target {
+                        Target::Pinned(resource) => Some(resource),
+                        Target::Any => None,
+                    };
+                    let mut ids = Vec::new();
+                    let held = runs.iter().filter_map(|run| run.resource);
+                    for id in pinned
+                        .into_iter()
+                        .chain(active_run.as_ref().map(|run| run.resource))
+                        .chain(held)
+                    {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                    let mut resources = Vec::new();
+                    for id in ids {
+                        if let Some(record) = self.resource(id)? {
+                            resources.push(record.resource);
+                        }
+                    }
+                    serde_json::to_value(JobDetail {
+                        job: record,
+                        active_run,
+                        runs,
+                        last_stop_cause,
+                        events: self.job_events(*job)?,
+                        resources,
+                        gpu_idle: Some(self.gpu_idle_detail(*job)?),
+                        lease_idle: self.lease_idle_trips(*job)?,
+                    })?
+                }
+                QueueRequest::NoticeCurrent { job, seq } => {
+                    self.require_machine_job(machine, *job)?;
+                    json!({ "current": self.job_notice_is_current(*job, *seq)? })
+                }
+                QueueRequest::Register { name, device } => {
+                    serde_json::to_value(self.register_resource(machine, name.clone(), *device)?)?
+                }
+                QueueRequest::Label { resource, label } => serde_json::to_value(
+                    self.set_resource_label(machine, resource, label.as_ref())?,
+                )?,
+                QueueRequest::Submit {
+                    job,
+                    origin,
+                    spec,
+                    submitted_at,
+                    placement,
+                } => serde_json::to_value(self.submit_job(&NewJob {
+                    id: *job,
+                    machine,
+                    origin: *origin,
+                    spec: *spec.clone(),
+                    env: env.clone(),
+                    origin_protocol: protocol,
+                    submitted_at: *submitted_at,
+                    placement: *placement,
+                })?)?,
+                QueueRequest::Move {
+                    operation,
+                    job,
+                    placement,
+                } => serde_json::to_value(self.move_job(machine, *operation, *job, *placement)?)?,
+                QueueRequest::Cancel { operation, job } => serde_json::to_value(self.cancel_job(
+                    machine,
+                    *operation,
+                    *job,
+                    chrono::Utc::now(),
+                )?)?,
+                QueueRequest::Preempt { operation, job } => serde_json::to_value(
+                    self.preempt_job(machine, *operation, *job, chrono::Utc::now(), memory)?,
+                )?,
+                QueueRequest::Release {
+                    operation,
+                    attention,
+                } => serde_json::to_value(
+                    self.release_resource_attention(machine, *operation, *attention)?,
+                )?,
+                QueueRequest::GpuIdle {
+                    operation,
+                    job,
+                    control,
+                } => serde_json::to_value(self.set_gpu_idle_control(
+                    machine,
+                    *operation,
+                    *job,
+                    control,
+                    chrono::Utc::now(),
+                )?)?,
+                QueueRequest::CiStatus => {
+                    return Err(AppError::Internal {
+                        message: "the daemon answers ci_status, not the store".into(),
+                    });
+                }
+                QueueRequest::CiCapacity { class, capacity } => {
+                    self.set_ci_capacity(machine, class, *capacity)?;
+                    serde_json::to_value(self.ci_slot_list(machine)?)?
+                }
+                QueueRequest::CiDrain { reason } => {
+                    let drain = reason.clone().map(|reason| Drain {
+                        reason,
+                        since: chrono::Utc::now(),
+                    });
+                    self.set_ci_drain(machine, drain)?;
+                    serde_json::to_value(self.ci_slot_list(machine)?)?
+                }
+                QueueRequest::CiTimings { since } => serde_json::to_value(CiTimingList {
+                    machine,
+                    timings: self.ci_timings(*since)?,
+                })?,
+            };
         downgrade_specs(&mut result, protocol);
         if let Some(object) = result.as_object_mut() {
             object.insert("api_version".into(), json!(API_VERSION));

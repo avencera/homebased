@@ -560,7 +560,7 @@ fn hold_keeps_only_an_old_run_and_a_manual_preempt_requeues_it_first() {
 
     let preempted = h
         .store()
-        .preempt_job(h.machine, OperationId::new(), old, Utc::now())
+        .preempt_job(h.machine, OperationId::new(), old, Utc::now(), None)
         .unwrap();
     assert_eq!((preempted.task, preempted.position), (task, 1));
     h.ended(high, "succeeded");
