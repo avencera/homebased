@@ -9,7 +9,9 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use crate::cancellation::{
     CancellationReceipt, CancellationRequest, CancellationRequestIdentity, ExecutorCancelState,
 };
-use crate::child_thread::{Lineage, LinkEnd, LinkId, LinkView, ReportStage, ThreadReport};
+use crate::child_thread::{
+    Lineage, LinkEnd, LinkId, LinkView, ReportSeq, ReportStage, ThreadReport,
+};
 use crate::daemon::actors::send_reply;
 use crate::dependency::{DependencyId, DependencyLookup, HeldCancellation};
 use crate::domain::{
@@ -699,13 +701,14 @@ pub(crate) enum StoreMsg {
         now: DateTime<Utc>,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
-    /// Save a child thread's report, or read the one already saved
+    /// Save a child thread's report, or read the latest one when another
+    /// call saved it first
     BeginReport {
         report: Box<ThreadReport>,
         reply: RpcReplyPort<Result<(ThreadReport, bool), AppError>>,
     },
-    /// Read the report a child thread saved
-    ThreadReport {
+    /// Read the latest report a child thread saved
+    LatestReport {
         id: LinkId,
         reply: RpcReplyPort<Result<Option<ThreadReport>, AppError>>,
     },
@@ -716,6 +719,7 @@ pub(crate) enum StoreMsg {
     /// Move a report on to its next stage
     AdvanceReport {
         id: LinkId,
+        seq: ReportSeq,
         next: ReportStage,
         reply: RpcReplyPort<Result<ThreadReport, AppError>>,
     },
@@ -1362,10 +1366,15 @@ impl Actor for StoreActor {
             StoreMsg::BeginReport { report, reply } => {
                 send_reply(reply, state.begin_report(&report));
             }
-            StoreMsg::ThreadReport { id, reply } => send_reply(reply, state.thread_report(id)),
+            StoreMsg::LatestReport { id, reply } => send_reply(reply, state.latest_report(id)),
             StoreMsg::OpenReports { reply } => send_reply(reply, state.open_reports()),
-            StoreMsg::AdvanceReport { id, next, reply } => {
-                send_reply(reply, state.advance_report(id, next));
+            StoreMsg::AdvanceReport {
+                id,
+                seq,
+                next,
+                reply,
+            } => {
+                send_reply(reply, state.advance_report(id, seq, next));
             }
             StoreMsg::UpsertWatch { watch, reply } => send_reply(reply, state.upsert_watch(&watch)),
             StoreMsg::GetWatch { id, reply } => send_reply(reply, state.watch_record(id)),

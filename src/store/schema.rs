@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 20;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 19] = [
+const MIGRATIONS: [Migration; 20] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -39,6 +39,7 @@ const MIGRATIONS: [Migration; 19] = [
     add_route_mem_peaks,
     add_sleep_holds,
     add_thread_lineage,
+    add_follow_up_reports,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -256,19 +257,18 @@ CREATE INDEX sleep_holds_parked ON sleep_holds (parked_under) WHERE parked_under
 
 /// Version 20: child-thread links and the one report each child sends
 fn add_thread_lineage(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(THREAD_LINEAGE_TABLES)
+    conn.execute_batch(&format!("{THREAD_LINEAGE_TABLE}{THREAD_REPORTS_V20}"))
 }
 
-/// Links that `t3 launch --child` makes, and the reports of child threads
+/// Links that `t3 launch --child` makes
 ///
 /// The launching daemon saves a link, and a child on another machine gets
 /// the same row there, so each machine reads the links it is part of.
-/// `report_message_id` is derived from the link, so the parent's machine
-/// counts the child reported once `message_receipts` has that id.
-/// `closed_at` is the parent's machine seeing a child on another machine put
-/// away without a report. A report row lives on the child's machine: its
-/// body and run are fixed when it is saved, and only `stage` moves on
-const THREAD_LINEAGE_TABLES: &str = "
+/// `report_message_id` is the message UUID of the child's first report,
+/// derived from the link, so the parent's machine counts the child reported
+/// once `message_receipts` has that id. `closed_at` is the parent's machine
+/// seeing a child on another machine put away without a report
+const THREAD_LINEAGE_TABLE: &str = "
 CREATE TABLE thread_lineage (
     id TEXT PRIMARY KEY,
     parent_machine TEXT NOT NULL,
@@ -281,7 +281,10 @@ CREATE TABLE thread_lineage (
     UNIQUE (child_machine, child_thread)
 );
 CREATE INDEX thread_lineage_parent ON thread_lineage (parent_machine, parent_thread);
+";
 
+/// The reports table of version 20, one per link, which version 21 rebuilds
+const THREAD_REPORTS_V20: &str = "
 CREATE TABLE thread_reports (
     link_id TEXT PRIMARY KEY REFERENCES thread_lineage(id),
     body TEXT NOT NULL,
@@ -291,6 +294,45 @@ CREATE TABLE thread_reports (
     created_at TEXT NOT NULL,
     sent_at TEXT CHECK ((stage = 'sending') = (sent_at IS NULL)),
     settled_at TEXT CHECK ((stage = 'settled') = (settled_at IS NOT NULL))
+);
+CREATE INDEX thread_reports_open ON thread_reports (stage)
+    WHERE stage IN ('sending', 'settle_pending');
+";
+
+/// Version 21: follow-up reports, numbered after a child's first one
+///
+/// Each saved report becomes report 0 of its link
+fn add_follow_up_reports(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE thread_reports RENAME TO thread_reports_v20;
+         DROP INDEX thread_reports_open;
+         {THREAD_REPORTS_TABLE}
+         INSERT INTO thread_reports
+             (link_id, seq, body, source_session, run_id, stage, created_at, sent_at, settled_at)
+         SELECT link_id, 0, body, source_session, run_id, stage, created_at, sent_at, settled_at
+         FROM thread_reports_v20;
+         DROP TABLE thread_reports_v20;"
+    ))
+}
+
+/// The reports of child threads, which live on the child's machine
+///
+/// `seq` is 0 for the report the parent waits on and counts up for
+/// follow-ups, at most one per T3 run. A row's body and run are fixed when
+/// it is saved, and only `stage` moves on
+const THREAD_REPORTS_TABLE: &str = "
+CREATE TABLE thread_reports (
+    link_id TEXT NOT NULL REFERENCES thread_lineage(id),
+    seq INTEGER NOT NULL CHECK (seq >= 0),
+    body TEXT NOT NULL,
+    source_session TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('sending', 'settle_pending', 'sent', 'settled')),
+    created_at TEXT NOT NULL,
+    sent_at TEXT CHECK ((stage = 'sending') = (sent_at IS NULL)),
+    settled_at TEXT CHECK ((stage = 'settled') = (settled_at IS NOT NULL)),
+    PRIMARY KEY (link_id, seq),
+    UNIQUE (link_id, run_id)
 );
 CREATE INDEX thread_reports_open ON thread_reports (stage)
     WHERE stage IN ('sending', 'settle_pending');
@@ -607,7 +649,8 @@ fn schema() -> String {
         .replace("{RESOURCE_CI_RETIRED}", RESOURCE_CI_RETIRED)
         .replace("{CI_TABLES}", CI_TABLES)
         .replace("{SLEEP_HOLDS_TABLE}", SLEEP_HOLDS_TABLE)
-        .replace("{THREAD_LINEAGE_TABLES}", THREAD_LINEAGE_TABLES)
+        .replace("{THREAD_LINEAGE_TABLE}", THREAD_LINEAGE_TABLE)
+        .replace("{THREAD_REPORTS_TABLE}", THREAD_REPORTS_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -957,7 +1000,8 @@ CREATE TABLE resource_job_delivery (
 {SERVICES_TABLE}
 {CI_TABLES}
 {SLEEP_HOLDS_TABLE}
-{THREAD_LINEAGE_TABLES}";
+{THREAD_LINEAGE_TABLE}
+{THREAD_REPORTS_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -1080,7 +1124,8 @@ mod tests {
             .replace(&format!(",\n    {}", super::RESOURCE_CI_RETIRED), "")
             .replace(super::CI_TABLES, "")
             .replace(super::SLEEP_HOLDS_TABLE, "")
-            .replace(super::THREAD_LINEAGE_TABLES, "")
+            .replace(super::THREAD_LINEAGE_TABLE, "")
+            .replace(super::THREAD_REPORTS_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -1116,6 +1161,8 @@ mod tests {
             "resource_gpu_idle_controls",
             "services",
             "sleep_holds",
+            "thread_lineage",
+            "thread_reports",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
@@ -1208,6 +1255,49 @@ mod tests {
             watch.condition,
             WatchCondition::ContextAbove(Threshold::Tokens(150_000))
         );
+    }
+
+    #[test]
+    fn a_report_saved_before_follow_ups_becomes_report_zero_of_its_link() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE thread_reports; {}",
+            super::THREAD_REPORTS_V20
+        ))
+        .unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+        conn.execute_batch(
+            "INSERT INTO thread_lineage (id, parent_machine, parent_thread, child_machine,
+                 child_thread, report_message_id, created_at)
+             VALUES ('l', 'pm', 'p', 'cm', 'c', 'm', 'x');
+             INSERT INTO thread_reports (link_id, body, source_session, run_id, stage,
+                 created_at, sent_at, settled_at)
+             VALUES ('l', 'done', 's', 'run-1', 'settled', 'x', 'y', 'z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let kept: (u32, String, String) = conn
+            .query_row(
+                "SELECT seq, body, stage FROM thread_reports WHERE link_id = 'l'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, (0, "done".into(), "settled".into()));
+        let follow_up = |seq: u32, run: &str| {
+            conn.execute(
+                "INSERT INTO thread_reports (link_id, seq, body, source_session, run_id, stage,
+                     created_at)
+                 VALUES ('l', ?1, 'more', 's', ?2, 'sending', 'x')",
+                rusqlite::params![seq, run],
+            )
+        };
+        // one report per run, numbered after the first
+        assert!(follow_up(1, "run-1").is_err());
+        follow_up(1, "run-2").unwrap();
+        assert!(follow_up(1, "run-3").is_err());
     }
 
     #[test]

@@ -150,7 +150,7 @@ pub enum ThreadCommand {
         /// Watch id that `thread watch` printed
         id: WatchId,
     },
-    /// Report back once from a child thread, then settle it
+    /// Report back from a child thread, then settle it
     ///
     /// Runs in a thread that `homebased t3 launch --child` started. Refuses
     /// while the thread still has open work: a homebased task or queue job
@@ -160,7 +160,9 @@ pub enum ThreadCommand {
     /// `HOMEBASED_MESSAGE`, then settles this thread once the turn that ran
     /// the command has ended, unless a later run or message keeps it active.
     /// A retry, or a daemon restart, finishes the same report and never sends
-    /// a second one; a retry with other text is refused.
+    /// a second one. A report from a later turn, such as one a user message to
+    /// the settled thread started, goes as a follow-up report once the one
+    /// before it was delivered; other text from the same turn is refused.
     Report {
         /// The report: what was done, what was found, and what is left
         #[arg(long)]
@@ -426,10 +428,11 @@ fn print_report(ctx: &Ctx, response: &ThreadReportResponse) -> Result<ExitCode, 
         OutputMode::Json => ctx.print_json(serde_json::to_value(response)?)?,
         OutputMode::Quiet => println!("{}", report.message_id),
         OutputMode::Human => {
-            let verb = if response.resumed {
-                "already reported"
-            } else {
-                "reported"
+            let verb = match (response.resumed, report.seq.is_follow_up()) {
+                (true, false) => "already reported",
+                (true, true) => "already sent the follow-up report",
+                (false, false) => "reported",
+                (false, true) => "sent a follow-up report",
             };
             let next = match report.stage {
                 ReportStageKind::Sending => "the send is unfinished; homebased retries it",

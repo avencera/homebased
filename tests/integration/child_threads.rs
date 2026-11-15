@@ -200,6 +200,21 @@ fn a_child_keeps_its_parent_waiting_until_it_reports_and_settles_once_its_run_en
         true
     );
 
+    // a retry is the same report, and other text from the same run is refused
+    let again = succeeded(&h.report((&child, CHILD_SESSION), body));
+    assert_eq!(again["resumed"], true, "{again}");
+    assert_eq!(
+        again["report"]["message_id"],
+        reported["report"]["message_id"]
+    );
+    let conflict = failed(
+        &h.report((&child, CHILD_SESSION), "Something else"),
+        5,
+        "thread_report_conflict",
+    );
+    assert_eq!(conflict["input"]["reason"], "same_run", "{conflict}");
+    assert_eq!(messages_to(&t3, PARENT.0).len(), 1);
+
     // the reporting run is still going, so the child is not settled under it
     std::thread::sleep(Duration::from_secs(3));
     assert!(settles_of(&t3, &child).is_empty());
@@ -214,19 +229,70 @@ fn a_child_keeps_its_parent_waiting_until_it_reports_and_settles_once_its_run_en
     assert_eq!(settles.len(), 1, "{settles:?}");
     assert_eq!(settles[0]["expectedLatestRunId"], "run-c-1");
 
-    // a retry is the same report, and other text is refused
-    let again = succeeded(&h.report((&child, CHILD_SESSION), body));
-    assert_eq!(again["resumed"], true, "{again}");
-    assert_eq!(
-        again["report"]["message_id"],
+    // a user reopens the settled child, and its later run sends a follow-up
+    h.t3_state()
+        .execute(
+            "UPDATE orchestration_v2_projection_threads
+             SET payload_json = json_remove(payload_json, '$.settledOverride')
+             WHERE thread_id = ?1",
+            [child.as_str()],
+        )
+        .unwrap();
+    h.child_run(&child, "run-c-2", "running");
+    let more = "Also fixed the retry timeout";
+    let follow_up = succeeded(&h.report((&child, CHILD_SESSION), more));
+    assert_eq!(follow_up["resumed"], false, "{follow_up}");
+    assert_eq!(follow_up["report"]["seq"], 1, "{follow_up}");
+    assert_eq!(follow_up["report"]["stage"], "settle_pending");
+    assert_ne!(
+        follow_up["report"]["message_id"],
         reported["report"]["message_id"]
     );
-    assert_eq!(messages_to(&t3, PARENT.0).len(), 1);
+    let delivered = messages_to(&t3, PARENT.0);
+    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    let delivered = delivered[1]["text"].as_str().unwrap();
+    assert!(delivered.contains(more), "{delivered}");
+    assert!(
+        delivered.contains(&format!(
+            "Follow-up report from child thread thread_{child}"
+        )),
+        "{delivered}"
+    );
+    // the parent waited on the first report only
+    assert_eq!(h.t3_context(PARENT.0)["state"], "idle");
+    assert_eq!(h.report_stage(&child), "settled");
+
+    // the follow-up retries like the first report, and settles after its own run
+    let again = succeeded(&h.report((&child, CHILD_SESSION), more));
+    assert_eq!(again["resumed"], true, "{again}");
     failed(
-        &h.report((&child, CHILD_SESSION), "Something else"),
+        &h.report((&child, CHILD_SESSION), "A third thing"),
         5,
         "thread_report_conflict",
     );
+    assert_eq!(messages_to(&t3, PARENT.0).len(), 2);
+    h.child_run(&child, "run-c-2", "completed");
+    assert!(
+        wait_until(Duration::from_secs(20), || settles_of(&t3, &child).len()
+            == 2),
+        "the child was not settled after its follow-up"
+    );
+    assert_eq!(settles_of(&t3, &child)[1]["expectedLatestRunId"], "run-c-2");
+
+    // the same text from yet another run is a new follow-up, not a retry
+    h.t3_state()
+        .execute(
+            "UPDATE orchestration_v2_projection_threads
+             SET payload_json = json_remove(payload_json, '$.settledOverride')
+             WHERE thread_id = ?1",
+            [child.as_str()],
+        )
+        .unwrap();
+    h.child_run(&child, "run-c-3", "running");
+    let resent = succeeded(&h.report((&child, CHILD_SESSION), more));
+    assert_eq!(resent["resumed"], false, "{resent}");
+    assert_eq!(resent["report"]["seq"], 2, "{resent}");
+    assert_eq!(messages_to(&t3, PARENT.0).len(), 3);
 
     // a message the user sends the child after its report keeps it unsettled
     let second = launched_thread(&h.launch_child(PARENT, "Check the upload metrics"));
@@ -359,11 +425,12 @@ fn a_report_whose_delivery_is_unknown_goes_again_as_the_same_message() {
     );
     assert_eq!(h.report_stage(&child), "sending");
     // the saved report is fixed, whatever its delivery
-    failed(
+    let conflict = failed(
         &h.report((&child, CHILD_SESSION), "Something else"),
         5,
         "thread_report_conflict",
     );
+    assert_eq!(conflict["input"]["reason"], "undelivered", "{conflict}");
 
     t3.behavior
         .drop_message_replies

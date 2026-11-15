@@ -1,6 +1,6 @@
 # Thread context, compaction, and watches
 
-`homebased thread` reads how full an agent thread's context is, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's one report to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
+`homebased thread` reads how full an agent thread's context is, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's report, and any follow-up reports, to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
 
 ```bash
 homebased --json thread context                      # this thread
@@ -49,7 +49,7 @@ Each entry has `machine_name`, `host` (`t3`, `worker`, or `terminal`), `provider
 - A thread is done when it is `settled`, or has `task_finished: true`, and runs no turn. This holds while its `state` is `waiting`: the pending homebased work wakes it with a new turn when it reports, and that makes it live again.
 - `session_exists`: whether the session's own record (Claude transcript or Codex rollout) is still on disk; `null` when not checked.
 - `model`, `effort`, `project`, `branch`, `workspace`, `parent_title`, and `pull_request` when T3 records them.
-- `child_thread`, only on a child thread launched with `t3 launch --child`: `link`, `parent` (its `machine` and `t3_thread`), `reported` (whether the parent's machine has its report), and `report`, how far the report has got on the child's machine, once it has one (see [`thread report`](#thread-report)).
+- `child_thread`, only on a child thread launched with `t3 launch --child`: `link`, `parent` (its `machine` and `t3_thread`), `reported` (whether the parent's machine has its report), and `report`, how far its first report has got on the child's machine, once it has one (see [`thread report`](#thread-report)).
 
 Human output gives times in US Central.
 
@@ -126,9 +126,11 @@ A child thread is a top-level T3 thread launched with `homebased t3 launch --chi
 Run in a child thread, inside its turn, as its last step: `homebased --json thread report --summary "<report>" [--file report.md]`. `--file` appends that file's text after a blank line, or stdin's with `-`. The whole report is at most 16 KiB.
 
 - It is refused with `thread_report_refused` (exit 5) while the child has open work, and sends nothing. `input.open` lists each piece by `kind`: `task` or `job` with its `id` (a homebased task or GPU queue job that has not sent this thread its final event), `owed_events` (such work that cannot be named, as from an earlier session of the thread), `hold` with its `id` (a task or job this thread sleeps on with `homebased wait --long`, including what a held worker parked on, until its final event ends the hold), `subagent` (T3 is due to wake the thread with a subagent's report), `child` (a child thread of its own that has not reported, with `child`), or `unconfirmed` (a child on a machine that did not answer, with `child` and `reason`). Wait for that work, then run it again.
-- It sends the report to the parent as one `HOMEBASED_MESSAGE` ([messages.md](messages.md#child-thread-reports)). The report is saved before it is sent, so a retry, or a daemon restart, finishes the same report and never sends a second one. A retry returns the saved report with `resumed: true`. A retry with other text fails with `thread_report_conflict` (exit 5).
-- After the turn ends, the child's machine asks T3 to settle the child, bound to the run the report came from. It leaves the child unsettled when a later run, or a user message to the child, came first, or when T3 refuses.
-- The result's `report` has `link`, `parent`, `child`, `message_id`, `created_at`, `sent_at`, and `stage`: `sending` (not delivered yet; run the command again), `settle_pending` (delivered; the settle waits for the turn to end), `sent` (delivered, and left unsettled), or `settled`.
+- It sends the report to the parent as one `HOMEBASED_MESSAGE` ([messages.md](messages.md#child-thread-reports)). The report is saved before it is sent, so a retry, or a daemon restart, finishes the same report and never sends a second one. A retry returns the saved report with `resumed: true`.
+- A child sends at most one report per T3 run. When a later run reopens a reported child, such as one a user message to it started, a report in that run goes as a follow-up report, `seq` 1, 2, and so on, once the report before it was delivered, even with the same text as before. Within one run, the same text is always a retry. The open-work check applies to it too. The parent waited only on the first report, so a follow-up does not make it `waiting` again.
+- Other text fails with `thread_report_conflict` (exit 5) and sends nothing. `input.reason` is `same_run` when this run already sent a report: send more now with `homebased message send`, or report again from a later turn. It is `undelivered` when the latest report has not reached the parent: repeat its text to finish it first.
+- After the turn ends, the child's machine asks T3 to settle the child, bound to the run the report came from, after a follow-up as after the first report. It leaves the child unsettled when a later run, or a user message to the child, came first, or when T3 refuses.
+- The result's `report` has `link`, `parent`, `child`, `seq` (0 for the first report), `message_id`, `created_at`, `sent_at`, and `stage`: `sending` (not delivered yet; run the command again), `settle_pending` (delivered; the settle waits for the turn to end), `sent` (delivered, and left unsettled), or `settled`.
 - A thread that no `--child` launch made fails with `not_child_thread` (exit 5); report with `homebased message send` instead. Outside a turn, or before T3 records the thread's session, it fails with `usage`.
 
 ## Orchestrator recipe

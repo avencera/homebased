@@ -535,7 +535,19 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             }),
         "thread_report_conflict" => {
             match (decode_field(input, "link"), decode_field(input, "stage")) {
-                (Some(link), Some(stage)) => AppError::ThreadReportConflict { link, stage },
+                (Some(link), Some(stage)) => AppError::ThreadReportConflict {
+                    link,
+                    stage,
+                    // a daemon older than follow-ups sends no reason, and
+                    // refused other text for an undelivered or delivered report
+                    reason: decode_field(input, "reason").unwrap_or(
+                        if stage == crate::child_thread::ReportStageKind::Sending {
+                            crate::child_thread::ReportConflict::Undelivered
+                        } else {
+                            crate::child_thread::ReportConflict::SameRun
+                        },
+                    ),
+                },
                 _ => AppError::Internal { message },
             }
         }
@@ -771,6 +783,7 @@ mod tests {
             AppError::ThreadReportConflict {
                 link: crate::child_thread::LinkId::from_launch(uuid::Uuid::now_v7()),
                 stage: crate::child_thread::ReportStageKind::Sent,
+                reason: crate::child_thread::ReportConflict::SameRun,
             },
         ];
 

@@ -188,7 +188,7 @@ pub struct LaunchArgs {
     #[arg(long)]
     source_thread: Option<ThreadId>,
     /// Launch a child thread of the calling T3 thread, which reports back to
-    /// it once with `homebased thread report`; implies --reply-route and
+    /// it with `homebased thread report`; implies --reply-route and
     /// needs a first message
     #[arg(long, conflicts_with = "source_thread")]
     child: bool,

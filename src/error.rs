@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::callback::destination::ThreadSuggestion;
-use crate::child_thread::{LinkId, OpenWork, ReportStageKind};
+use crate::child_thread::{LinkId, OpenWork, ReportConflict, ReportStageKind};
 use crate::dependency::{Dependency, DependencyId, DependencyOutcome};
 use crate::domain::{AgentKind, ProcessStatus, TaskId, ThreadId};
 use crate::fleet::protocol::ProtocolRange;
@@ -555,16 +555,20 @@ pub enum AppError {
         /// Each piece of open work, as the refusal names it
         open: Vec<OpenWork>,
     },
-    /// The child thread already saved a report with another body
+    /// The child thread's latest report has another body, and other text
+    /// cannot be a follow-up yet
     #[error(
-        "this thread already saved a different report (link {link}, now {}); a child thread reports once, and a retry must repeat the same text",
-        stage.as_str()
+        "this thread already saved a different report (link {link}, now {}): {}",
+        stage.as_str(),
+        reason.advice()
     )]
     ThreadReportConflict {
         /// The child's link
         link: LinkId,
-        /// How far the saved report has got
+        /// How far the latest saved report has got
         stage: ReportStageKind,
+        /// Why other text cannot be a follow-up yet
+        reason: ReportConflict,
     },
     /// The thread cannot launch as requested, or T3 Code refused it
     #[error("T3 thread launch refused: {message}")]
@@ -1157,7 +1161,11 @@ impl AppError {
             } => json!({ "request_id": request, "machine": machine, "message": message }),
             Self::NotChildThread { thread } => json!({ "thread": thread }),
             Self::ThreadReportRefused { open } => json!({ "open": open }),
-            Self::ThreadReportConflict { link, stage } => json!({ "link": link, "stage": stage }),
+            Self::ThreadReportConflict {
+                link,
+                stage,
+                reason,
+            } => json!({ "link": link, "stage": stage, "reason": reason }),
             Self::InvalidCwd {
                 path,
                 problem,

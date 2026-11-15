@@ -1,7 +1,8 @@
 //! `homebased thread report`, and the scan that finishes what it started
 //!
 //! The report route runs in the child thread's own machine. It refuses while
-//! the thread has open work, saves the report before it sends anything, sends
+//! the thread has open work, numbers the report after the child's latest one
+//! (see [`ReportPlan`]), saves it before it sends anything, sends
 //! it to the parent through the message path, and leaves the settle to the
 //! scan: T3 refuses `thread.settle` while a turn runs, and the turn that
 //! reported is still running then. The scan runs with the idle compaction
@@ -27,8 +28,8 @@ use super::thread_api::local::LocalIndex;
 use super::thread_api::watch_scan::GONE_SCANS;
 use super::thread_api::{find_on, local_sources};
 use crate::child_thread::{
-    Lineage, LinkEnd, LinkId, OpenWork, ReportStage, ThreadReport, ThreadReportRequest,
-    ThreadReportResponse,
+    Lineage, LinkEnd, LinkId, OpenWork, ReportConflict, ReportPlan, ReportStage, ThreadReport,
+    ThreadReportRequest, ThreadReportResponse,
 };
 use crate::domain::{API_VERSION, ThreadId};
 use crate::error::AppError;
@@ -76,11 +77,14 @@ async fn report(
         thread: format!("thread_{}", child.t3_thread),
     })?;
 
-    // a saved report is finished as it is: its checks passed when it was saved
+    // the same text again finishes the saved report as it is, since its
+    // checks passed when it was saved
     let id = lineage.id;
-    if let Some(saved) = call(&state.store, |reply| StoreMsg::ThreadReport { id, reply }).await? {
-        return resume(&state, saved, &body.body).await;
-    }
+    let latest = call(&state.store, |reply| StoreMsg::LatestReport { id, reply }).await?;
+    let seq = match ReportPlan::decide(latest, &body.body, reporter.run.as_deref())? {
+        ReportPlan::Resume(saved) => return resume(&state, *saved, &body.body).await,
+        ReportPlan::Save(seq) => seq,
+    };
 
     check_body(&body.body)?;
     let mut open = reporter.open;
@@ -100,6 +104,7 @@ async fn report(
 
     let report = ThreadReport {
         lineage,
+        seq,
         body: body.body,
         source,
         run,
@@ -117,7 +122,12 @@ async fn report(
         // another call saved one first
         return resume(&state, saved, &report.body).await;
     }
-    info!(link = %saved.lineage.id, parent = %saved.lineage.parent.t3_thread, "Child thread report saved");
+    info!(
+        link = %saved.lineage.id,
+        seq = saved.seq.get(),
+        parent = %saved.lineage.parent.t3_thread,
+        "Child thread report saved"
+    );
     let sent = finish_send(&state, saved).await?;
     Ok(Json(response(&sent, false)))
 }
@@ -129,10 +139,7 @@ async fn resume(
     body: &str,
 ) -> Result<Json<ThreadReportResponse>, AppError> {
     if saved.body != body {
-        return Err(AppError::ThreadReportConflict {
-            link: saved.lineage.id,
-            stage: saved.stage.kind(),
-        });
+        return Err(ReportConflict::with(&saved));
     }
     let report = finish_send(state, saved).await?;
     Ok(Json(response(&report, true)))
@@ -250,12 +257,13 @@ async fn finish_send(state: &AppState, report: ThreadReport) -> Result<ThreadRep
         return Ok(report);
     }
     message_sender::send(state, report.message()).await?;
-    let id = report.lineage.id;
+    let (id, seq) = (report.lineage.id, report.seq);
     let next = ReportStage::SettlePending {
         sent_at: Utc::now(),
     };
     call(&state.store, |reply| StoreMsg::AdvanceReport {
         id,
+        seq,
         next,
         reply,
     })
@@ -331,14 +339,20 @@ async fn settle(
             });
         }
     };
-    let id = report.lineage.id;
+    let (id, seq) = (report.lineage.id, report.seq);
     let saved = call(&state.store, |reply| StoreMsg::AdvanceReport {
         id,
+        seq,
         next,
         reply,
     })
     .await?;
-    info!(link = %id, stage = saved.stage.kind().as_str(), "Child thread report finished");
+    info!(
+        link = %id,
+        seq = seq.get(),
+        stage = saved.stage.kind().as_str(),
+        "Child thread report finished"
+    );
     Ok(())
 }
 

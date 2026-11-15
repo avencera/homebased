@@ -599,7 +599,7 @@ still go out. Events for a stopped Claude session wait until it runs again, for
 up to 3 days as task callbacks do. The skill's
 [threads.md](.agents/skills/homebased/references/threads.md) has the payload.
 
-`thread report` sends a child thread's one report to its parent, run in the
+`thread report` sends a child thread's report to its parent, run in the
 child's T3 thread during a turn. It is refused with `thread_report_refused`
 (exit 5), naming each piece, while the child has open work: a homebased task
 or GPU queue job that owes it events, a sleep hold (`hold`, including what a
@@ -608,10 +608,16 @@ of its own that has not reported (one on a machine that does
 not answer counts as open). Otherwise it sends `--summary`, followed by the
 text of `--file` (`-` reads stdin), up to 16 KiB in all, to the parent as a
 `HOMEBASED_MESSAGE` whose body starts `Report from child thread thread_<id>:`.
-The report is saved first, under a message UUID derived from the link, so a
-retry or a daemon restart finishes the same report and never sends a second;
-a retry with other text fails with `thread_report_conflict`, and a thread no
-`--child` launch made fails with `not_child_thread`. Once the reporting turn
+The report is saved first, under a message UUID derived from the link and the
+report's number, so a retry or a daemon restart finishes the same report and
+never sends a second. A child sends at most one report per T3 run: when a later
+run reopens a reported child, such as one a user message started, a report
+from it goes as a follow-up report (`seq` 1, 2, and so on) whose body starts
+`Follow-up report from child thread thread_<id>:`, once the report before it
+was delivered. The parent waited only on the first report, so a follow-up does
+not make it wait again. Other text from the run that already reported fails with `thread_report_conflict`, whose
+`reason` is `same_run` or `undelivered`, and a thread no `--child` launch made
+fails with `not_child_thread`. Once each reporting turn
 ends, the child's daemon asks T3 to settle the child (`thread.settle`, bound
 to that run), unless a later run or a user message to the child came first or
 T3 refuses. The output's `stage` is `sending`, `settle_pending`, `sent`
@@ -682,8 +688,9 @@ the project setup script, and starts the first message.
 - `--child` launches a child thread of the calling T3 thread instead of a
   hand-off, to own a phase, an experiment, or long work. Its first message
   ends with a route back to the parent's T3 thread, tells the child to sleep
-  on its long work with `homebased wait --long`, and asks it to report once
-  with `homebased thread report`.
+  on its long work with `homebased wait --long`, and asks it to report
+  with `homebased thread report`, and to report again as a follow-up if a later
+  message reopens it for more work.
   homebased records the link on both machines, so the parent lists the child
   under `thread context --children` and shows `waiting` until it reports, and
   the child's daemon settles it after its reporting turn ends. A child can

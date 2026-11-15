@@ -9,13 +9,15 @@
 //! where `homebased thread report` goes. A child can launch children of its
 //! own, which makes grandchildren with nothing extra
 //!
-//! A child reports once. `thread report` saves a [`ThreadReport`] on the
-//! child's machine before it sends anything, and the message UUID is fixed by
-//! the lineage, so a retry or a daemon restart finishes the same report and
-//! never sends a second one. The parent's machine counts the child reported
-//! once it holds the receipt of that message. The child's machine then
-//! settles the child after the run that reported has ended, unless a later
-//! run or message kept the thread active
+//! A child reports once per run. `thread report` saves a [`ThreadReport`] on
+//! the child's machine before it sends anything, and the message UUID is
+//! fixed by the lineage and the report's [`ReportSeq`], so a retry or a daemon
+//! restart finishes the same report and never sends a second one. The parent's
+//! machine counts the child reported once it holds the receipt of the first
+//! report. A later run of the child, such as one a user message to it started,
+//! can send a follow-up once the report before it was delivered; the parent
+//! does not wait for one. The child's machine settles the child after each
+//! reporting run has ended, unless a later run or message kept it active
 
 use std::fmt;
 use std::str::FromStr;
@@ -92,21 +94,63 @@ pub struct Lineage {
 }
 
 impl Lineage {
-    /// Message UUID of the child's one report
+    /// Message UUID of the child's report `seq`
     ///
-    /// Derived from the link, so the parent's machine knows it from the
-    /// launch and a retried report reuses it with no saved state
+    /// Derived from the link and `seq`, so the parent's machine knows the
+    /// first one from the launch and a retried report reuses it with no
+    /// saved state
     #[must_use]
-    pub fn report_message(&self) -> MessageId {
+    pub fn report_message(&self, seq: ReportSeq) -> MessageId {
         let mut hasher = Sha256::new();
         hasher.update(b"homebased-child-report\0");
         hasher.update(self.id.as_uuid().as_bytes());
+        // the first report keeps the UUID releases before follow-ups derived
+        if seq.is_follow_up() {
+            hasher.update(seq.0.to_be_bytes());
+        }
         let digest = hasher.finalize();
         let mut bytes = [0_u8; 16];
         bytes.copy_from_slice(&digest[..16]);
         MessageId::from_uuid(Builder::from_custom_bytes(bytes).into_uuid())
             // a SHA-256 prefix with version bits set is never nil
             .unwrap_or_default()
+    }
+}
+
+/// Which of a child's reports one is: 0 for the report its parent waits on,
+/// then 1, 2, and so on for follow-ups from later runs
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct ReportSeq(u32);
+
+impl ReportSeq {
+    /// The report the parent waits on
+    pub const FIRST: Self = Self(0);
+
+    /// The report after this one
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Whether this is a follow-up, sent after the first report
+    #[must_use]
+    pub const fn is_follow_up(self) -> bool {
+        self.0 > 0
+    }
+
+    /// The number as stored
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The report numbered `value`, as stored
+    #[must_use]
+    pub const fn from_stored(value: u32) -> Self {
+        Self(value)
     }
 }
 
@@ -121,8 +165,8 @@ pub struct LinkView {
     /// Whether this machine saw the child put away without a report, which
     /// the parent's machine records for a child on another machine
     pub closed: bool,
-    /// Where the child's own report stands, which only the child's machine
-    /// knows
+    /// Where the child's first report stands, which only the child's
+    /// machine knows
     pub report: Option<ReportStageKind>,
 }
 
@@ -228,16 +272,19 @@ impl FromStr for ReportStageKind {
     }
 }
 
-/// A child thread's one report, saved on the child's machine
+/// One of a child thread's reports, saved on the child's machine
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadReport {
     /// The child's link to its parent
     pub lineage: Lineage,
+    /// Which of the child's reports this is
+    pub seq: ReportSeq,
     /// Report text, as the parent receives it
     pub body: String,
     /// The child's session when it reported, which the message names as its source
     pub source: ThreadId,
-    /// T3 run the report was made in, which must end before the thread settles
+    /// T3 run the report was made in, which must end before the thread
+    /// settles; a child sends at most one report per run
     pub run: String,
     /// When the report was saved
     pub created_at: DateTime<Utc>,
@@ -252,7 +299,12 @@ impl ThreadReport {
     /// same request, which the message path delivers at most once
     #[must_use]
     pub fn message(&self) -> MessageSendRequest {
-        let message_id = self.lineage.report_message();
+        let message_id = self.lineage.report_message(self.seq);
+        let kind = if self.seq.is_follow_up() {
+            "Follow-up report"
+        } else {
+            "Report"
+        };
         MessageSendRequest {
             api_version: API_VERSION,
             message_id,
@@ -267,7 +319,7 @@ impl ThreadReport {
             },
             // the parent finds the child under `thread context --children` by its T3 id
             body: format!(
-                "Report from child thread thread_{}:\n\n{}",
+                "{kind} from child thread thread_{}:\n\n{}",
                 self.lineage.child.t3_thread, self.body
             ),
             reply_to: None,
@@ -282,10 +334,94 @@ impl ThreadReport {
             link: self.lineage.id,
             parent: self.lineage.parent.clone(),
             child: self.lineage.child.clone(),
-            message_id: self.lineage.report_message(),
+            seq: self.seq,
+            message_id: self.lineage.report_message(self.seq),
             stage: self.stage.kind(),
             created_at: self.created_at,
             sent_at: self.stage.sent_at(),
+        }
+    }
+}
+
+/// What `thread report` does with its text, given the child's latest
+/// saved report
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportPlan {
+    /// The text of the latest report again: finish that report
+    Resume(Box<ThreadReport>),
+    /// Save a new report under this number
+    Save(ReportSeq),
+}
+
+impl ReportPlan {
+    /// Decide for text `body`, sent from T3 run `run`
+    ///
+    /// The same text is a retry while the latest report is undelivered, from
+    /// its own run, or outside any run, so a retry after a lost reply can
+    /// never send a second message. A later run starts a follow-up once the
+    /// latest report was delivered, even with the same text, so that run
+    /// settles after it too
+    ///
+    /// # Errors
+    ///
+    /// `thread_report_conflict` when the latest report is undelivered or was
+    /// sent from this same run
+    pub fn decide(
+        latest: Option<ThreadReport>,
+        body: &str,
+        run: Option<&str>,
+    ) -> Result<Self, AppError> {
+        let Some(latest) = latest else {
+            return Ok(Self::Save(ReportSeq::FIRST));
+        };
+        let retry_only = latest.stage == ReportStage::Sending || run == Some(latest.run.as_str());
+        if latest.body == body && (retry_only || run.is_none()) {
+            return Ok(Self::Resume(Box::new(latest)));
+        }
+        if retry_only {
+            return Err(ReportConflict::with(&latest));
+        }
+        // outside any run this fails later, asking for the thread's own turn
+        Ok(Self::Save(latest.seq.next()))
+    }
+}
+
+/// Why `thread report` refused other text
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportConflict {
+    /// The latest report has not reached the parent yet
+    Undelivered,
+    /// This run already sent a report
+    SameRun,
+}
+
+impl ReportConflict {
+    /// The refusal of other text than `saved`'s, by how far `saved` got
+    #[must_use]
+    pub fn with(saved: &ThreadReport) -> AppError {
+        let reason = if saved.stage == ReportStage::Sending {
+            Self::Undelivered
+        } else {
+            Self::SameRun
+        };
+        AppError::ThreadReportConflict {
+            link: saved.lineage.id,
+            stage: saved.stage.kind(),
+            reason,
+        }
+    }
+
+    /// What the refusal tells the agent
+    #[must_use]
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::Undelivered => {
+                "its earlier report has not reached the parent yet; repeat that text to finish it, and send anything new as a follow-up report from a later turn"
+            }
+            Self::SameRun => {
+                "this turn already sent a report; repeat its text to retry it, send anything new as a follow-up report from a later turn, or reach the parent now with `homebased message send`"
+            }
         }
     }
 }
@@ -330,10 +466,10 @@ pub struct ChildThreadInfo {
     pub link: LinkId,
     /// The thread that launched this one
     pub parent: LinkEnd,
-    /// Whether the parent has this thread's report
+    /// Whether the parent has this thread's first report
     pub reported: bool,
-    /// How far this thread's report has got, on its own machine; `None`
-    /// before it reports
+    /// How far this thread's first report has got, on its own machine;
+    /// `None` before it reports
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<ReportStageKind>,
 }
@@ -370,6 +506,10 @@ pub struct ReportView {
     pub parent: LinkEnd,
     /// The reporting thread
     pub child: LinkEnd,
+    /// Which of the child's reports this is: 0 for the first, then one more
+    /// for each follow-up; a daemon older than follow-ups sends none
+    #[serde(default)]
+    pub seq: ReportSeq,
     /// Message UUID, the same on every attempt
     pub message_id: MessageId,
     /// How far it has got
@@ -447,7 +587,7 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    use super::{Lineage, LinkEnd, LinkId};
+    use super::{Lineage, LinkEnd, LinkId, ReportSeq};
     use crate::machine::MachineId;
 
     fn lineage(request: Uuid) -> Lineage {
@@ -466,16 +606,44 @@ mod tests {
     }
 
     #[test]
-    fn the_report_message_is_fixed_by_the_launch_alone() {
+    fn the_report_message_is_fixed_by_the_launch_and_report_number() {
         let request = Uuid::now_v7();
         let first = lineage(request);
         // another machine's copy of the same link, saved at another time
         let copy = lineage(request);
-        assert_eq!(first.report_message(), copy.report_message());
-        assert_ne!(
-            first.report_message(),
-            lineage(Uuid::now_v7()).report_message()
+        assert_eq!(
+            first.report_message(ReportSeq::FIRST),
+            copy.report_message(ReportSeq::FIRST)
         );
-        assert_ne!(first.report_message().as_uuid(), request);
+        assert_ne!(
+            first.report_message(ReportSeq::FIRST),
+            lineage(Uuid::now_v7()).report_message(ReportSeq::FIRST)
+        );
+        assert_ne!(first.report_message(ReportSeq::FIRST).as_uuid(), request);
+
+        let follow_up = ReportSeq::FIRST.next();
+        assert_eq!(
+            first.report_message(follow_up),
+            copy.report_message(follow_up)
+        );
+        assert_ne!(
+            first.report_message(follow_up),
+            first.report_message(ReportSeq::FIRST)
+        );
+        assert_ne!(
+            first.report_message(follow_up),
+            first.report_message(follow_up.next())
+        );
+    }
+
+    #[test]
+    fn the_first_report_keeps_the_message_uuid_older_releases_derived() {
+        // a parent's machine on an older release saved this UUID at launch
+        // and counts the child reported only once it holds its receipt
+        let link = lineage(Uuid::parse_str("0199aaaa-2222-7000-8000-000000000001").unwrap());
+        assert_eq!(
+            link.report_message(ReportSeq::FIRST).to_string(),
+            "34cc5929-5d8e-8a30-b8f3-c4062f99690a"
+        );
     }
 }

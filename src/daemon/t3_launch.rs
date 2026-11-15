@@ -69,7 +69,7 @@ pub struct T3LaunchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_thread: Option<ThreadId>,
     /// The calling agent, when it launches a child thread: a thread that
-    /// reports back to the caller's T3 thread once with `homebased thread
+    /// reports back to the caller's T3 thread with `homebased thread
     /// report`. Its first message names that thread instead of `source_thread`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_of: Option<Caller>,
@@ -715,7 +715,7 @@ fn t3_error(error: LaunchError, uncertain: impl FnOnce(String) -> AppError) -> A
 /// Footer that tells a child thread where it reports, and how
 fn child_route(machine: &MachineName, parent: &str) -> String {
     format!(
-        "\n\n---\nThis is a child thread of T3 thread `thread_{parent}` on machine `{machine}`, launched through homebased to own this work. Run long work as homebased tasks and jobs and sleep on them with `homebased wait --long <ids>`, then end the turn; the final event or an alert wakes this thread. When it is done and its homebased tasks, jobs and child threads have finished, report back once with:\n`homebased thread report --summary \"<report>\"`\nThat sends the report to the parent and settles this thread after the turn. To ask the parent something before then, run:\n`homebased message send --machine {machine} --thread thread_{parent} --message \"<message>\"`"
+        "\n\n---\nThis is a child thread of T3 thread `thread_{parent}` on machine `{machine}`, launched through homebased to own this work. Run long work as homebased tasks and jobs and sleep on them with `homebased wait --long <ids>`, then end the turn; the final event or an alert wakes this thread. When it is done and its homebased tasks, jobs and child threads have finished, report back with:\n`homebased thread report --summary \"<report>\"`\nThat sends the report to the parent and settles this thread after the turn. To ask the parent something before then, run:\n`homebased message send --machine {machine} --thread thread_{parent} --message \"<message>\"`\nIf a later message reopens this thread for more work, report again the same way when that work is done; it goes to the parent as a follow-up report."
     )
 }
 

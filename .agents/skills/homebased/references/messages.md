@@ -146,7 +146,7 @@ conversation UUID is the message UUID.
 
 ## Child-thread reports
 
-A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. Its message UUID comes from the link between the two threads, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
+A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. A follow-up report, sent from a later turn after the child was reopened, starts `Follow-up report from child thread thread_<id>:` instead. Its message UUID comes from the link between the two threads and the report's number, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
 
 ## Retry safely
 
