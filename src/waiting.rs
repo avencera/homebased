@@ -1,18 +1,21 @@
-//! Agent workers that park on other tasks and continue once those tasks end
+//! Agent workers that park on other tasks or GPU queue jobs and continue
+//! once those end
 //!
-//! A worker that needs a long command submits it as its own task, reports
-//! `waiting` on it with notes for later, and exits. Every run task stays
-//! immutable once terminal; a chain is the logical owner of the work across
-//! its runs. The daemon holds a continuation run until every waited task ends
-//! with any outcome, then launches it with the worker's notes
+//! A worker that needs a long command submits it as its own task or GPU queue
+//! job, reports `waiting` on it with notes for later, and exits. Every run
+//! task stays immutable once terminal; a chain is the logical owner of the
+//! work across its runs. The daemon holds a continuation run until every
+//! waited task ended and every waited job sent its final event, with any
+//! outcome, then launches it with the worker's notes
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::dependency::TaskOutcome;
+use crate::dependency::{Dependency, DependencyId, TaskOutcome};
 use crate::domain::{TASK_NAME_MAX_CHARS, TaskId, TaskName};
+use crate::queue::JobId;
 
-/// Most tasks one waiting report may name
+/// Most tasks and jobs one waiting report may name
 pub const MAX_WAIT_TARGETS: usize = 16;
 
 /// Largest notes text a waiting report may carry
@@ -24,69 +27,106 @@ pub const MAX_CHAIN_RUNS: u32 = 20;
 /// Suffix of a continuation's name
 const CONTINUED_SUFFIX: &str = " (continued)";
 
-/// Tasks a waiting report names: 1 to [`MAX_WAIT_TARGETS`], without
+/// Tasks and jobs a waiting report names: 1 to [`MAX_WAIT_TARGETS`], without
 /// duplicates, in the order the worker gave them
+///
+/// Each target is a [`Dependency`], the same task-or-job model as `after`.
+/// The wire form tags each one, as `{"task": id}` or `{"job": id}`. A bare
+/// UUID also reads as a task, the form saved before jobs could be named
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "Vec<TaskId>", into = "Vec<TaskId>")]
-pub struct WaitTargets(Vec<TaskId>);
+#[serde(try_from = "Vec<SavedTarget>", into = "Vec<Dependency>")]
+pub struct WaitTargets(Vec<Dependency>);
+
+/// One saved target: tagged, or a bare task UUID from before job targets
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedTarget {
+    Task(TaskId),
+    Tagged(Dependency),
+}
+
+impl From<SavedTarget> for Dependency {
+    fn from(saved: SavedTarget) -> Self {
+        match saved {
+            SavedTarget::Task(task) => Self::Task(task),
+            SavedTarget::Tagged(target) => target,
+        }
+    }
+}
 
 /// Why a list of wait targets is invalid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WaitTargetsError {
     /// No target was named
-    #[error("a waiting report must name at least one task with --on")]
+    #[error("a waiting report must name at least one task or job with --on")]
     Empty,
-    /// The same task appears twice
-    #[error("--on names task {task} more than once")]
+    /// The same id appears twice
+    #[error("--on names {id} more than once")]
     Duplicate {
-        /// Repeated task
-        task: TaskId,
+        /// Repeated id
+        id: DependencyId,
     },
-    /// More than [`MAX_WAIT_TARGETS`] tasks
-    #[error("--on names {count} tasks; the limit is {MAX_WAIT_TARGETS}")]
+    /// More than [`MAX_WAIT_TARGETS`] targets
+    #[error("--on names {count} tasks and jobs; the limit is {MAX_WAIT_TARGETS}")]
     TooMany {
-        /// Number of named tasks
+        /// Number of named targets
         count: usize,
     },
 }
 
 impl WaitTargets {
-    /// Validate the tasks a waiting report names
+    /// Validate the targets a waiting report names
     ///
     /// # Errors
     ///
-    /// Refuses an empty list, a repeated task, and more than [`MAX_WAIT_TARGETS`] tasks
-    pub fn new(tasks: Vec<TaskId>) -> Result<Self, WaitTargetsError> {
-        if tasks.is_empty() {
+    /// Refuses an empty list, a repeated id, and more than [`MAX_WAIT_TARGETS`] targets
+    pub fn new(targets: Vec<Dependency>) -> Result<Self, WaitTargetsError> {
+        let ids: Vec<DependencyId> = targets.iter().map(|target| target.id()).collect();
+        Self::check_ids(&ids)?;
+        Ok(Self(targets))
+    }
+
+    /// Check the shape of a list of ids before each is resolved to a task or job
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]
+    pub fn check_ids(ids: &[DependencyId]) -> Result<(), WaitTargetsError> {
+        if ids.is_empty() {
             return Err(WaitTargetsError::Empty);
         }
-        if tasks.len() > MAX_WAIT_TARGETS {
-            return Err(WaitTargetsError::TooMany { count: tasks.len() });
+        if ids.len() > MAX_WAIT_TARGETS {
+            return Err(WaitTargetsError::TooMany { count: ids.len() });
         }
-        for (index, task) in tasks.iter().enumerate() {
-            if tasks[..index].contains(task) {
-                return Err(WaitTargetsError::Duplicate { task: *task });
+        for (index, id) in ids.iter().enumerate() {
+            if ids[..index].contains(id) {
+                return Err(WaitTargetsError::Duplicate { id: *id });
             }
         }
-        Ok(Self(tasks))
+        Ok(())
     }
 
     /// Targets in report order
     #[must_use]
-    pub fn tasks(&self) -> &[TaskId] {
+    pub fn targets(&self) -> &[Dependency] {
         &self.0
     }
-}
 
-impl TryFrom<Vec<TaskId>> for WaitTargets {
-    type Error = WaitTargetsError;
-
-    fn try_from(tasks: Vec<TaskId>) -> Result<Self, Self::Error> {
-        Self::new(tasks)
+    /// The `after` entry of each target, in report order
+    pub fn ids(&self) -> impl Iterator<Item = DependencyId> + '_ {
+        self.0.iter().map(|target| target.id())
     }
 }
 
-impl From<WaitTargets> for Vec<TaskId> {
+impl TryFrom<Vec<SavedTarget>> for WaitTargets {
+    type Error = WaitTargetsError;
+
+    fn try_from(saved: Vec<SavedTarget>) -> Result<Self, Self::Error> {
+        Self::new(saved.into_iter().map(Dependency::from).collect())
+    }
+}
+
+impl From<WaitTargets> for Vec<Dependency> {
     fn from(targets: WaitTargets) -> Self {
         targets.0
     }
@@ -149,10 +189,10 @@ impl From<WaitingNotes> for String {
     }
 }
 
-/// Data of a `waiting` report: the tasks the worker waits on and its notes
+/// Data of a `waiting` report: the tasks and jobs the worker waits on and its notes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitingReport {
-    /// Tasks that must end before the continuation starts
+    /// Tasks and jobs that must end before the continuation starts
     pub on: WaitTargets,
     /// Notes the continuation receives
     pub notes: WaitingNotes,
@@ -174,7 +214,7 @@ pub enum ChainState {
     Waiting {
         /// Run that reported waiting and exited
         current: TaskId,
-        /// Tasks the continuation waits on
+        /// Tasks and jobs the continuation waits on
         on: WaitTargets,
         /// Held run that continues the work
         continuation: TaskId,
@@ -200,10 +240,10 @@ pub struct ChainView {
     pub state: ChainState,
 }
 
-/// What a parked run handed over: the tasks it waits on and its continuation
+/// What a parked run handed over: the tasks and jobs it waits on and its continuation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parking {
-    /// Tasks the continuation waits on
+    /// Tasks and jobs the continuation waits on
     pub on: WaitTargets,
     /// Held run that continues the work
     pub continuation: TaskId,
@@ -215,19 +255,23 @@ pub enum WaitingRejection {
     /// Only agent workers can be resumed, and queue runs report through their job
     #[error("only agent tasks outside the GPU queue may report waiting")]
     UnsupportedWorkload,
-    /// A target is not a task this daemon knows
-    #[error("waiting target {task} is not a task on this machine")]
+    /// A target names no task or job this daemon knows
+    #[error("waiting target {id} is not a task or a GPU queue job on this machine")]
     UnknownTarget {
-        /// Unknown target
-        task: TaskId,
+        /// Unknown id
+        id: DependencyId,
     },
     /// A target is a GPU queue run, which can end while its job continues
-    #[error("waiting target {task} is a GPU queue run; wait on a task instead")]
-    TargetUnsupported {
+    #[error(
+        "waiting target {task} is a run of GPU queue job {job}, which can run again; name the job with --on {job} instead"
+    )]
+    QueueRun {
         /// Queue run named as a target
         task: TaskId,
+        /// Job the run belongs to
+        job: JobId,
     },
-    /// The worker or a target runs on, or reports to, another machine
+    /// The worker or a target task runs on, or reports to, another machine
     #[error(
         "task {task} runs on or reports to another machine; waiting needs the worker and every target on this machine"
     )]
@@ -235,11 +279,20 @@ pub enum WaitingRejection {
         /// Task that is not local
         task: TaskId,
     },
+    /// A target job was submitted through another machine, so its events
+    /// never reach this one
+    #[error(
+        "job {job} was submitted from another machine; waiting needs every target job submitted from this machine"
+    )]
+    RemoteJob {
+        /// Job that is not local
+        job: JobId,
+    },
     /// Waiting on these targets would make the work wait on itself
-    #[error("waiting on {task} would wait on this task itself")]
+    #[error("waiting on {target} would wait on this task itself")]
     Cycle {
         /// Target that leads back to the worker
-        task: TaskId,
+        target: Dependency,
     },
     /// The chain already has the most runs it may have
     #[error(
@@ -258,22 +311,35 @@ impl WaitingRejection {
         match self {
             Self::UnsupportedWorkload => "waiting_unsupported_workload",
             Self::UnknownTarget { .. } => "unknown_dependency",
-            Self::TargetUnsupported { .. } => "waiting_target_unsupported",
-            Self::Remote { .. } => "waiting_remote_unsupported",
+            Self::QueueRun { .. } => "waiting_target_unsupported",
+            Self::Remote { .. } | Self::RemoteJob { .. } => "waiting_remote_unsupported",
             Self::Cycle { .. } => "waiting_cycle",
             Self::TooManyContinuations { .. } => "too_many_continuations",
         }
     }
 
     /// Structured input for the error body
+    ///
+    /// A task is under `task` and a job under `job`. An unknown id is under
+    /// `task`, as `unknown_dependency` names it for `after`
     #[must_use]
     pub fn input(&self) -> Value {
         match self {
             Self::UnsupportedWorkload => json!({}),
-            Self::UnknownTarget { task }
-            | Self::TargetUnsupported { task }
-            | Self::Remote { task }
-            | Self::Cycle { task } => json!({ "task": task }),
+            Self::UnknownTarget { id } => json!({ "task": id }),
+            Self::QueueRun { task, job } => json!({ "task": task, "job": job }),
+            Self::Remote { task }
+            | Self::Cycle {
+                target: Dependency::Task(task),
+            } => {
+                json!({ "task": task })
+            }
+            Self::RemoteJob { job }
+            | Self::Cycle {
+                target: Dependency::Job(job),
+            } => {
+                json!({ "job": job })
+            }
             Self::TooManyContinuations { runs } => json!({ "runs": runs, "max": MAX_CHAIN_RUNS }),
         }
     }
@@ -287,7 +353,7 @@ impl WaitingRejection {
 pub fn continuation_block(worker: TaskId, waiting: &WaitingReport) -> String {
     let targets = waiting
         .on
-        .tasks()
+        .targets()
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
@@ -295,12 +361,18 @@ pub fn continuation_block(worker: TaskId, waiting: &WaitingReport) -> String {
     let mut block = format!(
         "--- homebased continuation ---\n\
          You are continuing task {worker}. You reported waiting on {targets}.\n\
-         Those tasks have now ended. Read each outcome with:\n"
+         Those have now ended. Read each outcome with:\n"
     );
-    for task in waiting.on.tasks() {
-        block.push_str(&format!(
-            "  homebased --json task show {task}\n  homebased task log {task} --tail 200\n"
-        ));
+    for target in waiting.on.targets() {
+        match target {
+            Dependency::Task(task) => block.push_str(&format!(
+                "  homebased --json task show {task}\n  homebased task log {task} --tail 200\n"
+            )),
+            Dependency::Job(job) => block.push_str(&format!(
+                "  homebased --json resource job show {job}\n  \
+                 then homebased task log <run task> --tail 200 for its last run\n"
+            )),
+        }
     }
     block.push_str("Your notes from before you stopped:\n");
     block.push_str(waiting.notes.as_str());
@@ -328,17 +400,23 @@ mod tests {
         ChainState, MAX_WAIT_TARGETS, NOTES_MAX_BYTES, WaitTargets, WaitTargetsError, WaitingNotes,
         WaitingNotesError, WaitingReport, continuation_block, continuation_name,
     };
+    use crate::dependency::Dependency;
     use crate::domain::{TaskId, TaskName};
+    use crate::queue::JobId;
+
+    fn task() -> Dependency {
+        Dependency::Task(TaskId::new())
+    }
 
     #[test]
     fn targets_and_notes_refuse_invalid_input() {
-        let task = TaskId::new();
+        let task = task();
         assert_eq!(WaitTargets::new(Vec::new()), Err(WaitTargetsError::Empty));
         assert_eq!(
-            WaitTargets::new(vec![task, task]),
-            Err(WaitTargetsError::Duplicate { task })
+            WaitTargets::new(vec![task, Dependency::Job(JobId::new()), task]),
+            Err(WaitTargetsError::Duplicate { id: task.id() })
         );
-        let many = (0..=MAX_WAIT_TARGETS).map(|_| TaskId::new()).collect();
+        let many = (0..=MAX_WAIT_TARGETS).map(|_| self::task()).collect();
         assert!(matches!(
             WaitTargets::new(many),
             Err(WaitTargetsError::TooMany { .. })
@@ -356,18 +434,47 @@ mod tests {
     }
 
     #[test]
+    fn targets_are_tagged_and_a_bare_uuid_reads_as_a_saved_task() {
+        let (task, job) = (TaskId::new(), JobId::new());
+        let targets = WaitTargets::new(vec![Dependency::Task(task), Dependency::Job(job)]).unwrap();
+        let wire = serde_json::to_value(&targets).unwrap();
+        assert_eq!(wire, serde_json::json!([{ "task": task }, { "job": job }]));
+        assert_eq!(
+            serde_json::from_value::<WaitTargets>(wire).unwrap(),
+            targets
+        );
+
+        // reports and chains saved before job targets hold bare task UUIDs
+        let saved = serde_json::json!([task, { "job": job }]);
+        assert_eq!(
+            serde_json::from_value::<WaitTargets>(saved).unwrap(),
+            targets
+        );
+    }
+
+    #[test]
     fn continuation_block_names_each_target_and_carries_the_notes() {
         let worker = TaskId::new();
-        let (first, second) = (TaskId::new(), TaskId::new());
+        let (first, second, job) = (TaskId::new(), TaskId::new(), JobId::new());
         let waiting = WaitingReport {
-            on: WaitTargets::new(vec![first, second]).unwrap(),
+            on: WaitTargets::new(vec![
+                Dependency::Task(first),
+                Dependency::Job(job),
+                Dependency::Task(second),
+            ])
+            .unwrap(),
             notes: WaitingNotes::new("if it fails, rerun with --small".into()).unwrap(),
         };
         let block = continuation_block(worker, &waiting);
         assert!(block.starts_with("--- homebased continuation ---\n"));
         assert!(block.contains(&format!("You are continuing task {worker}.")));
-        assert!(block.contains(&format!("homebased --json task show {second}")));
-        assert!(block.contains(&format!("homebased task log {first} --tail 200")));
+        assert!(block.contains(&format!(
+            "You reported waiting on task {first}, job {job}, task {second}.\n"
+        )));
+        assert!(block.contains(&format!("homebased --json task show {second}\n")));
+        assert!(block.contains(&format!("homebased task log {first} --tail 200\n")));
+        assert!(block.contains(&format!("homebased --json resource job show {job}\n")));
+        assert!(!block.contains(&format!("task show {job}")), "{block}");
         assert!(block.contains("if it fails, rerun with --small\n"));
         assert!(block.ends_with("Do not redo completed work.\n"));
     }
@@ -387,7 +494,7 @@ mod tests {
         let continuation = TaskId::new();
         let state = ChainState::Waiting {
             current: TaskId::new(),
-            on: WaitTargets::new(vec![TaskId::new()]).unwrap(),
+            on: WaitTargets::new(vec![task(), Dependency::Job(JobId::new())]).unwrap(),
             continuation,
         };
         let wire = serde_json::to_value(&state).unwrap();

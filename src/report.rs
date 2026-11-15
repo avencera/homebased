@@ -7,12 +7,13 @@ When your work is complete, run exactly one of:
   homebased task report --outcome failed --summary "<what failed and why>"
   homebased task report --outcome blocked --summary "<the decision you need>"
 Do not wait on a long command or detach it with `&`, `nohup`, or `setsid`.
-Submit it with `homebased task submit`, then report waiting and exit:
-  homebased task report --outcome waiting --on <task-id> \
+Submit it with `homebased task submit`, or GPU work with
+`homebased resource job submit`, then report waiting and exit:
+  homebased task report --outcome waiting --on <task-or-job-id> \
     --summary "<what is running and why>" --notes-file - <<'NOTES'
 <what each outcome means and the next steps>
 NOTES
-Homebased starts a continuation with your notes once those tasks end.
+Homebased starts a continuation with your notes once those tasks and jobs end.
 Do not run `codex queue`. Do not report before the work is complete.
 You may report more than once. Reports are appended in order, and the
 last outcome is your final outcome. Add --notify only if the
@@ -28,7 +29,7 @@ mod tests {
         assert!(REPORT_TRAILER.contains("homebased task report"));
         assert!(REPORT_TRAILER.contains("Do not run `codex queue`"));
         assert!(REPORT_TRAILER.contains("--notify"));
-        assert!(REPORT_TRAILER.contains("--outcome waiting --on <task-id>"));
+        assert!(REPORT_TRAILER.contains("--outcome waiting --on <task-or-job-id>"));
         assert!(REPORT_TRAILER.contains("--notes-file -"));
     }
 }

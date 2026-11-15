@@ -185,9 +185,11 @@ pub enum TaskCommand {
         /// Summary file, or `-` for stdin.
         #[arg(long)]
         summary_file: Option<String>,
-        /// Task to wait on, repeated for each one. Required with `--outcome waiting`.
-        #[arg(long = "on", value_name = "TASK_ID")]
-        on: Vec<TaskId>,
+        /// Task, or GPU queue job, this machine submitted to wait on, repeated
+        /// for each one. Required with `--outcome waiting`. Name a job by its
+        /// job id, not by the id of one of its runs.
+        #[arg(long = "on", value_name = "TASK_OR_JOB_ID")]
+        on: Vec<DependencyId>,
         /// Notes for the continuation, or `-` for stdin. Required with `--outcome waiting`.
         #[arg(long)]
         notes_file: Option<String>,
@@ -1075,13 +1077,18 @@ struct ReportInput {
     outcome: ReportKind,
     summary: Option<String>,
     summary_file: Option<String>,
-    on: Vec<TaskId>,
+    on: Vec<DependencyId>,
     notes_file: Option<String>,
 }
 
 impl ReportInput {
     /// Read the summary and build the outcome with the data its kind needs
-    fn read(self) -> Result<(ReportOutcome, String), AppError> {
+    ///
+    /// `resolve` names each `--on` id as a task or a job
+    fn read(
+        self,
+        resolve: impl FnOnce(Vec<DependencyId>) -> Result<WaitTargets, AppError>,
+    ) -> Result<(ReportOutcome, String), AppError> {
         let usage = |message: &str| AppError::Usage {
             message: message.into(),
         };
@@ -1106,7 +1113,7 @@ impl ReportInput {
                 ));
             }
             (ReportKind::Waiting, _, Some(path)) => {
-                let on = WaitTargets::new(self.on).map_err(|error| usage(&error.to_string()))?;
+                let on = resolve(self.on)?;
                 let notes = WaitingNotes::new(read_summary(&path)?)
                     .map_err(|error| usage(&error.to_string()))?;
                 ReportOutcome::Waiting(WaitingReport { on, notes })
@@ -1138,8 +1145,8 @@ fn report(
             })?
             .parse()?,
     };
-    let (outcome, summary) = input.read()?;
     let store = Store::open(&ctx.home.db_path())?;
+    let (outcome, summary) = input.read(|ids| store.wait_targets(ids))?;
     let reports = store.append_report(id, &outcome, &summary, notify)?;
     let seq = reports.last().map_or(0, |r| r.seq);
     let row = store.require_task(id)?;

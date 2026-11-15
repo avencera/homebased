@@ -23,6 +23,7 @@ use super::{
     ProcessPayload, WorkloadView, check_due_event, classify_exit, exit_event, last_event_for_row,
     lost_event, notify_event, send_saved_queue_attempt,
 };
+use crate::dependency::Dependency;
 use crate::domain::{
     Agent, AgentKind, AgentWorkload, ExitReason, ProcessGroupExitEvidence, ReportOutcome, TaskEnv,
     TaskId, TaskReport, TaskRow, TaskState, Workload,
@@ -268,7 +269,7 @@ fn waiting_report(seq: i64, on: TaskId) -> TaskReport {
     report(
         seq,
         ReportOutcome::Waiting(WaitingReport {
-            on: WaitTargets::new(vec![on]).unwrap(),
+            on: WaitTargets::new(vec![Dependency::Task(on)]).unwrap(),
             notes: WaitingNotes::new("next steps".into()).unwrap(),
         }),
     )
@@ -345,7 +346,7 @@ fn a_parked_exit_names_its_targets_and_continuation_and_asks_nothing() {
         reason: ExitReason::Exit { code: 0 },
     });
     let parking = Parking {
-        on: WaitTargets::new(vec![target]).unwrap(),
+        on: WaitTargets::new(vec![Dependency::Task(target)]).unwrap(),
         continuation: TaskId::new(),
     };
     let reports = [waiting_report(1, target)];

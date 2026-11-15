@@ -810,7 +810,7 @@ pub enum ReportKind {
     Failed,
     /// Worker needs a decision
     Blocked,
-    /// Worker parked on other tasks and continues when they end
+    /// Worker parked on other tasks or jobs and continues when they end
     Waiting,
 }
 
@@ -858,7 +858,7 @@ pub enum ReportOutcome {
     Failed,
     /// Worker needs a decision
     Blocked,
-    /// Worker parked on other tasks
+    /// Worker parked on other tasks or jobs
     Waiting(crate::waiting::WaitingReport),
 }
 

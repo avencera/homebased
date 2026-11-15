@@ -187,7 +187,7 @@ pub enum EventKind {
     TaskLost,
     /// Last report is blocked.
     TaskBlocked,
-    /// The worker parked on other tasks; its continuation runs once they end.
+    /// The worker parked on other tasks or jobs; its continuation runs once they end.
     TaskWaiting,
     /// Failure or non-zero exit.
     TaskFailed,
@@ -330,10 +330,10 @@ pub struct HomebasedEvent {
     /// Why the origin cancelled a held task before it launched. Present only on that `TASK_CANCELLED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<HeldCancellation>,
-    /// Tasks the worker waits on. Present only on `TASK_WAITING`, with `continuation`.
+    /// Tasks and jobs the worker waits on. Present only on `TASK_WAITING`, with `continuation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<WaitTargets>,
-    /// Held task that continues the work once every `waiting_on` task ends.
+    /// Held task that continues the work once every `waiting_on` task and job ends.
     /// Present only on `TASK_WAITING`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<TaskId>,
