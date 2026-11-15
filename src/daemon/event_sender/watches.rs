@@ -22,7 +22,7 @@ use tracing::warn;
 
 use super::Retry;
 use crate::daemon::AppState;
-use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event};
+use crate::daemon::actors::callback::{CallbackMsg, deliver_watch_event, resumption};
 use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
 use crate::daemon::thread_api::{caller_t3_here, caller_wake_owed};
 use crate::error::AppError;
@@ -230,7 +230,8 @@ async fn deliver(
     // the routes that run `codex queue` check the saved cwd and Codex binary
     // themselves and settle a missing one as permanent; a Claude or T3 route
     // needs neither, so no check runs before the route is chosen
-    match deliver_watch_event(&state.home, watch, event, &callback).await? {
+    let resumption = resumption(&state.store, watch.caller).await?;
+    match deliver_watch_event(&state.home, watch, event, &callback, resumption).await? {
         Some(DeliveryOutcome::Delivered) => Ok(settle("delivered").await?),
         None => Ok(settle("suppressed").await?),
         Some(DeliveryOutcome::Permanent(message)) => {

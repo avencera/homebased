@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 18;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 18] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -37,6 +37,7 @@ const MIGRATIONS: [Migration; 17] = [
     add_ci_slots,
     add_preempt_operations,
     add_route_mem_peaks,
+    add_sleep_holds,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -225,6 +226,28 @@ fn add_route_mem_peaks(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE origin_routes ADD COLUMN {ROUTE_MEM_PEAK};"
     ))
 }
+
+/// Version 19: `homebased wait --long` holds progress events for its thread
+fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(SLEEP_HOLDS_TABLE)
+}
+
+/// One row per task chain or job a sleeping thread waits on
+///
+/// A task row names the chain's current run and moves to the continuation
+/// when that run parks. `held_json` lists the `HeldEvent`s settled without
+/// waking the thread; the final event's settlement deletes the row
+const SLEEP_HOLDS_TABLE: &str = "
+CREATE TABLE sleep_holds (
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('task', 'job')),
+    target_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    held_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (target_kind, target_id)
+);
+CREATE INDEX sleep_holds_thread ON sleep_holds (thread_id);
+";
 
 /// Peak host memory of a task in MiB, submitted with `mem_peak`; the route is
 /// held until the memory gate admits it, and its task is a claim while it runs
@@ -536,6 +559,7 @@ fn schema() -> String {
         .replace("{RESOURCE_CI_SLOT}", RESOURCE_CI_SLOT)
         .replace("{RESOURCE_CI_RETIRED}", RESOURCE_CI_RETIRED)
         .replace("{CI_TABLES}", CI_TABLES)
+        .replace("{SLEEP_HOLDS_TABLE}", SLEEP_HOLDS_TABLE)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -883,7 +907,8 @@ CREATE TABLE resource_job_delivery (
 {GPU_IDLE_TABLES}
 {LEASE_IDLE_TABLE}
 {SERVICES_TABLE}
-{CI_TABLES}";
+{CI_TABLES}
+{SLEEP_HOLDS_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -1005,6 +1030,7 @@ mod tests {
             .replace(&format!(",\n    {}", super::RESOURCE_CI_SLOT), "")
             .replace(&format!(",\n    {}", super::RESOURCE_CI_RETIRED), "")
             .replace(super::CI_TABLES, "")
+            .replace(super::SLEEP_HOLDS_TABLE, "")
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -1039,6 +1065,7 @@ mod tests {
             "resource_gpu_idle_attempts",
             "resource_gpu_idle_controls",
             "services",
+            "sleep_holds",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
@@ -1081,9 +1108,11 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // version 12 had no lease guard, services, CI slots, or memory peaks
+        // version 12 had no lease guard, services, CI slots, memory peaks, or
+        // sleep holds
         conn.execute_batch(
             "ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
+             DROP TABLE sleep_holds;
              DROP TABLE lease_idle_trips; DROP TABLE services;
              DROP TABLE ci_drain; DROP TABLE ci_run_timeouts; DROP TABLE ci_job_timings;
              ALTER TABLE resources DROP COLUMN ci_retired;

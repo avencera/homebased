@@ -186,6 +186,12 @@ pub enum DeliveryState {
         /// Last failed attempt before success, if any
         last_error: Option<String>,
     },
+    /// The origin thread sleeps on the task, so the event settled into the
+    /// sleep's hold without waking it, to be listed on the final event
+    Held {
+        /// Reserved command attempts
+        attempts: u8,
+    },
     /// Queue delivery ended without success; the result remains visible
     DeliveryFailed {
         /// Reserved command attempts
@@ -206,6 +212,7 @@ impl DeliveryState {
             Self::PendingDelivery { .. } => Some(CallbackStatus::Sending),
             Self::AwaitingThread { .. } => Some(CallbackStatus::Waiting),
             Self::Delivered { .. } => Some(CallbackStatus::Sent),
+            Self::Held { .. } => Some(CallbackStatus::Held),
             Self::DeliveryFailed { .. } => Some(CallbackStatus::Failed),
         }
     }

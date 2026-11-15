@@ -747,6 +747,9 @@ pub enum CallbackStatus {
     Waiting,
     /// `codex queue` succeeded
     Sent,
+    /// The origin thread sleeps on the work, so the event settled into the
+    /// sleep's hold without waking it
+    Held,
     /// The terminal event settled without queue success
     Failed,
 }
@@ -760,6 +763,7 @@ impl CallbackStatus {
             Self::Sending => "sending",
             Self::Waiting => "waiting",
             Self::Sent => "sent",
+            Self::Held => "held",
             Self::Failed => "failed",
         }
     }

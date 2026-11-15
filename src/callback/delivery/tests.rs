@@ -208,6 +208,7 @@ impl Fixture {
                 path: &self.lock,
                 check: Some(&check),
                 hold: false,
+                resumption: crate::callback::stale_context::Resumption::Likely,
             },
         )
     }
@@ -227,6 +228,7 @@ impl Fixture {
                 path: &self.lock,
                 check: Some(&check),
                 hold: false,
+                resumption: crate::callback::stale_context::Resumption::Likely,
             },
         )
     }

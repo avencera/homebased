@@ -131,7 +131,8 @@ A Claude session or Codex thread that a T3 thread owns may be compacted while it
 When it is not archived, runs no turn, and will likely run again (a task or queue job still runs
 for it, T3 owes it a delegated task's report, or it is unsettled and not a
 finished delegate), the daemon sends `/compact` to that thread after 55 idle minutes
-if the context has at least 175,000 tokens, while the prompt cache is still warm. A
+if the context has at least 175,000 tokens, while the prompt cache is still warm,
+or 60,000 tokens for a thread that sleeps on work with `homebased wait --long`. A
 message for such a session whose cache already lapsed, with at least 175,000 context
 tokens, sends `/compact` first.
 A message that arrives during a compaction waits behind it, so the agent reads

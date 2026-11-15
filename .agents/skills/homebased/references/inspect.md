@@ -32,7 +32,7 @@ homebased --json task show <id>
 | `workload` | `{"type":"agent","agent":"…","model":null\|string}`, `{"type":"task","command":[…]}`, or `{"type":"container","image":"…","args":[…]}` with optional `entrypoint` and `gpus`. Container environment values are not shown. |
 | `worker_thread` | Worker thread UUID. A Claude worker's session id, recorded when it starts running; send it new instructions with `message send --worker`. A Codex worker's thread, recorded when the task ends, including lost tasks, if Homebased found a valid session id in the first 64 KiB of `output.log`. Omitted when unknown. |
 | `exit_reason` | `null` while running, else the tagged payload (`exit`, `signal`, `cancelled`, `spawn_failed`). |
-| `callback` | Delivery of the terminal event to the submitting thread: `pending`, `sending`, `waiting`, `sent`, or `failed`. `null` when this machine delivers no callback for the task: on the executor of a task submitted from another machine (ask the origin), and on a queue run, which reports through its job. Use `failed_events` for per-event callback failures. |
+| `callback` | Delivery of the terminal event to the submitting thread: `pending`, `sending`, `waiting`, `sent`, `held`, or `failed`. `held` means the run parked while its thread slept on it with `homebased wait --long`, so its `TASK_WAITING` settled into the sleep without waking the thread. `null` when this machine delivers no callback for the task: on the executor of a task submitted from another machine (ask the origin), and on a queue run, which reports through its job. Use `failed_events` for per-event callback failures. |
 | `cancel_requested_at` | Set once `task cancel` ran. |
 | `reports` | Worker reports with `seq`, `outcome`, `summary`, `reported_at`, and `notified_at` when `--notify` succeeded. A `waiting` report also has `waiting_on` and the worker's `notes`. |
 | `evidence` | Task directory. |
@@ -71,9 +71,12 @@ The local daemon reads `output.log` on the execution machine. For a remote task,
 
 ```bash
 homebased wait [--next] <id> [<id> ...]    # task, job, or thread watch ids, 1-16 in total, no duplicates
+homebased wait --long <id> [<id> ...]      # sleep: hold the targets and exit at once
 ```
 
 Takes task ids, GPU queue job ids, and thread watch ids alike; the daemon works out which is which. Streams one `HOMEBASED_EVENT {...}` line per callback event of tasks and GPU queue jobs this session submitted and of watches it made, follows `TASK_WAITING` to the continuation run, and exits 0 when every target has its final outcome, or with `--next` about a second after the first event it prints. A job's final outcome is `JOB_SUCCEEDED`, `JOB_FAILED`, or `JOB_CANCELLED`, and a watch's is `THREAD_WATCH_ENDED`, or the `THREAD_CONTEXT_OVER` or `THREAD_STALLED` of a `--once` watch, which has `watch_ended: true`. It takes those events in place of normal delivery while it runs, and an event it did not print goes through normal delivery after about 5 seconds. It reconnects silently across a daemon restart for up to 5 minutes. A task of another thread or machine, a job or watch of another thread, a queue run that ran on this machine, a task or job submitted without a thread, and a job the queue refused or has not confirmed return `wait_unavailable`. An id that is not a task, job, or thread watch of this machine returns `wait_target_not_found`, and a malformed id list is a usage error. With `--next`, it is meant for a background Bash command of a Claude Code session in a T3 Code thread; [t3.md](t3.md) has the full contract.
+
+`--long` takes the same ids, holds each live task and job for this thread, prints one result per target on stderr (`held`, `already_ended`, `followed_to <continuation>`, or `watched`), and exits 0 at once. The daemon then wakes the thread only with each target's final event, which lists the held progress events under `held_events` ([events.md](events.md#held-events)), or with an alert. In a T3 `delegate_task` child it waits up to 115 minutes instead, and a homebased worker gets a usage error. [t3.md](t3.md#sleeping-on-long-work) has the full contract.
 
 ## Usage
 

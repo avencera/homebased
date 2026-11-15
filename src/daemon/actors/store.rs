@@ -227,6 +227,38 @@ pub(crate) enum StoreMsg {
         seq: u64,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Settle a progress event into a sleep's hold on its job
+    HoldJobEvent {
+        job: crate::queue::JobId,
+        seq: u64,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Hold a task chain for a sleeping thread, from the run that carries on its work
+    HoldTask {
+        task: TaskId,
+        thread: ThreadId,
+        reply: RpcReplyPort<Result<crate::task_wait::SleepOutcome, AppError>>,
+    },
+    /// Hold a job for a sleeping thread unless its final event settled
+    HoldJob {
+        job: crate::queue::JobId,
+        thread: ThreadId,
+        reply: RpcReplyPort<Result<crate::task_wait::SleepOutcome, AppError>>,
+    },
+    /// Read the hold on one target
+    SleepHold {
+        target: crate::task_wait::HoldTarget,
+        reply: RpcReplyPort<Result<Option<crate::task_wait::SleepHold>, AppError>>,
+    },
+    /// Whether a thread has at least one hold
+    ThreadSleeps {
+        thread: ThreadId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Read threads with at least one hold
+    SleepingThreads {
+        reply: RpcReplyPort<Result<Vec<ThreadId>, AppError>>,
+    },
     /// Wake the local queue after task mutations; worker commits also have a recovery scan
     WatchQueue {
         queue: ActorRef<super::queue::QueueMsg>,
@@ -479,6 +511,12 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         seq: NonZeroU64,
         outcome: DeliveryOutcome,
+        reply: RpcReplyPort<Result<InboxEvent, AppError>>,
+    },
+    /// Settle the earliest inbox event into a sleep's hold on its task
+    HoldInboxEvent {
+        id: TaskId,
+        seq: NonZeroU64,
         reply: RpcReplyPort<Result<InboxEvent, AppError>>,
     },
     /// Read retained origin callback failures
@@ -985,6 +1023,22 @@ impl Actor for StoreActor {
             StoreMsg::SettleJobEvent { job, seq, reply } => {
                 send_reply(reply, state.settle_job_event(job, seq))
             }
+            StoreMsg::HoldJobEvent { job, seq, reply } => {
+                send_reply(reply, state.hold_job_event(job, seq))
+            }
+            StoreMsg::HoldTask {
+                task,
+                thread,
+                reply,
+            } => send_reply(reply, state.hold_task(task, thread, Utc::now())),
+            StoreMsg::HoldJob { job, thread, reply } => {
+                send_reply(reply, state.hold_job(job, thread, Utc::now()))
+            }
+            StoreMsg::SleepHold { target, reply } => send_reply(reply, state.sleep_hold(target)),
+            StoreMsg::ThreadSleeps { thread, reply } => {
+                send_reply(reply, state.thread_sleeps(thread))
+            }
+            StoreMsg::SleepingThreads { reply } => send_reply(reply, state.sleeping_threads()),
             StoreMsg::WatchQueue { queue } => state.queue = Some(queue),
             StoreMsg::QueueLaunchFailed {
                 machine,
@@ -1195,6 +1249,9 @@ impl Actor for StoreActor {
                     .settle_inbox_attempt(id, seq, outcome)
                     .map_err(event_error),
             ),
+            StoreMsg::HoldInboxEvent { id, seq, reply } => {
+                send_reply(reply, state.hold_inbox_event(id, seq).map_err(event_error))
+            }
             StoreMsg::FailedInboxEvents { id, reply } => {
                 send_reply(reply, state.failed_inbox_events(id).map_err(event_error))
             }

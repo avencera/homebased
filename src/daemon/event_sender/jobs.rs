@@ -14,17 +14,22 @@ use tracing::warn;
 use super::Retry;
 use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::daemon::AppState;
-use crate::daemon::actors::callback::{CallbackMsg, deliver_job_event, job_event_line};
+use crate::daemon::actors::callback::{
+    CallbackMsg, JobSend, deliver_job_event, job_event_line, resumption, sleep_hold,
+    with_held_events,
+};
 use crate::daemon::actors::waiter::JobHandoff;
-use crate::daemon::actors::{StoreMsg, SupervisorMsg, call};
+use crate::daemon::actors::{StoreMsg, SupervisorMsg, WaiterRegistry, call};
 use crate::daemon::queue_api::{ClusterJobEvent, forward};
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, EventAcceptance};
 use crate::fleet::http::ClusterClient;
+use crate::home::Home;
 use crate::queue::delivery::{JobRoute, RoutedJobEvent};
 use crate::queue::{JobEvent, JobId};
 use crate::store::queue::interface::QueueRequest;
+use crate::task_wait::{EventClass, HoldTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Stage {
@@ -251,9 +256,12 @@ async fn deliver_origin(
         reply,
     })
     .await?;
-    // a connected `homebased wait` stream prints the line for the agent that
-    // armed it; waking the thread as well would wake the agent twice
-    let line = job_event_line(&route, &event.event)?;
+    let origin = JobOrigin {
+        store: &state.store,
+        home: &state.home,
+        callback: &callback,
+        waiters: &state.waiters,
+    };
     let notice = event.event.event.is_suppressible_notice();
     let seq = event.event.seq;
     // an unanswered check leaves the notice to normal delivery, whose own
@@ -266,26 +274,84 @@ async fn deliver_origin(
             Some(true)
         }
     };
-    match state
-        .waiters
-        .hand_off_job(route.thread, &event.event, &line, current)
+    origin
+        .deliver(&route, &event.event, before_send, current)
         .await
+}
+
+/// What delivering a job event to its origin thread uses besides the event
+pub(crate) struct JobOrigin<'a> {
+    /// Store holding the job's inbox and sleep holds
+    pub(crate) store: &'a ActorRef<StoreMsg>,
+    /// Home of the job's delivery evidence
+    pub(crate) home: &'a Home,
+    /// Callback actor that wakes threads
+    pub(crate) callback: &'a ActorRef<CallbackMsg>,
+    /// Connected `homebased wait` streams, which take events first
+    pub(crate) waiters: &'a WaiterRegistry,
+}
+
+impl JobOrigin<'_> {
+    /// Deliver one job event to its thread and settle it
+    ///
+    /// A connected wait stream prints it first. Otherwise a progress event of
+    /// a job a sleep holds settles into the hold without waking the thread,
+    /// and any other event wakes it, the final one listing the held events.
+    /// `current` answers whether a blocked or GPU idle notice still stands
+    pub(crate) async fn deliver<F>(
+        &self,
+        route: &JobRoute,
+        event: &JobEvent,
+        before_send: Option<SendCheck>,
+        current: impl Fn() -> F,
+    ) -> Result<(), AppError>
+    where
+        F: std::future::Future<Output = Option<bool>>,
     {
-        JobHandoff::Printed => {
-            let _ = callback.cast(CallbackMsg::Delivered {
-                thread: route.thread,
-            });
-            let delivered = Some(DeliveryOutcome::Delivered);
-            return settle_callback(&state.store, route.job, seq, delivered).await;
+        let class = EventClass::job(event.event, event.gpu_idle.as_ref());
+        let hold = sleep_hold(self.store, route.thread, HoldTarget::Job(route.job)).await?;
+        let mut line = job_event_line(route, event)?;
+        if let Some(hold) = hold.as_ref().filter(|_| class.is_final()) {
+            line = with_held_events(&line, &hold.held)?;
         }
-        JobHandoff::Obsolete if notice => {
-            return settle_callback(&state.store, route.job, seq, None).await;
+        let notice = event.event.is_suppressible_notice();
+        let seq = event.seq;
+        // a connected `homebased wait` stream prints the line for the agent that
+        // armed it; waking the thread as well would wake the agent twice
+        match self
+            .waiters
+            .hand_off_job(route.thread, event, &line, current)
+            .await
+        {
+            JobHandoff::Printed => {
+                let _ = self.callback.cast(CallbackMsg::Delivered {
+                    thread: route.thread,
+                });
+                let delivered = Some(DeliveryOutcome::Delivered);
+                return settle_callback(self.store, route.job, seq, delivered).await;
+            }
+            JobHandoff::Obsolete if notice => {
+                return settle_callback(self.store, route.job, seq, None).await;
+            }
+            JobHandoff::Obsolete | JobHandoff::Declined => {}
         }
-        JobHandoff::Obsolete | JobHandoff::Declined => {}
+        if hold.is_some() && class == EventClass::Progress {
+            // the sleeping thread reads it on the final event instead
+            let job = route.job;
+            return call(self.store, |reply| StoreMsg::HoldJobEvent {
+                job,
+                seq,
+                reply,
+            })
+            .await;
+        }
+        let send = JobSend {
+            before_send,
+            resumption: resumption(self.store, route.thread).await?,
+        };
+        let outcome = deliver_job_event(self.home, route, line, event, self.callback, send).await?;
+        settle_callback(self.store, route.job, seq, outcome).await
     }
-    let outcome =
-        deliver_job_event(&state.home, &route, &event.event, &callback, before_send).await?;
-    settle_callback(&state.store, route.job, event.event.seq, outcome).await
 }
 
 /// Settle delivered or suppressed callbacks without removing numbered payloads
