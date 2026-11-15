@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::chain::parking_on;
 use super::identity::{JOB_WAIT_LIMIT, OwedTarget};
 use super::{Store, fmt_time, parse_time};
 use crate::callback::{EventKind, HomebasedEvent};
@@ -264,53 +265,111 @@ fn job_cutoff() -> String {
 
 /// Follow the settled parks of the chain from `task` to the run that carries
 /// on its work now
+///
+/// A run's settled events are read from the inbox while retention keeps them.
+/// Once compaction removed a run's terminal callback it leaves a receipt, so
+/// the run ended or parked and the saved chain says which: the park its
+/// callback named is the one [`parking_on`] reads back
 fn follow_chain(conn: &Connection, task: TaskId) -> Result<ChainEnd, AppError> {
     let mut current = task;
     let mut parked_on = None;
     let mut seen = HashSet::from([task]);
-    'runs: loop {
-        let mut statement = conn.prepare(
-            "SELECT event_json,delivery_json FROM origin_inbox WHERE task_id=?1 ORDER BY seq",
-        )?;
-        let rows = statement
-            .query_map([current.to_string()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (event_json, delivery_json) in rows {
-            let delivery: DeliveryState = serde_json::from_str(&delivery_json)?;
-            // events past an unsettled one have not reached the thread yet
-            if delivery.is_unsettled() {
+    loop {
+        let parking = match run_end(conn, current)? {
+            RunEnd::Ended => return Ok(ChainEnd::Ended),
+            RunEnd::Live => {
                 return Ok(ChainEnd::Live {
                     run: current,
                     parked_on,
                 });
             }
-            let event: TaskEvent = serde_json::from_str(&event_json)?;
-            let EventPayload::Callback { event, .. } = event.payload else {
-                continue;
-            };
-            if EventClass::task(event.event).is_final() {
-                return Ok(ChainEnd::Ended);
-            }
-            if event.event == EventKind::TaskWaiting
-                && let Some(continuation) = event.continuation
-            {
-                if !seen.insert(continuation) {
-                    return Err(AppError::Internal {
-                        message: format!("task chain of {task} parks in a cycle"),
-                    });
-                }
-                current = continuation;
-                parked_on = event.waiting_on;
-                continue 'runs;
-            }
+            RunEnd::Parked(parking) => parking,
+        };
+        if !seen.insert(parking.continuation) {
+            return Err(AppError::Internal {
+                message: format!("task chain of {task} parks in a cycle"),
+            });
         }
-        return Ok(ChainEnd::Live {
-            run: current,
-            parked_on,
-        });
+        current = parking.continuation;
+        parked_on = parking.on;
     }
+}
+
+/// How one run of a chain stands, from its settled events
+enum RunEnd {
+    /// Its final event settled
+    Ended,
+    /// It parked, and its waiting event settled
+    Parked(SettledPark),
+    /// It still runs, or its next events have not settled
+    Live,
+}
+
+/// A settled park: the continuation and what the parked run waits on
+struct SettledPark {
+    continuation: TaskId,
+    on: Option<WaitTargets>,
+}
+
+/// How run `run` stands, from its retained inbox rows, or from its receipts
+/// and saved chain once compaction removed the rows that decide it
+fn run_end(conn: &Connection, run: TaskId) -> Result<RunEnd, AppError> {
+    let mut statement = conn.prepare(
+        "SELECT event_json,delivery_json FROM origin_inbox WHERE task_id=?1 ORDER BY seq",
+    )?;
+    let rows = statement
+        .query_map([run.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (event_json, delivery_json) in rows {
+        let delivery: DeliveryState = serde_json::from_str(&delivery_json)?;
+        // events past an unsettled one have not reached the thread yet
+        if delivery.is_unsettled() {
+            return Ok(RunEnd::Live);
+        }
+        let event: TaskEvent = serde_json::from_str(&event_json)?;
+        let EventPayload::Callback { event, .. } = event.payload else {
+            continue;
+        };
+        if EventClass::task(event.event).is_final() {
+            return Ok(RunEnd::Ended);
+        }
+        if event.event == EventKind::TaskWaiting
+            && let Some(continuation) = event.continuation
+        {
+            return Ok(RunEnd::Parked(SettledPark {
+                continuation,
+                on: event.waiting_on,
+            }));
+        }
+    }
+
+    if !has_terminal_receipt(conn, run)? {
+        return Ok(RunEnd::Live);
+    }
+    // a parked run's waiting event is its terminal callback, built from the
+    // same saved chain, so a receipt with no saved park is the final event
+    Ok(match parking_on(conn, run)? {
+        Some(parking) => RunEnd::Parked(SettledPark {
+            continuation: parking.continuation,
+            on: Some(parking.on),
+        }),
+        None => RunEnd::Ended,
+    })
+}
+
+/// Whether compaction kept a receipt of a settled terminal callback of `task`
+fn has_terminal_receipt(conn: &Connection, task: TaskId) -> Result<bool, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM origin_event_receipts
+             WHERE task_id=?1 AND terminal_callback=1 LIMIT 1",
+            [task.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Hold `target` for `thread` in `role`, keeping a hold already on it

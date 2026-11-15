@@ -700,6 +700,75 @@ fn long_wait_on_a_task_that_ended_holds_nothing() {
 }
 
 #[test]
+fn long_wait_reads_ends_and_parks_whose_events_retention_compacted() {
+    let mut h = Harness::new();
+    let ended = h.submit(&Harness::task_spec(&["true"]));
+    let target = h.gated("compacted-park-target");
+    h.set_control("waiting", &format!("{target}\nCheck the target.\n"));
+    h.set_control("report", "succeeded\nDone.");
+    let worker = h.submit(&Harness::spec("codex", "train the model"));
+    for task in [&ended, &worker] {
+        assert!(
+            wait_until(Duration::from_secs(20), || h.show(task)["callback"]
+                == "sent"),
+            "{}",
+            h.show(task)
+        );
+    }
+
+    // the daemon compacts settled events when it starts, and these settled
+    // past the retention window
+    let db = h.home.join(homebased::home::DB_NAME);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE origin_inbox SET settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-31 days')
+             WHERE task_id IN (?1, ?2)",
+            [&ended, &worker],
+        )
+        .unwrap();
+    h.restart_daemon();
+    let retained = || -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM origin_inbox WHERE task_id IN (?1, ?2)",
+                [&ended, &worker],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(wait_until(Duration::from_secs(20), || retained() == 0));
+
+    let (code, stderr) = h.sleep(&[&ended, &worker]);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(&format!("task {ended}: already_ended")),
+        "{stderr}"
+    );
+    let prefix = format!("task {worker}: followed_to ");
+    let continuation: TaskId = stderr
+        .lines()
+        .find_map(|line| line.split_once(&prefix))
+        .map(|(_, continuation)| continuation.trim().parse().unwrap())
+        .unwrap_or_else(|| panic!("{stderr}"));
+    let store = Store::open(&db).unwrap();
+    for task in [&ended, &worker] {
+        let hold = store
+            .sleep_hold(HoldTarget::Task(task.parse().unwrap()))
+            .unwrap();
+        assert_eq!(hold, None, "{task}");
+    }
+    assert!(
+        store
+            .sleep_hold(HoldTarget::Task(continuation))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn a_long_wait_hold_survives_a_daemon_restart() {
     let mut h = Harness::new();
     h.set_control("sleep", "4");
