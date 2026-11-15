@@ -147,6 +147,7 @@ pub(in crate::daemon) async fn local_sources(state: &AppState) -> Result<LocalSo
         .await?
         .into_iter()
         .collect();
+    let links = call(&state.store, |reply| StoreMsg::ThreadLinks { reply }).await?;
     Ok(LocalSources {
         env: T3Env::from_env(),
         machine: state.machine.identity.machine,
@@ -155,6 +156,7 @@ pub(in crate::daemon) async fn local_sources(state: &AppState) -> Result<LocalSo
         waiting,
         sleeping,
         titles: state.thread_titles.clone(),
+        links,
     })
 }
 
@@ -1058,6 +1060,26 @@ pub(in crate::daemon) async fn caller_t3_here(
         .into_iter()
         .find(|thread| thread.host == ThreadHost::T3)?
         .t3_thread
+}
+
+/// The T3 thread here that `caller` runs in, when T3 has it
+///
+/// # Errors
+///
+/// `t3_unavailable` when this machine's T3 state cannot be read
+pub(in crate::daemon) async fn caller_t3_thread(
+    state: &AppState,
+    caller: Caller,
+) -> Result<Option<String>, AppError> {
+    let sources = local_sources(state).await?;
+    run_blocking(move || {
+        let index =
+            LocalIndex::load(sources, Utc::now()).map_err(|message| AppError::T3Unavailable {
+                message: format!("T3's thread state cannot be read: {message}"),
+            })?;
+        Ok(index.caller_t3_here(&caller).map(|t3| t3.id.clone()))
+    })
+    .await?
 }
 
 /// Whether the watch caller `caller`, whose T3 thread here is `caller_t3`

@@ -162,6 +162,23 @@ const COMPACTION_RUN_SQL: &str = "
       AND json_valid(r.payload_json) AND json_valid(m.payload_json)
       AND json_extract(m.payload_json, '$.text') = ?2
     LIMIT 1";
+// what a child thread's deferred settle waits on: the thread row, the newest
+// run of any status, and whether a user message came after the report. T3
+// writes ISO 8601 times with a `Z` suffix, which `julianday` reads
+const SETTLE_CHECK_SQL: &str = "
+    SELECT t.archived_at IS NOT NULL OR t.deleted_at IS NOT NULL,
+           CASE WHEN json_valid(t.payload_json)
+               THEN COALESCE(json_extract(t.payload_json, '$.settledOverride') = 'settled', 0)
+               ELSE 0 END,
+           latest.run_id,
+           COALESCE(latest.status IN ('queued', 'preparing', 'starting', 'running', 'waiting'), 0),
+           EXISTS (SELECT 1 FROM orchestration_v2_projection_messages m
+                   WHERE m.thread_id = t.thread_id AND m.role = 'user'
+                     AND julianday(m.created_at) > julianday(?2))
+    FROM orchestration_v2_projection_threads t
+    LEFT JOIN (SELECT run_id, status FROM orchestration_v2_projection_runs
+               WHERE thread_id = ?1 ORDER BY ordinal DESC LIMIT 1) latest ON 1
+    WHERE t.thread_id = ?1";
 const REQUIRED_STATE_SQL: &str = "
     SELECT p.thread_id, p.provider, p.driver, p.payload_json, p.updated_at,
            t.thread_id, t.title, t.archived_at, t.deleted_at
@@ -482,6 +499,36 @@ pub(super) fn compaction_running(
         .map_err(|_| "statev2.sqlite compaction run lookup failed".to_string())
 }
 
+/// What the deferred settle of `t3_thread` sees, for a report saved at `since`
+///
+/// A thread with no row reads as put away, as in [`is_put_away`]
+pub(super) fn settle_state(
+    path: &Path,
+    t3_thread: &str,
+    since: &str,
+) -> Result<super::SettleState, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let row = db
+        .query_row(SETTLE_CHECK_SQL, [t3_thread, since], |row| {
+            Ok(super::SettleState {
+                put_away: row.get(0)?,
+                settled: row.get(1)?,
+                latest_run: row.get(2)?,
+                run_active: row.get(3)?,
+                later_message: row.get(4)?,
+            })
+        })
+        .optional()
+        .map_err(|_| "statev2.sqlite settle lookup failed".to_string())?;
+    Ok(row.unwrap_or(super::SettleState {
+        put_away: true,
+        settled: false,
+        latest_run: None,
+        run_active: false,
+        later_message: false,
+    }))
+}
+
 /// Active provider thread of every thread that is not deleted, as in [`active_thread`]
 pub(super) fn active_threads(path: &Path) -> Result<Vec<ActiveThread>, String> {
     let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
@@ -637,6 +684,26 @@ pub(super) fn compact(
     let command_id = deterministic_id("homebased-t3-compact-command", thread_id, key);
     let message_id = deterministic_id("homebased-t3-compact-message", thread_id, key);
     let payload = dispatch_payload(thread_id, &command_id, &message_id, COMPACT_COMMAND, start);
+    dispatch(origin, token, &payload, None)
+}
+
+/// Settle `thread_id` unless a run after `run` has started
+///
+/// The command id derives from the run, so a retried settle for the same
+/// report is one command to T3
+pub(super) fn settle(
+    origin: &str,
+    thread_id: &str,
+    run: &str,
+    token: &str,
+) -> Result<(), ApiFailure> {
+    let command_id = deterministic_id("homebased-t3-settle", thread_id, run);
+    let payload = json!({
+        "type": "thread.settle",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "expectedLatestRunId": run,
+    });
     dispatch(origin, token, &payload, None)
 }
 

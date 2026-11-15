@@ -435,6 +435,7 @@ homebased thread watch [<ref>...] --context-above <150k|80%> [--action compact] 
 homebased thread watch [<ref>...] --stalled-after <20m|1h> [--once] [--children]
 homebased thread watches [--all]
 homebased thread unwatch <watch-id>
+homebased thread report --summary <text> [--file <path>|-]
 ```
 
 A thread reference is T3 chip text (`[Thread: <title>; ref=<ref>]`),
@@ -473,13 +474,16 @@ pending.
 
 `thread context` prints each thread's host (`t3`, `worker`, or `terminal`),
 provider, session, T3 id and link, title, state (`waiting` when a homebased task
-or job still owes the thread events, or T3 is due to wake it with a delegated
-task's report), context tokens, context window
+or job still owes the thread events, T3 is due to wake it with a delegated
+task's report, or a child thread it launched with `t3 launch --child` has not
+reported yet), context tokens, context window
 and percent (Codex only), last activity in US Central, whether the prompt cache
 is warm, and the last compaction, looked up as far as 4 MiB back in the
 transcript or rollout. `--children` adds every T3 thread the calling
 T3 thread started as a subagent, with the parent link read from T3's thread
-lineage. Forks of the calling thread are not children. A child whose newest
+lineage, and every child thread it launched with `t3 launch --child`, on any
+machine, with a `child_thread` record of its link, its parent, and whether its
+report has arrived. Forks of the calling thread are not children. A child whose newest
 delegated task T3 records as ended, and that runs no turn, has
 `task_finished: true` and shows as `finished` while it is idle, and `settled`
 says whether T3 settled it. A child is done when it is settled or finished and
@@ -526,10 +530,12 @@ limit, and once it is unsettled or takes a new task it fires as before.
 the caller gets one `THREAD_STALLED` once the thread has sat `idle` that long
 since its last activity, or since a scan last saw it running or waiting, with no turn running, no homebased task or job owing
 it events, and no T3 delegated task due to report to it. A done thread never
-fires. One idle stretch fires once; a turn, a wait, or new activity re-arms it.
+fires, and neither does a child thread that has reported. One idle stretch
+fires once; a turn, a wait, or new activity re-arms it.
 It only notifies, so `--action compact` is refused, and each watch takes one
 condition, so a context watch and a stall watch on one thread are two watches.
-A delegate's stall watch ends with `finished` an hour after its task ends. A
+A delegate's stall watch ends with `finished` an hour after its task ends, and
+a child thread's as soon as it has reported and is settled. A
 top-level thread that sent its last report looks like a stalled one unless it
 is settled, so unwatch it when the report arrives. A `t3_background_wait` on a
 command outside homebased is invisible to homebased, so a thread that waits
@@ -570,11 +576,30 @@ still go out. Events for a stopped Claude session wait until it runs again, for
 up to 3 days as task callbacks do. The skill's
 [threads.md](.agents/skills/homebased/references/threads.md) has the payload.
 
+`thread report` sends a child thread's one report to its parent, run in the
+child's T3 thread during a turn. It is refused with `thread_report_refused`
+(exit 5), naming each piece, while the child has open work: a homebased task
+or GPU queue job that owes it events, a T3 delegated task due to report to it,
+or a child thread of its own that has not reported (one on a machine that does
+not answer counts as open). Otherwise it sends `--summary`, followed by the
+text of `--file` (`-` reads stdin), up to 16 KiB in all, to the parent as a
+`HOMEBASED_MESSAGE` whose body starts `Report from child thread thread_<id>:`.
+The report is saved first, under a message UUID derived from the link, so a
+retry or a daemon restart finishes the same report and never sends a second;
+a retry with other text fails with `thread_report_conflict`, and a thread no
+`--child` launch made fails with `not_child_thread`. Once the reporting turn
+ends, the child's daemon asks T3 to settle the child (`thread.settle`, bound
+to that run), unless a later run or a user message to the child came first or
+T3 refuses. The output's `stage` is `sending`, `settle_pending`, `sent`
+(delivered and left unsettled), or `settled`. A parent stops waiting on a
+child that is archived, deleted, or settled without a report; for a child on
+another machine, once a scan sees it so or misses it on two scans in a row.
+
 On the socket, `POST /v1/threads/context` resolves references and
 `GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both
 are also served on the dashboard port. `POST /v1/threads/compact`,
-`POST /v1/threads/watches`, and `POST /v1/threads/watches/{id}/unwatch` are
-socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
+`POST /v1/threads/watches`, `POST /v1/threads/watches/{id}/unwatch`, and
+`POST /v1/threads/report` are socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
 `POST /v1/cluster/threads/compact`.
 
 ### Launch a T3 thread on any machine
@@ -586,7 +611,8 @@ homebased t3 project add ~/code/app --machine code [--title app] \
 homebased t3 project icon ~/code/app --machine code --lucide captions --color sky
 homebased t3 launch --machine code --project ~/code/app \
   --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
-  [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high]
+  [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high] \
+  [--reply-route | --child]
 ```
 
 `t3 launch` starts an ordinary top-level T3 Code thread in the T3 on another
@@ -629,6 +655,17 @@ the project setup script, and starts the first message.
   launched it. `--reply-route` ends the first message with the calling thread
   and machine and the `homebased message send` command that reaches them, so
   the new agent can report back; `--source-thread <id>` names another thread.
+- `--child` launches a child thread of the calling T3 thread instead of a
+  hand-off. Its first message ends with a route back to the parent's T3
+  thread and asks the child to report once with `homebased thread report`.
+  homebased records the link on both machines, so the parent lists the child
+  under `thread context --children` and shows `waiting` until it reports, and
+  the child's daemon settles it after its reporting turn ends. A child can
+  launch children of its own. `--child` needs `--message` or
+  `--message-file`, must run in a T3 thread on the calling machine, and cannot
+  be combined with `--source-thread`. A retried `--request-id` returns the
+  same thread and link. A machine whose homebased predates child threads
+  refuses a `--child` launch with `t3_incompatible`.
 - The output has the thread id and a `t3code://threads/<environment>/<thread>`
   link that opens it in T3 Code.
 - T3 launches once per `--request-id`, so repeating the command with the same

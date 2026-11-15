@@ -19,6 +19,7 @@ use crate::t3::{
     IconChange, IconColor, InteractionMode, LaunchSpec, ModelChoice, ModelOption, OptionValue,
     ProbeReport, ProbeStatus, ProjectIcon, ProjectSpec, RuntimeMode, T3Env, Workspace, probe,
 };
+use crate::thread_ref::Caller;
 
 use super::{Ctx, OutputMode};
 
@@ -31,8 +32,13 @@ pub enum T3Command {
     /// Start a new T3 Code thread on this or another Fleet machine
     ///
     /// The thread is an ordinary top-level T3 thread on that machine, as if
-    /// started there. The first message ends with a line naming the calling
-    /// thread, so the new agent can report back with `homebased message send`
+    /// started there. With --reply-route, the first message ends with a line
+    /// naming the calling thread, so the new agent can report back with
+    /// `homebased message send`. With --child, the new thread is a child
+    /// thread of the calling T3 thread: homebased records the link, lists the
+    /// child under `thread context --children`, keeps the parent `waiting`
+    /// until the child reports with `homebased thread report`, and settles
+    /// the child after it reports
     Launch(Box<LaunchArgs>),
     /// List the T3 Code projects on this or another Fleet machine
     Projects {
@@ -181,6 +187,11 @@ pub struct LaunchArgs {
     /// Like --reply-route, but name this thread instead of the calling one
     #[arg(long)]
     source_thread: Option<ThreadId>,
+    /// Launch a child thread of the calling T3 thread, which reports back to
+    /// it once with `homebased thread report`; implies --reply-route and
+    /// needs a first message
+    #[arg(long, conflicts_with = "source_thread")]
+    child: bool,
 }
 
 /// Run one T3 Code command
@@ -271,18 +282,30 @@ async fn launch(ctx: &Ctx, args: LaunchArgs) -> Result<ExitCode, AppError> {
         .zip(args.model)
         .map(|(provider, model)| ModelChoice { provider, model });
     // launches are hand-offs: the user takes over the new thread, so it only
-    // learns how to reach this one when asked
-    let source_thread = match (args.reply_route, args.source_thread) {
-        (true, _) => Some(calling_thread().ok_or_else(|| AppError::Usage {
-            message: "--reply-route found no calling agent thread; pass --source-thread".into(),
-        })?),
-        (false, thread) => thread,
+    // learns how to reach this one when asked. A child's route names the
+    // caller's T3 thread, which the daemon finds
+    let (source_thread, child_of) = match (args.child, args.reply_route, args.source_thread) {
+        (true, _, _) => (None, Some(child_caller()?)),
+        (false, true, _) => (
+            Some(calling_thread().ok_or_else(|| AppError::Usage {
+                message: "--reply-route found no calling agent thread; pass --source-thread".into(),
+            })?),
+            None,
+        ),
+        (false, false, thread) => (thread, None),
     };
+    if child_of.is_some() && message.is_none() {
+        return Err(AppError::Usage {
+            message: "--child needs --message or --message-file, the work the child thread owns"
+                .into(),
+        });
+    }
 
     let request = T3LaunchRequest {
         api_version: API_VERSION,
         machine: args.machine,
         source_thread,
+        child_of,
         launch: LaunchSpec {
             request_id: args.request_id.unwrap_or_else(Uuid::now_v7),
             project: home_relative(args.project),
@@ -335,6 +358,12 @@ async fn launch(ctx: &Ctx, args: LaunchArgs) -> Result<ExitCode, AppError> {
             );
             if let Some(link) = &response.thread.link {
                 println!("open: {link}");
+            }
+            if let Some(lineage) = &response.lineage {
+                println!(
+                    "child of thread_{}; it reports back with `homebased thread report`",
+                    lineage.parent.t3_thread
+                );
             }
         }
     }
@@ -453,6 +482,17 @@ pub(super) fn home_relative(value: String) -> String {
         Some("") => "~/".into(),
         _ => value,
     }
+}
+
+/// The calling agent, which a child thread reports to
+fn child_caller() -> Result<Caller, AppError> {
+    let caller = Caller::from_env()?;
+    if caller.t3_thread.is_none() && caller.session.is_none() {
+        return Err(AppError::Usage {
+            message: "--child found no calling agent thread; run it from a T3 Code thread".into(),
+        });
+    }
+    Ok(caller)
 }
 
 /// The agent thread this command runs in, from the variables Codex and Claude Code set

@@ -516,6 +516,8 @@ mod ci_queue;
 mod dependencies;
 #[path = "fleet/events.rs"]
 mod events;
+#[path = "support/fake_t3.rs"]
+mod fake_t3;
 #[path = "fleet/inspection.rs"]
 mod inspection;
 #[path = "fleet/machine_wait.rs"]

@@ -1,5 +1,6 @@
 //! `homebased thread`: lookups, compaction refusals, and watches end to end
 
+use super::fake_t3::{open_state, set_session};
 use super::{Harness, THREAD, event_json, wait_until};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
@@ -28,58 +29,7 @@ impl Harness {
 
     /// T3's state database with the tables homebased reads, empty
     pub(super) fn t3_state(&self) -> rusqlite::Connection {
-        let userdata = self.user_home.join(".t3/userdata");
-        fs::create_dir_all(&userdata).unwrap();
-        let db = rusqlite::Connection::open(userdata.join("statev2.sqlite")).unwrap();
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS orchestration_v2_projection_threads (
-                thread_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL DEFAULT 'project',
-                title TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT '2026-10-02T19:00:00Z',
-                default_provider TEXT NOT NULL DEFAULT 'codex',
-                active_provider_thread_id TEXT,
-                provider_instance_id TEXT,
-                archived_at TEXT,
-                deleted_at TEXT,
-                payload_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE TABLE IF NOT EXISTS projection_projects (
-                project_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                workspace_root TEXT NOT NULL,
-                deleted_at TEXT,
-                default_model_selection_json TEXT
-             );
-             CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_threads (
-                provider_thread_id TEXT PRIMARY KEY,
-                thread_id TEXT,
-                provider TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                driver TEXT,
-                provider_instance_id TEXT
-             );
-             CREATE TABLE IF NOT EXISTS orchestration_v2_projection_runs (
-                run_id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                provider TEXT NOT NULL DEFAULT 'codex',
-                status TEXT NOT NULL,
-                requested_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
-                payload_json TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS orchestration_v2_projection_messages (
-                message_id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
-                updated_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
-                payload_json TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-        db
+        open_state(&self.user_home.join(".t3/userdata/statev2.sqlite"))
     }
 
     /// A T3 thread whose active provider thread is the Codex thread `session`
@@ -97,22 +47,7 @@ impl Harness {
 
     /// Make the Codex thread `session` the one T3 runs `thread` in next
     pub(super) fn t3_session(&self, thread: &str, session: &str) {
-        let id = format!("provider-thread:{session}");
-        let payload = json!({ "nativeThreadRef": { "driver": "codex", "nativeId": session } });
-        let db = self.t3_state();
-        db.execute(
-            "INSERT INTO orchestration_v2_projection_provider_threads
-             (provider_thread_id, thread_id, provider, driver, provider_instance_id, updated_at, payload_json)
-             VALUES (?1, ?2, 'codex', 'codex', 'codex', '2026-10-02T20:00:00Z', ?3)",
-            rusqlite::params![id, thread, payload.to_string()],
-        )
-        .unwrap();
-        db.execute(
-            "UPDATE orchestration_v2_projection_threads
-             SET active_provider_thread_id = ?1, provider_instance_id = 'codex' WHERE thread_id = ?2",
-            rusqlite::params![id, thread],
-        )
-        .unwrap();
+        set_session(&self.t3_state(), thread, session);
     }
 
     pub(super) fn delete_t3_thread(&self, thread: &str) {

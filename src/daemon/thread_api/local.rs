@@ -4,7 +4,7 @@
 //! Everything here reads files and SQLite, so callers run it off the async
 //! runtime. Only the matched threads' transcript or rollout tails are read
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -12,9 +12,10 @@ use chrono::{DateTime, Utc};
 
 use crate::callback::destination::claude_session_ids;
 use crate::callback::stale_context::{CodexRollouts, ContextUse, Resumption};
+use crate::child_thread::{Lineage, LinkView, OpenWork};
 use crate::domain::ThreadId;
 use crate::machine::MachineId;
-use crate::store::WorkerThread;
+use crate::store::{OwedTarget, WorkerThread};
 use crate::t3::{
     ProviderThread, T3Env, T3Thread, completion_wakes_due, environment_id, owning_thread,
     thread_index,
@@ -40,6 +41,8 @@ pub(crate) struct LocalSources {
     pub(crate) sleeping: HashSet<ThreadId>,
     /// Stores that title sessions outside T3
     pub(crate) titles: Option<TitleSources>,
+    /// Child-thread links this machine holds
+    pub(crate) links: Vec<LinkView>,
 }
 
 /// One snapshot of this machine's threads
@@ -264,25 +267,128 @@ impl LocalIndex {
             .map(|t3| t3.id.clone())
     }
 
-    /// T3 threads here that `parent` started as subagents, newest first; with
-    /// `live`, only those not settled, archived, or done with their task
+    /// T3 threads here that `parent` started as subagents, newest first, then
+    /// those it launched with `t3 launch --child`, oldest first; with `live`,
+    /// only those not settled, archived, or done with their task
     ///
     /// A fork names its source as its parent too, but it is no delegate, so it
-    /// is left out: a `--children` compact watch must never reach it
+    /// is left out: a `--children` compact watch must never reach it. A
+    /// launched child is matched by its parent's T3 id alone, since a peer
+    /// asks with nothing else
     pub(crate) fn children(&self, parent: &str, live: bool) -> Vec<ThreadContext> {
-        self.t3
+        let delegates = self
+            .t3
             .iter()
             .enumerate()
             .filter(|(_, t3)| t3.delegate && t3.parent.as_deref() == Some(parent))
-            .map(|(index, _)| self.context(Found::T3(index)))
+            .map(|(index, _)| index);
+        let launched = self
+            .sources
+            .links
+            .iter()
+            .filter(|link| {
+                link.lineage.parent.t3_thread == parent
+                    && link.lineage.child.machine == self.sources.machine
+            })
+            .filter_map(|link| {
+                self.t3
+                    .iter()
+                    .position(|t3| t3.id == link.lineage.child.t3_thread)
+            });
+        delegates
+            .chain(launched)
+            .map(|index| self.context(Found::T3(index)))
             .filter(|child| !live || !child.put_away())
             .collect()
     }
 
+    /// Children the T3 thread `parent` here launched that still owe it a
+    /// report, by the rule of [`LinkView::owes_report`]
+    ///
+    /// A child on another machine counts until its report arrives or this
+    /// machine's scan closes its link
+    pub(crate) fn open_children(&self, parent: &str) -> Vec<&LinkView> {
+        self.sources
+            .links
+            .iter()
+            .filter(|link| {
+                link.lineage.parent.machine == self.sources.machine
+                    && link.lineage.parent.t3_thread == parent
+            })
+            .filter(|link| link.owes_report(self.child_put_away(link)))
+            .collect()
+    }
+
+    /// The T3 thread here that runs as `caller`, if T3 has it
+    pub(crate) fn caller_t3_here(&self, caller: &Caller) -> Option<&T3Thread> {
+        let id = self.caller_t3(caller)?;
+        self.t3.iter().find(|t3| t3.id == id)
+    }
+
+    /// What keeps the T3 thread `t3` here from reporting to its parent, as
+    /// far as this machine can tell, and the links to its children on other
+    /// machines, which only their machines can rule out
+    ///
+    /// `owed` is every task and job that still owes a thread events; those
+    /// owed to any session of `t3`, current or earlier, count
+    pub(crate) fn open_work(
+        &self,
+        t3: &T3Thread,
+        owed: &[OwedTarget],
+    ) -> (Vec<OpenWork>, Vec<Lineage>) {
+        let current = t3.session.map(ProviderThread::id);
+        let mut ours: HashMap<ThreadId, bool> = HashMap::new();
+        let mut open: Vec<OpenWork> = Vec::new();
+        for target in owed {
+            let owed_here = *ours.entry(target.thread).or_insert_with(|| {
+                current == Some(target.thread)
+                    || owning_thread(&self.sources.env, target.thread).as_deref()
+                        == Some(t3.id.as_str())
+            });
+            if owed_here && !open.contains(&target.work) {
+                open.push(target.work.clone());
+            }
+        }
+        if self.delegate_wakes.contains(&t3.id) {
+            open.push(OpenWork::Subagent);
+        }
+
+        let mut remote = Vec::new();
+        for link in self.open_children(&t3.id) {
+            if link.lineage.child.machine == self.sources.machine {
+                open.push(OpenWork::Child {
+                    child: link.lineage.child.clone(),
+                });
+            } else {
+                remote.push(link.lineage.clone());
+            }
+        }
+        (open, remote)
+    }
+
+    /// Whether this machine sees the child of `link` archived, deleted, or
+    /// settled; a child on another machine is never seen so
+    fn child_put_away(&self, link: &LinkView) -> bool {
+        if link.lineage.child.machine != self.sources.machine {
+            return false;
+        }
+        self.t3
+            .iter()
+            .find(|t3| t3.id == link.lineage.child.t3_thread)
+            .is_none_or(|t3| t3.archived || (t3.settled && !t3.running))
+    }
+
+    /// The link that names the T3 thread `t3` here as a child
+    fn link_of(&self, t3: &str) -> Option<&LinkView> {
+        self.sources.links.iter().find(|link| {
+            link.lineage.child.machine == self.sources.machine && link.lineage.child.t3_thread == t3
+        })
+    }
+
     /// Whether something other than a watch event will wake the caller whose
     /// session is `session` and whose T3 thread here is `t3`: a homebased task
-    /// or job that still owes it events, or a delegated task T3 is due to
-    /// report to it
+    /// or job that still owes it events, a delegated task T3 is due to report
+    /// to it, or a child thread that owes it a report
     ///
     /// A live child alone is no proof: stopping the parent's run disposes of
     /// its tasks' reports, even of those still running
@@ -294,7 +400,10 @@ impl LocalIndex {
         let owed_events = std::iter::once(session)
             .chain(current.map(ProviderThread::id))
             .any(|session| self.sources.waiting.contains(&session));
-        owed_events || t3.is_some_and(|t3| self.delegate_wakes.contains(t3))
+        owed_events
+            || t3.is_some_and(|t3| {
+                self.delegate_wakes.contains(t3) || !self.open_children(t3).is_empty()
+            })
     }
 
     /// The task worker of `session`; follow-ups share a Codex thread, and the
@@ -316,11 +425,13 @@ impl LocalIndex {
         let worker_runs = session
             .and_then(|id| self.worker(id))
             .is_some_and(|worker| worker.running);
-        // a delegated task T3 will report wakes the thread as surely as a
-        // homebased task, so a coordinator waiting on its delegates is not idle
+        // a delegated task T3 will report, or a child thread's report, wakes
+        // the thread as surely as a homebased task, so a coordinator waiting
+        // on its delegates or children is not idle
         let waiting = session.is_some_and(|id| self.sources.waiting.contains(&id))
             || self.owed_earlier.contains(&t3.id)
-            || self.delegate_wakes.contains(&t3.id);
+            || self.delegate_wakes.contains(&t3.id)
+            || !self.open_children(&t3.id).is_empty();
         if t3.archived {
             ThreadState::Archived
         } else if t3.running || worker_runs {
@@ -448,6 +559,7 @@ impl LocalIndex {
             cache_warm: usage.as_ref().map(|usage| usage.cache_warm(self.now)),
             compacted_at: usage.as_ref().and_then(ContextUse::compacted_at),
             parent_t3_thread: t3.and_then(|t3| t3.parent.clone()),
+            child_thread: t3.and_then(|t3| self.link_of(&t3.id)).map(LinkView::info),
             details: t3.map(|t3| t3.details.clone()).unwrap_or_default(),
         }
     }
@@ -616,6 +728,7 @@ mod tests {
             waiting: HashSet::from([SESSION_A.parse::<ThreadId>().unwrap()]),
             sleeping: HashSet::new(),
             titles: None,
+            links: Vec::new(),
         }
     }
 

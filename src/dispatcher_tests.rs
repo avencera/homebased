@@ -406,6 +406,7 @@ fn idle_index(
         waiting: waiting.into_iter().collect(),
         sleeping: sleeping.iter().copied().collect(),
         titles: None,
+        links: Vec::new(),
     };
     LocalIndex::load(sources, chrono::Utc::now()).unwrap()
 }
