@@ -489,8 +489,10 @@ pub(crate) async fn dispatch_inbox(
                 .ok_or(AppError::Internal {
                     message: "pending inbox event has no callback payload".into(),
                 })?;
-            if let Some(hold) = hold.as_ref().filter(|_| class.is_final()) {
-                line = with_held_events(&line, &hold.held)?;
+            if let Some(held) = hold.as_ref().and_then(|hold| hold.listed_on_final())
+                && class.is_final()
+            {
+                line = with_held_events(&line, held)?;
             }
             // a connected `homebased wait` stream prints the line for the agent that
             // armed it; waking the thread as well would wake the agent twice
@@ -499,7 +501,7 @@ pub(crate) async fn dispatch_inbox(
             } else if route.thread.is_detached() {
                 // no session can receive it; the inbox keeps the event for inspection
                 AttemptOutcome::Settle(DeliveryOutcome::Delivered)
-            } else if hold.is_some() && class == EventClass::Progress {
+            } else if hold.as_ref().is_some_and(|hold| hold.holds(class)) {
                 // the sleeping thread reads it on the final event instead
                 call(&store, |reply| StoreMsg::HoldInboxEvent { id, seq, reply }).await?;
                 continue;

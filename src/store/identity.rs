@@ -21,7 +21,7 @@ use crate::submission::{
 /// Nothing closes a route whose queue owner never reports an ending, such as a
 /// machine that left the fleet. GPU jobs can run for days, so this is longer
 /// than the task wait limit
-const JOB_WAIT_LIMIT: TimeDelta = TimeDelta::days(7);
+pub(super) const JOB_WAIT_LIMIT: TimeDelta = TimeDelta::days(7);
 
 /// A durable identity operation failed without changing its existing owner
 #[derive(Debug, thiserror::Error)]

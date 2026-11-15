@@ -231,7 +231,7 @@ homebased --json resource job cancel "$job" --operation-id "$cancel"
 
 When telling the user where a job runs, call the GPU by its label, or just name the machine when it has one GPU. Resource names such as `gpu0` belong in specs and commands.
 
-Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callbacks. In a Claude Code session in a T3 Code thread, start `homebased wait --next "$job"` as a background Bash command right after submit to receive them in the live session ([t3.md](t3.md#waiting-in-a-claude-thread)). Deduplicate by `(job, seq)`, never by the run task UUID or event name. The sequence starts at 1. Delivery is at-least-once and ordered per job. Failed delivery stays pending and retries. Intermediate successful steps do not send callbacks. Run tasks have no ordinary task callback route.
+Job callbacks start with `HOMEBASED_EVENT` followed by a space, like task callbacks. In a Claude Code session in a T3 Code thread, sleep on a job expected to run or queue for over an hour with `homebased wait --long "$job"`, so only its final event or an alert wakes the thread ([t3.md](t3.md#sleeping-on-long-work)); for a shorter one, start `homebased wait --next "$job"` as a background Bash command right after submit to receive them in the live session ([t3.md](t3.md#waiting-in-a-claude-thread)). A T3 subagent never queues long GPU work; a child thread or a worker owns each such job. Deduplicate by `(job, seq)`, never by the run task UUID or event name. The sequence starts at 1. Delivery is at-least-once and ordered per job. Failed delivery stays pending and retries. Intermediate successful steps do not send callbacks. Run tasks have no ordinary task callback route.
 
 | Event | Action |
 | --- | --- |

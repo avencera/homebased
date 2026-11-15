@@ -675,6 +675,10 @@ pub(crate) enum StoreMsg {
     OwedTargets {
         reply: RpcReplyPort<Result<Vec<OwedTarget>, AppError>>,
     },
+    /// Read each sleep hold, as open work of the thread it holds for
+    HoldTargets {
+        reply: RpcReplyPort<Result<Vec<OwedTarget>, AppError>>,
+    },
     /// Save the link a `t3 launch --child` made
     InsertLineage {
         lineage: Lineage,
@@ -1346,6 +1350,7 @@ impl Actor for StoreActor {
             }
             StoreMsg::WaitingThreads { reply } => send_reply(reply, state.waiting_threads()),
             StoreMsg::OwedTargets { reply } => send_reply(reply, state.owed_targets()),
+            StoreMsg::HoldTargets { reply } => send_reply(reply, state.hold_targets()),
             StoreMsg::InsertLineage { lineage, reply } => {
                 send_reply(reply, state.insert_lineage(&lineage));
             }

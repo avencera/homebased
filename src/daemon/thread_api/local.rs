@@ -329,8 +329,9 @@ impl LocalIndex {
     /// far as this machine can tell, and the links to its children on other
     /// machines, which only their machines can rule out
     ///
-    /// `owed` is every task and job that still owes a thread events; those
-    /// owed to any session of `t3`, current or earlier, count
+    /// `owed` is every task and job that still owes a thread events, and
+    /// every sleep hold; those of any session of `t3`, current or earlier,
+    /// count
     pub(crate) fn open_work(
         &self,
         t3: &T3Thread,

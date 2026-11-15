@@ -592,10 +592,12 @@ fn long_wait_holds_reports_and_the_final_event_lists_them() {
 }
 
 #[test]
-fn long_wait_follows_a_parked_task_to_its_continuation() {
+fn long_wait_follows_a_parked_task_and_holds_what_it_parks_on() {
     let h = Harness::new();
+    let mut jobs = Jobs::new(&h);
     let target = h.gated("sleep-chain-target");
-    h.set_control("waiting", &format!("{target}\nCheck the target.\n"));
+    let job = h.gated_job(&mut jobs, "sleep-chain-job");
+    h.set_control("waiting", &format!("{target} {job}\nCheck the target.\n"));
     h.set_control("report", "succeeded\nDone.");
     h.set_control("sleep", "2");
     let worker = h.submit(&Harness::spec("codex", "train the model"));
@@ -624,7 +626,10 @@ fn long_wait_follows_a_parked_task_to_its_continuation() {
         .unwrap_or_else(|| panic!("{stderr}"));
     assert_ne!(continuation, worker);
 
+    // the worker's own task and job report to this thread, and the
+    // continuation reports on them, so their final events are held too
     h.release_gate("sleep-chain-target");
+    h.release_gate("sleep-chain-job");
     let delivered = h.wait_for_event(&continuation, "TASK_SUCCEEDED");
     let last = delivered
         .iter()
@@ -633,14 +638,34 @@ fn long_wait_follows_a_parked_task_to_its_continuation() {
         .unwrap();
     assert_eq!(last["event"], "TASK_SUCCEEDED");
     let held = last["held_events"].as_array().unwrap();
-    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held.len(), 3, "{held:?}");
     assert_eq!(held[0]["event"], "TASK_WAITING");
     assert_eq!(held[0]["task"], worker.as_str());
     assert_eq!(
         held[0]["summary"],
-        format!("parked; continues as task {continuation}")
+        format!("parked on task {target}, job {job}; continues as task {continuation}")
+    );
+    let mut ends: Vec<(&str, &str)> = held[1..]
+        .iter()
+        .map(|event| {
+            let id = event["task"].as_str().or(event["job"].as_str());
+            (event["event"].as_str().unwrap(), id.unwrap())
+        })
+        .collect();
+    ends.sort_unstable();
+    let job_id = job.to_string();
+    assert_eq!(
+        ends,
+        [
+            ("JOB_SUCCEEDED", job_id.as_str()),
+            ("TASK_SUCCEEDED", target.as_str())
+        ]
     );
     assert_eq!(h.normally_delivered(&worker), Vec::<String>::new());
+    assert_eq!(h.normally_delivered(&target), Vec::<String>::new());
+    assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+    let store = Store::open(&h.home.join(homebased::home::DB_NAME)).unwrap();
+    assert_eq!(store.sleeping_threads().unwrap(), Vec::new());
 }
 
 #[test]

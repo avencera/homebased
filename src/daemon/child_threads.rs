@@ -84,7 +84,6 @@ async fn report(
 
     check_body(&body.body)?;
     let mut open = reporter.open;
-    open.extend(open_holds(&state, &reporter.t3_thread).await?);
     for remote in reporter.remote_children {
         open.extend(remote_child_open(&state, remote).await);
     }
@@ -167,7 +166,10 @@ fn check_body(body: &str) -> Result<(), AppError> {
 /// Read the reporting thread from this machine's index
 async fn read_reporter(state: &AppState, caller: Caller) -> Result<Reporter, AppError> {
     let sources = local_sources(state).await?;
-    let owed = call(&state.store, |reply| StoreMsg::OwedTargets { reply }).await?;
+    // a sleep hold is open work as an owed task or job is, matched to the
+    // thread's sessions the same way
+    let mut owed = call(&state.store, |reply| StoreMsg::OwedTargets { reply }).await?;
+    owed.extend(call(&state.store, |reply| StoreMsg::HoldTargets { reply }).await?);
     run_blocking(move || {
         let index =
             LocalIndex::load(sources, Utc::now()).map_err(|message| AppError::T3Unavailable {
@@ -197,14 +199,6 @@ async fn read_reporter(state: &AppState, caller: Caller) -> Result<Reporter, App
         })
     })
     .await?
-}
-
-/// Sleep holds that keep the T3 thread `t3_thread` from reporting
-///
-/// Holds come with `homebased wait --long`, which keeps them in its own
-/// table; until that lands there are none, and its lookup belongs here
-async fn open_holds(_state: &AppState, _t3_thread: &str) -> Result<Vec<OpenWork>, AppError> {
-    Ok(Vec::new())
 }
 
 /// Whether the child of `link`, on another machine, is still open, by the

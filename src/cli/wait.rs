@@ -47,10 +47,10 @@ const NEXT_GATHER: Duration = Duration::from_secs(1);
 /// Opus input at 150K tokens, and starting the wait again costs about $0.13
 pub(super) const CACHE_LIMIT: Duration = Duration::from_secs(55 * 60);
 
-/// How long a `--long` wait of a delegated T3 task runs with no event, under
-/// Claude Code's 2-hour Bash timeout so the wait exits on its own first
+/// How long a `--long` wait of a T3 subagent runs with no event, under Claude
+/// Code's 2-hour Bash timeout so the wait exits on its own first
 ///
-/// T3 reports a delegated task to its parent when its turn ends, so such a
+/// T3 reports a subagent's task to its parent when its turn ends, so such a
 /// thread cannot sleep, and waits in the turn instead
 const LONG_LIMIT: Duration = Duration::from_secs(115 * 60);
 
@@ -80,8 +80,8 @@ pub struct WaitArgs {
     /// For work expected to take over an hour: hold the targets and exit at
     /// once, so the turn can end. The daemon then wakes this thread only with
     /// each target's final event, which lists the progress events it held, or
-    /// with an alert. A delegated T3 task, which reports when its turn ends,
-    /// waits up to 115m instead
+    /// with an alert. A T3 subagent, which T3 reports done when its turn
+    /// ends, waits up to 115m instead
     #[arg(long, conflicts_with = "timeout")]
     long: bool,
 }
@@ -92,7 +92,7 @@ enum LongWait {
     /// Hold the targets and exit, so the turn ends and the daemon wakes the
     /// thread for a final event or an alert
     Sleep,
-    /// Wait in the turn for up to [`LONG_LIMIT`], as a delegated T3 task must
+    /// Wait in the turn for up to [`LONG_LIMIT`], as a T3 subagent must
     Bounded,
 }
 
@@ -111,13 +111,9 @@ impl LongWait {
         let env = T3Env::from_env();
         let t3_thread =
             Caller::t3_thread_from_env().or_else(|| crate::t3::owning_thread(&env, thread));
-        let delegated =
+        let subagent =
             t3_thread.is_some_and(|t3_thread| crate::t3::runs_delegated_task(&env, &t3_thread));
-        Ok(if delegated {
-            Self::Bounded
-        } else {
-            Self::Sleep
-        })
+        Ok(if subagent { Self::Bounded } else { Self::Sleep })
     }
 }
 
@@ -228,7 +224,7 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
         match LongWait::of(thread)? {
             LongWait::Sleep => return sleep(&client, thread, &ids).await,
             LongWait::Bounded => eprintln!(
-                "homebased wait: --long cannot sleep in a delegated T3 task, which reports to its parent when the turn ends, so this waits up to {} minutes. Work that runs for hours belongs in a child thread",
+                "homebased wait: --long cannot sleep in a T3 subagent, which T3 reports done to its parent when the turn ends, so this waits up to {} minutes. Long work belongs in a child thread (`homebased t3 launch --child`), not a T3 subagent",
                 LONG_LIMIT.as_secs() / 60
             ),
         }
@@ -296,7 +292,7 @@ pub(super) async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<ExitCode, AppError
 
 /// How long the wait may run with no event that wakes it, `None` for no limit
 ///
-/// Only a delegated T3 task reaches here with `--long`
+/// Only a T3 subagent reaches here with `--long`
 fn limit(args: &WaitArgs, thread: ThreadId) -> Option<Duration> {
     if let Some(timeout) = args.timeout {
         return Some(timeout);

@@ -11,7 +11,7 @@ use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission,
 use crate::queue::spec::MachineSelector;
 use crate::queue::{JobEvent, JobEventKind, JobId, MoveRefusal, Priority, QueueError, Target};
 use crate::store::Store;
-use crate::store::sleep::{append_held, end_hold};
+use crate::store::sleep::{end_hold, read_hold, record_held};
 use crate::task_wait::{EventClass, HeldEvent, HoldTarget};
 
 /// Sequence cursors of one job's origin inbox
@@ -546,18 +546,22 @@ impl Store {
     /// Settle job event `seq` into a sleep's hold on the job without waking
     /// its thread
     ///
-    /// Only a progress event can be held, and only while a sleep holds the job
+    /// Only an event the hold keeps can be held: a progress event, or the
+    /// final event of a job a held chain parked on, which also ends the hold
     pub fn hold_job_event(&self, job: JobId, seq: u64) -> Result<(), AppError> {
         let sql_seq = sql_seq(seq)?;
         self.immediate(|| {
             let event = self.job_inbox_event(job, sql_seq)?;
-            if EventClass::job(event.event, event.gpu_idle.as_ref()) != EventClass::Progress {
-                return Err(QueueError::Invariant {
-                    message: format!("job {job} event {seq} is not a progress event to hold"),
-                }
-                .into());
+            let class = EventClass::job(event.event, event.gpu_idle.as_ref());
+            let hold = read_hold(&self.conn, HoldTarget::Job(job))?
+                .filter(|hold| hold.holds(class))
+                .ok_or_else(|| QueueError::Invariant {
+                    message: format!("job {job} event {seq} is not an event a hold keeps"),
+                })?;
+            record_held(&self.conn, &hold, &HeldEvent::job(&event))?;
+            if class.is_final() {
+                end_hold(&self.conn, hold.target)?;
             }
-            append_held(&self.conn, HoldTarget::Job(job), &HeldEvent::job(&event))?;
             self.settle_job_event_inner(job, seq, sql_seq)
         })
     }

@@ -181,10 +181,13 @@ pub enum Command {
     /// it with the target's final event, whose line lists them under
     /// `held_events`, or with an alert (`JOB_ATTENTION`, `JOB_BLOCKED`,
     /// `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, the first `JOB_GPU_IDLE` of an idle
-    /// episode), after which the hold stays. A connected wait still takes the
-    /// events first. A sleeping thread compacts when idle from 60K context
-    /// tokens instead of 175K. In a delegated T3 task, which reports to its
-    /// parent when its turn ends, `--long` waits up to 115 minutes instead.
+    /// episode), after which the hold stays. When a held task parks, the hold
+    /// follows its continuation and keeps the tasks and jobs it parked on, so
+    /// only the chain's final event wakes the thread. A connected wait still
+    /// takes the events first. A sleeping thread compacts when idle from 60K
+    /// context tokens instead of 175K. A T3 subagent (a `delegate_task` child),
+    /// which T3 reports done when its turn ends, cannot sleep: `--long` waits up
+    /// to 115 minutes there, and long work belongs in a child thread.
     Wait(wait::WaitArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),

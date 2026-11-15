@@ -294,9 +294,9 @@ pub(crate) struct JobOrigin<'a> {
 impl JobOrigin<'_> {
     /// Deliver one job event to its thread and settle it
     ///
-    /// A connected wait stream prints it first. Otherwise a progress event of
-    /// a job a sleep holds settles into the hold without waking the thread,
-    /// and any other event wakes it, the final one listing the held events.
+    /// A connected wait stream prints it first. Otherwise an event the job's
+    /// sleep hold keeps settles into it without waking the thread, and any
+    /// other event wakes it, the final one listing the held events.
     /// `current` answers whether a blocked or GPU idle notice still stands
     pub(crate) async fn deliver<F>(
         &self,
@@ -311,8 +311,10 @@ impl JobOrigin<'_> {
         let class = EventClass::job(event.event, event.gpu_idle.as_ref());
         let hold = sleep_hold(self.store, route.thread, HoldTarget::Job(route.job)).await?;
         let mut line = job_event_line(route, event)?;
-        if let Some(hold) = hold.as_ref().filter(|_| class.is_final()) {
-            line = with_held_events(&line, &hold.held)?;
+        if let Some(held) = hold.as_ref().and_then(|hold| hold.listed_on_final())
+            && class.is_final()
+        {
+            line = with_held_events(&line, held)?;
         }
         let notice = event.event.is_suppressible_notice();
         let seq = event.seq;
@@ -335,7 +337,7 @@ impl JobOrigin<'_> {
             }
             JobHandoff::Obsolete | JobHandoff::Declined => {}
         }
-        if hold.is_some() && class == EventClass::Progress {
+        if hold.as_ref().is_some_and(|hold| hold.holds(class)) {
             // the sleeping thread reads it on the final event instead
             let job = route.job;
             return call(self.store, |reply| StoreMsg::HoldJobEvent {

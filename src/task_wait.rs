@@ -21,7 +21,7 @@
 mod sleep;
 
 pub use sleep::{
-    HeldEvent, HeldKind, HoldTarget, SLEEP_ROUTE, SleepHold, SleepOutcome, SleepRequest,
+    HeldEvent, HeldKind, HoldRole, HoldTarget, SLEEP_ROUTE, SleepHold, SleepOutcome, SleepRequest,
     SleepResponse, SleepTarget,
 };
 

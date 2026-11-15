@@ -47,9 +47,9 @@ pub enum ThreadCommand {
         refs: Vec<String>,
         /// List the calling thread's T3 subagents, and the child threads it
         /// launched with `t3 launch --child` on any Fleet machine, finished
-        /// ones included, to rebuild a list of delegates; forks are left out.
-        /// A subagent whose delegated task ended reads as `finished` while it
-        /// is idle
+        /// ones included, to rebuild the list of children; forks are left out.
+        /// A T3 subagent whose delegated task ended reads as `finished` while
+        /// it is idle
         #[arg(long)]
         children: bool,
         /// With --children, leave out archived children, and settled ones or
@@ -74,12 +74,13 @@ pub enum ThreadCommand {
     /// the limit, and again only after the context drops below it. With
     /// --stalled-after, sends `THREAD_STALLED` once the thread has sat `idle`
     /// that long: no turn running, no homebased task or job owing it events,
-    /// no T3 delegated task due to report to it, and no child thread owing it
-    /// a report. It fires again only after the thread is active and stalls
+    /// no T3 subagent due to report to it, and no child thread owing it a
+    /// report. It fires again only after the thread is active and stalls
     /// again. A child thread that has sent its `thread report` never stalls,
     /// and its watch ends once it settles. A stall watch on another top-level
     /// thread cannot tell a stall from a thread that sent its last report, so
-    /// unwatch it when that report arrives; a delegate's watch ends on its own.
+    /// unwatch it when that report arrives; a T3 subagent's watch ends on its
+    /// own.
     /// The calling thread receives the events like task callbacks; `homebased
     /// wait --next <watch id>` takes them instead while it runs. The same watch
     /// again (thread, condition, and action) is the existing watch; another

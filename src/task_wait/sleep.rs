@@ -14,8 +14,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{WaitIds, WaitKey, WaitKeysError};
+use super::{EventClass, WaitIds, WaitKey, WaitKeysError};
 use crate::callback::{EventKind, HomebasedEvent};
+use crate::dependency::Dependency;
 use crate::domain::{TaskId, ThreadId};
 use crate::queue::{JobEvent, JobEventKind, JobId};
 
@@ -152,6 +153,35 @@ impl From<HoldTarget> for WaitKey {
     }
 }
 
+/// Why a target is held, which decides which of its events wake the thread
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldRole {
+    /// A sleep named the target, or the chain a named target parked into:
+    /// progress is held, and the final event wakes the thread with the list
+    Sleep,
+    /// A task or job that a parked run of the held chain `chain` waits on
+    ///
+    /// The chain's continuation starts once the target ends and reports on
+    /// it, so the target's final event is progress of the chain too. Its held
+    /// events join the chain's hold, and only its alerts wake the thread
+    Parked {
+        /// The run of the held chain whose hold collects the events
+        chain: TaskId,
+    },
+}
+
+impl HoldRole {
+    /// Whether an event of class `class` settles into the hold instead of
+    /// waking the thread
+    #[must_use]
+    pub fn holds(self, class: EventClass) -> bool {
+        match self {
+            Self::Sleep => class == EventClass::Progress,
+            Self::Parked { .. } => class != EventClass::Alert,
+        }
+    }
+}
+
 /// One sleep hold: a target whose progress events wait for its final event
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SleepHold {
@@ -159,10 +189,32 @@ pub struct SleepHold {
     pub target: HoldTarget,
     /// Thread that sleeps on the target
     pub thread: ThreadId,
-    /// When the sleep registered the hold
+    /// Why the target is held
+    pub role: HoldRole,
+    /// When the hold was registered
     pub created_at: DateTime<Utc>,
-    /// Progress events settled without waking the thread, in order
+    /// Events settled without waking the thread, in order; empty for a
+    /// [`HoldRole::Parked`] hold, whose events join its chain's list
     pub held: Vec<HeldEvent>,
+}
+
+impl SleepHold {
+    /// Whether an event of class `class` settles into the hold instead of
+    /// waking the thread
+    #[must_use]
+    pub fn holds(&self, class: EventClass) -> bool {
+        self.role.holds(class)
+    }
+
+    /// The events the final event's line lists, which only a sleep's own
+    /// hold has; a parked target's final event is held, not delivered
+    #[must_use]
+    pub fn listed_on_final(&self) -> Option<&[HeldEvent]> {
+        match self.role {
+            HoldRole::Sleep => Some(&self.held),
+            HoldRole::Parked { .. } => None,
+        }
+    }
 }
 
 /// Name of a held event
@@ -183,8 +235,8 @@ impl fmt::Display for HeldKind {
     }
 }
 
-/// One progress event a hold settled without waking its thread, as the final
-/// event's `held_events` lists it
+/// One event a hold settled without waking its thread, as the final event's
+/// `held_events` lists it
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeldEvent {
@@ -194,6 +246,10 @@ pub struct HeldEvent {
     /// their events separately
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
+    /// GPU queue job the event belongs to, since a chain's hold also lists
+    /// the events of jobs its parked runs wait on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobId>,
     /// Per-task or per-job event sequence
     pub seq: u64,
     /// When the event happened, or for a task event when the daemon held it
@@ -208,7 +264,15 @@ impl HeldEvent {
     pub fn task(event: &HomebasedEvent, seq: u64, at: DateTime<Utc>) -> Self {
         let summary = match (event.event, event.continuation, event.reports.last()) {
             (EventKind::TaskWaiting, Some(continuation), _) => {
-                format!("parked; continues as task {continuation}")
+                let on = event
+                    .waiting_on
+                    .as_ref()
+                    .map_or_else(String::new, |targets| {
+                        let names: Vec<String> =
+                            targets.targets().iter().map(target_name).collect();
+                        format!(" on {}", names.join(", "))
+                    });
+                format!("parked{on}; continues as task {continuation}")
             }
             (_, _, Some(report)) => format!(
                 "report {} ({}): {}",
@@ -221,6 +285,7 @@ impl HeldEvent {
         Self {
             event: HeldKind::Task(event.event),
             task: Some(event.task),
+            job: None,
             seq,
             at,
             summary,
@@ -250,10 +315,19 @@ impl HeldEvent {
         Self {
             event: HeldKind::Job(event.event),
             task: None,
+            job: Some(event.job),
             seq: event.seq,
             at: event.at,
             summary,
         }
+    }
+}
+
+/// A wait target as a held summary names it
+fn target_name(target: &Dependency) -> String {
+    match target {
+        Dependency::Task(task) => format!("task {task}"),
+        Dependency::Job(job) => format!("job {job}"),
     }
 }
 

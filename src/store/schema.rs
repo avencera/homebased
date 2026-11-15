@@ -237,17 +237,21 @@ fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
 ///
 /// A task row names the chain's current run and moves to the continuation
 /// when that run parks. `held_json` lists the `HeldEvent`s settled without
-/// waking the thread; the final event's settlement deletes the row
+/// waking the thread; the final event's settlement deletes the row. A row
+/// with `parked_under` is a task or job that run of a held chain parked on:
+/// its events, the final one too, join that run's `held_json` instead
 const SLEEP_HOLDS_TABLE: &str = "
 CREATE TABLE sleep_holds (
     target_kind TEXT NOT NULL CHECK (target_kind IN ('task', 'job')),
     target_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
+    parked_under TEXT,
     created_at TEXT NOT NULL,
     held_json TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (target_kind, target_id)
 );
 CREATE INDEX sleep_holds_thread ON sleep_holds (thread_id);
+CREATE INDEX sleep_holds_parked ON sleep_holds (parked_under) WHERE parked_under IS NOT NULL;
 ";
 
 /// Version 20: child-thread links and the one report each child sends

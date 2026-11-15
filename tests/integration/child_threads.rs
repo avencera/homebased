@@ -275,6 +275,12 @@ fn a_child_with_open_work_cannot_report_until_its_own_child_reports_and_its_task
     let mut spec = h.gated_target("child-task", 0);
     spec["thread"] = json!(CHILD_SESSION);
     let task = h.submit(&spec);
+    let slept = h.as_agent((&child, CHILD_SESSION), &["wait", "--long", &task]);
+    assert!(
+        slept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&slept.stderr)
+    );
     let refusal = failed(
         &h.report((&child, CHILD_SESSION), "Ported the uploader"),
         5,
@@ -290,6 +296,12 @@ fn a_child_with_open_work_cannot_report_until_its_own_child_reports_and_its_task
     assert!(
         open.iter()
             .any(|work| work["kind"] == "task" && work["id"] == task.as_str()),
+        "{refusal}"
+    );
+    // the sleep's hold is open work of its own until the final event ends it
+    assert!(
+        open.iter()
+            .any(|work| work["kind"] == "hold" && work["id"] == task.as_str()),
         "{refusal}"
     );
     assert!(messages_to(&t3, PARENT.0).is_empty());
