@@ -664,6 +664,16 @@ fn long_wait_follows_a_parked_task_and_holds_what_it_parks_on() {
     assert_eq!(h.normally_delivered(&worker), Vec::<String>::new());
     assert_eq!(h.normally_delivered(&target), Vec::<String>::new());
     assert_eq!(callbacks(&h, job), Vec::<Value>::new());
+    // the line reaches the thread before its delivery settles, and the
+    // settlement ends the chain's hold in the same transaction
+    assert!(
+        wait_until(
+            Duration::from_secs(20),
+            || h.show(&continuation)["callback"] == "sent"
+        ),
+        "{}",
+        h.show(&continuation)
+    );
     let store = Store::open(&h.home.join(homebased::home::DB_NAME)).unwrap();
     assert_eq!(store.sleeping_threads().unwrap(), Vec::new());
 }
