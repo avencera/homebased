@@ -37,12 +37,19 @@ fn direnv_installed(h: &Harness) -> bool {
 
 /// A repository directory whose `.envrc` exports a value and prints it, so a
 /// leak of the `.envrc`'s output into the task log would show
+///
+/// It also records the GPU selection it ran with in `<name>.cuda`
 fn repo_with_envrc(h: &Harness, name: &str) -> PathBuf {
     let repo = h.dir.path().join(name);
+    let cuda = h.dir.path().join(format!("{name}.cuda"));
     fs::create_dir_all(&repo).unwrap();
     fs::write(
         repo.join(".envrc"),
-        "export HB_ENVRC_SECRET=from-envrc-value\necho \"leak:$HB_ENVRC_SECRET\"\n",
+        format!(
+            "export HB_ENVRC_SECRET=from-envrc-value\necho \"leak:$HB_ENVRC_SECRET\"\n\
+             printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > '{}'\n",
+            cuda.display()
+        ),
     )
     .unwrap();
     repo
@@ -110,6 +117,12 @@ fn command_tasks_load_only_an_envrc_direnv_already_allows() {
     // the log names variables, never values or what the `.envrc` printed
     assert_eq!(log.matches("from-envrc-value").count(), 1, "{log}");
     assert!(!log.contains("leak:"), "{log}");
+    // the `.envrc` runs with the task's GPU selection, which hides every
+    // device from a task that did not ask for them
+    assert_eq!(
+        fs::read_to_string(h.dir.path().join("allowed.cuda")).unwrap(),
+        ""
+    );
 
     let (seen, log) = run_and_read(&h, &blocked, &[]);
     assert_eq!(seen, "unset", "{log}");

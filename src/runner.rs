@@ -432,9 +432,10 @@ async fn run_child(
         .open(&paths.output)?;
     // a cancel during a slow `.envrc` stops it rather than waiting it out;
     // dropping the lookup kills direnv's group, which is then confirmed gone
+    let run_vars = run_variables(store, home, id)?;
     let envrc_group = AtomicI32::new(0);
     let envrc = tokio::select! {
-        envrc = task_envrc(row, &envrc_group) => envrc,
+        envrc = task_envrc(row, &run_vars, &envrc_group) => envrc,
         reason = cancellation(store, id, sigterm) => {
             warn!(%id, "stopped while loading .envrc: not starting the command");
             let process_group_exit_evidence = match envrc_group.load(Ordering::SeqCst) {
@@ -475,15 +476,7 @@ async fn run_child(
     for (key, value) in invocation.environment.iter() {
         cmd.env(key, value);
     }
-    if let Some(checkpoint) = store.run_checkpoint(id)? {
-        for (key, value) in checkpoint.host_environment(home) {
-            cmd.env(key, value);
-        }
-    } else if task_gpu_access(store, id)?.is_hidden() {
-        // an empty list hides every device, so a CPU task cannot open a CUDA
-        // context that takes memory from a GPU queue job
-        cmd.env(run_env::CUDA_VISIBLE_DEVICES, "");
-    }
+    cmd.envs(run_vars);
     match invocation.stdin {
         StdinPolicy::PromptFeed => {
             cmd.stdin(Stdio::piped());
@@ -654,13 +647,41 @@ async fn cancellation(store: &Store, id: TaskId, sigterm: &mut SignalStream) -> 
 /// Only command workloads load it. An agent CLI keeps the environment it was
 /// configured with, since an `.envrc` could switch its account or API key, and
 /// a container gets only the variables its spec names
-async fn task_envrc(row: &TaskRow, group: &AtomicI32) -> Envrc {
+async fn task_envrc(row: &TaskRow, run_vars: &[(&str, String)], group: &AtomicI32) -> Envrc {
+    // direnv gets the run's GPU selection but never its marker: what an
+    // `.envrc` leaves running belongs to no run, as in a terminal
+    let gpu: Vec<(&str, String)> = run_vars
+        .iter()
+        .filter(|(name, _)| {
+            [run_env::CUDA_VISIBLE_DEVICES, run_env::CUDA_DEVICE_ORDER].contains(name)
+        })
+        .cloned()
+        .collect();
     match &row.workload {
         Workload::Task(task) if task.envrc == EnvrcPolicy::Load => {
-            Envrc::resolve(&row.cwd, &row.env.path, &row.env.home, group).await
+            Envrc::resolve(&row.cwd, &row.env.path, &row.env.home, &gpu, group).await
         }
         Workload::Task(_) | Workload::Agent(_) | Workload::Container(_) => Envrc::Absent,
     }
+}
+
+/// The run variables and GPU selection a child gets on top of the task's
+///
+/// A queue run gets its checkpoint's variables. Otherwise an empty device list
+/// hides every GPU from a task that did not ask for them, so a CPU task cannot
+/// open a CUDA context that takes memory from a GPU queue job
+fn run_variables(
+    store: &Store,
+    home: &Home,
+    id: TaskId,
+) -> Result<Vec<(&'static str, String)>, AppError> {
+    if let Some(checkpoint) = store.run_checkpoint(id)? {
+        return Ok(checkpoint.host_environment(home));
+    }
+    if task_gpu_access(store, id)?.is_hidden() {
+        return Ok(vec![(run_env::CUDA_VISIBLE_DEVICES, String::new())]);
+    }
+    Ok(Vec::new())
 }
 
 /// Save the child's identity for cleanup after a lost worker and return it

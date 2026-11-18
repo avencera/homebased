@@ -74,7 +74,11 @@ pub enum Envrc {
 }
 
 impl Envrc {
-    /// Ask direnv what `cwd` exports, with the task's `PATH` and `HOME`
+    /// Ask direnv what `cwd` exports, with the task's `PATH`, `HOME`, and GPU
+    /// selection
+    ///
+    /// `gpu` holds the CUDA variables the command will get, so an `.envrc` that
+    /// probes CUDA sees only the devices the task may use
     ///
     /// `direnv` is looked up on the absolute entries of the task's `PATH`: a
     /// relative entry would let the repository supply the `direnv` that runs
@@ -82,7 +86,13 @@ impl Envrc {
     ///
     /// `group` holds the process group of the direnv call in progress, or 0,
     /// so a caller that drops this future can confirm that group is gone
-    pub async fn resolve(cwd: &Path, path: &str, home: &str, group: &AtomicI32) -> Self {
+    pub async fn resolve(
+        cwd: &Path,
+        path: &str,
+        home: &str,
+        gpu: &[(&str, String)],
+        group: &AtomicI32,
+    ) -> Self {
         let direnv =
             absolute_entries(path).and_then(|path| which::which_in("direnv", Some(path), cwd).ok());
         let Some(direnv) = direnv else {
@@ -101,6 +111,7 @@ impl Envrc {
             cwd,
             path,
             home,
+            gpu,
             group,
         };
         probe
@@ -167,6 +178,7 @@ struct Probe<'a> {
     cwd: &'a Path,
     path: &'a str,
     home: &'a str,
+    gpu: &'a [(&'a str, String)],
     group: &'a AtomicI32,
 }
 
@@ -265,8 +277,14 @@ impl Probe<'_> {
                 ));
             }
             (_, Some(file)) => file,
-            // an unchanged environment exports nothing, not even `DIRENV_FILE`
-            (Some(found), None) => found.path,
+            // the call starts without direnv's state, so a load always
+            // exports `DIRENV_FILE`; nothing means direnv did not load it, as
+            // with `DIRENV_DISABLE`
+            (Some(_), None) => {
+                return Err(format!(
+                    "{label} not loaded: `direnv export` exported nothing"
+                ));
+            }
             (None, None) => return Ok(Envrc::Absent),
         };
         Ok(Envrc::Loaded { file, changes })
@@ -305,6 +323,7 @@ impl Probe<'_> {
             .current_dir(self.cwd)
             .env("PATH", self.path)
             .env("HOME", self.home)
+            .envs(self.gpu.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
