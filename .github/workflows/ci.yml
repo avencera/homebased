@@ -35,6 +35,15 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      # the `.envrc` integration test skips without direnv, so CI installs it;
+      # Ubuntu's older direnv also covers the fallback for one without `status --json`
+      - name: Install direnv
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y direnv
+          else
+            brew install direnv
+          fi
       # `just ci` checks the dashboard before building it, so dependencies come first
       - name: Install dashboard dependencies
         run: just web-install

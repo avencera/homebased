@@ -19,6 +19,7 @@ use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
 use crate::dependency::Dependencies;
 use crate::domain::{API_VERSION, MIN_TIMEOUT, TaskName, TaskWorkload, ThreadId};
+use crate::envrc::EnvrcPolicy;
 use crate::error::AppError;
 use crate::invocation::{CommandLine, resolve_executable};
 use crate::machine::{MachineId, MachineName};
@@ -627,7 +628,12 @@ fn parse_step(step: &Value, prefix: &str) -> Result<StepWorkload, AppError> {
                     error.to_string(),
                 )
             })?;
-            Ok(StepWorkload::Task(TaskWorkload { command }))
+            Ok(StepWorkload::Task(TaskWorkload {
+                command,
+                // a job step always loads its `.envrc`: an opt-out on the
+                // wire would break queue listings on peers that predate it
+                envrc: EnvrcPolicy::Load,
+            }))
         }
         Some("container") => {
             let container = ContainerWorkload::from_value(&content)

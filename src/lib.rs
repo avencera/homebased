@@ -14,6 +14,7 @@ pub(crate) mod curl;
 pub mod daemon;
 pub mod dependency;
 pub mod domain;
+pub mod envrc;
 pub mod error;
 pub mod events;
 pub mod files;

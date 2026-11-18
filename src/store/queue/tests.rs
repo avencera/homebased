@@ -932,6 +932,7 @@ fn an_ordinary_exit_75_stays_a_failure() {
         thread: crate::domain::ThreadId(uuid::Uuid::now_v7()),
         workload: crate::domain::Workload::Task(crate::domain::TaskWorkload {
             command: crate::invocation::CommandLine::try_from_argv(vec!["true".into()]).unwrap(),
+            envrc: crate::envrc::EnvrcPolicy::Load,
         }),
         cwd: PathBuf::from("/tmp"),
         timeout: std::time::Duration::from_secs(3600),

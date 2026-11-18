@@ -684,6 +684,8 @@ mod containers;
 mod dashboard;
 #[path = "integration/dependencies.rs"]
 mod dependencies;
+#[path = "integration/envrc.rs"]
+mod envrc;
 // the GPU idle watcher only runs on Linux
 #[cfg(target_os = "linux")]
 #[path = "integration/gpu_idle.rs"]

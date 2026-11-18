@@ -54,6 +54,7 @@ fn task_row(id: TaskId) -> TaskRow {
                 "--release".into(),
             ])
             .unwrap(),
+            envrc: crate::envrc::EnvrcPolicy::Load,
         }),
         cwd: Path::new("/tmp").to_path_buf(),
         timeout: Duration::from_secs(4 * 3600),

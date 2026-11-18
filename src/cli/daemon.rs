@@ -446,6 +446,7 @@ mod tests {
             thread: spec.thread,
             workload: Workload::Task(TaskWorkload {
                 command: CommandLine::try_from_argv(vec!["/bin/true".into()]).unwrap(),
+                envrc: crate::envrc::EnvrcPolicy::Load,
             }),
             cwd,
             timeout: spec.timeout,

@@ -6,6 +6,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -25,6 +26,7 @@ use crate::domain::{
     ExitReason, ProcessGroupExitEvidence, ProcessStatus, TaskExitEvidence, TaskId, TaskIdentity,
     TaskRow, TaskState, ThreadId, Workload,
 };
+use crate::envrc::{Envrc, EnvrcPolicy};
 use crate::error::AppError;
 use crate::home::{self, Home, LockMode, TaskPaths};
 use crate::invocation::{ChildInvocation, StdinPolicy, invocation_from_workload};
@@ -424,10 +426,37 @@ async fn run_child(
     sigterm: &mut SignalStream,
 ) -> Result<TaskRunExit, AppError> {
     let id = row.id;
-    let log = OpenOptions::new()
+    let mut log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.output)?;
+    // a cancel during a slow `.envrc` stops it rather than waiting it out;
+    // dropping the lookup stops direnv and everything it started
+    // a cancel during a slow `.envrc` stops it rather than waiting it out;
+    // dropping the lookup kills direnv's group, which is then confirmed gone
+    let envrc_group = AtomicI32::new(0);
+    let envrc = tokio::select! {
+        envrc = task_envrc(row, &envrc_group) => envrc,
+        reason = cancellation(store, id, sigterm) => {
+            warn!(%id, "stopped while loading .envrc: not starting the command");
+            let process_group_exit_evidence = match envrc_group.load(Ordering::SeqCst) {
+                0 => ProcessGroupExitEvidence::ConfirmedExited,
+                pgid => cleanup_process_group(pgid).await,
+            };
+            return Ok(TaskRunExit { reason, process_group_exit_evidence });
+        }
+    };
+    // a stop that arrived as the lookup finished must still win over the spawn
+    if let Some(reason) = pending_cancellation(store, id, sigterm).await {
+        warn!(%id, "stopped while loading .envrc: not starting the command");
+        return Ok(TaskRunExit {
+            reason,
+            process_group_exit_evidence: ProcessGroupExitEvidence::ConfirmedExited,
+        });
+    }
+    if let Some(line) = envrc.log_line() {
+        io::Write::write_all(&mut log, format!("{line}\n").as_bytes())?;
+    }
     let stdout = log.try_clone()?;
     let stderr = log;
 
@@ -436,8 +465,10 @@ async fn run_child(
     cmd.args(&invocation.args)
         .current_dir(&row.cwd)
         .env("PATH", &row.env.path)
-        .env("HOME", &row.env.home)
-        .env(run_env::TASK_ID, id.to_string())
+        .env("HOME", &row.env.home);
+    // before Homebased's own variables, so an `.envrc` cannot replace them
+    envrc.apply(cmd.as_std_mut());
+    cmd.env(run_env::TASK_ID, id.to_string())
         .env("HOMEBASED_HOME", home.root())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -572,6 +603,66 @@ async fn run_child(
     let exit = stop_child(&mut child, child_pgid, reason).await;
     stop_leftovers(id, store, descendants).await;
     Ok(exit)
+}
+
+/// Resolve once the worker is told to stop before its child exists, with the
+/// reason the task ends for
+///
+/// Watches the same two signals as the child loop: SIGTERM and the persisted
+/// cancellation marker
+/// A stop that is already pending, checked once without waiting
+async fn pending_cancellation(
+    store: &Store,
+    id: TaskId,
+    sigterm: &mut SignalStream,
+) -> Option<ExitReason> {
+    let signalled = tokio::select! {
+        biased;
+        _ = sigterm.recv() => true,
+        () = std::future::ready(()) => false,
+    };
+    match store.require_task(id) {
+        Ok(row) if row.cancel_requested_at.is_some() => Some(ExitReason::Cancelled),
+        _ if signalled => Some(ExitReason::Signal { signal: 15 }),
+        Ok(_) => None,
+        Err(err) => {
+            warn!(%id, "read cancellation state: {err}");
+            None
+        }
+    }
+}
+
+async fn cancellation(store: &Store, id: TaskId, sigterm: &mut SignalStream) -> ExitReason {
+    let mut poll = time::interval(CANCELLATION_POLL);
+    poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => break,
+            _ = poll.tick() => match store.require_task(id) {
+                Ok(row) if row.cancel_requested_at.is_some() => return ExitReason::Cancelled,
+                Ok(_) => {}
+                Err(err) => warn!(%id, "read cancellation state: {err}"),
+            },
+        }
+    }
+    match store.require_task(id) {
+        Ok(row) if row.cancel_requested_at.is_some() => ExitReason::Cancelled,
+        _ => ExitReason::Signal { signal: 15 },
+    }
+}
+
+/// The direnv environment a command task starts with
+///
+/// Only command workloads load it. An agent CLI keeps the environment it was
+/// configured with, since an `.envrc` could switch its account or API key, and
+/// a container gets only the variables its spec names
+async fn task_envrc(row: &TaskRow, group: &AtomicI32) -> Envrc {
+    match &row.workload {
+        Workload::Task(task) if task.envrc == EnvrcPolicy::Load => {
+            Envrc::resolve(&row.cwd, &row.env.path, &row.env.home, group).await
+        }
+        Workload::Task(_) | Workload::Agent(_) | Workload::Container(_) => Envrc::Absent,
+    }
 }
 
 /// Save the child's identity for cleanup after a lost worker and return it
@@ -1042,6 +1133,7 @@ mod tests {
                     "30".into(),
                 ])
                 .unwrap(),
+                envrc: crate::envrc::EnvrcPolicy::Load,
             }),
             cwd: "/tmp".into(),
             timeout: Duration::from_secs(30),

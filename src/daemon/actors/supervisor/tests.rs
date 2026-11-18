@@ -41,6 +41,7 @@ fn command_task_row(id: TaskId, spec: &NormalizedSpec, path: String, binary: &st
         thread: spec.thread,
         workload: Workload::Task(TaskWorkload {
             command: workload.command.clone(),
+            envrc: crate::envrc::EnvrcPolicy::Load,
         }),
         cwd: spec.cwd.clone(),
         timeout: spec.timeout,

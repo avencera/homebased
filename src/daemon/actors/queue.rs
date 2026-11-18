@@ -540,7 +540,10 @@ async fn checkout_run(
             message: format!("checkout wrapper: {error}"),
         })?;
     Ok(Some(CheckoutRun {
-        workload: Workload::Task(TaskWorkload { command }),
+        workload: Workload::Task(TaskWorkload {
+            command,
+            envrc: workload.envrc,
+        }),
         cwd: clone,
     }))
 }

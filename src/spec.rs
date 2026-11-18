@@ -14,6 +14,7 @@ use crate::container::ContainerWorkload;
 use crate::container::spec::container_workload_schema;
 use crate::dependency::{Dependencies, DependencyId, DependencyListError, MAX_DEPENDENCIES};
 use crate::domain::{API_VERSION, AgentKind, DEFAULT_TIMEOUT, MIN_TIMEOUT, TaskName, ThreadId};
+use crate::envrc::EnvrcPolicy;
 use crate::error::AppError;
 use crate::invocation::CommandLine;
 use crate::machine::MachineName;
@@ -134,6 +135,9 @@ pub struct SubmitAgentWorkload {
 pub struct SubmitTaskWorkload {
     /// Argv array. Index 0 is the program
     pub command: Vec<String>,
+    /// Whether the command loads its directory's allowed `.envrc`
+    #[serde(default)]
+    pub envrc: EnvrcPolicy,
 }
 
 /// Wire shape of `task submit --spec`
@@ -242,13 +246,24 @@ fn workload_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schem
                 "type": "object",
                 "properties": {
                     "type": { "const": "task" },
-                    "command": command
+                    "command": command,
+                    "envrc": envrc_schema()
                 },
                 "required": ["type", "command"],
                 "additionalProperties": false
             },
             container
         ]
+    })
+}
+
+/// Schema of a command workload's `envrc` key
+fn envrc_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["load", "ignore"],
+        "default": "load",
+        "description": "load (default) adds the environment of the .envrc that direnv already allows for cwd, as a terminal opened there would have; ignore runs the command without it. Homebased never runs `direnv allow`."
     })
 }
 
@@ -364,6 +379,8 @@ pub enum SubmitWorkloadValidated {
     Task {
         /// Validated argv
         command: CommandLine,
+        /// Whether the command loads its directory's allowed `.envrc`
+        envrc: EnvrcPolicy,
     },
     /// Docker container
     Container(Box<ContainerWorkload>),
@@ -434,6 +451,9 @@ pub struct NormalizedAgentWorkload {
 pub struct NormalizedTaskWorkload {
     /// Validated argv
     pub command: CommandLine,
+    /// Whether the command loads its directory's allowed `.envrc`
+    #[serde(default, skip_serializing_if = "EnvrcPolicy::is_default")]
+    pub envrc: EnvrcPolicy,
 }
 
 /// Daemon-socket workload: agent prompt is always inline
@@ -615,7 +635,10 @@ fn parse_normalized_workload(workload_raw: &Value) -> Result<NormalizedWorkload,
             let task: SubmitTaskWorkload = deserialize_under(&content, "/workload")?;
             let command = CommandLine::try_from_argv(task.command.clone())
                 .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
-            Ok(NormalizedWorkload::Task(NormalizedTaskWorkload { command }))
+            Ok(NormalizedWorkload::Task(NormalizedTaskWorkload {
+                command,
+                envrc: task.envrc,
+            }))
         }
         "container" => Ok(NormalizedWorkload::Container(parse_container(&content)?)),
         other => Err(AppError::InvalidSpec {
@@ -860,7 +883,10 @@ fn parse_submit_workload(workload_raw: &Value) -> Result<SubmitWorkloadValidated
             let task: SubmitTaskWorkload = deserialize_under(&content, "/workload")?;
             let command = CommandLine::try_from_argv(task.command.clone())
                 .map_err(|err| err.into_invalid_spec(json!(task.command)))?;
-            Ok(SubmitWorkloadValidated::Task { command })
+            Ok(SubmitWorkloadValidated::Task {
+                command,
+                envrc: task.envrc,
+            })
         }
         "container" => Ok(SubmitWorkloadValidated::Container(parse_container(
             &content,
@@ -972,9 +998,10 @@ pub fn normalize(spec: &SubmitSpec) -> Result<NormalizedSpec, AppError> {
                 persist_session: agent.persist_session,
             })
         }
-        SubmitWorkloadValidated::Task { command } => {
+        SubmitWorkloadValidated::Task { command, envrc } => {
             NormalizedWorkload::Task(NormalizedTaskWorkload {
                 command: command.clone(),
+                envrc: *envrc,
             })
         }
         SubmitWorkloadValidated::Container(container) => {

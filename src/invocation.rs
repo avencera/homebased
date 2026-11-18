@@ -484,6 +484,7 @@ pub fn persist_agent_workload(agent: &NormalizedAgentWorkload) -> AgentWorkload 
 pub fn persist_task_workload(task: &crate::spec::NormalizedTaskWorkload) -> TaskWorkload {
     TaskWorkload {
         command: task.command.clone(),
+        envrc: task.envrc,
     }
 }
 

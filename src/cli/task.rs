@@ -16,6 +16,7 @@ use crate::dependency::{Dependencies, DependencyId};
 use crate::domain::{
     ProcessStatus, ReportKind, ReportOutcome, TASK_NAME_MAX_CHARS, TaskId, TaskStatus, ThreadId,
 };
+use crate::envrc::EnvrcPolicy;
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
@@ -87,6 +88,10 @@ pub enum TaskCommand {
         /// of it, plus this peak, fits under the memory bar (default 40 GiB)
         #[arg(long, value_name = "GIB")]
         mem_peak: Option<MemPeak>,
+        /// Run without the working directory's `.envrc`. By default the command
+        /// gets the environment of the `.envrc` that direnv already allows there
+        #[arg(long)]
+        no_envrc: bool,
         /// Validate and print argv; spawn nothing.
         #[arg(long)]
         dry_run: bool,
@@ -96,7 +101,7 @@ pub enum TaskCommand {
         /// Let a Homebased worker send events to a thread other than its parent task's thread
         #[arg(long)]
         allow_other_thread: bool,
-        /// Program and arguments, after `--`. No shell: use `-- sh -lc '...'` for shell syntax
+        /// Program and arguments, after `--`. No shell: use `-- sh -lc '...'` for shell syntax; the directory's allowed `.envrc` still loads
         #[arg(required = true, num_args = 1.., last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
@@ -230,6 +235,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             wait_for_machine,
             gpu_visible,
             mem_peak,
+            no_envrc,
             dry_run,
             request_id,
             allow_other_thread,
@@ -244,6 +250,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
                 wait_for_machine,
                 gpu_visible,
                 mem_peak,
+                no_envrc,
                 command,
             })?;
             submit_value(ctx, value, dry_run, request_id, allow_other_thread).await
@@ -341,6 +348,7 @@ struct RunOptions {
     wait_for_machine: bool,
     gpu_visible: bool,
     mem_peak: Option<MemPeak>,
+    no_envrc: bool,
     command: Vec<String>,
 }
 
@@ -355,6 +363,7 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
         wait_for_machine,
         gpu_visible,
         mem_peak,
+        no_envrc,
         command,
     } = options;
     let cwd = match cwd {
@@ -391,6 +400,10 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
     }
     if let Some(peak) = mem_peak {
         spec["mem_peak"] = json!(peak);
+    }
+    // only an opt-out is sent, so a machine on an older release still accepts the spec
+    if no_envrc {
+        spec["workload"]["envrc"] = json!(EnvrcPolicy::Ignore);
     }
     Ok(spec)
 }
