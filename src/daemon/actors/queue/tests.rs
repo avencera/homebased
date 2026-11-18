@@ -700,6 +700,7 @@ fn attention_holds_lane_and_release_is_exact() {
     row.state = crate::domain::TaskState::Queued;
     row.workload = Workload::Task(crate::domain::TaskWorkload {
         command: crate::invocation::CommandLine::try_from_argv(vec!["/bin/true".into()]).unwrap(),
+        envrc: crate::envrc::EnvrcPolicy::Load,
     });
     h.store().insert_task(&row).unwrap();
     h.store()

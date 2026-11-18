@@ -1265,6 +1265,7 @@ async fn local_terminal_event_delivers_once_after_restart() {
         thread: route.thread,
         workload: Workload::Task(TaskWorkload {
             command: CommandLine::try_from_argv(vec!["echo".into(), "local".into()]).unwrap(),
+            envrc: crate::envrc::EnvrcPolicy::Load,
         }),
         cwd: route.callback.cwd.clone(),
         timeout: spec.timeout,

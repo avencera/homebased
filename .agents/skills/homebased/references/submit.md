@@ -25,7 +25,7 @@ homebased task run --name "release build" --timeout 2h -- cargo build --release
 homebased task run --name "eval on code" --machine code --cwd ~/code/project -- just eval
 ```
 
-It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--dry-run`, and `--request-id` work as for `task submit`; `--mem-peak <GiB>` sets `mem_peak` and `--gpu-visible` sets `"gpu": "visible"`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
+It runs in the current directory (`--cwd` overrides; with `--machine`, a path under your home is sent as `~/...`). The command after `--` is an argv with no shell; use `-- sh -lc '...'` for pipes or `&&`. `--after`, `--wait-for-machine`, `--dry-run`, and `--request-id` work as for `task submit`; `--mem-peak <GiB>` sets `mem_peak`, `--gpu-visible` sets `"gpu": "visible"`, and `--no-envrc` sets `"envrc": "ignore"`. Without `--name`, the command line becomes the name. Set `--timeout` to match the work (default 1h, min 30m): quiet output for that long sends `TASK_CHECK_DUE` and never kills the child.
 
 ## 2. Choose the workload
 
@@ -163,6 +163,7 @@ Task-only fields under `workload`:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `command` | yes | Non-empty argv. Index 0 is a non-empty program. Later args may be empty. No NUL bytes. No shell. |
+| `envrc` | no | `load` (default) adds the environment of the `.envrc` that direnv already allows for `cwd`; `output.log` names the variables loaded, or why none were. `ignore` runs without it. Homebased never runs `direnv allow`. |
 
 Container-only fields under `workload`:
 

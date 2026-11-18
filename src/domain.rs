@@ -1000,6 +1000,9 @@ fn default_true() -> bool {
 pub struct TaskWorkload {
     /// Validated command line
     pub command: crate::invocation::CommandLine,
+    /// Whether the command loads its directory's allowed `.envrc`
+    #[serde(default, skip_serializing_if = "crate::envrc::EnvrcPolicy::is_default")]
+    pub envrc: crate::envrc::EnvrcPolicy,
 }
 
 /// Persisted workload discriminant
@@ -1441,6 +1444,7 @@ mod tests {
         let command = Workload::Task(TaskWorkload {
             command: crate::invocation::CommandLine::try_from_argv(vec!["/bin/true".into()])
                 .unwrap(),
+            envrc: crate::envrc::EnvrcPolicy::Load,
         });
         let id = ContainerId::parse(&"f".repeat(64)).unwrap();
         let confirmed = ContainerExitEvidence::Confirmed {
