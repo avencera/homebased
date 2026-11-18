@@ -431,8 +431,6 @@ async fn run_child(
         .append(true)
         .open(&paths.output)?;
     // a cancel during a slow `.envrc` stops it rather than waiting it out;
-    // dropping the lookup stops direnv and everything it started
-    // a cancel during a slow `.envrc` stops it rather than waiting it out;
     // dropping the lookup kills direnv's group, which is then confirmed gone
     let envrc_group = AtomicI32::new(0);
     let envrc = tokio::select! {

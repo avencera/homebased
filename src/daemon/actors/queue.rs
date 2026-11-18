@@ -18,6 +18,7 @@ use crate::domain::{
     ProcessGroupExitEvidence, ProcessStatus, TaskId, TaskRow, TaskWorkload, WorkExitEvidence,
     Workload,
 };
+use crate::envrc::EnvrcPolicy;
 use crate::error::AppError;
 use crate::home::Home;
 use crate::invocation::CommandLine;
@@ -542,7 +543,10 @@ async fn checkout_run(
     Ok(Some(CheckoutRun {
         workload: Workload::Task(TaskWorkload {
             command,
-            envrc: workload.envrc,
+            // the runner would read the `.envrc` of the clone's previous
+            // commit, before the wrapper checks out this one and enters
+            // `workdir`, so a checkout run starts without one
+            envrc: EnvrcPolicy::Ignore,
         }),
         cwd: clone,
     }))

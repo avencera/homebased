@@ -1,8 +1,11 @@
 use super::*;
 
-/// Variables that point direnv's allow list into the harness, so a test never
-/// reads or writes the developer's own
-fn direnv_env(h: &Harness) -> [(&'static str, String); 2] {
+/// Variables that point direnv's allow list and config into the harness, so a
+/// test never reads or writes the developer's own
+///
+/// `DIRENV_CONFIG` takes precedence over `XDG_CONFIG_HOME`, so a developer's
+/// whitelist would otherwise allow the blocked fixture
+fn direnv_env(h: &Harness) -> [(&'static str, String); 3] {
     let root = h.dir.path();
     [
         ("XDG_DATA_HOME", root.join("xdg-data").display().to_string()),
@@ -10,15 +13,26 @@ fn direnv_env(h: &Harness) -> [(&'static str, String); 2] {
             "XDG_CONFIG_HOME",
             root.join("xdg-config").display().to_string(),
         ),
+        (
+            "DIRENV_CONFIG",
+            root.join("xdg-config/direnv").display().to_string(),
+        ),
     ]
 }
 
+/// Whether direnv is on the harness `PATH`; CI installs it, so there a missing
+/// direnv fails the test instead of skipping it
 fn direnv_installed(h: &Harness) -> bool {
-    Command::new("direnv")
+    let installed = Command::new("direnv")
         .arg("version")
         .env("PATH", &h.path)
         .output()
-        .is_ok_and(|out| out.status.success())
+        .is_ok_and(|out| out.status.success());
+    assert!(
+        installed || std::env::var_os("CI").is_none(),
+        "direnv is not on PATH; CI must install it so the .envrc tests run"
+    );
+    installed
 }
 
 /// A repository directory whose `.envrc` exports a value and prints it, so a

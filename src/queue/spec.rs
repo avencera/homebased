@@ -630,8 +630,9 @@ fn parse_step(step: &Value, prefix: &str) -> Result<StepWorkload, AppError> {
             })?;
             Ok(StepWorkload::Task(TaskWorkload {
                 command,
-                // a job step always loads its `.envrc`: an opt-out on the
-                // wire would break queue listings on peers that predate it
+                // a job step loads its `.envrc` unless it runs in a CI
+                // checkout: an opt-out on the wire would break queue listings
+                // on peers that predate it
                 envrc: EnvrcPolicy::Load,
             }))
         }

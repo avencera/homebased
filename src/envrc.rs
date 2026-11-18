@@ -203,8 +203,8 @@ impl Probe<'_> {
         let found = match self.found_rc().await? {
             Lookup::Found(found) => Some(found),
             Lookup::NoFile => return Ok(Envrc::Absent),
-            // an older direnv cannot say which file applies, so only an
-            // `.envrc` found here is exported: export would also evaluate a `.env`
+            // an older direnv cannot say which file applies, so export runs
+            // only when an `.envrc` exists, and what it loaded is checked below
             Lookup::Unsupported if nearest_envrc(self.cwd).is_none() => return Ok(Envrc::Absent),
             Lookup::Unsupported => None,
         };
@@ -249,12 +249,25 @@ impl Probe<'_> {
                     format!("{label} not loaded: could not read `direnv export json` ({error})")
                 })?
             };
-        let file = match found {
-            Some(found) => found.path,
-            None => match changes.get("DIRENV_FILE") {
-                Some(Some(file)) if is_envrc(Path::new(file)) => PathBuf::from(file),
-                _ => return Ok(Envrc::Absent),
-            },
+        // export searches for the file again, so what it loaded can differ
+        // from what status saw, such as a `.env` once the `.envrc` is gone
+        let exported = changes
+            .get("DIRENV_FILE")
+            .cloned()
+            .flatten()
+            .map(PathBuf::from);
+        let file = match (found, exported) {
+            (_, Some(file)) if !is_envrc(&file) => return Ok(Envrc::Absent),
+            (Some(found), Some(file)) if file != found.path => {
+                return Err(format!(
+                    "{label} not loaded: direnv loaded {} instead",
+                    file.display()
+                ));
+            }
+            (_, Some(file)) => file,
+            // an unchanged environment exports nothing, not even `DIRENV_FILE`
+            (Some(found), None) => found.path,
+            (None, None) => return Ok(Envrc::Absent),
         };
         Ok(Envrc::Loaded { file, changes })
     }
@@ -341,15 +354,14 @@ impl Drop for GroupGuard {
     }
 }
 
-/// The `.envrc` direnv would pick from `cwd`, without asking direnv
+/// The nearest `.envrc` at or above `cwd`, without asking direnv
 ///
-/// Direnv takes the nearest directory with an `.envrc` or a `.env`, preferring
-/// `.envrc`; a nearer `.env` hides an `.envrc` further up
+/// With `load_dotenv`, a nearer `.env` would hide it from direnv, but whether
+/// that is on lives in direnv's config; the file export reports decides
 fn nearest_envrc(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
-        .find(|dir| dir.join(".envrc").is_file() || dir.join(".env").is_file())
         .map(|dir| dir.join(".envrc"))
-        .filter(|file| file.is_file())
+        .find(|file| file.is_file())
 }
 
 /// Whether direnv picked an `.envrc` rather than a `.env`
