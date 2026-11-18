@@ -114,6 +114,9 @@ fn render_with(
             quote_systemd_environment(CONFIG_ENV, &path.display().to_string())?
         ));
     }
+    // `OOMPolicy=stop`, the default, stops the daemon whenever the kernel
+    // OOM-kills any task in its cgroup, and every running task then waits for a
+    // restart to be adopted again; the task that was killed already ends alone
     Ok(format!(
         "[Unit]\n\
          Description=homebased task supervisor\n\
@@ -122,6 +125,7 @@ fn render_with(
          [Service]\n\
          ExecStart={} daemon serve --home {}\n\
          KillMode=process\n\
+         OOMPolicy=continue\n\
          Restart=on-failure\n\
          TimeoutStopSec=15\n\
          {env_lines}\
@@ -395,6 +399,7 @@ mod tests {
         let home = Home::resolve(Some(PathBuf::from("/tmp/hb-state"))).unwrap();
         let text = render_with(&home, None, None).unwrap();
         assert!(text.contains("KillMode=process"), "{text}");
+        assert!(text.contains("OOMPolicy=continue"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("ExecStop=")),
             "{text}"

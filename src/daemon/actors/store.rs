@@ -551,6 +551,8 @@ pub(crate) enum StoreMsg {
     InsertOriginRoute {
         route: Box<OriginRoute>,
         terms: ReleaseTerms,
+        /// Level a route with a memory peak waits at; not part of its identity
+        priority: crate::queue::Priority,
         reply: RpcReplyPort<Result<OriginRoute, AppError>>,
     },
     /// Read the release terms saved with one origin route
@@ -726,6 +728,12 @@ pub(crate) enum StoreMsg {
     /// Read routes that wait for dependencies or for their launch to be answered
     HeldRoutes {
         reply: RpcReplyPort<Result<Vec<DependentRoute>, AppError>>,
+    },
+    /// Set the level a task waiting for memory is admitted at
+    SetHeldPriority {
+        task: TaskId,
+        priority: crate::queue::Priority,
+        reply: RpcReplyPort<Result<crate::store::PriorityChange, AppError>>,
     },
     /// Read local tasks submitted with dependencies whose rows still wait for a worker
     UnstartedDependentTasks {
@@ -1327,11 +1335,12 @@ impl Actor for StoreActor {
             StoreMsg::InsertOriginRoute {
                 route,
                 terms,
+                priority,
                 reply,
             } => send_reply(
                 reply,
                 state
-                    .insert_origin_route_with(&route, &terms)
+                    .insert_origin_route_at(&route, &terms, priority)
                     .map_err(identity_error),
             ),
             StoreMsg::RouteTerms { id, reply } => {
@@ -1429,6 +1438,11 @@ impl Actor for StoreActor {
             } => send_reply(reply, state.settle_service_event(id, &delivery, Utc::now())),
             StoreMsg::WorkerThreads { reply } => send_reply(reply, state.worker_threads()),
             StoreMsg::HeldRoutes { reply } => send_reply(reply, state.held_routes()),
+            StoreMsg::SetHeldPriority {
+                task,
+                priority,
+                reply,
+            } => send_reply(reply, state.set_held_priority(task, priority)),
             StoreMsg::UnstartedDependentTasks { reply } => {
                 send_reply(reply, state.unstarted_dependent_tasks());
             }

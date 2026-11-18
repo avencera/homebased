@@ -22,8 +22,8 @@ use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
-use crate::queue::JobId;
 use crate::queue::delivery::{HeldJobEnding, JobSubmission, RoutedJobEvent};
+use crate::queue::{JobId, Priority};
 use crate::submission::{
     DependentRoute, HeldPhase, OriginRoute, PreAcceptanceRejection, SubmissionState,
 };
@@ -213,6 +213,19 @@ pub struct UnlaunchedTask {
     pub chain: Option<crate::waiting::ChainView>,
 }
 
+/// What a priority change did to a task's route
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorityChange {
+    /// The task waits for memory at the new level
+    Changed,
+    /// This machine accepted no submit for the task
+    NoRoute,
+    /// The task was submitted without a peak, so it never waits for memory
+    NoPeak,
+    /// The task already left the wait: released, launched, or ended
+    NotWaiting,
+}
+
 /// Result of asking the origin to cancel a held route
 #[derive(Debug, Clone)]
 pub enum HeldCancel {
@@ -229,6 +242,41 @@ impl Store {
             "json_extract(route_json, '$.submission.type') = 'held'
              AND json_extract(route_json, '$.submission.phase.type') IN ('waiting', 'launching')",
         )
+    }
+
+    /// Set the level a task waiting for memory is admitted at
+    ///
+    /// Only a route still held and waiting, with a peak, changes; otherwise
+    /// the result says why it did not
+    pub fn set_held_priority(
+        &self,
+        task: TaskId,
+        priority: Priority,
+    ) -> Result<PriorityChange, AppError> {
+        let changed = self.conn.execute(
+            "UPDATE origin_routes SET priority = ?2
+             WHERE task_id = ?1 AND mem_peak_mib IS NOT NULL
+               AND json_extract(route_json, '$.submission.type') = 'held'
+               AND json_extract(route_json, '$.submission.phase.type') = 'waiting'",
+            params![task.to_string(), priority.rank()],
+        )?;
+        if changed > 0 {
+            return Ok(PriorityChange::Changed);
+        }
+
+        let peak: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT mem_peak_mib FROM origin_routes WHERE task_id = ?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match peak {
+            None => PriorityChange::NoRoute,
+            Some(None) => PriorityChange::NoPeak,
+            Some(Some(_)) => PriorityChange::NotWaiting,
+        })
     }
 
     /// Local tasks submitted with dependencies whose committed rows still wait for a worker
@@ -296,7 +344,8 @@ impl Store {
     /// Routes that may be held: those with dependencies, and those that wait for their machine
     fn dependent_routes(&self, filter: &str) -> Result<Vec<DependentRoute>, AppError> {
         let sql = format!(
-            "SELECT task_id,route_json,after_json,after_rule,wait_for_machine,mem_peak_mib
+            "SELECT task_id,route_json,after_json,after_rule,wait_for_machine,mem_peak_mib,
+                    priority
              FROM origin_routes
              WHERE (after_json IS NOT NULL OR wait_for_machine = 1 OR mem_peak_mib IS NOT NULL)
                AND json_valid(route_json) AND {filter}
@@ -312,12 +361,13 @@ impl Store {
                     row.get::<_, String>(3)?,
                     row.get::<_, bool>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(
-                |(task, route_json, after_json, rule, waits_for_machine, mem_peak)| {
+                |(task, route_json, after_json, rule, waits_for_machine, mem_peak, priority)| {
                     let route = decode_route(&route_json)?;
                     if route.task.to_string() != task {
                         return Err(AppError::ClusterTaskConflict { task: route.task });
@@ -333,6 +383,7 @@ impl Store {
                         rule,
                         waits_for_machine,
                         mem_peak: super::identity::stored_mem_peak(mem_peak)?,
+                        priority: super::identity::stored_priority(priority)?,
                     })
                 },
             )

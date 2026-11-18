@@ -26,6 +26,7 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::memory::{Gauge, Gib, MemPeak, MemoryWait, Room};
 use crate::queue::JobId;
+use crate::spec::{NormalizedSpec, NormalizedWorkload};
 
 pub(crate) const MEMORY_NAME: &str = "homebased.memory";
 
@@ -34,11 +35,13 @@ pub(crate) const MEMORY_NAME: &str = "homebased.memory";
 // release passes instead
 const GRANT_BOUND: Duration = Duration::from_secs(120);
 
-/// The bar and the gauge, fixed for the daemon's life
+/// The bar, the gauge, and whether command tasks must declare a peak, fixed
+/// for the daemon's life
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryLimits {
     bar: u64,
     gauge: Gauge,
+    require_peak: bool,
 }
 
 impl MemoryLimits {
@@ -47,7 +50,31 @@ impl MemoryLimits {
         Self {
             bar: config.bar,
             gauge: Gauge::new(config.cgroup.clone()),
+            require_peak: config.require_peak,
         }
+    }
+
+    /// Refuse a command task that would run here without a peak, when this
+    /// machine requires one
+    ///
+    /// A task with `machine` cannot carry a peak, since this gate measures
+    /// only this machine, so it is not checked; agents and containers are
+    /// exempt, as `memory.require_peak` explains
+    pub(crate) fn check_undeclared(&self, spec: &NormalizedSpec) -> Result<(), AppError> {
+        if !self.require_peak
+            || spec.machine.is_some()
+            || !matches!(spec.workload, NormalizedWorkload::Task(_))
+        {
+            return Ok(());
+        }
+        Err(AppError::InvalidSpec {
+            pointer: "/mem_peak".into(),
+            value: serde_json::Value::Null,
+            message: "this machine requires mem_peak on command tasks ([memory] require_peak): \
+                      pass --mem-peak <GiB> with the task's peak host memory plus about 10%, \
+                      or 0.1 with --priority high for a task that only waits"
+                .into(),
+        })
     }
 
     /// Refuse a peak this machine can never admit
@@ -342,6 +369,7 @@ mod tests {
                 limits: MemoryLimits {
                     bar: 10 * GIB,
                     gauge: Gauge::new(Some(cgroup)),
+                    require_peak: false,
                 },
                 store,
                 machine: MachineId::new(),

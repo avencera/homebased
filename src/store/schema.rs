@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 21;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 20] = [
+const MIGRATIONS: [Migration; 21] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -40,6 +40,7 @@ const MIGRATIONS: [Migration; 20] = [
     add_sleep_holds,
     add_thread_lineage,
     add_follow_up_reports,
+    add_route_priorities,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -229,6 +230,13 @@ fn add_route_mem_peaks(conn: &Connection) -> Result<(), rusqlite::Error> {
     ))
 }
 
+/// Version 22: the priority a held task with a memory peak is admitted at
+fn add_route_priorities(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE origin_routes ADD COLUMN {ROUTE_PRIORITY};"
+    ))
+}
+
 /// Version 19: `homebased wait --long` holds progress events for its thread
 fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(SLEEP_HOLDS_TABLE)
@@ -342,6 +350,11 @@ CREATE INDEX thread_reports_open ON thread_reports (stage)
 /// held until the memory gate admits it, and its task is a claim while it runs
 const ROUTE_MEM_PEAK: &str =
     "mem_peak_mib INTEGER CHECK (mem_peak_mib IS NULL OR mem_peak_mib > 0)";
+
+/// Memory admission level of a task with `mem_peak`, as `Priority::rank`:
+/// higher levels are admitted first, then submit order. Routes saved before
+/// version 22 read as medium
+const ROUTE_PRIORITY: &str = "priority INTEGER NOT NULL DEFAULT 1 CHECK (priority BETWEEN 0 AND 2)";
 
 /// Version 16: CI slot lanes, drains, run timeouts, and job timings
 fn add_ci_slots(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -629,6 +642,7 @@ fn schema() -> String {
         .replace("{ROUTE_WAIT_FOR_MACHINE}", ROUTE_WAIT_FOR_MACHINE)
         .replace("{ROUTE_COALESCE_KEY}", ROUTE_COALESCE_KEY)
         .replace("{ROUTE_MEM_PEAK}", ROUTE_MEM_PEAK)
+        .replace("{ROUTE_PRIORITY}", ROUTE_PRIORITY)
         .replace("{ROUTE_COALESCE_INDEX}", ROUTE_COALESCE_INDEX)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{RESOURCE_LABEL}", RESOURCE_LABEL)
@@ -756,7 +770,8 @@ CREATE TABLE origin_routes (
     {ROUTE_AFTER_RULE},
     {ROUTE_WAIT_FOR_MACHINE},
     {ROUTE_COALESCE_KEY},
-    {ROUTE_MEM_PEAK}
+    {ROUTE_MEM_PEAK},
+    {ROUTE_PRIORITY}
 );
 {ROUTE_COALESCE_INDEX}
 
@@ -1101,6 +1116,7 @@ mod tests {
         // version 1 is the current schema without what version 2 added
         let v1 = schema()
             .replace(&format!(",\n    {}", super::ROUTE_MEM_PEAK), "")
+            .replace(&format!(",\n    {}", super::ROUTE_PRIORITY), "")
             .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
             .replace(&format!(",\n    {}", super::ROUTE_WAIT_FOR_MACHINE), "")
@@ -1209,6 +1225,7 @@ mod tests {
         // sleep holds, or child-thread links
         conn.execute_batch(
             "DROP TABLE thread_reports; DROP TABLE thread_lineage;
+             ALTER TABLE origin_routes DROP COLUMN priority;
              ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
              DROP TABLE sleep_holds;
              DROP TABLE lease_idle_trips; DROP TABLE services;
@@ -1262,7 +1279,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn.execute_batch(&format!(
-            "DROP TABLE thread_reports; {}",
+            "DROP TABLE thread_reports; ALTER TABLE origin_routes DROP COLUMN priority; {}",
             super::THREAD_REPORTS_V20
         ))
         .unwrap();

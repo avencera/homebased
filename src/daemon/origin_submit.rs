@@ -22,6 +22,7 @@ use crate::fleet::probe::VerifiedDestination;
 use crate::fleet::protocol::{ClusterProtocolVersion, SUPPORTED_PROTOCOLS};
 use crate::invocation::resolve_agent_binary;
 use crate::machine::{MachineId, MachineName};
+use crate::queue::Priority;
 use crate::spec::{self, NormalizedSpec};
 use crate::submission::{
     CallbackContext, CallbackExecutable, ExecutorIdentity, HeldPhase, OriginRoute, ReleaseTerms,
@@ -77,7 +78,8 @@ pub(super) async fn submit(
         last_accepted_seq: 0,
         last_settled_seq: 0,
     };
-    let saved = insert_route(state, route, terms).await?;
+    // a remote task has no memory peak, so its priority never matters
+    let saved = insert_route(state, route, terms, Priority::default()).await?;
     if saved.task != task {
         return finish_saved(state, saved).await;
     }
@@ -95,11 +97,13 @@ pub(super) async fn insert_route(
     state: &AppState,
     route: OriginRoute,
     terms: ReleaseTerms,
+    priority: Priority,
 ) -> Result<OriginRoute, AppError> {
     let request = route.request;
     let inserted = call(&state.store, |reply| StoreMsg::InsertOriginRoute {
         route: Box::new(route),
         terms,
+        priority,
         reply,
     })
     .await;

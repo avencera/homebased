@@ -796,8 +796,8 @@ homebased --json task submit --spec "$spec"            # submit to the local mac
 `task run` builds a `task` spec from its flags: it runs the command after `--`
 in the current directory (`--cwd` overrides), names it after the command unless
 `--name` is given, and takes `--timeout`, `--machine`, `--after`,
-`--wait-for-machine`, `--mem-peak`, `--gpu-visible`, `--no-envrc`, `--dry-run`,
-and `--request-id`.
+`--wait-for-machine`, `--mem-peak`, `--priority`, `--gpu-visible`, `--no-envrc`,
+`--dry-run`, and `--request-id`.
 
 Always pass `--json` on data commands. Every JSON object carries `api_version: 1`. `--request-id` is an optional CLI flag for a stable retry identity; it is not a task field.
 
@@ -998,10 +998,36 @@ cgroup's cap; shmem (tmpfs) and unevictable (mlocked) pages stay counted, and
 a configured cgroup that is itself a scope counts once. Work already started counts at its
 declared peak until it grows that large, so two items that each fit alone
 cannot both start into the same room. Items wait in a fixed order: GPU queue jobs in
-serving order, then tasks in submit order. A waiting item keeps its room, so
-smaller work behind it cannot start ahead of it and keep it waiting. A job
-whose GPU is busy keeps no room until the GPU is free. Work without
-`mem_peak` starts as before and is counted only through memory in use.
+serving order, then tasks by `priority`, and in submit order within a level. A
+waiting item keeps its room, so smaller work behind it cannot start ahead of it
+and keep it waiting. A job whose GPU is busy keeps no room until the GPU is
+free. Work without `mem_peak` starts as before and is counted only through
+memory in use.
+
+A task's `priority` is `high`, `medium` (the default), or `low`, set with
+`task run --priority` or `priority` in the spec, and needs `mem_peak`. Change
+it while the task waits, on the machine that accepted the submit:
+
+```sh
+homebased --json task priority <task-id> high
+```
+
+A task that already started keeps the room it was granted; priority only
+orders tasks that still wait, and never puts a task ahead of a GPU job.
+
+A consumer that needs a large peak only once its producer has output should
+not hold that room while the producer waits for memory itself. Submit a small
+gate task, such as `--mem-peak 0.1`, that waits for the producer's first output,
+and submit the consumer `--after` the gate:
+
+```sh
+gate="$(homebased --quiet task run --mem-peak 0.1 -- ./wait-for-first-output.sh)"
+homebased task run --mem-peak 33 --after "$gate" -- ./consume.sh
+```
+
+The gate's room counts against the producer's, so leave room for both peaks,
+and submit the gate after the producer at no higher a level: a GPU queue job is
+admitted before any task, and a task producer then goes first in submit order.
 
 `task list`, `task show`, and `resource jobs` print why an item waits, such as
 `waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json`
@@ -1018,7 +1044,28 @@ the cgroup to read, in the daemon's config:
 [memory]
 bar_gib = 40
 # cgroup = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/homebased.service"
+# require_peak = true
 ```
+
+With `require_peak = true`, submit refuses a command task submitted here to run
+here without `mem_peak`, with `invalid_spec` at `/mem_peak`. Agent and
+container tasks are exempt, and a task submitted with `--machine` or from
+another machine is not checked, so the rule keeps local scripts honest rather
+than closing every path. Give a task that only waits `--mem-peak 0.1
+--priority high`: a waiting task keeps its room, so at medium a watcher would
+queue behind any larger task waiting ahead of it.
+
+Each task's command runs with an OOM score 300 above the daemon's, up to the
+kernel's maximum, so when the cgroup reaches its cap the kernel prefers to kill
+a task over the daemon. The Linux unit sets `OOMPolicy=continue`, so a task killed
+for memory does not make systemd stop the daemon. `homebased update` keeps the
+unit it finds, so a unit installed by an earlier release needs `homebased
+daemon install` once, with the same `--config` it was installed with.
+`daemon install` rewrites the whole unit, so keep settings of your own, such
+as `MemoryMax`, in a drop-in like
+`~/.config/systemd/user/homebased.service.d/memory-cap.conf`, which it leaves
+alone. Adding `OOMPolicy=continue` to such a drop-in works without a
+reinstall.
 
 ### Long commands inside an agent worker
 

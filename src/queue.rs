@@ -139,6 +139,7 @@ uuid_id!(
     Debug,
     Clone,
     Copy,
+    Default,
     PartialEq,
     Eq,
     PartialOrd,
@@ -153,6 +154,7 @@ pub enum Priority {
     /// Nice to have; runs when the GPU would sit idle
     Low,
     /// Needed soon, nothing blocked yet
+    #[default]
     Medium,
     /// A decision or person is blocked on the result now
     High,

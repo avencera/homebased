@@ -355,6 +355,7 @@ fn relative_prompt_file_resolves_against_cwd() {
         machine_wait: None,
         gpu: crate::spec::GpuAccess::Hidden,
         mem_peak: None,
+        priority: None,
         workload: SubmitWorkloadValidated::Agent(SubmitAgent {
             agent: AgentKind::Claude,
             model: None,

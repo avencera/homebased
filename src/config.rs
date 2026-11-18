@@ -136,6 +136,16 @@ pub struct MemoryConfig {
     /// The cgroup v2 directory whose use, with every `run-*.scope` beside it,
     /// counts; the daemon's own cgroup when unset
     pub cgroup: Option<PathBuf>,
+    /// Refuse a command task submitted here to run here without `mem_peak`
+    ///
+    /// Work started without a peak is neither admitted nor counted until it
+    /// allocates, so on a machine where memory is tight one undeclared task
+    /// can push the cgroup to its cap. Agents and containers are exempt: an
+    /// agent CLI has no peak to declare, and a container runs under its own
+    /// memory limit outside the daemon's cgroup. A task submitted with
+    /// `machine`, or from another machine, is not checked, since only a
+    /// local task can carry a peak
+    pub require_peak: bool,
 }
 
 impl Default for MemoryConfig {
@@ -143,6 +153,7 @@ impl Default for MemoryConfig {
         Self {
             bar: 40 << 30,
             cgroup: None,
+            require_peak: false,
         }
     }
 }
@@ -282,11 +293,16 @@ struct RawMemory {
     bar_gib: Option<f64>,
     #[serde(default)]
     cgroup: Option<PathBuf>,
+    #[serde(default)]
+    require_peak: bool,
 }
 
 impl RawMemory {
     fn validate(self) -> Result<MemoryConfig, String> {
-        let mut config = MemoryConfig::default();
+        let mut config = MemoryConfig {
+            require_peak: self.require_peak,
+            ..MemoryConfig::default()
+        };
         if let Some(gib) = self.bar_gib {
             let bar = crate::memory::MemPeak::from_gib(gib).map_err(|_| {
                 format!("memory.bar_gib must be more than 0 and at most 1024, not {gib}")
