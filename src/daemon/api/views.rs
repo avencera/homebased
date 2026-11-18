@@ -104,6 +104,9 @@ pub struct TaskSummary {
     /// Peak host memory of a held task submitted with `mem_peak`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_peak: Option<MemPeak>,
+    /// Level a held task with a peak is admitted at, before submit order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::queue::Priority>,
     /// Why a held task with a peak is not started yet, once nothing else holds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_wait: Option<MemoryWait>,
@@ -213,6 +216,7 @@ impl TaskSummary {
             after: None,
             chain: presentation.and_then(|presentation| presentation.chain.clone()),
             mem_peak: None,
+            priority: None,
             memory_wait: None,
         }
     }
@@ -274,6 +278,7 @@ impl TaskSummary {
             after: task.held.after.as_ref().map(|_| after),
             chain: task.chain.clone(),
             mem_peak: task.held.mem_peak,
+            priority: task.held.mem_peak.map(|_| task.held.priority),
             memory_wait: None,
         })
     }

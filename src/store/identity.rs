@@ -10,6 +10,7 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::{CoalesceKey, MachineWait};
 use crate::memory::MemPeak;
+use crate::queue::Priority;
 use crate::queue::delivery::JobRoute;
 use crate::submission::{
     ExecutionRecord, ExecutorIdentity, HeldPhase, OriginRoute, PreAcceptanceRejection,
@@ -146,6 +147,13 @@ struct SavedTerms {
     wait_for_machine: bool,
     coalesce: Option<String>,
     mem_peak: Option<i64>,
+}
+
+/// A route's saved `priority` rank
+pub(super) fn stored_priority(rank: i64) -> Result<Priority, AppError> {
+    Priority::from_rank(rank).ok_or_else(|| AppError::Internal {
+        message: format!("a route priority rank of {rank} is out of range"),
+    })
 }
 
 /// A route's saved `mem_peak_mib`
@@ -303,15 +311,28 @@ impl Store {
         self.insert_origin_route_with(route, &ReleaseTerms::default())
     }
 
-    /// Insert an origin route with the release terms it was submitted with
-    ///
-    /// The terms take part in the retry identity: the same request with a
-    /// different `after` list or machine wait is a conflict. Only a route with
-    /// dependencies or a machine wait may start held
+    /// Insert an origin route with its release terms, at the default priority
     pub fn insert_origin_route_with(
         &mut self,
         route: &OriginRoute,
         terms: &ReleaseTerms,
+    ) -> Result<OriginRoute, IdentityError> {
+        self.insert_origin_route_at(route, terms, Priority::default())
+    }
+
+    /// Insert an origin route with the release terms and memory priority it
+    /// was submitted with
+    ///
+    /// The terms take part in the retry identity: the same request with a
+    /// different `after` list or machine wait is a conflict. The priority does
+    /// not, since `task priority` changes it while the route waits, so a retry
+    /// keeps the saved one. Only a route with dependencies or a machine wait
+    /// may start held
+    pub fn insert_origin_route_at(
+        &mut self,
+        route: &OriginRoute,
+        terms: &ReleaseTerms,
+        priority: Priority,
     ) -> Result<OriginRoute, IdentityError> {
         validate_route(route)?;
         let tx = self
@@ -358,8 +379,8 @@ impl Store {
         tx.execute(
             "INSERT INTO origin_routes
                  (request_id,task_id,route_json,after_json,wait_for_machine,coalesce_key,
-                  mem_peak_mib)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                  mem_peak_mib,priority)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 route.request.0.to_string(),
                 route.task.to_string(),
@@ -368,6 +389,7 @@ impl Store {
                 terms.machine_wait.is_some(),
                 coalesce,
                 terms.mem_peak.map(MemPeak::stored),
+                priority.rank(),
             ],
         )
         .map_err(storage)?;

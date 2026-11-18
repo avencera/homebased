@@ -35,7 +35,7 @@ mod usage;
 
 pub use admission::LocalAdmission;
 pub use container::TaskContainerRecord;
-pub use dependency::{HeldCancel, UnlaunchedTask};
+pub use dependency::{HeldCancel, PriorityChange, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, OwedTarget};
 pub use lifecycle::CancelResult;

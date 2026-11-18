@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::callback::last_event_for_row;
 use crate::cancellation::{CancellationOwner, CancellationRoute};
@@ -35,7 +35,7 @@ use crate::files::{
 use crate::invocation::{ManagedEnvironmentPreview, StdinPolicy, invocation_from_normalized};
 use crate::machine_wait::MachineWait;
 use crate::spec::{self, GpuAccess, NormalizedSpec, NormalizedWorkload};
-use crate::store::CancelResult;
+use crate::store::{CancelResult, PriorityChange};
 use crate::submission::{ExecutorIdentity, ReleaseTerms, RequestId};
 
 impl IntoResponse for AppError {
@@ -80,6 +80,7 @@ pub fn write_routes() -> Router<AppState> {
         .merge(control_routes())
         .route("/v1/tasks", post(submit))
         .route("/v1/tasks/dry-run", post(dry_run))
+        .route("/v1/tasks/{id}/priority", post(set_priority))
 }
 
 /// Task controls that only stop work. The dashboard serves them behind its
@@ -217,6 +218,8 @@ pub(super) struct SubmitBody {
     pub(super) machine_wait: Option<MachineWait>,
     /// Origin-only peak that holds the task until it fits under the memory bar
     pub(super) mem_peak: Option<crate::memory::MemPeak>,
+    /// Level the memory gate admits it at; medium unless the submit named one
+    pub(super) priority: crate::queue::Priority,
 }
 
 impl SubmitBody {
@@ -252,6 +255,8 @@ struct SubmitEnvelope {
     coalesce: Option<String>,
     #[serde(default)]
     mem_peak: Option<crate::memory::MemPeak>,
+    #[serde(default)]
+    priority: Option<crate::queue::Priority>,
 }
 
 /// Application-owned JSON body extractor that maps failures to `AppError`
@@ -281,6 +286,14 @@ where
             envelope.coalesce,
             spec.machine.is_some(),
         )?;
+        // priority orders only memory admission, so without a peak it would do nothing
+        if envelope.priority.is_some() && envelope.mem_peak.is_none() {
+            return Err(AppError::InvalidSpec {
+                pointer: "/priority".into(),
+                value: serde_json::json!(envelope.priority),
+                message: "priority orders tasks waiting for memory, so it needs mem_peak".into(),
+            });
+        }
         // a caller without its own request UUID gets a fresh one, so every task has a retry identity
         let request = envelope.request_id.unwrap_or_default();
         Ok(Self(SubmitBody {
@@ -291,6 +304,7 @@ where
             after,
             machine_wait,
             mem_peak: envelope.mem_peak,
+            priority: envelope.priority.unwrap_or_default(),
         }))
     }
 }
@@ -400,6 +414,23 @@ async fn dry_run(
         Some(after) => Some(crate::daemon::dependencies::preview(&state, after).await?),
         None => None,
     };
+    // a dry run refuses what the submit would, so it cannot pass a task the
+    // memory gate turns away; like submit, a retry of an accepted request
+    // skips the limits, which may have changed since
+    crate::daemon::dependencies::refuse_remote_peak(body.mem_peak, &body.spec)?;
+    let request = body.request;
+    let accepted = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
+        request,
+        reply,
+    })
+    .await?
+    .is_some();
+    if !accepted {
+        match body.mem_peak {
+            Some(peak) => state.memory_limits.check_peak(peak)?,
+            None => state.memory_limits.check_undeclared(&body.spec)?,
+        }
+    }
     let spec = body.spec;
     let mut response = if spec.machine.is_some() {
         crate::daemon::origin_submit::dry_run(&state, spec, body.env).await?
@@ -694,6 +725,45 @@ async fn files_origin(State(state): State<AppState>) -> Result<Json<ContentOrigi
         port,
         https_port: state.content_https_port,
     }))
+}
+
+/// Body of `POST /v1/tasks/{id}/priority`
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityBody {
+    priority: crate::queue::Priority,
+}
+
+/// Change the level a held task waits for memory at
+///
+/// The release loop reads the level on its next pass, so nothing needs waking
+async fn set_priority(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    req: Request,
+) -> Result<Json<Value>, AppError> {
+    let value = json_body(req, &state).await?;
+    let body: PriorityBody =
+        serde_path_to_error::deserialize(&value).map_err(|err| invalid_at(&value, "", &err))?;
+    let priority = body.priority;
+    let change = call(&state.store, |reply| StoreMsg::SetHeldPriority {
+        task: id,
+        priority,
+        reply,
+    })
+    .await?;
+    match change {
+        PriorityChange::Changed => Ok(Json(json!({ "id": id, "priority": priority }))),
+        PriorityChange::NoRoute => Err(AppError::RouteNotFound { task: id }),
+        PriorityChange::NoPeak => Err(AppError::Usage {
+            message: format!(
+                "task {id} was submitted without mem_peak, so it never waits for memory"
+            ),
+        }),
+        PriorityChange::NotWaiting => Err(AppError::Usage {
+            message: format!("task {id} no longer waits for memory, so its priority cannot change"),
+        }),
+    }
 }
 
 async fn cancel(

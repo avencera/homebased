@@ -486,11 +486,17 @@ async fn run_child(
         }
     }
     #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            prctl::set_pdeathsig(Some(Signal::SIGKILL)).map_err(io::Error::from)?;
-            Ok(())
-        });
+    {
+        let oom_score = ChildOomScore::raised();
+        unsafe {
+            cmd.pre_exec(move || {
+                prctl::set_pdeathsig(Some(Signal::SIGKILL)).map_err(io::Error::from)?;
+                if let Some(score) = &oom_score {
+                    score.apply();
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = cmd.spawn().map_err(|err| AppError::Internal {
@@ -973,6 +979,68 @@ pub fn write_task_files(
 /// Open `runner.lock` and take the exclusive flock before spawn
 pub fn lock_before_spawn(paths: &TaskPaths) -> Result<File, AppError> {
     home::flock_exclusive(&paths.runner_lock, LockMode::Blocking)
+}
+
+/// How far each task's child raises its OOM score above the score it
+/// inherits from the daemon
+///
+/// Tasks share the daemon's cgroup, so when it reaches its memory cap the
+/// kernel picks among them and the daemon by badness, which this score
+/// weights. A task should be preferred, whatever score the daemon itself was
+/// started with
+#[cfg(target_os = "linux")]
+const TASK_OOM_SCORE_RAISE: i32 = 300;
+
+/// The OOM score a task's child writes for itself, as the decimal text
+/// `/proc/self/oom_score_adj` takes, or `None` when this process's score
+/// cannot be read
+///
+/// Read before the fork, so the child only writes it
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct ChildOomScore {
+    text: [u8; 8],
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl ChildOomScore {
+    /// This process's score raised by [`TASK_OOM_SCORE_RAISE`], up to the
+    /// kernel's maximum of 1000
+    fn raised() -> Option<Self> {
+        let current: i32 = std::fs::read_to_string("/proc/self/oom_score_adj")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let raised = current.saturating_add(TASK_OOM_SCORE_RAISE).min(1000);
+        let digits = raised.to_string();
+        let mut text = [0u8; 8];
+        text.get_mut(..digits.len())?
+            .copy_from_slice(digits.as_bytes());
+        Some(Self {
+            text,
+            len: digits.len(),
+        })
+    }
+
+    /// Write the score for the calling process
+    ///
+    /// Runs between fork and exec, so it makes raw syscalls and allocates
+    /// nothing. Raising a score needs no privilege; if the write still fails
+    /// the child keeps the score it inherited
+    fn apply(&self) {
+        let path = c"/proc/self/oom_score_adj";
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return;
+        }
+
+        unsafe {
+            libc::write(fd, self.text.as_ptr().cast(), self.len);
+            libc::close(fd);
+        }
+    }
 }
 
 #[cfg(test)]

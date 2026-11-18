@@ -20,8 +20,8 @@ use super::lifecycle::reports_from;
 use crate::dependency::{Dependencies, Dependency, DependencyId, ReleaseRule, TaskOutcome};
 use crate::domain::{API_VERSION, AgentKind, ReportOutcome, TaskId, TaskRow, ThreadId, Workload};
 use crate::error::AppError;
-use crate::queue::JobId;
 use crate::queue::delivery::{JobRoute, JobSubmission};
+use crate::queue::{JobId, Priority};
 use crate::spec::{NormalizedAgentWorkload, NormalizedSpec, NormalizedWorkload};
 use crate::submission::{HeldPhase, NewHeldRoute, OriginRoute, RequestId, SubmissionState};
 use crate::waiting::{
@@ -287,13 +287,15 @@ pub(super) fn park_on(
         Dependencies::new(waiting.on.ids().collect()).map_err(|error| AppError::Internal {
             message: format!("waiting targets are not a dependency list: {error}"),
         })?;
-    // the continuation keeps the parked run's memory peak, so its release
-    // waits for room and its run holds that room like the first one did
+    // the continuation keeps the parked run's memory peak and priority, so its
+    // release waits for room at the same level and its run holds that room
+    // like the first one did
     conn.execute(
         "INSERT INTO origin_routes
-             (request_id, task_id, route_json, after_json, after_rule, mem_peak_mib)
+             (request_id, task_id, route_json, after_json, after_rule, mem_peak_mib, priority)
          VALUES (?1, ?2, ?3, ?4, ?5,
-                 (SELECT mem_peak_mib FROM origin_routes WHERE task_id = ?6))",
+                 (SELECT mem_peak_mib FROM origin_routes WHERE task_id = ?6),
+                 COALESCE((SELECT priority FROM origin_routes WHERE task_id = ?6), ?7))",
         params![
             held.request.0.to_string(),
             continuation.to_string(),
@@ -301,6 +303,7 @@ pub(super) fn park_on(
             serde_json::to_string(&after)?,
             ReleaseRule::Ended.as_str(),
             row.id.to_string(),
+            Priority::default().rank(),
         ],
     )?;
     add_run_on(conn, chain.id, continuation, chain.runs + 1)?;

@@ -20,6 +20,7 @@ use crate::invocation::CommandLine;
 use crate::machine::MachineName;
 use crate::machine_wait::{CoalesceKey, MachineWait};
 use crate::memory::MemPeak;
+use crate::queue::Priority;
 
 mod host;
 #[cfg(test)]
@@ -196,6 +197,11 @@ struct SubmitSpecWire {
     /// for no memory check
     #[serde(default)]
     mem_peak: Option<MemPeak>,
+    /// Level among tasks waiting for memory: `high`, `medium` (default) or
+    /// `low`. Higher levels are admitted first, then submit order. Needs
+    /// `mem_peak`; `homebased task priority` changes it while the task waits
+    #[serde(default)]
+    priority: Option<Priority>,
     /// Workload variant. Parsed from `Value` after the envelope so nested
     /// JSON pointers stay accurate under the internally tagged enum
     #[schemars(schema_with = "workload_schema")]
@@ -416,6 +422,10 @@ pub struct SubmitSpec {
     ///
     /// Origin-only, like `after`: it travels beside the normalized spec
     pub mem_peak: Option<MemPeak>,
+    /// Level among tasks waiting for memory, when the spec named one
+    ///
+    /// Origin-only, like `mem_peak`
+    pub priority: Option<Priority>,
     /// Workload variant
     pub workload: SubmitWorkloadValidated,
 }
@@ -757,6 +767,14 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
     let thread = submit_thread(wire.thread, agent)?;
     let machine_wait =
         parse_machine_wait(wire.wait_for_machine, wire.coalesce, wire.machine.is_some())?;
+    // the daemon refuses it too, for a client that skips this parser
+    if wire.priority.is_some() && wire.mem_peak.is_none() {
+        return Err(AppError::InvalidSpec {
+            pointer: "/priority".into(),
+            value: json!(wire.priority),
+            message: "priority orders tasks waiting for memory, so it needs mem_peak".into(),
+        });
+    }
     Ok(SubmitSpec {
         api_version: wire.api_version,
         thread,
@@ -768,6 +786,7 @@ fn validate_spec(wire: SubmitSpecWire, _raw: &Value) -> Result<SubmitSpec, AppEr
         machine_wait,
         gpu: wire.gpu,
         mem_peak: wire.mem_peak,
+        priority: wire.priority,
         workload,
     })
 }

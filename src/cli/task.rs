@@ -21,6 +21,7 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
 use crate::memory::{MemPeak, MemoryWait};
+use crate::queue::Priority;
 use crate::spec::{self, GpuAccess};
 use crate::store::Store;
 use crate::submission::RequestId;
@@ -88,6 +89,10 @@ pub enum TaskCommand {
         /// of it, plus this peak, fits under the memory bar (default 40 GiB)
         #[arg(long, value_name = "GIB")]
         mem_peak: Option<MemPeak>,
+        /// Level among tasks waiting for memory: high, medium (default) or low.
+        /// Higher levels are admitted first, then submit order
+        #[arg(long, value_name = "LEVEL", requires = "mem_peak")]
+        priority: Option<Priority>,
         /// Run without the working directory's `.envrc`. By default the command
         /// gets the environment of the `.envrc` that direnv already allows there
         #[arg(long)]
@@ -176,6 +181,16 @@ pub enum TaskCommand {
         /// Full task UUID.
         id: TaskId,
     },
+    /// Change the level of a task that waits for memory.
+    ///
+    /// Higher levels are admitted first, then submit order. Run it on the
+    /// machine that accepted the submit, while the task is still held
+    Priority {
+        /// Full task UUID.
+        id: TaskId,
+        /// high, medium or low
+        level: Priority,
+    },
     /// Append a worker report. Writes SQLite directly.
     Report {
         /// Task id. Defaults to `HOMEBASED_TASK_ID`.
@@ -235,6 +250,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
             wait_for_machine,
             gpu_visible,
             mem_peak,
+            priority,
             no_envrc,
             dry_run,
             request_id,
@@ -250,6 +266,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
                 wait_for_machine,
                 gpu_visible,
                 mem_peak,
+                priority,
                 no_envrc,
                 command,
             })?;
@@ -286,6 +303,7 @@ pub async fn run(ctx: &Ctx, command: TaskCommand) -> Result<ExitCode, AppError> 
         TaskCommand::Log { id, tail } => log_cmd(ctx, id, tail).await,
         TaskCommand::Usage { since, thread, by } => usage::usage(ctx, since, thread, by).await,
         TaskCommand::Cancel { id } => cancel(ctx, id).await,
+        TaskCommand::Priority { id, level } => set_priority(ctx, id, level).await,
         TaskCommand::Report {
             id,
             outcome,
@@ -326,6 +344,7 @@ async fn submit_value(
         after: spec.after,
         machine_wait: spec.machine_wait,
         mem_peak: spec.mem_peak,
+        priority: spec.priority,
     };
     submit_normalized(
         ctx,
@@ -348,6 +367,7 @@ struct RunOptions {
     wait_for_machine: bool,
     gpu_visible: bool,
     mem_peak: Option<MemPeak>,
+    priority: Option<Priority>,
     no_envrc: bool,
     command: Vec<String>,
 }
@@ -363,6 +383,7 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
         wait_for_machine,
         gpu_visible,
         mem_peak,
+        priority,
         no_envrc,
         command,
     } = options;
@@ -400,6 +421,9 @@ fn run_spec(options: RunOptions) -> Result<Value, AppError> {
     }
     if let Some(peak) = mem_peak {
         spec["mem_peak"] = json!(peak);
+    }
+    if let Some(priority) = priority {
+        spec["priority"] = json!(priority);
     }
     // only an opt-out is sent, so a machine on an older release still accepts the spec
     if no_envrc {
@@ -441,6 +465,7 @@ struct Submission {
     after: Option<Dependencies>,
     machine_wait: Option<MachineWait>,
     mem_peak: Option<MemPeak>,
+    priority: Option<Priority>,
 }
 
 async fn submit_normalized(
@@ -456,6 +481,7 @@ async fn submit_normalized(
         after,
         machine_wait,
         mem_peak,
+        priority,
     } = submission;
     if normalized.machine.is_none() {
         spec::check_spec_host(&normalized)?;
@@ -483,6 +509,9 @@ async fn submit_normalized(
     }
     if let Some(peak) = mem_peak {
         body["mem_peak"] = json!(peak);
+    }
+    if let Some(priority) = priority {
+        body["priority"] = json!(priority);
     }
 
     let client = Client::new(ctx.home.sock_path());
@@ -702,6 +731,7 @@ async fn followup(ctx: &Ctx, task: TaskId, options: FollowupOptions) -> Result<E
         after: None,
         machine_wait: None,
         mem_peak: None,
+        priority: None,
     };
     submit_normalized(
         ctx,
@@ -1022,7 +1052,10 @@ fn print_dependencies(value: &Value) {
         .get("mem_peak")
         .and_then(|peak| serde_json::from_value::<MemPeak>(peak.clone()).ok())
     {
-        println!("  mem peak {peak}");
+        match value.get("priority").and_then(Value::as_str) {
+            Some(priority) => println!("  mem peak {peak}, priority {priority}"),
+            None => println!("  mem peak {peak}"),
+        }
     }
     if let Some(wait) = memory_wait_line(value) {
         println!("  {wait}");
@@ -1078,6 +1111,18 @@ async fn log_cmd(ctx: &Ctx, id: TaskId, tail: Option<usize>) -> Result<ExitCode,
     if !text.ends_with('\n') && ctx.output != super::OutputMode::Json {
         println!();
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn set_priority(ctx: &Ctx, id: TaskId, level: Priority) -> Result<ExitCode, AppError> {
+    let client = Client::new(ctx.home.sock_path());
+    let value = client
+        .post(
+            &format!("/v1/tasks/{id}/priority"),
+            &json!({ "priority": level }),
+        )
+        .await?;
+    ctx.print_id(&id.to_string(), &format!("{id} waits at {level}"), value)?;
     Ok(ExitCode::SUCCESS)
 }
 

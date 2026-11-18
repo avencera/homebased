@@ -29,6 +29,7 @@
 //! until someone uses it. Its `coalesce` key cancels the older routes it
 //! replaces here too
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
@@ -56,8 +57,8 @@ use crate::invocation::resolve_workload_binary;
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
 use crate::memory::MemPeak;
-use crate::queue::JobId;
 use crate::queue::delivery::{HeldJobEnding, JobSubmission};
+use crate::queue::{JobId, Priority};
 use crate::spec::{self, NormalizedSpec};
 use crate::store::HeldCancel;
 use crate::submission::{
@@ -84,25 +85,31 @@ pub(super) async fn submit(
     Ok(submitted)
 }
 
+/// Refuse a peak on a task for another machine
+///
+/// This machine's gate can only measure this machine's memory
+pub(super) fn refuse_remote_peak(
+    mem_peak: Option<MemPeak>,
+    spec: &NormalizedSpec,
+) -> Result<(), AppError> {
+    if mem_peak.is_none() || spec.machine.is_none() {
+        return Ok(());
+    }
+    Err(AppError::Usage {
+        message: "mem_peak holds a task until it fits this machine's memory, so it needs a \
+                  task that runs here; drop --machine or mem_peak"
+            .into(),
+    })
+}
+
 async fn admit_or_hold(
     state: &AppState,
     body: SubmitBody,
 ) -> Result<(TaskId, TaskStatus), AppError> {
-    if let Some(peak) = body.mem_peak {
-        // this machine's gate can only measure this machine's memory
-        if body.spec.machine.is_some() {
-            return Err(AppError::Usage {
-                message: "mem_peak holds a task until it fits this machine's memory, so it \
-                          needs a task that runs here; drop --machine or mem_peak"
-                    .into(),
-            });
-        }
-        state.memory_limits.check_peak(peak)?;
-    }
-    if !body.terms().may_hold() {
-        return launch(state, body).await;
-    }
-    // a retry resolves against its saved route, held or launched
+    refuse_remote_peak(body.mem_peak, &body.spec)?;
+    // a retry resolves against its saved route, held or launched, before the
+    // memory limits, so a bar or `require_peak` changed since the first
+    // submit cannot refuse a task that was already accepted
     let request = body.request;
     if call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
         request,
@@ -111,6 +118,13 @@ async fn admit_or_hold(
     .await?
     .is_some()
     {
+        return launch(state, body).await;
+    }
+    match body.mem_peak {
+        Some(peak) => state.memory_limits.check_peak(peak)?,
+        None => state.memory_limits.check_undeclared(&body.spec)?,
+    }
+    if !body.terms().may_hold() {
         return launch(state, body).await;
     }
     if let Some(after) = &body.after
@@ -410,6 +424,7 @@ async fn hold(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatus)
         after: _,
         machine_wait: _,
         mem_peak: _,
+        priority,
     } = body;
     let (execution_machine, callback) = match &spec.machine {
         Some(name) => (
@@ -430,7 +445,7 @@ async fn hold(state: &AppState, body: SubmitBody) -> Result<(TaskId, TaskStatus)
         callback,
         spec,
     });
-    let saved = origin_submit::insert_route(state, route, terms).await?;
+    let saved = origin_submit::insert_route(state, route, terms, priority).await?;
     let SubmissionState::Held { phase } = &saved.submission else {
         // an identical concurrent request saved a route that already launched
         return Err(origin_submit::conflict(
@@ -494,6 +509,7 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             rule,
             waits_for_machine,
             mem_peak,
+            priority,
         } in routes
         {
             match &route.submission {
@@ -508,7 +524,9 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
             }
             match decide(known_states(state, after.as_ref()).await?, rule) {
                 HeldDecision::Wait => {}
-                HeldDecision::Release if let Some(peak) = mem_peak => memory.push((route, peak)),
+                HeldDecision::Release if let Some(peak) = mem_peak => {
+                    memory.push((route, peak, priority));
+                }
                 HeldDecision::Release => {
                     retry_release(state, retries, &mut unreachable, route, waits_for_machine).await;
                 }
@@ -525,7 +543,8 @@ async fn settle(state: &AppState, retries: &mut HashMap<TaskId, Retry>) -> Resul
     }
 }
 
-/// Launch the ready tasks with a memory peak that fit, in submit order
+/// Launch the ready tasks with a memory peak that fit, by priority and then
+/// submit order
 ///
 /// The memory actor grants each one that fits after the GPU queue's waiting
 /// jobs and the tasks ahead of it, and records why the rest wait. A task
@@ -534,11 +553,31 @@ async fn release_by_memory(
     state: &AppState,
     retries: &mut HashMap<TaskId, Retry>,
     unreachable: &mut HashSet<MachineId>,
-    ready: Vec<(OriginRoute, MemPeak)>,
+    mut ready: Vec<(OriginRoute, MemPeak, Priority)>,
 ) -> Result<(), AppError> {
+    // `task priority` can change a level while this pass awaits dependency
+    // checks and remote launches, so read the levels again just before the
+    // grant; a task that left the held routes meanwhile keeps the level it
+    // had. An empty pass still goes to the memory actor, which clears stale
+    // grants and waits
+    if !ready.is_empty() {
+        let current: HashMap<TaskId, Priority> =
+            call(&state.store, |reply| StoreMsg::HeldRoutes { reply })
+                .await?
+                .into_iter()
+                .map(|held| (held.route.task, held.priority))
+                .collect();
+        for (route, _, priority) in &mut ready {
+            if let Some(level) = current.get(&route.task) {
+                *priority = *level;
+            }
+        }
+    }
+    // stable, so submit order stays within each level
+    ready.sort_by_key(|(_, _, priority)| Reverse(*priority));
     let candidates = ready
         .iter()
-        .map(|(route, peak)| TaskCandidate {
+        .map(|(route, peak, _)| TaskCandidate {
             task: route.task,
             peak: *peak,
             backing_off: backing_off(retries, route.task),
@@ -549,7 +588,7 @@ async fn release_by_memory(
         reply,
     })
     .await?;
-    for (route, _) in ready {
+    for (route, _, _) in ready {
         let task = route.task;
         if !admitted.contains(&task) {
             continue;

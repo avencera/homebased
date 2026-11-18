@@ -11,6 +11,7 @@ use crate::domain::{ProcessStatus, TaskEnv, TaskId, TaskStatus, ThreadId};
 use crate::machine::MachineId;
 use crate::machine_wait::MachineWait;
 use crate::memory::MemPeak;
+use crate::queue::Priority;
 use crate::spec::NormalizedSpec;
 
 /// The executable saved for callbacks owned by the origin
@@ -226,6 +227,8 @@ pub struct DependentRoute {
     pub waits_for_machine: bool,
     /// Submitted with `mem_peak`, so it launches only when the memory gate admits it
     pub mem_peak: Option<MemPeak>,
+    /// Level the memory gate admits it at, before submit order
+    pub priority: Priority,
 }
 
 /// Exact identity and origin-owned context used to create a held route

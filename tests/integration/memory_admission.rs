@@ -52,11 +52,16 @@ impl FakeCgroup {
 
 /// Restart the daemon with a 10 GiB bar over `cgroup`
 pub(super) fn with_memory_gate(h: &mut Harness, cgroup: &FakeCgroup, env: &[(&str, &str)]) {
+    with_memory_config(h, cgroup, "", env);
+}
+
+/// Restart the daemon with a 10 GiB bar over `cgroup` and `extra` lines in `[memory]`
+fn with_memory_config(h: &mut Harness, cgroup: &FakeCgroup, extra: &str, env: &[(&str, &str)]) {
     let config = h.dir.path().join("config.toml");
     fs::write(
         &config,
         format!(
-            "[memory]\nbar_gib = 10\ncgroup = \"{}\"\n",
+            "[memory]\nbar_gib = 10\ncgroup = \"{}\"\n{extra}",
             cgroup.0.display()
         ),
     )
@@ -366,4 +371,197 @@ fn tasks_run_with_gpus_hidden_unless_they_ask_to_see_them() {
     assert_eq!(seen("hidden", &[]), "");
     // visible removes the variable, as every task did before, so CUDA sees every GPU
     assert_eq!(seen("visible", &["--gpu-visible"]), "unset");
+}
+
+#[test]
+fn held_tasks_are_admitted_by_priority_then_submit_order() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    cgroup.set_used(10 * GIB);
+    with_memory_gate(&mut h, &cgroup, &[]);
+    let with_priority = |gate: &str, priority: &str| {
+        let mut spec = peak_task(&h, gate, 1.0);
+        spec["priority"] = json!(priority);
+        spec
+    };
+
+    // nothing fits yet; `last` is submitted last and raised once it waits
+    let first = h.submit(&peak_task(&h, "first", 1.0));
+    let low = h.submit(&with_priority("low", "low"));
+    let last = h.submit(&peak_task(&h, "last", 1.0));
+    eventually("the last task never reported its memory wait", || {
+        task(&h, &last)["memory_wait"]["reason"] == "room"
+    });
+    assert_eq!(task(&h, &low)["priority"], "low");
+    let raised = cli(&h, &["task", "priority", &last, "high"]);
+    assert_eq!(raised["priority"], "high", "{raised}");
+    assert_eq!(task(&h, &last)["priority"], "high");
+
+    // room for one task at a time: high first, then medium, then low
+    cgroup.set_used(9 * GIB);
+    h.wait_status(&last, "running");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(task(&h, &first)["status"], "held");
+    assert_eq!(task(&h, &low)["status"], "held");
+
+    // a started task no longer waits, so its level is fixed
+    let refused = h
+        .cmd()
+        .args(["--json", "task", "priority", &last, "low"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("no longer waits for memory"), "{stderr}");
+
+    cgroup.set_used(8 * GIB);
+    h.wait_status(&first, "running");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(task(&h, &low)["status"], "held");
+
+    cgroup.set_used(7 * GIB);
+    h.wait_status(&low, "running");
+    for gate in ["first", "low", "last"] {
+        h.release_gate(gate);
+    }
+    h.wait_status(&low, "succeeded");
+}
+
+#[test]
+fn a_priority_without_a_memory_peak_is_refused() {
+    let h = Harness::new();
+    let mut spec = Harness::task_spec(&["true"]);
+    spec["priority"] = json!("high");
+    let path = h.home.join("priority.json");
+    fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let refused = h
+        .cmd()
+        .args(["--json", "task", "submit", "--spec"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("needs mem_peak"), "{stderr}");
+}
+
+#[test]
+fn require_peak_refuses_command_tasks_without_one() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    with_memory_config(&mut h, &cgroup, "require_peak = true\n", &[]);
+    let run = |flags: &[&str]| {
+        h.cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["--json", "task", "run"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .unwrap()
+    };
+
+    let refused = run(&[]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("requires mem_peak"), "{stderr}");
+
+    let declared = run(&["--mem-peak", "0.1"]);
+    assert!(
+        declared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&declared.stderr)
+    );
+    let declared: Value = serde_json::from_slice(&declared.stdout).unwrap();
+    h.wait_status(declared["id"].as_str().unwrap(), "succeeded");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_task_child_runs_with_a_higher_oom_score_than_the_daemon() {
+    let h = Harness::new();
+    // the daemon inherits this process's score
+    let daemon: i32 = fs::read_to_string("/proc/self/oom_score_adj")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let path = h.record.join("oom");
+    let script = format!("cat /proc/self/oom_score_adj > '{}'", path.display());
+    let id = h.submit(&Harness::task_spec(&["/bin/sh", "-c", &script]));
+    h.wait_status(&id, "succeeded");
+    let task: i32 = fs::read_to_string(path).unwrap().trim().parse().unwrap();
+    assert_eq!(task, (daemon + 300).min(1000));
+}
+
+#[test]
+fn a_task_retry_keeps_its_route_after_its_priority_changes() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    cgroup.set_used(10 * GIB);
+    with_memory_gate(&mut h, &cgroup, &[]);
+    let request = uuid::Uuid::now_v7().to_string();
+    let run = |flags: &[&str]| {
+        let out = h
+            .cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["--json", "task", "run", "--request-id", &request])
+            .args(["--mem-peak", "1"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"].clone()
+    };
+
+    let id = run(&["--priority", "low"]);
+    let id_text = id.as_str().unwrap();
+    eventually("the task never reported its memory wait", || {
+        task(&h, id_text)["memory_wait"]["reason"] == "room"
+    });
+    cli(&h, &["task", "priority", id_text, "high"]);
+
+    // priority is not part of the request identity, and the retry keeps the saved level
+    assert_eq!(run(&[]), id);
+    assert_eq!(run(&["--priority", "low"]), id);
+    assert_eq!(task(&h, id_text)["priority"], "high");
+}
+
+#[test]
+fn a_retry_accepted_before_require_peak_still_resolves_to_its_task() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    with_memory_gate(&mut h, &cgroup, &[]);
+    let gate = h.submit(&h.gated_target("gate", 0));
+    let request = uuid::Uuid::now_v7().to_string();
+    let run = |h: &Harness| {
+        h.cmd()
+            .env("CODEX_THREAD_ID", THREAD)
+            .args(["--json", "task", "run", "--request-id", &request])
+            .args(["--after", &gate, "--", "true"])
+            .output()
+            .unwrap()
+    };
+    let first = run(&h);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    with_memory_config(&mut h, &cgroup, "require_peak = true\n", &[]);
+    let retry = run(&h);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry["id"], first["id"], "{retry}");
+    h.release_gate("gate");
 }
