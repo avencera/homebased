@@ -1,6 +1,6 @@
 ---
 name: homebased
-description: Run long, unattended agent CLIs and general task commands through the homebased daemon and handle the HOMEBASED_EVENT callback that returns to this Codex thread or Claude Code session. Use when the user invokes $homebased or $hbd, when work should run in the background and report back later, when a HOMEBASED_EVENT message arrives, when checking, cancelling, or resubmitting homebased tasks, when this session is itself a homebased worker, or to read, compact, or watch the context size of an agent thread on any Fleet machine. Do not use for work that finishes inside the current turn.
+description: "Run long, unattended agent CLIs and task commands through the homebased daemon, and handle the HOMEBASED_EVENT callbacks it sends back. Use when the user invokes $homebased or $hbd, when work should run in the background and report back, when a HOMEBASED_EVENT arrives, to check, cancel, or resubmit tasks, when this session is a homebased worker, or to read or compact an agent thread's context on a Fleet machine. Do not use for work that finishes inside the current turn."
 ---
 
 # Homebased
