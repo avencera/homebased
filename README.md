@@ -1028,6 +1028,9 @@ homebased task run --mem-peak 33 --after "$gate" -- ./consume.sh
 The gate's room counts against the producer's, so leave room for both peaks,
 and submit the gate after the producer at no higher a level: a GPU queue job is
 admitted before any task, and a task producer then goes first in submit order.
+The producer keeps its claim while the consumer runs, so their peaks must fit
+under the bar together. When they cannot, submit the consumer `--after` the
+producer, so it starts once the producer ends.
 
 `task list`, `task show`, and `resource jobs` print why an item waits, such as
 `waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json`

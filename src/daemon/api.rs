@@ -415,11 +415,21 @@ async fn dry_run(
         None => None,
     };
     // a dry run refuses what the submit would, so it cannot pass a task the
-    // memory gate turns away
+    // memory gate turns away; like submit, a retry of an accepted request
+    // skips the limits, which may have changed since
     crate::daemon::dependencies::refuse_remote_peak(body.mem_peak, &body.spec)?;
-    match body.mem_peak {
-        Some(peak) => state.memory_limits.check_peak(peak)?,
-        None => state.memory_limits.check_undeclared(&body.spec)?,
+    let request = body.request;
+    let accepted = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
+        request,
+        reply,
+    })
+    .await?
+    .is_some();
+    if !accepted {
+        match body.mem_peak {
+            Some(peak) => state.memory_limits.check_peak(peak)?,
+            None => state.memory_limits.check_undeclared(&body.spec)?,
+        }
     }
     let spec = body.spec;
     let mut response = if spec.machine.is_some() {
