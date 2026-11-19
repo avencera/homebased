@@ -1095,8 +1095,8 @@ mod tests {
         let now = Utc::now();
         let mut dir = PeerDirectory::new(local());
         let machine = MachineId::new();
-        let remote =
-            ProtocolRange::new(ClusterProtocolVersion(9), ClusterProtocolVersion(9)).unwrap();
+        let future = ClusterProtocolVersion(CLUSTER_PROTOCOL_VERSION.0 + 1);
+        let remote = ProtocolRange::new(future, future).unwrap();
         let header = MachineHeader {
             machine,
             boot: BootId::new(),

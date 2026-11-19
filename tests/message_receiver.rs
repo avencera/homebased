@@ -435,10 +435,14 @@ fn receiver_delivers_to_claude_sessions_without_codex_queue() {
     let live_thread = ThreadId(Uuid::now_v7());
     let listener = write_claude_session(&daemon.user_home, live_thread, &live_cwd);
     let inbox = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut body = String::new();
-        stream.read_to_string(&mut body).unwrap();
-        body
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            frames.push(body);
+        }
+        frames
     });
 
     let live_id = MessageId::new();
@@ -457,16 +461,40 @@ fn receiver_delivers_to_claude_sessions_without_codex_queue() {
         live.body["receipt"]["destination_cwd"],
         live_cwd.to_string_lossy().to_string()
     );
-    let frame = inbox.join().unwrap();
-    let lines: Vec<Value> = frame
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+
+    // a steered message joins the running turn instead of waiting for it
+    let mut steered = request(
+        MessageId::new(),
+        daemon.machine_id(),
+        json!({"kind": "thread", "thread": live_thread}),
+        "Stop the rebase",
+    );
+    steered["active_turn"] = json!("steer");
+    let steer = daemon.send(&steered);
+    assert_eq!(steer.status, 200, "{:?}", steer.body);
+
+    let frames: Vec<Vec<Value>> = inbox
+        .join()
+        .unwrap()
+        .iter()
+        .map(|frame| {
+            frame
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        })
         .collect();
+    let lines = &frames[0];
     assert_eq!(lines[1]["session_id"], live_thread.to_string());
     let content = lines[1]["message"]["content"].as_str().unwrap();
     assert!(content.starts_with("HOMEBASED_MESSAGE "), "{content}");
     assert!(content.contains(&format!("\"message_id\":\"{live_id}\"")));
     assert!(content.contains("\"body\":\"Review the Claude change\""));
+    // a message without `active_turn` waits for the session's running turn
+    assert_eq!(lines[1]["priority"], "later");
+    let steer_content = frames[1][1]["message"]["content"].as_str().unwrap();
+    assert!(steer_content.contains("\"body\":\"Stop the rebase\""));
+    assert_eq!(frames[1][1]["priority"], "next");
     assert!(daemon.queue_calls().is_empty());
 
     // a stopped session with no T3 owner fails with the reason, not as unknown

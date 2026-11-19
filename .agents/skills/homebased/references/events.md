@@ -29,6 +29,10 @@ The message is one line: the literal prefix `HOMEBASED_EVENT ` followed by one J
 
 `process` values: `{"kind":"exit","code":n}`, `{"kind":"signal","signal":n}`, `{"kind":"cancelled"}`, `{"kind":"spawn_failed","message":"…"}`, `{"kind":"runner_lost"}`. Output inactivity never appears as a process result.
 
+## Busy threads
+
+An event for a thread that is running a turn waits for that turn to end, unless it needs action first. These steer into the running turn, so the agent reads them at its next tool call: the alerts `TASK_CHECK_DUE`, `TASK_MEMORY_REVIEW`, `JOB_ATTENTION`, `JOB_BLOCKED`, `JOB_CHECK_DUE`, and the first `JOB_GPU_IDLE` of an idle episode, plus a `--notify` report's `TASK_REPORTED`, `THREAD_CONTEXT_OVER`, `THREAD_STALLED`, and `SERVICE_EXITED`. Final events, `TASK_WAITING`, `JOB_PREEMPTED`, GPU idle reminders, and `THREAD_WATCH_ENDED` wait. An idle thread gets either kind at once, as a new turn.
+
 ## Job events
 
 For `JOB_SUCCEEDED`, `JOB_FAILED`, `JOB_CANCELLED`, `JOB_PREEMPTED`, `JOB_ATTENTION`, `JOB_BLOCKED`, `JOB_CHECK_DUE`, and `JOB_GPU_IDLE`, use [resource-queue.md](resource-queue.md), or [ci-queue.md](ci-queue.md) for a CI job. These events identify a job. Deduplicate by `(job, seq)`. Their flat run fields are explicit nulls when no run exists. Final job events carry `gpu_summaries`, each attempt's GPU use with a one-line `brief`, and `JOB_PREEMPTED` carries the attempt it ended; read them before resubmitting. A job submitted with `after` that ended before it queued has `held_ending`, and its origin sent the event itself. A CI job's `JOB_FAILED` has `timeout` when the queue killed it at its `kill_after`. Queue runs have no ordinary task callback route. `TASK_PREEMPTED` can appear in task inspection event data for a preempted run; handle the job through `JOB_PREEMPTED`.

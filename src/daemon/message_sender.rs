@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
-use crate::domain::API_VERSION;
+use crate::domain::{API_VERSION, ActiveTurn};
 use crate::error::AppError;
 use crate::fleet::directory::NameTarget;
 use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
-use crate::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
+use crate::fleet::protocol::{ACTIVE_TURN_PROTOCOL, CLUSTER_PROTOCOL_VERSION};
 use crate::machine::{MachineId, MachineName};
 use crate::message::{
     MessageRequest, MessageResponse, MessageSendRequest, MessageSendResponse, MessageSource,
@@ -227,6 +227,13 @@ fn receiver_request(
         body: request.body.clone(),
         reply_to: request.reply_to,
         conversation_id: request.conversation_id,
+        // an earlier receiver steers every message, so leaving the field out
+        // keeps a steer as asked and makes a queued message steer
+        active_turn: if protocol_version >= ACTIVE_TURN_PROTOCOL.0 {
+            request.delivered_active_turn()
+        } else {
+            ActiveTurn::Queue
+        },
     }
 }
 
@@ -338,6 +345,62 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn steer_reaches_only_receivers_that_take_it_and_workers_always_steer() {
+        use super::{receiver_request, source_route};
+        use crate::domain::{ActiveTurn, TaskId};
+        use crate::fleet::protocol::ACTIVE_TURN_PROTOCOL;
+        use crate::message::{MessageSendRequest, MessageSourceSelector, MessageTarget};
+
+        let thread = ThreadId(Uuid::now_v7());
+        let send = |target, active_turn| {
+            let message_id = MessageId::new();
+            MessageSendRequest {
+                api_version: API_VERSION,
+                message_id,
+                target,
+                source: MessageSourceSelector::Thread {
+                    thread: ThreadId(Uuid::now_v7()),
+                },
+                body: "Stop the rebase".into(),
+                reply_to: None,
+                conversation_id: message_id.as_uuid(),
+                active_turn,
+            }
+        };
+        let wire = |request: &MessageSendRequest, protocol: u32| {
+            let wire = receiver_request(
+                request,
+                MachineId::new(),
+                source_route(request.source.clone(), MachineId::new()),
+                &Recipient::Thread { thread },
+                protocol,
+            );
+            serde_json::to_value(wire).unwrap()
+        };
+        let machine = || MessageTarget::Machine {
+            machine: "code".into(),
+            recipient: Recipient::Thread { thread },
+        };
+        let current = ACTIVE_TURN_PROTOCOL.0;
+
+        let steer = send(machine(), ActiveTurn::Steer);
+        assert_eq!(wire(&steer, current)["active_turn"], "steer");
+        // an earlier receiver rejects the field and steers every message anyway
+        assert!(wire(&steer, current - 1).get("active_turn").is_none());
+
+        let queue = send(machine(), ActiveTurn::Queue);
+        assert!(wire(&queue, current).get("active_turn").is_none());
+
+        let worker = send(
+            MessageTarget::Worker {
+                task: TaskId(Uuid::now_v7()),
+            },
+            ActiveTurn::Queue,
+        );
+        assert_eq!(wire(&worker, current)["active_turn"], "steer");
+    }
+
+    #[test]
     fn rejects_a_success_response_from_another_machine_identity() {
         let expected = MachineId::new();
         let found = MachineId::new();
@@ -356,6 +419,7 @@ mod tests {
             body: "Review this change".into(),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            active_turn: crate::domain::ActiveTurn::Queue,
         };
         let response = MessageResponse {
             api_version: API_VERSION,
@@ -400,6 +464,7 @@ mod tests {
             body: "Review this change".into(),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            active_turn: crate::domain::ActiveTurn::Queue,
         };
         let error = decode_remote_receipt(
             StatusCode::OK,

@@ -24,7 +24,7 @@ use super::claude_inbox::{ClaudeInbox, ClaudeSession};
 use super::send_check::{SendFailure, SendGate};
 use super::stale_context::{ContextUse, Resumption};
 use crate::daemon::compaction_log::{self, Trigger};
-use crate::domain::{TaskEnv, ThreadId};
+use crate::domain::{ActiveTurn, TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::submission::CallbackContext;
 use crate::t3::{
@@ -340,6 +340,7 @@ pub(crate) fn send_saved_queue_attempt(
     log_path: &Path,
     delivery_lock: &Path,
     pending: &PendingT3Send,
+    active_turn: ActiveTurn,
 ) -> Result<(), String> {
     // a direct message's sender waits for the answer, so only the 175K limit
     // may hold it behind a compaction, whether or not the recipient sleeps
@@ -348,6 +349,7 @@ pub(crate) fn send_saved_queue_attempt(
         check: None,
         hold: false,
         resumption: Resumption::Likely,
+        active_turn,
     };
     send_direct_message(context, thread, line, log_path, pending, gate)
         .map_err(|error| error.to_string())
@@ -558,6 +560,11 @@ fn wake_provider_thread(
 
     // a held line keeps its pending record, so later attempts go only through T3
     let start = turn_start(context, provider_thread, log_path, pending, gate)?;
+    // a queued line waits for any active run, not only a compaction
+    let start = match gate.active_turn {
+        ActiveTurn::Queue => TurnStart::AfterActive,
+        ActiveTurn::Steer => start,
+    };
     let outcome =
         match wake_thread_checked(&t3_env(context), provider_thread, line, gate.check, start) {
             Ok(outcome) => outcome,

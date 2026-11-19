@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::{Builder, Uuid};
 
-use crate::domain::{API_VERSION, ThreadId};
+use crate::domain::{API_VERSION, ActiveTurn, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::message::{MessageId, MessageSendRequest, MessageSourceSelector, MessageTarget};
@@ -324,6 +324,8 @@ impl ThreadReport {
             ),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            // a report waits for the parent's running turn
+            active_turn: ActiveTurn::Queue,
         }
     }
 

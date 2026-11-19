@@ -19,7 +19,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{TaskEnv, ThreadId};
+use crate::domain::{ActiveTurn, TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::submission::CallbackContext;
@@ -614,6 +614,18 @@ pub struct WatchEvent {
 }
 
 impl WatchEvent {
+    /// What the event does while the watching thread runs a turn
+    ///
+    /// A stall or an oversized context is what the watcher asked to act on,
+    /// so it steers like an alert; the watch's end only informs
+    #[must_use]
+    pub fn active_turn(&self) -> ActiveTurn {
+        match self.kind {
+            WatchEventKind::ContextOver | WatchEventKind::Stalled => ActiveTurn::Steer,
+            WatchEventKind::Ended => ActiveTurn::Queue,
+        }
+    }
+
     /// Whether this is the watch's last event, see [`ends_watch`]
     #[must_use]
     pub fn ends_watch(&self) -> bool {

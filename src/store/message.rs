@@ -287,6 +287,7 @@ mod tests {
             body: "Review the cluster change".into(),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            active_turn: crate::domain::ActiveTurn::Queue,
         }
     }
 
@@ -318,6 +319,7 @@ mod tests {
             body: "Review the message protocol retry".into(),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            active_turn: crate::domain::ActiveTurn::Queue,
         }
     }
 

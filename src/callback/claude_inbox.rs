@@ -23,7 +23,8 @@
 //! - Frame: an auth line `{"type":"auth","token":...}`, then one message line
 //!   with `type: "user"`, `message.content` as a string, `msgV`, a UUID
 //!   `msg_id`, `priority`, and `session_id`. The receiver drops a message
-//!   whose `session_id` is not its own
+//!   whose `session_id` is not its own. Priority `next` joins the running
+//!   turn at its next tool boundary; `later` waits until the turn ends
 //! - Frame size limit of 1 MiB, and the macOS close delay of 150 ms
 //! - Transcript location `~/.claude/projects/<cwd key>/<session id>.jsonl`,
 //!   used to tell a stopped Claude session from a Codex thread. A direct
@@ -55,7 +56,7 @@ use sha2::{Digest, Sha256};
 use uuid::{Builder, Uuid};
 
 use super::QUEUE_ATTEMPT_TIMEOUT;
-use crate::domain::ThreadId;
+use crate::domain::{ActiveTurn, ThreadId};
 
 /// Peer protocol version this sender speaks
 const PEER_PROTOCOL: u64 = 1;
@@ -209,7 +210,7 @@ impl ClaudeInbox {
         log_path: &Path,
         gate: super::send_check::SendGate<'_>,
     ) -> Result<(), super::send_check::SendFailure> {
-        let frame = frame(&self.token, thread, line)?;
+        let frame = frame(&self.token, thread, line, gate.active_turn)?;
         let _lock = lock_delivery(gate.path)?;
         let transcript = format!(
             "claude inbox pid={} socket={}\n",
@@ -316,15 +317,25 @@ fn key_file_name(pid: i32, socket: &Path) -> String {
 ///
 /// `session_id` makes the receiver drop the message if a different session
 /// now owns the socket. The message id is derived from the thread and line, so
-/// a retry of the same event carries the same id
-fn frame(token: &str, thread: ThreadId, line: &str) -> Result<Vec<u8>, String> {
+/// a retry of the same event carries the same id. Claude Code drains a `next`
+/// message into the running turn and holds a `later` one until the turn ends
+fn frame(
+    token: &str,
+    thread: ThreadId,
+    line: &str,
+    active_turn: ActiveTurn,
+) -> Result<Vec<u8>, String> {
+    let priority = match active_turn {
+        ActiveTurn::Queue => "later",
+        ActiveTurn::Steer => "next",
+    };
     let auth = json!({ "type": "auth", "token": token });
     let message = json!({
         "msgV": 1,
         "msg_id": message_id(thread, line).to_string(),
         "type": "user",
         "message": { "role": "user", "content": line },
-        "priority": "next",
+        "priority": priority,
         "session_id": thread.to_string(),
     });
     let frame = format!("{auth}\n{message}\n").into_bytes();
@@ -478,6 +489,7 @@ mod tests {
                     check: None,
                     hold: false,
                     resumption: crate::callback::stale_context::Resumption::Likely,
+                    active_turn: ActiveTurn::Steer,
                 },
             )
             .unwrap();
@@ -592,6 +604,7 @@ mod tests {
                 check: Some(&check),
                 hold: false,
                 resumption: crate::callback::stale_context::Resumption::Likely,
+                active_turn: ActiveTurn::Steer,
             },
         );
         assert!(matches!(result, Err(SendFailure::Suppressed)));

@@ -7,7 +7,7 @@ use clap::Subcommand;
 use uuid::Uuid;
 
 use crate::client::Client;
-use crate::domain::{API_VERSION, TaskId, ThreadId};
+use crate::domain::{API_VERSION, ActiveTurn, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::message::{
@@ -55,6 +55,14 @@ pub enum MessageCommand {
         /// Shared conversation UUID. Defaults to the message UUID.
         #[arg(long)]
         conversation: Option<Uuid>,
+        /// Deliver into the recipient's running turn instead of after it.
+        ///
+        /// By default a message to a busy thread waits until its turn ends.
+        /// Steer only when the recipient must read it before that turn ends:
+        /// a stop or a correction to the work in progress, or an answer the
+        /// turn is blocked on. A `--worker` message always steers.
+        #[arg(long)]
+        steer: bool,
         /// Explicit source thread UUID. Overrides source environment variables.
         #[arg(long, conflicts_with = "source_task")]
         source_thread: Option<ThreadId>,
@@ -74,6 +82,7 @@ struct SendArgs {
     message_id: Option<MessageId>,
     reply_to: Option<MessageId>,
     conversation: Option<Uuid>,
+    active_turn: ActiveTurn,
     source_thread: Option<ThreadId>,
     source_task: Option<TaskId>,
 }
@@ -91,6 +100,7 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
             message_id,
             reply_to,
             conversation,
+            steer,
             source_thread,
             source_task,
         } => {
@@ -106,6 +116,11 @@ pub async fn run(ctx: &Ctx, command: MessageCommand) -> Result<ExitCode, AppErro
                     message_id,
                     reply_to,
                     conversation,
+                    active_turn: if steer {
+                        ActiveTurn::Steer
+                    } else {
+                        ActiveTurn::Queue
+                    },
                     source_thread,
                     source_task,
                 },
@@ -141,6 +156,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<ExitCode, AppError> {
         body: args.body,
         reply_to: args.reply_to,
         conversation_id: conversation_id(args.conversation, message_id),
+        active_turn: args.active_turn,
     };
     request.validate()?;
 
@@ -370,6 +386,7 @@ mod tests {
             body: "Review this change".into(),
             reply_to: None,
             conversation_id: message_id.as_uuid(),
+            active_turn: ActiveTurn::Queue,
         };
         let value = json!({
             "api_version": API_VERSION,

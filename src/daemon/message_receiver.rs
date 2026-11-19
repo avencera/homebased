@@ -15,7 +15,7 @@ use crate::callback::{PendingT3Send, send_saved_queue_attempt};
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::keyed_locks::{KeyedGuard, KeyedLocks};
-use crate::domain::{AgentKind, TaskEnv, ThreadId};
+use crate::domain::{ActiveTurn, AgentKind, TaskEnv, ThreadId};
 use crate::error::AppError;
 use crate::invocation::resolve_agent_binary;
 use crate::message::{
@@ -115,6 +115,7 @@ impl MessageReceiver {
             attempt.destination_thread,
             attempt.destination_cwd.clone(),
             line,
+            attempt.request.active_turn,
         )
         .await
         .map_err(|error| delivery_failed(message_id, error))?;
@@ -141,6 +142,7 @@ async fn send_queue_line(
     destination_thread: ThreadId,
     destination_cwd: PathBuf,
     line: String,
+    active_turn: ActiveTurn,
 ) -> Result<(), String> {
     let paths = state
         .home
@@ -173,6 +175,7 @@ async fn send_queue_line(
             &log_path,
             &lock_path,
             &pending,
+            active_turn,
         )
     })
     .await
@@ -490,6 +493,7 @@ mod tests {
             body: "Please review this change".into(),
             reply_to: None,
             conversation_id: Uuid::now_v7(),
+            active_turn: crate::domain::ActiveTurn::Queue,
         };
         let attempt = MessageAttempt {
             request: request.clone(),

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::callback::EventKind;
-use crate::domain::{TaskId, ThreadId};
+use crate::domain::{ActiveTurn, TaskId, ThreadId};
 use crate::queue::gpu_idle::GpuIdleNotice;
 use crate::queue::{JobEventKind, JobId};
 use crate::thread_watch::{WatchEventKind, WatchId};
@@ -454,6 +454,31 @@ impl EventClass {
     #[must_use]
     pub fn is_final(self) -> bool {
         self == Self::Final
+    }
+
+    /// What the event does while its thread runs a turn
+    ///
+    /// Only an alert needs the thread before that turn ends; a final or
+    /// progress event waits for it, as it would for a sleeping thread
+    #[must_use]
+    pub fn active_turn(self) -> ActiveTurn {
+        match self {
+            Self::Alert => ActiveTurn::Steer,
+            Self::Final | Self::Progress => ActiveTurn::Queue,
+        }
+    }
+
+    /// What a task event does while its thread runs a turn
+    ///
+    /// A worker sends `TASK_REPORTED` only with `--notify`, which asks the
+    /// thread to act before the worker exits, so it steers although a sleep
+    /// holds it as progress
+    #[must_use]
+    pub fn task_active_turn(kind: EventKind) -> ActiveTurn {
+        match kind {
+            EventKind::TaskReported => ActiveTurn::Steer,
+            kind => Self::task(kind).active_turn(),
+        }
     }
 }
 

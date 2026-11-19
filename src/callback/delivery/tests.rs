@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use super::{IntentIo, PendingRetry, PendingT3Send, retry_pending_t3, wake_provider_thread};
 use crate::callback::send_check::{SendCheck, SendFailure, SendGate};
-use crate::domain::{TaskEnv, ThreadId};
+use crate::domain::{ActiveTurn, TaskEnv, ThreadId};
 use crate::submission::{CallbackContext, CallbackExecutable};
 use crate::t3::test_support::{FakeResponse, FakeT3Server, V2State, rpc_exit, write_runtime};
 use crate::t3::{ProviderThread, WakeOutcome};
@@ -209,6 +209,7 @@ impl Fixture {
                 check: Some(&check),
                 hold: false,
                 resumption: crate::callback::stale_context::Resumption::Likely,
+                active_turn: ActiveTurn::Steer,
             },
         )
     }
@@ -229,6 +230,7 @@ impl Fixture {
                 check: Some(&check),
                 hold: false,
                 resumption: crate::callback::stale_context::Resumption::Likely,
+                active_turn: ActiveTurn::Steer,
             },
         )
     }
@@ -319,6 +321,38 @@ fn failed_save_recovers(failure: Failure, operations: &[Operation]) {
 }
 
 #[test]
+fn direct_message_waits_for_the_active_run_unless_it_steers() {
+    let dispatched = |active_turn| {
+        let fixture = Fixture::new();
+        let pending = PendingT3Send::new(fixture.directory.path().join("t3-pending-1"));
+        super::send_saved_queue_attempt(
+            &fixture.context,
+            fixture.thread(),
+            "HOMEBASED_MESSAGE {}",
+            &fixture.log,
+            &fixture.lock,
+            &pending,
+            active_turn,
+        )
+        .unwrap();
+        let requests = fixture.server.requests();
+        let turn = requests
+            .iter()
+            .find(|request| request.method == "WS")
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&turn.body).unwrap()["payload"].clone()
+    };
+
+    let queued = dispatched(ActiveTurn::Queue);
+    assert_eq!(queued["dispatchMode"]["type"], "queue_after_active");
+    assert!(queued.get("deliveryIntent").is_none(), "{queued}");
+
+    let steered = dispatched(ActiveTurn::Steer);
+    assert_eq!(steered["dispatchMode"]["type"], "start_immediately");
+    assert_eq!(steered["deliveryIntent"], "auto");
+}
+
+#[test]
 fn bugfix_t3_send_requires_a_saved_intent() {
     failed_save_recovers(Failure::Write, &[Operation::Create, Operation::Write]);
 
@@ -339,6 +373,7 @@ fn bugfix_t3_send_requires_a_saved_intent() {
             &fixture.log,
             &fixture.lock,
             &pending,
+            ActiveTurn::Queue,
         )
         .unwrap_err();
         assert!(error.contains("invalid pending T3") || error.contains("read pending T3"));

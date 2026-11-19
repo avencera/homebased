@@ -75,7 +75,7 @@ homebased --json message send \
 
 The local daemon finds the task in the known Fleet and sends to its execution
 machine and its `worker_thread`. A Claude worker records `worker_thread` when it
-starts running. The worker reads the message at its next turn boundary. If it
+starts running. The message always steers, so the worker reads it at its next turn boundary. If it
 finishes its final turn first, the message is never read, and the sender cannot
 tell. Send while the worker still has work left, and confirm from its reports
 that it acted on the message.
@@ -121,6 +121,34 @@ The receiver delivers the line in one of three ways:
   thread, so T3 shows it. If T3 cannot take it, or no T3 thread owns the Codex
   thread, it goes through `codex queue`.
 
+## Queue or steer
+
+A message to a thread that is running a turn waits by default: T3 starts it
+as a new turn once the running one ends, and a live Claude Code session takes
+it after its turn. Pass `--steer` to deliver it into the running turn instead,
+where the agent reads it at its next tool call:
+
+```bash
+homebased --json message send \
+  --machine code \
+  --thread <thread-ref> \
+  --message "Stop: the rebase targets the wrong branch." \
+  --steer
+```
+
+Steer only when the recipient must read the message before its turn ends: a
+stop or a correction to the work in progress, or an answer the running turn is
+blocked on. Status updates, reports, questions, and anything that can wait for
+the recipient to finish should queue, so they do not interrupt its work. A
+`--worker` message always steers, since a worker exits when its final turn
+ends. A Codex thread that no T3 thread owns gets every message through
+`codex queue`, which always waits. A receiver on a release before the queue
+default steers every message, `--steer` or not.
+
+A message to an idle thread starts a turn at once either way.
+
+## T3 delivery and compaction
+
 A deleted T3 thread is refused without a change. An archived T3 thread is unarchived before the turn. Before a T3 send, Homebased saves the retry route. If it cannot save that route, the send fails without sending the message. If T3 may have taken the
 message but its reply was lost, the send fails with `message_delivery_failed`,
 and a retry with the same `--message-id` goes only through T3, which drops the
@@ -146,7 +174,7 @@ conversation UUID is the message UUID.
 
 ## Child-thread reports
 
-A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. A follow-up report, sent from a later turn after the child was reopened, starts `Follow-up report from child thread thread_<id>:` instead. Its message UUID comes from the link between the two threads and the report's number, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
+A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. Like any message without `--steer`, it waits for the parent's running turn to end. A follow-up report, sent from a later turn after the child was reopened, starts `Follow-up report from child thread thread_<id>:` instead. Its message UUID comes from the link between the two threads and the report's number, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
 
 ## Retry safely
 

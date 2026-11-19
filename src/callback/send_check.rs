@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use super::stale_context::Resumption;
+use crate::domain::ActiveTurn;
 
 /// A send can fail without suppressing the numbered notice
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +42,11 @@ pub(crate) struct SendGate<'a> {
     /// How sure it is that the thread runs again, which sets the context size
     /// at which an idle compaction is due and the line queues behind it
     pub(crate) resumption: Resumption,
+    /// Whether the line waits for the thread's running turn or joins it
+    ///
+    /// An alert steers, so it reaches a busy thread in time, while a final or
+    /// progress event waits; a direct message carries its sender's choice
+    pub(crate) active_turn: ActiveTurn,
 }
 
 impl SendGate<'_> {

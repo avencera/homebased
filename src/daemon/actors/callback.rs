@@ -17,7 +17,7 @@ use crate::callback::{
     send_codex_queue_attempt, send_t3_claude, wake_codex_thread, wake_stopped_session,
 };
 use crate::daemon::actors::{StoreMsg, WaiterRegistry, call, send_reply};
-use crate::domain::{TaskId, ThreadId};
+use crate::domain::{ActiveTurn, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryOutcome, DeliveryState, EventPayload, TaskEvent};
 use crate::home::Home;
@@ -521,6 +521,7 @@ pub(crate) async fn dispatch_inbox(
                     pending,
                     before_send: None,
                     resumption,
+                    active_turn: EventClass::task_active_turn(event.event),
                 };
                 attempt.run(&callback).await?
             }
@@ -705,6 +706,7 @@ pub(crate) async fn deliver_job_event(
             .before_send
             .filter(|_| event.event.is_suppressible_notice()),
         resumption: send.resumption,
+        active_turn: EventClass::job(event.event, event.gpu_idle.as_ref()).active_turn(),
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -744,6 +746,7 @@ pub(crate) async fn deliver_watch_event(
         pending: PendingT3Send::new(dir.join(format!("t3-pending-{}", event.seq))),
         before_send: None,
         resumption,
+        active_turn: event.active_turn(),
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -780,6 +783,8 @@ pub(crate) async fn deliver_service_event(
         pending: PendingT3Send::new(dir.join("t3-pending")),
         before_send: None,
         resumption,
+        // the owner may be using the service in the turn it runs now
+        active_turn: ActiveTurn::Steer,
     };
     let Some((outcome, _)) = attempt.run(callback).await?.into_settlement() else {
         return Ok(None);
@@ -809,6 +814,7 @@ struct OriginAttempt {
     pending: PendingT3Send,
     before_send: Option<SendCheck>,
     resumption: Resumption,
+    active_turn: ActiveTurn,
 }
 
 impl OriginAttempt {
@@ -818,6 +824,7 @@ impl OriginAttempt {
             check: self.before_send.as_ref(),
             hold: true,
             resumption: self.resumption,
+            active_turn: self.active_turn,
         }
     }
 

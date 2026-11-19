@@ -78,7 +78,7 @@ Always report. An agent given the report trailer that exits 0 without any report
 
 Reports append; they never replace. The last outcome is the final one. If you report `blocked` and then find the answer yourself, report again with `succeeded` or `failed`.
 
-Add `--notify` only when the orchestrator must act before you exit, for example a `blocked` report while you continue with a fallback. It sends one interim `TASK_REPORTED` message right away and is best effort. The exit message still follows. Default to no `--notify`.
+Add `--notify` only when the orchestrator must act before you exit, for example a `blocked` report while you continue with a fallback. It sends one interim `TASK_REPORTED` message right away, into the orchestrator's running turn if it has one, and is best effort. The exit message still follows. Default to no `--notify`.
 
 Limits: at most 20 reports per task (`too_many_reports`, exit 5). A report after the task has been marked terminal fails with `task_terminal`, exit 5.
 

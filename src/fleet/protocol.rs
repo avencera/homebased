@@ -21,7 +21,7 @@ impl fmt::Display for ClusterProtocolVersion {
 }
 
 /// Version this build speaks by default
-pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(8);
+pub const CLUSTER_PROTOCOL_VERSION: ClusterProtocolVersion = ClusterProtocolVersion(9);
 
 /// First version whose origins parse `JOB_GPU_IDLE`; a queue sends the event
 /// only to origins that submitted at this version or later
@@ -43,13 +43,19 @@ pub const PREEMPT_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(7);
 /// `mem_peak`, and `placement` on a submit
 pub const ADMISSION_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(8);
 
+/// First version whose message receivers take `active_turn` and queue a
+/// message that omits it; earlier receivers steer every message into a
+/// running turn and reject the field
+pub const ACTIVE_TURN_PROTOCOL: ClusterProtocolVersion = ClusterProtocolVersion(9);
+
 /// Range this build accepts
 ///
 /// Version 3 differs only in lacking `JOB_GPU_IDLE` and the `gpu_idle` queue
 /// command, version 4 only in lacking `lease_idle` on job events, version 5
 /// only in lacking CI jobs, version 6 only in lacking the `preempt` queue
-/// command and `preempt.hold`, and version 7 only in lacking `mem_peak` and
-/// submit `placement`, so peers on earlier releases keep working
+/// command and `preempt.hold`, version 7 only in lacking `mem_peak` and
+/// submit `placement`, and version 8 only in lacking message `active_turn`, so
+/// peers on earlier releases keep working
 pub const SUPPORTED_PROTOCOLS: ProtocolRange = ProtocolRange {
     min: ClusterProtocolVersion(3),
     max: CLUSTER_PROTOCOL_VERSION,

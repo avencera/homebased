@@ -157,6 +157,28 @@ pub fn session_thread() -> Result<Option<ThreadId>, AppError> {
     Ok(None)
 }
 
+/// What a line sent to a thread does while that thread runs a turn
+///
+/// It applies where the destination can hold a line until the turn ends: a T3
+/// thread, and a live Claude Code session's inbox. `codex queue` always waits
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveTurn {
+    /// Wait for the running turn to end, then start a new one
+    #[default]
+    Queue,
+    /// Join the running turn, so the agent reads the line before that turn ends
+    Steer,
+}
+
+impl ActiveTurn {
+    /// Whether this is the default, which the wire omits
+    #[must_use]
+    pub fn is_queue(&self) -> bool {
+        *self == Self::Queue
+    }
+}
+
 /// Codex thread or Claude Code session that submitted the task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

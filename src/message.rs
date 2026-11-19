@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{TaskId, ThreadId};
+use crate::domain::{ActiveTurn, TaskId, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
 
@@ -204,9 +204,24 @@ pub struct MessageSendRequest {
     pub reply_to: Option<MessageId>,
     /// Conversation UUID shared by related messages
     pub conversation_id: Uuid,
+    /// Whether the message waits for the recipient's running turn or joins it
+    ///
+    /// A message to a running worker always steers: a headless worker exits
+    /// when its final turn ends, so a queued message would never be read
+    #[serde(default, skip_serializing_if = "ActiveTurn::is_queue")]
+    pub active_turn: ActiveTurn,
 }
 
 impl MessageSendRequest {
+    /// How the receiver delivers this message to a thread mid-turn
+    #[must_use]
+    pub fn delivered_active_turn(&self) -> ActiveTurn {
+        match self.target {
+            MessageTarget::Worker { .. } => ActiveTurn::Steer,
+            _ => self.active_turn,
+        }
+    }
+
     /// Validate fields that do not depend on the local daemon or remote receiver
     pub fn validate(&self) -> Result<(), AppError> {
         if self.api_version != API_VERSION {
@@ -429,6 +444,12 @@ pub struct MessageRequest {
     pub reply_to: Option<MessageId>,
     /// Conversation UUID shared by related messages
     pub conversation_id: Uuid,
+    /// Whether the message waits for the recipient's running turn or joins it
+    ///
+    /// Sent only at [`crate::fleet::protocol::ACTIVE_TURN_PROTOCOL`] or later.
+    /// Earlier receivers reject the field and steer every message
+    #[serde(default, skip_serializing_if = "ActiveTurn::is_queue")]
+    pub active_turn: ActiveTurn,
 }
 
 /// Semantic request identity, excluding only the negotiated wire protocol version
@@ -442,6 +463,7 @@ pub(crate) struct MessageIdentity {
     body: String,
     reply_to: Option<MessageId>,
     conversation_id: Uuid,
+    active_turn: ActiveTurn,
 }
 
 impl MessageRequest {
@@ -455,6 +477,7 @@ impl MessageRequest {
             body: self.body.clone(),
             reply_to: self.reply_to,
             conversation_id: self.conversation_id,
+            active_turn: self.active_turn,
         }
     }
 

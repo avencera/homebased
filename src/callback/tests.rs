@@ -11,6 +11,7 @@ fn run_unconditionally(
             check: None,
             hold: false,
             resumption: crate::callback::stale_context::Resumption::Likely,
+            active_turn: ActiveTurn::Steer,
         },
     )?
     .ok_or_else(|| "unconditional callback was suppressed".into())
@@ -25,8 +26,8 @@ use super::{
 };
 use crate::dependency::Dependency;
 use crate::domain::{
-    Agent, AgentKind, AgentWorkload, ExitReason, ProcessGroupExitEvidence, ReportOutcome, TaskEnv,
-    TaskId, TaskReport, TaskRow, TaskState, Workload,
+    ActiveTurn, Agent, AgentKind, AgentWorkload, ExitReason, ProcessGroupExitEvidence,
+    ReportOutcome, TaskEnv, TaskId, TaskReport, TaskRow, TaskState, Workload,
 };
 use crate::submission::CallbackContext;
 use crate::waiting::{Parking, WaitTargets, WaitingNotes, WaitingReport};
@@ -105,6 +106,7 @@ fn direct_message_to_stopped_claude_session_needs_a_t3_owner() {
         &log,
         &lock,
         &pending,
+        ActiveTurn::Queue,
     )
     .unwrap_err();
     assert_eq!(

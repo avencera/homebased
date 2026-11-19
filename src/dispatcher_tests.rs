@@ -697,8 +697,9 @@ struct V2Thread {
     sleeps: bool,
     /// T3 runs a `/compact` turn in the thread now
     compaction_run: bool,
-    /// The event is the task's final `TASK_SUCCEEDED` rather than a report
-    final_event: bool,
+    /// The event's kind, such as the final `TASK_SUCCEEDED`; a `--notify`
+    /// report when unset
+    kind: Option<&'static str>,
 }
 
 async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDelivery {
@@ -726,10 +727,9 @@ async fn deliver_to_t3_v2_claude(origin: &str, thread: V2Thread) -> T3ClaudeDeli
             .hold_task(route.task, route.thread, chrono::Utc::now())
             .unwrap();
     }
-    let first = if thread.final_event {
-        callback_event(&route, 1, "TASK_SUCCEEDED")
-    } else {
-        event(&route, 1, true)
+    let first = match thread.kind {
+        Some(kind) => callback_event(&route, 1, kind),
+        None => event(&route, 1, true),
     };
     persisted.accept_inbound_event(&first).unwrap();
     drop(persisted);
@@ -998,7 +998,7 @@ async fn final_event_for_a_sleeping_thread_from_60k_tokens_queues_behind_its_com
     let thread = V2Thread {
         large_context_idle_minutes: Some(56),
         context_tokens: Some(100_000),
-        final_event: true,
+        kind: Some("TASK_SUCCEEDED"),
         ..V2Thread::default()
     };
 
@@ -1027,11 +1027,56 @@ async fn final_event_for_a_sleeping_thread_from_60k_tokens_queues_behind_its_com
     assert!(text.contains(r#""held_events":[]"#), "{text}");
     assert_eq!(sleeping[0]["dispatchMode"]["type"], "queue_after_active");
     assert!(sleeping[0].get("deliveryIntent").is_none());
-    // below 175K a thread that does not sleep starts its turn as usual
+    // below 175K a thread that does not sleep needs no compaction, and the
+    // final event still waits for any turn it runs
     let awake = dispatched_payloads(&awake_server);
     assert_eq!(awake.len(), 1);
     assert!(!awake[0]["text"].as_str().unwrap().contains("held_events"));
-    assert_eq!(awake[0]["deliveryIntent"], "auto");
+    assert_eq!(awake[0]["dispatchMode"]["type"], "queue_after_active");
+    assert!(awake[0].get("deliveryIntent").is_none());
+}
+
+#[tokio::test]
+async fn alerts_and_notify_reports_steer_while_a_final_event_waits() {
+    let ticket = || FakeResponse::http(200, &serde_json::json!({ "ticket": "fake-ticket" }));
+    let dispatched = || {
+        FakeResponse::WebSocket(vec![rpc_exit(
+            serde_json::json!({ "_tag": "Success", "value": { "sequence": 3 } }),
+        )])
+    };
+    let deliver = |kind| async move {
+        let server = FakeT3Server::start(Some(2), vec![ticket(), dispatched()]);
+        let result = deliver_to_t3_v2_claude(
+            &server.origin,
+            V2Thread {
+                kind,
+                ..V2Thread::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                result.delivery,
+                DeliveryState::Delivered { attempts: 1, .. }
+            ),
+            "{:?}",
+            result.delivery
+        );
+        let payloads = dispatched_payloads(&server);
+        assert_eq!(payloads.len(), 1);
+        payloads[0].clone()
+    };
+
+    // `None` is the `--notify` report, which asks the thread to act before the worker exits
+    for kind in [Some("TASK_CHECK_DUE"), None] {
+        let payload = deliver(kind).await;
+        assert_eq!(payload["deliveryIntent"], "auto", "{kind:?}");
+        assert_eq!(payload["dispatchMode"]["type"], "start_immediately");
+    }
+    let last = deliver(Some("TASK_SUCCEEDED")).await;
+    assert!(last["text"].as_str().unwrap().contains("TASK_SUCCEEDED"));
+    assert_eq!(last["dispatchMode"]["type"], "queue_after_active");
+    assert!(last.get("deliveryIntent").is_none());
 }
 
 #[tokio::test]
