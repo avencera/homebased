@@ -1138,6 +1138,9 @@ pub struct TaskRow {
     /// When the task's one inactivity reminder (`TASK_CHECK_DUE`) was produced.
     /// Independent of the process status: a reminder never changes it
     pub check_due_at: Option<DateTime<Utc>>,
+    /// The task's one `TASK_MEMORY_REVIEW`, once produced. Independent of the
+    /// process status, like `check_due_at`
+    pub memory_review: Option<crate::memory::ProducedMemoryReview>,
     /// When cancel was requested
     pub cancel_requested_at: Option<DateTime<Utc>>,
     /// Insert time
@@ -1519,6 +1522,7 @@ mod tests {
                 container_exit_evidence: container_evidence,
                 child: None,
                 check_due_at: None,
+                memory_review: None,
                 cancel_requested_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

@@ -221,7 +221,10 @@ impl TaskOutcome {
             EventKind::TaskCancelled => Some(Self::Cancelled),
             EventKind::TaskLost => Some(Self::Lost),
             EventKind::TaskPreempted => Some(Self::Preempted),
-            EventKind::TaskReported | EventKind::TaskCheckDue | EventKind::TaskWaiting => None,
+            EventKind::TaskReported
+            | EventKind::TaskCheckDue
+            | EventKind::TaskMemoryReview
+            | EventKind::TaskWaiting => None,
         }
     }
 

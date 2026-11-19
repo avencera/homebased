@@ -19,6 +19,7 @@ use crate::domain::{
     AgentKind, ExitReason, ReportKind, ReportOutcome, TaskId, TaskName, TaskReport, TaskRow,
     TaskState, ThreadId, Workload,
 };
+use crate::memory::MemoryReview;
 use crate::spec::NormalizedSpec;
 use crate::usage::TaskUsage;
 use crate::waiting::{Parking, WaitTargets};
@@ -181,6 +182,9 @@ pub enum EventKind {
     TaskReported,
     /// Output was inactive for the configured time; child still running.
     TaskCheckDue,
+    /// The part of a running task's peak it has not allocated alone keeps a
+    /// waiting task from starting. Never changes task status.
+    TaskMemoryReview,
     /// Process cancelled.
     TaskCancelled,
     /// Worker gone without `exit.json`.
@@ -236,6 +240,9 @@ pub enum NextAction {
     AnswerAndResubmit,
     /// Review successful output.
     ReviewOutput,
+    /// Keep the task if a later phase needs its peak, or cancel it and
+    /// resubmit with a smaller one.
+    ReviewMemoryPeak,
 }
 
 /// Tagged process payload in the event.
@@ -344,6 +351,11 @@ pub struct HomebasedEvent {
     /// Token usage of a finished Claude worker. Present only on terminal events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TaskUsage>,
+    /// What the task's peak keeps waiting. Present only on `TASK_MEMORY_REVIEW`,
+    /// which a task submitted on the machine that runs it gets, so no peer on
+    /// an older release reads it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_review: Option<MemoryReview>,
 }
 
 impl HomebasedEvent {
@@ -421,6 +433,24 @@ pub fn check_due_event(row: &TaskRow, reports: &[TaskReport], evidence: PathBuf)
         continuation: None,
         reason: None,
         usage: None,
+        memory_review: None,
+    }
+}
+
+/// Memory review of a running task. Never changes task status.
+#[must_use]
+pub fn memory_review_event(
+    row: &TaskRow,
+    reports: &[TaskReport],
+    evidence: PathBuf,
+    review: MemoryReview,
+) -> HomebasedEvent {
+    HomebasedEvent {
+        event: EventKind::TaskMemoryReview,
+        timeout_secs: None,
+        next_action: NextAction::ReviewMemoryPeak,
+        memory_review: Some(review),
+        ..check_due_event(row, reports, evidence)
     }
 }
 
@@ -467,6 +497,7 @@ fn build_event(
         continuation: parking.map(|parking| parking.continuation),
         reason: None,
         usage: None,
+        memory_review: None,
     }
 }
 
@@ -521,6 +552,7 @@ pub fn unlaunched_event(
         continuation: None,
         reason: None,
         usage: None,
+        memory_review: None,
     }
 }
 
@@ -545,6 +577,7 @@ pub fn notify_event(row: &TaskRow, report: &TaskReport, evidence: PathBuf) -> Ho
         continuation: None,
         reason: None,
         usage: None,
+        memory_review: None,
     }
 }
 
@@ -680,6 +713,13 @@ pub fn last_event_for_row(
         .map(HomebasedEvent::with_derived_reason)
 }
 
+/// An event a running task produced without changing its status
+enum Interim<'a> {
+    Report(&'a TaskReport),
+    CheckDue,
+    MemoryReview(&'a MemoryReview),
+}
+
 fn last_event_without_reason(
     row: &TaskRow,
     reports: &[TaskReport],
@@ -688,22 +728,28 @@ fn last_event_without_reason(
 ) -> Option<HomebasedEvent> {
     match row.state {
         TaskState::Queued | TaskState::Running { .. } => {
-            let report = reports
-                .iter()
-                .rev()
-                .find(|report| report.notified_at.is_some());
-            match (row.check_due_at, report) {
-                (Some(check_due_at), Some(report))
-                    if report
-                        .notified_at
-                        .is_some_and(|notified_at| notified_at > check_due_at) =>
-                {
-                    Some(notify_event(row, report, evidence))
+            let report = reports.iter().rev().find_map(|report| {
+                let at = report.notified_at?;
+                Some((at, Interim::Report(report)))
+            });
+            let check_due = row.check_due_at.map(|at| (at, Interim::CheckDue));
+            let review = row
+                .memory_review
+                .as_ref()
+                .map(|produced| (produced.at, Interim::MemoryReview(&produced.review)));
+            // the latest wins; `max_by_key` keeps the last of equals, so a
+            // reminder produced at a report's instant still reads as the reminder
+            let (_, latest) = [report, check_due, review]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(at, _)| *at)?;
+            Some(match latest {
+                Interim::Report(report) => notify_event(row, report, evidence),
+                Interim::CheckDue => check_due_event(row, reports, evidence),
+                Interim::MemoryReview(review) => {
+                    memory_review_event(row, reports, evidence, review.clone())
                 }
-                (Some(_), _) => Some(check_due_event(row, reports, evidence)),
-                (None, Some(report)) => Some(notify_event(row, report, evidence)),
-                (None, None) => None,
-            }
+            })
         }
         TaskState::Lost => Some(lost_event(row, reports, evidence)),
         TaskState::Finished { .. } => Some(exit_event(row, reports, evidence, parking)),

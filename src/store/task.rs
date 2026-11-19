@@ -19,7 +19,7 @@ use crate::error::AppError;
 pub(super) const TASK_SELECT: &str = "SELECT id, thread_id, name, workload_json, cwd, timeout_secs,
     env_path, env_home, binary, status, exit_reason, check_due_at, pid, cancel_requested_at,
     created_at, updated_at, process_group_exit_evidence, container_exit_evidence, child_pid,
-    child_start_time
+    child_start_time, memory_review
  FROM tasks";
 
 /// Insert an accepted task row with the Git root of its working directory
@@ -40,8 +40,9 @@ fn insert_task_on(
             id, thread_id, name, workload_json, cwd, timeout_secs,
             env_path, env_home, binary, status, exit_reason, check_due_at,
             pid, cancel_requested_at, created_at, updated_at, project_root,
-            process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            process_group_exit_evidence, container_exit_evidence, child_pid, child_start_time,
+            memory_review
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             row.id.to_string(),
             row.thread.to_string(),
@@ -64,6 +65,10 @@ fn insert_task_on(
             row.container_exit_evidence.to_storage()?,
             child_pid,
             child_start_time,
+            row.memory_review
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     Ok(())
@@ -295,6 +300,7 @@ pub(super) fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRo
     let container_exit_evidence: Option<String> = row.get(17)?;
     let child_pid: Option<i32> = row.get(18)?;
     let child_start_time: Option<i64> = row.get(19)?;
+    let memory_review: Option<String> = row.get(20)?;
 
     let parse_err = |err: AppError| rusqlite::Error::ToSqlConversionFailure(Box::new(err));
     let json_err = |err: serde_json::Error| {
@@ -353,6 +359,10 @@ pub(super) fn parse_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRo
         container_exit_evidence,
         child: child_from_storage(child_pid, child_start_time).map_err(parse_err)?,
         check_due_at: parse_optional_time(check_due_at)?,
+        memory_review: memory_review
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(json_err)?,
         cancel_requested_at: parse_optional_time(cancel_requested_at)?,
         created_at: parse_time(&created_at).map_err(parse_err)?,
         updated_at: parse_time(&updated_at).map_err(parse_err)?,
@@ -397,6 +407,7 @@ pub fn new_queued_task(new: NewTask) -> TaskRow {
         container_exit_evidence: ContainerExitEvidence::Unconfirmed,
         child: None,
         check_due_at: None,
+        memory_review: None,
         cancel_requested_at: None,
         created_at: now,
         updated_at: now,

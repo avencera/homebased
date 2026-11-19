@@ -101,10 +101,11 @@ pub struct TaskSummary {
     /// whole chain's state, so a parked run reads `waiting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainView>,
-    /// Peak host memory of a held task submitted with `mem_peak`.
+    /// Peak host memory of a task submitted with `mem_peak`. A started task
+    /// holds the part of it not yet allocated against the memory bar until it ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_peak: Option<MemPeak>,
-    /// Level a held task with a peak is admitted at, before submit order.
+    /// Level a task with a peak is admitted at, before submit order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::queue::Priority>,
     /// Why a held task with a peak is not started yet, once nothing else holds it.
@@ -187,6 +188,7 @@ impl TaskSummary {
     #[must_use]
     pub fn from_row(row: &TaskRow, presentation: Option<&TaskPresentation>) -> Self {
         let owners = presentation.and_then(|presentation| presentation.owners);
+        let memory = presentation.and_then(|presentation| presentation.memory);
         Self {
             id: row.id,
             name: row.name.clone(),
@@ -215,8 +217,8 @@ impl TaskSummary {
             updated_at: row.updated_at,
             after: None,
             chain: presentation.and_then(|presentation| presentation.chain.clone()),
-            mem_peak: None,
-            priority: None,
+            mem_peak: memory.map(|memory| memory.peak),
+            priority: memory.map(|memory| memory.priority),
             memory_wait: None,
         }
     }

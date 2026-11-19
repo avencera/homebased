@@ -8,7 +8,7 @@ use super::chain::{check_waiting_on, park_on, parking_on};
 use super::{Store, fmt_time, parse_time};
 use crate::callback::{
     ExitClass, ExitPolicy, ProcessPayload, ReportView, check_due_event, classify_exit,
-    notify_event, terminal_event,
+    memory_review_event, notify_event, terminal_event,
 };
 use crate::domain::{
     ContainerExitEvidence, ExitReason, ProcessGroupExitEvidence, ProcessStatus, REPORTS_MAX,
@@ -17,6 +17,7 @@ use crate::domain::{
 };
 use crate::error::AppError;
 use crate::events::EventPayload;
+use crate::memory::{MemoryReview, ProducedMemoryReview};
 use crate::queue::StopCause;
 use crate::queue::gpu_idle::summary::EndReading;
 use crate::submission::ExecutorIdentity;
@@ -322,6 +323,48 @@ impl Store {
             let row = self.require_task(id)?;
             let reports = self.reports(id)?;
             let event = check_due_event(&row, &reports, self.tasks_dir.join(id.to_string()));
+            self.append_produced_event(
+                id,
+                EventPayload::Callback {
+                    event: Box::new(event),
+                    state: None,
+                },
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Produce the one `TASK_MEMORY_REVIEW` of a running task
+    ///
+    /// Returns whether it was produced now: a task asked before, or no longer
+    /// running, gets nothing. A queue run reports through its job, and its
+    /// claim never names a task, so it never gets here
+    pub fn produce_memory_review(
+        &self,
+        id: TaskId,
+        review: MemoryReview,
+    ) -> Result<bool, AppError> {
+        self.immediate(|| {
+            if !self.is_event_task(id)? {
+                return Ok(false);
+            }
+            let produced = ProducedMemoryReview {
+                at: Utc::now(),
+                review,
+            };
+            let changed = self.conn.execute(
+                "UPDATE tasks SET memory_review=?1
+                 WHERE id=?2 AND memory_review IS NULL AND status='running'
+                   AND resource_job_id IS NULL",
+                params![serde_json::to_string(&produced)?, id.to_string()],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let row = self.require_task(id)?;
+            let reports = self.reports(id)?;
+            let evidence = self.tasks_dir.join(id.to_string());
+            let event = memory_review_event(&row, &reports, evidence, produced.review);
             self.append_produced_event(
                 id,
                 EventPayload::Callback {

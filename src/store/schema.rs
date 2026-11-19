@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 22;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 21] = [
+const MIGRATIONS: [Migration; 22] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -41,6 +41,7 @@ const MIGRATIONS: [Migration; 21] = [
     add_thread_lineage,
     add_follow_up_reports,
     add_route_priorities,
+    add_task_memory_reviews,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -237,6 +238,13 @@ fn add_route_priorities(conn: &Connection) -> Result<(), rusqlite::Error> {
     ))
 }
 
+/// Version 23: when a running task's owner was asked to review its memory peak
+fn add_task_memory_reviews(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "ALTER TABLE tasks ADD COLUMN {TASK_MEMORY_REVIEW};"
+    ))
+}
+
 /// Version 19: `homebased wait --long` holds progress events for its thread
 fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(SLEEP_HOLDS_TABLE)
@@ -355,6 +363,11 @@ const ROUTE_MEM_PEAK: &str =
 /// higher levels are admitted first, then submit order. Routes saved before
 /// version 22 read as medium
 const ROUTE_PRIORITY: &str = "priority INTEGER NOT NULL DEFAULT 1 CHECK (priority BETWEEN 0 AND 2)";
+
+/// The `TASK_MEMORY_REVIEW` produced for a running task, as JSON with when it
+/// was produced; set once, so a task's owner is asked at most once, across
+/// restarts too
+const TASK_MEMORY_REVIEW: &str = "memory_review TEXT";
 
 /// Version 16: CI slot lanes, drains, run timeouts, and job timings
 fn add_ci_slots(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -643,6 +656,7 @@ fn schema() -> String {
         .replace("{ROUTE_COALESCE_KEY}", ROUTE_COALESCE_KEY)
         .replace("{ROUTE_MEM_PEAK}", ROUTE_MEM_PEAK)
         .replace("{ROUTE_PRIORITY}", ROUTE_PRIORITY)
+        .replace("{TASK_MEMORY_REVIEW}", TASK_MEMORY_REVIEW)
         .replace("{ROUTE_COALESCE_INDEX}", ROUTE_COALESCE_INDEX)
         .replace("{CHAIN_TABLES}", CHAIN_TABLES)
         .replace("{RESOURCE_LABEL}", RESOURCE_LABEL)
@@ -730,7 +744,8 @@ CREATE TABLE tasks (
     step_index INTEGER CHECK (
         (step_index IS NULL) = (resource_job_id IS NULL)
         AND (step_index IS NULL OR step_index >= 0)
-    )
+    ),
+    {TASK_MEMORY_REVIEW}
 );
 CREATE INDEX tasks_status ON tasks(status);
 CREATE INDEX tasks_thread ON tasks(thread_id);
@@ -1117,6 +1132,7 @@ mod tests {
         let v1 = schema()
             .replace(&format!(",\n    {}", super::ROUTE_MEM_PEAK), "")
             .replace(&format!(",\n    {}", super::ROUTE_PRIORITY), "")
+            .replace(&format!(",\n    {}", super::TASK_MEMORY_REVIEW), "")
             .replace(&format!(",\n    {}", super::REPORT_WAITING_ON), "")
             .replace(&format!(",\n    {}", super::REPORT_NOTES), "")
             .replace(&format!(",\n    {}", super::ROUTE_WAIT_FOR_MACHINE), "")
@@ -1224,7 +1240,8 @@ mod tests {
         // version 12 had no lease guard, services, CI slots, memory peaks,
         // sleep holds, or child-thread links
         conn.execute_batch(
-            "DROP TABLE thread_reports; DROP TABLE thread_lineage;
+            "ALTER TABLE tasks DROP COLUMN memory_review;
+             DROP TABLE thread_reports; DROP TABLE thread_lineage;
              ALTER TABLE origin_routes DROP COLUMN priority;
              ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
              DROP TABLE sleep_holds;
@@ -1279,7 +1296,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn.execute_batch(&format!(
-            "DROP TABLE thread_reports; ALTER TABLE origin_routes DROP COLUMN priority; {}",
+            "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE thread_reports;
+             ALTER TABLE origin_routes DROP COLUMN priority; {}",
             super::THREAD_REPORTS_V20
         ))
         .unwrap();

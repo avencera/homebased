@@ -39,7 +39,7 @@ pub use dependency::{HeldCancel, PriorityChange, UnlaunchedTask};
 pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, OwedTarget};
 pub use lifecycle::CancelResult;
-pub use presentation::{TaskOwners, TaskPresentation};
+pub use presentation::{TaskMemory, TaskOwners, TaskPresentation};
 pub use task::{NewTask, new_queued_task};
 pub use thread_watch::{WatchRecord, WatchUpdate, WorkerThread};
 

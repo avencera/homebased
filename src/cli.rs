@@ -180,7 +180,7 @@ pub enum Command {
     /// `JOB_PREEMPTED`, GPU idle reminders) without waking the thread, and wakes
     /// it with the target's final event, whose line lists them under
     /// `held_events`, or with an alert (`JOB_ATTENTION`, `JOB_BLOCKED`,
-    /// `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, the first `JOB_GPU_IDLE` of an idle
+    /// `TASK_CHECK_DUE`, `TASK_MEMORY_REVIEW`, `JOB_CHECK_DUE`, the first `JOB_GPU_IDLE` of an idle
     /// episode), after which the hold stays. When a held task parks, the hold
     /// follows its continuation and keeps the tasks and jobs it parked on, so
     /// only the chain's final event wakes the thread. A connected wait still

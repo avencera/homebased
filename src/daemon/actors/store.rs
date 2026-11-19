@@ -913,6 +913,12 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<bool, AppError>>,
     },
+    /// Produce a running task's one memory review; replies whether it was produced now
+    ProduceMemoryReview {
+        id: TaskId,
+        review: crate::memory::MemoryReview,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
     /// Reports in seq order
     Reports {
         id: TaskId,
@@ -1585,6 +1591,9 @@ impl Actor for StoreActor {
             }
             StoreMsg::ProduceAttentionEvent { id, reply } => {
                 send_reply(reply, state.produce_attention_event(id));
+            }
+            StoreMsg::ProduceMemoryReview { id, review, reply } => {
+                send_reply(reply, state.produce_memory_review(id, review));
             }
             StoreMsg::Reports { id, reply } => send_reply(reply, state.reports(id)),
             StoreMsg::Parking { id, reply } => send_reply(reply, state.parking(id)),

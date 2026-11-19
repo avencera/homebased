@@ -15,7 +15,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::domain::TaskId;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -250,9 +253,20 @@ impl Room {
     }
 }
 
+/// What started with a peak
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOwner {
+    /// A task submitted on this machine
+    Task(TaskId),
+    /// A GPU queue job's run, which reports through its job
+    Job,
+}
+
 /// An item with a peak that started and has not ended
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Claim {
+    /// What started
+    pub owner: ClaimOwner,
     /// Its declared peak
     pub peak: MemPeak,
     /// Its child process, once spawned; `None` counts the whole peak as outstanding
@@ -260,12 +274,47 @@ pub struct Claim {
 }
 
 /// Memory in use, and the room started items still need, from one measurement
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Usage {
     /// Bytes in use, as [`Gauge::read`] counts them
     pub used: u64,
+    /// What each claim's process tree held, in the order of the claims measured
+    pub held: Vec<u64>,
     /// Bytes of their peaks that started items have not allocated yet
     pub outstanding: u64,
+}
+
+/// A running task whose peak, not yet allocated, alone keeps the first
+/// waiting task from starting
+///
+/// The gate keeps a started task's whole peak until it ends, since a late
+/// phase may still need it. Only the task's owner knows whether it will, so
+/// the owner gets this once the wait has lasted, and decides whether to keep
+/// the task or resubmit it with a smaller peak
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReview {
+    /// The running task's declared peak
+    pub mem_peak: MemPeak,
+    /// Bytes its process tree held at the last measurement
+    pub held_bytes: u64,
+    /// The waiting task its unallocated peak keeps from starting
+    pub waiting_task: TaskId,
+    /// That task's peak
+    pub waiting_peak: MemPeak,
+    /// Seconds the running task has kept `waiting_task` out this way
+    pub blocked_secs: u64,
+}
+
+/// A memory review as the store produced it, kept on the task so its last
+/// event can be read back
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducedMemoryReview {
+    /// When it was produced
+    pub at: DateTime<Utc>,
+    /// What it said
+    pub review: MemoryReview,
 }
 
 /// Bytes of their peaks that started items have not allocated yet, given
@@ -331,9 +380,11 @@ impl Gauge {
             .zip(after)
             .map(|(a, b)| a.min(b))
             .collect();
+        let outstanding = outstanding(claims, &held);
         Ok(Usage {
             used,
-            outstanding: outstanding(claims, &held),
+            held,
+            outstanding,
         })
     }
 
@@ -527,6 +578,7 @@ mod tests {
     #[test]
     fn a_claim_without_a_process_counts_its_whole_peak() {
         let claims = [Claim {
+            owner: super::ClaimOwner::Job,
             peak: gib(3.0),
             root: None,
         }];

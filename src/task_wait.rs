@@ -402,8 +402,9 @@ pub enum EventClass {
 impl EventClass {
     /// Class of a task event
     ///
-    /// `TASK_REPORTED` is progress and `TASK_CHECK_DUE` asks the thread to look
-    /// at a silent worker. `TASK_WAITING` parks the work but hands it to a
+    /// `TASK_REPORTED` is progress. `TASK_CHECK_DUE` asks the thread to look
+    /// at a silent worker, and `TASK_MEMORY_REVIEW` at a peak that keeps other
+    /// work waiting. `TASK_WAITING` parks the work but hands it to a
     /// continuation run, so the work goes on. Every other event is final,
     /// including `TASK_PREEMPTED`: a preempted queue run has no origin route, so
     /// its job continues under new runs that report through `JOB_*` events, not
@@ -412,7 +413,7 @@ impl EventClass {
     pub fn task(kind: EventKind) -> Self {
         match kind {
             EventKind::TaskReported | EventKind::TaskWaiting => Self::Progress,
-            EventKind::TaskCheckDue => Self::Alert,
+            EventKind::TaskCheckDue | EventKind::TaskMemoryReview => Self::Alert,
             EventKind::TaskCancelled
             | EventKind::TaskLost
             | EventKind::TaskBlocked

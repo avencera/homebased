@@ -7,7 +7,7 @@ use super::identity::stored_mem_peak;
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::memory::Claim;
+use crate::memory::{Claim, ClaimOwner};
 use crate::queue::RunPhase;
 
 impl Store {
@@ -18,7 +18,7 @@ impl Store {
     /// is a claim until its child exits; cleanup holds no memory worth counting
     pub fn memory_claims(&self, machine: MachineId) -> Result<Vec<Claim>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT routes.mem_peak_mib, tasks.child_pid FROM tasks
+            "SELECT tasks.id, routes.mem_peak_mib, tasks.child_pid FROM tasks
              JOIN origin_routes AS routes ON routes.task_id = tasks.id
              WHERE routes.mem_peak_mib IS NOT NULL
                AND tasks.resource_job_id IS NULL
@@ -26,13 +26,21 @@ impl Store {
         )?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<u32>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut claims = Vec::with_capacity(rows.len());
-        for (peak, root) in rows {
+        for (task, peak, root) in rows {
             if let Some(peak) = stored_mem_peak(peak)? {
-                claims.push(Claim { peak, root });
+                claims.push(Claim {
+                    owner: ClaimOwner::Task(task.parse()?),
+                    peak,
+                    root,
+                });
             }
         }
 
@@ -50,6 +58,7 @@ impl Store {
                 continue;
             };
             claims.push(Claim {
+                owner: ClaimOwner::Job,
                 peak,
                 root: self.child_pid(run.task)?,
             });

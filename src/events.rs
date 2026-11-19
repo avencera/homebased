@@ -374,6 +374,7 @@ mod tests {
             continuation: None,
             reason: None,
             usage: None,
+            memory_review: None,
         };
         let event = TaskEvent {
             task,

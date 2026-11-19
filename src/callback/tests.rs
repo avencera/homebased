@@ -66,6 +66,7 @@ fn row(state: TaskState) -> TaskRow {
         container_exit_evidence: crate::domain::ContainerExitEvidence::Unconfirmed,
         child: None,
         check_due_at: None,
+        memory_review: None,
         cancel_requested_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

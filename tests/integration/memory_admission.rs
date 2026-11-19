@@ -565,3 +565,88 @@ fn a_retry_accepted_before_require_peak_still_resolves_to_its_task() {
     assert_eq!(retry["id"], first["id"], "{retry}");
     h.release_gate("gate");
 }
+
+#[test]
+fn a_running_task_whose_unused_peak_alone_keeps_a_task_waiting_gets_one_memory_review() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    cgroup.set_used(GIB);
+    let review_in_a_second = [("HOMEBASED_TEST_MEMORY_REVIEW_SECS", "1")];
+    with_memory_gate(&mut h, &cgroup, &review_in_a_second);
+    let reviews = |h: &Harness, id: &str| -> Vec<Value> {
+        h.queue_messages()
+            .iter()
+            .map(|line| super::event_json(line))
+            .filter(|event| event["task"] == id && event["event"] == "TASK_MEMORY_REVIEW")
+            .collect()
+    };
+
+    // 8 GiB declared and a shell's worth used, so about 1 GiB is left
+    let holder = h.submit(&peak_task(&h, "holder", 8.0));
+    h.wait_status(&holder, "running");
+    let listed = task(&h, &holder);
+    assert_eq!(
+        listed["mem_peak"], 8.0,
+        "a started task shows its peak: {listed}"
+    );
+    assert_eq!(listed["priority"], "medium", "{listed}");
+    assert_eq!(h.show(&holder)["mem_peak"], 8.0);
+
+    // 9.5 GiB would not fit even if the holder gave back all it has not
+    // allocated, so the holder alone is not what keeps it out
+    let huge = h.submit(&peak_task(&h, "huge", 9.5));
+    eventually("the huge task never reported its memory wait", || {
+        task(&h, &huge)["memory_wait"]["reason"] == "room"
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        reviews(&h, &holder).is_empty(),
+        "{:?}",
+        reviews(&h, &holder)
+    );
+    let cancelled = h
+        .cmd()
+        .args(["--json", "task", "cancel", &huge])
+        .output()
+        .unwrap();
+    assert!(cancelled.status.success());
+
+    // 3 GiB fits once the holder gives back what it has not allocated
+    let waiter = h.submit(&peak_task(&h, "waiter", 3.0));
+    h.wait_for_event(&holder, "TASK_MEMORY_REVIEW");
+    let review = reviews(&h, &holder).remove(0);
+    assert_eq!(review["next_action"], "review_memory_peak", "{review}");
+    assert!(review["process"].is_null(), "{review}");
+    let detail = &review["memory_review"];
+    assert_eq!(detail["mem_peak"], 8.0, "{review}");
+    assert_eq!(detail["waiting_task"], waiter.as_str(), "{review}");
+    assert_eq!(detail["waiting_peak"], 3.0, "{review}");
+    assert!(detail["blocked_secs"].as_u64().unwrap() >= 1, "{review}");
+    let held = detail["held_bytes"].as_u64().unwrap();
+    assert!(held > 0 && held < GIB, "{review}");
+    let shown = h.show(&holder);
+    assert_eq!(
+        shown["last_event"]["event"], "TASK_MEMORY_REVIEW",
+        "{shown}"
+    );
+    assert_eq!(
+        shown["last_event"]["memory_review"]["waiting_task"],
+        waiter.as_str(),
+        "{shown}"
+    );
+    // the review only asks; the gate still holds the peak
+    assert_eq!(task(&h, &holder)["status"], "running");
+    assert_eq!(task(&h, &waiter)["status"], "held");
+
+    // asked once, also after a restart forgets the wait
+    with_memory_gate(&mut h, &cgroup, &review_in_a_second);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(reviews(&h, &holder).len(), 1, "{:?}", reviews(&h, &holder));
+
+    // the holder ending lets the waiter in
+    h.release_gate("holder");
+    h.wait_status(&holder, "succeeded");
+    h.wait_status(&waiter, "running");
+    h.release_gate("waiter");
+    h.wait_status(&waiter, "succeeded");
+}

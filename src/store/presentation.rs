@@ -12,6 +12,8 @@ use crate::domain::{CallbackStatus, ProcessStatus, TaskId, TaskRow, ThreadId};
 use crate::error::AppError;
 use crate::events::{DeliveryState, EventPayload, TaskEvent};
 use crate::machine::MachineId;
+use crate::memory::MemPeak;
+use crate::queue::Priority;
 use crate::submission::{ExecutorIdentity, OriginRoute};
 use crate::waiting::ChainView;
 
@@ -22,6 +24,16 @@ pub struct TaskOwners {
     pub origin_machine: MachineId,
     /// Machine that runs the task
     pub execution_machine: MachineId,
+}
+
+/// The memory a task declared at submit, which it holds against the memory
+/// bar from its release until it ends
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskMemory {
+    /// Its declared peak
+    pub peak: MemPeak,
+    /// Its level among tasks waiting for memory
+    pub priority: Priority,
 }
 
 /// Dashboard metadata read with a task row
@@ -43,6 +55,8 @@ pub struct TaskPresentation {
     pub attention_delivered: bool,
     /// Chain of an agent run that parked or continues parked work
     pub chain: Option<ChainView>,
+    /// The peak it was submitted with, when it declared one
+    pub memory: Option<TaskMemory>,
 }
 
 /// Which machine delivers a task's callbacks
@@ -70,8 +84,10 @@ impl Store {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT t.id, t.project_root, e.identity_json, t.worker_thread
+                "SELECT t.id, t.project_root, e.identity_json, t.worker_thread,
+                        r.mem_peak_mib, r.priority
                  FROM tasks t LEFT JOIN executor_identities e ON e.task_id=t.id
+                 LEFT JOIN origin_routes r ON r.task_id=t.id
                  WHERE t.id IN ({placeholders})"
             );
             let mut statement = self.conn.prepare(&sql)?;
@@ -286,6 +302,8 @@ fn presentation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPresen
     let project_root: Option<String> = row.get(1)?;
     let identity_json: Option<String> = row.get(2)?;
     let raw_worker_thread: Option<String> = row.get(3)?;
+    let mem_peak_mib: Option<i64> = row.get(4)?;
+    let priority_rank: Option<i64> = row.get(5)?;
     let id: TaskId = raw_id
         .parse()
         .map_err(|error: AppError| conversion_error(0, error))?;
@@ -310,6 +328,18 @@ fn presentation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPresen
         }
         Some(ExecutorIdentity::Rejected(_)) | None => None,
     };
+    let peak = super::identity::stored_mem_peak(mem_peak_mib)
+        .map_err(|error| conversion_error(4, error))?;
+    // a route without a peak still has a priority, which then orders nothing
+    let memory = match (peak, priority_rank) {
+        (Some(peak), Some(rank)) => Some(TaskMemory {
+            peak,
+            priority: super::identity::stored_priority(rank)
+                .map_err(|error| conversion_error(5, error))?,
+        }),
+        _ => None,
+    };
+
     Ok(TaskPresentation {
         id,
         project_root: project_root.map(PathBuf::from),
@@ -318,6 +348,7 @@ fn presentation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPresen
         terminal_callback: None,
         attention_delivered: false,
         chain: None,
+        memory,
     })
 }
 

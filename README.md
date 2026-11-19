@@ -423,7 +423,7 @@ While it lasts, the daemon sorts each event of the target:
   Its `HOMEBASED_EVENT` line gains `held_events`: the kind, `seq`, time, and a
   short summary of each event the hold kept
 - An alert wakes the thread, and the hold stays: `JOB_ATTENTION`,
-  `JOB_BLOCKED`, `TASK_CHECK_DUE`, `JOB_CHECK_DUE`, and the first
+  `JOB_BLOCKED`, `TASK_CHECK_DUE`, `TASK_MEMORY_REVIEW`, `JOB_CHECK_DUE`, and the first
   `JOB_GPU_IDLE` of an idle episode. End the turn again after handling it,
   without starting another wait
 - Progress settles without waking the thread: `TASK_REPORTED`,
@@ -1032,6 +1032,28 @@ The producer keeps its claim while the consumer runs, so their peaks must fit
 under the bar together. When they cannot, submit the consumer `--after` the
 producer, so it starts once the producer ends.
 
+Declare the most the work will hold, measured from a comparable run and
+including every child process and the largest phase, plus about 10%. A memory
+cap the command enforces on itself is an upper bound, not a peak: a task that
+caps itself at 28G but holds 3.5G still keeps the other 24.5G from every task
+behind it for as long as it runs. A started task keeps its whole peak until it
+ends, since a later phase, such as a join after a light load, may need it.
+
+When the part of one running task's peak that it has not allocated is, alone,
+what keeps the first task waiting for memory from starting, and that lasts ten
+minutes, the running task's thread gets one `TASK_MEMORY_REVIEW`. Its
+`memory_review` gives the task's `mem_peak`, the bytes its process tree held
+(`held_bytes`), the waiting task and its peak, and how long the wait has lasted
+(`blocked_secs`). It is an alert, so it wakes a thread sleeping with `wait
+--long`, and it changes nothing: the owner keeps the task when a later phase
+needs the room, or cancels it and resubmits with a smaller peak. Cancelling it
+also cancels work submitted `--after` it, and the replacement has a new id, so
+resubmit that work `--after` the replacement. GPU queue job
+runs, and tasks submitted from another machine, are not reviewed.
+
+`task show` and `task list --json` give the `mem_peak` and `priority` of every
+task submitted with one, also after it starts.
+
 `task list`, `task show`, and `resource jobs` print why an item waits, such as
 `waiting for memory: peak 17.0G, 9.2G free under the 40.0G bar`; `--json`
 gives it as `memory_wait` on a task and under `memory_waits` by job id. When
@@ -1183,6 +1205,7 @@ to ignore duplicates.
 | --- | --- |
 | `TASK_REPORTED` | Worker sent an interim report. The process is still running. |
 | `TASK_CHECK_DUE` | No output for the full inactivity timeout. The child is still live. |
+| `TASK_MEMORY_REVIEW` | For ten minutes, the part of this running task's `mem_peak` it has not allocated alone kept the first task waiting for memory from starting. Sent once per task. The child is still live and keeps its peak. |
 | `TASK_WAITING` | An agent worker submitted long tasks or GPU queue jobs, reported `waiting` on them, and exited. Homebased continues the work in a new run, `continuation`, once every task and job in `waiting_on` ends. |
 | `TASK_SUCCEEDED` | Exit 0 and last report was `succeeded`, or exit 0 with no report from a task, a container, or an agent without the report trailer. |
 | `TASK_BLOCKED` | Last report was `blocked`. The process has exited. Answer and submit a new spec. There is no resume. |

@@ -13,18 +13,24 @@
 //! GPU job that waits for memory reserves its peak for every task, and a task
 //! that waits reserves its peak for every later task. A job whose resources
 //! are busy reserves nothing, since it cannot start anyway
+//!
+//! A started task keeps its whole peak until it ends, since a late phase may
+//! need it. When the part of one task's peak it has not allocated is alone what
+//! keeps the first waiting task from starting, for ten minutes, its owner
+//! gets one `TASK_MEMORY_REVIEW` and decides whether the peak was right
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use tracing::{info, warn};
 
 use crate::config::MemoryConfig;
 use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::memory::{Gauge, Gib, MemPeak, MemoryWait, Room};
+use crate::memory::{Claim, ClaimOwner, Gauge, Gib, MemPeak, MemoryReview, MemoryWait, Room};
 use crate::queue::JobId;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
 
@@ -35,13 +41,26 @@ pub(crate) const MEMORY_NAME: &str = "homebased.memory";
 // release passes instead
 const GRANT_BOUND: Duration = Duration::from_secs(120);
 
-/// The bar, the gauge, and whether command tasks must declare a peak, fixed
-/// for the daemon's life
+/// How long one running task's unallocated peak must alone keep the first
+/// waiting task from starting before its owner is asked to review the peak
+///
+/// Long enough that a task still loading or between phases is not flagged,
+/// and short against the hour or more an overstated peak can hold others back
+const REVIEW_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Seconds instead of [`REVIEW_AFTER`], so integration tests see a review
+/// without waiting minutes
+const REVIEW_SECS_ENV: &str = "HOMEBASED_TEST_MEMORY_REVIEW_SECS";
+
+/// The bar, the gauge, whether command tasks must declare a peak, and how
+/// long a running task may keep the first waiting task out before its owner
+/// reviews its peak, fixed for the daemon's life
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryLimits {
     bar: u64,
     gauge: Gauge,
     require_peak: bool,
+    review_after: Duration,
 }
 
 impl MemoryLimits {
@@ -51,6 +70,10 @@ impl MemoryLimits {
             bar: config.bar,
             gauge: Gauge::new(config.cgroup.clone()),
             require_peak: config.require_peak,
+            review_after: std::env::var(REVIEW_SECS_ENV)
+                .ok()
+                .and_then(|seconds| seconds.trim().parse().ok())
+                .map_or(REVIEW_AFTER, Duration::from_secs),
         }
     }
 
@@ -172,12 +195,60 @@ pub(crate) struct MemoryArgs {
 /// The memory admission actor
 pub(crate) struct MemoryActor;
 
-/// Grants and wait reasons; both are rebuilt by the next passes after a restart
+/// Grants, wait reasons, and the running tasks keeping the first waiting
+/// task out; all are rebuilt by the next passes after a restart
 pub(crate) struct MemoryState {
     args: MemoryArgs,
     grants: HashMap<Grant, (MemPeak, Instant)>,
     job_waits: BTreeMap<JobId, MemoryWait>,
     task_waits: HashMap<TaskId, MemoryWait>,
+    /// Since when each running task has alone kept the first waiting task,
+    /// named here, out; a new first waiting task starts the time again
+    blocking: HashMap<TaskId, (TaskId, Instant)>,
+    /// Tasks whose review the store already answered for, so a pass does not
+    /// ask it again each second; the store keeps the durable once-only mark
+    reviewed: HashSet<TaskId>,
+}
+
+/// A running task's share of what started work holds
+#[derive(Debug, Clone, Copy)]
+struct Holding {
+    task: TaskId,
+    peak: MemPeak,
+    /// Bytes its process tree held at the measurement
+    held: u64,
+}
+
+impl Holding {
+    /// The running tasks among `claims` whose process has spawned, with what
+    /// each held; a claim without a process holds its whole peak only until
+    /// its spawn, which is no reason to review it
+    fn running(claims: &[Claim], held: &[u64]) -> Vec<Self> {
+        claims
+            .iter()
+            .zip(held)
+            .filter_map(|(claim, held)| match (claim.owner, claim.root) {
+                (ClaimOwner::Task(task), Some(_)) => Some(Self {
+                    task,
+                    peak: claim.peak,
+                    held: *held,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The part of its peak it has not allocated
+    fn unallocated(self) -> u64 {
+        self.peak.bytes().saturating_sub(self.held)
+    }
+}
+
+/// The first ready task refused for room, with the room it saw
+struct HeadWait {
+    task: TaskId,
+    peak: MemPeak,
+    room: Room,
 }
 
 impl Actor for MemoryActor {
@@ -195,6 +266,8 @@ impl Actor for MemoryActor {
             grants: HashMap::new(),
             job_waits: BTreeMap::new(),
             task_waits: HashMap::new(),
+            blocking: HashMap::new(),
+            reviewed: HashSet::new(),
         })
     }
 
@@ -205,7 +278,9 @@ impl Actor for MemoryActor {
         state: &mut MemoryState,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            MemoryMsg::JobRoom { reply } => send_reply(reply, state.room().await),
+            MemoryMsg::JobRoom { reply } => {
+                send_reply(reply, state.room().await.map(|(room, _)| room));
+            }
             MemoryMsg::GrantJob {
                 job,
                 peak,
@@ -216,7 +291,7 @@ impl Actor for MemoryActor {
             }
             MemoryMsg::JobsWaiting { waits } => state.job_waits = waits,
             MemoryMsg::AdmitTasks { ready, reply } => {
-                send_reply(reply, state.admit_tasks(ready).await);
+                send_reply(reply, state.admit_tasks(ready, Instant::now()).await);
             }
             MemoryMsg::Settle { grant } => {
                 state.grants.remove(&grant);
@@ -231,10 +306,11 @@ impl Actor for MemoryActor {
 }
 
 impl MemoryState {
-    /// The room under the bar, after started work and live grants
+    /// The room under the bar, after started work and live grants, and what
+    /// each running task held
     ///
     /// Blocking procfs and cgroupfs reads, each a few files
-    async fn room(&mut self) -> Result<Room, AppError> {
+    async fn room(&mut self) -> Result<(Room, Vec<Holding>), AppError> {
         let machine = self.args.machine;
         let claims = call(&self.args.store, |reply| StoreMsg::MemoryClaims {
             machine,
@@ -242,9 +318,12 @@ impl MemoryState {
         })
         .await?;
         let limits = &self.args.limits;
-        let mut room = match limits.gauge.measure(&claims) {
-            Ok(usage) => Room::new(limits.bar, usage.used, usage.outstanding),
-            Err(error) => Room::Unreadable { error },
+        let (mut room, holdings) = match limits.gauge.measure(&claims) {
+            Ok(usage) => (
+                Room::new(limits.bar, usage.used, usage.outstanding),
+                Holding::running(&claims, &usage.held),
+            ),
+            Err(error) => (Room::Unreadable { error }, Vec::new()),
         };
         // a task grant ends only by a settle or the next release pass, which
         // drops it once the task is no longer ready; a timed-out launch may
@@ -254,7 +333,7 @@ impl MemoryState {
             Grant::Task(_) => true,
         });
         room.reserve(self.grants.values().map(|(peak, _)| peak.bytes()).sum());
-        Ok(room)
+        Ok((room, holdings))
     }
 
     async fn grant_job(
@@ -263,7 +342,7 @@ impl MemoryState {
         peak: MemPeak,
         held_back: u64,
     ) -> Result<Result<(), MemoryWait>, AppError> {
-        let mut room = self.room().await?;
+        let (mut room, _) = self.room().await?;
         room.reserve(held_back);
         let granted = room.admit(peak);
         if granted.is_ok() {
@@ -272,7 +351,11 @@ impl MemoryState {
         Ok(granted)
     }
 
-    async fn admit_tasks(&mut self, ready: Vec<TaskCandidate>) -> Result<Vec<TaskId>, AppError> {
+    async fn admit_tasks(
+        &mut self,
+        ready: Vec<TaskCandidate>,
+        now: Instant,
+    ) -> Result<Vec<TaskId>, AppError> {
         // a task grant outlives its pass only when its launch timed out and may
         // still run. Its row and its released route commit in one transaction,
         // so a task no longer in `ready` holds a claim or never will, and its
@@ -286,8 +369,11 @@ impl MemoryState {
         });
         let mut waits = HashMap::new();
         let mut admitted = Vec::new();
+        let mut head = None;
+        let mut holdings = Vec::new();
         if !ready.is_empty() {
-            let mut room = self.room().await?;
+            let (mut room, held) = self.room().await?;
+            holdings = held;
             room.reserve(self.job_waits.values().map(reserved_bytes).sum());
             for candidate in ready {
                 // a pending launch's grant is already in the room, and its
@@ -302,6 +388,7 @@ impl MemoryState {
                     room.reserve(candidate.peak.bytes());
                     continue;
                 }
+                let before = head.is_none().then(|| room.clone());
                 match room.admit(candidate.peak) {
                     Ok(()) => {
                         let grant = (candidate.peak, Instant::now());
@@ -309,13 +396,93 @@ impl MemoryState {
                         admitted.push(candidate.task);
                     }
                     Err(wait) => {
+                        if let Some(room) = before {
+                            head = Some(HeadWait {
+                                task: candidate.task,
+                                peak: candidate.peak,
+                                room,
+                            });
+                        }
                         waits.insert(candidate.task, wait);
                     }
                 }
             }
         }
         self.task_waits = waits;
+        self.review_blockers(head.as_ref(), &holdings, now).await;
         Ok(admitted)
+    }
+
+    /// Track the running tasks whose unallocated peak alone keeps `head` out,
+    /// and ask the owner of each one that has for the review delay to review
+    /// its peak
+    ///
+    /// Only the first refused task counts: every task behind it waits for it
+    /// anyway. A blocker must free enough by itself, with the work ahead of the
+    /// head still counted, so a task is never flagged for a wait that ending
+    /// it would not have ended
+    async fn review_blockers(
+        &mut self,
+        head: Option<&HeadWait>,
+        holdings: &[Holding],
+        now: Instant,
+    ) {
+        let blockers: Vec<Holding> = head.map_or_else(Vec::new, |head| {
+            holdings
+                .iter()
+                .copied()
+                .filter(|holding| head.room.fits_after(head.peak, holding.unallocated()))
+                .collect()
+        });
+        self.blocking
+            .retain(|task, _| blockers.iter().any(|holding| holding.task == *task));
+        self.reviewed
+            .retain(|task| holdings.iter().any(|holding| holding.task == *task));
+        let Some(head) = head else {
+            return;
+        };
+
+        for holding in blockers {
+            let entry = self
+                .blocking
+                .entry(holding.task)
+                .or_insert((head.task, now));
+            if entry.0 != head.task {
+                *entry = (head.task, now);
+            }
+            let blocked = now.saturating_duration_since(entry.1);
+            if blocked < self.args.limits.review_after || self.reviewed.contains(&holding.task) {
+                continue;
+            }
+            let review = MemoryReview {
+                mem_peak: holding.peak,
+                held_bytes: holding.held,
+                waiting_task: head.task,
+                waiting_peak: head.peak,
+                blocked_secs: blocked.as_secs(),
+            };
+            let task = holding.task;
+            match call(&self.args.store, |reply| StoreMsg::ProduceMemoryReview {
+                id: task,
+                review,
+                reply,
+            })
+            .await
+            {
+                Ok(produced) => {
+                    if produced {
+                        info!(
+                            "Asked for a memory peak review task={task} peak={} held={} waiting={}",
+                            holding.peak,
+                            Gib(holding.held),
+                            head.task
+                        );
+                    }
+                    self.reviewed.insert(task);
+                }
+                Err(error) => warn!("memory review of task={task}: {error}"),
+            }
+        }
     }
 }
 
@@ -336,7 +503,7 @@ mod tests {
     use ractor::Actor;
     use tempfile::tempdir;
 
-    use super::{MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg, TaskCandidate};
+    use super::{MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg, REVIEW_AFTER, TaskCandidate};
     use crate::daemon::actors::{StoreActor, call};
     use crate::domain::TaskId;
     use crate::machine::MachineId;
@@ -370,6 +537,7 @@ mod tests {
                     bar: 10 * GIB,
                     gauge: Gauge::new(Some(cgroup)),
                     require_peak: false,
+                    review_after: REVIEW_AFTER,
                 },
                 store,
                 machine: MachineId::new(),

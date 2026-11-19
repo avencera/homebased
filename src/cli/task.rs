@@ -84,9 +84,11 @@ pub enum TaskCommand {
         /// `CUDA_VISIBLE_DEVICES` empty; GPU work belongs in the GPU queue
         #[arg(long)]
         gpu_visible: bool,
-        /// Peak host memory in GiB, such as `17` or `2.5`. Holds the task until
+        /// Peak host memory in GiB, such as `17` or `2.5`: the most the task
+        /// will hold, not a cap it sets on itself. Holds the task until
         /// memory in use, plus room promised to work started or waiting ahead
-        /// of it, plus this peak, fits under the memory bar (default 40 GiB)
+        /// of it, plus this peak, fits under the memory bar (default 40 GiB).
+        /// A started task keeps this room until it ends
         #[arg(long, value_name = "GIB")]
         mem_peak: Option<MemPeak>,
         /// Level among tasks waiting for memory: high, medium (default) or low.

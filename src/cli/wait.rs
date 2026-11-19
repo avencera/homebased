@@ -314,7 +314,7 @@ async fn sleep(client: &Client, thread: ThreadId, ids: &WaitIds) -> Result<ExitC
     }
     if response.holds_any() {
         eprintln!(
-            "homebased wait: end the turn now. The daemon wakes this thread with each held target's final event, which lists the progress events it held under `held_events`, or with an alert: JOB_ATTENTION, JOB_BLOCKED, TASK_CHECK_DUE, JOB_CHECK_DUE, or the first JOB_GPU_IDLE of an idle episode. After an alert the hold stays, so end the turn again without starting another wait"
+            "homebased wait: end the turn now. The daemon wakes this thread with each held target's final event, which lists the progress events it held under `held_events`, or with an alert: JOB_ATTENTION, JOB_BLOCKED, TASK_CHECK_DUE, TASK_MEMORY_REVIEW, JOB_CHECK_DUE, or the first JOB_GPU_IDLE of an idle episode. After an alert the hold stays, so end the turn again without starting another wait"
         );
     } else {
         eprintln!("homebased wait: every target already ended, so nothing is held");
