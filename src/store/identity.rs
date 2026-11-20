@@ -443,11 +443,17 @@ impl Store {
         Ok(route)
     }
 
-    /// Find unresolved origin routes for one startup recovery pass
+    /// Find origin routes whose executor has not yet given a definitive answer
     pub fn unknown_origin_routes(&self) -> Result<Vec<OriginRoute>, IdentityError> {
+        // the daemon rescans every minute, so skip decoding settled routes
         let mut statement = self
             .conn
-            .prepare("SELECT request_id,task_id,route_json FROM origin_routes ORDER BY request_id")
+            .prepare(
+                "SELECT request_id,task_id,route_json FROM origin_routes
+                 WHERE json_valid(route_json)
+                   AND json_extract(route_json, '$.submission.type') = 'acceptance_unknown'
+                 ORDER BY request_id",
+            )
             .map_err(storage)?;
         let rows = statement
             .query_map([], |row| {

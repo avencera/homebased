@@ -1161,7 +1161,9 @@ the dashboard is enabled, `daemon status` reports its URL.
 
 Errors with `--json` use the versioned error envelope. For example,
 `submission_outcome_unknown` means the executor may have accepted the task. Use
-the same `--request-id` to resolve or retry. `cluster_lookup_incomplete` means
+the same `--request-id` to resolve or retry. Without a retry, the origin daemon
+asks the executor again about once a minute and saves its answer, so the task
+stops counting as open work once the executor answers. `cluster_lookup_incomplete` means
 one or more known peers could not be checked. Retry the lookup; the daemon only
 returns `task_not_found` after every machine in the current known Fleet gives a
 definitive negative result.

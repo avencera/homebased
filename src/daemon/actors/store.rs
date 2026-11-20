@@ -542,7 +542,7 @@ pub(crate) enum StoreMsg {
         request: RequestId,
         reply: RpcReplyPort<Result<Option<OriginRoute>, AppError>>,
     },
-    /// Find unresolved origin routes after a daemon restart
+    /// Find origin routes whose executor has not yet given a definitive answer
     UnknownOriginRoutes {
         reply: RpcReplyPort<Result<Vec<OriginRoute>, AppError>>,
     },

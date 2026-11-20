@@ -215,7 +215,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let watch_events = tokio::spawn(event_sender::watches::run(state.clone()));
     let service_events = tokio::spawn(event_sender::services::run(state.clone()));
     let service_liveness = tokio::spawn(service_api::run(state.clone()));
-    let recovery = tokio::spawn(origin_submit::recover(state.clone()));
+    let recovery = tokio::spawn(origin_submit::run(state.clone()));
     let dependency_release = tokio::spawn(dependencies::run(state.clone()));
     let cancellation = tokio::spawn(cancel_delivery::run(state.clone()));
     let lease_guard = tokio::spawn(lease_guard::run(

@@ -1,11 +1,12 @@
 //! Origin-owned remote submission and unknown-acceptance resolution
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 
 use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, SupervisorMsg, call};
@@ -420,8 +421,49 @@ async fn reconcile(state: &AppState, route: OriginRoute) -> Result<(TaskId, Task
     resolve_identity(state, route, found.identity).await
 }
 
-/// Resolve routes left unknown by a prior daemon process without resending them
-pub(super) async fn recover(state: AppState) {
+/// How often unresolved remote submissions are checked again, and how old a
+/// route must be before a check after startup touches it
+///
+/// The age gives the caller's own retry the first answer to a lost reply
+const UNKNOWN_RECHECK: Duration = Duration::from_secs(60);
+
+/// Seconds to use instead of [`UNKNOWN_RECHECK`], so integration tests see a
+/// recheck without waiting a minute
+const UNKNOWN_RECHECK_SECS_ENV: &str = "HOMEBASED_TEST_UNKNOWN_RECHECK_SECS";
+
+/// Resolve routes whose acceptance is unknown, for as long as the daemon runs
+///
+/// A send that fails after its route was saved leaves the route unknown, and
+/// it owes its thread events until the executor answers. The first pass, at
+/// startup, takes every such route, since no send of a prior process can still
+/// be in flight. Later passes take routes older than [`UNKNOWN_RECHECK`], so a
+/// lost reply resolves without a caller retry or a daemon restart, including a
+/// submission cancelled on its executor before it arrived. Neither resends the
+/// task: an executor without its identity abandons it
+pub(super) async fn run(state: AppState) {
+    let recheck = std::env::var(UNKNOWN_RECHECK_SECS_ENV)
+        .ok()
+        .and_then(|seconds| seconds.trim().parse().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(UNKNOWN_RECHECK, Duration::from_secs);
+    let mut reported: HashSet<TaskId> = HashSet::new();
+    let mut min_age = chrono::Duration::zero();
+    loop {
+        recheck_unknown(&state, min_age, &mut reported).await;
+        min_age = chrono::Duration::from_std(recheck).unwrap_or(chrono::Duration::MAX);
+        tokio::time::sleep(recheck).await;
+    }
+}
+
+/// Reconcile each unknown route older than `min_age` once
+///
+/// `reported` keeps an executor that stays offline for days from logging a
+/// warning every pass
+async fn recheck_unknown(
+    state: &AppState,
+    min_age: chrono::Duration,
+    reported: &mut HashSet<TaskId>,
+) {
     let routes = match call(&state.store, |reply| StoreMsg::UnknownOriginRoutes {
         reply,
     })
@@ -433,13 +475,46 @@ pub(super) async fn recover(state: AppState) {
             return;
         }
     };
+    let cutoff = chrono::Utc::now() - min_age;
+    reported.retain(|task| routes.iter().any(|route| route.task == *task));
     for route in routes {
-        if let Err(error) = reconcile(&state, route).await
-            && !is_definite_rejection(&error)
-        {
-            warn!("origin submission recovery: {error}");
+        if route.last_updated_at > cutoff {
+            continue;
+        }
+        let task = route.task;
+        match recheck_route(state, route).await {
+            Err(error) if !is_definite_rejection(&error) => {
+                if reported.insert(task) {
+                    warn!(%task, "origin submission recovery: {error}");
+                } else {
+                    debug!(%task, "origin submission recovery: {error}");
+                }
+            }
+            _ => {
+                reported.remove(&task);
+            }
         }
     }
+}
+
+/// Reconcile one route under its request lock, unless it resolved meanwhile
+///
+/// The lock waits out a submit or retry of the same request that is still
+/// sending, which resolves the route itself
+async fn recheck_route(state: &AppState, route: OriginRoute) -> Result<(), AppError> {
+    let _request_guard = state.locks.origin_submissions.lock(route.request).await;
+    let current = call(&state.store, |reply| StoreMsg::OriginRouteByRequest {
+        request: route.request,
+        reply,
+    })
+    .await?;
+    let Some(route) = current else {
+        return Ok(());
+    };
+    if !matches!(route.submission, SubmissionState::AcceptanceUnknown) {
+        return Ok(());
+    }
+    reconcile(state, route).await.map(|_| ())
 }
 
 async fn resolve_identity(

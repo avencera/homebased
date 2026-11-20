@@ -9,7 +9,7 @@ use homebased::domain::{ProcessStatus, TaskId};
 use homebased::fleet::http::ClusterClient;
 use homebased::fleet::protocol::CLUSTER_PROTOCOL_VERSION;
 use homebased::store::Store;
-use homebased::submission::{ExecutionRecord, RequestId};
+use homebased::submission::{ExecutionRecord, RequestId, SubmissionState};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,44 @@ async fn cancellation_before_acceptance_prevents_delayed_submit() {
         "cancelled_before_acceptance"
     );
     assert!(!executor.home.join("tasks").join(task.to_string()).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_origin_resolves_a_submission_its_executor_cancelled_before_arrival() {
+    // a send that never arrived leaves the route unknown; a cancellation on the
+    // executor then refuses the task, and the origin must learn that without a
+    // restart or a caller retry, or the route keeps its thread from reporting
+    let origin = Daemon::start_with_env(
+        "unknown-origin",
+        true,
+        &[("HOMEBASED_TEST_UNKNOWN_RECHECK_SECS", "1")],
+    );
+    let executor = Daemon::start("unknown-executor", true);
+    add_peer(&origin, &executor);
+    let task = TaskId::new();
+    let (status, response) = post_cancel_wire(
+        &executor,
+        cancel_identity(&executor, &origin, &executor, task),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(
+        response["receipt"]["state"]["state"],
+        "prevented_before_start"
+    );
+
+    let spec = remote_spec(&executor, vec!["/bin/echo", "never-sent"]);
+    let request = seed_origin_route(&origin, &executor, task, &spec);
+    let store = || Store::open(&origin.home.join(homebased::home::DB_NAME)).unwrap();
+    assert_eq!(store().owed_targets().unwrap().len(), 1);
+
+    assert!(wait_until(Duration::from_secs(10), || {
+        matches!(
+            store().origin_route_by_request(request).unwrap().unwrap().submission,
+            SubmissionState::Rejected { ref reason } if reason == "cancelled_before_acceptance"
+        )
+    }));
+    assert!(store().owed_targets().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

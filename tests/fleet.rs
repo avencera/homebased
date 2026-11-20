@@ -34,6 +34,8 @@ struct Daemon {
     listen_host: String,
     mdns: bool,
     codex_override: Option<PathBuf>,
+    /// Extra environment for the daemon and its CLI calls, such as test intervals
+    env: Vec<(String, String)>,
     child: Option<Child>,
 }
 
@@ -42,7 +44,16 @@ impl Daemon {
         Self::start_on(name, fleet, false, "127.0.0.1")
     }
 
+    /// Start a daemon whose environment also has `env`
+    fn start_with_env(name: &str, fleet: bool, env: &[(&str, &str)]) -> Self {
+        Self::start_full(name, fleet, false, "127.0.0.1", env)
+    }
+
     fn start_on(name: &str, fleet: bool, mdns: bool, host: &str) -> Self {
+        Self::start_full(name, fleet, mdns, host, &[])
+    }
+
+    fn start_full(name: &str, fleet: bool, mdns: bool, host: &str, env: &[(&str, &str)]) -> Self {
         let dir = TempDir::new().unwrap();
         let home = dir.path().join("state");
         let user_home = dir.path().join("user-home");
@@ -62,6 +73,10 @@ impl Daemon {
             // submit resolves `codex` for the callback even when no test reads
             // the callback, and CI hosts have no `codex`, so default to a no-op
             codex_override: Some(PathBuf::from("/usr/bin/true")),
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
             child: None,
         };
         daemon.write_config(name, fleet);
@@ -93,6 +108,7 @@ impl Daemon {
         if let Some(codex) = &self.codex_override {
             cmd.env("HOMEBASED_CODEX", codex);
         }
+        cmd.envs(self.env.iter().map(|(key, value)| (key, value)));
         cmd
     }
 
