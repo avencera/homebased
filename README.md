@@ -1194,7 +1194,7 @@ the output went.
 [retention]
 enabled = true       # false: prune only with `homebased gc`
 interval = "6h"
-min_age = "1d"       # nothing younger is pruned, not even over a size limit
+min_age = "3d"       # nothing younger is pruned, not even over a size limit
 
 [retention.tasks]
 max_age = "14d"
@@ -1211,7 +1211,9 @@ max_age = "7d"       # slot clones; the next CI job on the slot clones again
 
 Each `max_size_gib` is a ceiling on that kind's total size on disk. While a
 kind is over it, its oldest ended output at least `min_age` old is pruned too.
-Every `max_age` must be at least `min_age`.
+`min_age` must be at least 3 days, the longest an event waits for its thread,
+so a late final event never names output that is gone, and every `max_age` must
+be at least `min_age`.
 
 Run a pass now with `homebased gc`:
 

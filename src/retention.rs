@@ -60,7 +60,8 @@ pub struct RetentionConfig {
     #[serde(with = "humantime_serde")]
     pub interval: Option<Duration>,
     /// Ended output younger than this is never pruned, not even over a size
-    /// limit, so a thread that just got a final event can still read it
+    /// limit, so a thread that gets a final event late can still read it; at
+    /// least [`MIN_AGE_FLOOR`]
     #[serde(with = "humantime_serde")]
     pub min_age: Duration,
     /// Task directories: `tasks/<id>`, which hold `output.log` and the
@@ -76,11 +77,24 @@ pub struct RetentionConfig {
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The lowest `min_age` a config may set: the longest an event may wait for
+/// its thread, so no final event, here or at the origin of work this machine
+/// ran, is ever delivered after the output its `evidence` names is gone
+pub const MIN_AGE_FLOOR: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+const _: () = assert!(
+    MIN_AGE_FLOOR.as_secs()
+        == crate::events::THREAD_WAIT_LIMIT
+            .num_seconds()
+            .unsigned_abs(),
+    "the min_age floor follows the event delivery limit"
+);
+
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             interval: Some(Duration::from_secs(6 * 60 * 60)),
-            min_age: DAY,
+            min_age: MIN_AGE_FLOOR,
             tasks: RecordRule {
                 limits: Limits {
                     max_age: 14 * DAY,

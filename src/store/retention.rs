@@ -185,20 +185,23 @@ impl Store {
     /// A run is reserved on its slot in a write transaction before its clone
     /// is created or entered, so holding the write lock while the slot is seen
     /// idle and the clone is renamed means no run can be inside the clone. A
-    /// run reserved after the rename creates a fresh clone. Returns whether the
-    /// clone moved
+    /// run reserved after the rename creates a fresh clone. A run that came
+    /// and went after the pass dated the clone at `last_use` used it again, so
+    /// it keeps the clone too. Returns whether the clone moved
     pub(crate) fn retire_slot_clone(
         &self,
         lane: &str,
         clone: &Path,
+        last_use: DateTime<Utc>,
         trash: &Path,
     ) -> Result<bool, AppError> {
         self.immediate(|| {
             let busy: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM resources
                      WHERE name = ?1 AND ci_class IS NOT NULL AND run_task IS NOT NULL)
-                 OR EXISTS (SELECT 1 FROM tasks WHERE cwd = ?2 AND status IN ('queued', 'running'))",
-                params![lane, clone.to_string_lossy()],
+                 OR EXISTS (SELECT 1 FROM tasks WHERE cwd = ?2
+                     AND (status IN ('queued', 'running') OR updated_at > ?3))",
+                params![lane, clone.to_string_lossy(), fmt_time(last_use)],
                 |row| row.get(0),
             )?;
             if busy {

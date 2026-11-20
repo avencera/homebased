@@ -165,8 +165,12 @@ fn remove(store: &Store, entry: &Entry, trash: &Path) -> Result<bool, AppError> 
         disk::remove(&entry.path)?;
         return Ok(true);
     };
+    // only an ended clone gets a prune verdict
+    let EntryState::Ended { at: last_use, .. } = entry.state else {
+        return Ok(false);
+    };
     let moved = trash.join(trash_name(&entry.path));
-    if !store.retire_slot_clone(lane, &entry.path, &moved)? {
+    if !store.retire_slot_clone(lane, &entry.path, last_use, &moved)? {
         return Ok(false);
     }
     disk::remove(&moved)?;

@@ -339,6 +339,12 @@ impl RawRetention {
         if let Some(raw) = self.min_age {
             config.min_age = positive_duration("retention.min_age", &raw)?;
         }
+        if config.min_age < crate::retention::MIN_AGE_FLOOR {
+            return Err(format!(
+                "retention.min_age must be at least {}, the longest an event waits for its thread",
+                humantime::format_duration(crate::retention::MIN_AGE_FLOOR)
+            ));
+        }
         self.tasks.apply("retention.tasks", &mut config.tasks)?;
         self.jobs.apply("retention.jobs", &mut config.jobs)?;
         self.ci.apply("retention.ci", &mut config.ci)?;
@@ -874,14 +880,14 @@ mod tests {
         use std::time::Duration;
 
         let config = Config::parse(
-            "[retention]\nenabled = false\nmin_age = \"2d\"\n\
+            "[retention]\nenabled = false\nmin_age = \"4d\"\n\
              [retention.tasks]\nmax_age = \"30d\"\nkeep_last = 0\n\
              [retention.ci]\nmax_size_gib = 5\n",
         )
         .unwrap();
         let retention = config.retention;
         assert_eq!(retention.interval, None);
-        assert_eq!(retention.min_age, Duration::from_secs(2 * 86_400));
+        assert_eq!(retention.min_age, Duration::from_secs(4 * 86_400));
         assert_eq!(
             retention.tasks.limits.max_age,
             Duration::from_secs(30 * 86_400)
@@ -894,7 +900,8 @@ mod tests {
         assert_eq!(retention.ci.max_size, Some(5 * 1024 * 1024 * 1024));
 
         for text in [
-            "[retention.jobs]\nmax_age = \"12h\"\n",
+            "[retention.jobs]\nmax_age = \"2d\"\n",
+            "[retention]\nmin_age = \"1d\"\n",
             "[retention.ci]\nmax_size_gib = 0\n",
             "[retention.tasks]\nmax_age = \"0s\"\n",
             "[retention.tasks]\nkeep = 2\n",

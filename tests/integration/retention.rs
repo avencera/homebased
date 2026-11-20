@@ -1,7 +1,9 @@
 //! `homebased gc` through the daemon: dry run, prune, and the tombstone that
 //! `task log` and `task show` report afterwards
 
-use super::Harness;
+use std::time::Duration;
+
+use super::{Harness, wait_until};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use serde_json::Value;
 
@@ -13,6 +15,21 @@ fn gc(h: &Harness, args: &[&str]) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Whether every event of `ids` is delivered and settled; until then
+/// retention counts a task as live, and settling may still touch its row
+fn settled(h: &Harness, ids: &[String]) -> bool {
+    let conn = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+    ids.iter().all(|id| {
+        conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM executor_outbox WHERE task_id = ?1 AND state = 'pending')
+                AND NOT EXISTS (SELECT 1 FROM origin_inbox WHERE task_id = ?1 AND settled_at IS NULL)",
+            [id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    })
 }
 
 fn backdate_end(h: &Harness, id: &str, days_ago: i64) {
@@ -37,6 +54,10 @@ fn gc_prunes_an_old_finished_task_beyond_keep_last_and_its_log_says_so() {
             id
         })
         .collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || settled(&h, &ids)),
+        "events never settled"
+    );
     for (offset, id) in ids.iter().enumerate() {
         backdate_end(&h, id, 30 - i64::try_from(offset).unwrap());
     }

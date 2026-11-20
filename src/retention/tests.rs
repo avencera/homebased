@@ -286,8 +286,7 @@ fn a_pass_prunes_only_ended_output_nothing_needs_and_tombstones_its_rows() {
 }
 
 #[test]
-fn chains_waiting_reports_open_jobs_and_a_submit_during_the_walk_keep_output_until_their_work_ends()
-{
+fn chains_waiting_reports_open_jobs_and_work_during_the_walk_keep_output_until_their_work_ends() {
     let fixture = Fixture::new();
     let mut config = RetentionConfig::default();
     config.tasks.keep_last = 0;
@@ -343,6 +342,15 @@ fn chains_waiting_reports_open_jobs_and_a_submit_during_the_walk_keep_output_unt
         ))
         .unwrap();
 
+    // a slot clone last used ten days ago, which a short run uses again
+    // during the walk
+    let clone = fixture
+        .checkouts()
+        .join("repo-0011223344556677")
+        .join("rust-1");
+    write_dated(&clone.join("target").join("lib.rlib"), 8192, days_ago(10));
+    fixture.task(Uuid::now_v7(), "succeeded", days_ago(10), &clone);
+
     // a dependent submitted on an old task after the pass read its facts
     let late = fixture.ended_task(thread, old);
     let dependent = Uuid::now_v7().to_string();
@@ -361,6 +369,7 @@ fn chains_waiting_reports_open_jobs_and_a_submit_during_the_walk_keep_output_unt
                     ],
                 )
                 .unwrap();
+            fixture.task(Uuid::now_v7(), "succeeded", Utc::now(), &clone);
         }
         false
     };
@@ -379,6 +388,7 @@ fn chains_waiting_reports_open_jobs_and_a_submit_during_the_walk_keep_output_unt
     for id in protected {
         assert!(fixture.task_dir(id).exists(), "{id} must be kept");
     }
+    assert!(clone.exists(), "a clone used during the walk must be kept");
     let store = Store::open(&fixture.home.db_path()).unwrap();
     assert!(
         store.pruned_at(OutputKind::Task, late).unwrap().is_none(),
@@ -442,10 +452,10 @@ fn a_size_limit_prunes_the_oldest_young_output_but_never_inside_min_age_or_keep_
     };
     let entries = vec![
         // newest of its thread, so kept whatever the size
-        ended(OutputKind::Job, 1, 2, 100),
         ended(OutputKind::Job, 1, 3, 100),
-        ended(OutputKind::Job, 1, 5, 100),
-        ended(OutputKind::Job, 2, 4, 100),
+        ended(OutputKind::Job, 1, 4, 100),
+        ended(OutputKind::Job, 1, 6, 100),
+        ended(OutputKind::Job, 2, 5, 100),
         // inside min_age
         Entry {
             state: EntryState::Ended {
