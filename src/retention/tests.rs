@@ -286,6 +286,122 @@ fn a_pass_prunes_only_ended_output_nothing_needs_and_tombstones_its_rows() {
 }
 
 #[test]
+fn chains_waiting_reports_open_jobs_and_a_submit_during_the_walk_keep_output_until_their_work_ends()
+{
+    let fixture = Fixture::new();
+    let mut config = RetentionConfig::default();
+    config.tasks.keep_last = 0;
+    let old = days_ago(20);
+    let thread = Uuid::now_v7();
+
+    // a running worker parked on an old task's result
+    let waited_on = fixture.ended_task(thread, old);
+    let reporter = fixture.task(thread, "running", old, Path::new("/tmp"));
+    fixture
+        .conn
+        .execute(
+            "INSERT INTO reports (task_id, seq, outcome, summary, reported_at, waiting_on, notes)
+             VALUES (?1, 1, 'waiting', 'parked', ?2, ?3, '')",
+            params![
+                reporter.to_string(),
+                stamp(Utc::now()),
+                format!("{{\"kind\":\"task\",\"id\":\"{waited_on}\"}}")
+            ],
+        )
+        .unwrap();
+
+    // an ended run of a chain whose next run is still going
+    let chain = Uuid::now_v7().to_string();
+    let earlier = fixture.ended_task(thread, old);
+    let later = fixture.task(thread, "running", old, Path::new("/tmp"));
+    fixture
+        .conn
+        .execute(
+            "INSERT INTO task_chains (id, state_json, updated_at) VALUES (?1, '{}', ?2)",
+            params![chain, stamp(Utc::now())],
+        )
+        .unwrap();
+    for (run, task) in [(1, earlier), (2, later)] {
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO chain_runs (task_id, chain_id, run_number) VALUES (?1, ?2, ?3)",
+                params![task.to_string(), chain, run],
+            )
+            .unwrap();
+    }
+
+    // a preempted run of a queue job that waits to run again
+    let job = fixture.job(thread, old);
+    let preempted = fixture.task(thread, "preempted", old, Path::new("/tmp"));
+    fixture
+        .conn
+        .execute_batch(&format!(
+            "UPDATE resource_jobs SET state = 'queued', position = 1, resume = 1 WHERE id = '{job}';
+             UPDATE tasks SET resource_job_id = '{job}', run_number = 1, step_index = 0
+                 WHERE id = '{preempted}';"
+        ))
+        .unwrap();
+
+    // a dependent submitted on an old task after the pass read its facts
+    let late = fixture.ended_task(thread, old);
+    let dependent = Uuid::now_v7().to_string();
+    let submitted = std::cell::Cell::new(false);
+    let submit_during_walk = || {
+        if !submitted.replace(true) {
+            fixture
+                .conn
+                .execute(
+                    "INSERT INTO origin_routes (request_id, task_id, route_json, after_json)
+                     VALUES (?1, ?2, '{}', ?3)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        dependent,
+                        format!("[\"{late}\"]")
+                    ],
+                )
+                .unwrap();
+        }
+        false
+    };
+
+    let protected = [waited_on, earlier, preempted, late];
+    let report = run_pass(
+        &fixture.home,
+        &fixture.checkouts(),
+        &config,
+        PassMode::Apply,
+        &submit_during_walk,
+    )
+    .unwrap();
+    assert!(submitted.get());
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    for id in protected {
+        assert!(fixture.task_dir(id).exists(), "{id} must be kept");
+    }
+    let store = Store::open(&fixture.home.db_path()).unwrap();
+    assert!(
+        store.pruned_at(OutputKind::Task, late).unwrap().is_none(),
+        "a kept entry gets no tombstone"
+    );
+
+    // once the work that needed them ends, they go
+    fixture
+        .conn
+        .execute_batch(&format!(
+            "UPDATE tasks SET status = 'succeeded' WHERE id IN ('{reporter}', '{later}');
+             UPDATE resource_jobs SET state = 'succeeded', position = NULL, resume = NULL WHERE id = '{job}';
+             UPDATE origin_routes SET outcome = 'succeeded' WHERE task_id = '{dependent}';"
+        ))
+        .unwrap();
+    fixture.pass(&config, PassMode::Apply);
+    for id in protected.into_iter().chain([reporter, later]) {
+        assert!(!fixture.task_dir(id).exists(), "{id} must be pruned");
+        assert!(store.pruned_at(OutputKind::Task, id).unwrap().is_some());
+    }
+}
+
+#[test]
 fn a_tombstoned_directory_left_by_an_interrupted_pass_is_removed_next_time() {
     let fixture = Fixture::new();
     let id = fixture.ended_task(Uuid::now_v7(), days_ago(1));

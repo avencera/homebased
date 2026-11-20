@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
+use uuid::Uuid;
 
 use super::disk;
 use super::inventory::{self, Roots};
@@ -105,14 +106,21 @@ fn apply(
         if stop() {
             break;
         }
+        let ids: Vec<Uuid> = batch
+            .iter()
+            .filter_map(|&index| entry_id(decided[index].0))
+            .collect();
         let tombstones: Vec<Tombstone> = batch
             .iter()
             .filter_map(|&index| tombstone(decided[index].0, decided[index].1))
             .collect();
-        store.save_tombstones(Utc::now(), &tombstones)?;
+        let needed = store.save_tombstones(Utc::now(), &ids, &tombstones)?;
 
         for &index in batch {
             let entry = decided[index].0;
+            if entry_id(entry).is_some_and(|id| needed.contains(&id)) {
+                continue;
+            }
             match remove(store, entry, trash) {
                 Ok(removed) => done[index] = removed,
                 Err(error) => failures.push(PruneFailure {
@@ -124,6 +132,14 @@ fn apply(
     }
 
     Ok(done)
+}
+
+/// The task or job id an entry's directory is named by; slot clones have none
+const fn entry_id(entry: &Entry) -> Option<Uuid> {
+    match entry.owner {
+        Owner::Record { id } | Owner::Delivery { id } => Some(id),
+        Owner::Unreferenced | Owner::Slot { .. } => None,
+    }
 }
 
 /// The tombstone a pruned task or job row gets; a leftover already has one,
@@ -238,7 +254,8 @@ fn kind_report(kind: OutputKind, decided: &[(&Entry, Verdict)], done: &[bool]) -
                 report.pruned += 1;
                 report.pruned_bytes += entry.bytes;
             }
-            // a prune that failed or lost its slot to a run stays on disk
+            // a prune that failed, lost its slot to a run, or that new work came
+            // to need stays on disk
             Verdict::Prune(_) => {}
             Verdict::Keep(KeepReason::Live { .. }) => report.kept_live += 1,
             Verdict::Keep(KeepReason::Recent) => report.kept_recent += 1,

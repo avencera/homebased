@@ -80,9 +80,16 @@ impl RetentionFacts {
     pub(crate) fn needed(&self, id: Uuid) -> Option<LiveReason> {
         self.needed.get(&id).copied()
     }
+}
 
+/// Ended tasks and jobs that open work still needs, with the first reason
+/// found
+#[derive(Debug, Default)]
+struct Needs(HashMap<Uuid, LiveReason>);
+
+impl Needs {
     fn need(&mut self, id: Uuid, reason: LiveReason) {
-        self.needed.entry(id).or_insert(reason);
+        self.0.entry(id).or_insert(reason);
     }
 }
 
@@ -115,7 +122,15 @@ impl Store {
         facts
     }
 
-    /// Save tombstones for prunes about to happen, in one transaction
+    /// Recheck what open work needs, then save tombstones for prunes about to
+    /// happen, in one write transaction
+    ///
+    /// A pass plans from facts read before it walks the disk, so work submitted
+    /// during the walk, such as an `after` dependent of an old task, may need
+    /// an entry the plan prunes. Rechecking under the write lock leaves only the
+    /// removal itself for such a submit to race. Returns the ids among `ids`
+    /// that something needs now; their entries must be kept, and get no
+    /// tombstone
     ///
     /// A tombstone is saved before its files are removed, so a crash between
     /// the two leaves a tombstone whose leftover files the next pass removes,
@@ -123,14 +138,23 @@ impl Store {
     pub(crate) fn save_tombstones(
         &self,
         now: DateTime<Utc>,
+        ids: &[Uuid],
         tombstones: &[Tombstone],
-    ) -> Result<(), AppError> {
+    ) -> Result<HashSet<Uuid>, AppError> {
         self.immediate(|| {
+            let jobs = job_facts(&self.conn)?;
+            let (_, needs) = needs(&self.conn, &jobs)?;
+            let kept: HashSet<Uuid> = ids
+                .iter()
+                .copied()
+                .filter(|id| needs.0.contains_key(id))
+                .collect();
+
             let mut insert = self.conn.prepare(
                 "INSERT OR IGNORE INTO pruned_outputs (kind, id, pruned_at, bytes, reason)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for tombstone in tombstones {
+            for tombstone in tombstones.iter().filter(|t| !kept.contains(&t.id)) {
                 insert.execute(params![
                     tombstone.kind.as_str(),
                     tombstone.id.to_string(),
@@ -139,7 +163,7 @@ impl Store {
                     tombstone.reason.as_str(),
                 ])?;
             }
-            Ok(())
+            Ok(kept)
         })
     }
 
@@ -218,24 +242,33 @@ impl Store {
 }
 
 fn read_facts(conn: &Connection, checkout_root: &Path) -> Result<RetentionFacts, AppError> {
-    let mut facts = RetentionFacts {
+    let jobs = job_facts(conn)?;
+    let (job_routes, needs) = needs(conn, &jobs)?;
+    Ok(RetentionFacts {
         tasks: task_facts(conn)?,
         task_routes: task_route_facts(conn)?,
         task_mentions: task_mentions(conn)?,
-        jobs: job_facts(conn)?,
-        job_routes: HashMap::new(),
-        needed: HashMap::new(),
+        jobs,
+        job_routes,
+        needed: needs.0,
         pruned: tombstones(conn)?,
         lanes: lane_facts(conn)?,
         clones: clone_uses(conn, checkout_root)?,
-    };
-    let (job_routes, route_after) = job_route_facts(conn, &facts.jobs)?;
-    facts.job_routes = job_routes;
+    })
+}
+
+/// Job route standings, and everything open work needs
+fn needs(
+    conn: &Connection,
+    jobs: &HashMap<Uuid, RecordFact>,
+) -> Result<(HashMap<Uuid, Standing>, Needs), AppError> {
+    let (job_routes, route_after) = job_route_facts(conn, jobs)?;
+    let mut needs = Needs::default();
     for id in route_after {
-        facts.need(id, LiveReason::Dependents);
+        needs.need(id, LiveReason::Dependents);
     }
-    needed_by_tasks(conn, &mut facts)?;
-    Ok(facts)
+    needed_by_tasks(conn, &mut needs)?;
+    Ok((job_routes, needs))
 }
 
 fn uuid(raw: &str) -> Result<Uuid, AppError> {
@@ -432,7 +465,7 @@ fn job_route_facts(
 }
 
 /// Mark what open tasks, chains, holds, and jobs still need
-fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), AppError> {
+fn needed_by_tasks(conn: &Connection, needs: &mut Needs) -> Result<(), AppError> {
     // `after` of every route whose task has not ended, held continuations too
     let mut statement = conn.prepare(
         "SELECT after_json FROM origin_routes WHERE outcome IS NULL AND after_json IS NOT NULL",
@@ -442,7 +475,7 @@ fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), 
         .collect::<Result<Vec<_>, _>>()?;
     for list in lists {
         for id in uuids_in(&serde_json::from_str(&list)?) {
-            facts.need(id, LiveReason::Dependents);
+            needs.need(id, LiveReason::Dependents);
         }
     }
 
@@ -459,7 +492,7 @@ fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), 
         .collect::<Result<Vec<_>, _>>()?;
     for target in targets {
         for id in uuids_in(&serde_json::from_str(&target)?) {
-            facts.need(id, LiveReason::Dependents);
+            needs.need(id, LiveReason::Dependents);
         }
     }
 
@@ -467,7 +500,7 @@ fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), 
         "SELECT task_id FROM chain_runs WHERE chain_id IN ({OPEN_CHAINS})"
     ))?;
     for id in column(&mut statement)? {
-        facts.need(id, LiveReason::OpenChain);
+        needs.need(id, LiveReason::OpenChain);
     }
 
     let mut statement = conn.prepare(
@@ -475,7 +508,7 @@ fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), 
          UNION SELECT parked_under FROM sleep_holds WHERE parked_under IS NOT NULL",
     )?;
     for id in column(&mut statement)? {
-        facts.need(id, LiveReason::SleepHold);
+        needs.need(id, LiveReason::SleepHold);
     }
 
     // earlier runs of a job that has not ended, such as a preempted attempt
@@ -484,7 +517,7 @@ fn needed_by_tasks(conn: &Connection, facts: &mut RetentionFacts) -> Result<(), 
          WHERE t.{TERMINAL_TASK} AND j.state IN ('queued', 'active')"
     ))?;
     for id in column(&mut statement)? {
-        facts.need(id, LiveReason::OpenJob);
+        needs.need(id, LiveReason::OpenJob);
     }
 
     Ok(())
