@@ -342,6 +342,17 @@ fn chains_waiting_reports_open_jobs_and_work_during_the_walk_keep_output_until_t
         ))
         .unwrap();
 
+    // a Claude worker whose usage the backfill has not read yet
+    let unread = fixture.ended_task(thread, old);
+    fixture
+        .conn
+        .execute(
+            "UPDATE tasks SET workload_json = '{\"type\":\"agent\",\"agent\":\"claude\"}'
+             WHERE id = ?1",
+            [unread.to_string()],
+        )
+        .unwrap();
+
     // a slot clone last used ten days ago, which a short run uses again
     // during the walk
     let clone = fixture
@@ -374,7 +385,7 @@ fn chains_waiting_reports_open_jobs_and_work_during_the_walk_keep_output_until_t
         false
     };
 
-    let protected = [waited_on, earlier, preempted, late];
+    let protected = [waited_on, earlier, preempted, unread, late];
     let report = run_pass(
         &fixture.home,
         &fixture.checkouts(),
@@ -396,12 +407,15 @@ fn chains_waiting_reports_open_jobs_and_work_during_the_walk_keep_output_until_t
     );
 
     // once the work that needed them ends, they go
+    let now = stamp(Utc::now());
     fixture
         .conn
         .execute_batch(&format!(
             "UPDATE tasks SET status = 'succeeded' WHERE id IN ('{reporter}', '{later}');
              UPDATE resource_jobs SET state = 'succeeded', position = NULL, resume = NULL WHERE id = '{job}';
-             UPDATE origin_routes SET outcome = 'succeeded' WHERE task_id = '{dependent}';"
+             UPDATE origin_routes SET outcome = 'succeeded' WHERE task_id = '{dependent}';
+             INSERT INTO task_usage (task_id, complete, turns, models_json, recorded_at)
+                 VALUES ('{unread}', 1, 1, '{{}}', '{now}');"
         ))
         .unwrap();
     fixture.pass(&config, PassMode::Apply);

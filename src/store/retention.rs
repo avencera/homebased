@@ -282,7 +282,12 @@ fn uuid(raw: &str) -> Result<Uuid, AppError> {
 
 fn task_facts(conn: &Connection) -> Result<HashMap<Uuid, RecordFact>, AppError> {
     let mut statement = conn.prepare(&format!(
-        "SELECT t.id, t.thread_id, t.{TERMINAL_TASK}, t.updated_at,
+        "SELECT t.id, t.thread_id, t.{TERMINAL_TASK},
+             MAX(t.updated_at,
+                 COALESCE((SELECT MAX(o.acknowledged_at) FROM executor_outbox o
+                     WHERE o.task_id = t.id), ''),
+                 COALESCE((SELECT MAX(i.settled_at) FROM origin_inbox i
+                     WHERE i.task_id = t.id), '')),
              EXISTS (SELECT 1 FROM executor_outbox o WHERE o.task_id = t.id AND o.state = 'pending')
              OR EXISTS (SELECT 1 FROM origin_inbox i WHERE i.task_id = t.id AND i.settled_at IS NULL)
          FROM tasks t"
@@ -304,7 +309,10 @@ fn task_facts(conn: &Connection) -> Result<HashMap<Uuid, RecordFact>, AppError> 
             let standing = match (ended, unsettled) {
                 (false, _) => Standing::Live(LiveReason::Running),
                 (true, true) => Standing::Live(LiveReason::UnsettledEvents),
-                // the terminal transition is the row's last status change
+                // dated by the later of the terminal transition and the last
+                // event settling: an origin acknowledges a remote event before
+                // it reaches the thread, and a thread notified late must find
+                // the evidence still there for `min_age`
                 (true, false) => Standing::Ended(parse_time(&updated)?),
             };
             Ok((
@@ -512,6 +520,19 @@ fn needed_by_tasks(conn: &Connection, needs: &mut Needs) -> Result<(), AppError>
     )?;
     for id in column(&mut statement)? {
         needs.need(id, LiveReason::SleepHold);
+    }
+
+    // Claude logs the usage backfill has not read yet; the same rule as
+    // `claude_tasks_without_usage`, which skips pruned tasks for good
+    let mut statement = conn.prepare(&format!(
+        "SELECT id FROM tasks
+         WHERE {TERMINAL_TASK}
+           AND json_extract(workload_json, '$.type') = 'agent'
+           AND json_extract(workload_json, '$.agent') = 'claude'
+           AND id NOT IN (SELECT task_id FROM task_usage)"
+    ))?;
+    for id in column(&mut statement)? {
+        needs.need(id, LiveReason::UsageUnread);
     }
 
     // earlier runs of a job that has not ended, such as a preempted attempt

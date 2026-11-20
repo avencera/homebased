@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::disk::{self, Usage};
@@ -163,31 +162,31 @@ fn unreferenced_state(path: &Path, usage: &Usage) -> EntryState {
     }
 }
 
-/// A slot clone, dated by its latest run, or by its own directory when no
-/// run row names it
+/// A slot clone, dated by its latest run
 ///
 /// A clone is not dated by its newest file: a later run's build can leave
 /// files whose times say nothing about use, and the runs already say when the
 /// slot last used it
 ///
 /// `ci.checkout_root` can be any directory, so only a directory shaped like a
-/// clone, under a remote's clone key, that a CI slot or a run names is an
-/// entry; anything else there is never touched
+/// clone, under a remote's clone key, whose path a run's `cwd` names is an
+/// entry; anything else there, such as a clone from a database this release
+/// never opens, is never touched
 fn clone_entry(facts: &RetentionFacts, lane: String, path: PathBuf) -> Option<Entry> {
-    let runs = facts.clones.get(&path);
+    let runs = facts.clones.get(&path)?;
     let remote = path.parent()?.file_name()?.to_str()?;
-    if !is_clone_key(remote) || (runs.is_none() && !facts.lanes.contains_key(&lane)) {
+    if !is_clone_key(remote) {
         return None;
     }
     let usage = disk::measure(&path).ok()?;
     let busy = facts.lanes.get(&lane).is_some_and(|fact| fact.busy);
-    let state = if busy || runs.is_some_and(|runs| runs.live) {
+    let state = if busy || runs.live {
         EntryState::Live {
             reason: LiveReason::SlotBusy,
         }
     } else {
         EntryState::Ended {
-            at: runs.map_or_else(|| own_mtime(&path), |runs| runs.last),
+            at: runs.last,
             thread: None,
         }
     };
@@ -199,12 +198,6 @@ fn clone_entry(facts: &RetentionFacts, lane: String, path: PathBuf) -> Option<En
         bytes: usage.bytes,
         state,
     })
-}
-
-fn own_mtime(path: &Path) -> DateTime<Utc> {
-    std::fs::symlink_metadata(path)
-        .and_then(|meta| meta.modified())
-        .map_or(DateTime::UNIX_EPOCH, DateTime::from)
 }
 
 /// Whether `name` has the `<segment>-<16 hex digits>` shape of a remote's

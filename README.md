@@ -1177,14 +1177,22 @@ checkpoint state all runs of a job share), and idle CI slot clones. It runs a
 pass 10 minutes after it starts and then every `retention.interval`.
 
 A pass prunes only output whose task or job has ended and whose events are
-delivered and settled. It keeps output that a task or job that has not ended
+delivered and settled. A task's age counts from the later of its end and its
+last event settling. It keeps output that a task or job that has not ended
 waits on with `after`, that a parked worker's report names, that belongs to a
-parked agent's chain or to an earlier run of a job that has not ended, or that
-`homebased wait --long` still holds. It also keeps the newest `keep_last`
-ended tasks and jobs of each thread, whatever their age. A CI clone is pruned
-only while its slot has no run, and its age counts from the slot's last run.
-A task directory that no record names, such as one an earlier release left, is
-dated by its newest file and kept while a worker holds its runner lock.
+parked agent's chain or to an earlier run of a job that has not ended, that
+`homebased wait --long` still holds, or that is a Claude worker's log whose
+usage has not been read yet. It also keeps the newest `keep_last` ended tasks
+and jobs of each thread, whatever their age. A CI clone is pruned only while
+its slot has no run and only if a run used it; its age counts from its last
+run. A task directory that no record names, such as one an earlier release
+left, is dated by its newest file and kept while a worker holds its runner
+lock.
+
+These protections read this machine's database only. Work that ran here for
+another machine is kept until its events are delivered there, but a task or
+parked worker on that machine that waits on it does not protect it, so keep
+`max_age` longer than such waits.
 
 A pruned task keeps its row, events, and reports. `task show` adds
 `output_pruned_at`, and `task log` fails with `output_pruned`, which says when

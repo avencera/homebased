@@ -211,6 +211,9 @@ pub enum LiveReason {
     Locked,
     /// Its CI slot has a run
     SlotBusy,
+    /// A Claude task whose token usage the daemon has not read from its log
+    /// yet; a pruned log's usage is lost for good
+    UsageUnread,
 }
 
 /// What the database and the directory say about one entry

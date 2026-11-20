@@ -36,10 +36,14 @@ fn backdate_end(h: &Harness, id: &str, days_ago: i64) {
     let at =
         (Utc::now() - ChronoDuration::days(days_ago)).to_rfc3339_opts(SecondsFormat::Millis, true);
     let conn = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
-    conn.execute(
-        "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
-        rusqlite::params![at, id],
-    )
+    // retention dates a task by its terminal transition or its last settled
+    // event, whichever is later
+    conn.execute_batch(&format!(
+        "UPDATE tasks SET updated_at = '{at}' WHERE id = '{id}';
+         UPDATE origin_inbox SET settled_at = '{at}' WHERE task_id = '{id}';
+         UPDATE executor_outbox SET acknowledged_at = '{at}'
+             WHERE task_id = '{id}' AND acknowledged_at IS NOT NULL;"
+    ))
     .unwrap();
 }
 
