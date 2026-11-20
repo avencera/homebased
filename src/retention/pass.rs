@@ -157,14 +157,20 @@ fn remove(store: &Store, entry: &Entry, trash: &Path) -> Result<bool, AppError> 
     Ok(true)
 }
 
-/// `<remote>--<lane>`, unique per clone, so two clones never meet in the trash
+/// `<remote>--<lane>--<nanoseconds>`, so neither two clones nor one clone
+/// retired again after a failed removal ever meet in the trash
 fn trash_name(clone: &Path) -> PathBuf {
     let name = |path: Option<&Path>| {
         path.and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
-    PathBuf::from(format!("{}--{}", name(clone.parent()), name(Some(clone))))
+    let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    PathBuf::from(format!(
+        "{}--{}--{stamp}",
+        name(clone.parent()),
+        name(Some(clone))
+    ))
 }
 
 fn report(

@@ -169,9 +169,17 @@ fn unreferenced_state(path: &Path, usage: &Usage) -> EntryState {
 /// A clone is not dated by its newest file: a later run's build can leave
 /// files whose times say nothing about use, and the runs already say when the
 /// slot last used it
+///
+/// `ci.checkout_root` can be any directory, so only a directory shaped like a
+/// clone, under a remote's clone key, that a CI slot or a run names is an
+/// entry; anything else there is never touched
 fn clone_entry(facts: &RetentionFacts, lane: String, path: PathBuf) -> Option<Entry> {
-    let usage = disk::measure(&path).ok()?;
     let runs = facts.clones.get(&path);
+    let remote = path.parent()?.file_name()?.to_str()?;
+    if !is_clone_key(remote) || (runs.is_none() && !facts.lanes.contains_key(&lane)) {
+        return None;
+    }
+    let usage = disk::measure(&path).ok()?;
     let busy = facts.lanes.get(&lane).is_some_and(|fact| fact.busy);
     let state = if busy || runs.is_some_and(|runs| runs.live) {
         EntryState::Live {
@@ -197,4 +205,14 @@ fn own_mtime(path: &Path) -> DateTime<Utc> {
     std::fs::symlink_metadata(path)
         .and_then(|meta| meta.modified())
         .map_or(DateTime::UNIX_EPOCH, DateTime::from)
+}
+
+/// Whether `name` has the `<segment>-<16 hex digits>` shape of a remote's
+/// clone key
+fn is_clone_key(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(segment, digest)| {
+        !segment.is_empty()
+            && digest.len() == 16
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }

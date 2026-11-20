@@ -17,7 +17,7 @@ mod pass;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -358,9 +358,9 @@ fn plan_kind(
 }
 
 /// Indices of the newest `keep_last` ended entries of each known thread
-fn recent_per_thread(entries: &[Entry], indices: &[usize], keep_last: u32) -> Vec<usize> {
+fn recent_per_thread(entries: &[Entry], indices: &[usize], keep_last: u32) -> HashSet<usize> {
     if keep_last == 0 {
-        return Vec::new();
+        return HashSet::new();
     }
     let mut by_thread: HashMap<ThreadId, Vec<(DateTime<Utc>, usize)>> = HashMap::new();
     for &index in indices {

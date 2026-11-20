@@ -33,6 +33,7 @@ const VACUUM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A `gc` request waiting for the retention task
 struct PassRequest {
     mode: PassMode,
+    vacuum: bool,
     reply: oneshot::Sender<Result<GcReport, AppError>>,
 }
 
@@ -53,13 +54,17 @@ impl Retention {
         (Self { config, requests }, PassRequests(receiver))
     }
 
-    async fn request(&self, mode: PassMode) -> Result<GcReport, AppError> {
+    async fn request(&self, mode: PassMode, vacuum: bool) -> Result<GcReport, AppError> {
         let (reply, answer) = oneshot::channel();
         let stopped = || AppError::Internal {
             message: "the retention task stopped".into(),
         };
         self.requests
-            .send(PassRequest { mode, reply })
+            .send(PassRequest {
+                mode,
+                vacuum,
+                reply,
+            })
             .await
             .map_err(|_| stopped())?;
         answer.await.map_err(|_| stopped())?
@@ -104,10 +109,8 @@ async fn gc(
     } else {
         PassMode::Apply
     };
-    let mut report = state.retention.request(mode).await?;
-    if request.vacuum && !request.dry_run {
-        report.database.vacuumed_bytes = Some(vacuum(&state).await?);
-    }
+    let vacuum = request.vacuum && !request.dry_run;
+    let report = state.retention.request(mode, vacuum).await?;
 
     Ok(Json(GcResponse {
         api_version: API_VERSION,
@@ -130,6 +133,20 @@ async fn pass(state: &AppState, mode: PassMode) -> Result<GcReport, AppError> {
     .map_err(|error| AppError::Internal {
         message: format!("retention pass: {error}"),
     })?
+}
+
+/// A requested pass, then its vacuum, both inside the retention task so no
+/// other pass opens the database while the vacuum holds it
+async fn requested(
+    state: &AppState,
+    mode: PassMode,
+    vacuum_after: bool,
+) -> Result<GcReport, AppError> {
+    let mut report = pass(state, mode).await?;
+    if vacuum_after {
+        report.database.vacuumed_bytes = Some(vacuum(state).await?);
+    }
+    Ok(report)
 }
 
 async fn vacuum(state: &AppState) -> Result<u64, AppError> {
@@ -164,7 +181,8 @@ pub(crate) async fn run(state: AppState, requests: PassRequests) {
             request = requests.recv() => {
                 let Some(request) = request else { return };
                 // the caller may have gone; its pass still counts
-                let _ = request.reply.send(pass(&state, request.mode).await);
+                let report = requested(&state, request.mode, request.vacuum).await;
+                let _ = request.reply.send(report);
             }
             () = due => {
                 match pass(&state, PassMode::Apply).await {
