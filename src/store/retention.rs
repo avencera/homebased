@@ -112,11 +112,11 @@ const TERMINAL_TASK: &str = "status NOT IN ('queued', 'running')";
 /// event settle after `?2`
 const CHANGED_SINCE: &str = "SELECT
     EXISTS (SELECT 1 FROM executor_outbox
-        WHERE task_id = ?1 AND (state = 'pending' OR acknowledged_at > ?2))
+        WHERE task_id = ?1 AND (state = 'pending' OR acknowledged_at >= ?2))
     OR EXISTS (SELECT 1 FROM origin_inbox
-        WHERE task_id = ?1 AND (settled_at IS NULL OR settled_at > ?2))
-    OR EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND updated_at > ?2)
-    OR EXISTS (SELECT 1 FROM resource_jobs WHERE id = ?1 AND updated_at > ?2)
+        WHERE task_id = ?1 AND (settled_at IS NULL OR settled_at >= ?2))
+    OR EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND updated_at >= ?2)
+    OR EXISTS (SELECT 1 FROM resource_jobs WHERE id = ?1 AND updated_at >= ?2)
     OR EXISTS (SELECT 1 FROM resource_job_routes
         WHERE job_id = ?1 AND settled_seq < accepted_seq)";
 
@@ -306,7 +306,11 @@ fn task_facts(conn: &Connection) -> Result<HashMap<Uuid, RecordFact>, AppError> 
              MAX(t.updated_at,
                  COALESCE((SELECT MAX(o.acknowledged_at) FROM executor_outbox o
                      WHERE o.task_id = t.id), ''),
+                 COALESCE((SELECT MAX(o.acknowledged_at) FROM executor_event_receipts o
+                     WHERE o.task_id = t.id), ''),
                  COALESCE((SELECT MAX(i.settled_at) FROM origin_inbox i
+                     WHERE i.task_id = t.id), ''),
+                 COALESCE((SELECT MAX(i.settled_at) FROM origin_event_receipts i
                      WHERE i.task_id = t.id), '')),
              EXISTS (SELECT 1 FROM executor_outbox o WHERE o.task_id = t.id AND o.state = 'pending')
              OR EXISTS (SELECT 1 FROM origin_inbox i WHERE i.task_id = t.id AND i.settled_at IS NULL)
@@ -332,7 +336,9 @@ fn task_facts(conn: &Connection) -> Result<HashMap<Uuid, RecordFact>, AppError> 
                 // dated by the later of the terminal transition and the last
                 // event settling: an origin acknowledges a remote event before
                 // it reaches the thread, and a thread notified late must find
-                // the evidence still there for `min_age`
+                // the evidence still there for `min_age`. Receipts keep the
+                // settle time once compaction removes the event row, so a
+                // `max_age` past the 30-day event retention still holds
                 (true, false) => Standing::Ended(parse_time(&updated)?),
             };
             Ok((
@@ -352,7 +358,9 @@ fn task_route_facts(conn: &Connection) -> Result<HashMap<Uuid, Standing>, AppErr
     let mut statement = conn.prepare(
         "SELECT r.task_id, r.outcome IS NOT NULL,
              EXISTS (SELECT 1 FROM origin_inbox i WHERE i.task_id = r.task_id AND i.settled_at IS NULL),
-             (SELECT MAX(i.settled_at) FROM origin_inbox i WHERE i.task_id = r.task_id)
+             (SELECT MAX(settled_at) FROM (
+                 SELECT settled_at FROM origin_inbox WHERE task_id = r.task_id
+                 UNION ALL SELECT settled_at FROM origin_event_receipts WHERE task_id = r.task_id))
          FROM origin_routes r
          WHERE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = r.task_id)",
     )?;

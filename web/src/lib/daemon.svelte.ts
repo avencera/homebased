@@ -364,7 +364,7 @@ export class TaskStore {
 							(cause: unknown) => ({ ok: false as const, cause })
 						)
 					: null;
-			const task = await fetchTask(id);
+			let task = await fetchTask(id);
 			const launched = hasLog(task);
 			// a task that has not launched has no log to wait for
 			const result = launched && log ? await log : { ok: false as const, cause: null };
@@ -372,6 +372,11 @@ export class TaskStore {
 			// a log read that started before the detail showed the output pruned
 			// answers output_pruned; the page says so from the detail
 			const code = result.ok ? null : asApiError(result.cause).code;
+			// a pass that pruned between the two reads leaves a detail with no
+			// pruning date, and an ended task is not polled again to learn it
+			if (code === 'output_pruned' && isTaskDetail(task) && task.output_pruned_at === undefined) {
+				task = await fetchTask(id);
+			}
 			if (
 				launched &&
 				log &&

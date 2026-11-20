@@ -444,6 +444,38 @@ fn a_tombstoned_directory_left_by_an_interrupted_pass_is_removed_next_time() {
     assert_eq!(report.pruned[0].reason, PruneReason::Leftover);
 }
 
+#[test]
+fn a_task_stays_dated_by_its_last_settled_event_after_compaction_removes_it() {
+    let fixture = Fixture::new();
+    let mut config = RetentionConfig::default();
+    config.tasks.keep_last = 0;
+    config.tasks.limits.max_age = 60 * DAY;
+    let thread = Uuid::now_v7();
+    // both ended 70 days ago; one reached its origin 50 days ago, and that
+    // event's row is gone, leaving only its receipts
+    let settled_late = fixture.ended_task(thread, days_ago(70));
+    let settled_early = fixture.ended_task(thread, days_ago(70));
+    for (task, settled) in [(settled_late, days_ago(50)), (settled_early, days_ago(70))] {
+        fixture
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO executor_event_receipts
+                     (task_id, seq, event_digest, result_json, terminal_callback, acknowledged_at)
+                 VALUES ('{task}', 1, 'd', '\"acknowledged\"', 1, '{at}');
+                 INSERT INTO origin_event_receipts
+                     (task_id, seq, event_digest, delivery_json, terminal_callback, settled_at)
+                 VALUES ('{task}', 1, 'd', '{{\"type\":\"delivered\"}}', 1, '{at}');",
+                at = stamp(settled)
+            ))
+            .unwrap();
+    }
+
+    fixture.pass(&config, PassMode::Apply);
+
+    assert!(fixture.task_dir(settled_late).exists());
+    assert!(!fixture.task_dir(settled_early).exists());
+}
+
 fn ended(kind: OutputKind, thread: u128, days: u32, bytes: u64) -> Entry {
     Entry {
         kind,
