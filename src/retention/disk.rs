@@ -21,8 +21,9 @@ pub(super) struct Usage {
 
 /// Walk `root` without following symlinks
 ///
-/// Entries that vanish or cannot be read during the walk are skipped, since a
-/// pass only needs totals; an unreadable root is an error
+/// Entries that vanish during the walk are skipped. Any other read error fails
+/// the walk, since a file the walk missed may be the recent change that keeps
+/// the entry, and the inventory never prunes an entry it cannot measure
 pub(super) fn measure(root: &Path) -> io::Result<Usage> {
     let meta = fs::symlink_metadata(root)?;
     let mut usage = Usage {
@@ -31,11 +32,14 @@ pub(super) fn measure(root: &Path) -> io::Result<Usage> {
     };
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let Ok(children) = fs::read_dir(&dir) else {
+        let Some(children) = gone_is_none(fs::read_dir(&dir))? else {
             continue;
         };
-        for child in children.flatten() {
-            let Ok(meta) = child.metadata() else {
+        for child in children {
+            let Some(child) = gone_is_none(child)? else {
+                continue;
+            };
+            let Some(meta) = gone_is_none(child.metadata())? else {
                 continue;
             };
             usage.bytes = usage.bytes.saturating_add(allocated(&meta));
@@ -47,6 +51,15 @@ pub(super) fn measure(root: &Path) -> io::Result<Usage> {
     }
 
     Ok(usage)
+}
+
+/// `None` for something removed while the walk ran
+fn gone_is_none<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn allocated(meta: &fs::Metadata) -> u64 {

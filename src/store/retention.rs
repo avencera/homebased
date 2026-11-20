@@ -108,6 +108,18 @@ pub(crate) struct Tombstone {
 
 const TERMINAL_TASK: &str = "status NOT IN ('queued', 'running')";
 
+/// Whether task or job `?1` has an unsettled event, or changed or had an
+/// event settle after `?2`
+const CHANGED_SINCE: &str = "SELECT
+    EXISTS (SELECT 1 FROM executor_outbox
+        WHERE task_id = ?1 AND (state = 'pending' OR acknowledged_at > ?2))
+    OR EXISTS (SELECT 1 FROM origin_inbox
+        WHERE task_id = ?1 AND (settled_at IS NULL OR settled_at > ?2))
+    OR EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND updated_at > ?2)
+    OR EXISTS (SELECT 1 FROM resource_jobs WHERE id = ?1 AND updated_at > ?2)
+    OR EXISTS (SELECT 1 FROM resource_job_routes
+        WHERE job_id = ?1 AND settled_seq < accepted_seq)";
+
 impl Store {
     /// Read every fact a retention pass needs in one read transaction
     ///
@@ -128,9 +140,10 @@ impl Store {
     /// A pass plans from facts read before it walks the disk, so work submitted
     /// during the walk, such as an `after` dependent of an old task, may need
     /// an entry the plan prunes. Rechecking under the write lock leaves only the
-    /// removal itself for such a submit to race. Returns the ids among `ids`
-    /// that something needs now; their entries must be kept, and get no
-    /// tombstone
+    /// removal itself for such a submit to race. An entry whose task or job
+    /// changed after `since`, when the pass began, such as by a late event, is
+    /// kept too, since the plan dated it from older facts. Returns the ids
+    /// among `ids` to keep; their entries get no tombstone
     ///
     /// A tombstone is saved before its files are removed, so a crash between
     /// the two leaves a tombstone whose leftover files the next pass removes,
@@ -138,17 +151,23 @@ impl Store {
     pub(crate) fn save_tombstones(
         &self,
         now: DateTime<Utc>,
+        since: DateTime<Utc>,
         ids: &[Uuid],
         tombstones: &[Tombstone],
     ) -> Result<HashSet<Uuid>, AppError> {
         self.immediate(|| {
             let jobs = job_facts(&self.conn)?;
             let (_, needs) = needs(&self.conn, &jobs)?;
-            let kept: HashSet<Uuid> = ids
-                .iter()
-                .copied()
-                .filter(|id| needs.0.contains_key(id))
-                .collect();
+            let mut changed = self.conn.prepare(CHANGED_SINCE)?;
+            let since = fmt_time(since);
+            let mut kept = HashSet::new();
+            for &id in ids {
+                if needs.0.contains_key(&id)
+                    || changed.query_row(params![id.to_string(), since], |row| row.get(0))?
+                {
+                    kept.insert(id);
+                }
+            }
 
             let mut insert = self.conn.prepare(
                 "INSERT OR IGNORE INTO pruned_outputs (kind, id, pruned_at, bytes, reason)
@@ -199,7 +218,8 @@ impl Store {
             let busy: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM resources
                      WHERE name = ?1 AND ci_class IS NOT NULL AND run_task IS NOT NULL)
-                 OR EXISTS (SELECT 1 FROM tasks WHERE cwd = ?2
+                 OR EXISTS (SELECT 1 FROM tasks
+                     WHERE (cwd = ?2 OR substr(cwd, 1, length(?2) + 1) = ?2 || '/')
                      AND (status IN ('queued', 'running') OR updated_at > ?3))",
                 params![lane, clone.to_string_lossy(), fmt_time(last_use)],
                 |row| row.get(0),

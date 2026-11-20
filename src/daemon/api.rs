@@ -703,7 +703,15 @@ pub(super) async fn local_log(
     let tail = state.home.task_paths(id).read_output(tail)?;
     let (log, truncated) = match tail {
         Some(output) => (output.text, output.truncated),
-        None => (String::new(), false),
+        None => {
+            // a pass may have pruned it between the check above and the read
+            if let Some(pruned_at) =
+                call(&state.store, |reply| StoreMsg::OutputPrunedAt { id, reply }).await?
+            {
+                return Err(AppError::OutputPruned { id, pruned_at });
+            }
+            (String::new(), false)
+        }
     };
     Ok(LogTail {
         api_version: API_VERSION,

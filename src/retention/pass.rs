@@ -72,7 +72,7 @@ pub fn run_pass(
             .iter()
             .map(|(_, verdict)| matches!(verdict, Verdict::Prune(_)))
             .collect(),
-        PassMode::Apply => apply(&store, &decided, &trash, &mut failures, stop)?,
+        PassMode::Apply => apply(&store, started_at, &decided, &trash, &mut failures, stop)?,
     };
 
     let (bytes, free_bytes) = store.database_usage()?;
@@ -93,6 +93,7 @@ pub fn run_pass(
 /// Prune every entry with a prune verdict; returns which entries are gone
 fn apply(
     store: &Store,
+    started_at: chrono::DateTime<Utc>,
     decided: &[(&Entry, Verdict)],
     trash: &Path,
     failures: &mut Vec<PruneFailure>,
@@ -114,7 +115,7 @@ fn apply(
             .iter()
             .filter_map(|&index| tombstone(decided[index].0, decided[index].1))
             .collect();
-        let needed = store.save_tombstones(Utc::now(), &ids, &tombstones)?;
+        let needed = store.save_tombstones(Utc::now(), started_at, &ids, &tombstones)?;
 
         for &index in batch {
             let entry = decided[index].0;
