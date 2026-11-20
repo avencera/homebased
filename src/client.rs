@@ -468,6 +468,10 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 None => AppError::Internal { message },
             }
         }
+        "output_pruned" => match (decode_field(input, "id"), decode_field(input, "pruned_at")) {
+            (Some(id), Some(pruned_at)) => AppError::OutputPruned { id, pruned_at },
+            _ => AppError::Internal { message },
+        },
         "route_not_found" => decode_field(input, "task")
             .map_or(AppError::Internal { message }, |task| {
                 AppError::RouteNotFound { task }

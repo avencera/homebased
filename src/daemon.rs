@@ -28,6 +28,7 @@ pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
 pub mod queue_api;
+pub(crate) mod retention;
 mod service_api;
 pub mod t3_launch;
 mod t3_watch;
@@ -109,6 +110,8 @@ pub struct AppState {
     pub(crate) memory: ActorRef<actors::memory::MemoryMsg>,
     /// Memory bar and gauge, for refusing a peak at submit
     pub(crate) memory_limits: actors::memory::MemoryLimits,
+    /// Retention settings and the lock that runs one pass at a time
+    pub(crate) retention: retention::Retention,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -159,6 +162,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         None => (None, None),
     };
     let notifier = Notifier::from_config(&config).map(Arc::new);
+    let (retention, retention_requests) = retention::Retention::new(config.retention);
     let memory_limits = actors::memory::MemoryLimits::new(&config.memory);
     let supervisor_args = SupervisorArgs::new(
         home.clone(),
@@ -204,6 +208,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         ci: config.ci.clone(),
         memory,
         memory_limits,
+        retention,
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),
@@ -233,6 +238,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         config.resource.gpu_idle.clone(),
     ));
     let hold_sweep = tokio::spawn(end_leftover_holds());
+    let retention_timer = tokio::spawn(retention::run(state.clone(), retention_requests));
     // a blocking task cannot be aborted, so shutdown sets this flag instead
     let usage_backfill_stop = Arc::new(AtomicBool::new(false));
     tokio::task::spawn_blocking({
@@ -292,6 +298,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     gpu_idle_watcher.abort();
     lease_guard.abort();
     hold_sweep.abort();
+    retention_timer.abort();
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {
         supervisor.stop(None);

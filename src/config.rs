@@ -121,6 +121,8 @@ pub struct Config {
     pub ci: crate::queue::ci::CiConfig,
     /// Host memory admission of work with a declared peak, from `[memory]`
     pub memory: MemoryConfig,
+    /// What finished output the daemon prunes, and when, from `[retention]`
+    pub retention: crate::retention::RetentionConfig,
 }
 
 /// Host memory admission settings
@@ -284,6 +286,110 @@ struct RawConfig {
     ci: RawCi,
     #[serde(default)]
     memory: RawMemory,
+    #[serde(default)]
+    retention: RawRetention,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetention {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    min_age: Option<String>,
+    #[serde(default)]
+    tasks: RawRecordRule,
+    #[serde(default)]
+    jobs: RawRecordRule,
+    #[serde(default)]
+    ci: RawLimits,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRecordRule {
+    #[serde(default)]
+    max_age: Option<String>,
+    #[serde(default)]
+    max_size_gib: Option<u64>,
+    #[serde(default)]
+    keep_last: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLimits {
+    #[serde(default)]
+    max_age: Option<String>,
+    #[serde(default)]
+    max_size_gib: Option<u64>,
+}
+
+impl RawRetention {
+    fn validate(self) -> Result<crate::retention::RetentionConfig, String> {
+        let mut config = crate::retention::RetentionConfig::default();
+        if let Some(raw) = self.interval {
+            config.interval = Some(positive_duration("retention.interval", &raw)?);
+        }
+        if self.enabled == Some(false) {
+            config.interval = None;
+        }
+        if let Some(raw) = self.min_age {
+            config.min_age = positive_duration("retention.min_age", &raw)?;
+        }
+        self.tasks.apply("retention.tasks", &mut config.tasks)?;
+        self.jobs.apply("retention.jobs", &mut config.jobs)?;
+        self.ci.apply("retention.ci", &mut config.ci)?;
+        for (name, limits) in [
+            ("tasks", config.tasks.limits),
+            ("jobs", config.jobs.limits),
+            ("ci", config.ci),
+        ] {
+            // min_age is the floor under every limit, so a lower max_age
+            // would read as a promise the pass does not keep
+            if limits.max_age < config.min_age {
+                return Err(format!(
+                    "retention.{name}.max_age must be at least retention.min_age ({})",
+                    humantime::format_duration(config.min_age)
+                ));
+            }
+        }
+        Ok(config)
+    }
+}
+
+impl RawRecordRule {
+    fn apply(self, name: &str, rule: &mut crate::retention::RecordRule) -> Result<(), String> {
+        let limits = RawLimits {
+            max_age: self.max_age,
+            max_size_gib: self.max_size_gib,
+        };
+        limits.apply(name, &mut rule.limits)?;
+        if let Some(keep_last) = self.keep_last {
+            rule.keep_last = keep_last;
+        }
+        Ok(())
+    }
+}
+
+impl RawLimits {
+    fn apply(self, name: &str, limits: &mut crate::retention::Limits) -> Result<(), String> {
+        if let Some(raw) = self.max_age {
+            limits.max_age = positive_duration(&format!("{name}.max_age"), &raw)?;
+        }
+        if let Some(gib) = self.max_size_gib {
+            if gib == 0 {
+                return Err(format!("{name}.max_size_gib must be more than 0"));
+            }
+            limits.max_size = Some(
+                gib.checked_mul(1024 * 1024 * 1024)
+                    .ok_or_else(|| format!("{name}.max_size_gib {gib} is too large"))?,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -678,6 +784,7 @@ impl RawConfig {
         let dashboard = self.dashboard.validate()?;
         let ci = self.ci.validate()?;
         let memory = self.memory.validate()?;
+        let retention = self.retention.validate()?;
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -708,6 +815,7 @@ impl RawConfig {
             dashboard,
             ci,
             memory,
+            retention,
         })
     }
 }
@@ -758,6 +866,40 @@ mod tests {
             "[resource.notify_blocked_after]\nyeld = \"1m\"\n",
         ] {
             assert!(Config::parse(text).is_err());
+        }
+    }
+
+    #[test]
+    fn retention_settings_override_defaults_and_refuse_limits_below_min_age() {
+        use std::time::Duration;
+
+        let config = Config::parse(
+            "[retention]\nenabled = false\nmin_age = \"2d\"\n\
+             [retention.tasks]\nmax_age = \"30d\"\nkeep_last = 0\n\
+             [retention.ci]\nmax_size_gib = 5\n",
+        )
+        .unwrap();
+        let retention = config.retention;
+        assert_eq!(retention.interval, None);
+        assert_eq!(retention.min_age, Duration::from_secs(2 * 86_400));
+        assert_eq!(
+            retention.tasks.limits.max_age,
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(retention.tasks.keep_last, 0);
+        assert_eq!(
+            retention.jobs,
+            crate::retention::RetentionConfig::default().jobs
+        );
+        assert_eq!(retention.ci.max_size, Some(5 * 1024 * 1024 * 1024));
+
+        for text in [
+            "[retention.jobs]\nmax_age = \"12h\"\n",
+            "[retention.ci]\nmax_size_gib = 0\n",
+            "[retention.tasks]\nmax_age = \"0s\"\n",
+            "[retention.tasks]\nkeep = 2\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
         }
     }
 

@@ -67,6 +67,8 @@ homebased --json task log <id>       # {"id", "log", "truncated"}
 
 The local daemon reads `output.log` on the execution machine. For a remote task, it gets the log from the executor over Fleet. The log can be empty while the child has not written anything yet. `--tail` keeps at most 5000 lines and reads at most 1 MiB of log bytes. A longer line can return only its end. `truncated` is true when earlier lines or bytes were dropped. If the executor is offline or the log has been removed, the CLI returns `task_unavailable`. A task prevented before it started has no log and returns `task_not_started`.
 
+Retention prunes a finished task's directory once it is older than `retention.tasks.max_age` (default 14 days), its events are settled, and no waiting task, job, chain, or `wait --long` still needs it; each thread's newest few are kept. A pruned task keeps its status, events, and reports: `task show` adds `output_pruned_at`, and `task log` fails with `output_pruned`. Read a log you need later within that window, or copy what matters out of `evidence`. `homebased gc --dry-run` shows what the next pass would prune, and `homebased gc` prunes now.
+
 ## Wait
 
 ```bash
