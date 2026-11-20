@@ -72,10 +72,7 @@ impl StepKind {
 impl Checkpoint {
     /// Durable host state directory shared by all attempts of this job
     pub fn job_dir(&self, home: &Home) -> PathBuf {
-        home.root()
-            .join("jobs")
-            .join(self.run.job.to_string())
-            .join("state")
+        home.jobs_dir().join(self.run.job.to_string()).join("state")
     }
 
     /// Run-scoped directory mounted read-only in containers

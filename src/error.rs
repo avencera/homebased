@@ -49,6 +49,16 @@ pub enum AppError {
         /// Id that had no row
         id: TaskId,
     },
+    /// Retention removed the task's directory; its row, events, and reports remain
+    #[error(
+        "the output of task {id} was pruned by retention at {pruned_at}; its status, events, and reports are kept, and `retention` in config.toml sets how long output stays"
+    )]
+    OutputPruned {
+        /// Task whose output is gone
+        id: TaskId,
+        /// When the pass removed it
+        pruned_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Known peers could not all be checked for this task
     #[error("cluster lookup incomplete for {task}")]
     ClusterLookupIncomplete {
@@ -779,6 +789,7 @@ impl AppError {
         match self {
             Self::DaemonUnavailable { .. } => "daemon_unavailable",
             Self::TaskNotFound { .. } => "task_not_found",
+            Self::OutputPruned { .. } => "output_pruned",
             Self::ClusterLookupIncomplete { .. } => "cluster_lookup_incomplete",
             Self::TaskUnavailable { .. } => "task_unavailable",
             Self::TaskNotStarted { .. } => "task_not_started",
@@ -891,6 +902,7 @@ impl AppError {
             | Self::NotifyNotConfigured => 2,
             Self::AgentConfiguration { .. } => 1,
             Self::TaskNotFound { .. }
+            | Self::OutputPruned { .. }
             | Self::WaitTargetNotFound { .. }
             | Self::TaskNotStarted { .. }
             | Self::RouteNotFound { .. }
@@ -966,6 +978,7 @@ impl AppError {
             Self::FollowupWrongMachine { .. } => http::StatusCode::BAD_REQUEST,
             Self::NotifyNotConfigured => http::StatusCode::BAD_REQUEST,
             Self::AgentConfiguration { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
+            Self::OutputPruned { .. } => http::StatusCode::GONE,
             Self::TaskNotFound { .. }
             | Self::WaitTargetNotFound { .. }
             | Self::TaskNotStarted { .. }
@@ -1064,6 +1077,7 @@ impl AppError {
     pub fn input(&self) -> Value {
         match self {
             Self::TaskNotFound { id } => json!({ "id": id }),
+            Self::OutputPruned { id, pruned_at } => json!({ "id": id, "pruned_at": pruned_at }),
             Self::FollowupUnavailable { task, reason } => {
                 json!({ "task": task, "reason": reason })
             }

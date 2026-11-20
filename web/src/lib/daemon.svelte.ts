@@ -34,9 +34,11 @@ import {
 import { mergeFleetTasks, type MachineTasks } from './fleet-merge';
 import { newOperationId } from './queue-view';
 
-/** Whether the task has launched, so it has an output log to read. */
+/** Whether the task has launched and still has its output log to read. */
 function hasLog(record: TaskRecord): boolean {
-	return isTaskDetail(record) && record.output_log !== undefined;
+	return (
+		isTaskDetail(record) && record.output_log !== undefined && record.output_pruned_at === undefined
+	);
 }
 
 /** Every queued and running task, from every thread. */
@@ -362,12 +364,26 @@ export class TaskStore {
 							(cause: unknown) => ({ ok: false as const, cause })
 						)
 					: null;
-			const task = await fetchTask(id);
+			let task = await fetchTask(id);
 			const launched = hasLog(task);
 			// a task that has not launched has no log to wait for
 			const result = launched && log ? await log : { ok: false as const, cause: null };
 			// the log request can lose a race with the launch; the next poll reads it
-			if (launched && log && !result.ok && asApiError(result.cause).code !== 'task_not_started') {
+			// a log read that started before the detail showed the output pruned
+			// answers output_pruned; the page says so from the detail
+			const code = result.ok ? null : asApiError(result.cause).code;
+			// a pass that pruned between the two reads leaves a detail with no
+			// pruning date, and an ended task is not polled again to learn it
+			if (code === 'output_pruned' && isTaskDetail(task) && task.output_pruned_at === undefined) {
+				task = await fetchTask(id);
+			}
+			if (
+				launched &&
+				log &&
+				!result.ok &&
+				code !== 'task_not_started' &&
+				code !== 'output_pruned'
+			) {
 				throw result.cause;
 			}
 			if (generation !== this.#generation) return;

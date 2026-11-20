@@ -4,6 +4,7 @@ pub mod ci;
 pub mod config;
 pub mod daemon;
 pub mod fleet;
+pub mod gc;
 pub mod message;
 pub mod notify;
 pub mod resource;
@@ -189,6 +190,9 @@ pub enum Command {
     /// which T3 reports done when its turn ends, cannot sleep: `--long` waits up
     /// to 115 minutes there, and long work belongs in a child thread.
     Wait(wait::WaitArgs),
+    /// Prune the output of finished tasks, jobs, and idle CI slot clones now,
+    /// as the daemon does on `retention.interval`
+    Gc(gc::GcArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
     /// Print the version
@@ -372,6 +376,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::T3 { command } => t3::run(&ctx, command).await,
         Command::Thread { command } => thread::run(&ctx, command).await,
         Command::Wait(args) => wait::wait(&ctx, args).await,
+        Command::Gc(args) => gc::run(&ctx, args).await,
         Command::Update(args) => update::run(&ctx, args).await,
         Command::Version => {
             version(&ctx)?;

@@ -24,6 +24,7 @@ mod memory;
 mod message;
 mod presentation;
 pub mod queue;
+mod retention;
 mod schema;
 mod service;
 mod sleep;
@@ -40,6 +41,7 @@ pub(crate) use events::EventRetentionBatch;
 pub use identity::{IdentityError, OwedTarget};
 pub use lifecycle::CancelResult;
 pub use presentation::{TaskMemory, TaskOwners, TaskPresentation};
+pub(crate) use retention::{RecordFact, RetentionFacts, Standing, Tombstone};
 pub use task::{NewTask, new_queued_task};
 pub use thread_watch::{WatchRecord, WatchUpdate, WorkerThread};
 

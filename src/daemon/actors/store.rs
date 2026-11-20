@@ -875,6 +875,16 @@ pub(crate) enum StoreMsg {
         id: TaskId,
         reply: RpcReplyPort<Result<Option<TaskUsage>, AppError>>,
     },
+    /// When retention pruned a task's output, if it did
+    OutputPrunedAt {
+        id: TaskId,
+        reply: RpcReplyPort<Result<Option<chrono::DateTime<chrono::Utc>>, AppError>>,
+    },
+    /// Rebuild the database to return its free pages, on the actor's own
+    /// connection so no other daemon write runs meanwhile; replies the new size
+    Vacuum {
+        reply: RpcReplyPort<Result<u64, AppError>>,
+    },
     /// Usage of the tasks submitted since a time, optionally from one thread
     UsageSince {
         since: DateTime<Utc>,
@@ -1575,6 +1585,11 @@ impl Actor for StoreActor {
                 send_reply(reply, state.record_task_usage(id, &usage));
             }
             StoreMsg::TaskUsage { id, reply } => send_reply(reply, state.task_usage(id)),
+            StoreMsg::OutputPrunedAt { id, reply } => send_reply(
+                reply,
+                state.pruned_at(crate::retention::OutputKind::Task, id.0),
+            ),
+            StoreMsg::Vacuum { reply } => send_reply(reply, state.vacuum()),
             StoreMsg::UsageSince {
                 since,
                 thread,

@@ -95,6 +95,7 @@ impl Store {
                AND json_extract(workload_json, '$.type') = 'agent'
                AND json_extract(workload_json, '$.agent') = 'claude'
                AND id NOT IN (SELECT task_id FROM task_usage)
+               AND id NOT IN (SELECT id FROM pruned_outputs WHERE kind = 'task')
              ORDER BY created_at",
         )?;
         let ids = statement

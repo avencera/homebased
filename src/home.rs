@@ -21,6 +21,8 @@ pub const DAEMON_LOCK: &str = "daemon.lock";
 pub const FALLBACK_LOG: &str = "callback-fallback.log";
 /// JSON lines log of Claude session compaction requests, kept for analysis.
 pub const COMPACTION_LOG: &str = "compactions.jsonl";
+/// Flock a task's or service's worker holds for as long as it runs.
+pub const RUNNER_LOCK_FILE: &str = "runner.lock";
 /// Per-task process-shared lock that serializes callback delivery.
 pub const DELIVERY_LOCK: &str = "delivery.lock";
 /// Stable machine UUID for this installation.
@@ -133,6 +135,12 @@ impl Home {
         self.root.join("tasks")
     }
 
+    /// `jobs/` directory: each queue job's shared state and callback delivery.
+    #[must_use]
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.root.join("jobs")
+    }
+
     /// Directory for one task.
     #[must_use]
     pub fn task_dir(&self, id: TaskId) -> PathBuf {
@@ -158,7 +166,7 @@ impl Home {
         let dir = self.root.join(SERVICES_DIR).join(id.to_string());
         ServicePaths {
             output: dir.join("output.log"),
-            runner_lock: dir.join("runner.lock"),
+            runner_lock: dir.join(RUNNER_LOCK_FILE),
             worker_log: dir.join("worker.log"),
             delivery: dir.join("delivery"),
             dir,
@@ -264,7 +272,7 @@ impl TaskPaths {
             trailer: dir.join("prompt.trailer.txt"),
             feed: dir.join("prompt.feed.txt"),
             output: dir.join("output.log"),
-            runner_lock: dir.join("runner.lock"),
+            runner_lock: dir.join(RUNNER_LOCK_FILE),
             worker_log: dir.join("worker.log"),
             exit_json: dir.join("exit.json"),
             callback_log: dir.join("callback.log"),

@@ -319,7 +319,7 @@
 			<dt class="text-muted-foreground">callback</dt>
 			<dd><CallbackBadge callback={task.callback} /></dd>
 
-			{#if task.evidence}
+			{#if task.evidence && !task.output_pruned_at}
 				<dt class="text-muted-foreground">evidence</dt>
 				<dd class="flex min-w-0 items-center gap-1">
 					<a
@@ -333,7 +333,7 @@
 				</dd>
 			{/if}
 
-			{#if task.output_log}
+			{#if task.output_log && !task.output_pruned_at}
 				<dt class="text-muted-foreground">output log</dt>
 				<dd class="flex min-w-0 items-center gap-1 sm:col-span-3">
 					<a
@@ -397,8 +397,9 @@
 				id="output-log"
 				bind:this={logBox}
 				onscroll={onLogScroll}
-				class="max-h-96 overflow-auto rounded border border-border bg-card px-3 py-2 font-mono text-[12px] leading-5 wrap-anywhere whitespace-pre-wrap">{store
-					.logTail?.log || 'No output yet'}</pre>
+				class="max-h-96 overflow-auto rounded border border-border bg-card px-3 py-2 font-mono text-[12px] leading-5 wrap-anywhere whitespace-pre-wrap">{task.output_pruned_at
+					? `Pruned by retention ${formatTimestamp(task.output_pruned_at)}`
+					: store.logTail?.log || 'No output yet'}</pre>
 		</section>
 
 		{#if task.last_event}

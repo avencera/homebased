@@ -320,9 +320,12 @@ pub(super) async fn log(
         }
         let mut value = remote_read(state, &records, *machine, &path, id)
             .await
-            .map_err(|_| AppError::TaskUnavailable {
-                task: id,
-                machine: *machine,
+            .map_err(|error| match error {
+                AppError::OutputPruned { .. } => error,
+                _ => AppError::TaskUnavailable {
+                    task: id,
+                    machine: *machine,
+                },
             })?;
         annotate(
             &mut value,
@@ -860,6 +863,13 @@ async fn remote_read(
             machine,
             message: err.to_string(),
         })?;
+    if response.status == StatusCode::GONE {
+        // the executor pruned the output; retrying it will not bring it back
+        let error = crate::client::map_error(response.status, &response.body);
+        if matches!(error, AppError::OutputPruned { .. }) {
+            return Err(error);
+        }
+    }
     if response.status != StatusCode::OK {
         return Err(AppError::TaskUnavailable { task: id, machine });
     }

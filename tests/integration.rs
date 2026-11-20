@@ -704,6 +704,8 @@ mod memory_admission;
 mod reports;
 #[path = "integration/resource_jobs.rs"]
 mod resource_jobs;
+#[path = "integration/retention.rs"]
+mod retention;
 #[path = "integration/service.rs"]
 mod service;
 #[path = "integration/service_mode.rs"]

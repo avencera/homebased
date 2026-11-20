@@ -30,6 +30,7 @@ pub mod notify;
 pub mod power;
 pub mod queue;
 pub mod report;
+pub mod retention;
 pub mod run_env;
 pub mod runner;
 pub mod service;

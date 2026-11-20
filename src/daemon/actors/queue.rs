@@ -471,6 +471,7 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
             .await;
         }
     };
+    let clone = checkout.as_ref().map(|checkout| checkout.cwd.clone());
     call(&args.store, |reply| StoreMsg::QueueReserve {
         machine: args.machine,
         job,
@@ -490,7 +491,14 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
     .ok_or_else(|| AppError::Internal {
         message: "new reservation is missing".into(),
     })?
-    .prepare(&args.home);
+    .prepare(&args.home)
+    .and_then(|prepared| {
+        // a failed create fails the launch like any other run path
+        if let Some(clone) = &clone {
+            std::fs::create_dir_all(clone)?;
+        }
+        Ok(prepared)
+    });
     call(&args.supervisor, |reply| SupervisorMsg::LaunchQueueRun {
         task,
         prepared,
@@ -500,7 +508,7 @@ async fn launch_job(args: &QueueArgs, job: JobId, resource: ResourceId) -> Resul
 }
 
 /// The checkout wrapper of a CI job with `git`, run from the slot's own
-/// clone, which this creates so the worker can start in it
+/// clone, which `launch_job` creates once the run is reserved
 async fn checkout_run(
     args: &QueueArgs,
     record: &JobRecord,
@@ -534,8 +542,10 @@ async fn checkout_run(
         .ok_or_else(|| QueueError::Invariant {
             message: format!("CI job {} has no checkout directory", record.id),
         })?;
+    // the clone is created once the run is reserved, so retention, which
+    // retires an idle slot's clone only while the slot has no run, never moves
+    // a clone a launch is about to enter
     let clone = git.clone_dir(&checkout_root(&args.home, &args.ci), &lane);
-    tokio::fs::create_dir_all(&clone).await?;
     let command = CommandLine::try_from_argv(git.wrap(&clone, &workdir, &workload.command))
         .map_err(|error| AppError::Internal {
             message: format!("checkout wrapper: {error}"),

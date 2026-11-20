@@ -687,11 +687,7 @@ pub(crate) async fn deliver_job_event(
     callback: &ActorRef<CallbackMsg>,
     send: JobSend,
 ) -> Result<Option<DeliveryOutcome>, AppError> {
-    let dir = home
-        .root()
-        .join("jobs")
-        .join(route.job.to_string())
-        .join("delivery");
+    let dir = home.jobs_dir().join(route.job.to_string()).join("delivery");
     std::fs::create_dir_all(&dir)?;
     let attempt = OriginAttempt {
         context: route.callback.clone(),

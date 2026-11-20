@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 23;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 22] = [
+const MIGRATIONS: [Migration; 23] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -42,6 +42,7 @@ const MIGRATIONS: [Migration; 22] = [
     add_follow_up_reports,
     add_route_priorities,
     add_task_memory_reviews,
+    add_pruned_outputs,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -244,6 +245,41 @@ fn add_task_memory_reviews(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE tasks ADD COLUMN {TASK_MEMORY_REVIEW};"
     ))
 }
+
+/// Version 24: tombstones of task and job output that retention pruned, and
+/// when each compacted event settled
+fn add_pruned_outputs(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "{PRUNED_OUTPUTS_TABLE}
+         ALTER TABLE executor_event_receipts ADD COLUMN {RECEIPT_ACKNOWLEDGED_AT};
+         ALTER TABLE origin_event_receipts ADD COLUMN {RECEIPT_SETTLED_AT};"
+    ))
+}
+
+/// When a compacted executor event was acknowledged, so retention still dates
+/// a task by its last settled event after compaction removes the event row;
+/// null for receipts compacted before version 24
+const RECEIPT_ACKNOWLEDGED_AT: &str = "acknowledged_at TEXT";
+
+/// When a compacted origin event settled; see [`RECEIPT_ACKNOWLEDGED_AT`]
+const RECEIPT_SETTLED_AT: &str = "settled_at TEXT";
+
+/// One row per task or job whose directory a retention pass removed
+///
+/// The row is saved before the files go, so `task log` can say the output was
+/// pruned, and a pass that stopped between the two removes the rest next
+/// time. `kind` is `task` for `tasks/<id>` and `job` for `jobs/<id>`; there is
+/// no foreign key, since the task or job row outlives its output either way
+const PRUNED_OUTPUTS_TABLE: &str = "
+CREATE TABLE pruned_outputs (
+    kind TEXT NOT NULL CHECK (kind IN ('task', 'job')),
+    id TEXT NOT NULL,
+    pruned_at TEXT NOT NULL,
+    bytes INTEGER NOT NULL CHECK (bytes >= 0),
+    reason TEXT NOT NULL CHECK (reason IN ('age', 'size')),
+    PRIMARY KEY (kind, id)
+);
+";
 
 /// Version 19: `homebased wait --long` holds progress events for its thread
 fn add_sleep_holds(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -679,6 +715,9 @@ fn schema() -> String {
         .replace("{SLEEP_HOLDS_TABLE}", SLEEP_HOLDS_TABLE)
         .replace("{THREAD_LINEAGE_TABLE}", THREAD_LINEAGE_TABLE)
         .replace("{THREAD_REPORTS_TABLE}", THREAD_REPORTS_TABLE)
+        .replace("{PRUNED_OUTPUTS_TABLE}", PRUNED_OUTPUTS_TABLE)
+        .replace("{RECEIPT_ACKNOWLEDGED_AT}", RECEIPT_ACKNOWLEDGED_AT)
+        .replace("{RECEIPT_SETTLED_AT}", RECEIPT_SETTLED_AT)
 }
 
 /// Every table of the current schema, with the columns and tables shared with
@@ -835,6 +874,7 @@ CREATE TABLE executor_event_receipts (
     event_digest TEXT NOT NULL,
     result_json TEXT NOT NULL,
     terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
+    {RECEIPT_ACKNOWLEDGED_AT},
     PRIMARY KEY (task_id, seq)
 );
 
@@ -844,6 +884,7 @@ CREATE TABLE origin_event_receipts (
     event_digest TEXT NOT NULL,
     delivery_json TEXT NOT NULL,
     terminal_callback INTEGER NOT NULL CHECK (terminal_callback IN (0, 1)),
+    {RECEIPT_SETTLED_AT},
     PRIMARY KEY (task_id, seq)
 );
 
@@ -1031,7 +1072,8 @@ CREATE TABLE resource_job_delivery (
 {CI_TABLES}
 {SLEEP_HOLDS_TABLE}
 {THREAD_LINEAGE_TABLE}
-{THREAD_REPORTS_TABLE}";
+{THREAD_REPORTS_TABLE}
+{PRUNED_OUTPUTS_TABLE}";
 
 #[cfg(test)]
 mod tests {
@@ -1158,6 +1200,16 @@ mod tests {
             .replace(super::SLEEP_HOLDS_TABLE, "")
             .replace(super::THREAD_LINEAGE_TABLE, "")
             .replace(super::THREAD_REPORTS_TABLE, "")
+            .replace(super::PRUNED_OUTPUTS_TABLE, "")
+            // `executor_outbox` and `origin_inbox` have columns of the same text
+            .replace(
+                &format!("(0, 1)),\n    {},", super::RECEIPT_ACKNOWLEDGED_AT),
+                "(0, 1)),",
+            )
+            .replace(
+                &format!("(0, 1)),\n    {},", super::RECEIPT_SETTLED_AT),
+                "(0, 1)),",
+            )
             // the last column of its table, unlike the `created_at` of tasks
             .replace(&format!(",\n    {}\n)", super::JOB_ROUTE_CREATED_AT), "\n)");
         let old = Connection::open_in_memory().unwrap();
@@ -1195,6 +1247,8 @@ mod tests {
             "sleep_holds",
             "thread_lineage",
             "thread_reports",
+            "executor_event_receipts",
+            "origin_event_receipts",
         ] {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
         }
@@ -1240,7 +1294,9 @@ mod tests {
         // version 12 had no lease guard, services, CI slots, memory peaks,
         // sleep holds, or child-thread links
         conn.execute_batch(
-            "ALTER TABLE tasks DROP COLUMN memory_review;
+            "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE pruned_outputs;
+             ALTER TABLE executor_event_receipts DROP COLUMN acknowledged_at;
+             ALTER TABLE origin_event_receipts DROP COLUMN settled_at;
              DROP TABLE thread_reports; DROP TABLE thread_lineage;
              ALTER TABLE origin_routes DROP COLUMN priority;
              ALTER TABLE origin_routes DROP COLUMN mem_peak_mib;
@@ -1297,7 +1353,9 @@ mod tests {
         migrate(&conn).unwrap();
         conn.execute_batch(&format!(
             "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE thread_reports;
-             ALTER TABLE origin_routes DROP COLUMN priority; {}",
+             DROP TABLE pruned_outputs;
+             ALTER TABLE executor_event_receipts DROP COLUMN acknowledged_at;
+             ALTER TABLE origin_event_receipts DROP COLUMN settled_at; ALTER TABLE origin_routes DROP COLUMN priority; {}",
             super::THREAD_REPORTS_V20
         ))
         .unwrap();

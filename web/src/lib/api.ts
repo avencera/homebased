@@ -378,6 +378,8 @@ const TaskDetailSchema = Schema.Struct({
 	output_log: Schema.optional(Schema.String),
 	/** Task directory. Absent until the task launches. */
 	evidence: Schema.optional(Schema.String),
+	/** When retention removed the task directory and its log. Absent while kept. */
+	output_pruned_at: Schema.optional(Schema.String),
 	last_event: Schema.NullOr(TaskEventSchema),
 	/** Container and its witness. Present only for container tasks. */
 	container: Schema.optional(ContainerDetailSchema)

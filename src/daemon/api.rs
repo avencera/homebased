@@ -99,6 +99,7 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(crate::daemon::child_threads::socket_routes())
         .merge(crate::daemon::thread_api::write_routes())
         .merge(crate::daemon::service_api::socket_routes())
+        .merge(crate::daemon::retention::routes())
         .with_state(state)
 }
 
@@ -639,6 +640,8 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
     })
     .await?;
     let reports = call(&state.store, |reply| StoreMsg::Reports { id, reply }).await?;
+    let output_pruned_at =
+        call(&state.store, |reply| StoreMsg::OutputPrunedAt { id, reply }).await?;
     let evidence = state.home.task_dir(id);
     let parking = call(&state.store, |reply| StoreMsg::Parking { id, reply }).await?;
     let mut last_event = last_event_for_row(&row, &reports, evidence.clone(), parking.as_ref());
@@ -659,6 +662,7 @@ pub(super) async fn local_detail(state: &AppState, id: TaskId) -> Result<TaskDet
         reports,
         output_log: state.home.task_paths(id).output,
         evidence,
+        output_pruned_at,
         last_event,
         container,
     })
@@ -691,10 +695,23 @@ pub(super) async fn local_log(
     {
         return Err(AppError::TaskNotFound { id });
     }
+    if let Some(pruned_at) =
+        call(&state.store, |reply| StoreMsg::OutputPrunedAt { id, reply }).await?
+    {
+        return Err(AppError::OutputPruned { id, pruned_at });
+    }
     let tail = state.home.task_paths(id).read_output(tail)?;
     let (log, truncated) = match tail {
         Some(output) => (output.text, output.truncated),
-        None => (String::new(), false),
+        None => {
+            // a pass may have pruned it between the check above and the read
+            if let Some(pruned_at) =
+                call(&state.store, |reply| StoreMsg::OutputPrunedAt { id, reply }).await?
+            {
+                return Err(AppError::OutputPruned { id, pruned_at });
+            }
+            (String::new(), false)
+        }
     };
     Ok(LogTail {
         api_version: API_VERSION,

@@ -231,8 +231,31 @@ fn aged_local_and_remote_events_compact_and_late_duplicates_use_receipts() {
         )
         .unwrap();
     age_event_payloads(&store);
+    let settled_times = |store: &Store, sql: &str| -> (String, String) {
+        store
+            .conn
+            .query_row(sql, [route.task.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+    };
+    let settled = settled_times(
+        &store,
+        "SELECT o.acknowledged_at, i.settled_at FROM executor_outbox o, origin_inbox i
+         WHERE o.task_id=?1 AND i.task_id=?1",
+    );
 
     assert_eq!(store.compact_old_event_payloads().unwrap().compacted, 2);
+    // the receipts keep when each event settled, which retention dates by
+    assert_eq!(
+        settled_times(
+            &store,
+            "SELECT o.acknowledged_at, i.settled_at
+             FROM executor_event_receipts o, origin_event_receipts i
+             WHERE o.task_id=?1 AND i.task_id=?1",
+        ),
+        settled
+    );
     assert_eq!(store.inbound_events(route.task).unwrap().len(), 0);
     assert!(
         store

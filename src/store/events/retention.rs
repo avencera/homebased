@@ -23,7 +23,8 @@ impl Store {
     /// Compact settled executor and origin event payloads older than 30 days
     ///
     /// Each side processes at most 64 rows in one immediate transaction. The
-    /// corresponding receipt is inserted before its payload row is deleted
+    /// corresponding receipt is inserted before its payload row is deleted, and
+    /// keeps when the event settled, which output retention dates a task by
     pub(crate) fn compact_old_event_payloads(&mut self) -> Result<EventRetentionBatch, EventError> {
         let cutoff = fmt_time(Utc::now() - ChronoDuration::days(EVENT_RETENTION_DAYS));
         let tx = self
@@ -34,7 +35,7 @@ impl Store {
         let outbox_rows = {
             let mut statement = tx
                 .prepare(
-                    "SELECT task_id,seq,event_json FROM executor_outbox
+                    "SELECT task_id,seq,event_json,acknowledged_at FROM executor_outbox
                      WHERE state='acknowledged' AND acknowledged_at <= ?1
                        AND NOT EXISTS (
                            SELECT 1 FROM executor_event_routes r
@@ -49,24 +50,26 @@ impl Store {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(storage)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(storage)?
         };
-        for (task, seq, event_json) in &outbox_rows {
+        for (task, seq, event_json, acknowledged_at) in &outbox_rows {
             let event = stored_event(task, *seq, event_json)?;
             tx.execute(
                 "INSERT INTO executor_event_receipts
-                 (task_id,seq,event_digest,result_json,terminal_callback)
-                 VALUES (?1,?2,?3,?4,?5)",
+                 (task_id,seq,event_digest,result_json,terminal_callback,acknowledged_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     task,
                     seq,
                     event_digest(&event)?,
                     encode(&OutboxState::Acknowledged)?,
                     is_terminal_callback_event(&event),
+                    acknowledged_at,
                 ],
             )
             .map_err(storage)?;
@@ -91,7 +94,7 @@ impl Store {
         let inbox_rows = {
             let mut statement = tx
                 .prepare(
-                    "SELECT i.task_id,i.seq,i.event_json,i.delivery_json
+                    "SELECT i.task_id,i.seq,i.event_json,i.delivery_json,i.settled_at
                      FROM origin_inbox i
                      JOIN origin_routes r ON r.task_id=i.task_id
                      WHERE i.settled_at <= ?1
@@ -107,13 +110,14 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(storage)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(storage)?
         };
-        for (task, seq, event_json, delivery_json) in &inbox_rows {
+        for (task, seq, event_json, delivery_json, settled_at) in &inbox_rows {
             let event = stored_event(task, *seq, event_json)?;
             let delivery: DeliveryState = decode(delivery_json)?;
             if !matches!(
@@ -128,14 +132,15 @@ impl Store {
             }
             tx.execute(
                 "INSERT INTO origin_event_receipts
-                 (task_id,seq,event_digest,delivery_json,terminal_callback)
-                 VALUES (?1,?2,?3,?4,?5)",
+                 (task_id,seq,event_digest,delivery_json,terminal_callback,settled_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     task,
                     seq,
                     event_digest(&event)?,
                     encode(&delivery)?,
                     is_terminal_callback_event(&event),
+                    settled_at,
                 ],
             )
             .map_err(storage)?;

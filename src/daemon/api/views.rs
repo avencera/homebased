@@ -347,6 +347,10 @@ pub struct TaskDetail {
     pub output_log: PathBuf,
     /// Task directory.
     pub evidence: PathBuf,
+    /// When retention removed `evidence` and `output_log`. Omitted while they
+    /// are kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_pruned_at: Option<DateTime<Utc>>,
     /// Event already sent, or the one that will be sent. `None` while running
     /// with no interim event.
     pub last_event: Option<HomebasedEvent>,
