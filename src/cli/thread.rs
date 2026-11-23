@@ -1,6 +1,6 @@
-//! `homebased thread`: context size, messages, compaction, and watches of
-//! agent threads anywhere in the Fleet, and the report a child thread sends
-//! its parent
+//! `homebased thread`: context size, messages, compaction, watches,
+//! interrupts, and answers of agent threads anywhere in the Fleet, and the
+//! report a child thread sends its parent
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,9 @@ use crate::child_thread::{ReportStageKind, ThreadReportRequest, ThreadReportResp
 use crate::client::Client;
 use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
+use crate::thread_control::{
+    ControlOutcome, ThreadControl, ThreadControlRequest, ThreadControlResponse,
+};
 use crate::thread_read::{
     CharLimit, MessageLimit, MessagePage, MessageRole, MessageWindow, ThreadMessage,
     ThreadReadRequest, ThreadReadResponse,
@@ -211,6 +214,63 @@ pub enum ThreadCommand {
         /// Append this file's text to the report, or stdin with `-`
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Stop each child thread that has not reported, as `thread interrupt
+        /// --stop` does, and stop waiting on it, when children are the only
+        /// open work left; a child whose machine does not answer still refuses
+        #[arg(long)]
+        stop_children: bool,
+    },
+    /// Interrupt a T3 thread's running turn, or stop the thread, on whichever
+    /// machine runs it
+    ///
+    /// Without --stop, ends the active run as the composer's stop button does,
+    /// and answers `idle` when no run is active; queued messages still start.
+    /// With --stop, does what the thread's Stop button does: ends the active
+    /// run, holds queued messages, and stops the thread's T3 subagents. It
+    /// stops the thread's own unreported child threads first, wherever they
+    /// run. A stopped child thread that has not reported counts as done, so
+    /// its parent stops waiting on it. Homebased tasks and jobs the thread
+    /// submitted keep running, and their final events can start it again
+    /// unless T3 still holds messages queued at the stop; cancel them with
+    /// `homebased cancel`. The reference must name exactly one thread;
+    /// prefixes are not accepted.
+    #[command(after_help = REFERENCE_HELP)]
+    Interrupt {
+        /// Thread reference
+        #[arg(value_name = "REF", required_unless_present = "task")]
+        reference: Option<String>,
+        /// Stop the thread instead of interrupting one run
+        #[arg(long)]
+        stop: bool,
+        /// Look only on this machine name or UUID
+        #[arg(long)]
+        machine: Option<String>,
+        /// The origin thread of this task; a worker session is not a T3
+        /// thread, so stop a worker with `homebased cancel`
+        #[arg(long, conflicts_with = "reference")]
+        task: Option<TaskId>,
+    },
+    /// Answer a question a T3 thread's agent is waiting on, on whichever
+    /// machine runs it
+    ///
+    /// The `HOMEBASED_MESSAGE` that tells a parent its child thread waits
+    /// on a question names the request and its questions. Pass one --answer
+    /// per question, in order; an answer that names an offered option picks
+    /// it. Approvals of commands and file changes are answered in T3 Code.
+    #[command(after_help = REFERENCE_HELP)]
+    Answer {
+        /// Thread reference
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// T3's id of the pending request
+        #[arg(long)]
+        request: String,
+        /// One answer per question, in order
+        #[arg(long = "answer", value_name = "TEXT", required = true)]
+        answers: Vec<String>,
+        /// Look only on this machine name or UUID
+        #[arg(long)]
+        machine: Option<String>,
     },
     /// Ask T3 to compact a T3 thread on whichever machine runs it
     ///
@@ -394,7 +454,11 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 .await?;
             print_watches(ctx, &response, "no watch")
         }
-        ThreadCommand::Report { summary, file } => {
+        ThreadCommand::Report {
+            summary,
+            file,
+            stop_children,
+        } => {
             let body = match file {
                 Some(path) => format!("{summary}\n\n{}", read_text(&path)?),
                 None => summary,
@@ -403,10 +467,48 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
                 api_version: API_VERSION,
                 caller: Caller::from_env()?,
                 body,
+                stop_children,
             };
             let response: ThreadReportResponse =
                 client.post_json("/v1/threads/report", &request).await?;
             print_report(ctx, &response)
+        }
+        ThreadCommand::Interrupt {
+            reference,
+            stop,
+            machine,
+            task,
+        } => {
+            let caller = Caller::from_env()?;
+            let mut threads = selectors(reference.into_iter().collect(), task, None, &caller)?;
+            let request = ThreadControlRequest {
+                api_version: API_VERSION,
+                thread: threads.remove(0),
+                machine,
+                carried_by: caller.t3_thread,
+                control: if stop {
+                    ThreadControl::Stop
+                } else {
+                    ThreadControl::Interrupt
+                },
+            };
+            control(ctx, &client, &request).await
+        }
+        ThreadCommand::Answer {
+            reference,
+            request,
+            answers,
+            machine,
+        } => {
+            let caller = Caller::from_env()?;
+            let request = ThreadControlRequest {
+                api_version: API_VERSION,
+                thread: ThreadSelector::Reference { text: reference },
+                machine,
+                carried_by: caller.t3_thread,
+                control: ThreadControl::Answer { request, answers },
+            };
+            control(ctx, &client, &request).await
         }
         ThreadCommand::Compact {
             reference,
@@ -442,6 +544,37 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Send one control request and print what T3 did
+async fn control(
+    ctx: &Ctx,
+    client: &Client,
+    request: &ThreadControlRequest,
+) -> Result<ExitCode, AppError> {
+    let response: ThreadControlResponse = client.post_json("/v1/threads/control", request).await?;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(serde_json::to_value(&response)?)?,
+        OutputMode::Quiet => println!("{}", response.outcome.as_str()),
+        OutputMode::Human => {
+            let detail = match &response.outcome {
+                ControlOutcome::Interrupted { run } => format!(" (run {run})"),
+                ControlOutcome::Answered { request } => format!(" (request {request})"),
+                ControlOutcome::Idle | ControlOutcome::Stopped => String::new(),
+            };
+            let closed = if response.closed_link.is_some() {
+                "; its parent no longer waits on its report"
+            } else {
+                ""
+            };
+            println!(
+                "{}{detail} {}{closed}",
+                response.outcome.as_str(),
+                response.thread.human_line()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn compact(client: &Client, request: &CompactRequest) -> Result<CompactResponse, AppError> {
@@ -620,6 +753,12 @@ fn print_report(ctx: &Ctx, response: &ThreadReportResponse) -> Result<ExitCode, 
                 ReportStageKind::Sent => "this thread stays active",
                 ReportStageKind::Settled => "this thread is settled",
             };
+            for child in &response.stopped {
+                println!(
+                    "stopped child thread thread_{} on machine {}",
+                    child.t3_thread, child.machine
+                );
+            }
             println!(
                 "{verb} to thread_{} on machine {} as message {}; {next}",
                 report.parent.t3_thread, report.parent.machine, report.message_id

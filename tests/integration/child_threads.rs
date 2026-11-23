@@ -1,7 +1,7 @@
 //! Child threads end to end: `t3 launch --child`, the parent's view of its
 //! children, `thread report`, and the settle that follows, against a fake T3
 
-use super::fake_t3::{FakeT3, install_t3, set_run};
+use super::fake_t3::{FakeT3, ask, install_t3, set_run};
 use super::{Harness, wait_until};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ const PARENT: (&str, &str) = (
 const CHILD_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000b";
 const SECOND_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000c";
 const GRANDCHILD_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000d";
+const GREAT_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000e";
 
 /// A harness whose daemon scans every second, a fake T3 that applies
 /// launches and settles to its state, and the parent thread [`PARENT`]
@@ -500,4 +501,178 @@ fn an_idle_unreported_child_stalls_and_its_watch_ends_once_it_reports_and_settle
         .filter(|event| event["event"] == "THREAD_STALLED")
         .count();
     assert_eq!(stalls, 1);
+}
+
+#[test]
+fn a_parent_hears_once_when_its_child_waits_on_a_question_and_can_answer_it() {
+    let (h, t3) = child_harness();
+    let child = launched_thread(&h.launch_child(PARENT, "Pick a database"));
+    h.child_agent(&child, CHILD_SESSION);
+    h.child_run(&child, "run-c-1", "waiting");
+    let questions = json!([{
+        "id": "Which database?",
+        "header": "Database",
+        "question": "Which database?",
+        "options": [{ "label": "Postgres" }, { "label": "SQLite" }]
+    }]);
+    ask(&h.t3_state(), &child, "request-1", &questions);
+
+    let alerted = |t3: &FakeT3| -> Vec<Value> {
+        messages_to(t3, PARENT.0)
+            .into_iter()
+            .filter(|message| {
+                message["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("is waiting on a question"))
+            })
+            .collect()
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || !alerted(&t3).is_empty()),
+        "the parent heard nothing"
+    );
+    let text = alerted(&t3)[0]["text"].as_str().unwrap().to_owned();
+    assert!(
+        text.contains(&format!(
+            "thread_{child} is waiting on a question (request request-1)"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("Database: Which database?"), "{text}");
+    assert!(text.contains("Options: Postgres | SQLite"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "homebased thread answer thread_{child} --request request-1"
+        )),
+        "{text}"
+    );
+    // later scans find the same request and send nothing more
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(alerted(&t3).len(), 1);
+
+    let reference = format!("thread_{child}");
+    let wrong = failed(
+        &h.as_agent(
+            PARENT,
+            &[
+                "thread",
+                "answer",
+                &reference,
+                "--request",
+                "request-2",
+                "--answer",
+                "x",
+            ],
+        ),
+        5,
+        "thread_control_refused",
+    );
+    assert!(
+        wrong["message"]
+            .as_str()
+            .unwrap()
+            .contains("it waits on request-1"),
+        "{wrong}"
+    );
+    let answered = succeeded(&h.as_agent(
+        PARENT,
+        &[
+            "thread",
+            "answer",
+            &reference,
+            "--request",
+            "request-1",
+            "--answer",
+            "sqlite",
+        ],
+    ));
+    assert_eq!(answered["outcome"], "answered");
+    let responses = t3.dispatched("runtime-request.respond");
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0]["threadId"], child.as_str());
+    assert_eq!(responses[0]["requestId"], "request-1");
+    assert_eq!(
+        responses[0]["answers"],
+        json!({ "Which database?": "SQLite" })
+    );
+}
+
+#[test]
+fn a_child_stops_its_unreported_children_by_interrupt_or_when_it_reports() {
+    let (h, t3) = child_harness();
+    let child = launched_thread(&h.launch_child(PARENT, "Port the uploader"));
+    h.child_agent(&child, CHILD_SESSION);
+    h.child_run(&child, "run-c-1", "running");
+    let as_child = (child.as_str(), CHILD_SESSION);
+    let first = launched_thread(&h.launch_child(as_child, "Port the retry module"));
+    h.child_agent(&first, GRANDCHILD_SESSION);
+    h.child_run(&first, "run-g-1", "running");
+    let second = launched_thread(&h.launch_child(as_child, "Port the cache"));
+    h.child_agent(&second, SECOND_SESSION);
+    h.child_run(&second, "run-s-1", "running");
+    let great = launched_thread(&h.launch_child((&second, SECOND_SESSION), "Port the cache keys"));
+    h.child_agent(&great, GREAT_SESSION);
+    h.child_run(&great, "run-k-1", "running");
+
+    // an interrupt ends one run and leaves the child owing its report
+    let first_ref = format!("thread_{first}");
+    let interrupted = succeeded(&h.as_agent(as_child, &["thread", "interrupt", &first_ref]));
+    assert_eq!(interrupted["outcome"], "interrupted");
+    assert_eq!(interrupted["run"], "run-g-1");
+    assert!(interrupted.get("closed_link").is_none(), "{interrupted}");
+    let idle = succeeded(&h.as_agent(as_child, &["thread", "interrupt", &first_ref]));
+    assert_eq!(idle["outcome"], "idle");
+    let interrupts = t3.dispatched("run.interrupt");
+    assert_eq!(interrupts.len(), 1, "{interrupts:?}");
+    assert_eq!(interrupts[0]["runId"], "run-g-1");
+
+    // a stop closes the link, so the stopped child no longer holds the report
+    let stopped = succeeded(&h.as_agent(as_child, &["thread", "interrupt", "--stop", &first_ref]));
+    assert_eq!(stopped["outcome"], "stopped");
+    assert!(stopped["closed_link"].is_string(), "{stopped}");
+    // a stopped child counts as done, so a live listing leaves it out
+    assert_eq!(h.t3_context(&first)["child_thread"]["closed"], true);
+    let live = succeeded(&h.as_agent(as_child, &["thread", "context", "--children", "--live"]));
+    let live: Vec<&str> = live["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|listed| listed["t3_thread"].as_str())
+        .collect();
+    assert_eq!(live, vec![second.as_str()]);
+    let refusal = failed(
+        &h.report(as_child, "Ported the uploader"),
+        5,
+        "thread_report_refused",
+    );
+    let open = refusal["input"]["open"].as_array().unwrap();
+    assert_eq!(open.len(), 1, "{refusal}");
+    assert_eq!(open[0]["child"]["t3_thread"], second.as_str());
+
+    let reported = succeeded(&h.as_agent(
+        as_child,
+        &[
+            "thread",
+            "report",
+            "--summary",
+            "Ported the uploader",
+            "--stop-children",
+        ],
+    ));
+    let stopped_children = reported["stopped"].as_array().unwrap();
+    assert_eq!(stopped_children.len(), 1, "{reported}");
+    assert_eq!(stopped_children[0]["t3_thread"], second.as_str());
+    let stops: Vec<Value> = t3.dispatched("thread.stop");
+    // stopping `second` stopped its own unreported child first
+    assert_eq!(
+        stops
+            .iter()
+            .map(|stop| stop["threadId"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec![first.clone(), great.clone(), second.clone()]
+    );
+    assert_eq!(h.t3_context(&great)["child_thread"]["closed"], true);
+    assert!(stops.iter().all(|stop| stop["stopDelegatedTasks"] == true));
+    let delivered = messages_to(&t3, PARENT.0);
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
 }

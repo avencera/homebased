@@ -466,7 +466,8 @@ impl ThreadContext {
     }
 
     /// Whether T3 is done with the thread: settled, or its delegated task
-    /// ended, and no turn runs
+    /// ended, and no turn runs; a child thread whose link was closed, as a
+    /// stop closes it, counts as done too
     ///
     /// This reads T3's own records, not the shown state, which says `waiting`
     /// while a homebased task owes the thread events. That work wakes the
@@ -475,8 +476,10 @@ impl ThreadContext {
     #[must_use]
     pub fn done(&self) -> bool {
         // a peer that predates `settled` shows a settled thread by its state
+        let closed = self.child_thread.as_ref().is_some_and(|info| info.closed);
         self.state == ThreadState::Settled
-            || (self.state != ThreadState::Running && (self.settled || self.task_finished))
+            || (self.state != ThreadState::Running
+                && (self.settled || self.task_finished || closed))
     }
 
     /// Whether `--children --live` and a `--children` watch leave the thread out

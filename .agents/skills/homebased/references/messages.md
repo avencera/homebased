@@ -176,6 +176,10 @@ conversation UUID is the message UUID.
 
 A child thread launched with `homebased t3 launch --child` reports with `homebased thread report`, not `message send` ([threads.md](threads.md#thread-report)). The report reaches the parent's T3 thread as one `HOMEBASED_MESSAGE` from the child's session. Its body starts `Report from child thread thread_<id>:` and a blank line, then the report text, so the parent finds the child under `thread context --children` by that id. Like any message without `--steer`, it waits for the parent's running turn to end. A follow-up report, sent from a later turn after the child was reopened, starts `Follow-up report from child thread thread_<id>:` instead. Its message UUID comes from the link between the two threads and the report's number, so every attempt, from a retry or the daemon after a restart, sends the same UUID, and its conversation UUID is the message UUID. Answer it with `message send --reply-to <message-uuid>` like any message; that starts a new turn in the child.
 
+## Child-thread request alerts
+
+When a linked child thread waits on a person, for a question its agent asked or an approval of a command or file change, the child's machine sends the parent's T3 thread one `HOMEBASED_MESSAGE` from the child's session, within a minute. Unlike a report, it steers into the parent's running turn, and it wakes a parent that sleeps with `homebased wait --long`. Its body starts `Child thread thread_<id> is waiting on a question (request <request-id>).`, or `on a <kind> approval`, then the child's T3 link, each question with its header and options, or what the approval asks for, and the command to answer it: `homebased thread answer thread_<id> --request <request-id> --answer "<text>"`, one `--answer` per question, in order ([threads.md](threads.md#thread-answer)). Answer an approval in T3 Code. Its message UUID comes from the link and the request, so every check, and a daemon restart, sends the same UUID, and the parent gets one alert per request.
+
 ## Retry safely
 
 Delivery is synchronous. The sender saves the message identity and request

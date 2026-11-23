@@ -581,6 +581,14 @@ pub enum AppError {
         /// base, which the CLI adds
         local: Option<LocalBase>,
     },
+    /// T3 would not interrupt, stop, or take an answer for the thread
+    #[error("{reference}: {message}")]
+    ThreadControlRefused {
+        /// The thread, as a reference
+        reference: String,
+        /// Why
+        message: String,
+    },
     /// `thread report` ran in a thread that `t3 launch --child` did not start
     #[error(
         "{thread} is not a child thread; only a thread that `homebased t3 launch --child` started can run `homebased thread report`"
@@ -594,6 +602,9 @@ pub enum AppError {
     ThreadReportRefused {
         /// Each piece of open work, as the refusal names it
         open: Vec<OpenWork>,
+        /// Children `--stop-children` stopped before the refusal, which
+        /// stay stopped
+        stopped: Vec<crate::child_thread::LinkEnd>,
     },
     /// The child thread's latest report has another body, and other text
     /// cannot be a follow-up yet
@@ -935,6 +946,7 @@ impl AppError {
             Self::T3ProjectNotFound { .. } => "t3_project_not_found",
             Self::T3WorktreeBaseMissing { .. } => "t3_worktree_base_missing",
             Self::T3LaunchRefused { .. } => "t3_launch_refused",
+            Self::ThreadControlRefused { .. } => "thread_control_refused",
             Self::NotChildThread { .. } => "not_child_thread",
             Self::ThreadReportRefused { .. } => "thread_report_refused",
             Self::ThreadReportConflict { .. } => "thread_report_conflict",
@@ -1033,6 +1045,7 @@ impl AppError {
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => 5,
             Self::NotChildThread { .. }
+            | Self::ThreadControlRefused { .. }
             | Self::ThreadReportRefused { .. }
             | Self::ThreadReportConflict { .. } => 5,
             Self::Queue(error) => error.exit_code(),
@@ -1078,6 +1091,7 @@ impl AppError {
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => http::StatusCode::CONFLICT,
             Self::NotChildThread { .. }
+            | Self::ThreadControlRefused { .. }
             | Self::ThreadReportRefused { .. }
             | Self::ThreadReportConflict { .. } => http::StatusCode::CONFLICT,
             Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => {
@@ -1274,7 +1288,12 @@ impl AppError {
                 message,
             } => json!({ "request_id": request, "machine": machine, "message": message }),
             Self::NotChildThread { thread } => json!({ "thread": thread }),
-            Self::ThreadReportRefused { open } => json!({ "open": open }),
+            Self::ThreadControlRefused { reference, message } => {
+                json!({ "reference": reference, "message": message })
+            }
+            Self::ThreadReportRefused { open, stopped } => {
+                json!({ "open": open, "stopped": stopped })
+            }
             Self::ThreadReportConflict {
                 link,
                 stage,

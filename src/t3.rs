@@ -69,7 +69,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use uuid::Builder;
+use uuid::{Builder, Uuid};
 
 use crate::callback::send_check::{SendCheck, SendFailure};
 use crate::curl::{CurlMethod, CurlRequest};
@@ -787,6 +787,202 @@ pub(crate) fn settle_thread(env: &T3Env, t3_thread: &str, run: &str) -> WakeOutc
         v2::settle(owner.origin, owner.thread, run, owner.token)
     })
     .unwrap_or_else(|failure| WakeOutcome::Unavailable(failure.to_string()))
+}
+
+/// What a person must answer before a T3 run can go on: a question the agent
+/// asked, or an approval
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRequest {
+    /// T3's runtime request id
+    pub id: String,
+    /// T3 thread that waits on it
+    pub thread: String,
+    /// T3's request kind: `user_input` for a question, `command`,
+    /// `file-change`, `permission`, and others for an approval
+    pub kind: String,
+    /// When the run started waiting, as T3 wrote it
+    pub created_at: String,
+    /// The questions of a `user_input` request, in order
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<PendingQuestion>,
+    /// What an approval asks for, such as the command and why T3 holds it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One question of a pending request
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingQuestion {
+    /// Id an answer is keyed by
+    pub id: String,
+    /// Short label T3 shows above it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The question
+    pub question: String,
+    /// Labels of the offered answers
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+impl PendingRequest {
+    /// Whether it is a question, which `respond` can answer, rather than an approval
+    #[must_use]
+    pub fn is_question(&self) -> bool {
+        self.kind == "user_input"
+    }
+
+    /// The request as T3's card for it shows it; a card that is missing or
+    /// of another shape leaves only the kind
+    fn from_card(
+        id: String,
+        thread: String,
+        kind: String,
+        created_at: String,
+        card: &Value,
+    ) -> Self {
+        let text = |value: &Value, key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        let questions = card
+            .get("questions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|question| {
+                Some(PendingQuestion {
+                    id: question.get("id")?.as_str()?.to_owned(),
+                    header: text(question, "header"),
+                    question: text(question, "question")?,
+                    options: question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| text(option, "label"))
+                        .collect(),
+                })
+            })
+            .collect();
+        let detail = [
+            text(card, "title"),
+            text(card, "prompt"),
+            text(card, "reason"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+        Self {
+            id,
+            thread,
+            kind,
+            created_at,
+            questions,
+            detail: (!detail.is_empty()).then_some(detail),
+        }
+    }
+}
+
+/// Every request a person must answer in this machine's T3, oldest first
+///
+/// # Errors
+///
+/// When the state cannot be read, or predates runtime requests; no T3 state
+/// at all is no request
+pub(crate) fn pending_requests(env: &T3Env) -> Result<Vec<PendingRequest>, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Ok(Vec::new());
+    }
+    v2::pending_requests(&state)
+}
+
+/// What [`interrupt_thread`] did, or why T3 would not
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptOutcome {
+    /// T3 took the interrupt of the run that was active
+    Interrupted(String),
+    /// No run was active, so nothing was interrupted
+    Idle,
+    /// T3 took the stop of the thread
+    Stopped,
+    /// T3 refused, such as for a thread it does not have
+    Refused(String),
+}
+
+/// Interrupt the active run of `t3_thread`, or with `stop` stop the thread
+/// as its Stop button does
+///
+/// # Errors
+///
+/// When T3 cannot be reached or its answer was lost; a retry is safe, since
+/// each command id derives from the run it ends
+pub(crate) fn interrupt_thread(
+    env: &T3Env,
+    t3_thread: &str,
+    stop: bool,
+    reason: &str,
+) -> Result<InterruptOutcome, String> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Err("this machine has no T3 state".into());
+    }
+    let run = v2::active_run(&state, t3_thread)?;
+    let outcome = match (&run, stop) {
+        (None, false) => return Ok(InterruptOutcome::Idle),
+        (Some(run), false) => with_t3_thread(env, t3_thread.to_owned(), |owner| {
+            v2::interrupt(owner.origin, owner.thread, run, reason, owner.token)
+        }),
+        (run, true) => {
+            // stopping again is harmless, so an idle thread gets a new command
+            // each time rather than one id that T3 would take only once
+            let key = run.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
+            with_t3_thread(env, t3_thread.to_owned(), |owner| {
+                v2::stop(owner.origin, owner.thread, &key, reason, owner.token)
+            })
+        }
+    };
+    match outcome.map_err(|failure| failure.to_string())? {
+        WakeOutcome::Woken { .. } if stop => Ok(InterruptOutcome::Stopped),
+        WakeOutcome::Woken { .. } => Ok(InterruptOutcome::Interrupted(run.unwrap_or_default())),
+        WakeOutcome::Refused(detail) => Ok(InterruptOutcome::Refused(detail)),
+        WakeOutcome::NotT3Thread => Ok(InterruptOutcome::Refused("T3 has no such thread".into())),
+        WakeOutcome::Unavailable(detail)
+        | WakeOutcome::Uncertain(detail)
+        | WakeOutcome::ApiChanged(detail) => Err(detail),
+    }
+}
+
+/// Answer the pending question `request` of `t3_thread` with `answers`, keyed
+/// by question id
+///
+/// # Errors
+///
+/// When T3 cannot be reached, its answer was lost, or it refused
+pub(crate) fn answer_request(
+    env: &T3Env,
+    t3_thread: &str,
+    request: &str,
+    answers: &Value,
+) -> Result<(), String> {
+    let outcome = with_t3_thread(env, t3_thread.to_owned(), |owner| {
+        v2::respond(owner.origin, owner.thread, request, answers, owner.token)
+    })
+    .map_err(|failure| failure.to_string())?;
+    match outcome {
+        WakeOutcome::Woken { .. } => Ok(()),
+        WakeOutcome::Refused(detail) => Err(format!("T3 refused the answer: {detail}")),
+        WakeOutcome::NotT3Thread => Err("T3 has no such thread".into()),
+        WakeOutcome::Unavailable(detail)
+        | WakeOutcome::Uncertain(detail)
+        | WakeOutcome::ApiChanged(detail) => Err(detail),
+    }
 }
 
 /// The T3 threads here that this machine's T3 is due to wake with the report

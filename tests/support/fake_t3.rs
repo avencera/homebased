@@ -206,6 +206,27 @@ impl Server {
                 });
                 Some(success(json!({})))
             }
+            // T3 ends the run, as its stop buttons do
+            Some("run.interrupt" | "thread.stop") => {
+                self.with_state(|db| {
+                    db.execute(
+                        "UPDATE orchestration_v2_projection_runs SET status = 'interrupted'
+                         WHERE thread_id = ?1 AND status IN ('preparing', 'starting', 'running', 'waiting')",
+                        [payload["threadId"].as_str().unwrap_or_default()],
+                    )
+                });
+                Some(success(json!({})))
+            }
+            Some("runtime-request.respond") => {
+                self.with_state(|db| {
+                    db.execute(
+                        "UPDATE orchestration_v2_projection_runtime_requests SET status = 'resolved'
+                         WHERE runtime_request_id = ?1",
+                        [payload["requestId"].as_str().unwrap_or_default()],
+                    )
+                });
+                Some(success(json!({})))
+            }
             _ => Some(success(json!({}))),
         }
     }
@@ -292,6 +313,21 @@ pub const STATE_TABLES: &str = "
         requested_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
         payload_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS orchestration_v2_projection_runtime_requests (
+        runtime_request_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        node_id TEXT,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+        payload_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_items (
+        item_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS orchestration_v2_projection_messages (
         message_id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
@@ -338,6 +374,23 @@ pub fn set_run(db: &rusqlite::Connection, thread: &str, run: &str, status: &str)
                  ?3, '{}')
          ON CONFLICT (run_id) DO UPDATE SET status = excluded.status",
         [run, thread, status],
+    )
+    .unwrap();
+}
+
+/// Make `thread` wait on the question `request`, with T3's card for it
+pub fn ask(db: &rusqlite::Connection, thread: &str, request: &str, questions: &Value) {
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_runtime_requests
+         (runtime_request_id, thread_id, kind, status) VALUES (?1, ?2, 'user_input', 'pending')",
+        [request, thread],
+    )
+    .unwrap();
+    let card = json!({ "requestId": request, "questions": questions });
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items (item_id, thread_id, type, payload_json)
+         VALUES (?1, ?2, 'user_input_request', ?3)",
+        rusqlite::params![format!("item-{request}"), thread, card.to_string()],
     )
     .unwrap();
 }

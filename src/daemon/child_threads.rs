@@ -8,8 +8,9 @@
 //! reported is still running then. The scan runs with the idle compaction
 //! loop. It resends a report whose send did not finish, which a lost reply
 //! or a daemon restart leaves, settles a reported thread once its reporting
-//! run has ended, and closes the parent's links to children on other
-//! machines that were put away without reporting
+//! run has ended, closes the parent's links to children on other machines
+//! that were put away without reporting, and tells parents of questions and
+//! approvals their children wait on (see [`super::child_requests`])
 
 use std::collections::HashMap;
 
@@ -21,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, call};
+use super::child_requests::{self, AlertMemory};
 use super::cluster::check_api_version;
 use super::context_threads::run_blocking;
 use super::message_sender;
@@ -36,6 +38,7 @@ use crate::error::AppError;
 use crate::machine::MachineId;
 use crate::message::MESSAGE_BODY_MAX_BYTES;
 use crate::t3::{SettleDue, T3Env, WakeOutcome, active_run_of, settle_state, settle_thread};
+use crate::thread_control::ThreadControl;
 use crate::thread_ref::Caller;
 
 /// Local-only routes; a report sends a message and settles a thread
@@ -87,32 +90,46 @@ async fn report(
     };
 
     check_body(&body.body)?;
+    // the message adds a header, so the size is checked on what is sent, and
+    // before any child is stopped, since a stop cannot be undone
+    let draft = match (&reporter.run, reporter.session) {
+        (Some(run), Some(source)) => Some(ThreadReport {
+            lineage,
+            seq,
+            body: body.body,
+            source,
+            run: run.clone(),
+            created_at: Utc::now(),
+            stage: ReportStage::Sending,
+        }),
+        _ => None,
+    };
+    if let Some(draft) = &draft {
+        draft.message().validate()?;
+    }
+
     let mut open = reporter.open;
     for remote in reporter.remote_children {
         open.extend(remote_child_open(&state, remote).await);
     }
+    // a report that would fail anyway stops nothing
+    let stopped = if body.stop_children && draft.is_some() {
+        stop_children(&state, &child, &mut open).await
+    } else {
+        Vec::new()
+    };
     if !open.is_empty() {
-        return Err(AppError::ThreadReportRefused { open });
+        return Err(AppError::ThreadReportRefused { open, stopped });
     }
-    let run = reporter.run.ok_or_else(|| AppError::Usage {
-        message: "no T3 run is active in this thread; run `homebased thread report` from the thread's own turn".into(),
-    })?;
-    let source = reporter.session.ok_or_else(|| AppError::Usage {
+    if reporter.run.is_none() {
+        return Err(AppError::Usage {
+            message: "no T3 run is active in this thread; run `homebased thread report` from the thread's own turn".into(),
+        });
+    }
+    let report = draft.ok_or_else(|| AppError::Usage {
         message: "this T3 thread has no Claude session or Codex thread to send the report from"
             .into(),
     })?;
-
-    let report = ThreadReport {
-        lineage,
-        seq,
-        body: body.body,
-        source,
-        run,
-        created_at: Utc::now(),
-        stage: ReportStage::Sending,
-    };
-    // the message adds a header, so the size is checked on what is sent
-    report.message().validate()?;
     let (saved, created) = call(&state.store, |reply| StoreMsg::BeginReport {
         report: Box::new(report.clone()),
         reply,
@@ -129,7 +146,7 @@ async fn report(
         "Child thread report saved"
     );
     let sent = finish_send(&state, saved).await?;
-    Ok(Json(response(&sent, false)))
+    Ok(Json(response(&sent, false, stopped)))
 }
 
 /// Finish the report already saved, refusing another body
@@ -142,15 +159,90 @@ async fn resume(
         return Err(ReportConflict::with(&saved));
     }
     let report = finish_send(state, saved).await?;
-    Ok(Json(response(&report, true)))
+    Ok(Json(response(&report, true, Vec::new())))
 }
 
-fn response(report: &ThreadReport, resumed: bool) -> ThreadReportResponse {
+fn response(report: &ThreadReport, resumed: bool, stopped: Vec<LinkEnd>) -> ThreadReportResponse {
     ThreadReportResponse {
         api_version: API_VERSION,
         report: report.view(),
         resumed,
+        stopped,
     }
+}
+
+/// Stop the unreported children in `open` and close their links, when
+/// children are all that is left open, and return the children stopped
+///
+/// A child that cannot be stopped stays in `open`, now saying why, so the
+/// report still refuses; one its machine no longer finds is not stopped but
+/// its link closes, as the scan would close it
+async fn stop_children(
+    state: &AppState,
+    parent: &LinkEnd,
+    open: &mut Vec<OpenWork>,
+) -> Vec<LinkEnd> {
+    let only_children = open
+        .iter()
+        .all(|work| matches!(work, OpenWork::Child { .. } | OpenWork::Unconfirmed { .. }));
+    if open.is_empty() || !only_children {
+        return Vec::new();
+    }
+    let links = match call(&state.store, |reply| StoreMsg::ThreadLinks { reply }).await {
+        Ok(links) => links,
+        Err(error) => {
+            warn!("child thread links cannot be read: {error}");
+            return Vec::new();
+        }
+    };
+
+    let mut stopped = Vec::new();
+    let mut left = Vec::new();
+    for work in std::mem::take(open) {
+        let (OpenWork::Child { child } | OpenWork::Unconfirmed { child, .. }) = &work else {
+            left.push(work);
+            continue;
+        };
+        let Some(link) = links
+            .iter()
+            .find(|link| link.lineage.parent == *parent && link.lineage.child == *child)
+        else {
+            left.push(work);
+            continue;
+        };
+        match stop_child(state, child).await {
+            Ok(()) => {
+                super::thread_control::close_link(state, link.lineage.id).await;
+                stopped.push(child.clone());
+            }
+            Err(reason) => left.push(OpenWork::Unconfirmed {
+                child: child.clone(),
+                reason,
+            }),
+        }
+    }
+    *open = left;
+    stopped
+}
+
+/// Stop `child` on its machine; a machine that answers without it has
+/// nothing left to stop
+async fn stop_child(state: &AppState, child: &LinkEnd) -> Result<(), String> {
+    let reference = format!("thread_{}", child.t3_thread);
+    let found = find_on(state, child.machine, vec![reference])
+        .await?
+        .pop()
+        .unwrap_or_default();
+    let Some(thread) = found
+        .iter()
+        .find(|thread| thread.t3_thread.as_deref() == Some(child.t3_thread.as_str()))
+    else {
+        return Ok(());
+    };
+    super::thread_control::control_resolved(state, thread, ThreadControl::Stop)
+        .await
+        .map(drop)
+        .map_err(|error| format!("it could not be stopped: {error}"))
 }
 
 fn check_body(body: &str) -> Result<(), AppError> {
@@ -271,14 +363,15 @@ async fn finish_send(state: &AppState, report: ThreadReport) -> Result<ThreadRep
 }
 
 /// What the scan remembers between runs: how many scans in a row found each
-/// remote child gone
+/// remote child gone, and the requests its parents were told of
 #[derive(Debug, Default)]
 pub(super) struct ChildScanMemory {
     gone: HashMap<LinkId, u8>,
+    alerted: AlertMemory,
 }
 
-/// Finish unfinished reports, and close links to remote children put away
-/// without a report
+/// Finish unfinished reports, close links to remote children put away
+/// without a report, and tell parents of requests their children wait on
 pub(super) async fn scan(state: &AppState, memory: &mut ChildScanMemory) {
     let reports = match call(&state.store, |reply| StoreMsg::OpenReports { reply }).await {
         Ok(reports) => reports,
@@ -299,6 +392,7 @@ pub(super) async fn scan(state: &AppState, memory: &mut ChildScanMemory) {
         }
     }
     close_gone_children(state, memory).await;
+    child_requests::scan(state, &mut memory.alerted).await;
 }
 
 /// Settle the reporting thread of `report` once its run has ended, unless
