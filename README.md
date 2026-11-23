@@ -661,6 +661,7 @@ homebased t3 project add ~/code/app --machine code [--title app] \
 homebased t3 project icon ~/code/app --machine code --lucide captions --color sky
 homebased t3 launch --machine code --project ~/code/app \
   --message "Fix the flaky upload test" [--worktree main --branch fix/upload] \
+  [--clone-if-missing [--clone-into ~/code/app]] \
   [--provider codex --model gpt-6.1-sol --model-option reasoningEffort=high] \
   [--reply-route | --child]
 ```
@@ -673,10 +674,27 @@ workspace (the project root, a new worktree, or `--existing-worktree`), runs
 the project setup script, and starts the first message.
 
 - `--project` takes a T3 project id, the project's workspace root on that
-  machine (absolute or `~/`), or its exact title. `t3 projects` lists them with
-  the model a launch uses by default, and lists the provider instances that
-  machine's running T3 has enabled under `providers`, which is absent when T3
-  is not running there.
+  machine (absolute or `~/`), its exact title, or the repository it checks
+  out, as `owner/repo` or a git remote URL. A repository matches the project
+  whose `origin` remote names it, compared by host and path in lowercase
+  without scheme, user, port, trailing slash, or `.git`, so the SSH and HTTPS
+  forms of one repository match. `owner/repo` matches on any host; a URL or
+  `host/owner/repo` names the host too. An exact title wins over a
+  repository of the same name. `t3 projects` lists projects with the model a
+  launch uses by default, and lists the provider instances that machine's
+  running T3 has enabled under `providers`, which is absent when T3 is not
+  running there.
+- `--clone-if-missing` clones the repository `--project` names into
+  `~/code/<repo>` on that machine, or `--clone-into <dir>`, adds it as a
+  project, and launches there, when no project checks it out. `owner/repo`
+  clones from GitHub, over SSH when a project there already reaches GitHub
+  over SSH and over HTTPS otherwise; a URL clones as given. The clone goes to a
+  staging directory beside the target and moves into place once complete, so
+  a clone cut short leaves nothing there. A directory already there that is a
+  clone of the repository is added as it is, which makes a retry safe; any
+  other directory there, or a clone that fails, refuses the launch with
+  `t3_launch_refused` and git's reason. Git runs without a terminal, so a
+  credential prompt fails the clone instead of waiting.
 - `t3 project add <path>` adds an existing directory on that machine as a T3
   project, through that machine's own `t3 project add`, so the running T3 shows
   it at once. A relative path resolves against the current directory, then
@@ -723,8 +741,24 @@ the project setup script, and starts the first message.
   link that opens it in T3 Code.
 - T3 launches once per `--request-id`, so repeating the command with the same
   id after `t3_launch_outcome_unknown` returns the same thread.
-- A workspace that cannot be prepared, such as a base branch that does not
-  exist, fails the run inside the new thread rather than the command.
+- With `--worktree`, the launching machine checks that the base resolves to a
+  commit in the project's checkout before it asks T3, fetching its branch
+  from origin first with `--from-origin`, as T3 then does. `--from-origin`
+  fetches branches only, so a commit id or an expression such as `main~2`
+  must already be there. A missing base fails the command with
+  `t3_worktree_base_missing` (exit 3). Its `input.fetched` is `true` when the
+  branch was fetched and origin has no such branch, and its
+  `input.repository` is the project's `host/owner/repo` when its origin
+  names one. A fetch that cannot run, such as one that times out, leaves the
+  decision to T3. When the command runs in a checkout whose origin is that
+  same repository, the calling machine looks the base up there and says what
+  it found in `input.local.kind`: `unpushed_branch`, which needs a push and
+  `--from-origin`; `unpushed_commit` (with `input.local.commit`), which needs
+  a pushed branch at that commit to launch from with `--from-origin`; or
+  `pushed`, a branch origin already has, which needs `--from-origin`. A
+  project that is not a git repository refuses a worktree with
+  `t3_launch_refused`. Other workspace failures, such as a branch name that
+  already exists there, still fail in the new thread or T3's own check.
 
 A machine whose homebased predates these commands answers `t3_incompatible` and
 needs `homebased update`. A `~/` path, quoted or expanded by the shell,

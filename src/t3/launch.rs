@@ -30,15 +30,21 @@
 //! - `environment-id` in the user data names this T3 environment, which the
 //!   `t3code://threads/<environment>/<thread>` link needs to open a thread on
 //!   another machine
+//! - T3 `0.1.11` checks a worktree base inside `launchThread` and refuses the
+//!   call, while earlier releases fail the new thread's run instead; homebased
+//!   checks the base itself first, see [`super::git`], so a missing base fails
+//!   the same way on every release and names what to push
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::git::{BaseProblem, CLONE_TIMEOUT, Git, RepoKey, RepoSelector};
 use super::rpc::{self, Exit};
 use super::{
     ApiFailure, IssueError, T3Cli, T3Env, connect, deterministic_id, state_connection, state_path,
@@ -157,8 +163,14 @@ pub enum OptionValue {
 pub struct LaunchSpec {
     /// Caller retry identity; a repeat returns the thread the first call made
     pub request_id: Uuid,
-    /// T3 project id, its workspace root path, or its exact title
+    /// T3 project id, its workspace root path, its exact title, or the
+    /// repository its origin remote names, as `owner/repo` or a remote URL
     pub project: String,
+    /// Clone the repository `project` names and add it as a project when no
+    /// project matches; skipped when absent, so a peer that predates clones
+    /// still takes other launches
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<CloneSpec>,
     /// Thread title; derived from the message when omitted
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -191,6 +203,9 @@ impl LaunchSpec {
         }
         if blank(&self.project) {
             return Err("project must not be empty".into());
+        }
+        if let Some(clone) = &self.clone {
+            clone.validate(&self.project)?;
         }
         if self.title.as_deref().is_some_and(blank) {
             return Err("title must not be blank".into());
@@ -241,6 +256,32 @@ impl LaunchSpec {
             return Err("model option ids must not be empty".into());
         }
         Ok(())
+    }
+}
+
+/// Where to clone a repository that no project on the launching machine checks out
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneSpec {
+    /// Directory for the clone: absolute, or starting with `~/` on the
+    /// launching machine; `~/code/<repo>` when omitted
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<String>,
+}
+
+impl CloneSpec {
+    fn validate(&self, project: &str) -> Result<(), String> {
+        if RepoSelector::parse(project).is_none() {
+            return Err(format!(
+                "--clone-if-missing needs --project to name a repository, as owner/repo or a remote URL, not {project:?}"
+            ));
+        }
+        match &self.into {
+            Some(path) if !(path.starts_with('/') || path.starts_with("~/")) => {
+                Err("clone directory must be absolute or start with ~/".into())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -440,6 +481,19 @@ pub enum LaunchError {
         selector: String,
         /// Title and root of the projects T3 has, up to 50
         projects: Vec<String>,
+        /// Whether the selector names a repository, which a launch can clone
+        repository: bool,
+    },
+    /// The worktree base resolves to no commit in the project's repository
+    BaseMissing {
+        /// Branch or commit the worktree was to start from
+        base_ref: String,
+        /// Project checkout it was looked up in
+        workspace_root: String,
+        /// Whether its branch was fetched from the remote first
+        fetched: bool,
+        /// The project's repository, from its origin, when it has one
+        repository: Option<String>,
     },
     /// The request cannot launch as given, or T3 refused it
     Refused(String),
@@ -657,8 +711,13 @@ fn set_icon(env: &T3Env, project_id: &str, change: &IconChange) -> Result<(), La
 /// that cannot launch issues no token. The bearer token is revoked on return
 pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, LaunchError> {
     spec.validate().map_err(LaunchError::Refused)?;
-    let projects = projects(env)?;
-    let project = find_project(&projects, &spec.project, &env.home)?;
+    let (projects, project) = resolve_project(env, spec)?;
+    let project = &project;
+    // a retry after a lost reply returns the thread already launched, even
+    // when its base has gone since
+    if !launched_before(env, spec.request_id) {
+        check_workspace(env, spec, project)?;
+    }
     let model = model_selection(spec, project)?;
 
     let userdata = env.userdata();
@@ -858,17 +917,218 @@ fn launch_failure(cause: &[Value]) -> LaunchError {
     }
 }
 
-/// The one project `selector` names: an id, a workspace root, or a title
+/// The project `spec` names, cloned and added first when it asks for that and
+/// none matches, with every project T3 lists
+fn resolve_project(
+    env: &T3Env,
+    spec: &LaunchSpec,
+) -> Result<(Vec<T3Project>, T3Project), LaunchError> {
+    let listed = projects(env)?;
+    let git = Git::find(env);
+    let origin = |root: &str| git.as_ref()?.origin_url(Path::new(root));
+    let missing = match find_project(&listed, &spec.project, &env.home, origin) {
+        Ok(project) => {
+            let project = project.clone();
+            return Ok((listed, project));
+        }
+        Err(error @ LaunchError::ProjectNotFound { .. }) => error,
+        Err(error) => return Err(error),
+    };
+    let (Some(clone), Some(repo)) = (&spec.clone, RepoSelector::parse(&spec.project)) else {
+        return Err(missing);
+    };
+    let git = git.ok_or_else(|| {
+        LaunchError::Refused("git is not installed on that machine, so it cannot clone".into())
+    })?;
+
+    let root = clone_repository(env, &git, &listed, &repo, clone, spec.request_id)?;
+    let added = add_project(
+        env,
+        &ProjectSpec {
+            path: root.to_string_lossy().into_owned(),
+            title: None,
+            icon: None,
+            existing_only: false,
+        },
+    )?;
+    Ok((projects(env)?, added.project))
+}
+
+/// Clone `repo` for a launch, into the clone directory or `~/code/<repo>`, and
+/// return the checkout
+///
+/// The clone lands in a staging directory named by the request and moves into
+/// place when complete, so a clone cut short leaves no half checkout there,
+/// and a retry finds the finished one
+fn clone_repository(
+    env: &T3Env,
+    git: &Git<'_>,
+    listed: &[T3Project],
+    repo: &RepoSelector,
+    clone: &CloneSpec,
+    request: Uuid,
+) -> Result<PathBuf, LaunchError> {
+    let into = match &clone.into {
+        Some(path) => expand_home(path, &env.home),
+        None => env.home.join("code").join(repo.name()),
+    };
+    let is_clone = |dir: &Path| {
+        git.origin_url(dir)
+            .and_then(|url| RepoKey::from_remote(&url))
+            .is_some_and(|key| repo.matches(&key))
+    };
+    if into.exists() {
+        if is_clone(&into) {
+            return Ok(into);
+        }
+        return Err(LaunchError::Refused(format!(
+            "{} exists and is not a clone of {}; pass --clone-into with another directory",
+            into.display(),
+            repo.name()
+        )));
+    }
+
+    let parent = into.parent().ok_or_else(|| {
+        LaunchError::Refused(format!("{} has no parent directory", into.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        LaunchError::Unavailable(format!("cannot create {}: {error}", parent.display()))
+    })?;
+    sweep_staging(parent, repo.name());
+    // each attempt its own, so a retry never deletes a clone still running
+    let staging = parent.join(format!(
+        "{}{}-{}",
+        staging_prefix(repo.name()),
+        request,
+        Uuid::now_v7()
+    ));
+    let known: Vec<String> = listed
+        .iter()
+        .filter_map(|project| git.origin_url(Path::new(&project.workspace_root)))
+        .collect();
+    let url = repo.clone_url(known.iter().map(String::as_str));
+    if let Err(reason) = git.clone_into(&url, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(LaunchError::Refused(reason));
+    }
+
+    if let Err(error) = fs::rename(&staging, &into) {
+        let _ = fs::remove_dir_all(&staging);
+        // another launch cloned the same repository there first
+        if is_clone(&into) {
+            return Ok(into);
+        }
+        return Err(LaunchError::Unavailable(format!(
+            "cannot move the clone to {}: {error}",
+            into.display()
+        )));
+    }
+    Ok(into)
+}
+
+fn staging_prefix(name: &str) -> String {
+    format!(".{name}.homebased-clone-")
+}
+
+/// Whether `suffix` is the `<request>-<attempt>` pair of UUIDs a clone
+/// attempt names its staging directory with, so the sweep removes only those
+fn is_attempt_suffix(suffix: &str) -> bool {
+    const UUID_LEN: usize = 36;
+    suffix.len() == UUID_LEN * 2 + 1
+        && suffix.is_char_boundary(UUID_LEN)
+        && suffix[UUID_LEN..].starts_with('-')
+        && Uuid::parse_str(&suffix[..UUID_LEN]).is_ok()
+        && Uuid::parse_str(&suffix[UUID_LEN + 1..]).is_ok()
+}
+
+/// Remove the staging directories of clones that a timeout or restart cut
+/// short: those older than any clone can run
+fn sweep_staging(parent: &Path, name: &str) {
+    let prefix = staging_prefix(name);
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > CLONE_TIMEOUT * 2);
+        let file_name = entry.file_name();
+        let owned = file_name
+            .to_string_lossy()
+            .strip_prefix(&prefix)
+            .is_some_and(is_attempt_suffix);
+        if stale && owned {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether T3 here already has the thread of launch `request`
+fn launched_before(env: &T3Env, request: Uuid) -> bool {
+    let state = state_path(&env.userdata());
+    state_connection(&state)
+        .and_then(|db| {
+            db.query_row(
+                "SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ?1",
+                [launch_thread_id(request)],
+                |_| Ok(()),
+            )
+            .optional()
+        })
+        .is_ok_and(|found| found.is_some())
+}
+
+/// Refuse a worktree whose base the project's repository lacks, before T3 is
+/// contacted
+fn check_workspace(env: &T3Env, spec: &LaunchSpec, project: &T3Project) -> Result<(), LaunchError> {
+    let Workspace::Worktree {
+        base_ref,
+        start_from_origin,
+        ..
+    } = &spec.workspace
+    else {
+        return Ok(());
+    };
+    // without git here T3 decides, as it did before this check
+    let Some(git) = Git::find(env) else {
+        return Ok(());
+    };
+    let root = Path::new(&project.workspace_root);
+    match git.check_base(root, base_ref, *start_from_origin) {
+        Ok(()) => Ok(()),
+        Err(BaseProblem::NotRepository) => Err(LaunchError::Refused(format!(
+            "project {} ({}) is not a git repository, so it cannot start a worktree; launch it without --worktree",
+            project.title, project.workspace_root
+        ))),
+        Err(BaseProblem::Missing { fetched }) => Err(LaunchError::BaseMissing {
+            base_ref: base_ref.clone(),
+            workspace_root: project.workspace_root.clone(),
+            fetched,
+            repository: git
+                .origin_url(root)
+                .and_then(|url| RepoKey::from_remote(&url))
+                .map(|key| key.as_str().to_owned()),
+        }),
+    }
+}
+
+/// The one project `selector` names: an id, a workspace root, a title, or
+/// the repository of its `origin`, which `origin` reads for a project root
 fn find_project<'a>(
     projects: &'a [T3Project],
     selector: &str,
     home: &Path,
+    origin: impl Fn(&str) -> Option<String>,
 ) -> Result<&'a T3Project, LaunchError> {
     if let Some(project) = projects.iter().find(|project| project.id == selector) {
         return Ok(project);
     }
 
-    let matches: Vec<&T3Project> = if selector.starts_with('/') || selector.starts_with("~/") {
+    let repository = RepoSelector::parse(selector);
+    let mut matches: Vec<&T3Project> = if selector.starts_with('/') || selector.starts_with("~/") {
         let wanted = comparable(&expand_home(selector, home));
         projects
             .iter()
@@ -880,6 +1140,18 @@ fn find_project<'a>(
             .filter(|project| project.title == selector)
             .collect()
     };
+    // a title wins, so a project titled `owner/repo` keeps working; origins
+    // are read only when it does not match, one git call per project
+    if let (true, Some(repository)) = (matches.is_empty(), &repository) {
+        matches = projects
+            .iter()
+            .filter(|project| {
+                origin(&project.workspace_root)
+                    .and_then(|url| RepoKey::from_remote(&url))
+                    .is_some_and(|key| repository.matches(&key))
+            })
+            .collect();
+    }
     match matches.as_slice() {
         [project] => Ok(project),
         [] => Err(LaunchError::ProjectNotFound {
@@ -889,6 +1161,7 @@ fn find_project<'a>(
                 .take(LISTED_PROJECTS)
                 .map(|project| format!("{} ({})", project.title, project.workspace_root))
                 .collect(),
+            repository: repository.is_some(),
         }),
         several => Err(LaunchError::Refused(format!(
             "{} projects match {selector:?}; pass one of their ids: {}",
@@ -1062,6 +1335,7 @@ mod tests {
         LaunchSpec {
             request_id: Uuid::now_v7(),
             project: project.into(),
+            clone: None,
             title: None,
             message: Some("Profile the release build\nthen report the hot paths".into()),
             workspace: Workspace::Root,
@@ -1089,6 +1363,32 @@ mod tests {
             settings.to_string(),
         )
         .unwrap();
+    }
+
+    /// A git repository at `root` with one commit on `main`, or `false`
+    /// without git
+    fn git_repository(root: &std::path::Path) -> bool {
+        if which::which("git").is_err() {
+            return false;
+        }
+        fs::create_dir_all(root).unwrap();
+        let git = |args: &[&str]| {
+            // the developer's own config, such as commit signing, stays out
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        true
     }
 
     #[test]
@@ -1124,7 +1424,9 @@ mod tests {
         );
         let fixture = Fixture::empty(Some(&server), live_pid());
         let root = fixture.dir.path().join("code/app");
-        fs::create_dir_all(&root).unwrap();
+        if !git_repository(&root) {
+            return;
+        }
         fixture
             .v2_state()
             .launch_project("project-app", "app", &root.to_string_lossy(), None);
@@ -1240,6 +1542,7 @@ mod tests {
             Err(LaunchError::ProjectNotFound {
                 selector: "/srv/missing".into(),
                 projects: vec!["app (/srv/app)".into()],
+                repository: false,
             })
         );
         assert_eq!(
