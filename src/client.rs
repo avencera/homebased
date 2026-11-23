@@ -536,6 +536,18 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         "t3_project_not_found" => AppError::T3ProjectNotFound {
             selector: decode_field(input, "selector").unwrap_or_default(),
             projects: decode_field(input, "projects").unwrap_or_default(),
+            // a peer older than clones sends no flag
+            repository: decode_field(input, "repository").unwrap_or_default(),
+        },
+        "t3_worktree_base_missing" => match decode_field(input, "base_ref") {
+            Some(base_ref) => AppError::T3WorktreeBaseMissing {
+                base_ref,
+                workspace_root: decode_field(input, "workspace_root").unwrap_or_default(),
+                fetched: decode_field(input, "fetched").unwrap_or_default(),
+                repository: decode_field(input, "repository").flatten(),
+                local: decode_field(input, "local").flatten(),
+            },
+            None => AppError::Internal { message },
         },
         "not_child_thread" => decode_field(input, "thread")
             .map_or(AppError::Internal { message }, |thread| {

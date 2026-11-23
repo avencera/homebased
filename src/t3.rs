@@ -37,16 +37,18 @@
 //! commands with a deadline. The callback dispatcher must call this module from
 //! `spawn_blocking`
 
+mod git;
 mod hold;
 mod launch;
 mod rpc;
 mod v2;
 
+pub use git::{CLONE_TIMEOUT, FETCH_TIMEOUT, RepoKey, names_repository};
 pub use launch::{
-    AddedProject, IconChange, IconColor, InteractionMode, LaunchError, LaunchSpec, LaunchedThread,
-    MESSAGE_MAX_BYTES as LAUNCH_MESSAGE_MAX_BYTES, ModelChoice, ModelOption, OptionValue,
-    ProjectIcon, ProjectSpec, ProviderInstance, RuntimeMode, T3Project, Workspace, add_project,
-    launch_thread, launch_thread_id, projects, providers,
+    AddedProject, CloneSpec, IconChange, IconColor, InteractionMode, LaunchError, LaunchSpec,
+    LaunchedThread, MESSAGE_MAX_BYTES as LAUNCH_MESSAGE_MAX_BYTES, ModelChoice, ModelOption,
+    OptionValue, ProjectIcon, ProjectSpec, ProviderInstance, RuntimeMode, T3Project, Workspace,
+    add_project, launch_thread, launch_thread_id, projects, providers,
 };
 
 use std::ffi::OsString;

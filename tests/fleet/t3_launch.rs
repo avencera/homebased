@@ -353,3 +353,270 @@ fn a_child_launched_on_another_machine_keeps_its_parent_waiting_until_it_reports
     assert_eq!(parent_state(), "idle");
     assert_eq!(children()[0]["child_thread"]["reported"], true);
 }
+
+/// Run git in `dir` as a test user, panicking on failure
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A repository at `dir` with one commit on `main`
+fn repository(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "--quiet", "--initial-branch=main"]);
+    git(dir, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+}
+
+/// Runs the command from `cwd`, as an agent in a checkout there would
+fn run_json_in(daemon: &Daemon, cwd: &Path, args: &[&str]) -> (i32, Value) {
+    let output = daemon
+        .cmd()
+        .current_dir(cwd)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    let stream = if output.status.success() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let value = serde_json::from_slice(stream).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code().unwrap_or(-1), value)
+}
+
+/// Make the fake `t3` CLI of `home` add projects to the state database too,
+/// as `t3 project add <root>` does
+fn fake_project_add(home: &Path, sqlite: &Path) {
+    let state = home.join(".t3/userdata/statev2.sqlite");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'auth session issue') printf '%s\\n' '{{\"sessionId\":\"fake-session\",\"token\":\"fake-token\",\"method\":\"bearer-access-token\",\"scopes\":[]}}' ;;\n  'auth session revoke') exit 0 ;;\n  'project add --') '{}' '{}' \"INSERT INTO projection_projects (project_id, title, workspace_root) VALUES ('project-cloned', 'cloned', '$4')\" ;;\n  *) exit 3 ;;\nesac\n",
+        sqlite.display(),
+        state.display()
+    );
+    fs::write(home.join(".t3/bin/t3"), script).unwrap();
+}
+
+#[test]
+fn a_project_resolves_on_another_machine_by_its_repository_or_is_cloned_there() {
+    let (Ok(_), Ok(_), Ok(sqlite)) = (
+        which::which("curl"),
+        which::which("git"),
+        which::which("sqlite3"),
+    ) else {
+        return;
+    };
+    let origin = Daemon::start("repo-origin", true);
+    let executor = Daemon::start("repo-executor", true);
+    add_peer(&origin, &executor);
+    let t3 = FakeT3::start(None);
+    install_t3(&executor.user_home, &t3.origin);
+    fake_project_add(&executor.user_home, &sqlite);
+    // the executor's checkout of the project, whose origin is an SSH remote
+    let app = executor.user_home.join("code/app");
+    repository(&app);
+    git(
+        &app,
+        &["remote", "add", "origin", "git@github.com:Acme/App.git"],
+    );
+    // a repository no project checks out yet, reachable offline through a
+    // rewrite of its HTTPS URL
+    let remotes = executor.user_home.join("remotes");
+    let source = remotes.join("acme/tool.git");
+    repository(&source);
+    let gitconfig = format!(
+        "[url \"{}/\"]\n\tinsteadOf = https://git.example.test/\n",
+        remotes.display()
+    );
+    fs::write(executor.user_home.join(".gitconfig"), gitconfig).unwrap();
+    let launch = |project: &str, extra: &[&str]| {
+        let mut args = vec![
+            "t3",
+            "launch",
+            "--machine",
+            "repo-executor",
+            "--project",
+            project,
+            "--title",
+            "By repository",
+        ];
+        args.extend(extra);
+        run_json(&origin, &args)
+    };
+
+    let (code, by_url) = launch("https://github.com/acme/app", &[]);
+    assert_eq!(code, 0, "{by_url}");
+    assert_eq!(by_url["thread"]["project_id"], "project-app");
+    let (code, by_name) = launch("acme/app.git", &[]);
+    assert_eq!(code, 0, "{by_name}");
+    assert_eq!(by_name["thread"]["project_id"], "project-app");
+
+    let (code, missing) = launch("https://git.example.test/acme/tool.git", &[]);
+    assert_eq!(code, 3, "{missing}");
+    assert_eq!(missing["error"]["code"], "t3_project_not_found");
+    assert_eq!(missing["error"]["input"]["repository"], true);
+    assert_eq!(t3.launches().len(), 2);
+
+    let request = uuid::Uuid::now_v7().to_string();
+    let clone = [
+        "--clone-if-missing",
+        "--clone-into",
+        "~/code/tool",
+        "--request-id",
+        &request,
+    ];
+    let (code, cloned) = launch("https://git.example.test/acme/tool.git", &clone);
+    assert_eq!(code, 0, "{cloned}");
+    let checkout = executor.user_home.join("code/tool");
+    assert_eq!(cloned["thread"]["project_id"], "project-cloned");
+    assert_eq!(
+        cloned["thread"]["workspace_root"],
+        checkout.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        git(&checkout, &["config", "--get", "remote.origin.url"]),
+        "https://git.example.test/acme/tool.git"
+    );
+    // the clone moved into place; no staging directory is left beside it
+    let leftovers: Vec<String> = fs::read_dir(executor.user_home.join("code"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("homebased-clone"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // a retry after a lost reply finds the clone and its project, adding nothing
+    let (code, retried) = launch("https://git.example.test/acme/tool.git", &clone);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(
+        retried["thread"]["thread_id"],
+        cloned["thread"]["thread_id"]
+    );
+    let (code, listed) = run_json(&origin, &["t3", "projects", "--machine", "repo-executor"]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["projects"].as_array().unwrap().len(), 2, "{listed}");
+}
+
+#[test]
+fn a_missing_worktree_base_fails_the_command_and_names_a_branch_only_the_caller_has() {
+    let (Ok(_), Ok(_)) = (which::which("curl"), which::which("git")) else {
+        return;
+    };
+    let origin = Daemon::start("base-origin", true);
+    let executor = Daemon::start("base-executor", true);
+    add_peer(&origin, &executor);
+    let t3 = FakeT3::start(None);
+    install_t3(&executor.user_home, &t3.origin);
+    // the shared remote has `pushed`, which the executor has not fetched yet
+    let remote = executor.user_home.join("remote.git");
+    let seed = origin.user_home.join("seed");
+    repository(&seed);
+    git(&seed, &["branch", "pushed"]);
+    git(
+        &origin.user_home,
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            &seed.to_string_lossy(),
+            &remote.to_string_lossy(),
+        ],
+    );
+    // install_t3 made the project directory; the executor's checkout replaces it
+    let app = executor.user_home.join("code/app");
+    fs::remove_dir_all(&app).unwrap();
+    git(
+        &executor.user_home,
+        &[
+            "clone",
+            "--quiet",
+            "--single-branch",
+            "--branch",
+            "main",
+            &remote.to_string_lossy(),
+            &app.to_string_lossy(),
+        ],
+    );
+    // both checkouts name one origin URL, which the executor's git config
+    // rewrites to the shared remote, so the error carries its repository key
+    let url = "https://git.example.test/acme/app.git";
+    git(&app, &["remote", "set-url", "origin", url]);
+    let gitconfig = format!("[url \"{}\"]\n\tinsteadOf = {url}\n", remote.display());
+    fs::write(executor.user_home.join(".gitconfig"), gitconfig).unwrap();
+    git(&seed, &["remote", "add", "origin", url]);
+    git(
+        &seed,
+        &[
+            "fetch",
+            "--quiet",
+            &remote.to_string_lossy(),
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    // the caller's checkout has a branch it never pushed
+    git(&seed, &["branch", "local-only"]);
+    let launch = |base: &str, extra: &[&str]| {
+        let mut args = vec![
+            "t3",
+            "launch",
+            "--machine",
+            "base-executor",
+            "--project",
+            "app",
+            "--title",
+            "Worktree",
+            "--worktree",
+            base,
+        ];
+        args.extend(extra);
+        run_json_in(&origin, &seed, &args)
+    };
+
+    let (code, local_only) = launch("local-only", &[]);
+    assert_eq!(code, 3, "{local_only}");
+    let error = &local_only["error"];
+    assert_eq!(error["code"], "t3_worktree_base_missing");
+    assert_eq!(error["input"]["base_ref"], "local-only");
+    assert_eq!(error["input"]["repository"], "git.example.test/acme/app");
+    assert_eq!(error["input"]["local"]["kind"], "unpushed_branch");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("git push -u origin local-only"),
+        "{message}"
+    );
+
+    let (code, unfetched) = launch("pushed", &[]);
+    assert_eq!(code, 3, "{unfetched}");
+    assert_eq!(unfetched["error"]["input"]["fetched"], false);
+    assert_eq!(unfetched["error"]["input"]["local"]["kind"], "pushed");
+    assert!(
+        unfetched["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--from-origin"),
+        "{unfetched}"
+    );
+    assert!(t3.launches().is_empty());
+
+    let (code, fetched) = launch("pushed", &["--from-origin"]);
+    assert_eq!(code, 0, "{fetched}");
+    let (code, present) = launch("main", &[]);
+    assert_eq!(code, 0, "{present}");
+    assert_eq!(t3.launches().len(), 2);
+}

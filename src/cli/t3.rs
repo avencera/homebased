@@ -14,10 +14,11 @@ use crate::daemon::t3_launch::{
     T3ProjectsRequest,
 };
 use crate::domain::{API_VERSION, THREAD_ENV_VARS, ThreadId};
-use crate::error::AppError;
+use crate::error::{AppError, LocalBase};
 use crate::t3::{
-    IconChange, IconColor, InteractionMode, LaunchSpec, ModelChoice, ModelOption, OptionValue,
-    ProbeReport, ProbeStatus, ProjectIcon, ProjectSpec, RuntimeMode, T3Env, Workspace, probe,
+    CloneSpec, IconChange, IconColor, InteractionMode, LaunchSpec, ModelChoice, ModelOption,
+    OptionValue, ProbeReport, ProbeStatus, ProjectIcon, ProjectSpec, RepoKey, RuntimeMode, T3Env,
+    Workspace, probe,
 };
 use crate::thread_ref::Caller;
 
@@ -137,9 +138,17 @@ pub struct LaunchArgs {
     #[arg(long)]
     machine: Option<String>,
     /// T3 project on that machine: its id, its workspace root (absolute or
-    /// starting with ~/), or its exact title
+    /// starting with ~/), its exact title, or the repository its origin
+    /// remote names, as owner/repo or a remote URL
     #[arg(long)]
     project: String,
+    /// When no project there checks out the --project repository, clone it
+    /// and add it as a project first
+    #[arg(long)]
+    clone_if_missing: bool,
+    /// Directory on that machine for --clone-if-missing; ~/code/<repo> when omitted
+    #[arg(long, requires = "clone_if_missing")]
+    clone_into: Option<String>,
     /// Thread title; derived from the message when omitted
     #[arg(long)]
     title: Option<String>,
@@ -309,6 +318,9 @@ async fn launch(ctx: &Ctx, args: LaunchArgs) -> Result<ExitCode, AppError> {
         launch: LaunchSpec {
             request_id: args.request_id.unwrap_or_else(Uuid::now_v7),
             project: home_relative(args.project),
+            clone: args.clone_if_missing.then(|| CloneSpec {
+                into: args.clone_into.map(home_relative),
+            }),
             title: args.title,
             message,
             workspace,
@@ -337,6 +349,22 @@ async fn launch(ctx: &Ctx, args: LaunchArgs) -> Result<ExitCode, AppError> {
                 request: request.launch.request_id,
                 machine: None,
                 message,
+            },
+            // the base may be a branch or commit only this checkout has
+            AppError::T3WorktreeBaseMissing {
+                base_ref,
+                workspace_root,
+                fetched,
+                repository,
+                local: None,
+            } => AppError::T3WorktreeBaseMissing {
+                local: repository
+                    .as_deref()
+                    .and_then(|repository| local_base(repository, &base_ref)),
+                base_ref,
+                workspace_root,
+                fetched,
+                repository,
             },
             error => error,
         })?;
@@ -482,6 +510,60 @@ pub(super) fn home_relative(value: String) -> String {
         Some("") => "~/".into(),
         _ => value,
     }
+}
+
+/// What the checkout in the current directory has of `base_ref`, which the
+/// launching machine lacks; `None` when it is not a checkout of `repository`
+/// or has nothing of that name either
+fn local_base(repository: &str, base_ref: &str) -> Option<LocalBase> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    // another repository's branch of the same name says nothing
+    let origin = git(&["config", "--get", "remote.origin.url"])?;
+    if RepoKey::from_remote(&origin)?.as_str() != repository {
+        return None;
+    }
+    let spec = format!("{base_ref}^{{commit}}");
+    let commit = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        &spec,
+    ])?;
+    // the launching machine fetches a branch by name, so a branch counts as
+    // pushed only when origin has that name, whatever its commit is on
+    let branch = format!("refs/heads/{base_ref}");
+    if git(&["show-ref", "--verify", "--quiet", &branch]).is_some() {
+        let tracking = format!("refs/remotes/origin/{base_ref}");
+        let pushed = git(&["show-ref", "--verify", "--quiet", &tracking]).is_some();
+        return Some(if pushed {
+            LocalBase::Pushed
+        } else {
+            LocalBase::UnpushedBranch
+        });
+    }
+
+    // a commit origin already has gets no local hint, since a launch cannot
+    // fetch a bare commit by name
+    let pushed = git(&[
+        "branch",
+        "--remotes",
+        "--list",
+        "origin/*",
+        "--contains",
+        &commit,
+    ])
+    .is_some_and(|branches| !branches.is_empty());
+    (!pushed).then_some(LocalBase::UnpushedCommit { commit })
 }
 
 /// The calling agent, which a child thread reports to

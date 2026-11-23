@@ -553,12 +553,33 @@ pub enum AppError {
         message: String,
     },
     /// T3 Code on the launching machine has no project that matches
-    #[error("T3 project not found: {selector}; known projects: {}", projects.join(", "))]
+    #[error(
+        "T3 project not found: {selector}; known projects: {}{}",
+        projects.join(", "),
+        if *repository { "; it names a repository, so --clone-if-missing can clone it there" } else { "" }
+    )]
     T3ProjectNotFound {
-        /// Project id, path, or title the caller gave
+        /// Project id, path, title, or repository the caller gave
         selector: String,
         /// Title and root of the projects T3 has, up to 50
         projects: Vec<String>,
+        /// Whether the selector names a repository, which a launch can clone
+        repository: bool,
+    },
+    /// The worktree base of a launch resolves to no commit on the launching machine
+    #[error("{}", base_missing_message(base_ref, workspace_root, *fetched, local.as_ref()))]
+    T3WorktreeBaseMissing {
+        /// Branch or commit the worktree was to start from
+        base_ref: String,
+        /// Project checkout on the launching machine
+        workspace_root: String,
+        /// Whether that machine fetched the branch from the remote first
+        fetched: bool,
+        /// The project's repository there, `host/owner/repo` from its origin
+        repository: Option<String>,
+        /// What the calling machine's checkout of that repository has of the
+        /// base, which the CLI adds
+        local: Option<LocalBase>,
     },
     /// `thread report` ran in a thread that `t3 launch --child` did not start
     #[error(
@@ -773,6 +794,53 @@ fn describe_matches(matches: &[ThreadMatch]) -> String {
         .join(", ")
 }
 
+/// What the calling machine's checkout has of a worktree base the launching
+/// machine lacks
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LocalBase {
+    /// A branch here that origin has no branch of that name for
+    UnpushedBranch,
+    /// A commit here that no `origin` remote-tracking branch contains yet
+    UnpushedCommit {
+        /// Full commit id
+        commit: String,
+    },
+    /// A branch that origin also has, as this checkout last fetched it
+    Pushed,
+}
+
+/// Why a launch's worktree base is missing, and what to do about it
+fn base_missing_message(
+    base_ref: &str,
+    workspace_root: &str,
+    fetched: bool,
+    local: Option<&LocalBase>,
+) -> String {
+    let after = if fetched {
+        ", even after fetching it from origin"
+    } else {
+        ""
+    };
+    let advice = match (local, fetched) {
+        (Some(LocalBase::UnpushedBranch), _) => format!(
+            "it is a branch only on this machine, so push it (`git push -u origin {base_ref}`) and launch again with --from-origin"
+        ),
+        (Some(LocalBase::UnpushedCommit { commit }), _) => format!(
+            "commit {commit} exists only on this machine, so push a branch that contains it and launch from that branch with --from-origin"
+        ),
+        (Some(LocalBase::Pushed), false) => {
+            "origin has this branch, so launch again with --from-origin".into()
+        }
+        (Some(LocalBase::Pushed), true) => "origin had this branch when this checkout last fetched; check that it still does and that both checkouts name the same origin".into(),
+        (None, false) => "pass --from-origin to fetch it from origin first, or name a branch or commit that exists there".into(),
+        (None, true) => "check the name, or push it from the machine that has it".into(),
+    };
+    format!(
+        "worktree base {base_ref} resolves to no commit in {workspace_root} on the launching machine{after}; {advice}"
+    )
+}
+
 /// Why a task's worker cannot take a direct message
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
@@ -865,6 +933,7 @@ impl AppError {
             Self::MessageOutcomeUnknown { .. } => "message_outcome_unknown",
             Self::MessageUnavailable { .. } => "message_receiver_unavailable",
             Self::T3ProjectNotFound { .. } => "t3_project_not_found",
+            Self::T3WorktreeBaseMissing { .. } => "t3_worktree_base_missing",
             Self::T3LaunchRefused { .. } => "t3_launch_refused",
             Self::NotChildThread { .. } => "not_child_thread",
             Self::ThreadReportRefused { .. } => "thread_report_refused",
@@ -959,7 +1028,7 @@ impl AppError {
             | Self::MessageOutcomeUnknown { .. }
             | Self::MessageUnavailable { .. } => 1,
             Self::T3Unavailable { .. } | Self::T3LaunchOutcomeUnknown { .. } => 1,
-            Self::T3ProjectNotFound { .. } => 3,
+            Self::T3ProjectNotFound { .. } | Self::T3WorktreeBaseMissing { .. } => 3,
             Self::T3LaunchRefused { .. }
             | Self::T3ProjectRefused { .. }
             | Self::T3Incompatible { .. } => 5,
@@ -1000,6 +1069,7 @@ impl AppError {
             | Self::MachineNotFound { .. } => http::StatusCode::NOT_FOUND,
             Self::AgentThreadNotFound { .. }
             | Self::T3ProjectNotFound { .. }
+            | Self::T3WorktreeBaseMissing { .. }
             | Self::ThreadNotFound { .. }
             | Self::WatchNotFound { .. }
             | Self::ServiceNotFound { .. } => http::StatusCode::NOT_FOUND,
@@ -1174,9 +1244,26 @@ impl AppError {
                 json!({ "message_id": id, "machine": machine, "message": message })
             }
             Self::MessageUnavailable { message } => json!({ "message": message }),
-            Self::T3ProjectNotFound { selector, projects } => {
-                json!({ "selector": selector, "projects": projects })
+            Self::T3ProjectNotFound {
+                selector,
+                projects,
+                repository,
+            } => {
+                json!({ "selector": selector, "projects": projects, "repository": repository })
             }
+            Self::T3WorktreeBaseMissing {
+                base_ref,
+                workspace_root,
+                fetched,
+                repository,
+                local,
+            } => json!({
+                "base_ref": base_ref,
+                "workspace_root": workspace_root,
+                "fetched": fetched,
+                "repository": repository,
+                "local": local,
+            }),
             Self::T3LaunchRefused { message }
             | Self::T3ProjectRefused { message }
             | Self::T3Unavailable { message }

@@ -37,8 +37,9 @@ use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, ClusterResponse, DEFAULT_MAX_BODY};
 use crate::machine::{MachineId, MachineName};
 use crate::t3::{
-    AddedProject, LaunchError, LaunchSpec, LaunchedThread, ProjectSpec, ProviderInstance, T3Env,
-    T3Project, add_project, launch_thread, launch_thread_id, projects, providers,
+    AddedProject, CLONE_TIMEOUT, FETCH_TIMEOUT, LaunchError, LaunchSpec, LaunchedThread,
+    ProjectSpec, ProviderInstance, T3Env, T3Project, Workspace, add_project, launch_thread,
+    launch_thread_id, names_repository, projects, providers,
 };
 use crate::thread_ref::Caller;
 
@@ -584,8 +585,23 @@ async fn forward_launch(
         parent,
     };
 
+    // a clone and the base check's fetch run before T3 is asked, so the
+    // reply waits for them too
+    let mut timeout = LAUNCH_REQUEST_TIMEOUT;
+    if wire.launch.clone.is_some() {
+        timeout += CLONE_TIMEOUT;
+    }
+    if matches!(
+        wire.launch.workspace,
+        Workspace::Worktree {
+            start_from_origin: true,
+            ..
+        }
+    ) {
+        timeout += FETCH_TIMEOUT;
+    }
     // T3 launches once per request id, so any transport failure is safe to retry
-    let response = ClusterClient::new(LAUNCH_REQUEST_TIMEOUT, DEFAULT_MAX_BODY)
+    let response = ClusterClient::new(timeout, DEFAULT_MAX_BODY)
         .post_json(&verified.address, CLUSTER_LAUNCH_PATH, &wire)
         .await
         .map_err(|error| AppError::T3LaunchOutcomeUnknown {
@@ -602,10 +618,25 @@ async fn forward_launch(
     };
     // axum refuses a body with a field it does not know before the handler
     // runs, and a peer from before child threads does not know `parent`
-    if wire.parent.is_some() && response.status == StatusCode::UNPROCESSABLE_ENTITY {
+    if response.status == StatusCode::UNPROCESSABLE_ENTITY {
+        let feature = match (&wire.parent, &wire.launch.clone) {
+            (Some(_), Some(_)) => Some("child threads or --clone-if-missing"),
+            (Some(_), None) => Some("child threads"),
+            (None, Some(_)) => Some("--clone-if-missing"),
+            (None, None) => None,
+        };
+        if let Some(feature) = feature {
+            return Err(AppError::T3Incompatible {
+                message: format!(
+                    "machine {destination} runs a homebased without {feature}; run `homebased update` there"
+                ),
+            });
+        }
+    }
+    if names_repository(&wire.launch.project) && peer_lacks_repositories(&response) {
         return Err(AppError::T3Incompatible {
             message: format!(
-                "machine {destination} runs a homebased without child threads; run `homebased update` there"
+                "machine {destination} runs a homebased that cannot find a project by its repository; run `homebased update` there"
             ),
         });
     }
@@ -621,6 +652,18 @@ async fn forward_launch(
         ));
     }
     Ok((body.thread, verified.advertisement.name))
+}
+
+/// Whether `response` is a peer's `t3_project_not_found` from before
+/// repository selectors, which says nothing of a repository
+fn peer_lacks_repositories(response: &ClusterResponse) -> bool {
+    if response.status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&response.body).is_ok_and(|body| {
+        body.pointer("/error/code").and_then(|code| code.as_str()) == Some("t3_project_not_found")
+            && body.pointer("/error/input/repository").is_none()
+    })
 }
 
 /// A peer's versioned answer for `machine`, or the error it returned
@@ -700,9 +743,27 @@ impl PeerBody for T3ProjectsBody {
 /// The daemon error for a T3 failure; `uncertain` builds the one for a lost reply
 fn t3_error(error: LaunchError, uncertain: impl FnOnce(String) -> AppError) -> AppError {
     match error {
-        LaunchError::ProjectNotFound { selector, projects } => {
-            AppError::T3ProjectNotFound { selector, projects }
-        }
+        LaunchError::ProjectNotFound {
+            selector,
+            projects,
+            repository,
+        } => AppError::T3ProjectNotFound {
+            selector,
+            projects,
+            repository,
+        },
+        LaunchError::BaseMissing {
+            base_ref,
+            workspace_root,
+            fetched,
+            repository,
+        } => AppError::T3WorktreeBaseMissing {
+            base_ref,
+            workspace_root,
+            fetched,
+            repository,
+            local: None,
+        },
         LaunchError::Refused(message) => AppError::T3LaunchRefused { message },
         LaunchError::Unavailable(message) => AppError::T3Unavailable { message },
         LaunchError::Changed(message) => AppError::T3Incompatible {
