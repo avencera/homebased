@@ -204,6 +204,7 @@ fn a_lost_t3_reply_reaches_the_caller_with_the_request_id_to_retry() {
 const PARENT: &str = "0199aaaa-0000-7000-8000-00000000000a";
 const PARENT_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000a";
 const CHILD_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000b";
+const SECOND_SESSION: &str = "0199aaaa-1111-7000-8000-00000000000c";
 
 fn state_path(daemon: &Daemon) -> PathBuf {
     daemon.user_home.join(".t3/userdata/statev2.sqlite")
@@ -352,6 +353,120 @@ fn a_child_launched_on_another_machine_keeps_its_parent_waiting_until_it_reports
     assert!(delivered[0]["text"].as_str().unwrap().contains(body));
     assert_eq!(parent_state(), "idle");
     assert_eq!(children()[0]["child_thread"]["reported"], true);
+}
+
+#[test]
+fn a_child_on_another_machine_detaches_from_either_end_on_both_machines() {
+    if which::which("curl").is_err() {
+        return;
+    }
+    let origin = Daemon::start("detach-origin", true);
+    let executor = Daemon::start("detach-executor", true);
+    add_peer(&origin, &executor);
+    add_peer(&executor, &origin);
+    let origin_t3 = FakeT3::start(Some(state_path(&origin)));
+    install_t3(&origin.user_home, &origin_t3.origin);
+    let executor_t3 = FakeT3::start(Some(state_path(&executor)));
+    install_t3(&executor.user_home, &executor_t3.origin);
+    let child_state = open_state(&state_path(&executor));
+    let parent_state = open_state(&state_path(&origin));
+    parent_state
+        .execute(
+            "INSERT INTO orchestration_v2_projection_threads (thread_id, title) VALUES (?1, 'parent')",
+            [PARENT],
+        )
+        .unwrap();
+    set_session(&parent_state, PARENT, PARENT_SESSION);
+    codex_rollout(&origin.user_home, PARENT_SESSION);
+    let parent = [
+        ("T3CODE_THREAD_ID", PARENT),
+        ("CODEX_THREAD_ID", PARENT_SESSION),
+    ];
+    let launch = |message: &str, session: &str| {
+        let (code, launched) = run_as(
+            &origin,
+            &parent,
+            &[
+                "t3",
+                "launch",
+                "--machine",
+                "detach-executor",
+                "--project",
+                "app",
+                "--message",
+                message,
+                "--child",
+            ],
+        );
+        assert_eq!(code, 0, "{launched}");
+        let child = launched["thread"]["thread_id"].as_str().unwrap().to_owned();
+        set_session(&child_state, &child, session);
+        set_run(&child_state, &child, "run-1", "running");
+        codex_rollout(&executor.user_home, session);
+        child
+    };
+    let children = || {
+        let (code, listed) = run_as(&origin, &parent, &["thread", "context", "--children"]);
+        assert_eq!(code, 0, "{listed}");
+        listed["children"].as_array().unwrap().len()
+    };
+    let parent_thread_state = || {
+        let (code, found) = run_as(&origin, &parent, &["thread", "context"]);
+        assert_eq!(code, 0, "{found}");
+        found["threads"][0]["state"].clone()
+    };
+    let notices = || {
+        origin_t3
+            .dispatched("message.dispatch")
+            .into_iter()
+            .filter(|payload| payload["threadId"] == PARENT)
+            .count()
+    };
+
+    // the child detaches itself, and its machine ends the parent's copy too
+    let child = launch("Coordinate the migration", CHILD_SESSION);
+    assert_eq!(parent_thread_state(), "waiting");
+    let as_child = [
+        ("T3CODE_THREAD_ID", child.as_str()),
+        ("CODEX_THREAD_ID", CHILD_SESSION),
+    ];
+    let (code, detached) = run_as(&executor, &as_child, &["thread", "detach"]);
+    assert_eq!(code, 0, "{detached}");
+    assert_eq!(detached["notice"]["outcome"], "sent", "{detached}");
+    assert_eq!(notices(), 1);
+    assert_eq!(children(), 0);
+    assert_eq!(parent_thread_state(), "idle");
+    let (code, refused) = run_as(
+        &executor,
+        &as_child,
+        &["thread", "report", "--summary", "x"],
+    );
+    assert_eq!(code, 5, "{refused}");
+    assert_eq!(refused["error"]["code"], "not_child_thread");
+
+    // the parent detaches its other remote child through that child's machine
+    let second = launch("Check the metrics", SECOND_SESSION);
+    assert_eq!(children(), 1);
+    let reference = format!("thread_{second}");
+    let (code, detached) = run_as(&origin, &parent, &["thread", "detach", &reference]);
+    assert_eq!(code, 0, "{detached}");
+    assert_eq!(detached["notice"]["outcome"], "skipped", "{detached}");
+    assert_eq!(
+        detached["child"]["machine"],
+        executor.machine_id().to_string()
+    );
+    assert_eq!(children(), 0);
+    assert_eq!(notices(), 1);
+    let (code, refused) = run_as(
+        &executor,
+        &[
+            ("T3CODE_THREAD_ID", second.as_str()),
+            ("CODEX_THREAD_ID", SECOND_SESSION),
+        ],
+        &["thread", "report", "--summary", "x"],
+    );
+    assert_eq!(code, 5, "{refused}");
+    assert_eq!(refused["error"]["code"], "not_child_thread");
 }
 
 /// Run git in `dir` as a test user, panicking on failure

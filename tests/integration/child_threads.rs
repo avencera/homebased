@@ -676,3 +676,50 @@ fn a_child_stops_its_unreported_children_by_interrupt_or_when_it_reports() {
     let delivered = messages_to(&t3, PARENT.0);
     assert_eq!(delivered.len(), 1, "{delivered:?}");
 }
+
+#[test]
+fn a_detached_child_no_longer_owes_its_parent_a_report_and_keeps_its_own_children() {
+    let (h, t3) = child_harness();
+    let child = launched_thread(&h.launch_child(PARENT, "Coordinate the migration"));
+    h.child_agent(&child, CHILD_SESSION);
+    h.child_run(&child, "run-c-1", "running");
+    let as_child = (child.as_str(), CHILD_SESSION);
+    let grandchild = launched_thread(&h.launch_child(as_child, "Migrate the first table"));
+    h.child_agent(&grandchild, GRANDCHILD_SESSION);
+    assert_eq!(h.t3_context(PARENT.0)["state"], "waiting");
+
+    let detached = succeeded(&h.as_agent(as_child, &["thread", "detach"]));
+    assert_eq!(detached["parent"]["t3_thread"], PARENT.0, "{detached}");
+    assert_eq!(detached["child"]["t3_thread"], child.as_str(), "{detached}");
+    assert_eq!(detached["notice"]["outcome"], "sent", "{detached}");
+    let told = messages_to(&t3, PARENT.0);
+    assert_eq!(told.len(), 1, "{told:?}");
+    let text = told[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("Child thread thread_{child} detached")),
+        "{text}"
+    );
+
+    // the parent stops waiting and no longer lists it, and it cannot report
+    assert_eq!(h.t3_context(PARENT.0)["state"], "idle");
+    assert!(h.listed_children(PARENT).is_empty());
+    assert!(h.t3_context(&child).get("child_thread").is_none());
+    failed(&h.report(as_child, "Done"), 5, "not_child_thread");
+    failed(
+        &h.as_agent(as_child, &["thread", "detach"]),
+        5,
+        "not_child_thread",
+    );
+    let kept = h.listed_children(as_child);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["t3_thread"], grandchild.as_str());
+
+    // a parent that detaches its own child is not told of it
+    let second = launched_thread(&h.launch_child(PARENT, "Check the metrics"));
+    h.child_agent(&second, SECOND_SESSION);
+    let reference = format!("thread_{second}");
+    let detached = succeeded(&h.as_agent(PARENT, &["thread", "detach", &reference]));
+    assert_eq!(detached["notice"]["outcome"], "skipped", "{detached}");
+    assert_eq!(messages_to(&t3, PARENT.0).len(), 1);
+    assert!(h.listed_children(PARENT).is_empty());
+}

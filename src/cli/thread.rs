@@ -1,6 +1,6 @@
 //! `homebased thread`: context size, messages, compaction, watches,
 //! interrupts, and answers of agent threads anywhere in the Fleet, and the
-//! report a child thread sends its parent
+//! report a child thread sends its parent or its detach from it
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,10 @@ use std::process::ExitCode;
 
 use clap::{ArgGroup, Args, Subcommand};
 
-use crate::child_thread::{ReportStageKind, ThreadReportRequest, ThreadReportResponse};
+use crate::child_thread::{
+    DetachNotice, ReportStageKind, ThreadDetachRequest, ThreadDetachResponse, ThreadReportRequest,
+    ThreadReportResponse,
+};
 use crate::client::Client;
 use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
@@ -219,6 +222,30 @@ pub enum ThreadCommand {
         /// open work left; a child whose machine does not answer still refuses
         #[arg(long)]
         stop_children: bool,
+    },
+    /// Detach a child thread from the thread that launched it, so it no
+    /// longer reports there
+    ///
+    /// For a child thread whose work outgrew its parent, such as one that
+    /// became a long-running coordinator. Afterwards the parent no longer
+    /// waits on its report or lists it under `thread context --children`, a
+    /// stop of the parent no longer stops it, its questions no longer alert
+    /// the parent, and `thread report` refuses in it. A report it already sent
+    /// stays delivered, and its own child threads stay linked to it. Unless
+    /// the parent runs the command itself, the parent gets a
+    /// `HOMEBASED_MESSAGE` saying the child detached; a notice that fails is
+    /// reported and leaves the detach in place. Both machines of the link
+    /// must answer; after a failure, the same command again finishes the
+    /// detach. The reference must name exactly one thread; prefixes are not
+    /// accepted.
+    #[command(after_help = REFERENCE_HELP)]
+    Detach {
+        /// Thread reference; the calling thread when omitted
+        #[arg(value_name = "REF")]
+        reference: Option<String>,
+        /// Look only on this machine name or UUID
+        #[arg(long)]
+        machine: Option<String>,
     },
     /// Interrupt a T3 thread's running turn, or stop the thread, on whichever
     /// machine runs it
@@ -472,6 +499,20 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
             let response: ThreadReportResponse =
                 client.post_json("/v1/threads/report", &request).await?;
             print_report(ctx, &response)
+        }
+        ThreadCommand::Detach { reference, machine } => {
+            let caller = Caller::from_env()?;
+            let mut threads = selectors(reference.into_iter().collect(), None, None, &caller)?;
+            let request = ThreadDetachRequest {
+                api_version: API_VERSION,
+                thread: threads.remove(0),
+                carried_by: caller.t3_thread.clone(),
+                caller,
+                machine,
+            };
+            let response: ThreadDetachResponse =
+                client.post_json("/v1/threads/detach", &request).await?;
+            print_detach(ctx, &response)
         }
         ThreadCommand::Interrupt {
             reference,
@@ -763,6 +804,31 @@ fn print_report(ctx: &Ctx, response: &ThreadReportResponse) -> Result<ExitCode, 
                 "{verb} to thread_{} on machine {} as message {}; {next}",
                 report.parent.t3_thread, report.parent.machine, report.message_id
             );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_detach(ctx: &Ctx, response: &ThreadDetachResponse) -> Result<ExitCode, AppError> {
+    let detached = &response.detached;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(serde_json::to_value(response)?)?,
+        OutputMode::Quiet => println!("{}", detached.link),
+        OutputMode::Human => {
+            let parent = format!(
+                "thread_{} on machine {}",
+                detached.parent.t3_thread, detached.parent.machine
+            );
+            println!("detached thread_{} from {parent}", detached.child.t3_thread);
+            match &detached.notice {
+                DetachNotice::Sent { message_id } => {
+                    println!("told the parent as message {message_id}");
+                }
+                DetachNotice::Skipped => println!("the parent detached it, so it was not told"),
+                DetachNotice::Failed { message } => eprintln!(
+                    "warning: the parent was not told ({message}); tell it with `homebased message send`"
+                ),
+            }
         }
     }
     Ok(ExitCode::SUCCESS)

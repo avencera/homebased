@@ -460,6 +460,7 @@ homebased thread watch [<ref>...] --stalled-after <20m|1h> [--once] [--children]
 homebased thread watches [--all]
 homebased thread unwatch <watch-id>
 homebased thread report --summary <text> [--file <path>|-] [--stop-children]
+homebased thread detach [<ref>] [--machine <name>]
 homebased thread interrupt <ref> [--stop] [--machine <name>]
 homebased thread answer <ref> --request <id> --answer <text>... [--machine <name>]
 ```
@@ -681,6 +682,22 @@ children it did stop. Stopping is explicit rather than
 automatic: an unreported child is work the parent asked for, the report's
 refusal is how the parent learns of it, and a stop cannot be undone. Archiving
 or settling a parent stops none of its children.
+
+`thread detach [<ref>]` ends a child thread's link to its parent, for a child
+whose work outgrew it, such as one that became a long-running coordinator.
+With no reference it detaches the calling thread. The parent stops waiting on
+it, `thread context --children` no longer lists it, a stop of the parent no
+longer stops it, its questions no longer alert the parent, and `thread report`
+in it fails with `not_child_thread`. Its own child threads stay linked to it.
+The child's machine runs the detach: it first ends the parent machine's copy
+of the link, then its own, so a failure never leaves the parent waiting on a
+child that can no longer report, and the same command again finishes it. Then,
+unless the parent ran the command, it tells the parent with a
+`HOMEBASED_MESSAGE` from the child's session whose body starts `Child thread
+thread_<id> detached`, under a message UUID derived from the link. The output's
+`notice.outcome` is `sent`, `skipped` (the parent detached it), or `failed`
+with a `message`, which leaves the detach in place. A detached link stays in
+the database so a retried launch still finds it.
 
 A child thread waiting on a person, for a question its agent asked or an
 approval, cannot go on, and its parent may be asleep on it. The child's

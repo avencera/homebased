@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 24;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 23] = [
+const MIGRATIONS: [Migration; 24] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -43,6 +43,7 @@ const MIGRATIONS: [Migration; 23] = [
     add_route_priorities,
     add_task_memory_reviews,
     add_pruned_outputs,
+    add_lineage_detach,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -255,6 +256,18 @@ fn add_pruned_outputs(conn: &Connection) -> Result<(), rusqlite::Error> {
          ALTER TABLE origin_event_receipts ADD COLUMN {RECEIPT_SETTLED_AT};"
     ))
 }
+
+/// Version 25: when `thread detach` ended a child-thread link
+fn add_lineage_detach(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(THREAD_LINEAGE_DETACH)
+}
+
+/// When `thread detach` ended a link; every lookup except a retried launch
+/// skips a detached link, as if it were never made, and the row stays so the
+/// launch's request id still names it
+const THREAD_LINEAGE_DETACH: &str = "
+ALTER TABLE thread_lineage ADD COLUMN detached_at TEXT;
+";
 
 /// When a compacted executor event was acknowledged, so retention still dates
 /// a task by its last settled event after compaction removes the event row;
@@ -714,6 +727,7 @@ fn schema() -> String {
         .replace("{CI_TABLES}", CI_TABLES)
         .replace("{SLEEP_HOLDS_TABLE}", SLEEP_HOLDS_TABLE)
         .replace("{THREAD_LINEAGE_TABLE}", THREAD_LINEAGE_TABLE)
+        .replace("{THREAD_LINEAGE_DETACH}", THREAD_LINEAGE_DETACH)
         .replace("{THREAD_REPORTS_TABLE}", THREAD_REPORTS_TABLE)
         .replace("{PRUNED_OUTPUTS_TABLE}", PRUNED_OUTPUTS_TABLE)
         .replace("{RECEIPT_ACKNOWLEDGED_AT}", RECEIPT_ACKNOWLEDGED_AT)
@@ -1072,6 +1086,7 @@ CREATE TABLE resource_job_delivery (
 {CI_TABLES}
 {SLEEP_HOLDS_TABLE}
 {THREAD_LINEAGE_TABLE}
+{THREAD_LINEAGE_DETACH}
 {THREAD_REPORTS_TABLE}
 {PRUNED_OUTPUTS_TABLE}";
 
@@ -1199,6 +1214,7 @@ mod tests {
             .replace(super::CI_TABLES, "")
             .replace(super::SLEEP_HOLDS_TABLE, "")
             .replace(super::THREAD_LINEAGE_TABLE, "")
+            .replace(super::THREAD_LINEAGE_DETACH, "")
             .replace(super::THREAD_REPORTS_TABLE, "")
             .replace(super::PRUNED_OUTPUTS_TABLE, "")
             // `executor_outbox` and `origin_inbox` have columns of the same text
@@ -1353,7 +1369,7 @@ mod tests {
         migrate(&conn).unwrap();
         conn.execute_batch(&format!(
             "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE thread_reports;
-             DROP TABLE pruned_outputs;
+             DROP TABLE pruned_outputs; ALTER TABLE thread_lineage DROP COLUMN detached_at;
              ALTER TABLE executor_event_receipts DROP COLUMN acknowledged_at;
              ALTER TABLE origin_event_receipts DROP COLUMN settled_at; ALTER TABLE origin_routes DROP COLUMN priority; {}",
             super::THREAD_REPORTS_V20

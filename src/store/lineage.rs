@@ -4,6 +4,10 @@
 //! A report moves only forward through its stages, inside one immediate
 //! transaction per step, so the daemon's scan and a retried `thread report`
 //! can both push the same report on without undoing each other
+//!
+//! A detached link stays saved, but every read except [`Store::lineage`]
+//! skips it, so the child, its reports, and its pending questions drop out
+//! of every lookup as if the link were never made
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
@@ -22,6 +26,9 @@ const REPORT_SELECT: &str = "
            r.body, r.source_session, r.run_id, r.stage, r.created_at, r.sent_at, r.settled_at,
            r.seq
     FROM thread_reports r JOIN thread_lineage l ON l.id = r.link_id";
+
+/// Leaves out links `thread detach` ended
+const NOT_DETACHED: &str = "l.detached_at IS NULL";
 
 impl Store {
     /// Save a link, or return the one a retried launch saved
@@ -70,7 +77,7 @@ impl Store {
         })
     }
 
-    /// One saved link
+    /// One saved link, detached or not, so a retried launch finds its own
     pub fn lineage(&self, id: LinkId) -> Result<Option<Lineage>, AppError> {
         self.conn
             .query_row(
@@ -82,13 +89,13 @@ impl Store {
             .transpose()
     }
 
-    /// The link that names `child` as its child, if any
+    /// The link that names `child` as its child, if any is not detached
     pub fn lineage_of_child(&self, child: &LinkEnd) -> Result<Option<Lineage>, AppError> {
         self.conn
             .query_row(
                 &format!(
                     "SELECT {LINEAGE_COLUMNS} FROM thread_lineage l
-                     WHERE l.child_machine = ?1 AND l.child_thread = ?2"
+                     WHERE l.child_machine = ?1 AND l.child_thread = ?2 AND {NOT_DETACHED}"
                 ),
                 params![child.machine.to_string(), child.t3_thread],
                 read_lineage,
@@ -97,8 +104,8 @@ impl Store {
             .transpose()
     }
 
-    /// Every link this machine holds, oldest first, with what it knows of
-    /// each child's first report
+    /// Every link this machine holds that is not detached, oldest first,
+    /// with what it knows of each child's first report
     pub fn thread_links(&self) -> Result<Vec<LinkView>, AppError> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT {LINEAGE_COLUMNS}, l.closed_at IS NOT NULL,
@@ -107,6 +114,7 @@ impl Store {
                     r.stage
              FROM thread_lineage l
              LEFT JOIN thread_reports r ON r.link_id = l.id AND r.seq = 0
+             WHERE {NOT_DETACHED}
              ORDER BY l.created_at, l.id"
         ))?;
         let rows = statement
@@ -139,6 +147,21 @@ impl Store {
             params![id.to_string(), fmt_time(now)],
         )?;
         Ok(())
+    }
+
+    /// Record link `id` detached, and return it; `None` when this machine
+    /// holds no copy. The first time counts, so a retry changes nothing
+    pub fn detach_link(&self, id: LinkId, now: DateTime<Utc>) -> Result<Option<Lineage>, AppError> {
+        self.immediate(|| {
+            let Some(lineage) = self.lineage(id)? else {
+                return Ok(None);
+            };
+            self.conn.execute(
+                "UPDATE thread_lineage SET detached_at = ?2 WHERE id = ?1 AND detached_at IS NULL",
+                params![id.to_string(), fmt_time(now)],
+            )?;
+            Ok(Some(lineage))
+        })
     }
 
     /// Save a new report in [`ReportStage::Sending`], or return the latest
@@ -197,10 +220,11 @@ impl Store {
             .transpose()
     }
 
-    /// Reports whose send or settle is unfinished, oldest first
+    /// Reports whose send or settle is unfinished, oldest first; a detached
+    /// child sends no more and is not settled for its parent
     pub fn open_reports(&self) -> Result<Vec<ThreadReport>, AppError> {
         let mut statement = self.conn.prepare(&format!(
-            "{REPORT_SELECT} WHERE r.stage IN ('sending', 'settle_pending')
+            "{REPORT_SELECT} WHERE r.stage IN ('sending', 'settle_pending') AND {NOT_DETACHED}
              ORDER BY r.created_at, r.link_id, r.seq"
         ))?;
         let rows = statement

@@ -18,6 +18,10 @@
 //! can send a follow-up once the report before it was delivered; the parent
 //! does not wait for one. The child's machine settles the child after each
 //! reporting run has ended, unless a later run or message kept it active
+//!
+//! `homebased thread detach` ends a link on both machines, for a child whose
+//! work outgrew its parent; every lookup then skips it, and the parent gets a
+//! [`Lineage::detach_notice`] unless it ran the detach
 
 use std::fmt;
 use std::str::FromStr;
@@ -34,7 +38,7 @@ use crate::message::{
     MESSAGE_BODY_MAX_BYTES, MessageId, MessageSendRequest, MessageSourceSelector, MessageTarget,
 };
 use crate::t3::PendingRequest;
-use crate::thread_ref::Caller;
+use crate::thread_ref::{Caller, ThreadSelector};
 
 /// One parent-child link: the request id of the launch that made it, so a
 /// retried launch makes the same link
@@ -153,6 +157,36 @@ impl Lineage {
             // the child can do nothing until someone answers, so the parent
             // reads it in its running turn rather than after it
             active_turn: ActiveTurn::Steer,
+        }
+    }
+
+    /// The message that tells the parent its child detached, sent from the
+    /// child's session `source`
+    ///
+    /// Its UUID derives from the link, so a detach the child's machine
+    /// finishes twice sends it once
+    #[must_use]
+    pub fn detach_notice(&self, source: ThreadId) -> MessageSendRequest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"homebased-child-detach\0");
+        hasher.update(self.id.as_uuid().as_bytes());
+        let message_id = derived_message_id(hasher);
+        MessageSendRequest {
+            api_version: API_VERSION,
+            message_id,
+            target: MessageTarget::Reference {
+                machine: self.parent.machine.to_string(),
+                reference: format!("thread_{}", self.parent.t3_thread),
+                carried_by: None,
+            },
+            source: MessageSourceSelector::Thread { thread: source },
+            body: format!(
+                "Child thread thread_{} detached from this thread. It will not report back, and `homebased thread context --children` no longer lists it.",
+                self.child.t3_thread
+            ),
+            reply_to: None,
+            conversation_id: message_id.as_uuid(),
+            active_turn: ActiveTurn::Queue,
         }
     }
 }
@@ -646,6 +680,67 @@ pub struct ReportView {
     /// When the parent's machine took it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /v1/threads/detach` body
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadDetachRequest {
+    /// Public API version
+    pub api_version: u32,
+    /// The child thread to detach; it must resolve to exactly one
+    pub thread: ThreadSelector,
+    /// The calling agent, so a parent that detaches its own child is not
+    /// told of it
+    pub caller: Caller,
+    /// The caller's T3 thread, whose message any T3 chip in `thread` came in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_by: Option<String>,
+    /// Look only on this machine, by name or UUID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// `POST /v1/threads/detach` answer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDetachResponse {
+    /// Public API version
+    pub api_version: u32,
+    /// The link that no longer holds
+    #[serde(flatten)]
+    pub detached: DetachedLink,
+}
+
+/// A link a detach ended, as the child's machine finished it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachedLink {
+    /// The launch that made the link
+    pub link: LinkId,
+    /// The thread that launched the child
+    pub parent: LinkEnd,
+    /// The thread that is no longer its child
+    pub child: LinkEnd,
+    /// Whether the parent was told
+    pub notice: DetachNotice,
+}
+
+/// Whether a detach told the parent, which never undoes the detach
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DetachNotice {
+    /// The parent got a `HOMEBASED_MESSAGE`
+    Sent {
+        /// Its message UUID
+        message_id: MessageId,
+    },
+    /// The parent ran the detach itself
+    Skipped,
+    /// The message did not go through, so the parent may still expect a
+    /// report
+    Failed {
+        /// Why
+        message: String,
+    },
 }
 
 /// Open work that keeps a child thread from reporting

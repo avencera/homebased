@@ -703,6 +703,13 @@ pub(crate) enum StoreMsg {
         now: DateTime<Utc>,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Record a link detached, and read it back; `None` when this machine
+    /// holds no copy
+    DetachLink {
+        id: LinkId,
+        now: DateTime<Utc>,
+        reply: RpcReplyPort<Result<Option<Lineage>, AppError>>,
+    },
     /// Save a child thread's report, or read the latest one when another
     /// call saved it first
     BeginReport {
@@ -1388,6 +1395,9 @@ impl Actor for StoreActor {
             }
             StoreMsg::ThreadLinks { reply } => send_reply(reply, state.thread_links()),
             StoreMsg::CloseLink { id, now, reply } => send_reply(reply, state.close_link(id, now)),
+            StoreMsg::DetachLink { id, now, reply } => {
+                send_reply(reply, state.detach_link(id, now));
+            }
             StoreMsg::BeginReport { report, reply } => {
                 send_reply(reply, state.begin_report(&report));
             }

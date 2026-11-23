@@ -35,6 +35,7 @@ pub mod t3_launch;
 mod t3_watch;
 pub mod thread_api;
 mod thread_control;
+mod thread_detach;
 mod thread_titles;
 pub mod usage_api;
 mod wait_api;

@@ -1,6 +1,6 @@
 # Thread context, messages, compaction, watches, and interrupts
 
-`homebased thread` reads how full an agent thread's context is, reads a T3 thread's messages, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's report, and any follow-up reports, to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
+`homebased thread` reads how full an agent thread's context is, reads a T3 thread's messages, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, sends a child thread's report, and any follow-up reports, to its parent, and detaches a child thread from its parent. It works on any Fleet machine. Pass `--json` and parse the result.
 
 ```bash
 homebased --json thread context                      # this thread
@@ -15,6 +15,7 @@ homebased --json thread watch --children --stalled-after 20m
 homebased --json thread watches
 homebased --json thread unwatch <watch-id>
 homebased --json thread report --summary "<report>" [--file report.md]  # in a child thread
+homebased --json thread detach [<ref>]               # end a child thread's link to its parent
 ```
 
 ## Thread references
@@ -175,6 +176,15 @@ Run in a child thread, inside its turn, as its last step: `homebased --json thre
 - The result's `report` has `link`, `parent`, `child`, `seq` (0 for the first report), `message_id`, `created_at`, `sent_at`, and `stage`: `sending` (not delivered yet; run the command again), `settle_pending` (delivered; the settle waits for the turn to end), `sent` (delivered, and left unsettled), or `settled`.
 - A thread that no `--child` launch made fails with `not_child_thread` (exit 5); report with `homebased message send` instead. Outside a turn, or before T3 records the thread's session, it fails with `usage`.
 - `--stop-children` stops each child thread of this one that has not reported, as `thread interrupt --stop` does, and stops waiting on it, when those children are the only open work left; the result's `stopped` lists them. The report is checked first, so a report that fails its own checks, such as its size, stops nothing. A child that cannot be stopped, such as one on a machine that does not answer, stays in `input.open`, so the report is still refused, and `input.stopped` lists the children it did stop. Nothing stops children on its own: archiving or settling a parent leaves them running, so stop them first when their work is no longer wanted.
+
+## `thread detach`
+
+`homebased --json thread detach [<ref>] [--machine <name>]` ends a child thread's link to its parent, for a child whose work outgrew it, such as one that became a long-running coordinator. With no reference it detaches the calling thread. Never edit homebased's database to do this.
+
+- Afterwards the parent no longer waits on the child, `thread context --children` no longer lists it, a stop of the parent no longer stops it, and its questions and approvals no longer alert the parent. `thread report` in it fails with `not_child_thread`; reach the old parent with `homebased message send` instead. A report it already sent stays delivered, and its own child threads stay linked to it and still report to it.
+- Unless the parent runs it, the parent gets one `HOMEBASED_MESSAGE` from the child's session whose body starts `Child thread thread_<id> detached` ([messages.md](messages.md#child-thread-reports)).
+- The result has `link`, `parent`, `child`, and `notice`, whose `outcome` is `sent` (with `message_id`), `skipped` (the parent ran the detach), or `failed` (with `message`). A failed notice leaves the detach in place; tell the parent with `homebased message send`.
+- Both machines of the link must answer. After a failure, such as `machine_unavailable`, run the same command again to finish the detach. Once it is done, the same command fails with `not_child_thread`.
 
 ## Orchestrator recipe
 

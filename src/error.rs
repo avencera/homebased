@@ -589,9 +589,10 @@ pub enum AppError {
         /// Why
         message: String,
     },
-    /// `thread report` ran in a thread that `t3 launch --child` did not start
+    /// `thread report` or `thread detach` named a thread that `t3 launch
+    /// --child` did not start, or one already detached
     #[error(
-        "{thread} is not a child thread; only a thread that `homebased t3 launch --child` started can run `homebased thread report`"
+        "{thread} is not a child thread; only a thread that `homebased t3 launch --child` started, and that was not detached, has a parent to report to or detach from"
     )]
     NotChildThread {
         /// The calling thread, as a reference
