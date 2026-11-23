@@ -623,7 +623,14 @@ fn a_running_task_whose_unused_peak_alone_keeps_a_task_waiting_gets_one_memory_r
     assert_eq!(detail["waiting_peak"], 3.0, "{review}");
     assert!(detail["blocked_secs"].as_u64().unwrap() >= 1, "{review}");
     let held = detail["held_bytes"].as_u64().unwrap();
-    assert!(held > 0 && held < GIB, "{review}");
+    // process trees are read through procfs, so only Linux, the one platform
+    // whose daemon accepts a peak, measures the shell; elsewhere the fake
+    // cgroup runs the gate but every tree holds nothing
+    if cfg!(target_os = "linux") {
+        assert!(held > 0 && held < GIB, "{review}");
+    } else {
+        assert_eq!(held, 0, "{review}");
+    }
     let shown = h.show(&holder);
     assert_eq!(
         shown["last_event"]["event"], "TASK_MEMORY_REVIEW",
