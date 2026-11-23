@@ -629,7 +629,10 @@ fn a_missing_worktree_base_fails_the_command_and_names_a_branch_only_the_caller_
     git(&remote, &["branch", "-D", "pushed"]);
     let (code, retried) = launch("pushed", &["--from-origin", "--request-id", &request]);
     assert_eq!(code, 0, "{retried}");
-    assert_eq!(retried["thread"]["thread_id"], fetched["thread"]["thread_id"]);
+    assert_eq!(
+        retried["thread"]["thread_id"],
+        fetched["thread"]["thread_id"]
+    );
     let (code, present) = launch("main", &[]);
     assert_eq!(code, 0, "{present}");
     // the retry asked T3 again, which answers with the thread it launched
