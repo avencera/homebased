@@ -39,6 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -712,7 +713,11 @@ pub fn launch_thread(env: &T3Env, spec: &LaunchSpec) -> Result<LaunchedThread, L
     spec.validate().map_err(LaunchError::Refused)?;
     let (projects, project) = resolve_project(env, spec)?;
     let project = &project;
-    check_workspace(env, spec, project)?;
+    // a retry after a lost reply returns the thread already launched, even
+    // when its base has gone since
+    if !launched_before(env, spec.request_id) {
+        check_workspace(env, spec, project)?;
+    }
     let model = model_selection(spec, project)?;
 
     let userdata = env.userdata();
@@ -1025,6 +1030,17 @@ fn staging_prefix(name: &str) -> String {
     format!(".{name}.homebased-clone-")
 }
 
+/// Whether `suffix` is the `<request>-<attempt>` pair of UUIDs a clone
+/// attempt names its staging directory with, so the sweep removes only those
+fn is_attempt_suffix(suffix: &str) -> bool {
+    const UUID_LEN: usize = 36;
+    suffix.len() == UUID_LEN * 2 + 1
+        && suffix.is_char_boundary(UUID_LEN)
+        && suffix[UUID_LEN..].starts_with('-')
+        && Uuid::parse_str(&suffix[..UUID_LEN]).is_ok()
+        && Uuid::parse_str(&suffix[UUID_LEN + 1..]).is_ok()
+}
+
 /// Remove the staging directories of clones that a timeout or restart cut
 /// short: those older than any clone can run
 fn sweep_staging(parent: &Path, name: &str) {
@@ -1039,10 +1055,30 @@ fn sweep_staging(parent: &Path, name: &str) {
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > CLONE_TIMEOUT * 2);
-        if stale && entry.file_name().to_string_lossy().starts_with(&prefix) {
+        let file_name = entry.file_name();
+        let owned = file_name
+            .to_string_lossy()
+            .strip_prefix(&prefix)
+            .is_some_and(is_attempt_suffix);
+        if stale && owned {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Whether T3 here already has the thread of launch `request`
+fn launched_before(env: &T3Env, request: Uuid) -> bool {
+    let state = state_path(&env.userdata());
+    state_connection(&state)
+        .and_then(|db| {
+            db.query_row(
+                "SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ?1",
+                [launch_thread_id(request)],
+                |_| Ok(()),
+            )
+            .optional()
+        })
+        .is_ok_and(|found| found.is_some())
 }
 
 /// Refuse a worktree whose base the project's repository lacks, before T3 is
@@ -1067,10 +1103,10 @@ fn check_workspace(env: &T3Env, spec: &LaunchSpec, project: &T3Project) -> Resul
             "project {} ({}) is not a git repository, so it cannot start a worktree; launch it without --worktree",
             project.title, project.workspace_root
         ))),
-        Err(BaseProblem::Missing) => Err(LaunchError::BaseMissing {
+        Err(BaseProblem::Missing { fetched }) => Err(LaunchError::BaseMissing {
             base_ref: base_ref.clone(),
             workspace_root: project.workspace_root.clone(),
-            fetched: *start_from_origin,
+            fetched,
             repository: git
                 .origin_url(root)
                 .and_then(|url| RepoKey::from_remote(&url))
@@ -1337,8 +1373,12 @@ mod tests {
         }
         fs::create_dir_all(root).unwrap();
         let git = |args: &[&str]| {
+            // the developer's own config, such as commit signing, stays out
             let status = std::process::Command::new("git")
                 .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .args(args)
                 .current_dir(root)
                 .output()

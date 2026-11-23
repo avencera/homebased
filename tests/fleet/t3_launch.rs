@@ -356,8 +356,13 @@ fn a_child_launched_on_another_machine_keeps_its_parent_waiting_until_it_reports
 
 /// Run git in `dir` as a test user, panicking on failure
 fn git(dir: &Path, args: &[&str]) -> String {
+    // the developer's own config, such as commit signing, stays out; the
+    // daemons read their own homes' config
     let output = std::process::Command::new("git")
         .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .args(args)
         .current_dir(dir)
         .output()
@@ -521,8 +526,10 @@ fn a_missing_worktree_base_fails_the_command_and_names_a_branch_only_the_caller_
     let origin = Daemon::start("base-origin", true);
     let executor = Daemon::start("base-executor", true);
     add_peer(&origin, &executor);
-    let t3 = FakeT3::start(None);
+    // T3 records each launched thread, which a retried launch looks for
+    let t3 = FakeT3::start(Some(state_path(&executor)));
     install_t3(&executor.user_home, &t3.origin);
+    open_state(&state_path(&executor));
     // the shared remote has `pushed`, which the executor has not fetched yet
     let remote = executor.user_home.join("remote.git");
     let seed = origin.user_home.join("seed");
@@ -614,9 +621,17 @@ fn a_missing_worktree_base_fails_the_command_and_names_a_branch_only_the_caller_
     );
     assert!(t3.launches().is_empty());
 
-    let (code, fetched) = launch("pushed", &["--from-origin"]);
+    let request = uuid::Uuid::now_v7().to_string();
+    let (code, fetched) = launch("pushed", &["--from-origin", "--request-id", &request]);
     assert_eq!(code, 0, "{fetched}");
+    // a retry returns the launched thread even once its base has gone
+    git(&app, &["update-ref", "-d", "refs/remotes/origin/pushed"]);
+    git(&remote, &["branch", "-D", "pushed"]);
+    let (code, retried) = launch("pushed", &["--from-origin", "--request-id", &request]);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["thread"]["thread_id"], fetched["thread"]["thread_id"]);
     let (code, present) = launch("main", &[]);
     assert_eq!(code, 0, "{present}");
-    assert_eq!(t3.launches().len(), 2);
+    // the retry asked T3 again, which answers with the thread it launched
+    assert_eq!(t3.launches().len(), 3);
 }

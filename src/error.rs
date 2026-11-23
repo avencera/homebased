@@ -833,7 +833,7 @@ fn base_missing_message(
             "origin has this branch, so launch again with --from-origin".into()
         }
         (Some(LocalBase::Pushed), true) => "origin had this branch when this checkout last fetched; check that it still does and that both checkouts name the same origin".into(),
-        (None, false) => "pass --from-origin to fetch it from origin first, or name a branch or commit that exists there".into(),
+        (None, false) => "pass --from-origin to fetch its branch from origin first (it fetches branches, not commits), or name a branch or commit that exists there".into(),
         (None, true) => "check the name, or push it from the machine that has it".into(),
     };
     format!(

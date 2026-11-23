@@ -235,7 +235,23 @@ pub enum BaseProblem {
     /// The project root is not in a git repository
     NotRepository,
     /// No commit, branch, or tag of that name resolves there
-    Missing,
+    Missing {
+        /// Whether its branch was fetched from its remote first and still
+        /// did not resolve
+        fetched: bool,
+    },
+}
+
+/// What [`Git::fetch_base`] found
+enum Fetched {
+    /// The branch was fetched and resolves now
+    Found,
+    /// The fetch ran, and the remote has no such branch
+    Absent,
+    /// Nothing was fetched: the base names no branch, or no such remote exists
+    NotTried,
+    /// The fetch could not run, such as when the remote did not answer in time
+    Failed,
 }
 
 /// Git commands for one machine's user
@@ -302,14 +318,22 @@ impl<'a> Git<'a> {
         if self.has_commit(root, base) {
             return Ok(());
         }
-        if from_origin && self.fetch_base(root, base) {
+        let fetched = if from_origin {
+            self.fetch_base(root, base)
+        } else {
+            Fetched::NotTried
+        };
+        // a fetch that cannot run passes like any check that cannot run
+        if matches!(fetched, Fetched::Found | Fetched::Failed) {
             return Ok(());
         }
         // a repository without any commit lets T3 start from nothing
         if !self.has_commit(root, "HEAD") {
             return Ok(());
         }
-        Err(BaseProblem::Missing)
+        Err(BaseProblem::Missing {
+            fetched: matches!(fetched, Fetched::Absent),
+        })
     }
 
     fn has_commit(&self, root: &Path, rev: &str) -> bool {
@@ -331,14 +355,14 @@ impl<'a> Git<'a> {
 
     /// Fetch `base`'s branch from its remote into the remote-tracking ref, as
     /// T3 does, and say whether that ref now resolves
-    fn fetch_base(&self, root: &Path, base: &str) -> bool {
+    fn fetch_base(&self, root: &Path, base: &str) -> Fetched {
         // a revision expression, such as `main~2`, names no remote branch
         if base == "HEAD"
             || base.starts_with('-')
             || base.contains(['~', '^', ':', '@', ' '])
             || base.contains("..")
         {
-            return false;
+            return Fetched::NotTried;
         }
         let remotes = self
             .run(Some(root), &["remote"], QUERY_TIMEOUT)
@@ -353,7 +377,7 @@ impl<'a> Git<'a> {
             _ => ("origin", base),
         };
         if !remotes.lines().any(|line| line.trim() == remote) {
-            return false;
+            return Fetched::NotTried;
         }
         let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
         let fetched = self.run(
@@ -361,10 +385,14 @@ impl<'a> Git<'a> {
             &["fetch", "--quiet", "--no-tags", "--", remote, &refspec],
             FETCH_TIMEOUT,
         );
-        if !fetched.is_ok_and(|output| output.success) {
-            return false;
+        match fetched {
+            Err(_) => Fetched::Failed,
+            Ok(output) if !output.success => Fetched::Absent,
+            Ok(_) if self.has_commit(root, &format!("refs/remotes/{remote}/{branch}")) => {
+                Fetched::Found
+            }
+            Ok(_) => Fetched::Absent,
         }
-        self.has_commit(root, &format!("refs/remotes/{remote}/{branch}"))
     }
 
     /// Clone `url` into `into`, which must not exist

@@ -743,14 +743,19 @@ the project setup script, and starts the first message.
   id after `t3_launch_outcome_unknown` returns the same thread.
 - With `--worktree`, the launching machine checks that the base resolves to a
   commit in the project's checkout before it asks T3, fetching its branch
-  from origin first with `--from-origin`, as T3 then does. A missing base
-  fails the command with `t3_worktree_base_missing` (exit 3), whose
+  from origin first with `--from-origin`, as T3 then does. `--from-origin`
+  fetches branches only, so a commit id or an expression such as `main~2`
+  must already be there. A missing base fails the command with
+  `t3_worktree_base_missing` (exit 3). Its `input.fetched` is `true` when the
+  branch was fetched and origin has no such branch, and its
   `input.repository` is the project's `host/owner/repo` when its origin
-  names one. When the command runs in a checkout whose origin is that same
-  repository, the calling machine looks the base up there and says what it
-  found in `input.local.kind`: `unpushed_branch` or `unpushed_commit` (with
-  `input.local.commit`), which need a push and `--from-origin`, or `pushed`,
-  a branch origin already has, which needs `--from-origin`. A
+  names one. A fetch that cannot run, such as one that times out, leaves the
+  decision to T3. When the command runs in a checkout whose origin is that
+  same repository, the calling machine looks the base up there and says what
+  it found in `input.local.kind`: `unpushed_branch`, which needs a push and
+  `--from-origin`; `unpushed_commit` (with `input.local.commit`), which needs
+  a pushed branch at that commit to launch from with `--from-origin`; or
+  `pushed`, a branch origin already has, which needs `--from-origin`. A
   project that is not a git repository refuses a worktree with
   `t3_launch_refused`. Other workspace failures, such as a branch name that
   already exists there, still fail in the new thread or T3's own check.
