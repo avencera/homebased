@@ -332,6 +332,9 @@ fn outstanding(claims: &[Claim], held: &[u64]) -> u64 {
 }
 
 /// What each claim's process tree holds now; one without a process holds nothing
+///
+/// Trees are read through procfs, so off Linux, where no real cgroup gauge
+/// exists and submit refuses a peak, every tree holds nothing
 fn held_by(claims: &[Claim]) -> Vec<u64> {
     claims
         .iter()
