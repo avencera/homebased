@@ -29,7 +29,9 @@ use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
 use crate::machine::MachineId;
-use crate::t3::{InterruptOutcome, T3Env, answer_request, interrupt_thread, pending_requests};
+use crate::t3::{
+    AnswerFailure, InterruptOutcome, T3Env, answer_request, interrupt_thread, pending_requests,
+};
 use crate::thread_control::{
     ControlOutcome, ThreadControl, ThreadControlRequest, ThreadControlResponse,
 };
@@ -230,6 +232,9 @@ async fn control_here(
                 InterruptOutcome::Interrupted(run) => Ok(ControlOutcome::Interrupted { run }),
                 InterruptOutcome::Idle => Ok(ControlOutcome::Idle),
                 InterruptOutcome::Stopped => {
+                    // a child the thread launched while the first pass ran
+                    // is linked by now, and the stopped thread launches no more
+                    stop_children_of(state, &t3_thread).await;
                     close_own_link(state, &t3_thread).await;
                     Ok(ControlOutcome::Stopped)
                 }
@@ -244,17 +249,17 @@ async fn control_here(
         let request = request.clone();
         move || {
             let env = T3Env::from_env();
-            let pending = pending_requests(&env).map_err(Err)?;
-            let answers = keyed_answers(&pending, &t3_thread, &request, answers).map_err(Ok)?;
-            answer_request(&env, &t3_thread, &request, &answers).map_err(Err)
+            let pending = pending_requests(&env).map_err(AnswerFailure::Unavailable)?;
+            let answers = keyed_answers(&pending, &t3_thread, &request, answers)
+                .map_err(AnswerFailure::Refused)?;
+            answer_request(&env, &t3_thread, &request, &answers)
         }
     })
     .await?;
-    // `Ok` carries a refusal of the answers, `Err` a T3 that cannot be reached
     match checked {
         Ok(()) => Ok(ControlOutcome::Answered { request }),
-        Err(Ok(message)) => Err(refused(message)),
-        Err(Err(message)) => Err(unavailable(message)),
+        Err(AnswerFailure::Refused(message)) => Err(refused(message)),
+        Err(AnswerFailure::Unavailable(message)) => Err(unavailable(message)),
     }
 }
 

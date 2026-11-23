@@ -6,9 +6,10 @@
 //! with the child-thread scan, and sends the parent one `HOMEBASED_MESSAGE`
 //! per request, which wakes a sleeping parent as an alert does. Its message
 //! UUID comes from the link and the request, so a restart that forgets what
-//! was sent sends the same message, which the message path delivers once
+//! was sent sends the same message, which the message path delivers once it
+//! holds a receipt
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use tracing::{debug, info, warn};
 
@@ -18,11 +19,14 @@ use super::context_threads::run_blocking;
 use super::message_sender;
 use super::thread_api::find_on;
 use crate::child_thread::{Lineage, LinkId};
+use crate::message::MessageSendRequest;
 use crate::t3::{PendingRequest, T3Env, pending_requests};
 
-/// Requests already sent, by link and T3 request id
+/// Alerts by link and T3 request id: `None` once sent, or the message of a
+/// send that failed, which the next scan sends again as it was, since the
+/// message path refuses the same UUID with another body
 #[derive(Debug, Default)]
-pub(super) struct AlertMemory(HashSet<(LinkId, String)>);
+pub(super) struct AlertMemory(HashMap<(LinkId, String), Option<MessageSendRequest>>);
 
 /// Send each parent an alert for every new request its child on this
 /// machine waits on
@@ -66,14 +70,19 @@ pub(super) async fn scan(state: &AppState, memory: &mut AlertMemory) {
         })
         .collect();
     // an answered request leaves the memory, so it stays small
-    memory.0.retain(|(link, request)| {
+    memory.0.retain(|(link, request), _| {
         waiting
             .iter()
             .any(|(waiting, pending)| waiting.id == *link && pending.id == *request)
     });
     let new: Vec<(&Lineage, PendingRequest)> = waiting
         .into_iter()
-        .filter(|(link, request)| !memory.0.contains(&(link.id, request.id.clone())))
+        .filter(|(link, request)| {
+            memory
+                .0
+                .get(&(link.id, request.id.clone()))
+                .is_none_or(Option::is_some)
+        })
         .collect();
     if new.is_empty() {
         return;
@@ -105,17 +114,26 @@ pub(super) async fn scan(state: &AppState, memory: &mut AlertMemory) {
             debug!(link = %link.id, "child thread has no session to send an alert from");
             continue;
         };
-        let message = link.request_alert(&request, source, thread.t3_link.as_deref());
-        match message_sender::send(state, message).await {
+        let key = (link.id, request.id.clone());
+        let message = memory
+            .0
+            .get(&key)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| link.request_alert(&request, source, thread.t3_link.as_deref()));
+        match message_sender::send(state, message.clone()).await {
             Ok(_) => {
                 info!(
                     link = %link.id,
                     request = %request.id,
                     "Child thread waits on a person; parent told"
                 );
-                memory.0.insert((link.id, request.id));
+                memory.0.insert(key, None);
             }
-            Err(error) => debug!(link = %link.id, "child thread request alert: {error}"),
+            Err(error) => {
+                debug!(link = %link.id, "child thread request alert: {error}");
+                memory.0.insert(key, Some(message));
+            }
         }
     }
 }

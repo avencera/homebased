@@ -85,7 +85,7 @@ async fn report(
     let id = lineage.id;
     let latest = call(&state.store, |reply| StoreMsg::LatestReport { id, reply }).await?;
     let seq = match ReportPlan::decide(latest, &body.body, reporter.run.as_deref())? {
-        ReportPlan::Resume(saved) => return resume(&state, *saved, &body.body).await,
+        ReportPlan::Resume(saved) => return resume(&state, *saved, &body.body, Vec::new()).await,
         ReportPlan::Save(seq) => seq,
     };
 
@@ -137,7 +137,7 @@ async fn report(
     .await?;
     if !created {
         // another call saved one first
-        return resume(&state, saved, &report.body).await;
+        return resume(&state, saved, &report.body, stopped).await;
     }
     info!(
         link = %saved.lineage.id,
@@ -149,17 +149,19 @@ async fn report(
     Ok(Json(response(&sent, false, stopped)))
 }
 
-/// Finish the report already saved, refusing another body
+/// Finish the report already saved, refusing another body; `stopped` is
+/// what this call stopped before it found the report saved
 async fn resume(
     state: &AppState,
     saved: ThreadReport,
     body: &str,
+    stopped: Vec<LinkEnd>,
 ) -> Result<Json<ThreadReportResponse>, AppError> {
     if saved.body != body {
         return Err(ReportConflict::with(&saved));
     }
     let report = finish_send(state, saved).await?;
-    Ok(Json(response(&report, true, Vec::new())))
+    Ok(Json(response(&report, true, stopped)))
 }
 
 fn response(report: &ThreadReport, resumed: bool, stopped: Vec<LinkEnd>) -> ThreadReportResponse {
@@ -211,9 +213,11 @@ async fn stop_children(
             continue;
         };
         match stop_child(state, child).await {
-            Ok(()) => {
+            Ok(was_running) => {
                 super::thread_control::close_link(state, link.lineage.id).await;
-                stopped.push(child.clone());
+                if was_running {
+                    stopped.push(child.clone());
+                }
             }
             Err(reason) => left.push(OpenWork::Unconfirmed {
                 child: child.clone(),
@@ -225,9 +229,9 @@ async fn stop_children(
     stopped
 }
 
-/// Stop `child` on its machine; a machine that answers without it has
-/// nothing left to stop
-async fn stop_child(state: &AppState, child: &LinkEnd) -> Result<(), String> {
+/// Stop `child` on its machine, and say whether there was a thread to
+/// stop; a machine that answers without it has nothing left to stop
+async fn stop_child(state: &AppState, child: &LinkEnd) -> Result<bool, String> {
     let reference = format!("thread_{}", child.t3_thread);
     let found = find_on(state, child.machine, vec![reference])
         .await?
@@ -237,11 +241,11 @@ async fn stop_child(state: &AppState, child: &LinkEnd) -> Result<(), String> {
         .iter()
         .find(|thread| thread.t3_thread.as_deref() == Some(child.t3_thread.as_str()))
     else {
-        return Ok(());
+        return Ok(false);
     };
     super::thread_control::control_resolved(state, thread, ThreadControl::Stop)
         .await
-        .map(drop)
+        .map(|_| true)
         .map_err(|error| format!("it could not be stopped: {error}"))
 }
 

@@ -673,7 +673,8 @@ another machine, once a scan sees it so or misses it on two scans in a row.
 `thread report --stop-children` stops each child thread that has not reported,
 as `thread interrupt --stop` does, and stops waiting on it, when such children
 are the only open work left; the output's `stopped` lists them. The report is
-checked first, so one that would fail stops nothing. A child that cannot be
+checked first, so a report that fails its own checks, such as its size,
+stops nothing. A child that cannot be
 stopped, such as one on a machine that does not answer, stays open work, so
 the report is still refused, and the refusal's `input.stopped` lists the
 children it did stop. Stopping is explicit rather than
@@ -690,7 +691,9 @@ sleeping parent. Its body starts `Child thread thread_<id> is waiting on a
 question (request <id>).` (or on an approval), then the child's T3 link, the
 questions with their options or what the approval asks for, and the
 `homebased thread answer` command. Its message UUID comes from the link and
-the request, so a daemon restart never sends it twice.
+the request, so a later scan or a daemon restart sends the same message,
+which the message path delivers once it has a receipt; a restart in the
+moment between delivery and receipt can deliver it again.
 
 On the socket, `POST /v1/threads/context` resolves references and
 `GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both

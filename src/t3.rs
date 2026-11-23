@@ -959,29 +959,42 @@ pub(crate) fn interrupt_thread(
     }
 }
 
+/// Why an answer did not reach T3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnswerFailure {
+    /// T3, or the request as it stands, refuses it; a retry gets the same
+    Refused(String),
+    /// T3 cannot be reached, or its answer was lost
+    Unavailable(String),
+}
+
 /// Answer the pending question `request` of `t3_thread` with `answers`, keyed
 /// by question id
 ///
 /// # Errors
 ///
-/// When T3 cannot be reached, its answer was lost, or it refused
+/// [`AnswerFailure::Refused`] when T3 refuses, such as for a question
+/// answered in T3 Code meanwhile, and [`AnswerFailure::Unavailable`] when it
+/// cannot be reached or its answer was lost
 pub(crate) fn answer_request(
     env: &T3Env,
     t3_thread: &str,
     request: &str,
     answers: &Value,
-) -> Result<(), String> {
+) -> Result<(), AnswerFailure> {
     let outcome = with_t3_thread(env, t3_thread.to_owned(), |owner| {
         v2::respond(owner.origin, owner.thread, request, answers, owner.token)
     })
-    .map_err(|failure| failure.to_string())?;
+    .map_err(|failure| AnswerFailure::Unavailable(failure.to_string()))?;
     match outcome {
         WakeOutcome::Woken { .. } => Ok(()),
-        WakeOutcome::Refused(detail) => Err(format!("T3 refused the answer: {detail}")),
-        WakeOutcome::NotT3Thread => Err("T3 has no such thread".into()),
+        WakeOutcome::Refused(detail) => Err(AnswerFailure::Refused(format!(
+            "T3 refused the answer: {detail}"
+        ))),
+        WakeOutcome::NotT3Thread => Err(AnswerFailure::Refused("T3 has no such thread".into())),
         WakeOutcome::Unavailable(detail)
         | WakeOutcome::Uncertain(detail)
-        | WakeOutcome::ApiChanged(detail) => Err(detail),
+        | WakeOutcome::ApiChanged(detail) => Err(AnswerFailure::Unavailable(detail)),
     }
 }
 
