@@ -29,6 +29,19 @@
 //! - `orchestration.dispatchCommand` takes `message.dispatch` and returns integer
 //!   `sequence`; a repeated `commandId` returns the first result without a second
 //!   turn. An unknown thread fails with `OrchestrationV2DispatchCommandError`
+//! - `orchestration_v2_projection_turn_items` holds a thread's items, with
+//!   `ordinal` growing within the thread: run `n` numbers its items from
+//!   `n * 1_000_000 + 1`. `user_message` and `assistant_message` items carry
+//!   `text`, `createdBy`, `creationSource`, `senderThreadId`, `startedAt`, and
+//!   `completedAt` in `payload_json`, which `thread read` shows as the
+//!   thread's messages
+//! - T3's thread read (`t3_thread_read`) numbers a thread's items from 0 as
+//!   `position`, in ordinal order. A thread whose `payload_json.forkedFrom` is
+//!   `{"type": "run", "threadId", "runId"}` first shows its parent's items
+//!   through that run as `inherited`, then one synthetic `fork` item, then its
+//!   own; a `node` fork, as a subagent is, inherits nothing. `thread read`
+//!   gives the same positions; checked against T3 Code `v0.1.9` on a plain
+//!   thread and a run fork, while a fork of a fork is unverified
 //! - V2 runs a turn in an archived thread and leaves it archived, where nobody
 //!   sees it, so homebased sends `thread.unarchive` first
 //! - A `message.dispatch` whose text is exactly `/compact` runs as a
@@ -44,6 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use chrono::DateTime;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde_json::{Value, json};
 use tracing::debug;
@@ -51,10 +65,11 @@ use uuid::Uuid;
 
 use super::rpc::{self, Exit};
 use super::{
-    ApiFailure, COMPACT_COMMAND, OpenThreadRow, ProbeCheck, ProbeStatus, ProviderThread,
-    PullRequest, ThreadDetails, TurnStart, deterministic_id, failed, open_thread_rows, passed,
-    state_connection,
+    ApiFailure, COMPACT_COMMAND, MessageReadError, OpenThreadRow, ProbeCheck, ProbeStatus,
+    ProviderThread, PullRequest, ThreadDetails, TurnStart, deterministic_id, failed,
+    open_thread_rows, passed, state_connection,
 };
+use crate::thread_read::{MessagePage, MessageRole, MessageWindow, MessagesPage, ThreadMessage};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const DISPATCH_METHOD: &str = "orchestration.dispatchCommand";
@@ -636,6 +651,298 @@ pub(super) fn schema_matches(path: &Path) -> bool {
         return false;
     };
     db.prepare(REQUIRED_STATE_SQL).is_ok()
+}
+
+const THREAD_FORK_SQL: &str = "
+    SELECT deleted_at IS NULL,
+           CASE WHEN json_valid(payload_json)
+               THEN json_extract(payload_json, '$.forkedFrom.type') END,
+           CASE WHEN json_valid(payload_json)
+               THEN json_extract(payload_json, '$.forkedFrom.threadId') END,
+           CASE WHEN json_valid(payload_json)
+               THEN json_extract(payload_json, '$.forkedFrom.runId') END
+    FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
+const RUN_ORDINAL_SQL: &str =
+    "SELECT ordinal FROM orchestration_v2_projection_runs WHERE run_id = ?1";
+// every item counts toward a position, so the scan reads all of them; the
+// largest thread here, 18,542 items, scans in 30 ms
+const SEGMENT_ITEMS_SQL: &str = "
+    SELECT ordinal, type IN ('user_message', 'assistant_message')
+    FROM orchestration_v2_projection_turn_items
+    WHERE thread_id = ?1 AND ordinal < ?2
+    ORDER BY ordinal";
+const MESSAGE_SQL: &str = "
+    SELECT type, status,
+           json_extract(payload_json, '$.text'),
+           json_extract(payload_json, '$.createdBy'),
+           json_extract(payload_json, '$.creationSource'),
+           json_extract(payload_json, '$.senderThreadId'),
+           COALESCE(json_extract(payload_json, '$.completedAt'),
+                    json_extract(payload_json, '$.startedAt'), updated_at)
+    FROM orchestration_v2_projection_turn_items
+    WHERE thread_id = ?1 AND ordinal = ?2 AND json_valid(payload_json)";
+
+/// Turn item ordinals of one run: run `n` numbers its items from
+/// `n * RUN_ORDINAL_STRIDE + 1`
+const RUN_ORDINAL_STRIDE: i64 = 1_000_000;
+/// Most forks a thread's view follows back, against a cycle in bad state
+const MAX_FORK_DEPTH: usize = 16;
+
+/// One stretch of a thread's view: the items of `thread` below `below`
+struct Segment {
+    thread: String,
+    below: i64,
+}
+
+/// One message of a thread's view, before its text is read
+struct MessageEntry {
+    position: i64,
+    /// Index into the view's segments
+    segment: usize,
+    ordinal: i64,
+}
+
+/// One row of [`THREAD_FORK_SQL`]
+struct ForkRow {
+    /// Whether the thread is not deleted
+    live: bool,
+    /// `forkedFrom.type`: `run`, `node`, or none for a thread never forked
+    kind: Option<String>,
+    parent: Option<String>,
+    run: Option<String>,
+}
+
+impl ForkRow {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            live: row.get(0)?,
+            kind: row.get(1)?,
+            parent: row.get(2)?,
+            run: row.get(3)?,
+        })
+    }
+}
+
+/// The stretches T3 shows as `t3_thread`'s items, oldest first
+///
+/// A thread forked from a run shows its parent's items through that run, as
+/// `inherited`, then its own; a thread forked from a node, as a subagent is,
+/// inherits nothing
+fn view_segments(db: &Connection, t3_thread: &str) -> Result<Vec<Segment>, MessageReadError> {
+    let mut segments = vec![Segment {
+        thread: t3_thread.to_owned(),
+        below: i64::MAX,
+    }];
+    let mut current = t3_thread.to_owned();
+    while segments.len() <= MAX_FORK_DEPTH {
+        let fork = db
+            .query_row(THREAD_FORK_SQL, [&current], ForkRow::from_row)
+            .optional()
+            .map_err(message_query_failed)?;
+        let fork = match fork {
+            Some(fork) => fork,
+            None if current == t3_thread => return Err(MessageReadError::ThreadMissing),
+            // a parent T3 no longer has leaves nothing to inherit
+            None => break,
+        };
+        if !fork.live && current == t3_thread {
+            return Err(MessageReadError::ThreadMissing);
+        }
+        let (Some("run"), Some(parent), Some(run)) = (fork.kind.as_deref(), fork.parent, fork.run)
+        else {
+            break;
+        };
+        let Some(run_ordinal) = run_ordinal(db, &run)? else {
+            break;
+        };
+        if segments.iter().any(|segment| segment.thread == parent) {
+            break;
+        }
+        segments.push(Segment {
+            thread: parent.clone(),
+            below: (run_ordinal + 1).saturating_mul(RUN_ORDINAL_STRIDE),
+        });
+        current = parent;
+    }
+    segments.reverse();
+    Ok(segments)
+}
+
+/// Ordinal of `run`, from its row or else from the `:ordinal:<n>` its id ends with
+fn run_ordinal(db: &Connection, run: &str) -> Result<Option<i64>, MessageReadError> {
+    let stored: Option<i64> = db
+        .query_row(RUN_ORDINAL_SQL, [run], |row| row.get(0))
+        .optional()
+        .map_err(message_query_failed)?;
+    Ok(stored.or_else(|| run.rsplit_once(":ordinal:")?.1.parse().ok()))
+}
+
+/// Every message of a thread's view, with the position T3 gives it
+///
+/// T3 numbers every item of the view from 0, messages or not, with one
+/// synthetic `fork` item after each inherited stretch
+fn view_messages(
+    db: &Connection,
+    segments: &[Segment],
+) -> Result<Vec<MessageEntry>, MessageReadError> {
+    let mut statement = db
+        .prepare(SEGMENT_ITEMS_SQL)
+        .map_err(message_query_failed)?;
+    let mut entries = Vec::new();
+    let mut position = 0_i64;
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            position += 1;
+        }
+        let items = statement
+            .query_map(rusqlite::params![segment.thread, segment.below], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(message_query_failed)?;
+        for (ordinal, is_message) in items {
+            if is_message {
+                entries.push(MessageEntry {
+                    position,
+                    segment: index,
+                    ordinal,
+                });
+            }
+            position += 1;
+        }
+    }
+    Ok(entries)
+}
+
+fn message_query_failed(error: rusqlite::Error) -> MessageReadError {
+    MessageReadError::Unreadable(format!("T3 message query failed: {error}"))
+}
+
+/// The messages of T3 thread `t3_thread` that `page` asks for, oldest first,
+/// numbered by T3's positions, the same that `t3_thread_read` gives
+///
+/// # Errors
+///
+/// [`MessageReadError::ThreadMissing`] for a thread that is gone or deleted,
+/// [`MessageReadError::ItemMissing`] for an item position with no message, and
+/// [`MessageReadError::Unreadable`] when the state cannot be read
+pub(super) fn thread_messages(
+    path: &Path,
+    t3_thread: &str,
+    page: MessagePage,
+) -> Result<MessagesPage, MessageReadError> {
+    let db = state_connection(path)
+        .map_err(|_| MessageReadError::Unreadable("statev2.sqlite cannot be read".into()))?;
+    let segments = view_segments(&db, t3_thread)?;
+    let entries = view_messages(&db, &segments)?;
+
+    let limit = usize::from(page.limit.get());
+    let before = |position: i64| entries.partition_point(|entry| entry.position < position);
+    let after = |position: i64| entries.partition_point(|entry| entry.position <= position);
+    // `chosen` is a range of `entries`; `floor` and `ceiling` bound it in
+    // positions when it is empty, so the page still says what lies around it
+    let (chosen, floor, ceiling, offset) = match page.window {
+        MessageWindow::Newest => (entries.len().saturating_sub(limit)..entries.len(), 0, 0, 0),
+        MessageWindow::Oldest => (0..limit.min(entries.len()), 0, 0, 0),
+        MessageWindow::Before { position } => {
+            let end = before(position);
+            (end.saturating_sub(limit)..end, position, position - 1, 0)
+        }
+        MessageWindow::After { position } => {
+            let start = after(position);
+            (
+                start..(start + limit).min(entries.len()),
+                position + 1,
+                position,
+                0,
+            )
+        }
+        MessageWindow::Item { position, offset } => {
+            let start = before(position);
+            if entries
+                .get(start)
+                .is_none_or(|entry| entry.position != position)
+            {
+                return Err(MessageReadError::ItemMissing(position));
+            }
+            (start..start + 1, position, position, offset)
+        }
+    };
+    let window = &entries[chosen.clone()];
+    let floor = window.first().map_or(floor, |entry| entry.position);
+    let ceiling = window.last().map_or(ceiling, |entry| entry.position);
+    let earlier = entries
+        .first()
+        .filter(|entry| entry.position < floor)
+        .map(|_| floor);
+    let later = entries
+        .last()
+        .filter(|entry| entry.position > ceiling)
+        .map(|_| ceiling);
+
+    let mut statement = db.prepare(MESSAGE_SQL).map_err(message_query_failed)?;
+    let max_chars = page.max_chars.get();
+    let mut messages = Vec::with_capacity(window.len());
+    for entry in window {
+        let segment = &segments[entry.segment];
+        let inherited_from = (entry.segment + 1 < segments.len()).then(|| segment.thread.clone());
+        let message = statement
+            .query_row(rusqlite::params![segment.thread, entry.ordinal], |row| {
+                message_from_row(row, entry.position, offset, max_chars, inherited_from)
+            })
+            .optional()
+            .map_err(message_query_failed)?;
+        // an item whose payload is not JSON has no text to show
+        messages.extend(message);
+    }
+    Ok(MessagesPage {
+        messages,
+        earlier,
+        later,
+    })
+}
+
+/// One row of [`MESSAGE_SQL`], its text cut to `max_chars` from `offset`
+fn message_from_row(
+    row: &Row<'_>,
+    position: i64,
+    offset: u32,
+    max_chars: u32,
+    inherited_from: Option<String>,
+) -> rusqlite::Result<ThreadMessage> {
+    let role = match row.get::<_, String>(0)?.as_str() {
+        "user_message" => MessageRole::User,
+        _ => MessageRole::Assistant,
+    };
+    let full: Option<String> = row.get(2)?;
+    let full = full.unwrap_or_default();
+    // a message over `u32::MAX` characters cannot fit T3's state anyway
+    let chars = u32::try_from(full.chars().count()).unwrap_or(u32::MAX);
+    let text: String = full
+        .chars()
+        .skip(offset as usize)
+        .take(max_chars as usize)
+        .collect();
+    let end = offset.saturating_add(max_chars);
+    let at: Option<String> = row.get(6)?;
+    let (created_by, source, sender_thread) = match role {
+        MessageRole::User => (row.get(3)?, row.get(4)?, row.get(5)?),
+        // T3 records no sender on the agent's own text
+        MessageRole::Assistant => (None, None, None),
+    };
+    Ok(ThreadMessage {
+        position,
+        role,
+        created_by,
+        source,
+        sender_thread,
+        inherited_from,
+        status: row.get(1)?,
+        at: at.and_then(|at| DateTime::parse_from_rfc3339(&at).ok().map(|at| at.to_utc())),
+        text,
+        chars,
+        next_offset: (end < chars).then_some(end),
+    })
 }
 
 /// Send `text` to `thread_id` as a message that T3 starts, steers, or queues

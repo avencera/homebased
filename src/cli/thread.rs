@@ -1,18 +1,24 @@
-//! `homebased thread`: context size, compaction, and watches of agent threads
-//! anywhere in the Fleet, and the report a child thread sends its parent
+//! `homebased thread`: context size, messages, compaction, and watches of
+//! agent threads anywhere in the Fleet, and the report a child thread sends
+//! its parent
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Subcommand;
+use clap::{ArgGroup, Args, Subcommand};
 
 use crate::child_thread::{ReportStageKind, ThreadReportRequest, ThreadReportResponse};
 use crate::client::Client;
 use crate::domain::{API_VERSION, TaskEnv, TaskId, ThreadId};
 use crate::error::AppError;
+use crate::thread_read::{
+    CharLimit, MessageLimit, MessagePage, MessageRole, MessageWindow, ThreadMessage,
+    ThreadReadRequest, ThreadReadResponse,
+};
 use crate::thread_ref::{
     Caller, ThreadContext, ThreadContextRequest, ThreadContextResponse, ThreadSelector,
+    central_time,
 };
 use crate::thread_watch::{
     CompactRequest, CompactResponse, StallAfter, Threshold, WatchAction, WatchCondition, WatchId,
@@ -65,6 +71,41 @@ pub enum ThreadCommand {
         task: Option<TaskId>,
         /// The worker session of this task
         #[arg(long, conflicts_with_all = ["refs", "task"])]
+        worker: Option<TaskId>,
+    },
+    /// Read a T3 thread's messages on whichever machine runs it
+    ///
+    /// Prints the user and assistant messages T3 shows in the thread, oldest
+    /// first, without tool calls; a message to the agent may be the user's,
+    /// another agent's, or one homebased sent, and a fork starts with the
+    /// history it inherited. Each message starts with its position, the same
+    /// one `t3_thread_read` gives, which --before, --after, and --item take. A
+    /// `running` message is still growing; read it again with --item. Looks on this
+    /// machine first, then on every reachable Fleet machine; a UUID prefix of
+    /// at least 4 characters is accepted, and must name one thread. Times are
+    /// US Central.
+    #[command(after_help = REFERENCE_HELP)]
+    Read {
+        /// Thread reference; the calling thread when omitted
+        #[arg(value_name = "REF")]
+        reference: Option<String>,
+        #[command(flatten)]
+        window: WindowArgs,
+        /// Most messages to print, from 1 to 100
+        #[arg(long, default_value_t)]
+        limit: MessageLimit,
+        /// Most characters of each message's text, from 1 to 20000; a longer
+        /// text says how to read on with --item and --offset
+        #[arg(long, default_value_t)]
+        max_chars: CharLimit,
+        /// Look only on this machine name or UUID
+        #[arg(long)]
+        machine: Option<String>,
+        /// The origin thread of this task
+        #[arg(long, conflicts_with_all = ["reference", "worker"])]
+        task: Option<TaskId>,
+        /// The worker session of this task
+        #[arg(long, conflicts_with_all = ["reference", "task"])]
         worker: Option<TaskId>,
     },
     /// Get one event when a thread's context passes a limit while it is idle,
@@ -194,6 +235,42 @@ pub enum ThreadCommand {
     },
 }
 
+/// Which messages `thread read` prints; the newest when no flag is given
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("window").args(["before", "after", "oldest", "item"])))]
+pub struct WindowArgs {
+    /// The newest messages before this position
+    #[arg(long, value_name = "POSITION")]
+    before: Option<i64>,
+    /// The oldest messages after this position
+    #[arg(long, value_name = "POSITION")]
+    after: Option<i64>,
+    /// The first messages of the thread
+    #[arg(long)]
+    oldest: bool,
+    /// Only the message at this position
+    #[arg(long, value_name = "POSITION")]
+    item: Option<i64>,
+    /// With --item, start its text at this character offset
+    #[arg(long, requires = "item", default_value_t = 0)]
+    offset: u32,
+}
+
+impl WindowArgs {
+    fn window(&self) -> MessageWindow {
+        match (self.before, self.after, self.oldest, self.item) {
+            (Some(position), ..) => MessageWindow::Before { position },
+            (None, Some(position), ..) => MessageWindow::After { position },
+            (None, None, true, _) => MessageWindow::Oldest,
+            (None, None, false, Some(position)) => MessageWindow::Item {
+                position,
+                offset: self.offset,
+            },
+            (None, None, false, None) => MessageWindow::Newest,
+        }
+    }
+}
+
 /// Run one thread command
 pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError> {
     let client = Client::new(ctx.home.sock_path());
@@ -225,6 +302,33 @@ pub async fn run(ctx: &Ctx, command: ThreadCommand) -> Result<ExitCode, AppError
             let response: ThreadContextResponse =
                 client.post_json("/v1/threads/context", &request).await?;
             print_context(ctx, &response)
+        }
+        ThreadCommand::Read {
+            reference,
+            window,
+            limit,
+            max_chars,
+            machine,
+            task,
+            worker,
+        } => {
+            let caller = Caller::from_env()?;
+            let page = MessagePage {
+                window: window.window(),
+                limit,
+                max_chars,
+            };
+            let mut threads = selectors(reference.into_iter().collect(), task, worker, &caller)?;
+            let request = ThreadReadRequest {
+                api_version: API_VERSION,
+                thread: threads.remove(0),
+                carried_by: caller.t3_thread,
+                machine,
+                page,
+            };
+            let response: ThreadReadResponse =
+                client.post_json("/v1/threads/read", &request).await?;
+            print_read(ctx, &response)
         }
         ThreadCommand::Watch {
             refs,
@@ -397,6 +501,82 @@ fn print_context(ctx: &Ctx, response: &ThreadContextResponse) -> Result<ExitCode
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_read(ctx: &Ctx, response: &ThreadReadResponse) -> Result<ExitCode, AppError> {
+    let messages = &response.page.messages;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(serde_json::to_value(response)?)?,
+        OutputMode::Quiet => {
+            for message in messages {
+                println!("{}", message.position);
+            }
+        }
+        OutputMode::Human => {
+            println!("{}", response.thread.human_line());
+            if messages.is_empty() {
+                println!("\nno messages");
+            }
+            for message in messages {
+                println!("\n{}\n{}", message_header(message), message.text);
+                if let Some(offset) = message.next_offset {
+                    println!(
+                        "[cut at {offset} of {} characters; read on with --item {} --offset {offset}]",
+                        message.chars, message.position
+                    );
+                }
+            }
+            let reference = response.thread.exact_reference();
+            if response.page.earlier.is_some() || response.page.later.is_some() {
+                println!();
+            }
+            if let Some(position) = response.page.earlier {
+                println!("older: homebased thread read {reference} --before {position}");
+            }
+            if let Some(position) = response.page.later {
+                println!("newer: homebased thread read {reference} --after {position}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `#5000030 assistant, 2026-11-23 11:17 CST`, naming who sent a message to
+/// the agent and how
+fn message_header(message: &ThreadMessage) -> String {
+    let from = match (message.role, message.created_by.as_deref()) {
+        (MessageRole::Assistant, _) => "assistant".to_owned(),
+        (MessageRole::User, Some("agent")) => "agent".to_owned(),
+        (MessageRole::User, _) => "user".to_owned(),
+    };
+    let inherited = message
+        .inherited_from
+        .as_deref()
+        .map(|thread| format!(" (inherited from thread_{thread})"))
+        .unwrap_or_default();
+    let sender = message
+        .sender_thread
+        .as_deref()
+        .map(|thread| format!(" from thread_{thread}"))
+        .unwrap_or_default();
+    let source = message
+        .source
+        .as_deref()
+        .map(|source| format!(" via {source}"))
+        .unwrap_or_default();
+    let at = message
+        .at
+        .map(|at| format!(", {}", central_time(at)))
+        .unwrap_or_default();
+    let status = if message.status == "completed" {
+        String::new()
+    } else {
+        format!(", {}", message.status)
+    };
+    format!(
+        "#{} {from}{sender}{source}{at}{status}{inherited}",
+        message.position
+    )
 }
 
 fn child_line(child: &ThreadContext) -> String {

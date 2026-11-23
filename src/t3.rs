@@ -801,6 +801,35 @@ pub(crate) fn completion_wakes_due(env: &T3Env) -> std::collections::HashSet<Str
         .unwrap_or_default()
 }
 
+/// Why [`thread_messages`] returned no page
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageReadError {
+    /// This machine's T3 has no such thread, or deleted it
+    ThreadMissing,
+    /// The thread has no message at this position
+    ItemMissing(i64),
+    /// T3's state exists but cannot be read
+    Unreadable(String),
+}
+
+/// The messages of T3 thread `t3_thread` that `page` asks for, oldest first,
+/// read from the state database on disk, so the server need not run
+///
+/// # Errors
+///
+/// See [`MessageReadError`]
+pub(crate) fn thread_messages(
+    env: &T3Env,
+    t3_thread: &str,
+    page: crate::thread_read::MessagePage,
+) -> Result<crate::thread_read::MessagesPage, MessageReadError> {
+    let state = state_path(&env.userdata());
+    if !state.is_file() {
+        return Err(MessageReadError::ThreadMissing);
+    }
+    v2::thread_messages(&state, t3_thread, page)
+}
+
 /// Every T3 thread that is not deleted, newest first
 ///
 /// Reads the state database on disk, so the server need not run. Empty only

@@ -157,6 +157,15 @@ pub enum AppError {
         /// What hosts the thread
         host: ThreadHost,
     },
+    /// The thread runs outside T3, which is the only host whose messages
+    /// homebased can read
+    #[error("{reference} runs as a {} session, and only T3 Code threads can be read by homebased", host.as_str())]
+    ReadUnsupportedHost {
+        /// Reference as the caller passed it
+        reference: String,
+        /// What hosts the thread
+        host: ThreadHost,
+    },
     /// No watch has this id on this machine
     #[error("no thread watch {watch} on this machine")]
     WatchNotFound {
@@ -802,6 +811,7 @@ impl AppError {
             Self::ThreadRefAmbiguous { .. } => "thread_ref_ambiguous",
             Self::ThreadNotFound { .. } => "thread_not_found",
             Self::CompactUnsupportedHost { .. } => "compact_unsupported_host",
+            Self::ReadUnsupportedHost { .. } => "read_unsupported_host",
             Self::WatchNotFound { .. } => "watch_not_found",
             Self::ServiceNotFound { .. } => "service_not_found",
             Self::ServiceNotReady { .. } => "service_not_ready",
@@ -919,6 +929,7 @@ impl AppError {
             Self::ServiceNotReady { .. } => 1,
             Self::ThreadRefAmbiguous { .. }
             | Self::CompactUnsupportedHost { .. }
+            | Self::ReadUnsupportedHost { .. }
             | Self::WatchWaitUnavailable { .. } => 5,
             Self::Permission { .. } => 4,
             Self::TooManyReports { .. }
@@ -1025,7 +1036,8 @@ impl AppError {
             | Self::WaitTargetAmbiguous { .. }
             | Self::WatchWaitUnavailable { .. }
             | Self::ThreadRefAmbiguous { .. }
-            | Self::CompactUnsupportedHost { .. } => http::StatusCode::CONFLICT,
+            | Self::CompactUnsupportedHost { .. }
+            | Self::ReadUnsupportedHost { .. } => http::StatusCode::CONFLICT,
             Self::SubmissionRejected { .. }
             | Self::SubmissionConflict { .. }
             | Self::MessageConflict { .. } => http::StatusCode::CONFLICT,
@@ -1097,7 +1109,8 @@ impl AppError {
             Self::ThreadNotFound { reference, detail } => {
                 json!({ "reference": reference, "detail": detail })
             }
-            Self::CompactUnsupportedHost { reference, host } => {
+            Self::CompactUnsupportedHost { reference, host }
+            | Self::ReadUnsupportedHost { reference, host } => {
                 json!({ "reference": reference, "host": host })
             }
             Self::WatchNotFound { watch } => json!({ "watch": watch }),

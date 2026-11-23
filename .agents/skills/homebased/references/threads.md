@@ -1,12 +1,14 @@
-# Thread context, compaction, and watches
+# Thread context, messages, compaction, and watches
 
-`homebased thread` reads how full an agent thread's context is, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's report, and any follow-up reports, to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
+`homebased thread` reads how full an agent thread's context is, reads a T3 thread's messages, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's report, and any follow-up reports, to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
 
 ```bash
 homebased --json thread context                      # this thread
 homebased --json thread context --children           # this thread's T3 children, finished ones too
 homebased --json thread context --children --live    # only children still working
 homebased --json thread context 'thread_3f2a…' 9c1e  # several references; 9c1e is a prefix
+homebased --json thread read 'thread_3f2a…'          # its newest 20 messages
+homebased --json thread read 'thread_3f2a…' --before <position>
 homebased --json thread compact 'thread_3f2a…'
 homebased --json thread watch <subagent-thread-id> --context-above <limit> --action compact
 homebased --json thread watch --children --stalled-after 20m
@@ -30,7 +32,7 @@ Every subcommand takes the same references:
 | `--worker <id>` | the worker session of a Homebased task |
 
 - The command looks on this machine first, then asks every reachable Fleet machine about the references it did not find here. `--machine <name>` looks only there; with `--children`, it limits only which machine's children are listed. A `--task` thread is on the machine the task was submitted from and a `--worker` thread on the machine that runs it, so a `--machine` naming another fails with `usage`.
-- Only `thread context` accepts a prefix: at least 4 characters of a UUID-shaped id. It must still name one thread.
+- Only `thread context` and `thread read` accept a prefix: at least 4 characters of a UUID-shaped id. It must still name one thread.
 - More than one match fails with `thread_ref_ambiguous` (exit 5) and lists the candidates; pass `exact_reference` from one of them. No match fails with `thread_not_found` (exit 3), whose message names the machines searched and those that did not answer.
 - A chip's `ref` is not a thread id. It is the id of a context record in the message that carried the chip, unique only within that message, and homebased reads the thread from that record in this machine's T3. Run from a T3 thread, it reads the record in the caller's own recent messages first; otherwise a ref that records in different messages tie to different threads fails with `thread_ref_ambiguous`, so pass the `threadId` instead. A chip with no record here (for example, one pasted from another machine) works only when its ref is `thread_<id>`; any other fails with `thread_not_found` and the hint "chip ref is not a thread id; pass the threadId from the t3_context block". The `<t3_context>` block in the same message has a `threadId:` line for each chip; pass that.
 - A T3 thread's session is the one T3 runs its next turn in: the active provider thread of the selected provider instance. Right after a provider switch, before the first turn on the new provider, the thread has no session. A T3 thread's own session matches as that T3 thread; older sessions of the same T3 thread match as plain terminal sessions.
@@ -60,6 +62,26 @@ Human output gives times in US Central.
 It also lists every child thread the calling T3 thread launched with `t3 launch --child`, on any machine, each with its `child_thread` record; see [Child threads](#child-threads). A grandchild is listed under its own parent only.
 
 The list can be incomplete. When a reachable Fleet machine does not answer, the result has `children_complete: false` and names each such machine with the reason in `unanswered`. Human output warns on stderr. Run the command again before you rely on the list. Machines that Fleet lists as offline are not asked and not listed.
+
+## `thread read`
+
+Reads a T3 thread's messages on whichever machine runs it, so a thread on another Fleet machine reads like one here. It returns the user and assistant messages T3 shows in the thread, oldest first, without tool calls, reasoning, or tool output; for those, use `t3_thread_read` with `view: "activity"` on the thread's own machine.
+
+```bash
+homebased --json thread read <ref>                           # newest 20 messages
+homebased --json thread read <ref> --before <position>       # the page before
+homebased --json thread read <ref> --after <position>        # newer messages
+homebased --json thread read <ref> --oldest                  # the first messages
+homebased --json thread read <ref> --item <position> --offset <n>  # read on in one long message
+```
+
+- The result has `thread`, as `thread context` describes it, then `messages`, `earlier`, and `later`. Pass `earlier` to `--before` for older messages and `later` to `--after` for newer ones; each is `null` when there are none.
+- `position` is the one `t3_thread_read` gives the same item: T3 numbers every item of the thread from 0, tool calls included, so positions skip, and either tool's positions work in the other.
+- A thread forked from a run starts with its parent's messages through that run, each with `inherited_from` naming the parent; a T3 subagent inherits nothing.
+- A message with `status: running` is still growing, and paging on with `--after` skips the rest of it; read it again with `--item <position>`.
+- Each message has `position`, `role` (`user` or `assistant`), `status` (such as `completed`, `running`, or `interrupted`), `at`, `text`, and `chars`, the length of the whole text. A `user` message is anything sent to the agent: `created_by` says whether a `user` or an `agent` sent it, `source` how (`web`, `mobile`, `server` for homebased events and messages, `mcp` for another agent's `t3_thread_send`), and `sender_thread` which T3 thread sent it.
+- `--limit` takes 1 to 100 messages (20 by default) and `--max-chars` 1 to 20000 characters of each text (4000 by default). A longer text has `next_offset`; read on with `--item <position> --offset <next_offset>`. A position with no message fails with `usage`.
+- A thread outside T3 fails with `read_unsupported_host` (exit 5). A peer that predates the command fails with a usage error; run `homebased update` there.
 
 ## `thread compact`
 

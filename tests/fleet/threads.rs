@@ -1,5 +1,5 @@
-//! `homebased thread` across machines: watch scans and child lookups that a
-//! peer answers
+//! `homebased thread` across machines: watch scans, child lookups, and
+//! message reads that a peer answers
 
 use super::{Daemon, add_peer, remote_spec, submit_file, wait_until};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -187,6 +187,15 @@ fn t3_state(daemon: &Daemon) -> rusqlite::Connection {
             requested_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
             payload_json TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_items (
+            turn_item_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT '2026-10-02T20:00:00Z',
+            payload_json TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS orchestration_v2_projection_messages (
             message_id TEXT PRIMARY KEY,
             thread_id TEXT NOT NULL,
@@ -330,4 +339,212 @@ fn a_browser_page_cannot_compact_a_thread_through_the_fleet_listener() {
         &body,
     );
     assert!(!lookup.starts_with("HTTP/1.1 403"), "{lookup}");
+}
+
+/// A turn item of `thread` in T3's state, with `payload` merged over its defaults
+fn turn_item(db: &rusqlite::Connection, thread: &str, ordinal: i64, kind: &str, payload: Value) {
+    let mut full = json!({ "status": "completed", "completedAt": "2026-10-02T20:15:00Z" });
+    full.as_object_mut()
+        .unwrap()
+        .extend(payload.as_object().unwrap().clone());
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items
+         (turn_item_id, thread_id, ordinal, type, status, payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            format!("item:{thread}:{ordinal}"),
+            thread,
+            ordinal,
+            kind,
+            full["status"].as_str().unwrap(),
+            full.to_string()
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_t3_thread_on_a_peer_reads_page_by_page_and_cuts_long_text() {
+    const THREAD: &str = "mcp:launch:reviewer";
+    let (origin, peer) = pair("read-peer");
+    let db = t3_state(&peer);
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_threads (thread_id, title) VALUES (?1, 'reviewer')",
+        [THREAD],
+    )
+    .unwrap();
+    turn_item(
+        &db,
+        THREAD,
+        1_000_001,
+        "user_message",
+        json!({ "text": "review the diff", "createdBy": "user", "creationSource": "web" }),
+    );
+    // a tool call between messages is not a message
+    turn_item(
+        &db,
+        THREAD,
+        1_000_002,
+        "command_execution",
+        json!({ "title": "git diff" }),
+    );
+    turn_item(
+        &db,
+        THREAD,
+        1_000_003,
+        "assistant_message",
+        json!({ "text": "one finding: the retry never ends" }),
+    );
+    turn_item(
+        &db,
+        THREAD,
+        2_000_001,
+        "user_message",
+        json!({
+            "text": "fix it",
+            "createdBy": "agent",
+            "creationSource": "mcp",
+            "senderThreadId": "mcp:launch:orchestrator"
+        }),
+    );
+    turn_item(
+        &db,
+        THREAD,
+        2_000_002,
+        "assistant_message",
+        // a running item has no end yet
+        json!({
+            "text": "fixed ✓",
+            "status": "running",
+            "startedAt": "2026-10-02T20:20:00Z",
+            "completedAt": null
+        }),
+    );
+    let read = |args: &[&str]| {
+        let mut full = vec!["read", "thread_mcp:launch:reviewer"];
+        full.extend_from_slice(args);
+        ok(&thread_cmd(&origin, &[("T3CODE_THREAD_ID", "")], &full))
+    };
+
+    // T3 numbers every item from 0, so the messages sit at 0, 2, 3, and 4;
+    // the newest two are found on the peer although nothing names its machine
+    let newest = read(&["--limit", "2"]);
+    assert_eq!(
+        newest["thread"]["machine_name"], "read-peer-peer",
+        "{newest}"
+    );
+    assert_eq!(newest["thread"]["title"], "reviewer", "{newest}");
+    let messages = newest["messages"].as_array().unwrap();
+    let positions: Vec<i64> = messages
+        .iter()
+        .map(|m| m["position"].as_i64().unwrap())
+        .collect();
+    assert_eq!(positions, [3, 4], "{newest}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["created_by"], "agent");
+    assert_eq!(messages[0]["source"], "mcp");
+    assert_eq!(messages[0]["sender_thread"], "mcp:launch:orchestrator");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["status"], "running");
+    assert_eq!(messages[1]["at"], "2026-10-02T20:20:00Z");
+    assert_eq!(newest["earlier"], 3, "{newest}");
+    assert_eq!(newest["later"], Value::Null, "{newest}");
+
+    // the page before them ends the thread, without the tool call
+    let older = read(&["--before", "3"]);
+    let texts: Vec<&str> = older["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        ["review the diff", "one finding: the retry never ends"],
+        "{older}"
+    );
+    assert_eq!(older["earlier"], Value::Null, "{older}");
+    assert_eq!(older["later"], 2, "{older}");
+
+    // a cut text reads on from its offset, counting characters, not bytes
+    let cut = read(&["--after", "3", "--max-chars", "6"]);
+    let message = &cut["messages"][0];
+    assert_eq!(message["text"], "fixed ", "{cut}");
+    assert_eq!(message["chars"], 7, "{cut}");
+    assert_eq!(message["next_offset"], 6, "{cut}");
+    let rest = read(&["--item", "4", "--offset", "6"]);
+    assert_eq!(rest["messages"][0]["text"], "✓", "{rest}");
+    assert_eq!(rest["messages"][0]["next_offset"], Value::Null, "{rest}");
+
+    // the tool call's position holds no message, a usage error the peer reports back
+    let out = thread_cmd(
+        &origin,
+        &[("T3CODE_THREAD_ID", "")],
+        &["read", "thread_mcp:launch:reviewer", "--item", "1"],
+    );
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{error}");
+    assert_eq!(error["error"]["code"], "usage", "{error}");
+
+    // a fork of the first run shows that run as inherited history, then one
+    // synthetic fork item, then its own messages, whose ordinals restart
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_threads (thread_id, title, payload_json)
+         VALUES ('mcp:launch:fork', 'fork', ?1)",
+        [json!({
+            "forkedFrom": {
+                "type": "run",
+                "threadId": THREAD,
+                "runId": "run:thread:mcp%3Alaunch%3Areviewer:ordinal:1"
+            }
+        })
+        .to_string()],
+    )
+    .unwrap();
+    turn_item(
+        &db,
+        "mcp:launch:fork",
+        1_000_001,
+        "user_message",
+        json!({ "text": "try another fix", "createdBy": "user", "creationSource": "web" }),
+    );
+    let fork = ok(&thread_cmd(
+        &origin,
+        &[("T3CODE_THREAD_ID", "")],
+        &["read", "thread_mcp:launch:fork"],
+    ));
+    let messages = fork["messages"].as_array().unwrap();
+    let seen: Vec<(i64, &str, &Value)> = messages
+        .iter()
+        .map(|m| {
+            (
+                m["position"].as_i64().unwrap(),
+                m["text"].as_str().unwrap(),
+                &m["inherited_from"],
+            )
+        })
+        .collect();
+    let parent = json!(THREAD);
+    assert_eq!(
+        seen,
+        [
+            (0, "review the diff", &parent),
+            (2, "one finding: the retry never ends", &parent),
+            (4, "try another fix", &Value::Null),
+        ],
+        "{fork}"
+    );
+}
+
+#[test]
+fn a_session_outside_t3_cannot_be_read() {
+    const SESSION: &str = "0199eeee-3333-7000-8000-000000000001";
+    let (origin, peer) = pair("read-terminal");
+    claude_session(&peer, SESSION, 1_000);
+
+    let out = thread_cmd(&origin, &[("T3CODE_THREAD_ID", "")], &["read", SESSION]);
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(5), "{error}");
+    assert_eq!(error["error"]["code"], "read_unsupported_host", "{error}");
+    assert_eq!(error["error"]["input"]["host"], "terminal", "{error}");
 }

@@ -449,10 +449,11 @@ that long work belongs in a child thread. A homebased
 worker gets a `usage` error (exit 2) and parks with
 `homebased task report --outcome waiting --on <id>` instead.
 
-### Thread context, compaction, and watches
+### Thread context, messages, compaction, and watches
 
 ```sh
 homebased thread context [<ref>...] [--children [--live]] [--machine <name>]
+homebased thread read [<ref>] [--before <pos>|--after <pos>|--oldest|--item <pos> [--offset <n>]] [--limit <n>] [--max-chars <n>] [--machine <name>]
 homebased thread compact [<ref>] [--machine <name>]
 homebased thread watch [<ref>...] --context-above <150k|80%> [--action compact] [--once] [--children]
 homebased thread watch [<ref>...] --stalled-after <20m|1h> [--once] [--children]
@@ -483,8 +484,8 @@ reference found only elsewhere fails with `thread_not_found`. With `--children`,
 `--machine` limits only which machine's children are listed; the calling thread
 is always read here. Each daemon advertises its
 T3 environment id to Fleet peers, so a `t3-thread://` link goes straight to
-the machine that runs it. Only `thread context` accepts a UUID prefix of at
-least 4 characters. A reference that matches several threads fails with
+the machine that runs it. Only `thread context` and `thread read` accept a
+UUID prefix of at least 4 characters. A reference that matches several threads fails with
 `thread_ref_ambiguous` (exit 5), and one that matches none with
 `thread_not_found` (exit 3).
 
@@ -520,6 +521,24 @@ not answer, the result has `children_complete: false` and names it in
 `unanswered`, and human output warns on stderr; `thread watch --children` then
 fails with the retryable `thread_lookup_incomplete` and saves no watch.
 Machines that Fleet lists as offline are not asked.
+
+`thread read` reads a T3 thread's messages from the state of the T3 on
+whichever machine runs it, through that machine's daemon, so the T3 server
+need not run. It prints the user and assistant messages T3 shows in the
+thread, oldest first, without tool calls: the newest 20 by default, or
+`--limit` 1 to 100, each text cut at `--max-chars` (4000 by default, at most
+20000). Each message has its position, the index T3's own `t3_thread_read`
+gives its item among all the thread's items, tool calls included, which
+`--before` and `--after` page from and `--item` reads alone; a cut text has
+`next_offset`, which `--item <pos> --offset <n>` reads on from. A thread
+forked from a run starts with its parent's messages through that run, marked
+`inherited_from`. A `running` message is still growing, so read it again with
+`--item`. JSON output has `thread`, as `thread
+context` prints it, then `messages`, `earlier`, and `later`, the positions to
+page from, or `null` at either end. A message to the agent carries
+`created_by` (`user` or `agent`), `source` (such as `web`, `server`, or
+`mcp`), and `sender_thread`. A thread outside T3 fails with
+`read_unsupported_host` (exit 5), and a position with no message with `usage`.
 
 `thread compact` sends `/compact` to a T3 thread on whichever machine runs it,
 and records it in `compactions.jsonl` with trigger `manual`. A thread that is
@@ -627,10 +646,11 @@ another machine, once a scan sees it so or misses it on two scans in a row.
 
 On the socket, `POST /v1/threads/context` resolves references and
 `GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both
-are also served on the dashboard port. `POST /v1/threads/compact`,
-`POST /v1/threads/watches`, `POST /v1/threads/watches/{id}/unwatch`, and
-`POST /v1/threads/report` are socket only. Fleet peers answer `POST /v1/cluster/threads/context` and
-`POST /v1/cluster/threads/compact`.
+are also served on the dashboard port. `POST /v1/threads/read`,
+`POST /v1/threads/compact`, `POST /v1/threads/watches`,
+`POST /v1/threads/watches/{id}/unwatch`, and `POST /v1/threads/report` are
+socket only. Fleet peers answer `POST /v1/cluster/threads/context`,
+`POST /v1/cluster/threads/read`, and `POST /v1/cluster/threads/compact`.
 
 ### Launch a T3 thread on any machine
 

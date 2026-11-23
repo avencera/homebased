@@ -39,6 +39,7 @@ pub mod store;
 pub mod submission;
 pub mod t3;
 pub mod task_wait;
+pub mod thread_read;
 pub mod thread_ref;
 pub mod thread_title;
 pub mod thread_watch;

@@ -328,6 +328,14 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
                 _ => AppError::Internal { message },
             }
         }
+        "read_unsupported_host" => {
+            let reference = decode_field(input, "reference");
+            let host = decode_field(input, "host");
+            match (reference, host) {
+                (Some(reference), Some(host)) => AppError::ReadUnsupportedHost { reference, host },
+                _ => AppError::Internal { message },
+            }
+        }
         "thread_lookup_incomplete" => decode_field(input, "unanswered")
             .map_or(AppError::Internal { message }, |unanswered| {
                 AppError::ThreadLookupIncomplete { unanswered }
@@ -743,6 +751,10 @@ mod tests {
             AppError::CompactUnsupportedHost {
                 reference: "thread_x".into(),
                 host: crate::thread_ref::ThreadHost::Terminal,
+            },
+            AppError::ReadUnsupportedHost {
+                reference: "thread_x".into(),
+                host: crate::thread_ref::ThreadHost::Worker,
             },
             AppError::WatchNotFound {
                 watch: crate::thread_watch::WatchId::new(),

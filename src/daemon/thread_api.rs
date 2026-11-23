@@ -1,10 +1,11 @@
 //! `homebased thread`: find a thread anywhere in the Fleet, read how full its
-//! context is, compact it, and watch it
+//! context is, read its messages, compact it, and watch it
 //!
 //! A reference is looked up on this machine first, then on every reachable
 //! peer, unless a T3 link's environment, a task route, or `--machine` names
 //! the machine. Each daemon reads only its own T3, Claude, and Codex state, so
-//! peers answer `POST /v1/cluster/threads/context` for their own threads.
+//! peers answer `POST /v1/cluster/threads/context` for their own threads, and
+//! `POST /v1/cluster/threads/read` for the messages of their own T3 threads.
 //! Compaction runs on the machine whose T3 owns the thread, forwarded with the
 //! same destination and protocol checks as other Fleet writes. Watches live on
 //! the caller's machine, which checks them in the idle compaction scan
@@ -36,10 +37,11 @@ use super::peer_read::post_peer;
 use crate::domain::{API_VERSION, ThreadId};
 use crate::error::{AppError, ThreadMatch};
 use crate::fleet::directory::Reachability;
-use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
+use crate::fleet::http::{ClusterClient, ClusterResponse, DEFAULT_MAX_BODY};
 use crate::machine::MachineId;
 use crate::submission::CallbackContext;
-use crate::t3::{T3Env, environment_id};
+use crate::t3::{MessageReadError, T3Env, environment_id, thread_messages};
+use crate::thread_read::{MessagePage, MessagesPage, ThreadReadRequest, ThreadReadResponse};
 use crate::thread_ref::{
     Caller, Provider, ThreadContext, ThreadContextRequest, ThreadContextResponse, ThreadHost,
     ThreadRef, ThreadSelector,
@@ -52,6 +54,13 @@ use crate::thread_watch::{
 
 const CLUSTER_CONTEXT_PATH: &str = "/v1/cluster/threads/context";
 const CLUSTER_COMPACT_PATH: &str = "/v1/cluster/threads/compact";
+const CLUSTER_READ_PATH: &str = "/v1/cluster/threads/read";
+
+// the peer reads its T3 state on disk, which answers in milliseconds unless locked
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+// a full page is 100 messages of 20,000 characters, which JSON escaping can
+// grow several times over
+const READ_MAX_BODY: usize = 32 * 1024 * 1024;
 
 // the peer asks its T3, which answers within seconds or not at all
 const COMPACT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,9 +75,14 @@ pub fn read_routes() -> Router<AppState> {
         .route("/v1/threads/watches", get(watches))
 }
 
-/// Compaction and watches, for the Unix socket
-pub fn write_routes() -> Router<AppState> {
+/// Message reads, compaction, and watches, for the Unix socket
+///
+/// A message read is not one of the dashboard's routes. Peers read through
+/// the cluster route on the same TCP listener, which trusts the LAN and
+/// tailnet as the task log routes do
+pub fn socket_routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/threads/read", post(read))
         .route("/v1/threads/compact", post(compact))
         .route("/v1/threads/watches", post(watch))
         .route("/v1/threads/watches/{id}/unwatch", post(unwatch))
@@ -82,6 +96,7 @@ pub fn write_routes() -> Router<AppState> {
 pub fn cluster_routes() -> Router<AppState> {
     Router::new()
         .route(CLUSTER_CONTEXT_PATH, post(cluster_context))
+        .route(CLUSTER_READ_PATH, post(cluster_read))
         .merge(
             Router::new()
                 .route(CLUSTER_COMPACT_PATH, post(cluster_compact))
@@ -134,6 +149,26 @@ struct ClusterCompactBody {
     machine: MachineId,
     outcome: CompactOutcome,
     detail: Option<String>,
+}
+
+/// `POST /v1/cluster/threads/read` body
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterRead {
+    api_version: u32,
+    destination_machine: MachineId,
+    t3_thread: String,
+    /// Reference as the caller passed it, for errors
+    reference: String,
+    page: MessagePage,
+}
+
+/// `POST /v1/cluster/threads/read` answer
+#[derive(Debug, Serialize, Deserialize)]
+struct ClusterReadBody {
+    api_version: u32,
+    machine: MachineId,
+    page: MessagesPage,
 }
 
 /// What the daemon knows about this machine's threads before reading files
@@ -814,20 +849,11 @@ pub(crate) async fn compact_resolved(
             message: error.to_string(),
         })?;
     if !response.status.is_success() {
-        // a peer without the route answers with the web listener's `not_found`
-        let route_missing = response.status == StatusCode::NOT_FOUND
-            && serde_json::from_slice::<serde_json::Value>(&response.body).is_ok_and(|body| {
-                body.pointer("/error/code").and_then(|code| code.as_str()) == Some("not_found")
-            });
-        if route_missing {
-            return Err(AppError::Usage {
-                message: format!(
-                    "{} runs a homebased without `thread compact`; run `homebased update` there",
-                    thread.machine_name
-                ),
-            });
-        }
-        return Err(crate::client::map_error(response.status, &response.body));
+        return Err(peer_error(
+            &response,
+            &thread.machine_name,
+            "thread compact",
+        ));
     }
     let body: ClusterCompactBody = serde_json::from_slice(&response.body)?;
     if body.api_version != API_VERSION || body.protocol_version != wire.protocol_version {
@@ -842,6 +868,154 @@ pub(crate) async fn compact_resolved(
         });
     }
     Ok((body.outcome, body.detail))
+}
+
+/// The error a peer answered with, or an update hint when it runs a homebased
+/// without the route
+fn peer_error(response: &ClusterResponse, machine_name: &str, command: &str) -> AppError {
+    // a peer without the route answers with the web listener's `not_found`
+    let route_missing = response.status == StatusCode::NOT_FOUND
+        && serde_json::from_slice::<serde_json::Value>(&response.body).is_ok_and(|body| {
+            body.pointer("/error/code").and_then(|code| code.as_str()) == Some("not_found")
+        });
+    if route_missing {
+        return AppError::Usage {
+            message: format!(
+                "{machine_name} runs a homebased without `{command}`; run `homebased update` there"
+            ),
+        };
+    }
+    crate::client::map_error(response.status, &response.body)
+}
+
+async fn read(
+    State(state): State<AppState>,
+    Json(body): Json<ThreadReadRequest>,
+) -> Result<Json<ThreadReadResponse>, AppError> {
+    check_api_version(body.api_version)?;
+    let Resolved { mut threads, .. } = resolve(
+        &state,
+        vec![body.thread],
+        body.machine.as_deref(),
+        true,
+        None,
+        body.carried_by.as_deref(),
+    )
+    .await?;
+    let thread = threads.pop().ok_or_else(|| AppError::Internal {
+        message: "thread lookup returned no thread".into(),
+    })?;
+    let page = read_resolved(&state, &thread, body.page).await?;
+    Ok(Json(ThreadReadResponse {
+        api_version: API_VERSION,
+        thread,
+        page,
+    }))
+}
+
+/// Read the messages of a looked-up thread from the machine whose T3 runs it
+///
+/// # Errors
+///
+/// `read_unsupported_host` for a thread outside T3, `thread_not_found` for
+/// one that T3 no longer has, and the transport errors of a forward
+async fn read_resolved(
+    state: &AppState,
+    thread: &ThreadContext,
+    page: MessagePage,
+) -> Result<MessagesPage, AppError> {
+    let reference = thread
+        .reference
+        .clone()
+        .unwrap_or_else(|| thread.exact_reference());
+    let t3_thread = match (thread.host, &thread.t3_thread) {
+        (ThreadHost::T3, Some(t3_thread)) => t3_thread.clone(),
+        (host, _) => return Err(AppError::ReadUnsupportedHost { reference, host }),
+    };
+    let local = state.machine.identity.machine;
+    if thread.machine == local {
+        return read_here(t3_thread, reference, page).await;
+    }
+
+    let fleet = state
+        .fleet
+        .handle()
+        .ok_or_else(|| AppError::MachineNotFound {
+            machine: thread.machine.to_string(),
+        })?;
+    let verified = fleet.connect(thread.machine).await?;
+    let wire = ClusterRead {
+        api_version: API_VERSION,
+        destination_machine: thread.machine,
+        t3_thread,
+        reference,
+        page,
+    };
+    let response = ClusterClient::new(READ_TIMEOUT, READ_MAX_BODY)
+        .post_json(&verified.address, CLUSTER_READ_PATH, &wire)
+        .await
+        .map_err(|error| AppError::MachineUnavailable {
+            machine: thread.machine,
+            message: error.to_string(),
+        })?;
+    if !response.status.is_success() {
+        return Err(peer_error(&response, &thread.machine_name, "thread read"));
+    }
+    let body: ClusterReadBody = serde_json::from_slice(&response.body)?;
+    if body.api_version != API_VERSION {
+        return Err(AppError::Internal {
+            message: format!("{} answered with another version", thread.machine_name),
+        });
+    }
+    if body.machine != thread.machine {
+        return Err(AppError::MachineIdentityMismatch {
+            expected: thread.machine,
+            found: Some(body.machine),
+        });
+    }
+    Ok(body.page)
+}
+
+/// Read the messages of a T3 thread from this machine's T3
+async fn read_here(
+    t3_thread: String,
+    reference: String,
+    page: MessagePage,
+) -> Result<MessagesPage, AppError> {
+    let read = run_blocking({
+        let t3_thread = t3_thread.clone();
+        move || thread_messages(&T3Env::from_env(), &t3_thread, page)
+    })
+    .await?;
+    read.map_err(|error| match error {
+        MessageReadError::ThreadMissing => AppError::ThreadNotFound {
+            reference,
+            detail: format!("; T3 has no thread {t3_thread} here any more"),
+        },
+        MessageReadError::ItemMissing(position) => AppError::Usage {
+            message: format!("{reference} has no message at position {position}"),
+        },
+        MessageReadError::Unreadable(message) => AppError::T3Unavailable {
+            message: format!("T3's thread state cannot be read: {message}"),
+        },
+    })
+}
+
+async fn cluster_read(
+    State(state): State<AppState>,
+    Json(body): Json<ClusterRead>,
+) -> Result<Json<ClusterReadBody>, AppError> {
+    state
+        .machine
+        .identity
+        .check_destination(body.destination_machine)?;
+    check_api_version(body.api_version)?;
+    let page = read_here(body.t3_thread, body.reference, body.page).await?;
+    Ok(Json(ClusterReadBody {
+        api_version: API_VERSION,
+        machine: state.machine.identity.machine,
+        page,
+    }))
 }
 
 async fn cluster_compact(
