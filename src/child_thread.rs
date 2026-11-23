@@ -30,7 +30,10 @@ use uuid::{Builder, Uuid};
 use crate::domain::{API_VERSION, ActiveTurn, ThreadId};
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::message::{MessageId, MessageSendRequest, MessageSourceSelector, MessageTarget};
+use crate::message::{
+    MESSAGE_BODY_MAX_BYTES, MessageId, MessageSendRequest, MessageSourceSelector, MessageTarget,
+};
+use crate::t3::PendingRequest;
 use crate::thread_ref::Caller;
 
 /// One parent-child link: the request id of the launch that made it, so a
@@ -108,13 +111,123 @@ impl Lineage {
         if seq.is_follow_up() {
             hasher.update(seq.0.to_be_bytes());
         }
-        let digest = hasher.finalize();
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        MessageId::from_uuid(Builder::from_custom_bytes(bytes).into_uuid())
-            // a SHA-256 prefix with version bits set is never nil
-            .unwrap_or_default()
+        derived_message_id(hasher)
     }
+
+    /// Message UUID of the alert that the child waits on T3 runtime request
+    /// `request`, so every scan that finds the request sends the same message
+    #[must_use]
+    pub fn request_message(&self, request: &str) -> MessageId {
+        let mut hasher = Sha256::new();
+        hasher.update(b"homebased-child-request\0");
+        hasher.update(self.id.as_uuid().as_bytes());
+        hasher.update(request.as_bytes());
+        derived_message_id(hasher)
+    }
+
+    /// The message that tells the parent its child waits on `request`, sent
+    /// from the child's session `source`; `link` opens the child in T3 Code
+    ///
+    /// Every field comes from the link and the request, so each scan sends
+    /// the same request, which the message path delivers at most once
+    #[must_use]
+    pub fn request_alert(
+        &self,
+        request: &PendingRequest,
+        source: ThreadId,
+        link: Option<&str>,
+    ) -> MessageSendRequest {
+        let message_id = self.request_message(&request.id);
+        MessageSendRequest {
+            api_version: API_VERSION,
+            message_id,
+            target: MessageTarget::Reference {
+                machine: self.parent.machine.to_string(),
+                reference: format!("thread_{}", self.parent.t3_thread),
+                carried_by: None,
+            },
+            source: MessageSourceSelector::Thread { thread: source },
+            body: alert_body(&self.child.t3_thread, request, link),
+            reply_to: None,
+            conversation_id: message_id.as_uuid(),
+            // the child can do nothing until someone answers, so the parent
+            // reads it in its running turn rather than after it
+            active_turn: ActiveTurn::Steer,
+        }
+    }
+}
+
+/// A message UUID from a hash of what names it
+fn derived_message_id(hasher: Sha256) -> MessageId {
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    MessageId::from_uuid(Builder::from_custom_bytes(bytes).into_uuid())
+        // a SHA-256 prefix with version bits set is never nil
+        .unwrap_or_default()
+}
+
+/// What a parent reads when its child `child` waits on `request`
+///
+/// The header and footer are built first, so the questions or approval
+/// text, cut to what is left, always fit one message
+fn alert_body(child: &str, request: &PendingRequest, link: Option<&str>) -> String {
+    let id = &request.id;
+    let what = if request.is_question() {
+        "a question".to_owned()
+    } else {
+        format!("a {} approval", request.kind)
+    };
+    let mut header = format!("Child thread thread_{child} is waiting on {what} (request {id}).\n");
+    if let Some(link) = link {
+        header.push_str(link);
+        header.push('\n');
+    }
+    let answer = if request.is_question() {
+        format!(
+            "Answer with `homebased thread answer thread_{child} --request {id} --answer \"<text>\"`, one --answer per question in order, or in T3 Code."
+        )
+    } else {
+        "Approve or deny it in T3 Code; homebased leaves approvals to a person.".to_owned()
+    };
+    let footer = format!(
+        "\n{answer} To give up on it instead, run `homebased thread interrupt --stop thread_{child}`."
+    );
+
+    let mut asked = String::new();
+    for question in &request.questions {
+        asked.push('\n');
+        if let Some(header) = &question.header {
+            asked.push_str(header);
+            asked.push_str(": ");
+        }
+        asked.push_str(&question.question);
+        asked.push('\n');
+        if !question.options.is_empty() {
+            asked.push_str("Options: ");
+            asked.push_str(&question.options.join(" | "));
+            asked.push('\n');
+        }
+    }
+    if let Some(detail) = &request.detail {
+        asked.push('\n');
+        asked.push_str(detail);
+        asked.push('\n');
+    }
+    let room = MESSAGE_BODY_MAX_BYTES.saturating_sub(header.len() + footer.len());
+    format!("{header}{}{footer}", truncate(&asked, room))
+}
+
+/// The longest prefix of `text` within `max` bytes, cut at a character
+fn truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let end = (0..=max)
+        .rev()
+        .find(|end| text.is_char_boundary(*end))
+        .unwrap_or(0);
+    &text[..end]
 }
 
 /// Which of a child's reports one is: 0 for the report its parent waits on,
@@ -457,6 +570,7 @@ impl LinkView {
             parent: self.lineage.parent.clone(),
             reported: self.reported(),
             report: self.report,
+            closed: self.closed,
         }
     }
 }
@@ -474,6 +588,10 @@ pub struct ChildThreadInfo {
     /// `None` before it reports
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<ReportStageKind>,
+    /// Whether the machine that answered stopped waiting on this thread's
+    /// report: it saw the thread put away, or stopped it
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
 }
 
 /// `POST /v1/threads/report` body
@@ -486,6 +604,10 @@ pub struct ThreadReportRequest {
     pub caller: Caller,
     /// Report text
     pub body: String,
+    /// Stop the children that have not reported when they are the only open
+    /// work left
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_children: bool,
 }
 
 /// `POST /v1/threads/report` answer
@@ -497,6 +619,9 @@ pub struct ThreadReportResponse {
     pub report: ReportView,
     /// Whether an earlier call already saved this report
     pub resumed: bool,
+    /// Children `--stop-children` stopped before the report
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stopped: Vec<LinkEnd>,
 }
 
 /// A saved report, for output
@@ -590,6 +715,33 @@ mod tests {
     use uuid::Uuid;
 
     use super::{Lineage, LinkEnd, LinkId, ReportSeq};
+    use crate::domain::ThreadId;
+    use crate::message::MESSAGE_BODY_MAX_BYTES;
+    use crate::t3::PendingRequest;
+
+    #[test]
+    fn a_request_alert_fits_one_message_however_long_the_request() {
+        let link = lineage(Uuid::now_v7());
+        let request = PendingRequest {
+            id: "r".repeat(462),
+            thread: "child".into(),
+            kind: "command".into(),
+            created_at: "2026-11-23T18:00:00Z".into(),
+            questions: Vec::new(),
+            detail: Some("é".repeat(20_000)),
+        };
+        let link_text = format!("t3code://threads/{}/child", "e".repeat(64));
+
+        let alert = link.request_alert(&request, ThreadId(Uuid::now_v7()), Some(&link_text));
+
+        assert!(
+            alert.body.len() <= MESSAGE_BODY_MAX_BYTES,
+            "{}",
+            alert.body.len()
+        );
+        assert!(alert.body.ends_with("interrupt --stop thread_child`."));
+        assert!(alert.validate().is_ok());
+    }
     use crate::machine::MachineId;
 
     fn lineage(request: Uuid) -> Lineage {

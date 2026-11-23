@@ -872,7 +872,11 @@ pub(crate) async fn compact_resolved(
 
 /// The error a peer answered with, or an update hint when it runs a homebased
 /// without the route
-fn peer_error(response: &ClusterResponse, machine_name: &str, command: &str) -> AppError {
+pub(in crate::daemon) fn peer_error(
+    response: &ClusterResponse,
+    machine_name: &str,
+    command: &str,
+) -> AppError {
     // a peer without the route answers with the web listener's `not_found`
     let route_missing = response.status == StatusCode::NOT_FOUND
         && serde_json::from_slice::<serde_json::Value>(&response.body).is_ok_and(|body| {

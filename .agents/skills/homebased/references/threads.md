@@ -1,4 +1,4 @@
-# Thread context, messages, compaction, and watches
+# Thread context, messages, compaction, watches, and interrupts
 
 `homebased thread` reads how full an agent thread's context is, reads a T3 thread's messages, compacts T3 threads, sends one event when a thread's context passes a limit or the thread stalls, and sends a child thread's report, and any follow-up reports, to its parent. It works on any Fleet machine. Pass `--json` and parse the result.
 
@@ -100,6 +100,25 @@ The daemon's own idle compaction is separate: after about 55 idle minutes, at 17
 
 A thread that sleeps with `homebased wait --long` ([t3.md](t3.md#sleeping-on-long-work)) is certain to run again hours later, after its cache lapsed, so its limit is 60K tokens instead. An event that arrives for a thread due such a compaction, or while T3 runs a `/compact` turn in it, waits behind the compaction instead of steering into it.
 
+## `thread interrupt`
+
+`homebased --json thread interrupt <ref> [--stop] [--machine <name>]` acts on a T3 thread on whichever machine runs it. The reference must name one thread; prefixes are not accepted.
+
+- Without `--stop`, it ends the active run, as the composer's stop button does. `outcome` is `interrupted` with its `run`, or `idle` when no run was active. Queued messages still start.
+- `--stop` does what the thread's Stop button does: it ends the active run, holds queued messages, and stops the thread's T3 subagents. `outcome` is `stopped`.
+- A stop first stops the thread's own child threads that have not reported, wherever they run, so none of them wakes it again with a question or a report.
+- A stopped child thread that has not reported counts as done: lookups show `child_thread.closed: true`, `--children --live` and stall watches leave it out, and its parent stops `waiting` on it from any machine. `closed_link` names the link when the parent's end is on the calling machine.
+- Homebased tasks and jobs the thread submitted keep running, and their final events can start it again unless T3 still holds messages queued at the stop. Cancel them with `homebased cancel` first when the work should end.
+- `--task <id>` names the task's origin thread instead of a reference. A worker session is not a T3 thread; stop a worker with `homebased cancel`.
+- T3's refusal fails with `thread_control_refused` (exit 5). A thread outside T3 fails with `read_unsupported_host`.
+
+## `thread answer`
+
+`homebased --json thread answer <ref> --request <id> --answer <text> [--answer <text>...]` answers a question the thread's agent is waiting on, on whichever machine runs it. The request alert a parent gets from its child ([Child threads](#child-threads)) names the request and prints this command.
+
+- Pass one `--answer` per question, in the order the alert lists them. An answer that names an offered option in another case picks that option; any other text is sent as written.
+- A request that is no longer pending, a wrong number of answers, or an approval fails with `thread_control_refused` (exit 5), and its message lists the requests the thread still waits on. Approvals of commands and file changes stay with a person in T3 Code, since they gate what an agent may run.
+
 ## `thread watch`
 
 ```bash
@@ -142,6 +161,7 @@ A child thread is a top-level T3 thread launched with `homebased t3 launch --chi
 - A child that is idle, not settled, owed nothing, and has not reported is stalled, so `thread watch --children --stalled-after` fires `THREAD_STALLED` for it like any child.
 - Once the child has reported and is settled, it is done: `--children --live` leaves it out, and its watches end with `finished`.
 - A child can launch children of its own. Each thread lists and waits on its own children only.
+- A child waiting on a person, for a question its agent asked or an approval, makes its machine send the parent one `HOMEBASED_MESSAGE` per request within a minute ([messages.md](messages.md#child-thread-request-alerts)). It steers into a running turn and wakes a sleeping parent. Answer a question with `homebased thread answer`, an approval in T3 Code at the child's link, or give up on the child with `homebased thread interrupt --stop`.
 
 ## `thread report`
 
@@ -154,6 +174,7 @@ Run in a child thread, inside its turn, as its last step: `homebased --json thre
 - After the turn ends, the child's machine asks T3 to settle the child, bound to the run the report came from, after a follow-up as after the first report. It leaves the child unsettled when a later run, or a user message to the child, came first, or when T3 refuses.
 - The result's `report` has `link`, `parent`, `child`, `seq` (0 for the first report), `message_id`, `created_at`, `sent_at`, and `stage`: `sending` (not delivered yet; run the command again), `settle_pending` (delivered; the settle waits for the turn to end), `sent` (delivered, and left unsettled), or `settled`.
 - A thread that no `--child` launch made fails with `not_child_thread` (exit 5); report with `homebased message send` instead. Outside a turn, or before T3 records the thread's session, it fails with `usage`.
+- `--stop-children` stops each child thread of this one that has not reported, as `thread interrupt --stop` does, and stops waiting on it, when those children are the only open work left; the result's `stopped` lists them. The report is checked first, so a report that fails its own checks, such as its size, stops nothing. A child that cannot be stopped, such as one on a machine that does not answer, stays in `input.open`, so the report is still refused, and `input.stopped` lists the children it did stop. Nothing stops children on its own: archiving or settling a parent leaves them running, so stop them first when their work is no longer wanted.
 
 ## Orchestrator recipe
 
@@ -163,4 +184,5 @@ A T3 root that coordinates work runs each phase, experiment, or long run in a ch
 2. Watch the children for stalls: `homebased --json thread watch --children --stalled-after 20m` wakes you with `THREAD_STALLED` when a child thread or T3 subagent ends its turn without a report, a registered wait, or a sleep, and sits idle for 20 minutes. It covers the children live when you run it, so run it again after launching more. Read the child's last turn, then send it a message to carry on or report, or hand its work to a fresh child.
 3. Watch context one thread at a time. Watch your own thread with `homebased --json thread watch --context-above <limit> --action compact`, with no reference. For each Claude T3 subagent, run `homebased --json thread watch <subagent-thread-id> --context-above <limit> --action compact` with the thread id that `delegate_task` returned; it compacts the child while it is idle once it passes the limit. A compaction that starts wakes you for nothing; you hear only when T3 would not compact it. After the compaction drops the context, the watch re-arms. To raise one child's limit, unwatch its old watch, since a new limit adds a second watch. Add a notify-only watch (no `--action`) only for a child whose work you would rather hand to a fresh thread than compact. Do not use `--children` for context watches (see `thread watch` above). A sleeping child thread is compacted by idle compaction, so it needs no watch from you. The orchestrate skill sets the default limits.
 4. After your own compaction, run `homebased --json thread context --children` to rebuild the list of children, their links, and their states; `task_finished` marks the T3 subagents whose task ended, and `child_thread.reported` the child threads that reported. `--children --live` lists only those still working.
-5. A child thread's report arrives as one `HOMEBASED_MESSAGE` ([messages.md](messages.md#child-thread-reports)), and homebased then settles it. A done child never fires, and its watches end with `finished`, at once for a reported, settled child thread and after an hour without activity for a T3 subagent, without waking you, so there is nothing to unwatch. Unwatching one yourself wakes you for nothing either. Archiving a child ends its watches at once, and settling or archiving the root ends the root's watches with `caller_gone`.
+5. A child that waits on a question or an approval sends you a request alert ([messages.md](messages.md#child-thread-request-alerts)). Answer a question with `homebased thread answer`, ask the user about an approval, or stop the child with `homebased thread interrupt --stop` when its work is no longer wanted.
+6. A child thread's report arrives as one `HOMEBASED_MESSAGE` ([messages.md](messages.md#child-thread-reports)), and homebased then settles it. A done child never fires, and its watches end with `finished`, at once for a reported, settled child thread and after an hour without activity for a T3 subagent, without waking you, so there is nothing to unwatch. Unwatching one yourself wakes you for nothing either. Archiving a child ends its watches at once, and settling or archiving the root ends the root's watches with `caller_gone`.

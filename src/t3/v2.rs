@@ -48,6 +48,22 @@
 //!   compaction turn (`RunExecutionService.ts`). T3 rejects a message that
 //!   would steer into it, so the message after it uses `queue_after_active`
 //!   without `deliveryIntent`, like the web client's "compact first" send
+//! - `run.interrupt` (`commandId`, `threadId`, `runId`, `reason`) ends one
+//!   run, as the composer's stop does; `thread.stop` (`commandId`, `threadId`,
+//!   `reason`, `stopDelegatedTasks`) is the thread's Stop button: it ends the
+//!   active run, holds queued messages, and stops the thread's delegated tasks.
+//!   Both are in T3 Code `0.1.11`
+//! - `orchestration_v2_projection_runtime_requests` holds what a run waits on:
+//!   `kind` (`user_input` for a question, `command`, `file-read`,
+//!   `file-change`, `permission`, and others for an approval) and `status`
+//!   (`pending`, `resolved`, `expired`, `cancelled`). The turn item of type
+//!   `user_input_request` or `approval_request` whose `payload_json.requestId`
+//!   is the request carries what T3 shows: `questions` (`id`, `header`,
+//!   `question`, `options[].label`) or an approval's `title`, `requestKind`,
+//!   and `reason`. `runtime-request.respond` (`commandId`, `threadId`,
+//!   `requestId`, `answers`) answers a question, with `answers` keyed by
+//!   question id; a Claude question's id is its text. Checked against T3 Code
+//!   `0.1.11` state
 //! - A `/compact` with `deliveryIntent: "auto"` resolves to a steer while a
 //!   run is active, which T3 refuses (`Orchestrator.ts`), while one with
 //!   `queue_after_active` and no intent waits behind that run and starts as a
@@ -162,6 +178,17 @@ const ARCHIVED_SQL: &str =
     "SELECT archived_at IS NOT NULL FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
 const PUT_AWAY_SQL: &str = "SELECT archived_at IS NOT NULL OR deleted_at IS NOT NULL
      FROM orchestration_v2_projection_threads WHERE thread_id = ?1";
+// every request a person must answer, with the turn item that shows it
+const PENDING_REQUESTS_SQL: &str = "
+    SELECT r.runtime_request_id, r.thread_id, r.kind, r.created_at, i.payload_json
+    FROM orchestration_v2_projection_runtime_requests r
+    LEFT JOIN orchestration_v2_projection_turn_items i
+      ON i.thread_id = r.thread_id
+     AND i.type IN ('user_input_request', 'approval_request')
+     AND json_valid(i.payload_json)
+     AND json_extract(i.payload_json, '$.requestId') = r.runtime_request_id
+    WHERE r.status = 'pending'
+    ORDER BY r.created_at, r.runtime_request_id";
 // the statuses of T3's `isActiveRun`, the run a queued message waits behind
 const ACTIVE_RUN_SQL: &str = "
     SELECT run_id FROM orchestration_v2_projection_runs
@@ -1012,6 +1039,104 @@ pub(super) fn settle(
         "expectedLatestRunId": run,
     });
     dispatch(origin, token, &payload, None)
+}
+
+/// End `run` of `thread_id`
+///
+/// The command id derives from the run, so a retry is one command to T3
+pub(super) fn interrupt(
+    origin: &str,
+    thread_id: &str,
+    run: &str,
+    reason: &str,
+    token: &str,
+) -> Result<(), ApiFailure> {
+    let payload = json!({
+        "type": "run.interrupt",
+        "commandId": deterministic_id("homebased-t3-interrupt", thread_id, run),
+        "threadId": thread_id,
+        "runId": run,
+        "reason": reason,
+    });
+    dispatch(origin, token, &payload, None)
+}
+
+/// Stop `thread_id` as its Stop button does, delegated tasks included
+///
+/// `key` names the state stopped, such as the active run, so a retry is one
+/// command while a stop after a later run is another
+pub(super) fn stop(
+    origin: &str,
+    thread_id: &str,
+    key: &str,
+    reason: &str,
+    token: &str,
+) -> Result<(), ApiFailure> {
+    let payload = json!({
+        "type": "thread.stop",
+        "commandId": deterministic_id("homebased-t3-stop", thread_id, key),
+        "threadId": thread_id,
+        "reason": reason,
+        "stopDelegatedTasks": true,
+    });
+    dispatch(origin, token, &payload, None)
+}
+
+/// Answer the pending question `request` of `thread_id`
+pub(super) fn respond(
+    origin: &str,
+    thread_id: &str,
+    request: &str,
+    answers: &Value,
+    token: &str,
+) -> Result<(), ApiFailure> {
+    let payload = json!({
+        "type": "runtime-request.respond",
+        "commandId": deterministic_id("homebased-t3-respond", thread_id, request),
+        "threadId": thread_id,
+        "requestId": request,
+        "answers": answers,
+    });
+    dispatch(origin, token, &payload, None)
+}
+
+/// Every request a person must answer in any thread, oldest first
+///
+/// # Errors
+///
+/// When the state cannot be read, or predates runtime requests
+pub(super) fn pending_requests(path: &Path) -> Result<Vec<super::PendingRequest>, String> {
+    let db = state_connection(path).map_err(|_| "statev2.sqlite cannot be read".to_string())?;
+    let mut statement = db
+        .prepare(PENDING_REQUESTS_SQL)
+        .map_err(|_| "statev2.sqlite has no runtime requests to read".to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|_| "statev2.sqlite pending request query failed".to_string())?;
+
+    let mut requests: Vec<super::PendingRequest> = Vec::new();
+    for (id, thread, kind, created_at, card) in rows {
+        // a request shown by two cards is one request
+        if requests.iter().any(|request| request.id == id) {
+            continue;
+        }
+        let card: Value = card
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null);
+        requests.push(super::PendingRequest::from_card(
+            id, thread, kind, created_at, &card,
+        ));
+    }
+    Ok(requests)
 }
 
 pub(super) fn dispatch(

@@ -449,7 +449,7 @@ that long work belongs in a child thread. A homebased
 worker gets a `usage` error (exit 2) and parks with
 `homebased task report --outcome waiting --on <id>` instead.
 
-### Thread context, messages, compaction, and watches
+### Thread context, messages, compaction, watches, and interrupts
 
 ```sh
 homebased thread context [<ref>...] [--children [--live]] [--machine <name>]
@@ -459,7 +459,9 @@ homebased thread watch [<ref>...] --context-above <150k|80%> [--action compact] 
 homebased thread watch [<ref>...] --stalled-after <20m|1h> [--once] [--children]
 homebased thread watches [--all]
 homebased thread unwatch <watch-id>
-homebased thread report --summary <text> [--file <path>|-]
+homebased thread report --summary <text> [--file <path>|-] [--stop-children]
+homebased thread interrupt <ref> [--stop] [--machine <name>]
+homebased thread answer <ref> --request <id> --answer <text>... [--machine <name>]
 ```
 
 A thread reference is T3 chip text (`[Thread: <title>; ref=<ref>]`),
@@ -549,6 +551,30 @@ that should resume on its own afterwards keeps a `homebased wait` running or
 watches itself with `--action compact --once` instead. A thread outside
 T3 fails with `compact_unsupported_host` (exit 5), and a T3 thread with no
 session to compact yet with `thread_not_found` (exit 3).
+
+`thread interrupt` ends a T3 thread's running turn on whichever machine runs
+it, as the composer's stop button does (`run.interrupt`), and answers
+`interrupted` with the `run`, or `idle` when no run was active. `--stop` does
+what the thread's Stop button does instead (`thread.stop`): it ends the active
+run, holds queued messages, and stops the thread's T3 subagents, and answers
+`stopped`. A stop first stops the thread's own child threads that have not
+reported, wherever they run, so none of them wakes it again. A stopped child
+thread that has not reported counts as done: its link closes on its own
+machine (`child_thread.closed` in lookups), so `--children --live`, stall
+watches, and its parent's wait all leave it out, and on the calling machine
+when the parent's end is there, which the output's `closed_link` names.
+Homebased tasks and jobs the thread submitted keep running, and their final
+events can start it again unless T3 still holds messages queued at the stop,
+so cancel those with `homebased cancel` first. A refusal from T3 fails with
+`thread_control_refused` (exit 5).
+
+`thread answer` answers a question a T3 thread's agent is waiting on, on
+whichever machine runs it (`runtime-request.respond`). Pass T3's request id
+with `--request` and one `--answer` per question, in order; an answer that
+names an offered option in another case picks that option. A request that is
+not pending, a wrong number of answers, or an approval of a command or file
+change fails with `thread_control_refused`. Approvals stay with a person in
+T3 Code, since they gate what an agent may run.
 
 `thread watch` keeps a watch on the calling machine and checks it every minute,
 right after the idle compaction scan, which keeps its own 55-minute rule and
@@ -644,13 +670,40 @@ T3 refuses. The output's `stage` is `sending`, `settle_pending`, `sent`
 child that is archived, deleted, or settled without a report; for a child on
 another machine, once a scan sees it so or misses it on two scans in a row.
 
+`thread report --stop-children` stops each child thread that has not reported,
+as `thread interrupt --stop` does, and stops waiting on it, when such children
+are the only open work left; the output's `stopped` lists them. The report is
+checked first, so a report that fails its own checks, such as its size,
+stops nothing. A child that cannot be
+stopped, such as one on a machine that does not answer, stays open work, so
+the report is still refused, and the refusal's `input.stopped` lists the
+children it did stop. Stopping is explicit rather than
+automatic: an unreported child is work the parent asked for, the report's
+refusal is how the parent learns of it, and a stop cannot be undone. Archiving
+or settling a parent stops none of its children.
+
+A child thread waiting on a person, for a question its agent asked or an
+approval, cannot go on, and its parent may be asleep on it. The child's
+machine checks its T3 for pending requests of linked child threads every
+minute, with the child-thread scan, and sends the parent one
+`HOMEBASED_MESSAGE` per request, which steers into a running turn and wakes a
+sleeping parent. Its body starts `Child thread thread_<id> is waiting on a
+question (request <id>).` (or on an approval), then the child's T3 link, the
+questions with their options or what the approval asks for, and the
+`homebased thread answer` command. Its message UUID comes from the link and
+the request, so a later scan or a daemon restart sends the same message,
+which the message path delivers once it has a receipt; a restart in the
+moment between delivery and receipt can deliver it again.
+
 On the socket, `POST /v1/threads/context` resolves references and
 `GET /v1/threads/watches?caller=<thread>` (or `all=true`) lists watches; both
 are also served on the dashboard port. `POST /v1/threads/read`,
 `POST /v1/threads/compact`, `POST /v1/threads/watches`,
-`POST /v1/threads/watches/{id}/unwatch`, and `POST /v1/threads/report` are
-socket only. Fleet peers answer `POST /v1/cluster/threads/context`,
-`POST /v1/cluster/threads/read`, and `POST /v1/cluster/threads/compact`.
+`POST /v1/threads/watches/{id}/unwatch`, `POST /v1/threads/report`, and
+`POST /v1/threads/control` (interrupt, stop, and answer) are socket only.
+Fleet peers answer `POST /v1/cluster/threads/context`,
+`POST /v1/cluster/threads/read`, `POST /v1/cluster/threads/compact`, and
+`POST /v1/cluster/threads/control`.
 
 ### Launch a T3 thread on any machine
 

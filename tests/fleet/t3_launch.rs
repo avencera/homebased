@@ -7,8 +7,8 @@ use std::sync::atomic::Ordering;
 use homebased::domain::ThreadId;
 use serde_json::{Value, json};
 
-use super::fake_t3::{FakeT3, install_t3, open_state, set_run, set_session};
-use super::{Daemon, add_peer};
+use super::fake_t3::{FakeT3, ask, install_t3, open_state, set_run, set_session};
+use super::{Daemon, add_peer, wait_until};
 
 fn run_json(daemon: &Daemon, args: &[&str]) -> (i32, Value) {
     run_json_in_thread(daemon, None, args)
@@ -637,4 +637,110 @@ fn a_missing_worktree_base_fails_the_command_and_names_a_branch_only_the_caller_
     assert_eq!(code, 0, "{present}");
     // the retry asked T3 again, which answers with the thread it launched
     assert_eq!(t3.launches().len(), 3);
+}
+
+#[test]
+fn a_parent_hears_of_a_question_its_child_on_another_machine_waits_on_and_stops_it() {
+    if which::which("curl").is_err() {
+        return;
+    }
+    let scan = [("HOMEBASED_TEST_SCAN_SECS", "1")];
+    let origin = Daemon::start_with_env("ask-origin", true, &scan);
+    let executor = Daemon::start_with_env("ask-executor", true, &scan);
+    add_peer(&origin, &executor);
+    add_peer(&executor, &origin);
+    let origin_t3 = FakeT3::start(Some(state_path(&origin)));
+    install_t3(&origin.user_home, &origin_t3.origin);
+    let executor_t3 = FakeT3::start(Some(state_path(&executor)));
+    install_t3(&executor.user_home, &executor_t3.origin);
+    let child_state = open_state(&state_path(&executor));
+    let parent_state = open_state(&state_path(&origin));
+    parent_state
+        .execute(
+            "INSERT INTO orchestration_v2_projection_threads (thread_id, title) VALUES (?1, 'parent')",
+            [PARENT],
+        )
+        .unwrap();
+    set_session(&parent_state, PARENT, PARENT_SESSION);
+    codex_rollout(&origin.user_home, PARENT_SESSION);
+    let parent = [
+        ("T3CODE_THREAD_ID", PARENT),
+        ("CODEX_THREAD_ID", PARENT_SESSION),
+    ];
+    let (code, launched) = run_as(
+        &origin,
+        &parent,
+        &[
+            "t3",
+            "launch",
+            "--machine",
+            "ask-executor",
+            "--project",
+            "app",
+            "--message",
+            "Pick a database",
+            "--child",
+        ],
+    );
+    assert_eq!(code, 0, "{launched}");
+    let child = launched["thread"]["thread_id"].as_str().unwrap().to_owned();
+    set_session(&child_state, &child, CHILD_SESSION);
+    set_run(&child_state, &child, "run-c-1", "waiting");
+    codex_rollout(&executor.user_home, CHILD_SESSION);
+    let questions = json!([{ "id": "Which database?", "question": "Which database?" }]);
+    ask(&child_state, &child, "request-1", &questions);
+
+    let alerts = || -> Vec<Value> {
+        origin_t3
+            .dispatched("message.dispatch")
+            .into_iter()
+            .filter(|payload| {
+                payload["threadId"] == PARENT
+                    && payload["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("is waiting on a question"))
+            })
+            .collect()
+    };
+    assert!(
+        wait_until(std::time::Duration::from_secs(30), || !alerts().is_empty()),
+        "the parent heard nothing"
+    );
+    let text = alerts()[0]["text"].as_str().unwrap().to_owned();
+    assert!(text.contains("Which database?"), "{text}");
+
+    let reference = format!("thread_{child}");
+    let (code, answered) = run_as(
+        &origin,
+        &parent,
+        &[
+            "thread",
+            "answer",
+            &reference,
+            "--request",
+            "request-1",
+            "--answer",
+            "SQLite",
+        ],
+    );
+    assert_eq!(code, 0, "{answered}");
+    assert_eq!(
+        executor_t3.dispatched("runtime-request.respond")[0]["answers"],
+        json!({ "Which database?": "SQLite" })
+    );
+
+    // the stop runs on the child's machine and closes the link on the parent's
+    let (code, stopped) = run_as(
+        &origin,
+        &parent,
+        &["thread", "interrupt", "--stop", &reference],
+    );
+    assert_eq!(code, 0, "{stopped}");
+    assert_eq!(stopped["outcome"], "stopped");
+    assert!(stopped["closed_link"].is_string(), "{stopped}");
+    assert_eq!(executor_t3.dispatched("thread.stop").len(), 1);
+    assert!(origin_t3.dispatched("thread.stop").is_empty());
+    let (code, found) = run_as(&origin, &parent, &["thread", "context"]);
+    assert_eq!(code, 0, "{found}");
+    assert_eq!(found["threads"][0]["state"], "idle", "{found}");
 }

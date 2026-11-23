@@ -549,14 +549,22 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
             },
             None => AppError::Internal { message },
         },
+        "thread_control_refused" => AppError::ThreadControlRefused {
+            reference: decode_field(input, "reference").unwrap_or_default(),
+            message: decode_field(input, "message").unwrap_or(message),
+        },
         "not_child_thread" => decode_field(input, "thread")
             .map_or(AppError::Internal { message }, |thread| {
                 AppError::NotChildThread { thread }
             }),
-        "thread_report_refused" => decode_field(input, "open")
-            .map_or(AppError::Internal { message }, |open| {
-                AppError::ThreadReportRefused { open }
-            }),
+        "thread_report_refused" => {
+            decode_field(input, "open").map_or(AppError::Internal { message }, |open| {
+                AppError::ThreadReportRefused {
+                    open,
+                    stopped: decode_field(input, "stopped").unwrap_or_default(),
+                }
+            })
+        }
         "thread_report_conflict" => {
             match (decode_field(input, "link"), decode_field(input, "stage")) {
                 (Some(link), Some(stage)) => AppError::ThreadReportConflict {
@@ -795,6 +803,10 @@ mod tests {
             AppError::NotChildThread {
                 thread: "thread_root".into(),
             },
+            AppError::ThreadControlRefused {
+                reference: "thread_root".into(),
+                message: "T3 has no such thread".into(),
+            },
             AppError::ThreadReportRefused {
                 open: vec![
                     crate::child_thread::OpenWork::Task {
@@ -807,6 +819,10 @@ mod tests {
                         },
                     },
                 ],
+                stopped: vec![crate::child_thread::LinkEnd {
+                    machine: crate::machine::MachineId::new(),
+                    t3_thread: "stopped".into(),
+                }],
             },
             AppError::ThreadReportConflict {
                 link: crate::child_thread::LinkId::from_launch(uuid::Uuid::now_v7()),
