@@ -171,6 +171,17 @@ impl CreateBody {
                 "--boot-timeout must be more than 0 and at most 24h".into(),
             ));
         }
+        // a machine could never join before the pool ends, so every job would be
+        // refused before the first lease shows the real boot grace
+        if let Some(timeout) = self.boot_timeout
+            && timeout >= self.deadline
+        {
+            return Err(usage(format!(
+                "--boot-timeout {} must be shorter than --deadline {}",
+                humantime::format_duration(timeout),
+                humantime::format_duration(self.deadline),
+            )));
+        }
         let min_free_disk_gib = self.min_free_disk_gib.unwrap_or(DEFAULT_MIN_FREE_DISK_GIB);
         // the machine's config takes GiB that fit in bytes, and would not start otherwise
         if min_free_disk_gib.checked_mul(1 << 30).is_none() {
@@ -1401,5 +1412,45 @@ fn local_reason(state: &MachineState) -> Option<ReleaseReason> {
     match state {
         MachineState::Releasing { reason, .. } => Some(reason.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{AppError, CreateBody};
+
+    fn create(deadline: &str, boot_timeout: Option<&str>) -> Result<(), AppError> {
+        let mut body = json!({
+            "api_version": crate::domain::API_VERSION,
+            "name": "ci",
+            "machine_class": "do-c16",
+            "max_machines": 1,
+            "deadline": deadline,
+        });
+        if let Some(timeout) = boot_timeout {
+            body["boot_timeout"] = Value::from(timeout);
+        }
+        serde_json::from_value::<CreateBody>(body)
+            .unwrap()
+            .into_pool()
+            .map(drop)
+    }
+
+    #[test]
+    fn a_boot_timeout_must_be_shorter_than_the_deadline() {
+        for (deadline, timeout) in [("30m", "55m"), ("30m", "30m")] {
+            let Err(AppError::Usage { message }) = create(deadline, Some(timeout)) else {
+                panic!("{timeout} against {deadline} was accepted");
+            };
+            assert_eq!(
+                message,
+                format!("--boot-timeout {timeout} must be shorter than --deadline {deadline}")
+            );
+        }
+
+        create("30m", Some("29m")).unwrap();
+        create("30m", None).unwrap();
     }
 }
