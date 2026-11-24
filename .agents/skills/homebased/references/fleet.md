@@ -70,7 +70,7 @@ address = "http://main:7677"
 iroh = "<main's endpoint id>"
 transports = ["http", "iroh"] # omitted: the transports the entry has, HTTP first
 # iroh_addrs = ["192.168.1.10:7679"]        # needed unless relays = "n0"
-# iroh_relay = "https://relay.example.com"  # or this
+# iroh_relay = "https://relay.example.com"  # or this, with custom relays
 ```
 
 - `homebased --json fleet endpoint-id` prints this installation's id. It reads
@@ -82,7 +82,9 @@ transports = ["http", "iroh"] # omitted: the transports the entry has, HTTP firs
   daemon does not dial. Every other id is refused. List each peer on both
   sides so events come back over the link.
 - An entry without `http` is link-only: that peer is never reached at an HTTP
-  address, even a discovered one.
+  address, even a discovered one, once a link probe has confirmed its id
+  (`iroh` in `fleet machines`). Confirm it with both transports listed before
+  dropping `http`.
 - To turn HTTP off on a machine whose peers all reach it over the link, set
   `HOMEBASED_WEB_LISTEN=127.0.0.1:7677`, not `off`: link streams are handed to
   that listener. The CLI uses the Unix socket either way.

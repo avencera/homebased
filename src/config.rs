@@ -1155,13 +1155,22 @@ fn validate_machines(
                     "fleet.machines[{index}].iroh needs [fleet.iroh] to run this daemon's endpoint"
                 ));
             };
-            // only n0's lookup finds an endpoint by its id alone
-            let findable = *relays == crate::fleet::iroh::Relays::N0
-                || endpoint.relay.is_some()
-                || !endpoint.addrs.is_empty();
+            // only n0's lookup finds an endpoint by its id alone, and with
+            // relays off a relay url is never dialed
+            let findable = match relays {
+                crate::fleet::iroh::Relays::N0 => true,
+                crate::fleet::iroh::Relays::Custom(_) => {
+                    endpoint.relay.is_some() || !endpoint.addrs.is_empty()
+                }
+                crate::fleet::iroh::Relays::Disabled => !endpoint.addrs.is_empty(),
+            };
             if !findable {
+                let needs = match relays {
+                    crate::fleet::iroh::Relays::Disabled => "iroh_addrs",
+                    _ => "iroh_relay or iroh_addrs",
+                };
                 return Err(format!(
-                    "fleet.machines[{index}]: with relays = {relays}, set iroh_relay or iroh_addrs"
+                    "fleet.machines[{index}]: with relays = {relays}, set {needs}"
                 ));
             }
             if !ids.insert(endpoint.id) {
@@ -1562,6 +1571,12 @@ address = "http://training:7677"
         let direct = "[fleet.iroh]\nrelays = \"disabled\"";
         let err = parse(&only, direct).unwrap_err();
         assert!(err.contains("iroh_addrs"), "{err}");
+        // with relays off a relay url alone is never dialed
+        let relayed = format!("{only}\niroh_relay = \"https://relay.example.com\"");
+        let err = parse(&relayed, direct).unwrap_err();
+        assert!(err.contains("set iroh_addrs"), "{err}");
+        let custom = "[fleet.iroh]\nrelays = [\"https://relay.example.com\"]";
+        parse(&relayed, custom).unwrap();
         let addressed = format!("{only}\niroh_addrs = [\"10.0.0.2:7679\"]");
         let config = parse(&addressed, direct).unwrap();
         let endpoint = config.fleet_settings().unwrap().machines[0].iroh().unwrap();

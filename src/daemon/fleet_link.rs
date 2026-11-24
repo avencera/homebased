@@ -436,8 +436,14 @@ impl FleetLink {
                 };
                 match attempt {
                     Ok(connection) => {
-                        wait = RECONNECT;
+                        // a peer that has not allowed this endpoint yet takes
+                        // the handshake and closes at once, so only a link
+                        // that held resets the backoff
+                        let opened = Instant::now();
                         serve_connection(&state, &link, connection.clone()).await;
+                        if opened.elapsed() >= SETTLE {
+                            wait = RECONNECT;
+                        }
                         warn!(reason = ?connection.close_reason(), "fleet link to {} closed", peer.id.fmt_short());
                     }
                     // a peer that is off for hours fails every dial, so only
@@ -635,16 +641,28 @@ fn read_key(path: &std::path::Path) -> Result<Option<SecretKey>, AppError> {
     Ok(Some(SecretKey::from_bytes(&bytes)))
 }
 
+/// Write `bytes` to a new owner-only file at `path`, failing with
+/// `AlreadyExists` when it is there. The file appears only once complete,
+/// so a concurrent reader never sees it half written
 fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
+    let staging = path.with_extension(format!("new.{}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
         .write(true)
         .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    Ok(())
+        .open(&staging)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        // a hard link, unlike a rename, refuses to replace a key another
+        // process published first
+        .and_then(|()| std::fs::hard_link(&staging, path));
+    let _ = std::fs::remove_file(&staging);
+    written
 }
 
 async fn bind_endpoint(key: SecretKey, config: &IrohConfig) -> Result<Endpoint, AppError> {

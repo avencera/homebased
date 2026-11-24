@@ -94,15 +94,18 @@ transports = ["http", "iroh"]         # try in this order
 | `address` | The peer's HTTP base address |
 | `iroh` | The peer's endpoint id. Needs `[fleet.iroh]` here. This daemon grants the id the whole Fleet API and keeps a connection to it |
 | `transports` | `"http"` and `"iroh"` in the order to try them. Each one listed needs its key, and each key needs its transport listed. Omitted, it is the transports the entry has, HTTP first |
-| `iroh_addrs`, `iroh_relay` | Where to dial the peer. With `relays = "n0"` the id alone finds it; with custom relays or `"disabled"`, set one of them |
+| `iroh_addrs`, `iroh_relay` | Where to dial the peer. With `relays = "n0"` the id alone finds it; with custom relays, set one of them; with `"disabled"`, set `iroh_addrs` |
 
 A call to a peer tries its addresses in order and moves on when one does not
 answer: the entry's transports in their order, then addresses that mDNS,
 Tailscale, or earlier probes found. An entry without `http` is link-only: the
 peer is reached over the link and never at an HTTP address, even one that
 answers with its machine UUID, because plain HTTP cannot prove who answered.
-The directory keeps the endpoint id that a link probe confirmed for each
-machine, so this holds across restarts.
+This takes hold once a link probe has confirmed the peer's machine at that
+endpoint id, which the directory keeps across restarts; until then, an HTTP
+address cached for the machine can still be tried. To turn an HTTP peer
+link-only, first list it with both transports and check that `fleet machines`
+shows its `iroh` id.
 
 `[fleet.iroh] peers` allows ids this daemon does not dial, such as a machine
 that lists this one but that this one does not list. To reach a peer over the
@@ -110,7 +113,8 @@ link and get its events back, each side lists the other.
 
 Each pair of machines keeps one connection. A daemon dials a listed peer only
 while it has no connection to it, backing off to one try a minute while the
-peer stays unreachable. When both dial at once, both keep the connection the
+peer stays unreachable or closes the link at once, as a peer that has not yet
+allowed this daemon's id does. When both dial at once, both keep the connection the
 smaller endpoint id opened.
 
 `homebased --json fleet machines` shows the link: `local.iroh` has this
