@@ -1192,3 +1192,50 @@ fn cancel_race_reports_cancelled_queued() {
         "a row that reached Running must be signalled, not reported cancelled: {result:?}"
     );
 }
+
+#[test]
+fn a_pool_saved_from_a_stale_read_is_not_reopened() {
+    use crate::pool::{Pool, PoolEnd, PoolSettings, PoolState};
+    use crate::queue::ci::SlotCapacity;
+
+    let directory = tempdir().unwrap();
+    let store = Store::open(&directory.path().join("state.sqlite")).unwrap();
+    let now = chrono::Utc::now();
+    let open = Pool {
+        name: "afv".parse().unwrap(),
+        settings: PoolSettings {
+            machine_class: "do-c16".parse().unwrap(),
+            max_machines: 4,
+            deadline_at: now + chrono::Duration::hours(1),
+            slots: SlotCapacity::default(),
+            idle_limit: Duration::from_secs(600),
+            stall_after: Duration::from_secs(1800),
+            boot_timeout: Duration::from_secs(900),
+            env_file: None,
+        },
+        run_request: uuid::Uuid::now_v7(),
+        run: None,
+        state: PoolState::Open,
+        created_at: now,
+        last_error: None,
+    };
+    store.insert_pool(&open).unwrap();
+
+    // `pool release` saves while a reconcile pass still holds the open pool
+    let released = Pool {
+        state: PoolState::Releasing {
+            end: PoolEnd::Requested,
+        },
+        ..open.clone()
+    };
+    store.update_pool(&released).unwrap();
+    let pass = Pool {
+        last_error: Some("cloudlease timed out".into()),
+        ..open
+    };
+    store.update_pool(&pass).unwrap();
+
+    let stored = store.pool(&pass.name).unwrap().unwrap();
+    assert_eq!(stored.state, released.state);
+    assert_eq!(stored.last_error.as_deref(), Some("cloudlease timed out"));
+}

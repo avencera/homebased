@@ -363,6 +363,12 @@ pub(super) async fn join(
 
     match &machine.state {
         MachineState::Booting { lease } if lease.lease == request.lease => {
+            if !claims_new_machine(&state, slot, request.machine).await? {
+                return Err(refused(format!(
+                    "machine {} is already known to this coordinator",
+                    request.machine
+                )));
+            }
             let address = admit_member(&link, peer.endpoint, request.machine).await?;
             let joined = JoinedMachine {
                 machine: request.machine,
@@ -417,6 +423,51 @@ pub(super) async fn join(
         stall_after: pool.settings.stall_after,
         env,
     }))
+}
+
+/// Whether a joining machine's id is one this coordinator has never seen
+///
+/// The machine names its own id, and when its lease ends the coordinator
+/// fails the jobs and forgets the Fleet entry of that id, so the id of this
+/// daemon, a Fleet peer, or another pool machine must never be bound to a lease
+async fn claims_new_machine(
+    state: &AppState,
+    slot: SlotId,
+    machine: crate::machine::MachineId,
+) -> Result<bool, AppError> {
+    if machine == state.machine.identity.machine {
+        return Ok(false);
+    }
+    if let Some(fleet) = state.fleet.handle()
+        && fleet
+            .peers()
+            .await
+            .iter()
+            .any(|peer| peer.machine == machine)
+    {
+        return Ok(false);
+    }
+
+    let pools = call(&state.store, |reply| StoreMsg::Pools { reply }).await?;
+    for pool in pools {
+        let name = pool.name;
+        let machines = call(&state.store, |reply| StoreMsg::PoolMachines {
+            pool: name,
+            reply,
+        })
+        .await?;
+        let taken = machines.iter().any(|other| {
+            other.slot != slot
+                && other
+                    .state
+                    .joined()
+                    .is_some_and(|joined| joined.machine == machine)
+        });
+        if taken {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn save_pool(state: &AppState, pool: &Pool) -> Result<(), AppError> {
@@ -795,6 +846,13 @@ impl Pass<'_> {
         }
         let wanted = self.wanted_machines(pool, live).await?;
         for _ in 0..wanted {
+            // a `pool release` saved since this pass read the pool stops it asking
+            if !matches!(
+                read_pool(self.state, &pool.name).await?.state,
+                PoolState::Open
+            ) {
+                break;
+            }
             let token = JoinToken::generate()?;
             let slot = SlotId::new();
             let mut machine = PoolMachine {
@@ -877,9 +935,12 @@ impl Pass<'_> {
     /// Retry the create of a machine whose earlier call got no answer and
     /// left no lease in the run, so cloudlease never saw that call's token
     async fn create_machine(&self, pool: &Pool, machine: &mut PoolMachine) -> Result<(), AppError> {
-        // only the token's hash was saved, so the retry sends a new token
+        // only the token's hash was saved, so the retry sends a new token,
+        // saved before the call so a machine booted from it can join even if
+        // this daemon stops before the answer is saved
         let token = JoinToken::generate()?;
         machine.join_token = token.hash();
+        save_machine(self.state, machine).await?;
         let mut pool = pool.clone();
         if let Some(end) = self.create_with_token(&mut pool, machine, &token).await? {
             warn!(pool = %pool.name, "machine create refused: {}", end.job_message(&pool.name));

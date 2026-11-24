@@ -380,6 +380,16 @@ impl PoolState {
             Self::Released { .. } => "released",
         }
     }
+
+    /// How far along its life it is; a pool never moves back
+    #[must_use]
+    pub fn stage(&self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Releasing { .. } => 1,
+            Self::Released { .. } => 2,
+        }
+    }
 }
 
 /// A pool as its coordinator stores it

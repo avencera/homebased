@@ -117,7 +117,7 @@ Each side serves an endpoint id only what it granted that id:
 | Machine of a joined lease | pool member | Join again, the Fleet probe (`/v1/cluster/machine`), and event delivery (`/v1/cluster/job-events`, `/v1/cluster/events`) for work it runs itself. No route that starts work, sends messages, or reads other machines' tasks |
 | Coordinator, on the machine | peer | Every route of the machine's own API, over streams it opens on the machine's connection |
 
-The coordinator grants an id when its join succeeds, and revokes it and closes its connection when the lease leaves `joined`. The lease stays bound to that one id: a join from another id for the same lease is refused. The machine grants only the coordinator's id, from its boot data.
+The coordinator grants an id when its join succeeds, and revokes it and closes its connection when the lease leaves `joined`. The lease stays bound to that one id: a join from another id for the same lease is refused, and so is a join that names a machine id the coordinator already knows, its own or another Fleet or pool machine's. The machine grants only the coordinator's id, from its boot data.
 
 `relays` picks the relays both ends use to find each other. A relay carries traffic until a direct path works, and whenever none does.
 

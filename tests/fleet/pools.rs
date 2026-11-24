@@ -217,6 +217,15 @@ fn machine_states(pool: &Value) -> Vec<String> {
 /// make it: the status, or `None` when the coordinator closed the connection
 /// instead of answering
 fn link_request(lease: &FakeLease, key: iroh::SecretKey, request: &str) -> Option<u16> {
+    link_answer(lease, key, request)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// The raw HTTP answer to one request over the coordinator's link
+fn link_answer(lease: &FakeLease, key: iroh::SecretKey, request: &str) -> Option<String> {
     let config = lease.boot["files"][0]["content"].as_str().unwrap();
     let temporary = &toml::from_str::<toml::Value>(config).unwrap()["temporary"];
     let hub: iroh::EndpointId = temporary["hub"].as_str().unwrap().parse().unwrap();
@@ -242,8 +251,7 @@ fn link_request(lease: &FakeLease, key: iroh::SecretKey, request: &str) -> Optio
             send.finish().ok()?;
             let answer = recv.read_to_end(64 * 1024).await.ok()?;
             endpoint.close().await;
-            let answer = String::from_utf8_lossy(&answer).into_owned();
-            answer.split_whitespace().nth(1)?.parse().ok()
+            Some(String::from_utf8_lossy(&answer).into_owned())
         })
 }
 
@@ -330,6 +338,32 @@ fn a_pool_boots_machines_for_jobs_hands_over_secrets_and_releases_idle_machines(
         run(&origin, thread, "afv", &script),
         run(&origin, thread, "afv", &script),
     ];
+
+    // even with a lease's own token, a join that claims an id the coordinator
+    // already knows is refused: when the lease ends, the coordinator fails
+    // the jobs and forgets the Fleet entry of the id it bound
+    assert!(wait_until(Duration::from_secs(30), || !fake
+        .leases()
+        .is_empty()));
+    let first = fake.leases().remove(0);
+    let config = first.boot["files"][0]["content"].as_str().unwrap();
+    let temporary = &toml::from_str::<toml::Value>(config).unwrap()["temporary"];
+    let coordinator_id = fs::read_to_string(origin.home.join("machine-id")).unwrap();
+    let claim = json!({
+        "api_version": 1,
+        "pool": "afv",
+        "slot": temporary["slot"].as_str().unwrap(),
+        "machine": coordinator_id.trim(),
+        "lease": first.lease_id,
+        "join_token": temporary["join_token"].as_str().unwrap(),
+    });
+    let answer = link_answer(
+        &first,
+        iroh::SecretKey::generate(),
+        &post("/v1/cluster/pool/join", &claim.to_string()),
+    )
+    .unwrap();
+    assert!(answer.contains("already known"), "{answer}");
 
     let mut machines = Machines::default();
     assert!(

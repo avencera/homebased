@@ -86,22 +86,33 @@ impl Store {
             .collect()
     }
 
-    /// Replace a pool's record
+    /// Replace a pool's record, keeping its stored state when that is further
+    /// along than the new one
+    ///
+    /// A reconcile pass reads the pool, waits on cloudlease, and saves; a
+    /// `pool release` saved in between must not be undone by that save
     pub fn update_pool(&self, pool: &Pool) -> Result<(), AppError> {
-        let changed = self.conn.execute(
-            "UPDATE pools SET state = ?2, pool_json = ?3 WHERE name = ?1",
-            params![
-                pool.name.to_string(),
-                pool.state.as_str(),
-                serde_json::to_string(pool)?
-            ],
-        )?;
-        if changed == 0 {
-            return Err(AppError::Internal {
-                message: format!("pool {} vanished while it was updated", pool.name),
-            });
-        }
-        Ok(())
+        self.immediate(|| {
+            let Some(stored) = self.pool(&pool.name)? else {
+                return Err(AppError::Internal {
+                    message: format!("pool {} vanished while it was updated", pool.name),
+                });
+            };
+
+            let mut pool = pool.clone();
+            if stored.state.stage() > pool.state.stage() {
+                pool.state = stored.state;
+            }
+            self.conn.execute(
+                "UPDATE pools SET state = ?2, pool_json = ?3 WHERE name = ?1",
+                params![
+                    pool.name.to_string(),
+                    pool.state.as_str(),
+                    serde_json::to_string(&pool)?
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every machine of a pool, newest first
