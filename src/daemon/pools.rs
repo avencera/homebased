@@ -547,15 +547,21 @@ pub(super) async fn run(state: AppState) {
             }
         };
         for pool in pools {
-            if matches!(pool.state, PoolState::Released { .. }) {
-                continue;
-            }
             let name = pool.name.clone();
             let pass = Pass {
                 state: &state,
                 client: &client,
                 config: &config,
             };
+            // a job whose machine refused it after the pool's last pass is held
+            // again with no pool left to place it, so a released pool keeps
+            // ending its held jobs; it needs no cloudlease call for that
+            if let PoolState::Released { end, .. } = &pool.state {
+                if let Err(error) = pass.end_held_jobs(&pool, end).await {
+                    warn!(pool = %name, "ending a released pool's held jobs: {error}");
+                }
+                continue;
+            }
             if let Err(error) = pass.reconcile(pool).await {
                 warn!(pool = %name, "pool reconcile: {error}");
             }
@@ -752,6 +758,10 @@ impl Pass<'_> {
                     reason,
                 };
             }
+            // a create whose answer was lost and that the provider is still
+            // working on: it is neither a success nor a failure yet, so it must
+            // not reset the count of failed creates in a row
+            (Some(lease), MachineState::Requested) if lease.state == LeaseState::Provisioning => {}
             // a create whose answer was lost, which the provider took
             (Some(lease), MachineState::Requested) => {
                 pool.create_succeeded();
@@ -1067,7 +1077,7 @@ impl Pass<'_> {
             join_token: token,
             hub: &hub,
             relays: &relays,
-            version: &self.config.homebased_version,
+            install: &self.config.machine_install,
         };
         Some(boot.render())
     }

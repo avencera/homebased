@@ -672,6 +672,43 @@ fn a_pool_stops_asking_after_machines_the_provider_cannot_create() {
 }
 
 #[test]
+fn creates_whose_answers_were_lost_still_count_as_failed_in_a_row() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    // each create's answer is lost, and the lease shows provisioning for a few
+    // passes before the provider fails it
+    fake.fail_creates(10);
+    fake.slow_creates(10);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "slow",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    run(&origin, thread, "slow", "true");
+
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            pool(&origin, thread, "slow")["state"] == "released"
+        }),
+        "the pool never stopped: {}",
+        pool(&origin, thread, "slow")
+    );
+    assert_eq!(pool(&origin, thread, "slow")["reason"], "create_failed");
+    assert_eq!(fake.leases().len(), 3);
+}
+
+#[test]
 fn a_refused_create_stops_the_pool_and_running_jobs_finish() {
     let fake = FakeCloudlease::start(Duration::from_secs(4));
     let origin = coordinator(&fake);

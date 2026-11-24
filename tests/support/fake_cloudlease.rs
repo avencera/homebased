@@ -33,6 +33,9 @@ pub struct FakeLease {
     pub release: Option<(String, &'static str)>,
     pub gone_at: Option<DateTime<Utc>>,
     pub renewals: u32,
+    /// While the provider still works on a slow create: when it answers,
+    /// and whether it fails
+    pub provisioning: Option<(DateTime<Utc>, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,10 @@ struct State {
     failing_creates: u32,
     /// Status and code every new machine create is refused with
     refuse_creates: Option<(u16, &'static str)>,
+    /// New machine creates answered `503 busy` while the provider is still
+    /// working, as when cloudlease's answer is lost; the lease shows
+    /// `provisioning` for a few seconds before its outcome
+    slow_creates: u32,
 }
 
 /// The running fake
@@ -105,6 +112,12 @@ impl FakeCloudlease {
         self.state.lock().unwrap().failing_creates = count;
     }
 
+    /// Lose the answers of the next `count` machine creates, which stay
+    /// `provisioning` for a few seconds
+    pub fn slow_creates(&self, count: u32) {
+        self.state.lock().unwrap().slow_creates = count;
+    }
+
     /// Refuse every new machine create with `status` and `code`, as a run
     /// whose class was repriced (`409 run_ended`) or a reached spend cap
     pub fn refuse_creates(&self, status: u16, code: &'static str) {
@@ -145,6 +158,18 @@ impl FakeCloudlease {
 fn advance(state: &mut State) {
     let now = Utc::now();
     for lease in &mut state.leases {
+        if let Some((until, failed)) = lease.provisioning {
+            if now < until {
+                continue;
+            }
+            lease.provisioning = None;
+            lease.state = "running";
+            if failed {
+                lease.state = "releasing";
+                lease.release = Some(("create_failed".into(), "cloudlease"));
+            }
+            continue;
+        }
         if lease.state == "releasing" {
             lease.state = "released";
             lease.gone_at = Some(now);
@@ -299,9 +324,18 @@ fn route(
                 release: None,
                 gone_at: None,
                 renewals: 0,
+                provisioning: None,
             };
-            if state.failing_creates > 0 {
-                state.failing_creates -= 1;
+            let failed = state.failing_creates > 0;
+            state.failing_creates = state.failing_creates.saturating_sub(1);
+            if state.slow_creates > 0 {
+                state.slow_creates -= 1;
+                lease.state = "provisioning";
+                lease.provisioning = Some((now + Duration::seconds(3), failed));
+                state.leases.push(lease);
+                return error(503, "busy");
+            }
+            if failed {
                 lease.state = "releasing";
                 lease.release = Some(("create_failed".into(), "cloudlease"));
             }
