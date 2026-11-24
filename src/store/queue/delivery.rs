@@ -283,8 +283,11 @@ impl Store {
                     HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested,
                 ) => true,
                 (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.owes_final_event,
-                // a pool that ended before the job got a machine refuses it
-                (JobSubmission::Held, HeldJobEnding::Refused { .. }) => route.spec.ci.is_some(),
+                // a pool that ended before the job got a machine refuses it,
+                // unless a move pinned it to a machine since the pool read it
+                (JobSubmission::Held, HeldJobEnding::Refused { .. }) => {
+                    route.spec.ci.is_some() && route.spec.machine.is_none()
+                }
                 _ => false,
             };
             let accepted = self

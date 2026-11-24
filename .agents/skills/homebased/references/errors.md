@@ -143,4 +143,4 @@ See [resource-queue.md](resource-queue.md) for job and operation retry identitie
 | `pool_ended` | 5 | The pool is releasing or released. Create a new one only with the user's approval. |
 | `join_refused` | 5 | A machine's join did not match a machine the coordinator asked for. Agents never see it; the machine retries and cloudlease deletes it at its boot deadline. |
 
-A pool that cloudlease refuses, for example with `spend_cap_reached`, releases itself and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code. See [pools.md](pools.md).
+A pool that cloudlease refuses, for example with `spend_cap_reached`, or whose run cloudlease lost (`run_not_found`), releases itself and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code. See [pools.md](pools.md).

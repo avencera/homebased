@@ -5,8 +5,9 @@
 //! coordinator with the single-use token from its config, stores the
 //! variables the coordinator hands over, and offers the pool's CI class.
 //! Each round it decides from what runs here whether to renew, withhold, or
-//! release; see [`crate::pool::renewal`]. Before an idle release it drains
-//! itself and checks again, so a job placed in that instant keeps it alive
+//! release; see [`crate::pool::renewal`]. Before an idle release it stops
+//! offering the class and checks again, so a job placed in that instant
+//! keeps it alive and none can be queued after the check
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
 use crate::pool::cloudlease::{CloudleaseError, LeaseCredential, SelfRelease};
 use crate::pool::renewal::{Activity, IdleClock, Limits, Renewal};
 use crate::pool::{JoinAnswer, JoinRequest};
+use crate::queue::ci::SlotCapacity;
 use crate::store::queue::interface::QueueRequest;
 
 /// Wait between attempts to read the lease or join the coordinator
@@ -36,8 +38,6 @@ const RETRY: Duration = Duration::from_secs(5);
 
 /// Time limit for one join call
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-const DRAIN_REASON: &str = "temporary machine releasing: idle";
 
 /// What other parts of the daemon read about this machine's lease
 ///
@@ -72,10 +72,8 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
     state.temporary.set_ends_at(lease.hard_deadline_at);
     let coordinator = start_link(&state, &config).await;
     let answer = join_until_accepted(&state, &config, &coordinator, &lease).await;
-    if let Err(error) = apply(&state, &coordinator, &answer).await {
-        warn!("temporary machine setup: {error}");
-    }
     info!(pool = %answer.pool, "temporary machine joined its pool");
+    let mut offered = setup(&state, &coordinator, &answer).await;
 
     let limits = Limits {
         idle_limit: answer.idle_limit,
@@ -94,7 +92,13 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
                 continue;
             }
         };
-        match clock.observe(&activity, Utc::now(), limits) {
+        let decision = clock.observe(&activity, Utc::now(), limits);
+        // a setup or a reopen that failed is tried again each round the
+        // machine is not releasing; until then it takes no CI job
+        if !offered && !matches!(decision, Renewal::Release { .. }) {
+            offered = setup(&state, &coordinator, &answer).await;
+        }
+        match decision {
             Renewal::Renew => {
                 withheld = false;
                 if renew(&lease).await == LeaseEnd::Ended {
@@ -108,7 +112,8 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
                 withheld = true;
             }
             Renewal::Release { idle_since } => {
-                if release_idle(&state, &lease, idle_since).await == LeaseEnd::Ended {
+                let end = release_idle(&state, &lease, &answer, idle_since, &mut offered).await;
+                if end == LeaseEnd::Ended {
                     break;
                 }
             }
@@ -204,6 +209,17 @@ async fn join(
     Ok(serde_json::from_slice(&response.body)?)
 }
 
+/// Apply the join answer; whether the machine now offers the pool's class
+async fn setup(state: &AppState, coordinator: &MachineAddress, answer: &JoinAnswer) -> bool {
+    match apply(state, coordinator, answer).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!("temporary machine setup: {error}");
+            false
+        }
+    }
+}
+
 /// Know the coordinator as a peer, store the pool's variables for runs, and
 /// offer the pool's class
 async fn apply(
@@ -226,13 +242,22 @@ async fn apply(
         .map(|(name, value)| format!("{name}={value}\n"))
         .collect();
     write_private(&path, &text)?;
+    offer(state, answer, answer.slots).await
+}
+
+/// Set how many slots of the pool's class this machine offers
+async fn offer(
+    state: &AppState,
+    answer: &JoinAnswer,
+    capacity: SlotCapacity,
+) -> Result<(), AppError> {
     let machine = state.machine.identity.machine;
     forward(
         state,
         machine,
         QueueRequest::CiCapacity {
             class: answer.pool.class().clone(),
-            capacity: answer.slots,
+            capacity,
         },
     )
     .await?;
@@ -306,34 +331,31 @@ async fn renew(lease: &LeaseCredential) -> LeaseEnd {
     }
 }
 
-/// Drain, make sure nothing arrived, then release the lease
+/// Stop offering the class, make sure nothing arrived, then release the lease
 async fn release_idle(
     state: &AppState,
     lease: &LeaseCredential,
+    answer: &JoinAnswer,
     idle_since: DateTime<Utc>,
+    offered: &mut bool,
 ) -> LeaseEnd {
-    let machine = state.machine.identity.machine;
-    let drain = |reason: Option<&str>| {
-        forward(
-            state,
-            machine,
-            QueueRequest::CiDrain {
-                reason: reason.map(str::to_owned),
-            },
-        )
-    };
-    if let Err(error) = drain(Some(DRAIN_REASON)).await {
-        warn!("drain before release: {error}");
+    // with no slots of its class the queue refuses a job of it in the same
+    // store write that would queue it, so none can land after the check below
+    if let Err(error) = offer(state, answer, SlotCapacity::default()).await {
+        warn!("close the class before release: {error}");
         return LeaseEnd::Live;
     }
-    // a job placed just before the drain is in the queue by now
+    *offered = false;
+    // a job queued just before the class closed is in the queue by now
     let busy = activity(state)
         .await
         .map_or(true, |activity| activity != Activity::default());
     if busy {
-        if let Err(error) = drain(None).await {
-            warn!("reopen after a late job: {error}");
-        }
+        // a failed reopen is tried again next round
+        *offered = offer(state, answer, answer.slots)
+            .await
+            .inspect_err(|error| warn!("reopen after a late job: {error}"))
+            .is_ok();
         return LeaseEnd::Live;
     }
 

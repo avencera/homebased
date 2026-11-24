@@ -297,7 +297,11 @@ impl FleetLink {
             if current == Some(connection.stable_id()) {
                 return false;
             }
-            entry.connection = Some(connection.clone());
+            // a peer keeps one connection, and a revoke closes only the one
+            // tracked here, so an older one must not stay open beside it
+            if let Some(superseded) = entry.connection.replace(connection.clone()) {
+                superseded.close(REFUSED.into(), b"superseded");
+            }
             true
         });
     }
@@ -422,6 +426,13 @@ async fn serve_connection(state: &AppState, link: &FleetLink, connection: Connec
         let Some((send, recv)) = next else {
             break;
         };
+        // the grant may have been revoked while this connection waited
+        let current = link.grant_of(endpoint);
+        if grant.is_some() && current.is_none() {
+            connection.close(REFUSED.into(), b"revoked");
+            break;
+        }
+        let grant = current;
 
         let peer = LinkPeer { endpoint, grant };
         match grant {
@@ -437,8 +448,9 @@ async fn serve_connection(state: &AppState, link: &FleetLink, connection: Connec
             None => {}
         }
 
+        // an unknown peer must not hold a stream open by sending a request slowly
         let router = routes(super::pools::enrollment_routes(), state, peer);
-        serve_stream(router, send, recv).await;
+        let _ = tokio::time::timeout(ENROLL_WINDOW, serve_stream(router, send, recv)).await;
         if link.grant_of(endpoint).is_none() {
             // a close drops answer bytes the peer has not acknowledged, so
             // give it time to read the refusal and close first

@@ -655,7 +655,19 @@ pub(crate) enum StoreMsg {
     /// Save a machine before its create call
     InsertPoolMachine {
         machine: Box<crate::pool::PoolMachine>,
+        boot: Box<crate::pool::boot::BootPayload>,
         reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read the create body of a machine cloudlease has not answered for
+    PendingBoot {
+        slot: crate::pool::SlotId,
+        reply: RpcReplyPort<Result<Option<crate::pool::boot::BootPayload>, AppError>>,
+    },
+    /// Move an open pool to releasing
+    ReleasePool {
+        name: crate::pool::PoolName,
+        end: crate::pool::PoolEnd,
+        reply: RpcReplyPort<Result<Option<crate::pool::Pool>, AppError>>,
     },
     /// Replace a machine's record
     UpdatePoolMachine {
@@ -1493,8 +1505,16 @@ impl Actor for StoreActor {
                 send_reply(reply, state.pool_machines(&pool));
             }
             StoreMsg::PoolMachine { slot, reply } => send_reply(reply, state.pool_machine(slot)),
-            StoreMsg::InsertPoolMachine { machine, reply } => {
-                send_reply(reply, state.insert_pool_machine(&machine));
+            StoreMsg::InsertPoolMachine {
+                machine,
+                boot,
+                reply,
+            } => {
+                send_reply(reply, state.insert_pool_machine(&machine, &boot));
+            }
+            StoreMsg::PendingBoot { slot, reply } => send_reply(reply, state.pending_boot(slot)),
+            StoreMsg::ReleasePool { name, end, reply } => {
+                send_reply(reply, state.release_pool(&name, end));
             }
             StoreMsg::UpdatePoolMachine { machine, reply } => {
                 send_reply(reply, state.update_pool_machine(&machine));

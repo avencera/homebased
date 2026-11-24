@@ -63,7 +63,7 @@ Each pass, about every 15 seconds, the coordinator:
 2. reads the run, moves each machine to its lease's state, and releases a machine that has not joined within the boot timeout;
 3. asks for machines while ready jobs of the class outnumber the free slots on joined machines plus the slots of machines still booting, up to `--max`;
 4. for each machine cloudlease reports `released`, removes it from the Fleet and ends every job it still held with `JOB_FAILED`;
-5. at the deadline, or after `pool release`, releases the run, fails the pool's jobs that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool that cloudlease refuses, such as with `spend_cap_reached`, ends the same way with cloudlease's code.
+5. at the deadline, or after `pool release`, releases the run, fails the pool's jobs that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool that cloudlease refuses, such as with `spend_cap_reached`, ends the same way with cloudlease's code, and a pool whose run cloudlease no longer has ends with `run_not_found`. The pool is marked released only once cloudlease took the run's release.
 
 ## On the machine
 
@@ -80,8 +80,8 @@ The machine's boot data, written by the coordinator and passed through cloudleas
 | Jobs wait in its queue and no run holds a slot | renew |
 | Events it owes the coordinator are not delivered yet | renew |
 | No work, idle less than `--idle-limit` | renew |
-| Every run went silent for `--stall-after` | do not renew: cloudlease deletes the machine at the heartbeat deadline (about 10 minutes) unless output resumes |
-| No work for `--idle-limit` | drain the CI class, check again that nothing arrived, then release the lease |
+| Every run went silent for `--stall-after`, and it owes no events | do not renew: cloudlease deletes the machine at the heartbeat deadline (about 10 minutes) unless output resumes |
+| No work for `--idle-limit` | stop offering the CI class, so no job can be queued, check again that nothing arrived, then release the lease |
 
 Its hard deadline applies whatever the machine decides.
 

@@ -174,7 +174,8 @@ archive="homebased-$tag-$target.tar.gz"
 base="https://github.com/avencera/homebased/releases/download/$tag"
 work=$(mktemp -d)
 curl -fsSL --retry 5 -o "$work/$archive" "$base/$archive"
-curl -fsSL --retry 5 -o "$work/$archive.sha256" "$base/$archive.sha256"
+# the release names the checksum after the target, without the archive suffix
+curl -fsSL --retry 5 -o "$work/$archive.sha256" "$base/homebased-$tag-$target.sha256"
 expected=$(cut -d ' ' -f 1 "$work/$archive.sha256")
 actual=$(sha256sum "$work/$archive" | cut -d ' ' -f 1)
 if [ "$expected" != "$actual" ]; then

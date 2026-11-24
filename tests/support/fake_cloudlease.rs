@@ -87,6 +87,13 @@ impl FakeCloudlease {
         &self.base
     }
 
+    /// Lose every run and lease, as a cloudlease that no longer has them
+    pub fn forget_runs(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.runs.clear();
+        state.leases.clear();
+    }
+
     /// Every lease, oldest first, after applying the lifetime rules
     pub fn leases(&self) -> Vec<FakeLease> {
         let mut state = self.state.lock().unwrap();

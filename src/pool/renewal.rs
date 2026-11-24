@@ -4,7 +4,8 @@
 //! run on it made output within the pool's stall window, while jobs wait in
 //! its queue with no run in the way, while it still owes events to another
 //! machine, and for the pool's idle limit after its last work ended. When
-//! every run on it has stalled it withholds renewal, so cloudlease deletes it
+//! every run on it has stalled and it owes no event it withholds renewal, so
+//! cloudlease deletes it
 //! at the heartbeat deadline unless output resumes first. When it has been
 //! idle for the idle limit it releases itself. The hard deadline applies
 //! whatever this decides
@@ -90,8 +91,9 @@ impl IdleClock {
 }
 
 fn busy_renewal(activity: &Activity, now: DateTime<Utc>, stall_after: Duration) -> Renewal {
-    if activity.runs.is_empty() {
-        // queued jobs are about to start, or events are still on their way
+    // queued jobs are about to start, or events are still on their way; a
+    // finished job's result must reach its submitter even beside a stalled run
+    if activity.runs.is_empty() || activity.undelivered > 0 {
         return Renewal::Renew;
     }
 
@@ -168,6 +170,12 @@ mod tests {
             ..stalled
         };
         assert_eq!(clock.observe(&resumed, at(2000), LIMITS), Renewal::Renew);
+        // a finished job's result still owed keeps the machine beside a stalled run
+        let owing = Activity {
+            undelivered: 1,
+            ..stalled.clone()
+        };
+        assert_eq!(clock.observe(&owing, at(1900), LIMITS), Renewal::Renew);
     }
 
     #[test]

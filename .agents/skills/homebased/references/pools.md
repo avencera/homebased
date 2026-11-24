@@ -24,7 +24,7 @@ homebased --json pool release afv
 ## Lifetime rules
 
 - A machine renews its lease only while a run on it wrote output within `--stall-after`, jobs wait in its queue, or it still owes events. A job that goes silent longer than that loses its machine about 10 minutes later.
-- A machine with no work for `--idle-limit` drains and releases itself.
+- A machine with no work for `--idle-limit` stops offering the class and releases itself.
 - At the pool's deadline, or after `pool release`, every machine is deleted, running or not.
 
 ## Outputs
@@ -33,6 +33,6 @@ A job must upload its results before it exits. A job whose machine was deleted u
 
 ## Inspect
 
-`pool show <name>` lists each machine with its state: `requested`, `booting`, `joined`, `releasing`, or `released` with a `reason`. `last_error` holds the last cloudlease error. `ci slots` shows the joined machines' slots and `ends_at`. A pool that cloudlease refused (for example `spend_cap_reached`) releases itself and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code. Jobs still waiting when a pool reaches its deadline or is released fail the same way, with `pool_deadline` or `pool_released`.
+`pool show <name>` lists each machine with its state: `requested`, `booting`, `joined`, `releasing`, or `released` with a `reason`. `last_error` holds the last cloudlease error. `ci slots` shows the joined machines' slots and `ends_at`. A pool that cloudlease refused (for example `spend_cap_reached`) or whose run it lost (`run_not_found`) releases itself and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code. Jobs still waiting when a pool reaches its deadline or is released fail the same way, with `pool_deadline` or `pool_released`.
 
 See `docs/temporary-machines.md` in the homebased repository for the design and the cloudlease contract.

@@ -7,7 +7,8 @@ use rusqlite::{OptionalExtension, params};
 use super::{fmt_time, parse_time};
 use crate::domain::TaskId;
 use crate::error::AppError;
-use crate::pool::{Pool, PoolMachine, PoolName, PoolState, SlotId};
+use crate::pool::boot::BootPayload;
+use crate::pool::{Pool, PoolEnd, PoolMachine, PoolName, PoolState, SlotId};
 use crate::store::Store;
 
 /// What runs or waits on a temporary machine, before output times are read
@@ -86,6 +87,29 @@ impl Store {
             .collect()
     }
 
+    /// Move an open pool to releasing for `end`, and return it as stored;
+    /// `None` when there is no such pool
+    pub fn release_pool(&self, name: &PoolName, end: PoolEnd) -> Result<Option<Pool>, AppError> {
+        self.immediate(|| {
+            let Some(mut pool) = self.pool(name)? else {
+                return Ok(None);
+            };
+            if !matches!(pool.state, PoolState::Open) {
+                return Ok(Some(pool));
+            }
+            pool.state = PoolState::Releasing { end };
+            self.conn.execute(
+                "UPDATE pools SET state = ?2, pool_json = ?3 WHERE name = ?1",
+                params![
+                    pool.name.to_string(),
+                    pool.state.as_str(),
+                    serde_json::to_string(&pool)?
+                ],
+            )?;
+            Ok(Some(pool))
+        })
+    }
+
     /// Replace a pool's record, keeping its stored state when that is further
     /// along than the new one
     ///
@@ -143,10 +167,17 @@ impl Store {
     }
 
     /// Save a machine before its create call goes out
-    pub fn insert_pool_machine(&self, machine: &PoolMachine) -> Result<(), AppError> {
+    /// Save a machine about to be asked for, with the create body every
+    /// attempt of it sends
+    pub fn insert_pool_machine(
+        &self,
+        machine: &PoolMachine,
+        boot: &BootPayload,
+    ) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT INTO pool_machines (slot, pool, state, machine_id, machine_json, requested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO pool_machines
+                 (slot, pool, state, machine_id, machine_json, requested_at, pending_boot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 machine.slot.to_string(),
                 machine.pool.to_string(),
@@ -157,15 +188,33 @@ impl Store {
                     .map(|joined| joined.machine.to_string()),
                 serde_json::to_string(machine)?,
                 fmt_time(machine.requested_at),
+                serde_json::to_string(boot)?,
             ],
         )?;
         Ok(())
     }
 
-    /// Replace a machine's record
+    /// The create body of a machine cloudlease has not answered for yet
+    pub fn pending_boot(&self, slot: SlotId) -> Result<Option<BootPayload>, AppError> {
+        let json: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT pending_boot FROM pool_machines WHERE slot = ?1",
+                [slot.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.flatten()
+            .map(|json| Ok(serde_json::from_str(&json)?))
+            .transpose()
+    }
+
+    /// Replace a machine's record; its create body is dropped once it is no
+    /// longer `requested`
     pub fn update_pool_machine(&self, machine: &PoolMachine) -> Result<(), AppError> {
         let changed = self.conn.execute(
-            "UPDATE pool_machines SET state = ?2, machine_id = ?3, machine_json = ?4
+            "UPDATE pool_machines SET state = ?2, machine_id = ?3, machine_json = ?4,
+                 pending_boot = CASE WHEN ?2 = 'requested' THEN pending_boot END
              WHERE slot = ?1",
             params![
                 machine.slot.to_string(),
@@ -208,7 +257,10 @@ impl Store {
             |row| row.get(0),
         )?;
         let pending_tasks: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT task_id) FROM executor_outbox WHERE state = 'pending'",
+            // an orphaned route's events are never sent, so they owe no one
+            "SELECT COUNT(DISTINCT task_id) FROM executor_outbox
+             WHERE state = 'pending'
+               AND task_id NOT IN (SELECT task_id FROM executor_event_routes)",
             [],
             |row| row.get(0),
         )?;

@@ -124,8 +124,13 @@ pub(super) async fn check_offered(
     let Some(ci) = &spec.ci else {
         return Ok(());
     };
-    // a pool's class is offered by machines it creates on demand
-    if choice == MachineChoice::Any && super::pools::admit_pool_job(state, ci).await? {
+    // a pool's class is offered by machines it creates on demand; a pool
+    // that refuses the job still leaves any other machine offering the class
+    let pool = match choice {
+        MachineChoice::Any => super::pools::admit_pool_job(state, ci).await,
+        MachineChoice::Pinned(_) => Ok(false),
+    };
+    if matches!(pool, Ok(true)) {
         return Ok(());
     }
     let scope = match choice {
@@ -142,6 +147,8 @@ pub(super) async fn check_offered(
     if statuses.iter().any(offered) {
         return Ok(());
     }
+    // no other machine offers it, so the pool's refusal says why
+    pool?;
     let mut classes: Vec<JobClass> = statuses
         .iter()
         .flat_map(|status| status.offer.classes.iter())

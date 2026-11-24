@@ -354,9 +354,9 @@ impl LeaseCredential {
 }
 
 fn read_token(path: &Path) -> Result<String, CloudleaseError> {
-    let text = std::fs::read_to_string(path).map_err(|error| CloudleaseError::Refused {
-        status: 0,
-        code: "token_unreadable".into(),
+    // a missing or unreadable token file is retried, since it may be mid-rotation;
+    // only cloudlease's own answer ends a pool
+    let text = std::fs::read_to_string(path).map_err(|error| CloudleaseError::Unavailable {
         message: format!("read {}: {error}", path.display()),
     })?;
     Ok(text.trim().to_owned())

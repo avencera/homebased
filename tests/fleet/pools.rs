@@ -546,3 +546,49 @@ fn renewal_lasts_while_output_flows_and_a_stalled_job_fails_with_its_machine() {
         ["released"]
     );
 }
+
+#[test]
+fn a_pool_whose_run_cloudlease_lost_ends_and_fails_its_waiting_jobs() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "lost",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    // the coordinator asks for a machine, which never boots here
+    let job = run(&origin, thread, "lost", "true");
+    assert!(wait_until(Duration::from_secs(30), || !fake
+        .leases()
+        .is_empty()));
+
+    fake.forget_runs();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            pool(&origin, thread, "lost")["state"] == "released"
+        }),
+        "the pool never ended: {}",
+        pool(&origin, thread, "lost")
+    );
+    let shown = pool(&origin, thread, "lost");
+    assert_eq!(shown["code"], "run_not_found", "{shown}");
+    assert!(wait_until(Duration::from_secs(20), || final_event(
+        &origin, job
+    )
+    .is_some()));
+    assert_eq!(
+        final_event(&origin, job).unwrap().event,
+        JobEventKind::JobFailed
+    );
+}

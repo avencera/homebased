@@ -1194,7 +1194,7 @@ fn cancel_race_reports_cancelled_queued() {
 }
 
 #[test]
-fn a_pool_saved_from_a_stale_read_is_not_reopened() {
+fn a_pool_release_keeps_its_run_and_survives_a_stale_save() {
     use crate::pool::{Pool, PoolEnd, PoolSettings, PoolState};
     use crate::queue::ci::SlotCapacity;
 
@@ -1221,21 +1221,33 @@ fn a_pool_saved_from_a_stale_read_is_not_reopened() {
     };
     store.insert_pool(&open).unwrap();
 
-    // `pool release` saves while a reconcile pass still holds the open pool
-    let released = Pool {
-        state: PoolState::Releasing {
-            end: PoolEnd::Requested,
-        },
+    // a reconcile pass saves the run it created; `pool release` then changes
+    // only the state, so the run stays known
+    let with_run = Pool {
+        run: Some(crate::pool::RunId::new("run-1")),
         ..open.clone()
     };
-    store.update_pool(&released).unwrap();
+    store.update_pool(&with_run).unwrap();
+    let released = store
+        .release_pool(&open.name, PoolEnd::Requested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.run, with_run.run);
+
+    // a pass that read the pool before the release saves its copy after it
     let pass = Pool {
         last_error: Some("cloudlease timed out".into()),
-        ..open
+        ..with_run
     };
     store.update_pool(&pass).unwrap();
 
     let stored = store.pool(&pass.name).unwrap().unwrap();
-    assert_eq!(stored.state, released.state);
+    assert_eq!(
+        stored.state,
+        PoolState::Releasing {
+            end: PoolEnd::Requested
+        }
+    );
+    assert_eq!(stored.run, pass.run);
     assert_eq!(stored.last_error.as_deref(), Some("cloudlease timed out"));
 }

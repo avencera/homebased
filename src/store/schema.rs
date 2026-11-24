@@ -197,7 +197,10 @@ fn add_pools(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// Pools this daemon coordinates and every machine each one asked for
 ///
 /// `pool_json` and `machine_json` hold the whole record; `state` and
-/// `machine_id` repeat what the reconciler and the join look up by. Rows are
+/// `machine_id` repeat what the reconciler and the join look up by, and a
+/// machine id is bound to one machine only. `pending_boot` is the create body
+/// of a machine still `requested`, so a retry sends the same body; it holds
+/// the join token, so it is cleared once cloudlease has the machine. Rows are
 /// kept after release so `pool show` can say what happened
 const POOL_TABLES: &str = "
 CREATE TABLE pools (
@@ -213,9 +216,11 @@ CREATE TABLE pool_machines (
         CHECK (state IN ('requested', 'booting', 'joined', 'releasing', 'released')),
     machine_id TEXT,
     machine_json TEXT NOT NULL,
-    requested_at TEXT NOT NULL
+    requested_at TEXT NOT NULL,
+    pending_boot TEXT
 );
 CREATE INDEX pool_machines_live ON pool_machines (pool) WHERE state <> 'released';
+CREATE UNIQUE INDEX pool_machines_machine ON pool_machines (machine_id);
 ";
 
 /// Version 15: long-lived services that agents start and do not wait on
