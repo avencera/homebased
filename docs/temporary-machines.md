@@ -129,7 +129,7 @@ Boot data is readable by anything on the machine through the provider's metadata
 
 ## Link
 
-Temporary machines reach the coordinator over the [Fleet link](fleet.md#iroh-link), an [iroh](https://www.iroh.computer) endpoint (`iroh` 1.5.0) on each side, not over the LAN or tailnet HTTP that the rest of the Fleet uses. The coordinator's endpoint listens on UDP port `[fleet.iroh] port`, keyed by `iroh/secret.key` in its state directory so its id survives restarts. Each machine makes its own key at first start and keeps it, and opens one QUIC connection to the coordinator. Machines need no inbound port, no tailnet, and no `tailscaled`.
+Temporary machines reach the coordinator over the [Fleet link](fleet.md#iroh-link), an [iroh](https://www.iroh.computer) endpoint (`iroh` 1.5.0) on each side, not over LAN or tailnet HTTP. The coordinator's endpoint listens on UDP port `[fleet.iroh] port`, keyed by `iroh/secret.key` in its state directory so its id survives restarts. Each machine makes its own key at first start and keeps it, and opens one QUIC connection to the coordinator. Machines need no inbound port, no tailnet, and no `tailscaled`.
 
 Each Fleet call between the two, in either direction, is one HTTP/1 exchange on its own QUIC stream of that connection, so the Fleet API is unchanged. Each side's Fleet knows the other at a loopback address: on the machine, `127.0.0.1:7678` (`link_listen`) reaches the coordinator; on the coordinator, one loopback port per machine reaches it. A forwarder turns each TCP connection there into a stream on the link, and the other side hands each stream to its own API.
 

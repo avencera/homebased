@@ -22,9 +22,10 @@ address = "http://training:7677"
 ```
 
 Use a different unique `machine_name` on each installation. `mdns` is on by
-default. Tailscale discovery is optional. Fleet uses plain HTTP. Use it only on
-a trusted LAN or tailnet. Fleet does not add authentication over HTTP; the
-[iroh link](#iroh-link) does.
+default. Tailscale discovery is optional. Plain Fleet HTTP has no
+authentication: use it only on a trusted LAN or tailnet. A peer reached over
+the [iroh link](#iroh-link) is authenticated, and works off the LAN without
+Tailscale.
 
 Validate the file, then restart the daemon so it loads the changes:
 
@@ -57,18 +58,89 @@ link, next to its HTTP listener:
 [fleet.iroh]
 relays = "n0"   # or ["https://relay.example.com"], or "disabled"
 port = 7679     # UDP port; 0 picks a free one
+# peers = ["<endpoint id>"]   # more ids allowed the whole Fleet API
 ```
 
-The link authenticates by endpoint id. Each daemon keeps its key in
-`iroh/secret.key` in its state directory and serves an id only what that id
-was granted: a peer gets the whole Fleet API, and a pool machine gets only
-its member routes. A pools coordinator also lets an unknown id call the pool
-join route, and nothing else; any other daemon closes connections from ids it
-has not granted. Fleet calls over the link are plain HTTP/1, one exchange per
-QUIC stream, so the Fleet API is the same over both. HTTP stays on alongside
-it.
+The link authenticates both ends by endpoint id. Each daemon keeps its key in
+`iroh/secret.key` in its state directory, and `homebased fleet endpoint-id`
+prints the id, making the key first if needed. It reads the state directory,
+not the daemon, so you can collect every machine's id before you turn the link
+on anywhere.
 
-Today only pools use it. Cloud machines join the Fleet for a while as
+A daemon serves an endpoint id only what it granted that id. A Fleet peer gets
+the whole Fleet API, the same as over HTTP; a pool machine gets only its member
+routes. A pools coordinator also lets an unknown id call the pool join route,
+and nothing else. Any other daemon closes connections from ids it has not
+granted. Fleet calls over the link are plain HTTP/1, one exchange per QUIC
+stream, handed to the daemon's own listener, so the Fleet API is the same over
+both.
+
+### Fleet machines over the link
+
+Each `[[fleet.machines]]` entry can name a peer's endpoint id next to, or
+instead of, its HTTP address, and the order to try them in:
+
+```toml
+[[fleet.machines]]
+address = "http://main:7677"          # plain HTTP
+iroh = "<main's endpoint id>"         # the Fleet link
+transports = ["http", "iroh"]         # try in this order
+# iroh_addrs = ["192.168.1.10:7679"]  # direct UDP addresses, optional
+# iroh_relay = "https://relay.example.com"  # the peer's home relay, optional
+```
+
+| Key | Meaning |
+| --- | --- |
+| `address` | The peer's HTTP base address |
+| `iroh` | The peer's endpoint id. Needs `[fleet.iroh]` here. This daemon grants the id the whole Fleet API and keeps a connection to it |
+| `transports` | `"http"` and `"iroh"` in the order to try them. Each one listed needs its key, and each key needs its transport listed. Omitted, it is the transports the entry has, HTTP first |
+| `iroh_addrs`, `iroh_relay` | Where to dial the peer. With `relays = "n0"` the id alone finds it; with custom relays or `"disabled"`, set one of them |
+
+A call to a peer tries its addresses in order and moves on when one does not
+answer: the entry's transports in their order, then addresses that mDNS,
+Tailscale, or earlier probes found. An entry without `http` is link-only: the
+peer is reached over the link and never at an HTTP address, even one that
+answers with its machine UUID, because plain HTTP cannot prove who answered.
+The directory keeps the endpoint id that a link probe confirmed for each
+machine, so this holds across restarts.
+
+`[fleet.iroh] peers` allows ids this daemon does not dial, such as a machine
+that lists this one but that this one does not list. To reach a peer over the
+link and get its events back, each side lists the other.
+
+Each pair of machines keeps one connection. A daemon dials a listed peer only
+while it has no connection to it, backing off to one try a minute while the
+peer stays unreachable. When both dial at once, both keep the connection the
+smaller endpoint id opened.
+
+`homebased --json fleet machines` shows the link: `local.iroh` has this
+daemon's endpoint id, relays, and each allowed id with its grant and, when
+connected, who dialed and since when. Each peer shows the endpoint id a link
+probe confirmed (`iroh`), and a link address carries the endpoint id it
+forwards to. A link address is a loopback port this daemon opens at each start;
+it is not saved.
+
+### HTTP off
+
+Once every peer reaches a machine over the link, bind its HTTP listener to
+loopback, so nothing unauthenticated is reachable from the network:
+
+```sh
+HOMEBASED_WEB_LISTEN=127.0.0.1:7677 homebased daemon install
+homebased daemon restart
+```
+
+A systemd drop-in that sets `HOMEBASED_WEB_LISTEN` overrides the unit, so
+change it there too.
+
+Keep the listener on loopback rather than `off`: link streams from peers are
+handed to it. The CLI uses the daemon's Unix socket and does not need it. The
+dashboard stays reachable on the machine itself, and through `tailscale serve`
+if you set that up (see [install](install.md#dashboard-over-https-tailscale)).
+A loopback listener is not announced over mDNS, so peers find it only over the
+link.
+
+Cloud machines join the Fleet for a while as
 [temporary machines](temporary-machines.md): they reach only their pool's
 coordinator, over the link, and only the routes they need. Their boot data
 writes their config, with `[fleet.iroh]` and `[temporary]` sections, so never

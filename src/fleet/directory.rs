@@ -14,6 +14,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -82,7 +83,12 @@ pub struct ProbeFailure {
 
 #[derive(Debug, Clone, Default)]
 struct AddressRecord {
-    configured: bool,
+    /// Position in its `[[fleet.machines]]` entry's transports, when the
+    /// config file declares this address
+    configured: Option<usize>,
+    /// The endpoint id this address forwards to, when it is a loopback
+    /// forwarder onto the Fleet link rather than the peer's own listener
+    link: Option<EndpointId>,
     explicit: bool,
     mdns_until: Option<DateTime<Utc>>,
     tailscale_until: Option<DateTime<Utc>>,
@@ -106,7 +112,7 @@ impl AddressRecord {
 
     /// Best current source, or `None` when nothing justifies keeping it.
     fn source(&self, now: DateTime<Utc>) -> Option<AddressSource> {
-        if self.configured {
+        if self.configured.is_some() {
             return Some(AddressSource::Configured);
         }
         if self.explicit {
@@ -137,6 +143,11 @@ struct MachineRecord {
     // records saved before the field existed load without it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     t3_environment: Option<String>,
+    // the endpoint id a probe over the Fleet link last confirmed for this
+    // machine; kept across restarts so a link-only peer is never routed over
+    // HTTP before its link answers again
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<EndpointId>,
     last_seen: DateTime<Utc>,
     identity: IdentityStatus,
 }
@@ -152,6 +163,18 @@ pub struct LocalMachine {
     pub protocol: ProtocolRange,
 }
 
+/// An address `config.toml` declares for a peer
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredAddress {
+    /// Base URL: the peer's HTTP listener, or a loopback forwarder onto the
+    /// Fleet link
+    pub address: MachineAddress,
+    /// Position in its entry's `transports`; lower is tried first
+    pub position: usize,
+    /// The peer's endpoint id when `address` is a link forwarder
+    pub link: Option<EndpointId>,
+}
+
 /// Address in routing order for one machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +183,10 @@ pub struct RankedAddress {
     pub address: MachineAddress,
     /// Best current source.
     pub source: AddressSource,
+    /// The endpoint id when the address is a loopback forwarder onto the
+    /// Fleet link. Omitted for plain HTTP addresses
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<EndpointId>,
     /// Last probe that confirmed the machine at this address.
     pub verified_at: Option<DateTime<Utc>>,
     /// Last probe failure.
@@ -211,6 +238,10 @@ pub struct PeerView {
     /// for the same reason as `dashboard_url`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t3_environment: Option<String>,
+    /// Endpoint id a probe over the Fleet link confirmed for the peer.
+    /// Omitted when no link probe has
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<EndpointId>,
     /// Reachability now.
     pub reachability: Reachability,
     /// Identity status.
@@ -344,6 +375,9 @@ pub struct PeerDirectory {
     local: LocalMachine,
     addresses: BTreeMap<MachineAddress, AddressRecord>,
     machines: BTreeMap<MachineId, MachineRecord>,
+    /// Endpoint ids whose `[[fleet.machines]]` entry leaves out HTTP; their
+    /// machines are routed over the link only
+    link_only: BTreeSet<EndpointId>,
 }
 
 impl PeerDirectory {
@@ -354,6 +388,7 @@ impl PeerDirectory {
             local,
             addresses: BTreeMap::new(),
             machines: BTreeMap::new(),
+            link_only: BTreeSet::new(),
         }
     }
 
@@ -365,16 +400,26 @@ impl PeerDirectory {
 
     /// Replace the configured address set. `config.toml` is the source of
     /// truth, so addresses absent from the new set lose the configured source.
-    pub fn set_configured(&mut self, addresses: &[MachineAddress]) {
+    /// A machine confirmed at an endpoint in `link_only` is routed only over
+    /// its link, never at a discovered or cached HTTP address
+    pub fn set_configured(
+        &mut self,
+        addresses: &[ConfiguredAddress],
+        link_only: BTreeSet<EndpointId>,
+    ) {
         for record in self.addresses.values_mut() {
-            record.configured = false;
+            record.configured = None;
+            record.link = None;
         }
-        for address in addresses {
-            self.addresses
-                .entry(address.clone())
-                .or_default()
-                .configured = true;
+        for configured in addresses {
+            let record = self
+                .addresses
+                .entry(configured.address.clone())
+                .or_default();
+            record.configured = Some(configured.position);
+            record.link = configured.link;
         }
+        self.link_only = link_only;
     }
 
     /// Add an explicit address. Returns `false` when it was already explicit.
@@ -440,6 +485,7 @@ impl PeerDirectory {
         let header = probed.header();
         let record = self.addresses.entry(address.clone()).or_default();
         record.last_failure = None;
+        let via_link = record.link;
         if self.local.identity.is_self(header.machine, header.boot) {
             record.binding = AddressBinding::Local { verified_at: now };
             return;
@@ -462,10 +508,10 @@ impl PeerDirectory {
             ),
             ProbedMachine::Incompatible { .. } => (None, Vec::new(), None, None),
         };
-        let identity = self
-            .machines
-            .get(&header.machine)
-            .map_or(IdentityStatus::Consistent, |old| old.identity.clone());
+        let old = self.machines.get(&header.machine);
+        let identity = old.map_or(IdentityStatus::Consistent, |old| old.identity.clone());
+        // only a probe over the link proves which endpoint a machine holds
+        let link = via_link.or_else(|| old.and_then(|old| old.link));
         self.machines.insert(
             header.machine,
             MachineRecord {
@@ -474,6 +520,7 @@ impl PeerDirectory {
                 advertised,
                 dashboard_url,
                 t3_environment,
+                link,
                 last_seen: now,
                 identity,
             },
@@ -697,6 +744,7 @@ impl PeerDirectory {
             advertised: record.advertised.clone(),
             dashboard_url: record.dashboard_url.clone(),
             t3_environment: record.t3_environment.clone(),
+            iroh: record.link,
             reachability,
             identity: record.identity.clone(),
             name_conflict,
@@ -709,27 +757,39 @@ impl PeerDirectory {
     }
 
     fn ranked_addresses(&self, machine: MachineId, now: DateTime<Utc>) -> Vec<RankedAddress> {
-        let mut ranked: Vec<RankedAddress> = self
+        // a link-only peer's HTTP addresses are unauthenticated, so another
+        // host answering there with its UUID must never get its work
+        let only_link = self
+            .machines
+            .get(&machine)
+            .and_then(|record| record.link)
+            .filter(|endpoint| self.link_only.contains(endpoint));
+        let mut ranked: Vec<(Option<usize>, RankedAddress)> = self
             .addresses
             .iter()
             .filter(|(_, record)| record.bound_to(machine))
+            .filter(|(_, record)| only_link.is_none_or(|endpoint| record.link == Some(endpoint)))
             .filter_map(|(address, record)| {
-                Some(RankedAddress {
+                let ranked = RankedAddress {
                     address: address.clone(),
                     source: record.source(now)?,
+                    iroh: record.link,
                     verified_at: record.verified_at(),
                     last_failure: record.last_failure.clone(),
-                })
+                };
+                Some((record.configured, ranked))
             })
             .collect();
-        // most preferred source first, then the most recent confirmation
-        ranked.sort_by(|a, b| {
+        // most preferred source first, configured addresses in their
+        // transports order, then the most recent confirmation
+        ranked.sort_by(|(a_position, a), (b_position, b)| {
             AddressPreference::from(a.source)
                 .cmp(&AddressPreference::from(b.source))
+                .then_with(|| a_position.cmp(b_position))
                 .then_with(|| b.verified_at.cmp(&a.verified_at))
                 .then_with(|| a.address.cmp(&b.address))
         });
-        ranked
+        ranked.into_iter().map(|(_, ranked)| ranked).collect()
     }
 }
 
@@ -834,6 +894,9 @@ impl PeerDirectory {
             addresses: self
                 .addresses
                 .iter()
+                // a link forwarder's port is picked at each start, so it
+                // means nothing to the next one
+                .filter(|(_, record)| record.link.is_none())
                 .filter(|(_, record)| {
                     record.explicit || matches!(record.binding, AddressBinding::Machine { .. })
                 })
@@ -873,8 +936,8 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
 
     use super::{
-        AddressBinding, LocalMachine, NameError, NameTarget, PeerDirectory, Reachability,
-        RouteError, Sighting, SightingProvider,
+        AddressBinding, ConfiguredAddress, LocalMachine, NameError, NameTarget, PeerDirectory,
+        Reachability, RouteError, Sighting, SightingProvider,
     };
     use crate::fleet::address::{AddressSource, MachineAddress};
     use crate::fleet::advertisement::{
@@ -899,6 +962,17 @@ mod tests {
 
     fn addr(raw: &str) -> MachineAddress {
         raw.parse().unwrap()
+    }
+
+    /// Plain HTTP addresses, each the only transport of its entry
+    fn configured(raws: &[&str]) -> Vec<ConfiguredAddress> {
+        raws.iter()
+            .map(|raw| ConfiguredAddress {
+                address: addr(raw),
+                position: 0,
+                link: None,
+            })
+            .collect()
     }
 
     fn probed(machine: MachineId, boot: BootId, name: &str) -> ProbedMachine {
@@ -937,7 +1011,7 @@ mod tests {
         let mut dir = PeerDirectory::new(local());
         let machine = MachineId::new();
         let boot = BootId::new();
-        dir.set_configured(&[addr("http://code:7677")]);
+        dir.set_configured(&configured(&["http://code:7677"]), BTreeSet::new());
         let later = now + Duration::seconds(60);
         dir.record_sighting(sighting(
             "http://100.64.0.2:7677",
@@ -971,6 +1045,87 @@ mod tests {
             ]
         );
         assert_eq!(dir.peers(now).len(), 1);
+    }
+
+    #[test]
+    fn configured_transports_keep_their_order_and_link_only_peers_skip_http() {
+        let now = Utc::now();
+        let dir_path = tempfile::tempdir().unwrap();
+        let path = dir_path.path().join("fleet-peers.json");
+        let local = local();
+        let mut dir = PeerDirectory::new(local.clone());
+        let machine = MachineId::new();
+        let boot = BootId::new();
+        let endpoint = iroh::SecretKey::generate().public();
+        let link = ConfiguredAddress {
+            address: addr("http://127.0.0.1:41000"),
+            position: 0,
+            link: Some(endpoint),
+        };
+        let http = ConfiguredAddress {
+            address: addr("http://code:7677"),
+            position: 1,
+            link: None,
+        };
+        // iroh first, then HTTP, then what discovery found
+        dir.set_configured(&[http.clone(), link.clone()], BTreeSet::new());
+        dir.record_sighting(sighting(
+            "http://10.0.0.2:7677",
+            SightingProvider::Mdns,
+            now + Duration::seconds(60),
+        ));
+        for raw in [
+            "http://10.0.0.2:7677",
+            "http://code:7677",
+            "http://127.0.0.1:41000",
+        ] {
+            dir.record_probe(&addr(raw), &probed(machine, boot, "code"), now);
+        }
+        let order = |dir: &PeerDirectory| -> Vec<String> {
+            dir.route(machine, now).map_or_else(
+                |_| Vec::new(),
+                |plan| {
+                    plan.addresses
+                        .iter()
+                        .map(|ranked| ranked.address.to_string())
+                        .collect()
+                },
+            )
+        };
+        assert_eq!(
+            order(&dir),
+            vec![
+                "http://127.0.0.1:41000",
+                "http://code:7677",
+                "http://10.0.0.2:7677"
+            ]
+        );
+        let peer = dir.peer(machine, now).unwrap();
+        assert_eq!(peer.iroh, Some(endpoint));
+        assert_eq!(peer.addresses[0].iroh, Some(endpoint));
+        assert_eq!(peer.addresses[1].iroh, None);
+
+        // an entry without http routes its machine over the link alone
+        dir.set_configured(std::slice::from_ref(&link), BTreeSet::from([endpoint]));
+        assert_eq!(order(&dir), vec!["http://127.0.0.1:41000"]);
+
+        // the forwarder's port means nothing after a restart, but the
+        // machine's endpoint does: until the new forwarder answers, the
+        // machine has no route rather than an HTTP one
+        dir.save(&path).unwrap();
+        let mut restarted = PeerDirectory::load(local, &path).unwrap();
+        assert!(restarted.binding(&link.address).is_none());
+        restarted.set_configured(&[], BTreeSet::from([endpoint]));
+        assert!(matches!(
+            restarted.route(machine, now),
+            Err(RouteError::NoAddress(_))
+        ));
+        restarted.set_configured(&[], BTreeSet::new());
+        assert_eq!(
+            restarted.route(machine, now).unwrap().addresses.len(),
+            2,
+            "without link_only the cached HTTP addresses route again"
+        );
     }
 
     #[test]
@@ -1029,7 +1184,14 @@ mod tests {
         let local = local();
         let mut dir = PeerDirectory::new(local.clone());
         let address = addr("http://10.0.0.1:7677");
-        dir.set_configured(std::slice::from_ref(&address));
+        dir.set_configured(
+            &[ConfiguredAddress {
+                address: address.clone(),
+                position: 0,
+                link: None,
+            }],
+            BTreeSet::new(),
+        );
         dir.record_probe(
             &address,
             &probed(local.identity.machine, local.identity.boot, "main"),
@@ -1184,7 +1346,7 @@ mod tests {
         let local = local();
         let mut peers = PeerDirectory::new(local.clone());
         let machine = MachineId::new();
-        peers.set_configured(&[addr("http://configured:7677")]);
+        peers.set_configured(&configured(&["http://configured:7677"]), BTreeSet::new());
         peers.add_explicit(addr("http://explicit:7677"));
         peers.record_sighting(sighting(
             "http://10.0.0.5:7677",
@@ -1229,7 +1391,7 @@ mod tests {
         let now = Utc::now();
         let later = now + Duration::seconds(60);
         let mut dir = PeerDirectory::new(local());
-        dir.set_configured(&[addr("http://code:7677")]);
+        dir.set_configured(&configured(&["http://code:7677"]), BTreeSet::new());
         dir.record_sighting(sighting(
             "http://100.64.0.3:7677",
             SightingProvider::Tailscale,
@@ -1268,7 +1430,7 @@ mod tests {
         let now = Utc::now();
         let mut dir = PeerDirectory::new(local());
         let machine = MachineId::new();
-        dir.set_configured(&[addr("http://code:7677")]);
+        dir.set_configured(&configured(&["http://code:7677"]), BTreeSet::new());
         dir.add_explicit(addr("http://10.0.0.2:7677"));
         dir.record_probe(
             &addr("http://code:7677"),

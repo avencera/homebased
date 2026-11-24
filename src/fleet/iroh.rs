@@ -4,8 +4,8 @@
 //! state directory, is its identity on the link. Peers are authorized by
 //! endpoint id, and each Fleet call is one HTTP/1 exchange on its own QUIC
 //! stream, so the Fleet API is the same as over plain HTTP; see
-//! `daemon::fleet_link`. Today only a pool's coordinator and its temporary
-//! machines use it; the rest of the Fleet stays on plain HTTP
+//! `daemon::fleet_link`. Fleet machines opt in per peer with an `iroh`
+//! transport in `[[fleet.machines]]`; pools' temporary machines always use it
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -111,7 +111,7 @@ impl fmt::Display for Relays {
 ///
 /// None of it is secret. With n0's relays, the id alone is enough once the
 /// addresses are stale
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LinkAddr {
     /// The daemon's endpoint id, its public key
     pub id: EndpointId,

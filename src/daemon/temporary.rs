@@ -167,7 +167,9 @@ async fn dial_coordinator(
     let hub = config.hub.endpoint_addr();
     link.grant(hub.id, Grant::Peer);
     let address = link.forward_to(hub.id, config.link_listen).await?;
-    link.dial(state, hub);
+    // a machine reconnects promptly so it delivers what it owes while its
+    // lease still runs
+    link.dial(state, hub, super::fleet_link::RECONNECT);
     Ok(address)
 }
 

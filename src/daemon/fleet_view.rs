@@ -149,7 +149,13 @@ fn peer_view(peer: &PeerView) -> ViewMachine {
         name: peer.name.clone(),
         version: peer.version.clone(),
         location: MachineLocation::Peer {
-            address: peer.addresses.first().map(|ranked| ranked.address.clone()),
+            // a link forwarder is on this daemon's loopback, which a browser
+            // elsewhere cannot reach
+            address: peer
+                .addresses
+                .iter()
+                .find(|ranked| ranked.iroh.is_none())
+                .map(|ranked| ranked.address.clone()),
             dashboard_url: peer.dashboard_url.clone(),
         },
     }

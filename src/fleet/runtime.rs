@@ -5,24 +5,25 @@
 //! cluster code routes work through [`FleetHandle::connect`], which resolves a
 //! machine UUID through the directory and confirms identity before use
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use iroh::EndpointId;
 use serde::Serialize;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Discovery, FleetSettings};
+use crate::config::{Discovery, FleetSettings, MachineTransport};
 use crate::error::AppError;
 use crate::fleet::address::{DashboardUrl, MachineAddress};
 use crate::fleet::advertisement::{Capabilities, MachineAdvertisement, ProbedMachine};
 use crate::fleet::directory::{
-    LocalMachine, NameTarget, PeerDirectory, PeerView, UnresolvedAddress,
+    ConfiguredAddress, LocalMachine, NameTarget, PeerDirectory, PeerView, UnresolvedAddress,
 };
 use crate::fleet::discovery::mdns::{MdnsAnnouncement, MdnsProvider, MdnsTimings};
 use crate::fleet::discovery::tailscale::{TailscaleProvider, TailscaleTimings};
@@ -83,6 +84,10 @@ pub struct FleetStart {
     pub local: LocalMachine,
     /// Enabled fleet settings
     pub settings: FleetSettings,
+    /// Loopback forwarder onto the Fleet link for each endpoint id an entry
+    /// of `settings.machines` names; an entry's iroh transport without one
+    /// is left out
+    pub link_forwarders: BTreeMap<EndpointId, MachineAddress>,
     /// Address the TCP listener bound, or `None` when it is off. Without it
     /// the machine can discover peers but peers cannot reach it
     pub listener: Option<SocketAddr>,
@@ -131,13 +136,15 @@ impl FleetRuntime {
         let FleetStart {
             local,
             settings,
+            link_forwarders,
             listener,
             peers_path,
             dashboard_url,
             timings,
         } = start;
         let mut directory = PeerDirectory::load(local.clone(), &peers_path)?;
-        directory.set_configured(&settings.machines);
+        let (configured, link_only) = configured_addresses(&settings, &link_forwarders);
+        directory.set_configured(&configured, link_only);
         let advertisement = MachineAdvertisement {
             api_version: crate::domain::API_VERSION,
             machine: local.identity.machine,
@@ -196,6 +203,42 @@ impl FleetRuntime {
         }
         self.handle.persist().await;
     }
+}
+
+/// The addresses `config.toml` declares, each at its position in its
+/// entry's transports, and the endpoint ids whose entry leaves out HTTP
+fn configured_addresses(
+    settings: &FleetSettings,
+    link_forwarders: &BTreeMap<EndpointId, MachineAddress>,
+) -> (Vec<ConfiguredAddress>, BTreeSet<EndpointId>) {
+    let mut configured = Vec::new();
+    let mut link_only = BTreeSet::new();
+    for machine in &settings.machines {
+        if let (None, Some(link)) = (machine.http_address(), machine.iroh()) {
+            link_only.insert(link.id);
+        }
+        for (position, transport) in machine.transports().iter().enumerate() {
+            let address = match transport {
+                MachineTransport::Http(address) => ConfiguredAddress {
+                    address: address.clone(),
+                    position,
+                    link: None,
+                },
+                MachineTransport::Iroh(link) => {
+                    let Some(forwarder) = link_forwarders.get(&link.id) else {
+                        continue;
+                    };
+                    ConfiguredAddress {
+                        address: forwarder.clone(),
+                        position,
+                        link: Some(link.id),
+                    }
+                }
+            };
+            configured.push(address);
+        }
+    }
+    (configured, link_only)
 }
 
 fn start_providers(

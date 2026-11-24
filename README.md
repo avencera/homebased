@@ -106,4 +106,4 @@ homebased service start --name api --port 8787 -- pnpm dev
 
 ## Security
 
-Fleet and the dashboard use plain HTTP with no login. Anyone who can reach the listener can run work and read any file the daemon's user can read. Keep it on a trusted LAN or tailnet. The listener is off until you turn it on; see [Install and configure](docs/install.md#listener-for-fleet-and-the-dashboard).
+Fleet and the dashboard use plain HTTP with no login. Anyone who can reach the listener can run work and read any file the daemon's user can read. Keep it on a trusted LAN or tailnet, or move Fleet peers to the authenticated [iroh link](docs/fleet.md#iroh-link) and keep the listener on loopback. The listener is off until you turn it on; see [Install and configure](docs/install.md#listener-for-fleet-and-the-dashboard).

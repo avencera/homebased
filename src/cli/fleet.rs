@@ -29,6 +29,12 @@ pub enum FleetCommand {
     Add { address: MachineAddress },
     /// Remove one explicit address or forget one machine.
     Remove { machine_or_address: String },
+    /// Print this installation's endpoint id on the iroh Fleet link.
+    ///
+    /// Makes the key on first use, so peers can list the id before
+    /// `[fleet.iroh]` is turned on here. Reads the state directory, not the
+    /// daemon.
+    EndpointId,
 }
 
 /// Run one fleet command.
@@ -87,6 +93,8 @@ pub async fn run(ctx: &Ctx, command: FleetCommand) -> Result<ExitCode, AppError>
             )?;
             serde_json::to_value(body)?
         }
+        // the key file, not the daemon, holds the id
+        FleetCommand::EndpointId => return endpoint_id(ctx),
         FleetCommand::Remove { machine_or_address } => {
             let target = if machine_or_address.starts_with("http://")
                 || machine_or_address.parse::<MachineId>().is_ok()
@@ -114,6 +122,19 @@ pub async fn run(ctx: &Ctx, command: FleetCommand) -> Result<ExitCode, AppError>
         OutputMode::Human | OutputMode::Quiet => {
             println!("{}", serde_json::to_string_pretty(&value)?)
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn endpoint_id(ctx: &Ctx) -> Result<ExitCode, AppError> {
+    ctx.home.ensure()?;
+    let endpoint = crate::daemon::fleet_link::endpoint_id(&ctx.home)?;
+    match ctx.output {
+        OutputMode::Json => ctx.print_json(json!({
+            "api_version": API_VERSION,
+            "endpoint_id": endpoint,
+        }))?,
+        OutputMode::Human | OutputMode::Quiet => println!("{endpoint}"),
     }
     Ok(ExitCode::SUCCESS)
 }
