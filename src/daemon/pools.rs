@@ -8,7 +8,7 @@
 //! CI queue's; this loop only makes and removes the machines it places on.
 //! See `docs/temporary-machines.md`
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -347,20 +347,6 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
             Ok(true)
         }
     }
-}
-
-/// Every machine that joined the pool a CI job's class names
-pub(super) async fn pool_members(
-    state: &AppState,
-    ci: &CiSpec,
-) -> Result<BTreeSet<crate::machine::MachineId>, AppError> {
-    let pool = PoolName::from_class(ci.class.clone());
-    let machines = call(&state.store, |reply| StoreMsg::PoolMachines { pool, reply }).await?;
-    Ok(machines
-        .iter()
-        .filter_map(|machine| machine.state.joined())
-        .map(|joined| joined.machine)
-        .collect())
 }
 
 /// `POST /v1/cluster/pool/join` over the Fleet link: a temporary machine
@@ -766,7 +752,9 @@ impl Pass<'_> {
                     reason,
                 };
             }
+            // a create whose answer was lost, which the provider took
             (Some(lease), MachineState::Requested) => {
+                pool.create_succeeded();
                 machine.state = MachineState::Booting {
                     lease: machine_lease(lease),
                 };
@@ -1186,7 +1174,7 @@ impl Pass<'_> {
                 message: end.job_message(&pool.name),
             };
             let _guard = self.state.locks.job_submissions.lock(job).await;
-            call(&self.state.store, |reply| StoreMsg::EndHeldJob {
+            call(&self.state.store, |reply| StoreMsg::EndPoolJob {
                 job,
                 ending,
                 reply,

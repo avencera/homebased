@@ -19,7 +19,7 @@ homebased wait --next "$job"
 - `--after <task-or-job>` holds the job until those succeed.
 - `--keep <path>` keeps an untracked path through the clean before each run. Ignored files such as `target/` are always kept, so each slot's clone stays warm.
 
-Submit fails with `class_not_offered` when no reachable machine it may use offers the class, unless the class is an open pool's: its machines are created on demand ([pools.md](pools.md)). `homebased ci slots` lists what each machine offers.
+Submit fails with `class_not_offered` when no reachable machine it may use offers the class, unless the class is an open pool's: its machines are created on demand ([pools.md](pools.md)). A stopped or releasing pool refuses its class with `pool_ended`, which names why, even when another machine offers it. `homebased ci slots` lists what each machine offers.
 
 The run sees `HOMEBASED_RESOURCE` set to its slot, such as `rust-3`, and `HOMEBASED_JOB_ID`. Use the slot name to keep per-slot ports or emulators apart.
 

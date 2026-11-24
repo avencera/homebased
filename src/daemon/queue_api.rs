@@ -439,6 +439,18 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
             Ok(value)
         }
         Err(error) => {
+            // a machine that closed the class after placement read its offer,
+            // as an idle temporary machine does before it releases itself,
+            // leaves the job to another machine
+            if error.code() == "class_not_offered" {
+                let job = route.job;
+                let held =
+                    call(&state.store, |reply| StoreMsg::UnplaceCiJob { job, reply }).await?;
+                if held {
+                    tracing::info!(%job, machine = %route.authority, "CI job held again: its machine closed the class");
+                    return Err(error);
+                }
+            }
             if matches!(route.submission, JobSubmission::Unknown) && definite_refusal(&error) {
                 let refusal = JobRefusal {
                     code: error.code().to_owned(),

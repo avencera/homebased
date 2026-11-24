@@ -26,7 +26,7 @@ homebased ci run --class rust --repo git@github.com:me/app.git --commit "$sha" -
 
 | Flag | Meaning |
 | --- | --- |
-| `--class` | Class of slot the job needs. Submit fails with `class_not_offered` when no reachable machine it may use offers the class, unless it is an open [pool](temporary-machines.md)'s class |
+| `--class` | Class of slot the job needs. Submit fails with `class_not_offered` when no reachable machine it may use offers the class, unless it is an open [pool](temporary-machines.md)'s class. A pool that stopped or is releasing refuses its class with `pool_ended`, even when another machine offers the class |
 | `--machine` | Run only on this machine. Without it, any machine that offers the class |
 | `--priority` | `high`, `medium` (default), or `low` |
 | `--kill-after` | Hard limit on the run, from `1s` to `24h`, default `1h` |
@@ -42,7 +42,7 @@ A job waits on the machine that submitted it until a machine that offers its cla
 
 ### Placement
 
-Each second, the submitting machine reads every reachable machine's offer: whether it admits CI runs, its load and free disk, per class its slots, busy slots, and queued jobs, and for a [temporary machine](temporary-machines.md) when cloudlease deletes it. A job never goes to a temporary machine that ends before the job's `--kill-after` would. It walks its waiting jobs by priority, then by submit time, and sends each to an open machine with a free slot of the class, choosing the lowest load per core, then the most free slots. A job with no free slot anywhere keeps waiting, so it goes to whichever machine frees a slot first.
+Each second, the submitting machine reads every reachable machine's offer: whether it admits CI runs, its load and free disk, per class its slots, busy slots, and queued jobs, and for a [temporary machine](temporary-machines.md) when cloudlease deletes it. A job never goes to a temporary machine that ends before the job's `--kill-after` would. It walks its waiting jobs by priority, then by submit time, and sends each to an open machine with a free slot of the class, choosing the lowest load per core, then the most free slots. A job with no free slot anywhere keeps waiting, so it goes to whichever machine frees a slot first. A machine that stopped offering the class before the job reached it, such as a temporary machine closing its class to release, refuses it, and the job waits for the next pass instead of failing.
 
 ### Checkouts
 

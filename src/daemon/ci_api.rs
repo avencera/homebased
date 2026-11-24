@@ -5,8 +5,6 @@
 //! loop reads every machine's offer and sends ready jobs to the machines
 //! [`place`] picks. See `docs/ci-queue-design.md`
 
-use std::collections::BTreeSet;
-
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -126,37 +124,30 @@ pub(super) async fn check_offered(
     let Some(ci) = &spec.ci else {
         return Ok(());
     };
-    // a pool's class is offered by machines it creates on demand; a pool
-    // that refuses the job still leaves any other machine offering the class
+    // a pool's class is offered by machines it creates on demand. A pool
+    // that is not released owns its class: it fails the class's held jobs
+    // as it ends, so its refusal stands even if another machine offers it
     let pool = match choice {
-        MachineChoice::Any => super::pools::admit_pool_job(state, ci).await,
-        MachineChoice::Pinned(_) => Ok(false),
+        MachineChoice::Any => super::pools::admit_pool_job(state, ci).await?,
+        MachineChoice::Pinned(_) => false,
     };
-    if matches!(pool, Ok(true)) {
+    if pool {
         return Ok(());
     }
-    // the refusing pool's own machines do not count as other machines
-    let members = match &pool {
-        Err(_) => super::pools::pool_members(state, ci).await?,
-        Ok(_) => BTreeSet::new(),
-    };
     let scope = match choice {
         MachineChoice::Any => Scope::All,
         MachineChoice::Pinned(machine) => Scope::One(machine),
     };
     let (_, statuses) = fleet_status(state, scope).await?;
     let offered = |status: &CiStatus| {
-        !members.contains(&status.offer.machine)
-            && status
-                .offer
-                .class(&ci.class)
-                .is_some_and(|offer| offer.capacity.get() > 0)
+        status
+            .offer
+            .class(&ci.class)
+            .is_some_and(|offer| offer.capacity.get() > 0)
     };
     if statuses.iter().any(offered) {
         return Ok(());
     }
-    // no other machine offers it, so the pool's refusal says why
-    pool?;
     let mut classes: Vec<JobClass> = statuses
         .iter()
         .flat_map(|status| status.offer.classes.iter())

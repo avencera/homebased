@@ -175,6 +175,30 @@ impl Store {
         })
     }
 
+    /// Hold a placed CI job for placement again, after the machine it was
+    /// sent to answered that it does not offer the class now
+    ///
+    /// That answer means the machine stored nothing, since it answers a job
+    /// id it already has with the job, so another machine may take it. Only
+    /// a job that may run on any machine is held again; `false` otherwise
+    pub fn unplace_ci_job(&self, job: JobId) -> Result<bool, AppError> {
+        self.immediate(|| {
+            let Some(mut route) = self.job_route(job)? else {
+                return Ok(false);
+            };
+            let placed = matches!(route.submission, JobSubmission::Unknown)
+                && route.spec.ci.is_some()
+                && route.spec.machine.is_none();
+            if !placed {
+                return Ok(false);
+            }
+            route.authority = route.origin;
+            route.submission = JobSubmission::Held;
+            self.save_route(&route)?;
+            Ok(true)
+        })
+    }
+
     /// Change where and at what level a CI job held for placement may run
     ///
     /// `authority` is the pinned machine, or the origin when any machine may
@@ -235,6 +259,21 @@ impl Store {
     /// that the authority refused. Anything else returns `false`
     pub fn end_held_job(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
         self.immediate(|| self.end_held_job_inner(job, ending))
+    }
+
+    /// End a CI job its pool still holds for placement, with why the pool
+    /// ended; a job placement sent to a machine meanwhile is that machine's
+    /// to run or refuse, so it is left alone
+    pub fn end_pool_job(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
+        self.immediate(|| {
+            let held = self
+                .job_route(job)?
+                .is_some_and(|route| matches!(route.submission, JobSubmission::Held));
+            if !held {
+                return Ok(false);
+            }
+            self.end_held_job_inner(job, ending)
+        })
     }
 
     /// Record the authority's definite refusal of a sent route

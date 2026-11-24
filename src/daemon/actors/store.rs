@@ -160,6 +160,17 @@ pub(crate) enum StoreMsg {
         authority: MachineId,
         reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
     },
+    /// End a CI job its pool still holds, as the pool ends
+    EndPoolJob {
+        job: crate::queue::JobId,
+        ending: crate::queue::delivery::HeldJobEnding,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Hold a placed CI job for placement again
+    UnplaceCiJob {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
     /// Change a held CI job's machine choice or level
     MoveHeldCiJob {
         job: crate::queue::JobId,
@@ -1121,6 +1132,10 @@ impl Actor for StoreActor {
                 authority,
                 reply,
             } => send_reply(reply, state.place_held_job(job, authority)),
+            StoreMsg::UnplaceCiJob { job, reply } => send_reply(reply, state.unplace_ci_job(job)),
+            StoreMsg::EndPoolJob { job, ending, reply } => {
+                send_reply(reply, state.end_pool_job(job, ending));
+            }
             StoreMsg::MoveHeldCiJob {
                 job,
                 machine,
