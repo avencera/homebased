@@ -65,7 +65,7 @@ max_load_per_core = 3.0       # default 3.0
 min_free_disk_gib = 10        # default 10
 ```
 
-A slot's clone stays between runs, so a later job on the slot fetches only what it lacks and keeps ignored build output such as `target/`. Retention removes a clone whose slot has had no run for `retention.ci.max_age` (default 7 days), and the next job on that slot clones again; see the README's Retention section.
+A slot's clone stays between runs, so a later job on the slot fetches only what it lacks and keeps ignored build output such as `target/`. Retention removes a clone whose slot has had no run for `retention.ci.max_age` (default 7 days), and the next job on that slot clones again; see [Retention](retention.md).
 
 ## Drain a machine
 
