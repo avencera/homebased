@@ -42,12 +42,32 @@ pub const DEFAULT_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 /// Time without output after which running work no longer keeps a machine, by default
 pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// Time from create to join after which a machine is released, by default
+/// How long before cloudlease's boot grace ends a machine that has not
+/// joined is released, at most; a grace shorter than four of these keeps a
+/// quarter of itself instead
 ///
-/// Inside cloudlease's boot grace, 8 minutes by default, which deletes a
-/// machine that has not renewed by then: a machine renews only once it
-/// joined, so the coordinator releases it first, with `boot_timeout`
-pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(7 * 60);
+/// A machine renews only once it joined, so cloudlease deletes it at the end
+/// of the grace anyway; releasing it first records `boot_timeout` as the
+/// reason rather than `heartbeat_lapsed`
+pub const BOOT_GRACE_MARGIN: Duration = Duration::from_secs(60);
+
+/// cloudlease's boot grace when no lease of the pool has shown its own yet:
+/// cloudlease's default, 8 minutes
+pub const ASSUMED_BOOT_GRACE: Duration = Duration::from_secs(8 * 60);
+
+/// Free disk, in GiB, below which a pool machine admits no CI run, by default
+///
+/// Lower than a Fleet machine's 10 GiB: a pool machine is fresh and runs only
+/// its pool's jobs, so its class's disk decides what fits, and a small
+/// machine must still take work
+pub const DEFAULT_MIN_FREE_DISK_GIB: u64 = 1;
+
+/// Time from a lease's create to the release of its machine if it has not
+/// joined, for a boot grace of `grace`
+#[must_use]
+pub fn boot_timeout_within(grace: Duration) -> Duration {
+    grace.saturating_sub(BOOT_GRACE_MARGIN.min(grace / 4))
+}
 
 /// Machines in a row the provider could not create before a pool stops
 /// asking, so a broken class or region never turns into a create loop
@@ -305,9 +325,17 @@ pub struct PoolSettings {
     /// Running work with no output for this long no longer renews the lease
     #[serde(with = "humantime_serde")]
     pub stall_after: Duration,
-    /// A machine that has not joined this long after its create is released
-    #[serde(with = "humantime_serde")]
-    pub boot_timeout: Duration,
+    /// A machine that has not joined this long after its create is
+    /// released; without it, shortly before cloudlease's boot grace ends,
+    /// which each lease shows in its first `heartbeat_deadline_at`
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub boot_timeout: Option<Duration>,
+    /// Free disk, in GiB, below which a machine of the pool admits no CI run
+    pub min_free_disk_gib: u64,
     /// File on the coordinator of `NAME=value` lines each machine's runs
     /// get, read again at each join; never stored or sent to cloudlease
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +344,27 @@ pub struct PoolSettings {
     /// cap when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_cap_cents: Option<NonZeroU32>,
+}
+
+impl PoolSettings {
+    /// When a machine of `lease` that has not joined is released
+    #[must_use]
+    pub fn boot_released_at(&self, lease: &MachineLease) -> DateTime<Utc> {
+        let timeout = self
+            .boot_timeout
+            .unwrap_or_else(|| boot_timeout_within(lease.boot_grace()));
+        lease.created_at + chrono::Duration::from_std(timeout).unwrap_or_default()
+    }
+}
+
+/// Why cloudlease ended a pool's run that the coordinator did not release
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEndCause {
+    /// Its machines reached the run's spend cap
+    SpendCap,
+    /// Someone else released it, such as an operator of cloudlease
+    Released,
 }
 
 /// Why a pool stopped taking machines
@@ -338,6 +387,12 @@ pub enum PoolEnd {
         /// Failed creates in a row
         failures: u32,
     },
+    /// cloudlease ended the pool's run before its deadline, without this
+    /// coordinator asking
+    RunEnded {
+        /// Why, as far as the run's leases tell
+        cause: RunEndCause,
+    },
 }
 
 impl PoolEnd {
@@ -349,6 +404,7 @@ impl PoolEnd {
             Self::Deadline => "pool_deadline",
             Self::Refused { code, .. } => code,
             Self::CreateFailed { .. } => "create_failed",
+            Self::RunEnded { .. } => "run_ended",
         }
     }
 
@@ -366,6 +422,14 @@ impl PoolEnd {
             Self::CreateFailed { failures } => {
                 format!("the provider could not create {failures} machines of pool {pool} in a row")
             }
+            Self::RunEnded {
+                cause: RunEndCause::SpendCap,
+            } => format!("cloudlease ended pool {pool}'s run: it reached its spend cap"),
+            Self::RunEnded {
+                cause: RunEndCause::Released,
+            } => format!(
+                "cloudlease ended pool {pool}'s run before its deadline, without its coordinator asking"
+            ),
         }
     }
 }
@@ -561,6 +625,19 @@ pub struct MachineLease {
     pub hard_deadline_at: DateTime<Utc>,
     /// When cloudlease created the lease
     pub created_at: DateTime<Utc>,
+    /// When cloudlease's boot grace ends: the lease's first
+    /// `heartbeat_deadline_at`, before the machine ever renewed
+    pub boot_deadline_at: DateTime<Utc>,
+}
+
+impl MachineLease {
+    /// cloudlease's boot grace for this lease
+    #[must_use]
+    pub fn boot_grace(&self) -> Duration {
+        (self.boot_deadline_at - self.created_at)
+            .to_std()
+            .unwrap_or_default()
+    }
 }
 
 /// A machine as the Fleet knows it once it joined
@@ -685,6 +762,117 @@ pub struct PoolMachine {
     /// Where it is in its life
     #[serde(flatten)]
     pub state: MachineState,
+}
+
+/// Which jobs a pool's machines can still run to their kill limit, as of one
+/// moment
+///
+/// cloudlease deletes every machine of the pool by the pool's deadline, or
+/// sooner when the machine class has a shorter lifetime, and placement sends
+/// a job only to a machine that outlives the job's kill limit. Time only
+/// takes reach away, so a job out of reach now never runs on the pool
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolReach {
+    now: DateTime<Utc>,
+    /// The latest hard deadline of a machine that is booting or joined
+    live_until: Option<DateTime<Utc>>,
+    /// A machine asked for now: when it has joined at the latest, and when
+    /// cloudlease deletes it; `None` once the pool asks for no machines
+    new_machine: Option<NewMachine>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NewMachine {
+    joined_by: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
+}
+
+impl PoolReach {
+    /// Reach of `pool` with `machines`, every one it has had, at `now`
+    #[must_use]
+    pub fn new(pool: &Pool, machines: &[PoolMachine], now: DateTime<Utc>) -> Self {
+        let live_until = machines
+            .iter()
+            .filter_map(|machine| match &machine.state {
+                MachineState::Booting { lease } | MachineState::Joined { lease, .. } => {
+                    Some(lease.hard_deadline_at)
+                }
+                _ => None,
+            })
+            .max();
+        let new_machine = matches!(pool.state, PoolState::Open).then(|| {
+            let deadline = pool.settings.deadline_at;
+            let leases: Vec<&MachineLease> = machines
+                .iter()
+                .filter_map(|machine| machine.state.lease())
+                .collect();
+            // every lease of the pool has the same grace and class lifetime,
+            // so the newest one tells; before any, cloudlease's defaults
+            let grace = leases
+                .iter()
+                .max_by_key(|lease| lease.created_at)
+                .map_or(ASSUMED_BOOT_GRACE, |lease| lease.boot_grace());
+            let join_within = pool
+                .settings
+                .boot_timeout
+                .unwrap_or_else(|| boot_timeout_within(grace));
+            // a lease that ends before the pool's deadline shows the class's
+            // own lifetime, which every later machine gets too
+            let class_lifetime = leases
+                .iter()
+                .filter(|lease| lease.hard_deadline_at < deadline)
+                .map(|lease| lease.hard_deadline_at - lease.created_at)
+                .min();
+            NewMachine {
+                joined_by: now + chrono::Duration::from_std(join_within).unwrap_or_default(),
+                ends_at: class_lifetime.map_or(deadline, |lifetime| (now + lifetime).min(deadline)),
+            }
+        });
+        Self {
+            now,
+            live_until,
+            new_machine,
+        }
+    }
+
+    /// Whether a job with kill limit `kill` can still run on some machine of
+    /// the pool: one it has, if a slot frees in time, or one it may ask for
+    #[must_use]
+    pub fn can_run(&self, kill: Duration) -> bool {
+        let fits_live = self
+            .live_until
+            .is_some_and(|until| ends_by(self.now, kill, until));
+        fits_live || self.new_machine_can_run(kill)
+    }
+
+    /// Whether a machine asked for now could run a job with kill limit
+    /// `kill` once it joined
+    #[must_use]
+    pub fn new_machine_can_run(&self, kill: Duration) -> bool {
+        self.new_machine
+            .is_some_and(|machine| ends_by(machine.joined_by, kill, machine.ends_at))
+    }
+
+    /// The longest kill limit a job could have now and still run, for error
+    /// messages
+    #[must_use]
+    pub fn longest_kill(&self) -> Duration {
+        let live = self.live_until.map(|until| until - self.now);
+        let new = self
+            .new_machine
+            .map(|machine| machine.ends_at - machine.joined_by);
+        live.max(new)
+            .and_then(|span| span.to_std().ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Whether a run started at `start` and killed after `kill` ends by `until`
+fn ends_by(start: DateTime<Utc>, kill: Duration, until: DateTime<Utc>) -> bool {
+    chrono::Duration::from_std(kill)
+        .ok()
+        .and_then(|kill| start.checked_add_signed(kill))
+        .is_some_and(|end| end <= until)
 }
 
 /// Why a job ended with its machine: carried by the `JOB_FAILED` its origin
@@ -822,6 +1010,109 @@ mod tests {
         assert!(parse_env_file("HOMEBASED_HOME=/x").is_err());
         assert!(parse_env_file("1BAD=x").is_err());
         assert!(parse_env_file("novalue").is_err());
+    }
+
+    fn test_pool(deadline_at: DateTime<Utc>, boot_timeout: Option<Duration>) -> Pool {
+        Pool {
+            name: "afv".parse().unwrap(),
+            settings: PoolSettings {
+                machine_class: "do-c16".parse().unwrap(),
+                max_machines: 4,
+                deadline_at,
+                slots: SlotCapacity::default(),
+                idle_limit: DEFAULT_IDLE_LIMIT,
+                stall_after: DEFAULT_STALL_AFTER,
+                boot_timeout,
+                min_free_disk_gib: DEFAULT_MIN_FREE_DISK_GIB,
+                env_file: None,
+                spend_cap_cents: None,
+            },
+            run_request: Uuid::now_v7(),
+            run: None,
+            state: PoolState::Open,
+            created_at: deadline_at - chrono::Duration::hours(6),
+            last_error: None,
+            create_failures: None,
+        }
+    }
+
+    fn booting(pool: &Pool, created_at: DateTime<Utc>, grace: i64, life: i64) -> PoolMachine {
+        let slot = SlotId::new();
+        PoolMachine {
+            slot,
+            pool: pool.name.clone(),
+            name: pool.name.machine_name(slot),
+            join_token: JoinToken::new("t".into()).hash(),
+            requested_at: created_at,
+            state: MachineState::Booting {
+                lease: MachineLease {
+                    lease: LeaseId::new("lease"),
+                    hard_deadline_at: created_at + chrono::Duration::minutes(life),
+                    created_at,
+                    boot_deadline_at: created_at + chrono::Duration::minutes(grace),
+                },
+            },
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn reach_counts_a_new_machines_boot_and_learns_grace_and_class_lifetime() {
+        let now = Utc::now();
+        let pool = test_pool(now + chrono::Duration::hours(1), None);
+
+        // before any lease: cloudlease's default 8 minute grace, released at 7
+        let reach = PoolReach::new(&pool, &[], now);
+        assert!(reach.can_run(53 * MINUTE));
+        assert!(!reach.can_run(54 * MINUTE));
+        assert_eq!(reach.longest_kill(), 53 * MINUTE);
+
+        // a phoenixNAP lease shows a 20 minute grace; it is released at 19
+        let mut released = booting(&pool, now - chrono::Duration::hours(1), 20, 600);
+        released.state = MachineState::Released {
+            lease: released.state.lease().cloned(),
+            joined: None,
+            reason: ReleaseReason::Idle,
+            gone_at: now,
+        };
+        let reach = PoolReach::new(&pool, std::slice::from_ref(&released), now);
+        assert!(reach.new_machine_can_run(41 * MINUTE));
+        assert!(!reach.new_machine_can_run(42 * MINUTE));
+
+        // a class whose machines live 30 minutes caps every new machine, but
+        // a booting machine still offers what is left of its own life
+        let short = booting(&pool, now - chrono::Duration::minutes(5), 8, 30);
+        let reach = PoolReach::new(&pool, &[short], now);
+        assert!(!reach.new_machine_can_run(24 * MINUTE));
+        assert!(reach.new_machine_can_run(23 * MINUTE));
+        assert!(reach.can_run(25 * MINUTE));
+        assert!(!reach.can_run(26 * MINUTE));
+
+        // a stopped pool asks for no machine, so only live ones count
+        let mut stopped = test_pool(now + chrono::Duration::hours(1), Some(MINUTE));
+        stopped.stop(PoolEnd::Requested);
+        assert!(!PoolReach::new(&stopped, &[], now).can_run(MINUTE));
+    }
+
+    #[test]
+    fn boot_timeouts_stop_short_of_the_grace_unless_set() {
+        assert_eq!(boot_timeout_within(8 * MINUTE), 7 * MINUTE);
+        assert_eq!(boot_timeout_within(20 * MINUTE), 19 * MINUTE);
+        assert_eq!(boot_timeout_within(MINUTE), Duration::from_secs(45));
+        let now = Utc::now();
+        let pool = test_pool(now + chrono::Duration::hours(1), None);
+        let machine = booting(&pool, now, 20, 60);
+        let lease = machine.state.lease().unwrap();
+        assert_eq!(
+            pool.settings.boot_released_at(lease),
+            now + chrono::Duration::minutes(19)
+        );
+        let set = test_pool(now + chrono::Duration::hours(1), Some(2 * MINUTE));
+        assert_eq!(
+            set.settings.boot_released_at(lease),
+            now + chrono::Duration::minutes(2)
+        );
     }
 
     #[test]

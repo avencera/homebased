@@ -127,7 +127,10 @@ fn boot(fake: &FakeCloudlease, lease: &FakeLease) -> Daemon {
                 lease_file.display()
             ),
         );
-    fs::write(&daemon.config, format!("{config}{OPEN_ADMISSION}")).unwrap();
+    // the boot data's own `[ci]` sets the pool's disk floor; keep it, and
+    // open admission whatever the test host's load
+    let config = config.replace("\n[ci]\n", "\n[ci]\nmax_load_per_core = 1000\n");
+    fs::write(&daemon.config, config).unwrap();
     daemon.restart();
     daemon
 }
@@ -854,4 +857,295 @@ fn a_machine_whose_lease_ended_stops_taking_jobs() {
         event.machine_released.unwrap().reason.to_string(),
         "spend_cap"
     );
+}
+
+/// `ci run` of a job of `class` with `kill_after` and `extra` arguments
+/// before the command: its id and the command's output
+fn ci_run(
+    daemon: &Daemon,
+    thread: ThreadId,
+    class: &str,
+    kill_after: &str,
+    extra: &[&str],
+    script: &str,
+) -> (JobId, std::process::Output) {
+    let job = JobId::new();
+    let job_text = job.to_string();
+    let mut args = vec![
+        "ci",
+        "run",
+        "--class",
+        class,
+        "--job-id",
+        &job_text,
+        "--kill-after",
+        kill_after,
+    ];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", "/bin/sh", "-c", script]);
+    (job, cli_output(daemon, thread, &args))
+}
+
+/// The job of a `ci run`, asserting it was accepted
+fn accepted((job, output): (JobId, std::process::Output)) -> JobId {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    job
+}
+
+/// The disk floor of the first offer `ci slots` shows closed for low disk
+fn low_disk_floor(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(fields) if fields.get("state").is_some_and(|state| state == "low_disk") => {
+            fields.get("floor")?.as_u64()
+        }
+        Value::Object(fields) => fields.values().find_map(low_disk_floor),
+        Value::Array(items) => items.iter().find_map(low_disk_floor),
+        _ => None,
+    }
+}
+
+/// A task on `daemon` that sleeps `secs`, for jobs to wait on
+fn sleeper(daemon: &Daemon, thread: ThreadId, secs: u32) -> String {
+    let task = cli(
+        daemon,
+        thread,
+        &["task", "run", "--", "sleep", &secs.to_string()],
+    );
+    task["id"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_job_no_pool_machine_can_run_gets_no_machine_and_fails() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "tight",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "2",
+            "--deadline",
+            "3m",
+            "--boot-timeout",
+            "10s",
+            "--idle-limit",
+            "3s",
+        ],
+    );
+
+    // inside the deadline, but not once a new machine has booted: refused
+    let (_, late) = ci_run(&origin, thread, "tight", "2m55s", &[], "true");
+    assert!(!late.status.success());
+    let refusal =
+        String::from_utf8_lossy(&late.stderr).into_owned() + &String::from_utf8_lossy(&late.stdout);
+    assert!(refusal.contains("pool_deadline_too_close"), "{refusal}");
+
+    // a new machine could still run this job now, but it waits for a task
+    // that ends only after no machine could
+    let task = sleeper(&origin, thread, 25);
+    let job = accepted(ci_run(
+        &origin,
+        thread,
+        "tight",
+        "2m40s",
+        &["--after", &task],
+        "true",
+    ));
+    let mut machines = Machines::default();
+    assert!(
+        machines.drive(&fake, Duration::from_secs(45), || final_event(&origin, job)
+            .is_some()),
+        "the job never ended: {}\n{:?}",
+        pool(&origin, thread, "tight"),
+        fake.leases()
+    );
+    let event = final_event(&origin, job).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&event), "pool_deadline_too_close");
+    // no machine was ever asked for, so none idled out to be asked for again
+    assert!(fake.leases().is_empty(), "{:?}", fake.leases());
+    assert_eq!(pool(&origin, thread, "tight")["state"], "open");
+}
+
+#[test]
+fn a_pool_machine_admits_jobs_by_the_pools_disk_floor() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    // a floor no disk meets
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "disk",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+            "--min-free-disk",
+            "1000000000",
+        ],
+    );
+    let job = run(&origin, thread, "disk", "true");
+    let mut machines = Machines::default();
+    let mut floor = None;
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            machines.boot_new(&fake);
+            let Some(daemon) = machines_first(&fake, &machines) else {
+                return false;
+            };
+            floor = low_disk_floor(&cli(daemon, thread, &["ci", "slots"]));
+            floor.is_some()
+        }),
+        "the machine never closed admission for disk: {}",
+        pool(&origin, thread, "disk")
+    );
+    assert_eq!(floor, Some(1_000_000_000_u64 << 30));
+    assert!(final_event(&origin, job).is_none());
+    cli(&origin, thread, &["pool", "release", "disk"]);
+}
+
+/// The daemon of the pool's first lease, once it booted
+fn machines_first<'a>(fake: &FakeCloudlease, machines: &'a Machines) -> Option<&'a Daemon> {
+    let lease = fake.leases().into_iter().next()?;
+    machines.daemons.get(&lease.lease_id)
+}
+
+#[test]
+fn a_run_cloudlease_ends_outside_the_coordinator_ends_the_pool() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "capped",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "2",
+            "--deadline",
+            "1h",
+        ],
+    );
+    let started = origin.user_home.join("started");
+    let running = run(
+        &origin,
+        thread,
+        "capped",
+        &format!("touch {}; sleep 60", started.display()),
+    );
+    // a job that waits on a task asks for no machine yet
+    let task = sleeper(&origin, thread, 120);
+    let waiting = accepted(ci_run(
+        &origin,
+        thread,
+        "capped",
+        "10m",
+        &["--after", &task],
+        "true",
+    ));
+    let mut machines = Machines::default();
+    assert!(
+        machines.drive(&fake, Duration::from_secs(60), || started.exists()),
+        "the first job never started: {}",
+        pool(&origin, thread, "capped")
+    );
+
+    // the run's spend cap: cloudlease releases every lease of it
+    fake.end_runs("spend_cap");
+    assert!(
+        machines.drive(&fake, Duration::from_secs(30), || {
+            pool(&origin, thread, "capped")["state"] == "released"
+        }),
+        "the pool never ended: {}",
+        pool(&origin, thread, "capped")
+    );
+    let shown = pool(&origin, thread, "capped");
+    assert_eq!(shown["reason"], "run_ended", "{shown}");
+    assert_eq!(shown["cause"], "spend_cap", "{shown}");
+    assert_eq!(machine_states(&shown), ["released"]);
+
+    assert!(wait_until(Duration::from_secs(20), || {
+        final_event(&origin, waiting).is_some() && final_event(&origin, running).is_some()
+    }));
+    let event = final_event(&origin, waiting).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&event), "run_ended");
+    let event = final_event(&origin, running).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(
+        event.machine_released.unwrap().reason.to_string(),
+        "spend_cap"
+    );
+    assert_eq!(fake.leases().len(), 1);
+}
+
+#[test]
+fn a_machine_that_never_joins_is_released_before_its_boot_grace_ends() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    // a lease's first heartbeat deadline gives the boot grace; no flag
+    fake.set_boot_grace(Duration::from_secs(8));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "slowboot",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    run(&origin, thread, "slowboot", "true");
+
+    // the machine never boots here: the coordinator releases it a quarter of
+    // the grace before cloudlease would let its heartbeat lapse
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            fake.leases()
+                .first()
+                .is_some_and(|lease| lease.release.is_some())
+        }),
+        "the machine was never released: {}",
+        pool(&origin, thread, "slowboot")
+    );
+    let lease = fake.leases().remove(0);
+    assert_eq!(
+        lease.release.as_ref().unwrap(),
+        &("requested".to_owned(), "client"),
+        "{lease:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            pool(&origin, thread, "slowboot")["machines"][0]["reason"] == "boot_timeout"
+        }),
+        "{}",
+        pool(&origin, thread, "slowboot")
+    );
+    cli(&origin, thread, &["pool", "release", "slowboot"]);
 }

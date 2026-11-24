@@ -65,6 +65,9 @@ struct State {
     /// working, as when cloudlease's answer is lost; the lease shows
     /// `provisioning` for a few seconds before its outcome
     slow_creates: u32,
+    /// Time from a lease's create to its first heartbeat deadline; 60
+    /// seconds unless a test sets it
+    boot_grace: Option<Duration>,
 }
 
 /// The running fake
@@ -122,6 +125,27 @@ impl FakeCloudlease {
     /// whose class was repriced (`409 run_ended`) or a reached spend cap
     pub fn refuse_creates(&self, status: u16, code: &'static str) {
         self.state.lock().unwrap().refuse_creates = Some((status, code));
+    }
+
+    /// Give new leases `grace` before their first renewal, as a class's boot grace
+    pub fn set_boot_grace(&self, grace: std::time::Duration) {
+        self.state.lock().unwrap().boot_grace = Some(Duration::from_std(grace).unwrap());
+    }
+
+    /// End every run from cloudlease's side, releasing its leases with
+    /// `reason`, as a reached spend cap (`spend_cap`) or an operator's
+    /// release (`run_released`) would
+    pub fn end_runs(&self, reason: &str) {
+        let mut state = self.state.lock().unwrap();
+        for run in state.runs.values_mut() {
+            run.state = "releasing";
+        }
+        for lease in &mut state.leases {
+            if lease.state != "released" && lease.state != "releasing" {
+                lease.state = "releasing";
+                lease.release = Some((reason.into(), "cloudlease"));
+            }
+        }
     }
 
     /// End a lease from cloudlease's side, as a spend cap would
@@ -210,13 +234,23 @@ fn lease_json(lease: &FakeLease) -> Value {
 }
 
 fn run_json(state: &State, run: &FakeRun) -> Value {
+    // an ended run is released once none of its leases is live
+    let live = state
+        .leases
+        .iter()
+        .any(|lease| lease.run_id == run.run_id && lease.state != "released");
+    let run_state = if run.state == "open" || live {
+        run.state
+    } else {
+        "released"
+    };
     json!({
         "run_id": run.run_id,
         "name": run.name,
         "class": run.class,
         "max_machines": run.max_machines,
         "deadline_at": run.deadline_at,
-        "state": run.state,
+        "state": run_state,
         "created_at": run.created_at,
         "machines": state.leases.iter()
             .filter(|lease| lease.run_id == run.run_id)
@@ -320,7 +354,7 @@ fn route(
                 created_at: now,
                 hard_deadline_at: found.deadline_at,
                 // boot grace before the first renewal
-                heartbeat_deadline_at: now + Duration::seconds(60),
+                heartbeat_deadline_at: now + state.boot_grace.unwrap_or(Duration::seconds(60)),
                 release: None,
                 gone_at: None,
                 renewals: 0,

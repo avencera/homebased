@@ -14,7 +14,7 @@ pub enum PoolCode {
     PoolNotFound,
     /// The pool takes no more jobs or machines
     PoolEnded,
-    /// The job's kill limit runs past the pool's deadline
+    /// The job's kill limit outlasts every machine the pool has or could ask for
     PoolDeadlineTooClose,
     /// A machine's join did not match a machine this coordinator asked for
     JoinRefused,

@@ -139,6 +139,8 @@ pub struct BootPlan<'a> {
     pub relays: &'a Relays,
     /// Where it gets the Homebased it installs
     pub install: &'a MachineInstall,
+    /// Free disk, in GiB, below which it admits no CI run
+    pub min_free_disk_gib: u64,
 }
 
 impl BootPlan<'_> {
@@ -202,6 +204,9 @@ hub = "{hub}"
 {relay}hub_addrs = [{addrs}]
 join_token = "{token}"
 lease_file = "{lease}"
+
+[ci]
+min_free_disk_gib = {min_free_disk_gib}
 "#,
             name = self.name,
             pool = self.pool,
@@ -211,6 +216,7 @@ lease_file = "{lease}"
             relays = self.relays.to_toml(),
             token = self.join_token.expose(),
             lease = LEASE_FILE,
+            min_free_disk_gib = self.min_free_disk_gib,
         )
     }
 }
@@ -294,6 +300,7 @@ mod tests {
             hub: &hub,
             relays: &Relays::N0,
             install: &MachineInstall::release("v0.37.0").unwrap(),
+            min_free_disk_gib: 3,
         };
         let payload = plan.render();
         let paths: Vec<&str> = payload
@@ -322,6 +329,7 @@ mod tests {
         assert_eq!(temporary.slot, slot);
         assert_eq!(temporary.join_token.expose(), "t0ken");
         assert_eq!(temporary.hub, hub);
+        assert_eq!(config.ci.min_free_disk, 3 << 30);
         let iroh = config.fleet_settings().unwrap().iroh.as_ref().unwrap();
         assert_eq!(iroh.relays, Relays::N0);
         assert_eq!(config.machine_name, Some(name));

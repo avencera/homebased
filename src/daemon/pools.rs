@@ -34,10 +34,11 @@ use crate::pool::cloudlease::{
     CloudleaseClient, CloudleaseError, Lease, LeaseState, Run, RunState,
 };
 use crate::pool::{
-    DEFAULT_BOOT_TIMEOUT, DEFAULT_IDLE_LIMIT, DEFAULT_STALL_AFTER, JoinAnswer, JoinRequest,
+    DEFAULT_IDLE_LIMIT, DEFAULT_MIN_FREE_DISK_GIB, DEFAULT_STALL_AFTER, JoinAnswer, JoinRequest,
     JoinToken, JoinedMachine, MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease,
     MachineReleased, MachineState, Pool, PoolCode, PoolEnd, PoolError, PoolMachine, PoolName,
-    PoolSettings, PoolState, PoolView, ReleaseReason, SlotId, parse_env_file,
+    PoolReach, PoolSettings, PoolState, PoolView, ReleaseReason, RunEndCause, SlotId,
+    parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
 use crate::queue::delivery::HeldJobEnding;
@@ -137,6 +138,8 @@ struct CreateBody {
     env_file: Option<std::path::PathBuf>,
     #[serde(default)]
     spend_cap_cents: Option<std::num::NonZeroU32>,
+    #[serde(default)]
+    min_free_disk_gib: Option<u64>,
 }
 
 impl CreateBody {
@@ -160,6 +163,21 @@ impl CreateBody {
         if let Some(path) = &self.env_file {
             read_env(path).map_err(usage)?;
         }
+        if self
+            .boot_timeout
+            .is_some_and(|timeout| timeout.is_zero() || timeout > MAX_LIFETIME)
+        {
+            return Err(usage(
+                "--boot-timeout must be more than 0 and at most 24h".into(),
+            ));
+        }
+        let min_free_disk_gib = self.min_free_disk_gib.unwrap_or(DEFAULT_MIN_FREE_DISK_GIB);
+        // the machine's config takes GiB that fit in bytes, and would not start otherwise
+        if min_free_disk_gib.checked_mul(1 << 30).is_none() {
+            return Err(usage(format!(
+                "--min-free-disk {min_free_disk_gib} GiB is too large"
+            )));
+        }
         let now = Utc::now();
         let deadline = chrono::Duration::from_std(self.deadline)
             .map_err(|_| usage("--deadline does not fit the clock".into()))?;
@@ -172,7 +190,8 @@ impl CreateBody {
                 slots,
                 idle_limit: self.idle_limit.unwrap_or(DEFAULT_IDLE_LIMIT),
                 stall_after: self.stall_after.unwrap_or(DEFAULT_STALL_AFTER),
-                boot_timeout: self.boot_timeout.unwrap_or(DEFAULT_BOOT_TIMEOUT),
+                boot_timeout: self.boot_timeout,
+                min_free_disk_gib,
                 env_file: self.env_file,
                 spend_cap_cents: self.spend_cap_cents,
             },
@@ -306,8 +325,10 @@ async fn release(
 /// Whether a CI job may wait for a machine of the pool its class names
 ///
 /// A job of an open pool's class is admitted even with no machine yet, as
-/// long as its kill limit ends before the pool's deadline; a releasing pool
-/// takes no new job. Without a pool of that class the usual offer check runs
+/// long as some machine of the pool could run it to its kill limit: one it
+/// has, or one it would ask for now (see [`PoolReach`]); a stopped or
+/// releasing pool takes no new job. Without a pool of that class the usual
+/// offer check runs
 pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool, AppError> {
     let name = PoolName::from_class(ci.class.clone());
     let pool = call(&state.store, |reply| StoreMsg::Pool { name, reply }).await?;
@@ -331,22 +352,37 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
         )
         .into()),
         PoolState::Open => {
-            let kill = chrono::Duration::from_std(ci.kill_after.get()).unwrap_or_default();
-            let ends = Utc::now() + kill;
-            if ends > pool.settings.deadline_at {
-                return Err(PoolError::new(
-                    PoolCode::PoolDeadlineTooClose,
-                    format!(
-                        "the job's --kill-after runs to {ends}, past pool {}'s deadline {}; \
-                         its machine would be deleted under it",
-                        pool.name, pool.settings.deadline_at
-                    ),
-                )
-                .into());
+            let name = pool.name.clone();
+            let machines = call(&state.store, |reply| StoreMsg::PoolMachines {
+                pool: name,
+                reply,
+            })
+            .await?;
+            let reach = PoolReach::new(&pool, &machines, Utc::now());
+            let kill = ci.kill_after.get();
+            if !reach.can_run(kill) {
+                return Err(out_of_reach(&pool, &reach, kill).into());
             }
             Ok(true)
         }
     }
+}
+
+/// Why a job with kill limit `kill` can run on no machine of `pool`
+fn out_of_reach(pool: &Pool, reach: &PoolReach, kill: Duration) -> PoolError {
+    let kill = humantime::format_duration(kill);
+    // whole seconds, so the message stays short
+    let longest = Duration::from_secs(reach.longest_kill().as_secs());
+    let longest = humantime::format_duration(longest);
+    PoolError::new(
+        PoolCode::PoolDeadlineTooClose,
+        format!(
+            "a job with --kill-after {kill} would outlast every machine of pool {}, which \
+             cloudlease deletes by its deadline {}; counting a new machine's boot, the \
+             longest --kill-after the pool can run now is {longest}",
+            pool.name, pool.settings.deadline_at
+        ),
+    )
 }
 
 /// `POST /v1/cluster/pool/join` over the Fleet link: a temporary machine
@@ -614,9 +650,12 @@ impl Pass<'_> {
                     .collect()
             })
             .unwrap_or_default();
-        let mut live = Vec::new();
+        // every machine, released ones too, since their leases show the
+        // class's boot grace and lifetime
+        let mut synced = Vec::with_capacity(machines.len());
         for machine in machines {
             if !machine.state.is_live() {
+                synced.push(machine);
                 continue;
             }
             let slot = machine.slot;
@@ -635,13 +674,20 @@ impl Pass<'_> {
             let machine = self
                 .sync_machine(&mut pool, run.as_ref(), machine, lease)
                 .await?;
-            if machine.state.is_live() {
-                live.push(machine);
-            }
+            synced.push(machine);
         }
+        let live: Vec<PoolMachine> = synced
+            .iter()
+            .filter(|machine| machine.state.is_live())
+            .cloned()
+            .collect();
 
         match &pool.state {
-            PoolState::Open => self.grow(&mut pool, run.as_ref(), &live).await?,
+            PoolState::Open => {
+                let reach = PoolReach::new(&pool, &synced, Utc::now());
+                self.end_out_of_reach(&pool, &reach).await?;
+                self.grow(&mut pool, run.as_ref(), &live, &reach).await?;
+            }
             // once its machines finished their jobs and are gone, a stopped
             // pool winds down like a released one
             PoolState::Stopped { end } if live.is_empty() => {
@@ -696,6 +742,11 @@ impl Pass<'_> {
         match blocking(move || client.run(&run)).await {
             Ok(run) => {
                 pool.last_error = None;
+                if matches!(pool.state, PoolState::Open) && run.state != RunState::Open {
+                    let end = ended_outside(&run, pool.settings.deadline_at);
+                    warn!(pool = %pool.name, code = end.job_code(), "cloudlease ended the pool's run");
+                    pool.state = PoolState::Releasing { end };
+                }
                 Ok(Some(run))
             }
             // a run cloudlease no longer has holds no machine and takes no
@@ -751,9 +802,12 @@ impl Pass<'_> {
                     .release_reason()
                     .unwrap_or(ReleaseReason::Other("unknown".into()));
                 let joined = state.joined().cloned();
+                // the stored lease keeps the boot deadline, which renewals
+                // moved on cloudlease's side
+                let kept = state.lease().cloned();
                 count_create_failure(pool, &machine, &reason);
                 machine.state = MachineState::Releasing {
-                    lease: machine_lease(lease),
+                    lease: kept.unwrap_or_else(|| machine_lease(lease)),
                     joined,
                     reason,
                 };
@@ -769,9 +823,8 @@ impl Pass<'_> {
                     lease: machine_lease(lease),
                 };
             }
-            (Some(lease), MachineState::Booting { .. }) => {
-                let boot_age = (Utc::now() - lease.created_at).to_std().unwrap_or_default();
-                if boot_age >= pool.settings.boot_timeout {
+            (Some(_), MachineState::Booting { lease }) => {
+                if Utc::now() >= pool.settings.boot_released_at(lease) {
                     self.release_lease(&mut machine, ReleaseReason::BootTimeout)
                         .await;
                 }
@@ -938,12 +991,13 @@ impl Pass<'_> {
         pool: &mut Pool,
         run: Option<&Run>,
         live: &[PoolMachine],
+        reach: &PoolReach,
     ) -> Result<(), AppError> {
         let backoff = self.config.reconcile_interval * CREATE_BACKOFF_PASSES;
         if run.is_none() || !pool.creates_allowed(Utc::now(), backoff) {
             return Ok(());
         }
-        let wanted = self.wanted_machines(pool, live).await?;
+        let wanted = self.wanted_machines(pool, live, reach).await?;
         for _ in 0..wanted {
             if !self.still_open(pool).await? {
                 break;
@@ -983,12 +1037,30 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// How many machines to ask for now: ready jobs with no slot, less the
-    /// slots of machines still booting and free slots on joined ones, within
-    /// the pool's limit
-    async fn wanted_machines(&self, pool: &Pool, live: &[PoolMachine]) -> Result<u32, AppError> {
+    /// How many machines to ask for now: ready jobs with no slot that a new
+    /// machine could run to their kill limit, less the slots of machines
+    /// still booting and free slots on joined ones, within the pool's limit
+    async fn wanted_machines(
+        &self,
+        pool: &Pool,
+        live: &[PoolMachine],
+        reach: &PoolReach,
+    ) -> Result<u32, AppError> {
         let held = held_ci_routes(self.state, pool.name.class()).await?;
-        let ready = u32::try_from(held.ready.len()).unwrap_or(u32::MAX);
+        // a job only a machine the pool has can run waits for its slot; a
+        // new machine would idle out without it
+        let ready = held
+            .ready
+            .iter()
+            .filter(|route| {
+                route
+                    .spec
+                    .ci
+                    .as_ref()
+                    .is_some_and(|ci| reach.new_machine_can_run(ci.kill_after.get()))
+            })
+            .count();
+        let ready = u32::try_from(ready).unwrap_or(u32::MAX);
         if ready == 0 {
             return Ok(0);
         }
@@ -1078,6 +1150,7 @@ impl Pass<'_> {
             hub: &hub,
             relays: &relays,
             install: &self.config.machine_install,
+            min_free_disk_gib: pool.settings.min_free_disk_gib,
         };
         Some(boot.render())
     }
@@ -1174,6 +1247,37 @@ impl Pass<'_> {
         Ok(())
     }
 
+    /// End the pool's jobs that have not started and that no machine of the
+    /// pool can run to their kill limit any more: time only takes reach away
+    async fn end_out_of_reach(&self, pool: &Pool, reach: &PoolReach) -> Result<(), AppError> {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        for route in held.ready.into_iter().chain(held.waiting) {
+            let Some(kill) = route.spec.ci.as_ref().map(|ci| ci.kill_after.get()) else {
+                continue;
+            };
+            if reach.can_run(kill) {
+                continue;
+            }
+            let job = route.job;
+            let refusal = out_of_reach(pool, reach, kill);
+            let ending = HeldJobEnding::Refused {
+                code: refusal.code.as_str().to_owned(),
+                message: refusal.message,
+            };
+            let _guard = self.state.locks.job_submissions.lock(job).await;
+            let ended = call(&self.state.store, |reply| StoreMsg::EndPoolJob {
+                job,
+                ending,
+                reply,
+            })
+            .await?;
+            if ended {
+                warn!(pool = %pool.name, %job, "job ended: no machine of the pool can run it to its kill limit");
+            }
+        }
+        Ok(())
+    }
+
     /// End the pool's jobs that have not started, with why the pool ended
     async fn end_held_jobs(&self, pool: &Pool, end: &PoolEnd) -> Result<(), AppError> {
         let held = held_ci_routes(self.state, pool.name.class()).await?;
@@ -1195,11 +1299,37 @@ impl Pass<'_> {
     }
 }
 
+/// The lease of a machine that has not joined, so it never renewed and its
+/// heartbeat deadline is still the end of its boot grace
 fn machine_lease(lease: &Lease) -> MachineLease {
     MachineLease {
         lease: lease.lease_id.clone(),
         hard_deadline_at: lease.hard_deadline_at,
         created_at: lease.created_at,
+        boot_deadline_at: lease.heartbeat_deadline_at,
+    }
+}
+
+/// Why a pool ends whose run cloudlease ended without this coordinator asking
+///
+/// The run itself carries no reason, so its leases tell: a spend cap
+/// releases them with `spend_cap`. A run past its deadline ends like the
+/// pool's own deadline, whichever clock saw it first
+fn ended_outside(run: &Run, deadline: chrono::DateTime<Utc>) -> PoolEnd {
+    let spend_cap = run
+        .machines
+        .iter()
+        .any(|lease| lease.release_reason() == Some(ReleaseReason::SpendCap));
+    if spend_cap {
+        return PoolEnd::RunEnded {
+            cause: RunEndCause::SpendCap,
+        };
+    }
+    if Utc::now() >= deadline || Utc::now() >= run.deadline_at {
+        return PoolEnd::Deadline;
+    }
+    PoolEnd::RunEnded {
+        cause: RunEndCause::Released,
     }
 }
 

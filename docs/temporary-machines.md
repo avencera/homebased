@@ -31,7 +31,7 @@ Machines use the coordinator's `relays` too; see [Link](#link). They need no inb
 
 ```sh
 homebased pool create afv --machine-class do-c16 --max 16 --deadline 6h \
-  --env-file ~/.config/afv/pool.env
+  --min-free-disk 20 --env-file ~/.config/afv/pool.env
 homebased ci run --class afv --git --kill-after 2h -- ./clean_scroll.sh PHerc-0172
 homebased --json pool show afv
 homebased pool release afv
@@ -45,13 +45,18 @@ homebased pool release afv
 | `--slots` | CI slots of the class on each machine (default 1) |
 | `--idle-limit` | A machine with no work for this long releases itself (default 10m) |
 | `--stall-after` | Running work with no output for this long stops keeping its machine (default 30m) |
-| `--boot-timeout` | A machine that has not joined this long after its create is released (default 7m). Keep it inside cloudlease's boot grace, 8 minutes by default: a machine renews only once it joined, so cloudlease deletes it at the end of the grace anyway |
+| `--boot-timeout` | A machine that has not joined this long after its create is released. By default a minute before cloudlease's boot grace ends, or a quarter of the grace for one under 4 minutes; the coordinator reads the grace from each lease's first `heartbeat_deadline_at`, so DigitalOcean's 8 minutes gives 7m and phoenixNAP's 20 gives 19m. A machine renews only once it joined, so cloudlease deletes it at the end of the grace anyway; a value past the grace only changes the reason to `heartbeat_lapsed` |
+| `--min-free-disk` | Free disk, in GiB, below which a machine of the pool admits no CI run (default 1; a Fleet machine's `[ci] min_free_disk_gib` is 10). The boot data writes it as the machine's `[ci] min_free_disk_gib`. Set it to what one job needs, within what the class has free after boot; a machine below it takes no job, idles out, and a fresh one replaces it |
 | `--env-file` | `NAME=value` lines on the coordinator that every run on the pool's machines gets |
 | `--spend-cap` | Most the pool's cloudlease run may spend, in US dollars, such as `25` or `12.50`. cloudlease's own per-run cap applies without it, and refuses a larger value |
 
 The pool's name is the CI class its jobs name. A job of an open pool's class is accepted even before any machine exists. Submit pool jobs on the coordinator: only it reaches pool machines, and it counts only its own waiting jobs when it asks for machines.
 
-A job whose `--kill-after` would run past the pool's deadline is refused at submit with `pool_deadline_too_close`, and placement never sends a job to a machine that cloudlease will delete before the job's kill limit.
+Placement never sends a job to a machine that cloudlease will delete before the job's kill limit, and every machine of the pool ends by its deadline, or sooner when the cloudlease class has a shorter lifetime. So the coordinator keeps each job within reach of some machine:
+
+- At submit, a job is refused with `pool_deadline_too_close` unless a machine the pool has (booting or joined) outlives its `--kill-after` from now, or a machine asked for now would, once it joined: the boot timeout from now plus the kill limit must end by the pool's deadline, or by the end of the class's lifetime, which a lease that ends before the deadline shows. Before the pool has any lease, it assumes cloudlease's default 8-minute boot grace. The message names the longest `--kill-after` the pool takes.
+- Each pass, a job that has not started and has fallen out of that reach, for example while its `--after` dependency ran, ends with `JOB_FAILED` whose `held_ending` has code `pool_deadline_too_close`. Time only takes reach away, so such a job could never run.
+- The pool asks for machines only for ready jobs that a new machine could run; a job that only a machine it has could run waits for that machine's slot.
 
 ## Lifecycle
 
@@ -69,15 +74,16 @@ Each pass, about every 15 seconds, the coordinator:
 
 1. creates the pool's cloudlease run on its first pass;
 2. reads the run, moves each machine to its lease's state, and releases a machine that has not joined within the boot timeout;
-3. asks for machines while ready jobs of the class outnumber the free slots on joined machines plus the slots of machines still booting, up to `--max`. A machine the provider could not create comes back from cloudlease already releasing with reason `create_failed`; the coordinator then waits 4 passes (a minute at the default interval) before it asks again, twice that after a second failure in a row, and stops the pool after a third;
+3. ends waiting jobs out of reach (see above), then asks for machines while ready jobs of the class that a new machine could run outnumber the free slots on joined machines plus the slots of machines still booting, up to `--max`. A machine the provider could not create comes back from cloudlease already releasing with reason `create_failed`; the coordinator then waits 4 passes (a minute at the default interval) before it asks again, twice that after a second failure in a row, and stops the pool after a third;
 4. for each machine cloudlease reports `released`, removes it from the Fleet and ends every job it still held with `JOB_FAILED`;
 5. at the deadline, or after `pool release`, releases the run, fails the pool's jobs that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool whose run cloudlease no longer has ends the same way with `run_not_found`. The pool is marked released only once cloudlease took the run's release.
+6. when it reads the run as `releasing` or `released` while the pool is open, cloudlease ended the run without the coordinator asking: at its spend cap, or by an operator's release. The pool ends the same way with code `run_ended` and a `cause`: `spend_cap` when a lease of the run was released with `spend_cap`, `released` otherwise (the run has no reason of its own). Its machines are already releasing, and each drops out of the Fleet once cloudlease confirms it gone; a job running on one ends with `machine_released`.
 
 A pool stops when cloudlease refuses a machine for good, or after three `create_failed` machines in a row. A stopped pool asks for no more machines, takes no new job, and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries the code; jobs already running finish on their machines, which then release themselves when idle, and the pool is released once they are gone. `pool release` releases a stopped pool at once.
 
 | Code | Why cloudlease refused |
 | --- | --- |
-| `run_ended` | The run takes no machines: its class was repriced or removed, or it hit its spend cap |
+| `run_ended` | The run takes no machines: its class was repriced or removed, or it hit its spend cap. A run cloudlease ended on its own releases the pool rather than stopping it (step 6 above) |
 | `spend_cap_reached` | The machine would take the run past its spend cap, or cloudlease past its hourly cap |
 | `create_failed` | The provider could not create three machines in a row |
 | others, such as `invalid_boot` or `unauthorized` | A request or configuration error to fix before a new pool |
