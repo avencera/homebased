@@ -43,6 +43,7 @@ struct FakeRun {
     class: String,
     max_machines: u64,
     deadline_at: DateTime<Utc>,
+    spend_cap_cents: Option<u64>,
     state: &'static str,
     created_at: DateTime<Utc>,
 }
@@ -52,6 +53,11 @@ struct State {
     runs: BTreeMap<String, FakeRun>,
     leases: Vec<FakeLease>,
     next: u64,
+    /// New machine creates the provider fails, answered `201` with the
+    /// lease already releasing, as cloudlease does
+    failing_creates: u32,
+    /// Status and code every new machine create is refused with
+    refuse_creates: Option<(u16, &'static str)>,
 }
 
 /// The running fake
@@ -92,6 +98,39 @@ impl FakeCloudlease {
         let mut state = self.state.lock().unwrap();
         state.runs.clear();
         state.leases.clear();
+    }
+
+    /// Let the provider fail the next `count` machine creates
+    pub fn fail_creates(&self, count: u32) {
+        self.state.lock().unwrap().failing_creates = count;
+    }
+
+    /// Refuse every new machine create with `status` and `code`, as a run
+    /// whose class was repriced (`409 run_ended`) or a reached spend cap
+    pub fn refuse_creates(&self, status: u16, code: &'static str) {
+        self.state.lock().unwrap().refuse_creates = Some((status, code));
+    }
+
+    /// End a lease from cloudlease's side, as a spend cap would
+    pub fn end_lease(&self, lease_id: &str, reason: &str) {
+        let mut state = self.state.lock().unwrap();
+        let lease = state
+            .leases
+            .iter_mut()
+            .find(|lease| lease.lease_id == lease_id)
+            .unwrap();
+        lease.state = "releasing";
+        lease.release = Some((reason.into(), "cloudlease"));
+    }
+
+    /// `spend_cap_cents` of each run create, by run name
+    pub fn spend_caps(&self) -> BTreeMap<String, Option<u64>> {
+        let state = self.state.lock().unwrap();
+        state
+            .runs
+            .values()
+            .map(|run| (run.name.clone(), run.spend_cap_cents))
+            .collect()
     }
 
     /// Every lease, oldest first, after applying the lifetime rules
@@ -193,6 +232,7 @@ fn route(
                 class: body["class"].as_str().unwrap_or_default().into(),
                 max_machines: body["max_machines"].as_u64().unwrap_or(0),
                 deadline_at: serde_json::from_value(body["deadline_at"].clone()).unwrap(),
+                spend_cap_cents: body["spend_cap_cents"].as_u64(),
                 state: "open",
                 created_at: Utc::now(),
             };
@@ -231,6 +271,9 @@ fn route(
             if found.state != "open" {
                 return error(409, "run_ended");
             }
+            if let Some((status, code)) = state.refuse_creates {
+                return error(status, code);
+            }
             let live = state
                 .leases
                 .iter()
@@ -241,7 +284,7 @@ fn route(
             }
             state.next += 1;
             let now = Utc::now();
-            let lease = FakeLease {
+            let mut lease = FakeLease {
                 lease_id: format!("lease-{}", state.next),
                 run_id: found.run_id.clone(),
                 request_id: request,
@@ -257,6 +300,11 @@ fn route(
                 gone_at: None,
                 renewals: 0,
             };
+            if state.failing_creates > 0 {
+                state.failing_creates -= 1;
+                lease.state = "releasing";
+                lease.release = Some(("create_failed".into(), "cloudlease"));
+            }
             let answer = lease_json(&lease);
             state.leases.push(lease);
             (201, answer)

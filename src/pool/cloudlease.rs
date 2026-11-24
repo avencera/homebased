@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::boot::BootPayload;
-use super::{LeaseId, MachineClass, PoolName, ReleaseReason, RunId, SlotId};
+use super::{LeaseId, MachineClass, PoolName, PoolSettings, ReleaseReason, RunId, SlotId};
 use crate::curl::{CurlMethod, CurlRequest, send};
 use crate::machine::MachineName;
 
@@ -216,21 +216,26 @@ impl CloudleaseClient {
     }
 
     /// Create a pool's run, or read it back when `request_id` was used before
+    ///
+    /// A retry sends the same settings, spend cap included, as cloudlease
+    /// matches a retried create by its whole body
     pub fn create_run(
         &self,
         request_id: Uuid,
         pool: &PoolName,
-        class: &MachineClass,
-        max_machines: u32,
-        deadline_at: DateTime<Utc>,
+        settings: &PoolSettings,
     ) -> Result<Run, CloudleaseError> {
-        let body = json!({
+        let mut body = json!({
             "request_id": request_id,
             "name": pool,
-            "class": class,
-            "max_machines": max_machines,
-            "deadline_at": deadline_at,
+            "class": settings.machine_class,
+            "max_machines": settings.max_machines,
+            "deadline_at": settings.deadline_at,
         });
+        // absent means cloudlease's own per-run cap
+        if let Some(cap) = settings.spend_cap_cents {
+            body["spend_cap_cents"] = json!(cap);
+        }
         self.call(CurlMethod::Post, "/v1/runs", Some(&body))
     }
 
@@ -303,6 +308,9 @@ pub struct LeaseCredential {
     pub api_base: String,
     /// cloudlease deletes the machine at this time whatever happens
     pub hard_deadline_at: DateTime<Utc>,
+    /// cloudlease deletes the machine this long after its last renew
+    #[serde(default)]
+    heartbeat_ttl_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for LeaseCredential {
@@ -311,6 +319,7 @@ impl std::fmt::Debug for LeaseCredential {
             .field("lease_id", &self.lease_id)
             .field("api_base", &self.api_base)
             .field("hard_deadline_at", &self.hard_deadline_at)
+            .field("heartbeat_ttl_secs", &self.heartbeat_ttl_secs)
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +330,16 @@ impl LeaseCredential {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    }
+
+    /// Time between renewals: `configured`, but never slower than a quarter
+    /// of the lease's heartbeat window, so a failed renew has rounds to spare
+    #[must_use]
+    pub fn renew_interval(&self, configured: Duration) -> Duration {
+        self.heartbeat_ttl_secs
+            .map(|ttl| Duration::from_secs(ttl) / 4)
+            .filter(|quarter| !quarter.is_zero())
+            .map_or(configured, |quarter| configured.min(quarter))
     }
 
     /// Move the heartbeat deadline; `410 lease_ended` means the machine is going away
@@ -419,4 +438,35 @@ fn request<T: DeserializeOwned>(
         code,
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::LeaseCredential;
+
+    fn lease(ttl: Option<u64>) -> LeaseCredential {
+        serde_json::from_value(serde_json::json!({
+            "lease_id": "run_1-1",
+            "token": "cll_secret",
+            "api_base": "https://cloudlease.example",
+            "hard_deadline_at": "2026-11-25T02:00:00Z",
+            "heartbeat_ttl_secs": ttl,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn renewals_come_at_least_four_times_per_heartbeat_window() {
+        let configured = Duration::from_secs(30);
+        // the default 3-minute window leaves the configured 30 s alone
+        assert_eq!(lease(Some(180)).renew_interval(configured), configured);
+        // the shortest window cloudlease allows forces 15 s
+        assert_eq!(
+            lease(Some(60)).renew_interval(configured),
+            Duration::from_secs(15)
+        );
+        assert_eq!(lease(None).renew_interval(configured), configured);
+    }
 }

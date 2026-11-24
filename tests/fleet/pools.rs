@@ -592,3 +592,229 @@ fn a_pool_whose_run_cloudlease_lost_ends_and_fails_its_waiting_jobs() {
         JobEventKind::JobFailed
     );
 }
+
+/// Error code a job that never got a machine ended with
+fn held_code(event: &JobEvent) -> Value {
+    serde_json::to_value(&event.held_ending).unwrap()["code"].clone()
+}
+
+/// Slots of `class` a daemon offers, as `ci slots` shows them
+fn class_capacity(daemon: &Daemon, thread: ThreadId, class: &str) -> Option<u64> {
+    fn find(value: &Value, class: &str) -> Option<u64> {
+        match value {
+            Value::Object(fields) if fields.get("class").is_some_and(|name| name == class) => {
+                fields.get("capacity")?.as_u64()
+            }
+            Value::Object(fields) => fields.values().find_map(|value| find(value, class)),
+            Value::Array(items) => items.iter().find_map(|value| find(value, class)),
+            _ => None,
+        }
+    }
+    find(&cli(daemon, thread, &["ci", "slots"]), class)
+}
+
+#[test]
+fn a_pool_stops_asking_after_machines_the_provider_cannot_create() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    fake.fail_creates(10);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "flaky",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "2",
+            "--deadline",
+            "1h",
+            "--spend-cap",
+            "12.50",
+        ],
+    );
+    let job = run(&origin, thread, "flaky", "true");
+
+    // three failed creates, with a pause after each, and then no more
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            pool(&origin, thread, "flaky")["state"] == "released"
+        }),
+        "the pool never stopped: {}",
+        pool(&origin, thread, "flaky")
+    );
+    let shown = pool(&origin, thread, "flaky");
+    assert_eq!(shown["reason"], "create_failed", "{shown}");
+    let leases = fake.leases();
+    assert_eq!(leases.len(), 3, "{leases:?}");
+    let created: Vec<_> = leases.iter().map(|lease| lease.created_at).collect();
+    assert!(
+        created
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] >= chrono::Duration::seconds(3)),
+        "creates did not back off: {created:?}"
+    );
+    for machine in shown["machines"].as_array().unwrap() {
+        assert_eq!(machine["reason"], "create_failed", "{shown}");
+    }
+    assert_eq!(fake.spend_caps()["flaky"], Some(1250));
+
+    assert!(wait_until(Duration::from_secs(20), || final_event(
+        &origin, job
+    )
+    .is_some()));
+    let event = final_event(&origin, job).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&event), "create_failed");
+}
+
+#[test]
+fn a_refused_create_stops_the_pool_and_running_jobs_finish() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "repriced",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "2",
+            "--deadline",
+            "1h",
+            "--idle-limit",
+            "3s",
+        ],
+    );
+    let started = origin.user_home.join("started");
+    let running = run(
+        &origin,
+        thread,
+        "repriced",
+        &format!("touch {}; sleep 8", started.display()),
+    );
+    let mut machines = Machines::default();
+    assert!(
+        machines.drive(&fake, Duration::from_secs(60), || started.exists()),
+        "the first job never started: {}",
+        pool(&origin, thread, "repriced")
+    );
+
+    // the class was repriced: cloudlease refuses new machines with run_ended
+    fake.refuse_creates(409, "run_ended");
+    let waiting = run(&origin, thread, "repriced", "true");
+    assert!(
+        machines.drive(&fake, Duration::from_secs(30), || final_event(
+            &origin, waiting
+        )
+        .is_some()),
+        "the waiting job never ended: {}",
+        pool(&origin, thread, "repriced")
+    );
+    let event = final_event(&origin, waiting).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&event), "run_ended");
+    let shown = pool(&origin, thread, "repriced");
+    assert_eq!(shown["state"], "stopped", "{shown}");
+    assert_eq!(shown["code"], "run_ended", "{shown}");
+
+    // a stopped pool takes no new job, and says why
+    let late = cli_output(
+        &origin,
+        thread,
+        &["ci", "run", "--class", "repriced", "--", "true"],
+    );
+    assert!(!late.status.success());
+    let refusal =
+        String::from_utf8_lossy(&late.stderr).into_owned() + &String::from_utf8_lossy(&late.stdout);
+    assert!(refusal.contains("run_ended"), "{refusal}");
+
+    // the running job keeps its machine; the machine then idles out and
+    // the pool ends with it
+    assert!(
+        machines.drive(&fake, Duration::from_secs(60), || {
+            pool(&origin, thread, "repriced")["state"] == "released"
+        }),
+        "the stopped pool never ended: {}",
+        pool(&origin, thread, "repriced")
+    );
+    assert_eq!(
+        final_event(&origin, running).unwrap().event,
+        JobEventKind::JobSucceeded
+    );
+    assert_eq!(fake.leases().len(), 1);
+    assert_eq!(
+        fake.leases()[0].release.as_ref().unwrap(),
+        &("idle".to_owned(), "machine")
+    );
+}
+
+#[test]
+fn a_machine_whose_lease_ended_stops_taking_jobs() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "capped",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    let started = origin.user_home.join("capped-started");
+    let job = run(
+        &origin,
+        thread,
+        "capped",
+        &format!("touch {}; sleep 600", started.display()),
+    );
+    let mut machines = Machines::default();
+    // the job must hold the machine's slot before the lease ends, or it
+    // waits for another machine
+    assert!(
+        machines.drive(&fake, Duration::from_secs(60), || started.exists()),
+        "the job never started: {:?}",
+        fake.leases()
+    );
+    let lease = fake.leases()[0].clone();
+    let machine = &machines.daemons[&lease.lease_id];
+    let machine_thread = self::thread(machine);
+    assert!(wait_until(Duration::from_secs(20), || {
+        class_capacity(machine, machine_thread, "capped") == Some(1)
+    }));
+
+    // cloudlease ends the lease, as a reached spend cap does: the next renew
+    // gets 410 lease_ended and the machine closes its class at once
+    fake.end_lease(&lease.lease_id, "spend_cap");
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            class_capacity(machine, machine_thread, "capped") == Some(0)
+        }),
+        "the machine still offers its class after its lease ended"
+    );
+    assert!(wait_until(Duration::from_secs(20), || final_event(
+        &origin, job
+    )
+    .is_some()));
+    let event = final_event(&origin, job).unwrap();
+    assert_eq!(event.event, JobEventKind::JobFailed);
+    assert_eq!(
+        event.machine_released.unwrap().reason.to_string(),
+        "spend_cap"
+    );
+}

@@ -8,7 +8,7 @@
 //! CI queue's; this loop only makes and removes the machines it places on.
 //! See `docs/temporary-machines.md`
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -63,6 +63,10 @@ pub const JOIN_PATH: &str = "/v1/cluster/pool/join";
 /// How long after its join a machine's slots count as coming even while it
 /// cannot yet say what it offers
 const JOIN_SETTLE: Duration = Duration::from_secs(120);
+
+/// Reconcile passes a pool waits after a machine the provider could not
+/// create before it asks for another, doubled for each failure in a row
+const CREATE_BACKOFF_PASSES: u32 = 4;
 
 /// What an endpoint with no grant may call on a coordinator: the join only
 pub(super) fn enrollment_routes() -> Router<AppState> {
@@ -131,6 +135,8 @@ struct CreateBody {
     boot_timeout: Option<Duration>,
     #[serde(default)]
     env_file: Option<std::path::PathBuf>,
+    #[serde(default)]
+    spend_cap_cents: Option<std::num::NonZeroU32>,
 }
 
 impl CreateBody {
@@ -168,12 +174,14 @@ impl CreateBody {
                 stall_after: self.stall_after.unwrap_or(DEFAULT_STALL_AFTER),
                 boot_timeout: self.boot_timeout.unwrap_or(DEFAULT_BOOT_TIMEOUT),
                 env_file: self.env_file,
+                spend_cap_cents: self.spend_cap_cents,
             },
             run_request: uuid::Uuid::now_v7(),
             run: None,
             state: PoolState::Open,
             created_at: now,
             last_error: None,
+            create_failures: None,
         })
     }
 }
@@ -308,6 +316,15 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
     };
     match pool.state {
         PoolState::Released { .. } => Ok(false),
+        PoolState::Stopped { end } => Err(PoolError::new(
+            PoolCode::PoolEnded,
+            format!(
+                "pool {} is stopped and takes no new jobs: {}",
+                pool.name,
+                end.job_message(&pool.name)
+            ),
+        )
+        .into()),
         PoolState::Releasing { .. } => Err(PoolError::new(
             PoolCode::PoolEnded,
             format!("pool {} is releasing and takes no new jobs", pool.name),
@@ -330,6 +347,20 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
             Ok(true)
         }
     }
+}
+
+/// Every machine that joined the pool a CI job's class names
+pub(super) async fn pool_members(
+    state: &AppState,
+    ci: &CiSpec,
+) -> Result<BTreeSet<crate::machine::MachineId>, AppError> {
+    let pool = PoolName::from_class(ci.class.clone());
+    let machines = call(&state.store, |reply| StoreMsg::PoolMachines { pool, reply }).await?;
+    Ok(machines
+        .iter()
+        .filter_map(|machine| machine.state.joined())
+        .map(|joined| joined.machine)
+        .collect())
 }
 
 /// `POST /v1/cluster/pool/join` over the Fleet link: a temporary machine
@@ -554,7 +585,9 @@ struct Pass<'a> {
 
 impl Pass<'_> {
     async fn reconcile(&self, mut pool: Pool) -> Result<(), AppError> {
-        if matches!(pool.state, PoolState::Open) && Utc::now() >= pool.settings.deadline_at {
+        if matches!(pool.state, PoolState::Open | PoolState::Stopped { .. })
+            && Utc::now() >= pool.settings.deadline_at
+        {
             pool.state = PoolState::Releasing {
                 end: PoolEnd::Deadline,
             };
@@ -566,7 +599,7 @@ impl Pass<'_> {
                 pool.last_error = Some(error.to_string());
                 // ending waiting jobs needs only this daemon, so a cloudlease
                 // outage does not hold them
-                if let PoolState::Releasing { end } = &pool.state {
+                if let PoolState::Stopped { end } | PoolState::Releasing { end } = &pool.state {
                     self.end_held_jobs(&pool, end).await?;
                 }
                 save_pool(self.state, &pool).await?;
@@ -617,6 +650,16 @@ impl Pass<'_> {
 
         match &pool.state {
             PoolState::Open => self.grow(&mut pool, run.as_ref(), &live).await?,
+            // once its machines finished their jobs and are gone, a stopped
+            // pool winds down like a released one
+            PoolState::Stopped { end } if live.is_empty() => {
+                let end = end.clone();
+                self.wind_down(&mut pool, run.as_ref(), &live, end).await?;
+            }
+            PoolState::Stopped { end } => {
+                let end = end.clone();
+                self.end_held_jobs(&pool, &end).await?;
+            }
             PoolState::Releasing { end } => {
                 let end = end.clone();
                 self.wind_down(&mut pool, run.as_ref(), &live, end).await?;
@@ -634,15 +677,9 @@ impl Pass<'_> {
                 return Ok(None);
             }
             let client = self.client.clone();
-            let (request, name, class, max, deadline) = (
-                pool.run_request,
-                pool.name.clone(),
-                pool.settings.machine_class.clone(),
-                pool.settings.max_machines,
-                pool.settings.deadline_at,
-            );
-            let created =
-                blocking(move || client.create_run(request, &name, &class, max, deadline)).await;
+            let (request, name, settings) =
+                (pool.run_request, pool.name.clone(), pool.settings.clone());
+            let created = blocking(move || client.create_run(request, &name, &settings)).await;
             match created {
                 Ok(run) => {
                     info!(pool = %pool.name, run = %run.run_id, "cloudlease run created");
@@ -711,6 +748,7 @@ impl Pass<'_> {
                 let reason = local_reason(&machine.state)
                     .or_else(|| lease.release_reason())
                     .unwrap_or(ReleaseReason::Other("unknown".into()));
+                count_create_failure(pool, &machine, &reason);
                 let gone_at = lease.gone_at.unwrap_or_else(Utc::now);
                 return self.finish(pool, machine, reason, gone_at).await;
             }
@@ -720,9 +758,11 @@ impl Pass<'_> {
                 let reason = lease
                     .release_reason()
                     .unwrap_or(ReleaseReason::Other("unknown".into()));
+                let joined = state.joined().cloned();
+                count_create_failure(pool, &machine, &reason);
                 machine.state = MachineState::Releasing {
                     lease: machine_lease(lease),
-                    joined: state.joined().cloned(),
+                    joined,
                     reason,
                 };
             }
@@ -743,13 +783,17 @@ impl Pass<'_> {
                 // the create may not have reached cloudlease: send it again
                 Some(_) if self.still_open(pool).await? => {
                     if let Some(end) = self.create_machine(pool, &mut machine).await? {
-                        pool.state = PoolState::Releasing { end };
+                        stop(pool, end);
                     }
                 }
                 // wind-down releases the run first; cloudlease then lists
                 // the lease if the create reached it
-                Some(run) if run.state == RunState::Open => {}
-                // the run ended with no lease for this slot, so no machine exists
+                Some(run)
+                    if run.state == RunState::Open
+                        && matches!(pool.state, PoolState::Releasing { .. }) => {}
+                // the run ended, or the pool stopped, with no lease for this
+                // slot; a create that still lands later holds a lease no
+                // record knows, which ends with the run
                 _ => machine.state = never_created(),
             },
             (None, _) if run.is_some() => {
@@ -778,12 +822,7 @@ impl Pass<'_> {
             (None, _) => {}
         }
 
-        if !matches!(pool.state, PoolState::Open)
-            && matches!(
-                machine.state,
-                MachineState::Booting { .. } | MachineState::Joined { .. }
-            )
-        {
+        if ends_with_pool(&pool.state, &machine.state) {
             self.release_lease(&mut machine, ReleaseReason::Requested)
                 .await;
         }
@@ -902,7 +941,8 @@ impl Pass<'_> {
         run: Option<&Run>,
         live: &[PoolMachine],
     ) -> Result<(), AppError> {
-        if run.is_none() {
+        let backoff = self.config.reconcile_interval * CREATE_BACKOFF_PASSES;
+        if run.is_none() || !pool.creates_allowed(Utc::now(), backoff) {
             return Ok(());
         }
         let wanted = self.wanted_machines(pool, live).await?;
@@ -934,13 +974,11 @@ impl Pass<'_> {
             .await?;
             let outcome = self.create(pool, &mut machine, &boot).await?;
             if let Some(end) = outcome {
-                pool.state = PoolState::Releasing { end };
+                stop(pool, end);
                 break;
             }
-            if matches!(
-                machine.state,
-                MachineState::Requested | MachineState::Released { .. }
-            ) {
+            // no answer, a refusal, or a machine the provider could not make
+            if !matches!(machine.state, MachineState::Booting { .. }) {
                 break;
             }
         }
@@ -1062,9 +1100,23 @@ impl Pass<'_> {
         let end = match created {
             Ok(lease) => {
                 info!(pool = %pool.name, machine = %machine.name, lease = %lease.lease_id, "temporary machine requested");
-                machine.state = MachineState::Booting {
-                    lease: machine_lease(&lease),
-                };
+                // cloudlease answers a provider failure with the lease already ending
+                match lease.release_reason() {
+                    Some(reason) => {
+                        count_create_failure(pool, machine, &reason);
+                        machine.state = MachineState::Releasing {
+                            lease: machine_lease(&lease),
+                            joined: None,
+                            reason,
+                        };
+                    }
+                    None => {
+                        pool.create_succeeded();
+                        machine.state = MachineState::Booting {
+                            lease: machine_lease(&lease),
+                        };
+                    }
+                }
                 None
             }
             Err(error) if error.is_capacity() => {
@@ -1160,6 +1212,41 @@ fn never_created() -> MachineState {
         joined: None,
         reason: ReleaseReason::Other("never_created".into()),
         gone_at: Utc::now(),
+    }
+}
+
+/// Stop the pool for a refusal, so its machines finish their jobs
+fn stop(pool: &mut Pool, end: PoolEnd) {
+    warn!(pool = %pool.name, code = end.job_code(), "pool stopped: it asks for no more machines");
+    pool.stop(end);
+}
+
+/// Count a machine that ended before it ever joined because the provider
+/// could not create it
+fn count_create_failure(pool: &mut Pool, machine: &PoolMachine, reason: &ReleaseReason) {
+    let unjoined = matches!(
+        machine.state,
+        MachineState::Requested | MachineState::Booting { .. }
+    );
+    if *reason != ReleaseReason::CreateFailed || !unjoined {
+        return;
+    }
+    pool.create_failed(Utc::now());
+    let failures = pool.create_failures.map_or(0, |failures| failures.count);
+    warn!(pool = %pool.name, machine = %machine.name, failures, "the provider could not create a machine");
+}
+
+/// Whether a machine is released because its pool no longer runs: a
+/// releasing pool releases every machine, a stopped one only those that
+/// have not joined, so joined ones finish their jobs
+fn ends_with_pool(pool: &PoolState, machine: &MachineState) -> bool {
+    match pool {
+        PoolState::Open => false,
+        PoolState::Stopped { .. } => matches!(machine, MachineState::Booting { .. }),
+        PoolState::Releasing { .. } | PoolState::Released { .. } => matches!(
+            machine,
+            MachineState::Booting { .. } | MachineState::Joined { .. }
+        ),
     }
 }
 

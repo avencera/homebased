@@ -1212,12 +1212,14 @@ fn a_pool_release_keeps_its_run_and_survives_a_stale_save() {
             stall_after: Duration::from_secs(1800),
             boot_timeout: Duration::from_secs(900),
             env_file: None,
+            spend_cap_cents: None,
         },
         run_request: uuid::Uuid::now_v7(),
         run: None,
         state: PoolState::Open,
         created_at: now,
         last_error: None,
+        create_failures: None,
     };
     store.insert_pool(&open).unwrap();
 

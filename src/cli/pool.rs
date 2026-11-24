@@ -1,5 +1,6 @@
 //! `homebased pool` commands: pools of temporary machines from cloudlease
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -47,6 +48,10 @@ pub enum PoolCommand {
         /// read at each join; it never reaches cloudlease or boot data
         #[arg(long = "env-file")]
         env_file: Option<PathBuf>,
+        /// Most the pool's cloudlease run may spend, in US dollars, such as
+        /// 25 or 12.50; cloudlease's own per-run cap when omitted
+        #[arg(long = "spend-cap", value_parser = parse_dollars)]
+        spend_cap: Option<NonZeroU32>,
     },
     /// List pools with their machines
     List,
@@ -77,6 +82,7 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
             stall_after,
             boot_timeout,
             env_file,
+            spend_cap,
         } => {
             let env_file = env_file.map(std::path::absolute).transpose()?;
             let format = |duration: Option<Duration>| {
@@ -93,6 +99,7 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
                 "stall_after": format(stall_after),
                 "boot_timeout": format(boot_timeout),
                 "env_file": env_file,
+                "spend_cap_cents": spend_cap,
             });
             client.post("/v1/pools", &body).await?
         }
@@ -114,4 +121,39 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whole US cents from a dollar amount with at most two decimals
+fn parse_dollars(text: &str) -> Result<NonZeroU32, String> {
+    let invalid = || format!("{text} is not a dollar amount such as 25 or 12.50");
+    let amount = text.strip_prefix('$').unwrap_or(text);
+    let (dollars, cents) = amount.split_once('.').unwrap_or((amount, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if dollars.is_empty() || cents.len() > 2 || !digits(dollars) || !digits(cents) {
+        return Err(invalid());
+    }
+    let dollars: u32 = dollars.parse().map_err(|_| invalid())?;
+    // "12.5" is 50 cents
+    let cents: u32 = format!("{cents:0<2}").parse().map_err(|_| invalid())?;
+    let total = dollars
+        .checked_mul(100)
+        .and_then(|total| total.checked_add(cents))
+        .ok_or_else(invalid)?;
+    NonZeroU32::new(total).ok_or_else(|| "--spend-cap must be more than 0".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dollars;
+
+    #[test]
+    fn dollar_amounts_become_whole_cents() {
+        let cents = |text| parse_dollars(text).map(std::num::NonZeroU32::get);
+        assert_eq!(cents("25"), Ok(2500));
+        assert_eq!(cents("12.5"), Ok(1250));
+        assert_eq!(cents("$0.07"), Ok(7));
+        for bad in ["0", "0.00", "1.234", ".5", "-1", "1e3", "ten", "99999999"] {
+            assert!(parse_dollars(bad).is_err(), "{bad}");
+        }
+    }
 }

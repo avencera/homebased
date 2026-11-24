@@ -87,14 +87,14 @@ impl Store {
             .collect()
     }
 
-    /// Move an open pool to releasing for `end`, and return it as stored;
-    /// `None` when there is no such pool
+    /// Move an open or stopped pool to releasing for `end`, and return it as
+    /// stored; `None` when there is no such pool
     pub fn release_pool(&self, name: &PoolName, end: PoolEnd) -> Result<Option<Pool>, AppError> {
         self.immediate(|| {
             let Some(mut pool) = self.pool(name)? else {
                 return Ok(None);
             };
-            if !matches!(pool.state, PoolState::Open) {
+            if !matches!(pool.state, PoolState::Open | PoolState::Stopped { .. }) {
                 return Ok(Some(pool));
             }
             pool.state = PoolState::Releasing { end };
@@ -166,7 +166,6 @@ impl Store {
             .transpose()
     }
 
-    /// Save a machine before its create call goes out
     /// Save a machine about to be asked for, with the create body every
     /// attempt of it sends
     pub fn insert_pool_machine(

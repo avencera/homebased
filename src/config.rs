@@ -444,7 +444,9 @@ impl RawTemporary {
         }
         let renew_interval = match self.renew_interval {
             Some(raw) => positive_duration("temporary.renew_interval", &raw)?,
-            None => std::time::Duration::from_secs(60),
+            // cloudlease's heartbeat window is 3 minutes by default, and it
+            // expects a renew every 30 seconds within it
+            None => std::time::Duration::from_secs(30),
         };
         Ok(TemporaryConfig {
             pool: self.pool,

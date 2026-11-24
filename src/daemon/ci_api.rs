@@ -5,6 +5,8 @@
 //! loop reads every machine's offer and sends ready jobs to the machines
 //! [`place`] picks. See `docs/ci-queue-design.md`
 
+use std::collections::BTreeSet;
+
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -133,16 +135,22 @@ pub(super) async fn check_offered(
     if matches!(pool, Ok(true)) {
         return Ok(());
     }
+    // the refusing pool's own machines do not count as other machines
+    let members = match &pool {
+        Err(_) => super::pools::pool_members(state, ci).await?,
+        Ok(_) => BTreeSet::new(),
+    };
     let scope = match choice {
         MachineChoice::Any => Scope::All,
         MachineChoice::Pinned(machine) => Scope::One(machine),
     };
     let (_, statuses) = fleet_status(state, scope).await?;
     let offered = |status: &CiStatus| {
-        status
-            .offer
-            .class(&ci.class)
-            .is_some_and(|offer| offer.capacity.get() > 0)
+        !members.contains(&status.offer.machine)
+            && status
+                .offer
+                .class(&ci.class)
+                .is_some_and(|offer| offer.capacity.get() > 0)
     };
     if statuses.iter().any(offered) {
         return Ok(());

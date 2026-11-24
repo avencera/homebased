@@ -205,7 +205,7 @@ fn add_pools(conn: &Connection) -> Result<(), rusqlite::Error> {
 const POOL_TABLES: &str = "
 CREATE TABLE pools (
     name TEXT PRIMARY KEY,
-    state TEXT NOT NULL CHECK (state IN ('open', 'releasing', 'released')),
+    state TEXT NOT NULL CHECK (state IN ('open', 'stopped', 'releasing', 'released')),
     pool_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

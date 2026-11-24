@@ -140,7 +140,7 @@ See [resource-queue.md](resource-queue.md) for job and operation retry identitie
 | `pool_deadline_too_close` | 2 | Lower `--kill-after` to fit the pool's remaining time, or ask the user for a new pool with a later `--deadline`. |
 | `pool_not_found` | 3 | Read `homebased --json pool list` on the coordinator. |
 | `pool_exists` | 5 | Use the open pool, or release it first when its settings are wrong. |
-| `pool_ended` | 5 | The pool is releasing or released. Create a new one only with the user's approval. |
+| `pool_ended` | 5 | The pool is stopped, releasing, or released; the message has cloudlease's code when it stopped. Create a new one only with the user's approval. |
 | `join_refused` | 5 | A machine's join did not match a machine the coordinator asked for. Agents never see it; the machine retries and cloudlease deletes it at its boot deadline. |
 
-A pool that cloudlease refuses, for example with `spend_cap_reached`, or whose run cloudlease lost (`run_not_found`), releases itself and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code. See [pools.md](pools.md).
+A pool that cloudlease refuses a machine, for example with `run_ended` or `spend_cap_reached`, or whose machines the provider failed to create 3 times in a row (`create_failed`), stops: it fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code, and lets running jobs finish. A pool whose run cloudlease lost (`run_not_found`) is released. See [pools.md](pools.md).

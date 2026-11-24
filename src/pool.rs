@@ -14,6 +14,7 @@ pub mod error;
 pub mod renewal;
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -42,7 +43,15 @@ pub const DEFAULT_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Time from create to join after which a machine is released, by default
-pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+///
+/// Inside cloudlease's boot grace, 8 minutes by default, which deletes a
+/// machine that has not renewed by then: a machine renews only once it
+/// joined, so the coordinator releases it first, with `boot_timeout`
+pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(7 * 60);
+
+/// Machines in a row the provider could not create before a pool stops
+/// asking, so a broken class or region never turns into a create loop
+pub const MAX_CREATE_FAILURES: u32 = 3;
 
 /// A pool's name, which is also the CI class its machines offer
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -303,6 +312,10 @@ pub struct PoolSettings {
     /// get, read again at each join; never stored or sent to cloudlease
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<PathBuf>,
+    /// Most the pool's run may spend, in US cents; cloudlease's own per-run
+    /// cap when absent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap_cents: Option<NonZeroU32>,
 }
 
 /// Why a pool stopped taking machines
@@ -320,6 +333,11 @@ pub enum PoolEnd {
         /// cloudlease's message
         message: String,
     },
+    /// The provider could not create this many machines in a row
+    CreateFailed {
+        /// Failed creates in a row
+        failures: u32,
+    },
 }
 
 impl PoolEnd {
@@ -330,6 +348,7 @@ impl PoolEnd {
             Self::Requested => "pool_released",
             Self::Deadline => "pool_deadline",
             Self::Refused { code, .. } => code,
+            Self::CreateFailed { .. } => "create_failed",
         }
     }
 
@@ -344,6 +363,9 @@ impl PoolEnd {
             Self::Refused { code, message } => {
                 format!("cloudlease refused pool {pool} ({code}): {message}")
             }
+            Self::CreateFailed { failures } => {
+                format!("the provider could not create {failures} machines of pool {pool} in a row")
+            }
         }
     }
 }
@@ -354,6 +376,13 @@ impl PoolEnd {
 pub enum PoolState {
     /// It asks for machines as its jobs need them
     Open,
+    /// It asks for no more machines and takes no new job; its machines
+    /// finish the jobs they run and release themselves once idle
+    Stopped {
+        /// Why
+        #[serde(flatten)]
+        end: PoolEnd,
+    },
     /// It asks for no more machines and releases the ones it has
     Releasing {
         /// Why
@@ -376,6 +405,7 @@ impl PoolState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Open => "open",
+            Self::Stopped { .. } => "stopped",
             Self::Releasing { .. } => "releasing",
             Self::Released { .. } => "released",
         }
@@ -386,8 +416,9 @@ impl PoolState {
     pub fn stage(&self) -> u8 {
         match self {
             Self::Open => 0,
-            Self::Releasing { .. } => 1,
-            Self::Released { .. } => 2,
+            Self::Stopped { .. } => 1,
+            Self::Releasing { .. } => 2,
+            Self::Released { .. } => 3,
         }
     }
 }
@@ -412,6 +443,60 @@ pub struct Pool {
     /// Last cloudlease error the coordinator met, for `pool show`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Machines in a row the provider could not create, since the last
+    /// create it took
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_failures: Option<CreateFailures>,
+}
+
+impl Pool {
+    /// Count a machine the provider could not create; the pool stops at
+    /// [`MAX_CREATE_FAILURES`] in a row
+    pub fn create_failed(&mut self, at: DateTime<Utc>) {
+        let count = self
+            .create_failures
+            .map_or(1, |failures| failures.count + 1);
+        self.create_failures = Some(CreateFailures { count, last_at: at });
+        if count >= MAX_CREATE_FAILURES {
+            self.stop(PoolEnd::CreateFailed { failures: count });
+        }
+    }
+
+    /// Ask for no more machines and take no new job, for `end`, when still open
+    pub fn stop(&mut self, end: PoolEnd) {
+        if matches!(self.state, PoolState::Open) {
+            self.state = PoolState::Stopped { end };
+        }
+    }
+
+    /// The provider took a create, so earlier failures were not the class's fault
+    pub fn create_succeeded(&mut self) {
+        self.create_failures = None;
+    }
+
+    /// Whether a new machine may be asked for at `now`: after a failed
+    /// create the pool waits `backoff`, doubled for each failure in a row
+    #[must_use]
+    pub fn creates_allowed(&self, now: DateTime<Utc>, backoff: Duration) -> bool {
+        let Some(failures) = self.create_failures else {
+            return true;
+        };
+        let doublings = failures.count.saturating_sub(1).min(8);
+        let wait = backoff.saturating_mul(1 << doublings);
+        chrono::Duration::from_std(wait)
+            .ok()
+            .and_then(|wait| failures.last_at.checked_add_signed(wait))
+            .is_some_and(|at| now >= at)
+    }
+}
+
+/// Machines in a row the provider could not create
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateFailures {
+    /// How many
+    pub count: u32,
+    /// When the last one was seen
+    pub last_at: DateTime<Utc>,
 }
 
 /// Why a machine was or is being deleted

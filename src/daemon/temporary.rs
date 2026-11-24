@@ -39,6 +39,9 @@ const RETRY: Duration = Duration::from_secs(5);
 /// Time limit for one join call
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wait between attempts at a renew that failed, within one round
+const RENEW_RETRY: Duration = Duration::from_secs(5);
+
 /// What other parts of the daemon read about this machine's lease
 ///
 /// A watch channel rather than a lock, since the daemon holds no shared
@@ -81,7 +84,8 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
     };
     let mut clock = IdleClock::started(Utc::now());
     let mut withheld = false;
-    let mut tick = tokio::time::interval(config.renew_interval);
+    let round = lease.renew_interval(config.renew_interval);
+    let mut tick = tokio::time::interval(round);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
@@ -101,7 +105,8 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
         match decision {
             Renewal::Renew => {
                 withheld = false;
-                if renew(&lease).await == LeaseEnd::Ended {
+                if renew(&lease, round).await == LeaseEnd::Ended {
+                    close_class(&state, &answer).await;
                     break;
                 }
             }
@@ -309,25 +314,49 @@ enum LeaseEnd {
     Ended,
 }
 
-async fn renew(lease: &LeaseCredential) -> LeaseEnd {
-    let call = lease.clone();
-    let renewed = tokio::task::spawn_blocking(move || call.renew())
-        .await
-        .unwrap_or_else(|error| {
-            Err(CloudleaseError::Unavailable {
-                message: error.to_string(),
-            })
-        });
-    match renewed {
-        Ok(_) => LeaseEnd::Live,
-        Err(error) if error.is_gone() => {
-            warn!("lease renewal refused: {error}");
-            LeaseEnd::Ended
-        }
-        Err(error) => {
+/// Renew the lease, trying again within this round when a call fails
+///
+/// cloudlease's heartbeat window is a few renew rounds long, so a brief
+/// outage must not wait out whole rounds before the next attempt
+async fn renew(lease: &LeaseCredential, round: Duration) -> LeaseEnd {
+    let started = tokio::time::Instant::now();
+    loop {
+        let call = lease.clone();
+        let renewed = tokio::task::spawn_blocking(move || call.renew())
+            .await
+            .unwrap_or_else(|error| {
+                Err(CloudleaseError::Unavailable {
+                    message: error.to_string(),
+                })
+            });
+        let error = match renewed {
+            Ok(_) => return LeaseEnd::Live,
+            Err(error) if error.is_gone() => {
+                warn!("lease renewal refused: {error}");
+                return LeaseEnd::Ended;
+            }
+            Err(error) => error,
+        };
+
+        // the next round tries again
+        if started.elapsed() + RENEW_RETRY >= round {
             warn!("lease renewal failed: {error}");
-            LeaseEnd::Live
+            return LeaseEnd::Live;
         }
+        warn!("lease renewal failed, retrying: {error}");
+        tokio::time::sleep(RENEW_RETRY).await;
+    }
+}
+
+/// Stop offering the pool's class once cloudlease ended the lease, so no
+/// job is placed on a machine about to be deleted; running jobs go on
+/// until it is
+async fn close_class(state: &AppState, answer: &JoinAnswer) {
+    // the queue is this daemon's own, so a failure is brief; the machine is
+    // deleted soon whatever happens
+    while let Err(error) = offer(state, answer, SlotCapacity::default()).await {
+        warn!("close the class after the lease ended: {error}");
+        tokio::time::sleep(RETRY).await;
     }
 }
 
