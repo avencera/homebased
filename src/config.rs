@@ -138,8 +138,9 @@ pub struct PoolsConfig {
     pub cloudlease_url: String,
     /// File holding the cloudlease client token, read for each call
     pub cloudlease_token_file: PathBuf,
-    /// Homebased release temporary machines install; this daemon's own by default
-    pub homebased_version: String,
+    /// Where temporary machines get the Homebased they install; this
+    /// daemon's own release by default
+    pub machine_install: crate::pool::boot::MachineInstall,
     /// Time between passes over each pool
     #[serde(with = "humantime_serde")]
     pub reconcile_interval: std::time::Duration,
@@ -358,7 +359,16 @@ struct RawPools {
     #[serde(default)]
     homebased_version: Option<String>,
     #[serde(default)]
+    homebased_archive: Option<RawArchive>,
+    #[serde(default)]
     reconcile_interval: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawArchive {
+    url: String,
+    sha256: String,
 }
 
 impl RawPools {
@@ -375,19 +385,21 @@ impl RawPools {
                 self.cloudlease_token_file.display()
             ));
         }
-        let version = self
-            .homebased_version
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
-        let version = version.trim_start_matches('v').to_owned();
-        let semver_like = !version.is_empty()
-            && version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'));
-        if !semver_like {
-            return Err(format!(
-                "pools.homebased_version {version:?} is not a release version"
-            ));
-        }
+        use crate::pool::boot::MachineInstall;
+        let machine_install = match (self.homebased_version, self.homebased_archive) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "pools.homebased_version and pools.homebased_archive are exclusive".into(),
+                );
+            }
+            (_, Some(archive)) => MachineInstall::archive(&archive.url, &archive.sha256)
+                .map_err(|error| format!("pools.homebased_archive: {error}"))?,
+            (version, None) => {
+                let version = version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+                MachineInstall::release(&version)
+                    .map_err(|error| format!("pools.homebased_version: {error}"))?
+            }
+        };
         let reconcile_interval = match self.reconcile_interval {
             Some(raw) => positive_duration("pools.reconcile_interval", &raw)?,
             None => std::time::Duration::from_secs(15),
@@ -395,7 +407,7 @@ impl RawPools {
         Ok(PoolsConfig {
             cloudlease_url: url,
             cloudlease_token_file: self.cloudlease_token_file,
-            homebased_version: version,
+            machine_install,
             reconcile_interval,
         })
     }

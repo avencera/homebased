@@ -18,7 +18,14 @@ cloudlease_url = "https://cloudlease.example.workers.dev"
 cloudlease_token_file = "/home/me/.config/homebased/cloudlease-token"
 # homebased_version = "0.37.0"         # release machines install; this daemon's by default
 # reconcile_interval = "15s"
+
+# instead of homebased_version, for a build with no release: one archive pinned by its sha256
+# [pools.homebased_archive]
+# url = "https://example.com/homebased-x86_64-unknown-linux-musl.tar.gz"
+# sha256 = "<64 hex digits>"
 ```
+
+`homebased_archive` and `homebased_version` are exclusive. The archive is a `.tar.gz` holding a static Linux `homebased` for the machines' architecture; every machine downloads it from `url`, an `https` URL with no quotes or whitespace, and refuses it unless its sha256 matches. The URL is in the boot data, which anything on the machine can read, so a signed URL in it should expire soon after the pool's deadline.
 
 Machines use the coordinator's `relays` too; see [Link](#link). They need no inbound port and no tailnet.
 
@@ -77,7 +84,7 @@ A pool stops when cloudlease refuses a machine for good, or after three `create_
 
 ## On the machine
 
-The machine's boot data, written by the coordinator and passed through cloudlease, installs the static Homebased release for the machine's architecture, checks its `.sha256`, and starts `homebased daemon serve` on loopback with a `[temporary]` config section naming the coordinator's iroh endpoint. The daemon then:
+The machine's boot data, written by the coordinator and passed through cloudlease, installs the static Homebased release for the machine's architecture and checks it against the release's `.sha256`, or downloads the `homebased_archive` and checks it against the sha256 the coordinator pinned, and starts `homebased daemon serve` on loopback with a `[temporary]` config section naming the coordinator's iroh endpoint. The daemon then:
 
 1. reads `/etc/cloudlease/lease.json`, the lease and its lease-scoped token;
 2. makes its iroh key, dials the coordinator, and joins with the single-use join token from its boot data, which binds its endpoint id to its lease; it gets the pool's settings and the `--env-file` variables in the answer;

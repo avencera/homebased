@@ -31,6 +31,78 @@ pub const DEFAULT_LINK_LISTEN: SocketAddr =
 /// coordinator reaches it over the link
 const MACHINE_WEB_LISTEN: &str = "127.0.0.1:7677";
 
+/// Where a temporary machine gets the Homebased it installs
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum MachineInstall {
+    /// A GitHub release, such as `0.37.0`, checked against the `.sha256` of
+    /// the same release
+    Release {
+        /// Release version, without the `v`
+        version: String,
+    },
+    /// One archive the coordinator pins by its sha256, for a build that has
+    /// no release; the archive must hold the Linux build for the machine's
+    /// architecture
+    Archive {
+        /// `https` URL of the `.tar.gz`
+        url: String,
+        /// Its sha256, 64 lowercase hex digits
+        sha256: String,
+    },
+}
+
+impl MachineInstall {
+    /// A release install, checking that `version` looks like one
+    pub fn release(version: &str) -> Result<Self, String> {
+        let version = version.trim_start_matches('v');
+        let semver_like = !version.is_empty()
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'));
+        if !semver_like {
+            return Err(format!("{version:?} is not a release version"));
+        }
+        Ok(Self::Release {
+            version: version.to_owned(),
+        })
+    }
+
+    /// An archive install, checking that the URL is safe to quote in the boot
+    /// script and that the digest is a sha256
+    pub fn archive(url: &str, sha256: &str) -> Result<Self, String> {
+        // the script single-quotes the URL, so it may hold no quote, and no
+        // whitespace or control character that could end the line
+        let quotable = !url
+            .chars()
+            .any(|ch| ch == '\'' || ch.is_whitespace() || ch.is_control());
+        if !url.starts_with("https://") || !quotable {
+            return Err(format!(
+                "the archive URL must be https with no quotes or whitespace, got {url:?}"
+            ));
+        }
+        let sha256 = sha256.to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{sha256:?} is not a sha256 of 64 hex digits"));
+        }
+        Ok(Self::Archive {
+            url: url.to_owned(),
+            sha256,
+        })
+    }
+
+    /// The boot script that installs and starts Homebased
+    fn script(&self) -> String {
+        let fetch = match self {
+            Self::Release { version } => RELEASE_FETCH.replace("@VERSION@", version),
+            Self::Archive { url, sha256 } => ARCHIVE_FETCH
+                .replace("@URL@", url)
+                .replace("@SHA256@", sha256),
+        };
+        format!("{fetch}{INSTALL}")
+    }
+}
+
 /// One file cloudlease writes before running the boot commands
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootFile {
@@ -65,8 +137,8 @@ pub struct BootPlan<'a> {
     pub hub: &'a LinkAddr,
     /// Relays the machine's endpoint uses, the coordinator's own
     pub relays: &'a Relays,
-    /// Homebased release it installs, such as `0.37.0`
-    pub version: &'a str,
+    /// Where it gets the Homebased it installs
+    pub install: &'a MachineInstall,
 }
 
 impl BootPlan<'_> {
@@ -88,7 +160,7 @@ impl BootPlan<'_> {
                 BootFile {
                     path: SCRIPT_FILE.into(),
                     mode: "0755".into(),
-                    content: SCRIPT.replace("@VERSION@", self.version),
+                    content: self.install.script(),
                 },
             ],
             run: vec![vec!["/bin/sh".into(), SCRIPT_FILE.into()]],
@@ -162,7 +234,7 @@ WantedBy=multi-user.target
 
 // the checksum comes from the same release as the archive, so it catches a
 // corrupt download, not a compromised release
-const SCRIPT: &str = r#"#!/bin/sh
+const RELEASE_FETCH: &str = r#"#!/bin/sh
 set -eu
 case "$(uname -m)" in
   x86_64) target=x86_64-unknown-linux-musl ;;
@@ -177,7 +249,18 @@ curl -fsSL --retry 5 -o "$work/$archive" "$base/$archive"
 # the release names the checksum after the target, without the archive suffix
 curl -fsSL --retry 5 -o "$work/$archive.sha256" "$base/homebased-$tag-$target.sha256"
 expected=$(cut -d ' ' -f 1 "$work/$archive.sha256")
-actual=$(sha256sum "$work/$archive" | cut -d ' ' -f 1)
+"#;
+
+// the coordinator pins the checksum, so the archive's host is not trusted
+const ARCHIVE_FETCH: &str = r#"#!/bin/sh
+set -eu
+archive=homebased.tar.gz
+work=$(mktemp -d)
+curl -fsSL --retry 5 -o "$work/$archive" '@URL@'
+expected=@SHA256@
+"#;
+
+const INSTALL: &str = r#"actual=$(sha256sum "$work/$archive" | cut -d ' ' -f 1)
 if [ "$expected" != "$actual" ]; then
   echo "homebased boot: checksum mismatch for $archive" >&2
   exit 1
@@ -210,7 +293,7 @@ mod tests {
             join_token: &token,
             hub: &hub,
             relays: &Relays::N0,
-            version: "0.37.0",
+            install: &MachineInstall::release("v0.37.0").unwrap(),
         };
         let payload = plan.render();
         let paths: Vec<&str> = payload
@@ -244,5 +327,86 @@ mod tests {
         assert_eq!(config.machine_name, Some(name));
         // boot data stays well under cloudlease's 32 KiB limit
         assert!(serde_json::to_vec(&payload).unwrap().len() < 8 * 1024);
+    }
+
+    #[test]
+    fn archive_installs_are_checked_against_the_pinned_sha256() {
+        assert!(MachineInstall::archive("http://example.com/hb.tar.gz", &"0".repeat(64)).is_err());
+        assert!(MachineInstall::archive("https://example.com/a'b", &"0".repeat(64)).is_err());
+        assert!(MachineInstall::archive("https://example.com/a b", &"0".repeat(64)).is_err());
+        assert!(MachineInstall::archive("https://example.com/hb.tar.gz", "abc").is_err());
+        assert!(MachineInstall::release("not a version").is_err());
+
+        let url = "https://example.com/hb.tar.gz?X-Amz-Signature=ab&X-Amz-Expires=3600";
+        let install = MachineInstall::archive(url, &"AB".repeat(32)).unwrap();
+        let script = install.script();
+        assert!(script.contains(&format!("'{url}'")), "{script}");
+        assert!(
+            script.contains(&format!("expected={}", "ab".repeat(32))),
+            "{script}"
+        );
+        assert!(!script.contains("github.com"), "{script}");
+    }
+
+    /// Runs a rendered archive script with `curl`, `install`, and `systemctl`
+    /// replaced, and returns whether it installed the binary
+    #[cfg(target_os = "linux")]
+    fn run_archive_script(archive: &std::path::Path, sha256: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let installed = dir.path().join("installed");
+        let stubs = [
+            // curl -fsSL --retry 5 -o <out> <url>
+            (
+                "curl",
+                format!("#!/bin/sh\ncp '{}' \"$5\"\n", archive.display()),
+            ),
+            (
+                "install",
+                format!("#!/bin/sh\ncp \"$3\" '{}'\n", installed.display()),
+            ),
+            ("systemctl", "#!/bin/sh\nexit 0\n".to_owned()),
+        ];
+        for (name, body) in stubs {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let install = MachineInstall::archive("https://example.com/hb.tar.gz", sha256).unwrap();
+        let script = dir.path().join("boot.sh");
+        std::fs::write(&script, install.script()).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let status = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .env("PATH", path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        status.success() && installed.exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_archive_script_installs_only_the_archive_it_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("homebased"), "binary").unwrap();
+        let archive = dir.path().join("hb.tar.gz");
+        let packed = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir.path())
+            .arg("homebased")
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let digest = crate::queue::sha256_hex(&std::fs::read(&archive).unwrap());
+
+        assert!(run_archive_script(&archive, &digest));
+        assert!(!run_archive_script(&archive, &"0".repeat(64)));
     }
 }
