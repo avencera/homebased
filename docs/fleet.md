@@ -98,11 +98,15 @@ transports = ["http", "iroh"]         # try in this order
 
 A call to a peer tries its addresses in order and moves on when one does not
 answer: the entry's transports in their order, then addresses that mDNS,
-Tailscale, or earlier probes found. An entry without `http` is link-only: the
-peer is reached over the link and never at an HTTP address, even one that
-answers with its machine UUID, because plain HTTP cannot prove who answered.
+Tailscale, or earlier probes found. The choice is made when an identity probe
+answers: a request that then fails on that address is not retried on the next
+transport, and the caller's next try probes again.
+
+An entry without `http` is link-only: the peer is reached over the link and
+never at an HTTP address, even one that answers with its machine UUID, because
+plain HTTP cannot prove who answered.
 This takes hold once a link probe has confirmed the peer's machine at that
-endpoint id, which the directory keeps across restarts; until then, an HTTP
+endpoint id, which the directory saves at once and keeps across restarts; until then, an HTTP
 address cached for the machine can still be tried. To turn an HTTP peer
 link-only, first list it with both transports and check that `fleet machines`
 shows its `iroh` id.

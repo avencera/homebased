@@ -647,10 +647,10 @@ fn read_key(path: &std::path::Path) -> Result<Option<SecretKey>, AppError> {
 fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let staging = path.with_extension(format!("new.{}", std::process::id()));
+    // unique per call, so two callers never write through one staging file
+    let staging = path.with_extension(format!("new.{}", uuid::Uuid::now_v7()));
     let written = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&staging)
@@ -661,6 +661,7 @@ fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
         // a hard link, unlike a rename, refuses to replace a key another
         // process published first
         .and_then(|()| std::fs::hard_link(&staging, path));
+    // the staging name is this call's alone, so removing it is always safe
     let _ = std::fs::remove_file(&staging);
     written
 }

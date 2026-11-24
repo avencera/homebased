@@ -405,9 +405,18 @@ impl FleetHandle {
         let result = probe(&self.shared.client, address, self.shared.local.protocol).await;
         let now = Utc::now();
         let mut directory = self.shared.directory.write().await;
-        match &result {
+        let bound = match &result {
             Ok(probed) => directory.record_probe(address, probed, now),
-            Err(err) => directory.record_probe_failure(address, err.to_string(), now),
+            Err(err) => {
+                directory.record_probe_failure(address, err.to_string(), now);
+                false
+            }
+        };
+        drop(directory);
+        // a restart before the round's save must not lose the binding, or a
+        // link-only peer's cached HTTP addresses would route again
+        if bound {
+            self.persist().await;
         }
         result
     }
@@ -663,6 +672,7 @@ impl FleetHandle {
         let mut sweep = ProbeSweep::default();
         for (address, result, at) in results {
             let err = match result {
+                // the round saves once it settles
                 Ok(probed) => {
                     directory.record_probe(&address, &probed, at);
                     sweep.answers.push(ProbeObservation {

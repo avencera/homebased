@@ -476,19 +476,22 @@ impl PeerDirectory {
     ///
     /// This does not change identity status; the runtime decides that from
     /// two probe rounds with [`Self::apply_verdict`].
+    ///
+    /// Returns `true` when the probe bound the machine to a new endpoint id,
+    /// which the caller should save at once: link-only routing rests on it
     pub fn record_probe(
         &mut self,
         address: &MachineAddress,
         probed: &ProbedMachine,
         now: DateTime<Utc>,
-    ) {
+    ) -> bool {
         let header = probed.header();
         let record = self.addresses.entry(address.clone()).or_default();
         record.last_failure = None;
         let via_link = record.link;
         if self.local.identity.is_self(header.machine, header.boot) {
             record.binding = AddressBinding::Local { verified_at: now };
-            return;
+            return false;
         }
         record.binding = AddressBinding::Machine {
             machine: header.machine,
@@ -497,7 +500,7 @@ impl PeerDirectory {
         if header.machine == self.local.identity.machine {
             // a second daemon claims the local UUID; keep no peer record for
             // it, the runtime reports the conflict from its probe rounds
-            return;
+            return false;
         }
         let (capabilities, advertised, dashboard_url, t3_environment) = match probed {
             ProbedMachine::Compatible { advertisement, .. } => (
@@ -511,7 +514,8 @@ impl PeerDirectory {
         let old = self.machines.get(&header.machine);
         let identity = old.map_or(IdentityStatus::Consistent, |old| old.identity.clone());
         // only a probe over the link proves which endpoint a machine holds
-        let link = via_link.or_else(|| old.and_then(|old| old.link));
+        let known = old.and_then(|old| old.link);
+        let link = via_link.or(known);
         self.machines.insert(
             header.machine,
             MachineRecord {
@@ -525,6 +529,7 @@ impl PeerDirectory {
                 identity,
             },
         );
+        link != known
     }
 
     /// Record a failed probe. The binding stays as a cached hint.
@@ -1074,13 +1079,17 @@ mod tests {
             SightingProvider::Mdns,
             now + Duration::seconds(60),
         ));
-        for raw in [
+        let bound: Vec<bool> = [
             "http://10.0.0.2:7677",
             "http://code:7677",
             "http://127.0.0.1:41000",
-        ] {
-            dir.record_probe(&addr(raw), &probed(machine, boot, "code"), now);
-        }
+            "http://127.0.0.1:41000",
+        ]
+        .into_iter()
+        .map(|raw| dir.record_probe(&addr(raw), &probed(machine, boot, "code"), now))
+        .collect();
+        // only the first probe over the link binds, so the caller saves once
+        assert_eq!(bound, vec![false, false, true, false]);
         let order = |dir: &PeerDirectory| -> Vec<String> {
             dir.route(machine, now).map_or_else(
                 |_| Vec::new(),
