@@ -874,6 +874,24 @@ async fn cluster_event(
     State(state): State<AppState>,
     QueueJson(body): QueueJson<ClusterJobEvent>,
 ) -> Result<Json<Value>, AppError> {
+    accept_job_event(&state, body).await
+}
+
+/// `POST /v1/cluster/job-events` over the Fleet link: only for jobs the
+/// temporary machine on the other end stores
+pub(super) async fn member_job_event(
+    State(state): State<AppState>,
+    axum::Extension(peer): axum::Extension<super::fleet_link::LinkPeer>,
+    QueueJson(body): QueueJson<ClusterJobEvent>,
+) -> Result<Json<Value>, AppError> {
+    peer.require_member(body.event.authority)?;
+    accept_job_event(&state, body).await
+}
+
+async fn accept_job_event(
+    state: &AppState,
+    body: ClusterJobEvent,
+) -> Result<Json<Value>, AppError> {
     state
         .machine
         .identity

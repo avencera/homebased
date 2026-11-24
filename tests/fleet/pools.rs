@@ -32,19 +32,24 @@ fn coordinator(fake: &FakeCloudlease) -> Daemon {
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     daemon.codex_override = Some(codex);
     let token = daemon.user_home.join("cloudlease-token");
+    // a fixed link port, as in production, so boot data's addresses survive
+    // the coordinator's restarts
+    let link_port = std::net::UdpSocket::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     fs::write(&token, format!("{CLIENT_TOKEN}\n")).unwrap();
     let mut config = fs::read_to_string(&daemon.config).unwrap();
     config.push_str(&format!(
         "\n[pools]\ncloudlease_url = \"{}\"\ncloudlease_token_file = \"{}\"\n\
          homebased_version = \"0.0.0-test\"\nreconcile_interval = \"1s\"\n\
-         link = {{ kind = \"tailnet\", join_address = \"{}\" }}\n",
+         \n[fleet.iroh]\nrelays = \"disabled\"\nport = {link_port}\n",
         fake.base(),
         token.display(),
-        daemon.address(),
     ));
     config.push_str(OPEN_ADMISSION);
     fs::write(&daemon.config, config).unwrap();
-    // the restart keeps the port the join address names
     daemon.restart();
     daemon
 }
@@ -118,7 +123,7 @@ fn boot(fake: &FakeCloudlease, lease: &FakeLease) -> Daemon {
         .replace(
             "lease_file = \"/etc/cloudlease/lease.json\"",
             &format!(
-                "lease_file = \"{}\"\nrenew_interval = \"1s\"",
+                "lease_file = \"{}\"\nrenew_interval = \"1s\"\nlink_listen = \"127.0.0.1:0\"",
                 lease_file.display()
             ),
         );
@@ -206,6 +211,61 @@ fn machine_states(pool: &Value) -> Vec<String> {
         .iter()
         .map(|machine| machine["state"].as_str().unwrap().to_owned())
         .collect()
+}
+
+/// One HTTP exchange over the pool link, as an endpoint with `key` would
+/// make it: the status, or `None` when the coordinator closed the connection
+/// instead of answering
+fn link_request(lease: &FakeLease, key: iroh::SecretKey, request: &str) -> Option<u16> {
+    let config = lease.boot["files"][0]["content"].as_str().unwrap();
+    let temporary = &toml::from_str::<toml::Value>(config).unwrap()["temporary"];
+    let hub: iroh::EndpointId = temporary["hub"].as_str().unwrap().parse().unwrap();
+    let addrs = temporary["hub_addrs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|addr| iroh::TransportAddr::Ip(addr.as_str().unwrap().parse().unwrap()));
+    let hub = iroh::EndpointAddr::from_parts(hub, addrs);
+    let request = request.to_owned();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .secret_key(key)
+                .bind()
+                .await
+                .unwrap();
+            let connection = endpoint.connect(hub, b"homebased/fleet/1").await.unwrap();
+            let (mut send, mut recv) = connection.open_bi().await.ok()?;
+            send.write_all(request.as_bytes()).await.ok()?;
+            send.finish().ok()?;
+            let answer = recv.read_to_end(64 * 1024).await.ok()?;
+            endpoint.close().await;
+            let answer = String::from_utf8_lossy(&answer).into_owned();
+            answer.split_whitespace().nth(1)?.parse().ok()
+        })
+}
+
+fn get(path: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n\r\n")
+}
+
+fn post(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: hub\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The iroh key a booted machine made for itself
+fn machine_key(daemon: &Daemon) -> iroh::SecretKey {
+    let bytes: [u8; 32] = fs::read(daemon.home.join("iroh/secret.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    iroh::SecretKey::from_bytes(&bytes)
 }
 
 #[test]
@@ -305,6 +365,33 @@ fn a_pool_boots_machines_for_jobs_hands_over_secrets_and_releases_idle_machines(
         assert!(lease.renewals > 0, "{} never renewed", lease.hostname);
     }
 
+    // the link serves an unknown endpoint only the join route, and closes
+    // its connection once that fails
+    let probe = get("/v1/cluster/machine?api_version=1");
+    let stranger = iroh::SecretKey::generate();
+    assert_eq!(
+        link_request(&leases[0], stranger.clone(), &probe),
+        Some(404)
+    );
+    let forged_join = post("/v1/cluster/pool/join", "{}");
+    assert!(link_request(&leases[0], stranger, &forged_join).is_some_and(|status| status >= 400));
+    // a joined machine reaches the member routes, and nothing that starts
+    // work or reads other machines' tasks
+    let member = machine_key(&machines.daemons[&leases[0].lease_id]);
+    assert_eq!(link_request(&leases[0], member.clone(), &probe), Some(200));
+    for forbidden in [
+        post("/v1/cluster/executions", "{}"),
+        post("/v1/cluster/messages", "{}"),
+        get("/v1/cluster/tasks"),
+        post("/v1/pools", "{}"),
+    ] {
+        assert_eq!(
+            link_request(&leases[0], member.clone(), &forbidden),
+            Some(404),
+            "{forbidden}"
+        );
+    }
+
     // idle machines release themselves; the coordinator drops each from the
     // Fleet once cloudlease confirms it gone
     assert!(
@@ -323,6 +410,8 @@ fn a_pool_boots_machines_for_jobs_hands_over_secrets_and_releases_idle_machines(
     for machine in pool(&origin, thread, "afv")["machines"].as_array().unwrap() {
         assert_eq!(machine["reason"], "idle");
     }
+    // once its lease ended, the machine's id gets only the join route again
+    assert_eq!(link_request(&leases[0], member, &probe), Some(404));
     let fleet = cli(&origin, thread, &["fleet", "machines"]);
     for lease in &leases {
         assert!(
@@ -342,7 +431,7 @@ fn a_pool_boots_machines_for_jobs_hands_over_secrets_and_releases_idle_machines(
 #[test]
 fn renewal_lasts_while_output_flows_and_a_stalled_job_fails_with_its_machine() {
     let fake = FakeCloudlease::start(Duration::from_secs(4));
-    let origin = coordinator(&fake);
+    let mut origin = coordinator(&fake);
     let thread = thread(&origin);
     cli(
         &origin,
@@ -384,13 +473,29 @@ fn renewal_lasts_while_output_flows_and_a_stalled_job_fails_with_its_machine() {
         fake.leases()
     );
 
+    // a coordinator restart keeps its endpoint id and serves the joined
+    // machine again under the id its lease is bound to
+    let lease = ticking.unwrap();
+    let member = machine_key(&machines.daemons[&lease.lease_id]);
+    origin.restart();
+    let probe = get("/v1/cluster/machine?api_version=1");
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            link_request(&lease, member.clone(), &probe) == Some(200)
+        }),
+        "the restarted coordinator never served its machine again"
+    );
+
     // silence for the stall window stops renewal; cloudlease lets the
     // heartbeat lapse and the coordinator fails the job with its machine
     assert!(
-        machines.drive(&fake, Duration::from_secs(60), || final_event(&origin, job)
+        // the machine renews while it owes events; after the restart it
+        // delivers them once the link is back and its retries come round
+        machines.drive(&fake, Duration::from_secs(90), || final_event(&origin, job)
             .is_some()),
-        "the stalled job never ended: {}",
-        pool(&origin, thread, "stall")
+        "the stalled job never ended: {}\n{:?}",
+        pool(&origin, thread, "stall"),
+        fake.leases()
     );
     let event = final_event(&origin, job).unwrap();
     assert_eq!(event.event, JobEventKind::JobFailed);

@@ -138,8 +138,6 @@ pub struct PoolsConfig {
     pub cloudlease_url: String,
     /// File holding the cloudlease client token, read for each call
     pub cloudlease_token_file: PathBuf,
-    /// How temporary machines reach this daemon
-    pub link: crate::pool::link::MemberLink,
     /// Homebased release temporary machines install; this daemon's own by default
     pub homebased_version: String,
     /// Time between passes over each pool
@@ -154,8 +152,11 @@ pub struct TemporaryConfig {
     pub pool: crate::pool::PoolName,
     /// Its slot
     pub slot: crate::pool::SlotId,
-    /// Address of the pool's coordinator
-    pub coordinator: MachineAddress,
+    /// The coordinator's iroh endpoint
+    #[serde(skip)]
+    pub hub: crate::fleet::iroh::LinkAddr,
+    /// Loopback address where this machine's Fleet reaches the coordinator
+    pub link_listen: std::net::SocketAddr,
     /// Single-use token it joins with
     #[serde(skip)]
     pub join_token: crate::pool::JoinToken,
@@ -249,6 +250,20 @@ pub struct FleetSettings {
     pub discovery: Discovery,
     /// Declared peer addresses, unique after normalization
     pub machines: Vec<MachineAddress>,
+    /// The iroh link, when `[fleet.iroh]` is present
+    pub iroh: Option<IrohConfig>,
+}
+
+/// This daemon's iroh endpoint for the Fleet link
+///
+/// Today only a pool's coordinator and its temporary machines use it; other
+/// Fleet traffic stays on plain HTTP
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IrohConfig {
+    /// Relays the endpoint uses to find its peers
+    pub relays: crate::fleet::iroh::Relays,
+    /// IPv4 UDP port of the endpoint; `0` picks one at each start
+    pub port: u16,
 }
 
 /// Automatic discovery providers
@@ -340,7 +355,6 @@ struct RawConfig {
 struct RawPools {
     cloudlease_url: String,
     cloudlease_token_file: PathBuf,
-    link: crate::pool::link::MemberLink,
     #[serde(default)]
     homebased_version: Option<String>,
     #[serde(default)]
@@ -381,7 +395,6 @@ impl RawPools {
         Ok(PoolsConfig {
             cloudlease_url: url,
             cloudlease_token_file: self.cloudlease_token_file,
-            link: self.link,
             homebased_version: version,
             reconcile_interval,
         })
@@ -393,7 +406,13 @@ impl RawPools {
 struct RawTemporary {
     pool: crate::pool::PoolName,
     slot: crate::pool::SlotId,
-    coordinator: MachineAddress,
+    hub: iroh::EndpointId,
+    #[serde(default)]
+    hub_relay: Option<iroh::RelayUrl>,
+    #[serde(default)]
+    hub_addrs: Vec<std::net::SocketAddr>,
+    #[serde(default)]
+    link_listen: Option<std::net::SocketAddr>,
     join_token: String,
     #[serde(default)]
     lease_file: Option<PathBuf>,
@@ -415,6 +434,14 @@ impl RawTemporary {
                 lease_file.display()
             ));
         }
+        let link_listen = self
+            .link_listen
+            .unwrap_or(crate::pool::boot::DEFAULT_LINK_LISTEN);
+        if !link_listen.ip().is_loopback() {
+            return Err(format!(
+                "temporary.link_listen must be a loopback address, got {link_listen}"
+            ));
+        }
         let renew_interval = match self.renew_interval {
             Some(raw) => positive_duration("temporary.renew_interval", &raw)?,
             None => std::time::Duration::from_secs(60),
@@ -422,7 +449,12 @@ impl RawTemporary {
         Ok(TemporaryConfig {
             pool: self.pool,
             slot: self.slot,
-            coordinator: self.coordinator,
+            hub: crate::fleet::iroh::LinkAddr {
+                id: self.hub,
+                relay: self.hub_relay,
+                addrs: self.hub_addrs,
+            },
+            link_listen,
             join_token: crate::pool::JoinToken::new(self.join_token),
             lease_file,
             renew_interval,
@@ -882,6 +914,17 @@ struct RawFleet {
     discovery: RawDiscovery,
     #[serde(default)]
     machines: Vec<RawMachine>,
+    #[serde(default)]
+    iroh: Option<RawIroh>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIroh {
+    #[serde(default)]
+    relays: crate::fleet::iroh::Relays,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -922,7 +965,12 @@ impl RawConfig {
             machine_name,
             discovery,
             machines,
+            iroh,
         } = self.fleet;
+        let iroh = iroh.map(|raw| IrohConfig {
+            relays: raw.relays,
+            port: raw.port.unwrap_or(crate::fleet::iroh::DEFAULT_PORT),
+        });
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
         let waiting_tasks = self.power.waiting_tasks;
@@ -933,8 +981,17 @@ impl RawConfig {
         let retention = self.retention.validate()?;
         let pools = self.pools.map(RawPools::validate).transpose()?;
         let temporary = self.temporary.map(RawTemporary::validate).transpose()?;
-        if temporary.is_some() && !enabled {
-            return Err("temporary needs fleet.enabled = true to join its coordinator".into());
+        if temporary.is_some() && !(enabled && iroh.is_some()) {
+            return Err(
+                "temporary needs fleet.enabled = true and [fleet.iroh] to join its coordinator"
+                    .into(),
+            );
+        }
+        if pools.is_some() && !(enabled && iroh.is_some()) {
+            return Err(
+                "pools need fleet.enabled = true and [fleet.iroh] for their machines to join"
+                    .into(),
+            );
         }
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
@@ -952,6 +1009,7 @@ impl RawConfig {
             Fleet::Enabled(FleetSettings {
                 discovery,
                 machines: addresses,
+                iroh,
             })
         } else {
             Fleet::Disabled

@@ -15,6 +15,7 @@ pub mod context_threads;
 mod dependencies;
 pub mod event_sender;
 pub mod fleet_api;
+pub mod fleet_link;
 pub mod fleet_queues;
 pub mod fleet_tasks;
 pub mod fleet_view;
@@ -119,6 +120,8 @@ pub struct AppState {
     pub(crate) retention: retention::Retention,
     /// How this daemon reaches cloudlease, when it coordinates pools
     pub pools: Option<crate::config::PoolsConfig>,
+    /// This daemon's end of the Fleet link, when `[fleet.iroh]` is set
+    pub(crate) fleet_link: Option<fleet_link::FleetLink>,
     /// This machine's lease, when it is a temporary machine
     pub(crate) temporary: temporary::Member,
 }
@@ -192,6 +195,16 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let waiters = call(&supervisor, |reply| SupervisorMsg::GetWaiters { reply }).await?;
     let memory = call(&supervisor, |reply| SupervisorMsg::GetMemory { reply }).await?;
     let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
+    let iroh = config
+        .fleet_settings()
+        .and_then(|settings| settings.iroh.as_ref());
+    let link = match iroh {
+        // only a pool coordinator lets ids with no grant enroll
+        Some(iroh) => {
+            Some(fleet_link::FleetLink::start(&home, iroh, config.pools.is_some()).await?)
+        }
+        None => None,
+    };
     let fleet = fleet_runtime
         .as_ref()
         .map_or(FleetState::Disabled, |runtime| {
@@ -221,6 +234,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         memory_limits,
         retention,
         pools: config.pools.clone(),
+        fleet_link: link.clone(),
         temporary: temporary::Member::new(config.temporary.is_some()),
     };
     let sender = tokio::spawn(event_sender::run(
@@ -253,6 +267,9 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let hold_sweep = tokio::spawn(end_leftover_holds());
     let retention_timer = tokio::spawn(retention::run(state.clone(), retention_requests));
     let pool_reconciler = tokio::spawn(pools::run(state.clone()));
+    let link_server = link
+        .clone()
+        .map(|link| tokio::spawn(fleet_link::serve(state.clone(), link)));
     let temporary_member = config
         .temporary
         .clone()
@@ -318,6 +335,12 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     hold_sweep.abort();
     retention_timer.abort();
     pool_reconciler.abort();
+    if let Some(server) = link_server {
+        server.abort();
+    }
+    if let Some(link) = &link {
+        link.close().await;
+    }
     if let Some(member) = temporary_member {
         member.abort();
     }

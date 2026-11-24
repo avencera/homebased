@@ -4,7 +4,7 @@ A pool is a CI class whose machines cloudlease creates when its jobs wait and de
 
 ## Create, submit, release
 
-Run these on the pool's coordinator (the daemon with a `[pools]` config, `code` today); ask the user before creating a pool, since it costs money.
+Run these on the pool's coordinator (the daemon with `[pools]` and `[fleet.iroh]` config, `code` today): only it reaches pool machines, over the iroh Fleet link. Ask the user before creating a pool, since it costs money.
 
 ```sh
 homebased --json pool create afv --machine-class do-c16 --max 16 --deadline 6h --env-file ~/.config/afv/pool.env

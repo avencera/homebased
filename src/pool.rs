@@ -11,7 +11,6 @@
 pub mod boot;
 pub mod cloudlease;
 pub mod error;
-pub mod link;
 pub mod renewal;
 
 use std::fmt;
@@ -474,7 +473,11 @@ pub struct MachineLease {
 pub struct JoinedMachine {
     /// The machine's Homebased installation
     pub machine: MachineId,
-    /// Where its daemon listens
+    /// Its iroh endpoint id, bound to its lease by the join; the coordinator
+    /// serves no other id for this machine
+    pub endpoint: iroh::EndpointId,
+    /// Loopback address on the coordinator where its Fleet reaches the
+    /// machine through the link; a new one after each coordinator restart
     pub address: MachineAddress,
     /// When it joined
     pub joined_at: DateTime<Utc>,
@@ -629,8 +632,6 @@ pub struct JoinRequest {
     pub slot: SlotId,
     /// Its Homebased installation
     pub machine: MachineId,
-    /// Where its daemon listens, over the pool's link
-    pub address: MachineAddress,
     /// The lease from its `lease.json`
     pub lease: LeaseId,
     /// The single-use token from its boot data

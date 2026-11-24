@@ -18,12 +18,14 @@ use tracing::{info, warn};
 
 use super::AppState;
 use super::actors::{StoreMsg, call};
+use super::fleet_link::Grant;
+use super::pools::JOIN_PATH;
 use super::queue_api::forward;
 use crate::config::TemporaryConfig;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
-use crate::fleet::http::ClusterClient;
+use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
 use crate::pool::cloudlease::{CloudleaseError, LeaseCredential, SelfRelease};
 use crate::pool::renewal::{Activity, IdleClock, Limits, Renewal};
 use crate::pool::{JoinAnswer, JoinRequest};
@@ -31,6 +33,9 @@ use crate::store::queue::interface::QueueRequest;
 
 /// Wait between attempts to read the lease or join the coordinator
 const RETRY: Duration = Duration::from_secs(5);
+
+/// Time limit for one join call
+const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DRAIN_REASON: &str = "temporary machine releasing: idle";
 
@@ -65,8 +70,9 @@ impl Member {
 pub(super) async fn run(state: AppState, config: TemporaryConfig) {
     let lease = read_lease(&config).await;
     state.temporary.set_ends_at(lease.hard_deadline_at);
-    let answer = join_until_accepted(&state, &config, &lease).await;
-    if let Err(error) = apply(&state, &config, &answer).await {
+    let coordinator = start_link(&state, &config).await;
+    let answer = join_until_accepted(&state, &config, &coordinator, &lease).await;
+    if let Err(error) = apply(&state, &coordinator, &answer).await {
         warn!("temporary machine setup: {error}");
     }
     info!(pool = %answer.pool, "temporary machine joined its pool");
@@ -121,13 +127,48 @@ async fn read_lease(config: &TemporaryConfig) -> LeaseCredential {
     }
 }
 
+/// Reach the coordinator over the Fleet link; it is at the returned
+/// loopback address from then on
+async fn start_link(state: &AppState, config: &TemporaryConfig) -> MachineAddress {
+    loop {
+        match dial_coordinator(state, config).await {
+            Ok(address) => return address,
+            Err(error) => warn!("fleet link to the coordinator: {error}"),
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+/// Allow the coordinator on the link as a full Fleet peer, keep a
+/// connection to it, and return where this machine's Fleet reaches it
+async fn dial_coordinator(
+    state: &AppState,
+    config: &TemporaryConfig,
+) -> Result<MachineAddress, AppError> {
+    let link = state.fleet_link.as_ref().ok_or_else(|| AppError::Usage {
+        message: "a temporary machine needs [fleet.iroh] to reach its coordinator".into(),
+    })?;
+    if state.web.is_none() {
+        return Err(AppError::Usage {
+            message: "a temporary machine needs its web listener for the coordinator's calls"
+                .into(),
+        });
+    }
+    let hub = config.hub.endpoint_addr();
+    link.grant(hub.id, Grant::Peer);
+    let address = link.forward_to(hub.id, config.link_listen).await?;
+    link.dial(state, hub);
+    Ok(address)
+}
+
 async fn join_until_accepted(
     state: &AppState,
     config: &TemporaryConfig,
+    coordinator: &MachineAddress,
     lease: &LeaseCredential,
 ) -> JoinAnswer {
     loop {
-        match join(state, config, lease).await {
+        match join(state, config, coordinator, lease).await {
             Ok(answer) => return answer,
             Err(error) => warn!("join pool {}: {error}", config.pool),
         }
@@ -138,25 +179,20 @@ async fn join_until_accepted(
 async fn join(
     state: &AppState,
     config: &TemporaryConfig,
+    coordinator: &MachineAddress,
     lease: &LeaseCredential,
 ) -> Result<JoinAnswer, AppError> {
-    let address = state
-        .web
-        .map(MachineAddress::from_socket)
-        .ok_or_else(|| AppError::Usage {
-            message: "a temporary machine needs its web listener on its tailnet address".into(),
-        })?;
     let request = JoinRequest {
         api_version: API_VERSION,
         pool: config.pool.clone(),
         slot: config.slot,
         machine: state.machine.identity.machine,
-        address,
         lease: lease.lease_id.clone(),
         join_token: config.join_token.clone(),
     };
-    let response = ClusterClient::default()
-        .post_json(&config.coordinator, "/v1/cluster/pool/join", &request)
+    // the first call may wait for the link to find a path through a relay
+    let response = ClusterClient::new(JOIN_TIMEOUT, DEFAULT_MAX_BODY)
+        .post_json(coordinator, JOIN_PATH, &request)
         .await
         .map_err(|error| AppError::MachineUnavailable {
             machine: state.machine.identity.machine,
@@ -172,13 +208,13 @@ async fn join(
 /// offer the pool's class
 async fn apply(
     state: &AppState,
-    config: &TemporaryConfig,
+    coordinator: &MachineAddress,
     answer: &JoinAnswer,
 ) -> Result<(), AppError> {
     // job events go back to the coordinator through this machine's Fleet
     // directory, which discovery alone may not fill on a fresh machine
     if let Some(fleet) = state.fleet.handle() {
-        fleet.add_explicit(config.coordinator.clone()).await;
+        fleet.add_explicit(coordinator.clone()).await;
     }
     let path = state.home.pool_env_path();
     if let Some(parent) = path.parent() {

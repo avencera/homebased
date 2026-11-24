@@ -2,14 +2,16 @@
 //!
 //! cloudlease writes `lease.json`, then writes these files and runs these
 //! commands. The script installs the static Homebased release that matches
-//! the coordinator, starts its daemon where the pool's [`MemberLink`] says,
-//! and the daemon joins the coordinator. Nothing here is secret except the
+//! the coordinator and starts its daemon on loopback; the daemon dials the
+//! coordinator's iroh endpoint and joins. Nothing here is secret except the
 //! single-use join token
+
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 
-use super::link::MemberLink;
 use super::{JoinToken, PoolName, SlotId};
+use crate::fleet::iroh::{LinkAddr, Relays};
 use crate::machine::MachineName;
 
 /// Where cloudlease writes the machine's lease credential
@@ -21,8 +23,13 @@ pub const CONFIG_FILE: &str = "/etc/homebased/config.toml";
 const SCRIPT_FILE: &str = "/usr/local/lib/homebased/boot.sh";
 const UNIT_FILE: &str = "/etc/systemd/system/homebased.service";
 
-/// Port the machine's daemon listens on, on its link's address
-pub const LISTEN_PORT: u16 = 7677;
+/// Loopback address where a temporary machine's Fleet reaches its coordinator
+pub const DEFAULT_LINK_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7678));
+
+/// Loopback address a temporary machine's daemon serves its own API on; the
+/// coordinator reaches it over the link
+const MACHINE_WEB_LISTEN: &str = "127.0.0.1:7677";
 
 /// One file cloudlease writes before running the boot commands
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,8 +61,10 @@ pub struct BootPlan<'a> {
     pub name: &'a MachineName,
     /// Its single-use join token
     pub join_token: &'a JoinToken,
-    /// How it reaches its coordinator
-    pub link: &'a MemberLink,
+    /// The coordinator's iroh endpoint
+    pub hub: &'a LinkAddr,
+    /// Relays the machine's endpoint uses, the coordinator's own
+    pub relays: &'a Relays,
     /// Homebased release it installs, such as `0.37.0`
     pub version: &'a str,
 }
@@ -74,14 +83,12 @@ impl BootPlan<'_> {
                 BootFile {
                     path: UNIT_FILE.into(),
                     mode: "0644".into(),
-                    content: UNIT.replace("@AFTER@", self.link.unit_after()),
+                    content: UNIT.replace("@LISTEN@", MACHINE_WEB_LISTEN),
                 },
                 BootFile {
                     path: SCRIPT_FILE.into(),
                     mode: "0755".into(),
-                    content: SCRIPT
-                        .replace("@VERSION@", self.version)
-                        .replace("@LISTEN@\n", &self.link.listen_script(LISTEN_PORT)),
+                    content: SCRIPT.replace("@VERSION@", self.version),
                 },
             ],
             run: vec![vec!["/bin/sh".into(), SCRIPT_FILE.into()]],
@@ -91,6 +98,18 @@ impl BootPlan<'_> {
     /// The machine's `config.toml`
     #[must_use]
     pub fn config(&self) -> String {
+        let relay = self
+            .hub
+            .relay
+            .as_ref()
+            .map(|url| format!("hub_relay = \"{url}\"\n"))
+            .unwrap_or_default();
+        let addrs: Vec<String> = self
+            .hub
+            .addrs
+            .iter()
+            .map(|addr| format!("\"{addr}\""))
+            .collect();
         format!(
             r#"# written at boot by the pool's coordinator through cloudlease
 [fleet]
@@ -100,17 +119,24 @@ machine_name = "{name}"
 [fleet.discovery]
 mdns = false
 
+[fleet.iroh]
+relays = {relays}
+port = 0
+
 [temporary]
 pool = "{pool}"
 slot = "{slot}"
-coordinator = "{coordinator}"
+hub = "{hub}"
+{relay}hub_addrs = [{addrs}]
 join_token = "{token}"
 lease_file = "{lease}"
 "#,
             name = self.name,
             pool = self.pool,
             slot = self.slot,
-            coordinator = self.link.coordinator(),
+            hub = self.hub.id,
+            addrs = addrs.join(", "),
+            relays = self.relays.to_toml(),
             token = self.join_token.expose(),
             lease = LEASE_FILE,
         )
@@ -119,13 +145,13 @@ lease_file = "{lease}"
 
 const UNIT: &str = "[Unit]
 Description=Homebased on a temporary machine
-After=@AFTER@
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Environment=HOME=/root
 Environment=HOMEBASED_CONFIG=/etc/homebased/config.toml
-EnvironmentFile=/etc/homebased/listen.env
+Environment=HOMEBASED_WEB_LISTEN=@LISTEN@
 ExecStart=/usr/local/bin/homebased daemon serve
 Restart=on-failure
 RestartSec=5
@@ -157,7 +183,6 @@ if [ "$expected" != "$actual" ]; then
 fi
 tar -xzf "$work/$archive" -C "$work"
 install -m 0755 "$(find "$work" -type f -name homebased | head -n 1)" /usr/local/bin/homebased
-@LISTEN@
 systemctl daemon-reload
 systemctl enable --now homebased.service
 "#;
@@ -172,15 +197,18 @@ mod tests {
         let slot = SlotId::new();
         let name = pool.machine_name(slot);
         let token = JoinToken::new("t0ken".into());
-        let link = MemberLink::Tailnet {
-            join_address: "http://code:7677".parse().unwrap(),
+        let hub = LinkAddr {
+            id: iroh::SecretKey::generate().public(),
+            relay: Some("https://relay.example.com".parse().unwrap()),
+            addrs: vec!["192.0.2.1:4433".parse().unwrap()],
         };
         let plan = BootPlan {
             pool: &pool,
             slot,
             name: &name,
             join_token: &token,
-            link: &link,
+            hub: &hub,
+            relays: &Relays::N0,
             version: "0.37.0",
         };
         let payload = plan.render();
@@ -199,17 +227,19 @@ mod tests {
             );
         }
         assert!(
-            payload.files[2]
+            payload.files[1]
                 .content
-                .contains("HOMEBASED_WEB_LISTEN=%s:7677")
+                .contains("HOMEBASED_WEB_LISTEN=127.0.0.1:7677")
         );
 
         let config = crate::config::Config::parse(&payload.files[0].content).unwrap();
-        let temporary = config.temporary.unwrap();
+        let temporary = config.temporary.clone().unwrap();
         assert_eq!(temporary.pool, pool);
         assert_eq!(temporary.slot, slot);
         assert_eq!(temporary.join_token.expose(), "t0ken");
-        assert_eq!(&temporary.coordinator, link.coordinator());
+        assert_eq!(temporary.hub, hub);
+        let iroh = config.fleet_settings().unwrap().iroh.as_ref().unwrap();
+        assert_eq!(iroh.relays, Relays::N0);
         assert_eq!(config.machine_name, Some(name));
         // boot data stays well under cloudlease's 32 KiB limit
         assert!(serde_json::to_vec(&payload).unwrap().len() < 8 * 1024);

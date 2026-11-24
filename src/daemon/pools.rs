@@ -9,11 +9,12 @@
 //! See `docs/temporary-machines.md`
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,9 +24,11 @@ use tracing::{info, warn};
 use super::AppState;
 use super::actors::{StoreMsg, call};
 use super::dependencies::held_ci_routes;
+use super::fleet_link::{FleetLink, Grant, LinkPeer};
 use crate::config::PoolsConfig;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
+use crate::fleet::advertisement::MACHINE_PROBE_PATH;
 use crate::pool::boot::BootPlan;
 use crate::pool::cloudlease::{CloudleaseClient, CloudleaseError, Lease, LeaseState, Run};
 use crate::pool::{
@@ -52,9 +55,44 @@ pub fn read_routes() -> Router<AppState> {
         .route("/v1/pools/{name}", get(show))
 }
 
-/// Cluster route a temporary machine joins through
-pub fn cluster_routes() -> Router<AppState> {
-    Router::new().route("/v1/cluster/pool/join", post(join))
+/// Route a temporary machine joins through, over the Fleet link
+pub const JOIN_PATH: &str = "/v1/cluster/pool/join";
+
+/// What an endpoint with no grant may call on a coordinator: the join only
+pub(super) fn enrollment_routes() -> Router<AppState> {
+    Router::new().route(JOIN_PATH, post(join))
+}
+
+/// What a joined temporary machine may call on its coordinator: join again,
+/// the Fleet probe, and event delivery for its own work; nothing that starts
+/// work, sends messages, or reads other machines' tasks
+pub(super) fn member_routes(state: &AppState) -> Router<AppState> {
+    let routes = enrollment_routes()
+        .route(
+            "/v1/cluster/job-events",
+            post(super::queue_api::member_job_event),
+        )
+        .route("/v1/cluster/events", post(super::cluster::member_event));
+    let Some(fleet) = state.fleet.handle() else {
+        return routes;
+    };
+    let fleet = fleet.clone();
+    routes.route(
+        MACHINE_PROBE_PATH,
+        get(move || super::cluster::machine(fleet.clone())),
+    )
+}
+
+/// Allow a joined machine's endpoint on the link as a pool member, and
+/// return where this daemon's Fleet reaches it
+async fn admit_member(
+    link: &FleetLink,
+    endpoint: iroh::EndpointId,
+    machine: crate::machine::MachineId,
+) -> Result<crate::fleet::address::MachineAddress, AppError> {
+    link.grant(endpoint, Grant::PoolMember { machine });
+    link.forward_to(endpoint, SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
 }
 
 fn configured(state: &AppState) -> Result<&PoolsConfig, AppError> {
@@ -284,16 +322,26 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
     }
 }
 
-/// `POST /v1/cluster/pool/join`: a temporary machine joins its coordinator
+/// `POST /v1/cluster/pool/join` over the Fleet link: a temporary machine
+/// joins its coordinator
 ///
 /// The machine proves it is the one this coordinator asked for with the
-/// single-use token from its boot data, and gets its settings and the
-/// pool's variables back. A retry by the same machine gets the same answer
-async fn join(
+/// single-use token from its boot data, which binds the link's endpoint id to
+/// its lease, and gets its settings and the pool's variables back. A retry
+/// from the same endpoint gets the same answer; any other endpoint is refused
+pub(super) async fn join(
     State(state): State<AppState>,
+    Extension(peer): Extension<LinkPeer>,
     Json(request): Json<JoinRequest>,
 ) -> Result<Json<JoinAnswer>, AppError> {
     configured(&state)?;
+    let Some(link) = state.fleet_link.clone() else {
+        return Err(PoolError::new(
+            PoolCode::PoolsNotConfigured,
+            "this daemon has no [fleet.iroh] link",
+        )
+        .into());
+    };
     let refused =
         |message: String| -> AppError { PoolError::new(PoolCode::JoinRefused, message).into() };
     if request.api_version != API_VERSION {
@@ -315,23 +363,30 @@ async fn join(
 
     match &machine.state {
         MachineState::Booting { lease } if lease.lease == request.lease => {
+            let address = admit_member(&link, peer.endpoint, request.machine).await?;
             let joined = JoinedMachine {
                 machine: request.machine,
-                address: request.address.clone(),
+                endpoint: peer.endpoint,
+                address: address.clone(),
                 joined_at: Utc::now(),
             };
             machine.state = MachineState::Joined {
                 lease: lease.clone(),
                 joined,
             };
-            save_machine(&state, &machine).await?;
+            if let Err(error) = save_machine(&state, &machine).await {
+                link.revoke(peer.endpoint);
+                return Err(error);
+            }
             if let Some(fleet) = state.fleet.handle() {
-                fleet.add_explicit(request.address.clone()).await;
+                fleet.add_explicit(address).await;
             }
             info!(pool = %pool.name, machine = %machine.name, "temporary machine joined");
         }
         MachineState::Joined { lease, joined }
-            if lease.lease == request.lease && joined.machine == request.machine => {}
+            if lease.lease == request.lease
+                && joined.machine == request.machine
+                && joined.endpoint == peer.endpoint => {}
         MachineState::Requested => {
             return Err(refused(format!(
                 "pool machine {slot} has no lease recorded yet; retry"
@@ -620,10 +675,36 @@ impl Pass<'_> {
             self.release_lease(&mut machine, ReleaseReason::Requested)
                 .await;
         }
+        self.sync_link(&mut machine).await?;
         if machine.state != before {
             save_machine(self.state, &machine).await?;
         }
         Ok(machine)
+    }
+
+    /// Serve a joined machine on the link under its bound endpoint id, again
+    /// after a coordinator restart, and stop serving any other
+    async fn sync_link(&self, machine: &mut PoolMachine) -> Result<(), AppError> {
+        let Some(link) = &self.state.fleet_link else {
+            return Ok(());
+        };
+        let MachineState::Joined { joined, .. } = &mut machine.state else {
+            if let Some(joined) = machine.state.joined() {
+                link.revoke(joined.endpoint);
+            }
+            return Ok(());
+        };
+
+        let address = admit_member(link, joined.endpoint, joined.machine).await?;
+        if address == joined.address {
+            return Ok(());
+        }
+        if let Some(fleet) = self.state.fleet.handle() {
+            fleet.remove_explicit(&joined.address).await;
+            fleet.add_explicit(address.clone()).await;
+        }
+        joined.address = address;
+        Ok(())
     }
 
     /// Ask cloudlease to release a machine's lease; a failed call is retried
@@ -662,6 +743,9 @@ impl Pass<'_> {
         let lease = machine.state.lease().cloned();
         let joined = machine.state.joined().cloned();
         if let Some(joined) = &joined {
+            if let Some(link) = &self.state.fleet_link {
+                link.revoke(joined.endpoint);
+            }
             if let Some(fleet) = self.state.fleet.handle() {
                 fleet.remove_explicit(&joined.address).await;
                 fleet.forget_machine(joined.machine).await;
@@ -774,13 +858,20 @@ impl Pass<'_> {
     /// Free slots of the pool's class a joined machine offers now; one that
     /// does not answer offers none
     async fn free_slots(&self, pool: &Pool, joined: &JoinedMachine) -> u32 {
-        match super::ci_api::machine_status(self.state, joined.machine).await {
-            Ok(status) if status.offer.admission.is_open() => status
-                .offer
-                .class(pool.name.class())
-                .map_or(0, crate::queue::ci::ClassOffer::free),
-            Ok(_) | Err(_) => 0,
+        // a machine that just joined is the Fleet's only once its address was
+        // probed, and offers the class only once it applied the join answer;
+        // it was asked for this pool, so count its slots rather than ask for
+        // another machine in that window
+        let Ok(status) = super::ci_api::machine_status(self.state, joined.machine).await else {
+            return pool.settings.slots.into();
+        };
+        if !status.offer.admission.is_open() {
+            return 0;
         }
+        status.offer.class(pool.name.class()).map_or(
+            pool.settings.slots.into(),
+            crate::queue::ci::ClassOffer::free,
+        )
     }
 
     /// Retry the create of a machine whose earlier call got no answer and
@@ -806,12 +897,18 @@ impl Pass<'_> {
         let Some(run) = pool.run.clone() else {
             return Ok(None);
         };
+        let Some(link) = &self.state.fleet_link else {
+            return Ok(None);
+        };
+        let hub = link.addr().await;
+        let relays = link.relays();
         let boot = BootPlan {
             pool: &pool.name,
             slot: machine.slot,
             name: &machine.name,
             join_token: token,
-            link: &self.config.link,
+            hub: &hub,
+            relays: &relays,
             version: &self.config.homebased_version,
         }
         .render();
