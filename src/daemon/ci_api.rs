@@ -72,13 +72,17 @@ async fn local_status(state: &AppState) -> Result<CiStatus, AppError> {
             admission: Admission::decide(list.drain.as_ref(), &gauge, &state.ci),
             gauge,
             classes: list.classes,
+            ends_at: state.temporary.ends_at(),
         },
         slots: list.slots,
     })
 }
 
 /// One machine's `ci_status`, checked to come from that machine
-async fn machine_status(state: &AppState, machine: MachineId) -> Result<CiStatus, AppError> {
+pub(super) async fn machine_status(
+    state: &AppState,
+    machine: MachineId,
+) -> Result<CiStatus, AppError> {
     let status: CiStatus =
         serde_json::from_value(forward(state, machine, QueueRequest::CiStatus).await?)?;
     if status.offer.machine != machine {
@@ -92,7 +96,7 @@ async fn machine_status(state: &AppState, machine: MachineId) -> Result<CiStatus
 
 /// `ci_status` of every machine `scope` covers that answers; a peer on a
 /// release without CI jobs is left out
-async fn fleet_status(
+pub(super) async fn fleet_status(
     state: &AppState,
     scope: Scope,
 ) -> Result<(Vec<FleetMachine>, Vec<CiStatus>), AppError> {
@@ -120,6 +124,10 @@ pub(super) async fn check_offered(
     let Some(ci) = &spec.ci else {
         return Ok(());
     };
+    // a pool's class is offered by machines it creates on demand
+    if choice == MachineChoice::Any && super::pools::admit_pool_job(state, ci).await? {
+        return Ok(());
+    }
     let scope = match choice {
         MachineChoice::Any => Scope::All,
         MachineChoice::Pinned(machine) => Scope::One(machine),
@@ -181,6 +189,8 @@ pub(super) async fn place_ready(
                 priority: route.spec.priority,
                 choice: choice(route),
                 submitted_at: route.submitted_at.unwrap_or_else(Utc::now),
+                must_end_by: Utc::now()
+                    + chrono::Duration::from_std(ci.kill_after.get()).unwrap_or_default(),
             })
         })
         .collect();

@@ -25,6 +25,10 @@ Use a different unique `machine_name` on each installation. `mdns` is on by
 default. Tailscale discovery is optional. Fleet uses plain HTTP. Use it only on
 a trusted LAN or tailnet. Fleet does not add authentication.
 
+Cloud machines can join the Fleet for a while as [temporary machines](temporary-machines.md).
+Their boot data writes their config, with a `[temporary]` section, so never add
+one by hand.
+
 Validate the file, then restart the daemon so it loads the changes:
 
 ```sh

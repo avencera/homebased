@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::AppError;
 
 /// Schema version this binary writes, stored in SQLite's `user_version`
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// One step that moves a database from version `N` to `N + 1`
 ///
@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: i64 = 25;
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version 1 up to [`SCHEMA_VERSION`]; add the next one at the end
-const MIGRATIONS: [Migration; 24] = [
+const MIGRATIONS: [Migration; 25] = [
     add_waiting_handoff,
     add_job_route_created_at,
     add_task_usage,
@@ -44,6 +44,7 @@ const MIGRATIONS: [Migration; 24] = [
     add_task_memory_reviews,
     add_pruned_outputs,
     add_lineage_detach,
+    add_pools,
 ];
 
 /// Version 2: waiting reports, the continuation release rule, and run chains
@@ -187,6 +188,35 @@ fn add_watch_conditions(conn: &Connection) -> Result<(), rusqlite::Error> {
          WHERE json_valid(watch_json) AND json_type(watch_json, '$.threshold') = 'object';",
     )
 }
+
+/// Version 26: pools of temporary machines this daemon coordinates
+fn add_pools(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(POOL_TABLES)
+}
+
+/// Pools this daemon coordinates and every machine each one asked for
+///
+/// `pool_json` and `machine_json` hold the whole record; `state` and
+/// `machine_id` repeat what the reconciler and the join look up by. Rows are
+/// kept after release so `pool show` can say what happened
+const POOL_TABLES: &str = "
+CREATE TABLE pools (
+    name TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('open', 'releasing', 'released')),
+    pool_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE pool_machines (
+    slot TEXT PRIMARY KEY,
+    pool TEXT NOT NULL REFERENCES pools(name),
+    state TEXT NOT NULL
+        CHECK (state IN ('requested', 'booting', 'joined', 'releasing', 'released')),
+    machine_id TEXT,
+    machine_json TEXT NOT NULL,
+    requested_at TEXT NOT NULL
+);
+CREATE INDEX pool_machines_live ON pool_machines (pool) WHERE state <> 'released';
+";
 
 /// Version 15: long-lived services that agents start and do not wait on
 fn add_services(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -721,6 +751,7 @@ fn schema() -> String {
         .replace("{GPU_IDLE_TABLES}", GPU_IDLE_TABLES)
         .replace("{LEASE_IDLE_TABLE}", LEASE_IDLE_TABLE)
         .replace("{SERVICES_TABLE}", SERVICES_TABLE)
+        .replace("{POOL_TABLES}", POOL_TABLES)
         .replace("{RESOURCE_CI_CLASS}", RESOURCE_CI_CLASS)
         .replace("{RESOURCE_CI_SLOT}", RESOURCE_CI_SLOT)
         .replace("{RESOURCE_CI_RETIRED}", RESOURCE_CI_RETIRED)
@@ -1088,7 +1119,8 @@ CREATE TABLE resource_job_delivery (
 {THREAD_LINEAGE_TABLE}
 {THREAD_LINEAGE_DETACH}
 {THREAD_REPORTS_TABLE}
-{PRUNED_OUTPUTS_TABLE}";
+{PRUNED_OUTPUTS_TABLE}
+{POOL_TABLES}";
 
 #[cfg(test)]
 mod tests {
@@ -1217,6 +1249,7 @@ mod tests {
             .replace(super::THREAD_LINEAGE_DETACH, "")
             .replace(super::THREAD_REPORTS_TABLE, "")
             .replace(super::PRUNED_OUTPUTS_TABLE, "")
+            .replace(super::POOL_TABLES, "")
             // `executor_outbox` and `origin_inbox` have columns of the same text
             .replace(
                 &format!("(0, 1)),\n    {},", super::RECEIPT_ACKNOWLEDGED_AT),
@@ -1310,7 +1343,7 @@ mod tests {
         // version 12 had no lease guard, services, CI slots, memory peaks,
         // sleep holds, or child-thread links
         conn.execute_batch(
-            "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE pruned_outputs;
+            "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE pruned_outputs; DROP TABLE pool_machines; DROP TABLE pools;
              ALTER TABLE executor_event_receipts DROP COLUMN acknowledged_at;
              ALTER TABLE origin_event_receipts DROP COLUMN settled_at;
              DROP TABLE thread_reports; DROP TABLE thread_lineage;
@@ -1369,7 +1402,7 @@ mod tests {
         migrate(&conn).unwrap();
         conn.execute_batch(&format!(
             "ALTER TABLE tasks DROP COLUMN memory_review; DROP TABLE thread_reports;
-             DROP TABLE pruned_outputs; ALTER TABLE thread_lineage DROP COLUMN detached_at;
+             DROP TABLE pruned_outputs; DROP TABLE pool_machines; DROP TABLE pools; ALTER TABLE thread_lineage DROP COLUMN detached_at;
              ALTER TABLE executor_event_receipts DROP COLUMN acknowledged_at;
              ALTER TABLE origin_event_receipts DROP COLUMN settled_at; ALTER TABLE origin_routes DROP COLUMN priority; {}",
             super::THREAD_REPORTS_V20

@@ -677,6 +677,9 @@ pub enum AppError {
     /// The GPU priority queue refused a request
     #[error(transparent)]
     Queue(#[from] QueueError),
+    /// A pool request was refused
+    #[error(transparent)]
+    Pool(#[from] crate::pool::PoolError),
     /// A `waiting` report was refused
     #[error(transparent)]
     Waiting(#[from] WaitingRejection),
@@ -958,6 +961,7 @@ impl AppError {
             Self::ClusterProtocolIncompatible { .. } => "cluster_protocol_incompatible",
             Self::DaemonBusy => "daemon_busy",
             Self::Queue(error) => error.code(),
+            Self::Pool(error) => error.code.as_str(),
             Self::Waiting(rejection) => rejection.code(),
             Self::SchemaTooNew { .. } => "schema_too_new",
             Self::Internal { .. } => "internal",
@@ -1050,6 +1054,7 @@ impl AppError {
             | Self::ThreadReportRefused { .. }
             | Self::ThreadReportConflict { .. } => 5,
             Self::Queue(error) => error.exit_code(),
+            Self::Pool(error) => error.code.exit_code(),
             Self::Waiting(WaitingRejection::UnknownTarget { .. }) => 3,
             Self::Waiting(_) => 5,
         }
@@ -1144,6 +1149,7 @@ impl AppError {
             | Self::SchemaTooNew { .. }
             | Self::Internal { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::Queue(error) => error.http_status(),
+            Self::Pool(error) => error.http_status(),
             Self::Waiting(WaitingRejection::UnknownTarget { .. }) => http::StatusCode::NOT_FOUND,
             Self::Waiting(_) => http::StatusCode::CONFLICT,
         }
@@ -1392,6 +1398,7 @@ impl AppError {
             Self::DaemonAlreadyRunning => json!({}),
             Self::LockHeld { path } => json!({ "path": path }),
             Self::Queue(error) => error.input(),
+            Self::Pool(_) => json!({}),
             Self::Waiting(rejection) => rejection.input(),
         }
     }

@@ -96,6 +96,7 @@ homebased service start --name api --port 8787 -- pnpm dev
 | [Host memory](docs/memory.md) | Holding tasks until there's enough RAM |
 | [GPU queue](docs/resource-queue.md) | Priorities, preemption, idle alerts |
 | [CI queue](docs/ci-queue.md) | Build and test slots across machines ([design](docs/ci-queue-design.md)) |
+| [Temporary machines](docs/temporary-machines.md) | Pools of cloud machines that cloudlease creates for CI jobs and deletes when idle or past a deadline |
 | [Fleet](docs/fleet.md) | Connecting machines |
 | [T3 Code](docs/t3.md) | Waking threads, compaction, waiting and sleeping on work, launching threads on other machines |
 | [Thread commands](docs/threads.md) | Reading, compacting, watching, and reporting from threads |

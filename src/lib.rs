@@ -27,6 +27,7 @@ pub mod machine_wait;
 pub mod memory;
 pub mod message;
 pub mod notify;
+pub mod pool;
 pub mod power;
 pub mod queue;
 pub mod report;

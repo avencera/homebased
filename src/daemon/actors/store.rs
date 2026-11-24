@@ -623,6 +623,55 @@ pub(crate) enum StoreMsg {
         id: crate::thread_watch::WatchId,
         reply: RpcReplyPort<Result<Vec<crate::thread_watch::WatchEvent>, AppError>>,
     },
+    /// Save a new pool
+    InsertPool {
+        pool: Box<crate::pool::Pool>,
+        reply: RpcReplyPort<Result<crate::store::PoolInsert, AppError>>,
+    },
+    /// Read one pool
+    Pool {
+        name: crate::pool::PoolName,
+        reply: RpcReplyPort<Result<Option<crate::pool::Pool>, AppError>>,
+    },
+    /// Read every pool
+    Pools {
+        reply: RpcReplyPort<Result<Vec<crate::pool::Pool>, AppError>>,
+    },
+    /// Replace a pool's record
+    UpdatePool {
+        pool: Box<crate::pool::Pool>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read every machine of a pool
+    PoolMachines {
+        pool: crate::pool::PoolName,
+        reply: RpcReplyPort<Result<Vec<crate::pool::PoolMachine>, AppError>>,
+    },
+    /// Read one pool machine
+    PoolMachine {
+        slot: crate::pool::SlotId,
+        reply: RpcReplyPort<Result<Option<crate::pool::PoolMachine>, AppError>>,
+    },
+    /// Save a machine before its create call
+    InsertPoolMachine {
+        machine: Box<crate::pool::PoolMachine>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Replace a machine's record
+    UpdatePoolMachine {
+        machine: Box<crate::pool::PoolMachine>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// What runs or waits on this temporary machine
+    TemporaryActivity {
+        reply: RpcReplyPort<Result<crate::store::StoredActivity, AppError>>,
+    },
+    /// End the unfinished jobs this origin sent to a machine cloudlease deleted
+    EndJobsOfReleasedMachine {
+        machine: MachineId,
+        released: Box<crate::pool::MachineReleased>,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
+    },
     /// Save a new service
     InsertService {
         service: Box<crate::service::Service>,
@@ -1436,6 +1485,29 @@ impl Actor for StoreActor {
             StoreMsg::SettledWatchEvents { id, reply } => {
                 send_reply(reply, state.settled_watch_events(id));
             }
+            StoreMsg::InsertPool { pool, reply } => send_reply(reply, state.insert_pool(&pool)),
+            StoreMsg::Pool { name, reply } => send_reply(reply, state.pool(&name)),
+            StoreMsg::Pools { reply } => send_reply(reply, state.pools()),
+            StoreMsg::UpdatePool { pool, reply } => send_reply(reply, state.update_pool(&pool)),
+            StoreMsg::PoolMachines { pool, reply } => {
+                send_reply(reply, state.pool_machines(&pool));
+            }
+            StoreMsg::PoolMachine { slot, reply } => send_reply(reply, state.pool_machine(slot)),
+            StoreMsg::InsertPoolMachine { machine, reply } => {
+                send_reply(reply, state.insert_pool_machine(&machine));
+            }
+            StoreMsg::UpdatePoolMachine { machine, reply } => {
+                send_reply(reply, state.update_pool_machine(&machine));
+            }
+            StoreMsg::TemporaryActivity { reply } => send_reply(reply, state.temporary_activity()),
+            StoreMsg::EndJobsOfReleasedMachine {
+                machine,
+                released,
+                reply,
+            } => send_reply(
+                reply,
+                state.end_jobs_of_released_machine(machine, &released),
+            ),
             StoreMsg::InsertService { service, reply } => {
                 send_reply(reply, state.insert_service(&service));
             }

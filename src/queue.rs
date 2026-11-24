@@ -1301,6 +1301,11 @@ pub struct JobEvent {
     // only CI jobs carry it, and only an origin that can submit them
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<ci::RunTimeout>,
+    /// Present on the `JOB_FAILED` the origin writes for a job whose
+    /// temporary machine cloudlease deleted before the job ended
+    // only an origin writes it, for its own route, so no peer ever reads it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_released: Option<crate::pool::MachineReleased>,
 }
 
 #[cfg(test)]

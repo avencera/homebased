@@ -7,6 +7,7 @@ use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
 use crate::machine::MachineId;
+use crate::pool::MachineReleased;
 use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
 use crate::queue::spec::MachineSelector;
 use crate::queue::{JobEvent, JobEventKind, JobId, MoveRefusal, Priority, QueueError, Target};
@@ -282,6 +283,8 @@ impl Store {
                     HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested,
                 ) => true,
                 (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.owes_final_event,
+                // a pool that ended before the job got a machine refuses it
+                (JobSubmission::Held, HeldJobEnding::Refused { .. }) => route.spec.ci.is_some(),
                 _ => false,
             };
             let accepted = self
@@ -317,6 +320,7 @@ impl Store {
                     gpu_summaries: Vec::new(),
                     lease_idle: None,
                     timeout: None,
+                    machine_released: None,
                 },
             };
             route.submission = JobSubmission::Ended { ending };
@@ -330,6 +334,99 @@ impl Store {
             )?;
             Ok(true)
         }
+    }
+
+    /// End every job this origin sent to `machine` that has no final event,
+    /// once cloudlease confirmed the machine gone
+    ///
+    /// The machine can never send another event, so each such job gets a
+    /// `JOB_FAILED` after the last event it did send, carrying `released`.
+    /// A job whose final event already arrived is left alone. Returns the
+    /// jobs it ended
+    pub fn end_jobs_of_released_machine(
+        &self,
+        machine: MachineId,
+        released: &MachineReleased,
+    ) -> Result<Vec<JobId>, AppError> {
+        self.immediate(|| {
+            let mut statement = self.conn.prepare(
+                "SELECT r.job_id FROM resource_job_routes r
+                 WHERE json_extract(r.route_json, '$.authority') = ?1
+                   AND json_extract(r.route_json, '$.submission.state') IN ('accepted', 'unknown')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM resource_job_inbox i
+                       WHERE i.job_id = r.job_id
+                         AND json_extract(i.event_json, '$.event.event')
+                             IN ('JOB_SUCCEEDED', 'JOB_FAILED', 'JOB_CANCELLED'))",
+            )?;
+            let jobs = statement
+                .query_map([machine.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            let mut ended = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let job: JobId = job.parse()?;
+                self.append_released_failure(job, released)?;
+                ended.push(job);
+            }
+            Ok(ended)
+        })
+    }
+
+    fn append_released_failure(
+        &self,
+        job: JobId,
+        released: &MachineReleased,
+    ) -> Result<(), AppError> {
+        let route = self
+            .job_route(job)?
+            .ok_or(QueueError::JobNotFound { job })?;
+        let accepted = self
+            .job_route_cursors(job)?
+            .ok_or(QueueError::JobNotFound { job })?
+            .accepted;
+        let seq = accepted + 1;
+        let stored_seq = i64::try_from(seq).map_err(|_| AppError::Internal {
+            message: format!("job {job} event sequence {seq} does not fit"),
+        })?;
+        let envelope = RoutedJobEvent {
+            origin: route.origin,
+            authority: route.authority,
+            digest: route.digest.clone(),
+            event: JobEvent {
+                job,
+                seq,
+                event: JobEventKind::JobFailed,
+                run: None,
+                resource_name: None,
+                resource_label: None,
+                process: None,
+                attention: None,
+                at: Utc::now(),
+                blocked: None,
+                held_ending: None,
+                gpu_idle: None,
+                gpu_summaries: Vec::new(),
+                lease_idle: None,
+                timeout: None,
+                machine_released: Some(released.clone()),
+            },
+        };
+        let mut route = route;
+        route.submission = JobSubmission::Accepted;
+        self.conn.execute(
+            "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,?2,?3)",
+            params![
+                job.to_string(),
+                stored_seq,
+                serde_json::to_string(&envelope)?
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE resource_job_routes SET accepted_seq=?2,route_json=?3 WHERE job_id=?1",
+            params![job.to_string(), stored_seq, serde_json::to_string(&route)?],
+        )?;
+        Ok(())
     }
 
     /// Resolve submission without regressing acceptance proved by an incoming event

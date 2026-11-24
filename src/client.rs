@@ -228,6 +228,10 @@ fn from_code(code: &str, message: String, input: &Value, status: StatusCode) -> 
         .into();
     }
 
+    if let Ok(code) = serde_json::from_value::<crate::pool::PoolCode>(Value::String(code.into())) {
+        return crate::pool::PoolError { code, message }.into();
+    }
+
     match code {
         "usage" => AppError::Usage { message },
         "daemon_unavailable" => AppError::DaemonUnavailable { message },

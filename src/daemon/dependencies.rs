@@ -57,7 +57,7 @@ use crate::invocation::resolve_workload_binary;
 use crate::machine::MachineId;
 use crate::machine_wait::CoalesceKey;
 use crate::memory::MemPeak;
-use crate::queue::delivery::{HeldJobEnding, JobSubmission};
+use crate::queue::delivery::{HeldJobEnding, JobRoute, JobSubmission};
 use crate::queue::{JobId, Priority};
 use crate::spec::{self, NormalizedSpec};
 use crate::store::HeldCancel;
@@ -341,6 +341,44 @@ async fn settle_jobs(
         record_attempt(retries, job, sent, "CI job send deferred");
     }
     Ok(())
+}
+
+/// Held CI routes of `class` that may go to any machine, split by whether
+/// every `after` entry already succeeded: ready ones need a slot now, the
+/// rest only later
+pub(super) async fn held_ci_routes(
+    state: &AppState,
+    class: &crate::queue::ci::JobClass,
+) -> Result<HeldCiRoutes, AppError> {
+    let routes = call(&state.store, |reply| StoreMsg::HeldJobRoutes { reply }).await?;
+    let mut held = HeldCiRoutes::default();
+    for route in routes {
+        let of_class = route.spec.ci.as_ref().is_some_and(|ci| &ci.class == class);
+        if !of_class
+            || route.spec.machine.is_some()
+            || !matches!(route.submission, JobSubmission::Held)
+        {
+            continue;
+        }
+        let decision = decide(
+            known_states(state, route.after.as_ref()).await?,
+            ReleaseRule::Succeeded,
+        );
+        match decision {
+            HeldDecision::Release => held.ready.push(route),
+            HeldDecision::Wait | HeldDecision::Cancel(_) => held.waiting.push(route),
+        }
+    }
+    Ok(held)
+}
+
+/// Held CI routes of one class, from [`held_ci_routes`]
+#[derive(Debug, Default)]
+pub(super) struct HeldCiRoutes {
+    /// Every dependency succeeded; the job needs a slot now
+    pub(super) ready: Vec<JobRoute>,
+    /// Some dependency has not finished
+    pub(super) waiting: Vec<JobRoute>,
 }
 
 /// Whether a new submission may launch now

@@ -66,6 +66,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             gpu_summaries: Vec::new(),
             lease_idle: None,
             timeout: None,
+            machine_released: None,
         },
     }
 }

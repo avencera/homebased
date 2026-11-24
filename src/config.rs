@@ -123,6 +123,47 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// What finished output the daemon prunes, and when, from `[retention]`
     pub retention: crate::retention::RetentionConfig,
+    /// How this daemon reaches cloudlease to run pools, from `[pools]`;
+    /// `None` when it coordinates no pools
+    pub pools: Option<PoolsConfig>,
+    /// The pool slot this daemon fills, from `[temporary]`; set only on a
+    /// temporary machine, by its boot data
+    pub temporary: Option<TemporaryConfig>,
+}
+
+/// How a pool coordinator reaches cloudlease and how its machines reach it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolsConfig {
+    /// Base URL of the cloudlease API
+    pub cloudlease_url: String,
+    /// File holding the cloudlease client token, read for each call
+    pub cloudlease_token_file: PathBuf,
+    /// How temporary machines reach this daemon
+    pub link: crate::pool::link::MemberLink,
+    /// Homebased release temporary machines install; this daemon's own by default
+    pub homebased_version: String,
+    /// Time between passes over each pool
+    #[serde(with = "humantime_serde")]
+    pub reconcile_interval: std::time::Duration,
+}
+
+/// The pool slot a temporary machine fills
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TemporaryConfig {
+    /// Pool it was created for
+    pub pool: crate::pool::PoolName,
+    /// Its slot
+    pub slot: crate::pool::SlotId,
+    /// Address of the pool's coordinator
+    pub coordinator: MachineAddress,
+    /// Single-use token it joins with
+    #[serde(skip)]
+    pub join_token: crate::pool::JoinToken,
+    /// `lease.json` cloudlease wrote at boot
+    pub lease_file: PathBuf,
+    /// Time between renewal decisions
+    #[serde(with = "humantime_serde")]
+    pub renew_interval: std::time::Duration,
 }
 
 /// Host memory admission settings
@@ -288,6 +329,105 @@ struct RawConfig {
     memory: RawMemory,
     #[serde(default)]
     retention: RawRetention,
+    #[serde(default)]
+    pools: Option<RawPools>,
+    #[serde(default)]
+    temporary: Option<RawTemporary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPools {
+    cloudlease_url: String,
+    cloudlease_token_file: PathBuf,
+    link: crate::pool::link::MemberLink,
+    #[serde(default)]
+    homebased_version: Option<String>,
+    #[serde(default)]
+    reconcile_interval: Option<String>,
+}
+
+impl RawPools {
+    fn validate(self) -> Result<PoolsConfig, String> {
+        let url = self.cloudlease_url.trim_end_matches('/').to_owned();
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(format!(
+                "pools.cloudlease_url must be an http or https URL, got {url:?}"
+            ));
+        }
+        if !self.cloudlease_token_file.is_absolute() {
+            return Err(format!(
+                "pools.cloudlease_token_file must be absolute, got {}",
+                self.cloudlease_token_file.display()
+            ));
+        }
+        let version = self
+            .homebased_version
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+        let version = version.trim_start_matches('v').to_owned();
+        let semver_like = !version.is_empty()
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'));
+        if !semver_like {
+            return Err(format!(
+                "pools.homebased_version {version:?} is not a release version"
+            ));
+        }
+        let reconcile_interval = match self.reconcile_interval {
+            Some(raw) => positive_duration("pools.reconcile_interval", &raw)?,
+            None => std::time::Duration::from_secs(15),
+        };
+        Ok(PoolsConfig {
+            cloudlease_url: url,
+            cloudlease_token_file: self.cloudlease_token_file,
+            link: self.link,
+            homebased_version: version,
+            reconcile_interval,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTemporary {
+    pool: crate::pool::PoolName,
+    slot: crate::pool::SlotId,
+    coordinator: MachineAddress,
+    join_token: String,
+    #[serde(default)]
+    lease_file: Option<PathBuf>,
+    #[serde(default)]
+    renew_interval: Option<String>,
+}
+
+impl RawTemporary {
+    fn validate(self) -> Result<TemporaryConfig, String> {
+        if self.join_token.trim().is_empty() {
+            return Err("temporary.join_token must not be empty".into());
+        }
+        let lease_file = self
+            .lease_file
+            .unwrap_or_else(|| PathBuf::from(crate::pool::boot::LEASE_FILE));
+        if !lease_file.is_absolute() {
+            return Err(format!(
+                "temporary.lease_file must be absolute, got {}",
+                lease_file.display()
+            ));
+        }
+        let renew_interval = match self.renew_interval {
+            Some(raw) => positive_duration("temporary.renew_interval", &raw)?,
+            None => std::time::Duration::from_secs(60),
+        };
+        Ok(TemporaryConfig {
+            pool: self.pool,
+            slot: self.slot,
+            coordinator: self.coordinator,
+            join_token: crate::pool::JoinToken::new(self.join_token),
+            lease_file,
+            renew_interval,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -791,6 +931,11 @@ impl RawConfig {
         let ci = self.ci.validate()?;
         let memory = self.memory.validate()?;
         let retention = self.retention.validate()?;
+        let pools = self.pools.map(RawPools::validate).transpose()?;
+        let temporary = self.temporary.map(RawTemporary::validate).transpose()?;
+        if temporary.is_some() && !enabled {
+            return Err("temporary needs fleet.enabled = true to join its coordinator".into());
+        }
         let discovery = discovery.validate()?;
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::with_capacity(machines.len());
@@ -822,6 +967,8 @@ impl RawConfig {
             ci,
             memory,
             retention,
+            pools,
+            temporary,
         })
     }
 }

@@ -135,6 +135,13 @@ impl Home {
         self.root.join("tasks")
     }
 
+    /// Variables a temporary machine's coordinator handed it at join, which
+    /// every task and job run on the machine gets; absent on other machines
+    #[must_use]
+    pub fn pool_env_path(&self) -> PathBuf {
+        self.root.join("temporary").join("env")
+    }
+
     /// `jobs/` directory: each queue job's shared state and callback delivery.
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {
