@@ -34,8 +34,8 @@ use crate::pool::cloudlease::{
     CloudleaseClient, CloudleaseError, Lease, LeaseState, Run, RunState,
 };
 use crate::pool::{
-    DEFAULT_IDLE_LIMIT, DEFAULT_MIN_FREE_DISK_GIB, DEFAULT_STALL_AFTER, JoinAnswer, JoinRequest,
-    JoinToken, JoinedMachine, MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease,
+    ComingSlots, DEFAULT_IDLE_LIMIT, DEFAULT_MIN_FREE_DISK_GIB, DEFAULT_STALL_AFTER, JoinAnswer,
+    JoinRequest, JoinToken, JoinedMachine, MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease,
     MachineReleased, MachineState, Pool, PoolCode, PoolEnd, PoolError, PoolMachine, PoolName,
     PoolReach, PoolSettings, PoolState, PoolView, ReleaseReason, RunEndCause, SlotId,
     parse_env_file,
@@ -1049,33 +1049,29 @@ impl Pass<'_> {
         let held = held_ci_routes(self.state, pool.name.class()).await?;
         // a job only a machine the pool has can run waits for its slot; a
         // new machine would idle out without it
-        let ready = held
+        let kills: Vec<Duration> = held
             .ready
             .iter()
-            .filter(|route| {
-                route
-                    .spec
-                    .ci
-                    .as_ref()
-                    .is_some_and(|ci| reach.new_machine_can_run(ci.kill_after.get()))
-            })
-            .count();
-        let ready = u32::try_from(ready).unwrap_or(u32::MAX);
-        if ready == 0 {
+            .filter_map(|route| route.spec.ci.as_ref().map(|ci| ci.kill_after.get()))
+            .filter(|kill| reach.new_machine_can_run(*kill))
+            .collect();
+        if kills.is_empty() {
             return Ok(0);
         }
         let slots = pool.settings.slots.get().max(1);
-        let mut coming = 0_u32;
+        let mut coming = Vec::with_capacity(live.len());
         for machine in live {
-            match &machine.state {
-                MachineState::Requested | MachineState::Booting { .. } => coming += slots,
-                MachineState::Joined { joined, .. } => {
-                    coming += self.free_slots(pool, joined).await;
-                }
-                MachineState::Releasing { .. } | MachineState::Released { .. } => {}
-            }
+            let free = match &machine.state {
+                MachineState::Requested | MachineState::Booting { .. } => slots,
+                MachineState::Joined { joined, .. } => self.free_slots(pool, joined).await,
+                MachineState::Releasing { .. } | MachineState::Released { .. } => continue,
+            };
+            let ends_at = machine.state.lease().map(|lease| lease.hard_deadline_at);
+            coming.push(ComingSlots { ends_at, free });
         }
-        let missing = ready.saturating_sub(coming);
+        // a free slot on a machine that ends before a job's kill limit does
+        // not take the job, so it must not stand in for a new machine
+        let missing = reach.jobs_without_slot(kills, coming);
         let room = pool
             .settings
             .max_machines
@@ -1306,7 +1302,7 @@ fn machine_lease(lease: &Lease) -> MachineLease {
         lease: lease.lease_id.clone(),
         hard_deadline_at: lease.hard_deadline_at,
         created_at: lease.created_at,
-        boot_deadline_at: lease.heartbeat_deadline_at,
+        boot_deadline_at: Some(lease.heartbeat_deadline_at),
     }
 }
 
