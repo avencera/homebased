@@ -826,17 +826,21 @@ impl PoolReach {
                 .filter_map(|machine| machine.state.lease())
                 .collect();
             // every lease of the pool has the same grace and class lifetime,
-            // so the newest one tells; before any, cloudlease's defaults
-            let grace = leases
+            // so the newest one that kept its boot deadline tells
+            let shown_grace = leases
                 .iter()
+                .filter(|lease| lease.boot_deadline_at.is_some())
                 .max_by_key(|lease| lease.created_at)
-                .map_or(ASSUMED_BOOT_GRACE, |lease| lease.boot_grace());
+                .map(|lease| lease.boot_grace());
             // cloudlease deletes a machine that has not joined by the end of
-            // its grace, so a longer boot timeout never delays a join further
-            let join_within = pool
-                .settings
-                .boot_timeout
-                .map_or_else(|| boot_timeout_within(grace), |timeout| timeout.min(grace));
+            // its grace, so a longer boot timeout never delays a join
+            // further; before a lease showed the grace, a set boot timeout
+            // is the only bound, and without one cloudlease's default
+            let join_within = match (pool.settings.boot_timeout, shown_grace) {
+                (Some(timeout), Some(grace)) => timeout.min(grace),
+                (Some(timeout), None) => timeout,
+                (None, grace) => boot_timeout_within(grace.unwrap_or(ASSUMED_BOOT_GRACE)),
+            };
             // a lease that ends before the pool's deadline shows the class's
             // own lifetime, which every later machine gets too
             let class_lifetime = leases
@@ -1145,9 +1149,17 @@ mod tests {
         // cloudlease deletes an unjoined machine at its 8 minute grace, so a
         // 55 minute boot timeout still leaves a new machine 52 minutes
         let pool = test_pool(now + chrono::Duration::hours(1), Some(55 * MINUTE));
-        let reach = PoolReach::new(&pool, &[], now);
+        let lease = booting(&pool, now - chrono::Duration::minutes(1), 8, 120);
+        let reach = PoolReach::new(&pool, std::slice::from_ref(&lease), now);
         assert!(reach.new_machine_can_run(52 * MINUTE));
         assert!(!reach.new_machine_can_run(53 * MINUTE));
+
+        // before any lease showed the grace, a set boot timeout is the bound,
+        // as for a phoenixNAP pool whose grace is 20 minutes
+        let pool = test_pool(now + chrono::Duration::minutes(30), Some(19 * MINUTE));
+        let reach = PoolReach::new(&pool, &[], now);
+        assert!(reach.new_machine_can_run(11 * MINUTE));
+        assert!(!reach.new_machine_can_run(12 * MINUTE));
     }
 
     #[test]
