@@ -256,7 +256,10 @@ fn a_job_next_for_a_busy_gpu_holds_room_from_tasks_only_when_asked() {
     eventually("the trace never started", || {
         job_state(&h, trace) == "active"
     });
-    assert_eq!(cli(&h, &["resource", "jobs"])["memory_holds"], Value::Null);
+    // the pass that launched it sends the holds once the launch returns
+    eventually("the started trace still held room", || {
+        cli(&h, &["resource", "jobs"])["memory_holds"] == Value::Null
+    });
     assert_eq!(task(&h, &late)["status"], "held");
     fs::write(h.home.join("finish-trace"), "").unwrap();
     h.wait_status(&late, "running");

@@ -217,8 +217,8 @@ pub struct Decisions {
 /// 3. A job with `hold_room` whose resources are all busy, and that no job
 ///    ahead of it waits for any of the same resources, holds back from tasks
 ///    its peak less the least that one of those resources' jobs frees when
-///    it ends. It holds nothing from other GPU jobs, which are served first
-///    anyway
+///    it ends. It holds nothing from other GPU jobs: one behind it that finds
+///    a free resource starts now rather than leave that GPU idle
 #[must_use]
 pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut free: Vec<&ResourceView> = snapshot
@@ -291,8 +291,10 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
 /// A job behind another that waits for any of the same resources holds
 /// nothing, since it cannot start before that one. A job ahead of it frees
 /// its own peak when it ends, so only the rest is held; the least any of the
-/// job's resources frees counts, as any of them may come free first, and a
-/// job without a peak, or a run whose job is gone, frees an unknown amount
+/// job's resources frees counts, as any of them may come free first. A job
+/// without a peak, or a run whose job is gone, frees an unknown amount, and a
+/// run cleaning up or in `Attention` already gave its memory back, so these
+/// count nothing
 fn memory_holds(
     snapshot: &Snapshot,
     waiting: &[&JobView],
@@ -306,15 +308,13 @@ fn memory_holds(
     };
     // what the job on a busy resource frees when it ends
     let frees = |resource: &ResourceView| {
-        let job = resource.run.as_ref().map_or_else(
-            || {
-                taken
-                    .iter()
-                    .find(|(id, _)| *id == resource.id)
-                    .map(|(_, job)| job.id)
-            },
-            |run| Some(run.job),
-        );
+        let job = match &resource.run {
+            Some(run) => run.phase.holds_job().then_some(run.job),
+            None => taken
+                .iter()
+                .find(|(id, _)| *id == resource.id)
+                .map(|(_, job)| job.id),
+        };
         job.and_then(|job| snapshot.queue.iter().find(|view| view.id == job))
             .and_then(|view| view.mem_peak)
             .map_or(0, MemPeak::bytes)

@@ -586,6 +586,20 @@ fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
     // a run that frees at least the peak leaves nothing to hold
     machine.set_peak(predict, Some(28.0));
     assert!(decide(&machine.snapshot(t0())).memory_holds.is_empty());
+
+    // a run cleaning up after a preemption already gave its memory back,
+    // though its job is still queued, so the whole peak is held
+    let gpu0 = machine.resource("gpu0");
+    let task = machine.resources[0].run.as_ref().unwrap().task;
+    machine
+        .queue
+        .iter_mut()
+        .find(|view| view.id == predict)
+        .unwrap()
+        .state = QueuedState::Queued;
+    machine.set_run(gpu0, predict, task, RunPhase::Cleaning { attempt: 1 });
+    let holds = decide(&machine.snapshot(t0())).memory_holds;
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28)));
 }
 
 #[test]
