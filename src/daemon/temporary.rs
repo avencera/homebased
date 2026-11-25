@@ -58,6 +58,12 @@ impl Member {
         Self(temporary.then(|| Arc::new(watch::Sender::new(None))))
     }
 
+    /// Whether this daemon is a temporary machine
+    #[must_use]
+    pub fn is_temporary(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// When cloudlease deletes this machine, once its lease is known
     #[must_use]
     pub fn ends_at(&self) -> Option<DateTime<Utc>> {

@@ -69,6 +69,8 @@ pub(crate) struct QueueArgs {
     pub thresholds: NoticeThresholds,
     /// CI admission and checkout settings from config.toml
     pub ci: CiConfig,
+    /// Where slot clones get the commits of CI jobs
+    pub commits: crate::queue::ci::CommitOrigin,
     /// Owner of host memory admission, shared with the task release loop
     pub memory: ActorRef<MemoryMsg>,
 }
@@ -546,10 +548,12 @@ async fn checkout_run(
     // retires an idle slot's clone only while the slot has no run, never moves
     // a clone a launch is about to enter
     let clone = git.clone_dir(&checkout_root(&args.home, &args.ci), &lane);
-    let command = CommandLine::try_from_argv(git.wrap(&clone, &workdir, &workload.command))
-        .map_err(|error| AppError::Internal {
-            message: format!("checkout wrapper: {error}"),
-        })?;
+    let source = args.commits.source(args.home.root(), record.id);
+    let command =
+        CommandLine::try_from_argv(git.wrap(&clone, &workdir, &workload.command, &source))
+            .map_err(|error| AppError::Internal {
+                message: format!("checkout wrapper: {error}"),
+            })?;
     Ok(Some(CheckoutRun {
         workload: Workload::Task(TaskWorkload {
             command,

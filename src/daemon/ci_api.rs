@@ -130,7 +130,12 @@ pub(super) async fn check_offered(
     // Once released, the class is the Fleet's again
     let pool = match choice {
         MachineChoice::Any => super::pools::admit_pool_job(state, ci).await?,
-        MachineChoice::Pinned(_) => false,
+        MachineChoice::Pinned(machine) => {
+            // a job pinned to one of a pool's machines checks out from a
+            // bundle like any other job of the pool
+            super::pools::prepare_pinned_pool_job(state, ci, machine).await?;
+            false
+        }
     };
     if pool {
         return Ok(());

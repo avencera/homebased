@@ -139,6 +139,7 @@ pub(crate) struct SupervisorArgs {
     machine_name: String,
     thresholds: crate::queue::schedule::NoticeThresholds,
     ci: crate::queue::ci::CiConfig,
+    commits: crate::queue::ci::CommitOrigin,
     memory: MemoryLimits,
 }
 
@@ -156,6 +157,7 @@ impl SupervisorArgs {
             machine_name: "this machine".into(),
             thresholds: crate::queue::schedule::NoticeThresholds::default(),
             ci: crate::queue::ci::CiConfig::default(),
+            commits: crate::queue::ci::CommitOrigin::Remote,
             memory: MemoryLimits::new(&crate::config::MemoryConfig::default()),
         }
     }
@@ -169,6 +171,12 @@ impl SupervisorArgs {
     /// Set CI admission and checkout settings from the daemon configuration
     pub(crate) fn with_ci(mut self, ci: crate::queue::ci::CiConfig) -> Self {
         self.ci = ci;
+        self
+    }
+
+    /// Set where slot clones get the commits of CI jobs
+    pub(crate) fn with_commits(mut self, commits: crate::queue::ci::CommitOrigin) -> Self {
+        self.commits = commits;
         self
     }
 
@@ -208,6 +216,7 @@ impl Actor for SupervisorActor {
             machine_name,
             thresholds,
             ci,
+            commits,
             memory,
         }: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
@@ -274,6 +283,7 @@ impl Actor for SupervisorActor {
                 supervisor: myself.clone(),
                 thresholds,
                 ci,
+                commits,
                 memory: state.memory.clone(),
             },
             myself.get_cell(),

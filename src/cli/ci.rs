@@ -14,6 +14,7 @@ use crate::client::Client;
 use crate::dependency::DependencyId;
 use crate::error::AppError;
 use crate::machine::MachineId;
+use crate::pool::bundle::FetchAnswer;
 use crate::queue::ci::{
     ClassStats, CommitId, GitRemote, JobClass, KillAfter, SlotCapacity, Spread, format_bytes,
 };
@@ -58,6 +59,13 @@ pub enum CiCommand {
     Move(MoveArgs),
     /// Queue waits and run times per machine and class, with p50 and p90
     Stats(StatsArgs),
+    /// Hidden step of a pool job's checkout on a temporary machine: download
+    /// the job's bundle from the coordinator and print where it is
+    #[command(name = "fetch-bundle", hide = true)]
+    FetchBundle {
+        /// The job whose commit to download
+        job: JobId,
+    },
 }
 
 /// Optional machine selector
@@ -209,6 +217,7 @@ pub async fn run(ctx: &Ctx, command: CiCommand) -> Result<ExitCode, AppError> {
             ctx.print_id(&args.job.to_string(), &format!("moved {}", args.job), value)?;
         }
         CiCommand::Stats(args) => stats(ctx, &client, args).await?,
+        CiCommand::FetchBundle { job } => fetch_bundle(&client, job).await?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -253,6 +262,45 @@ async fn submit(ctx: &Ctx, client: &Client, args: RunArgs) -> Result<(), AppErro
     };
     let job = args.job_id.unwrap_or_default();
     submit_value(ctx, client, job, spec, flags, args.after).await
+}
+
+/// Download attempts of one bundle before the checkout fails
+const BUNDLE_ATTEMPTS: u32 = 3;
+
+/// Wait before the second attempt, doubled before each later one
+const BUNDLE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ask this machine's daemon for job `job`'s bundle until it has it, and
+/// print its path; each failed attempt goes to stderr, which is the run's log
+async fn fetch_bundle(client: &Client, job: JobId) -> Result<(), AppError> {
+    let mut wait = BUNDLE_RETRY;
+    for attempt in 1..=BUNDLE_ATTEMPTS {
+        let answer: FetchAnswer = client
+            .post_json("/v1/ci/bundles", &json!({ "job": job }))
+            .await?;
+        let message = match answer {
+            FetchAnswer::Ready { path, .. } => {
+                println!("{}", path.display());
+                return Ok(());
+            }
+            FetchAnswer::Retry { message, .. } => message,
+        };
+        if attempt == BUNDLE_ATTEMPTS {
+            return Err(AppError::Internal {
+                message: format!(
+                    "the bundle of job {job} did not arrive in {BUNDLE_ATTEMPTS} attempts: {message}"
+                ),
+            });
+        }
+        eprintln!(
+            "homebased: bundle download attempt {attempt} of {BUNDLE_ATTEMPTS} failed: {message}; \
+             trying again in {}",
+            humantime::format_duration(wait)
+        );
+        tokio::time::sleep(wait).await;
+        wait *= 2;
+    }
+    Ok(())
 }
 
 /// This checkout's HEAD as a `ci.git` value, and the current directory

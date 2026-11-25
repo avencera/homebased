@@ -509,12 +509,19 @@ impl GitCheckout {
     /// Wrap `command` so it runs in `workdir` inside `clone` once the commit is
     /// checked out there
     ///
-    /// The wrapper creates the clone on first use, fetches the commit only when
-    /// the clone lacks it, checks it out detached, and removes untracked files
-    /// except ignored ones and `keep`. It then `exec`s the command, so the
-    /// command keeps the run's process group and the queue's kill reaches it
+    /// The wrapper creates the clone on first use, gets the commit from
+    /// `source` only when the clone lacks it, checks it out detached, and
+    /// removes untracked files except ignored ones and `keep`. It then
+    /// `exec`s the command, so the command keeps the run's process group and
+    /// the queue's kill reaches it
     #[must_use]
-    pub fn wrap(&self, clone: &Path, workdir: &InnerPath, command: &CommandLine) -> Vec<String> {
+    pub fn wrap(
+        &self,
+        clone: &Path,
+        workdir: &InnerPath,
+        command: &CommandLine,
+        source: &CommitSource,
+    ) -> Vec<String> {
         let excludes: String = self
             .keep
             .iter()
@@ -529,17 +536,34 @@ impl GitCheckout {
             64 => " --object-format=sha256",
             _ => "",
         };
+        let fetch = match source {
+            CommitSource::Remote => format!(
+                "remote={remote}\n\
+                 \x20 git fetch -q --no-tags \"$remote\" \"$commit\" \
+                 || git fetch -q --no-tags \"$remote\" '+refs/heads/*:refs/remotes/homebased-ci/*'\n",
+                remote = shell_quote(self.remote.as_str()),
+            ),
+            // the bundle holds the commit without its parents, so the clone
+            // records it as a shallow root first; git then takes the bundle as
+            // complete instead of looking for history it never had
+            CommitSource::Bundle { program, home, job } => format!(
+                "\x20 bundle=$({program} --home {home} ci fetch-bundle {job})\n\
+                 \x20 grep -qxF \"$commit\" .git/shallow 2>/dev/null \
+                 || printf '%s\\n' \"$commit\" >> .git/shallow\n\
+                 \x20 git fetch -q --no-tags \"$bundle\" \"$commit\"\n",
+                program = shell_quote(&program.display().to_string()),
+                home = shell_quote(&home.display().to_string()),
+            ),
+        };
         let script = format!(
             "set -eu\n\
              dir={dir}\n\
              commit={commit}\n\
-             remote={remote}\n\
              if [ ! -d \"$dir/.git\" ]; then mkdir -p \"$dir\" && git init -q{format} \"$dir\"; fi\n\
              cd \"$dir\"\n\
              find .git -name '*.lock' -type f -delete\n\
              if ! git cat-file -e \"$commit^{{commit}}\" 2>/dev/null; then\n\
-             \x20 git fetch -q --no-tags \"$remote\" \"$commit\" \
-             || git fetch -q --no-tags \"$remote\" '+refs/heads/*:refs/remotes/homebased-ci/*'\n\
+             {fetch}\
              fi\n\
              git -c advice.detachedHead=false checkout -q --detach -f \"$commit\"\n\
              git clean -ffdq{excludes}\n\
@@ -547,7 +571,6 @@ impl GitCheckout {
              exec \"$@\"\n",
             dir = shell_quote(&clone.display().to_string()),
             commit = shell_quote(self.commit.as_str()),
-            remote = shell_quote(self.remote.as_str()),
             workdir = shell_quote(&format!("./{}", workdir.as_path().display())),
         );
         let mut argv = vec![
@@ -559,6 +582,53 @@ impl GitCheckout {
         argv.extend(std::iter::once(command.program().to_owned()));
         argv.extend(command.args().iter().cloned());
         argv
+    }
+}
+
+/// Where a slot's clone gets a commit it lacks
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitSource {
+    /// Fetch it from the job's remote, with this machine's git credentials
+    Remote,
+    /// Check it out from the one-commit bundle the job's pool coordinator
+    /// made, which `program` downloads through this daemon over the Fleet
+    /// link; a temporary machine holds no git credentials
+    Bundle {
+        /// This daemon's executable
+        program: PathBuf,
+        /// This daemon's state directory
+        home: PathBuf,
+        /// The job whose bundle to download
+        job: super::JobId,
+    },
+}
+
+/// Where this machine's slot clones get the commits of CI jobs
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOrigin {
+    /// From each job's remote
+    Remote,
+    /// From the bundles of the pool coordinator, on a temporary machine;
+    /// `program` is this daemon's executable, which downloads them
+    Coordinator {
+        /// This daemon's executable
+        program: PathBuf,
+    },
+}
+
+impl CommitOrigin {
+    /// Where job `job`'s run gets its commit, for a daemon whose state
+    /// directory is `home`
+    #[must_use]
+    pub fn source(&self, home: &Path, job: super::JobId) -> CommitSource {
+        match self {
+            Self::Remote => CommitSource::Remote,
+            Self::Coordinator { program } => CommitSource::Bundle {
+                program: program.clone(),
+                home: home.to_path_buf(),
+                job,
+            },
+        }
     }
 }
 
@@ -1264,13 +1334,40 @@ mod tests {
         );
         let command =
             CommandLine::try_from_argv(vec!["cargo".into(), "test".into(), "a b".into()]).unwrap();
-        let argv = checkout.wrap(&clone, &InnerPath::top(), &command);
+        let argv = checkout.wrap(&clone, &InnerPath::top(), &command, &CommitSource::Remote);
         assert_eq!(argv[..2], ["sh", "-c"]);
         assert!(argv[2].contains(r"remote='https://example.com/o'\''brien/cove.git'"));
         assert!(argv[2].contains("git clean -ffdq -e 'rust/target'"));
         assert!(argv[2].contains("git init -q \"$dir\""));
         assert!(argv[2].ends_with("exec \"$@\"\n"));
         assert_eq!(argv[3..], ["homebased-ci", "cargo", "test", "a b"]);
+    }
+
+    #[test]
+    fn a_bundle_checkout_asks_the_daemon_and_never_names_the_remote() {
+        let checkout = GitCheckout {
+            remote: GitRemote::parse("git@github.com:me/private.git").unwrap(),
+            commit: CommitId::parse(&"c".repeat(40)).unwrap(),
+            keep: Vec::new(),
+        };
+        let job = crate::queue::JobId::new();
+        let source = CommitSource::Bundle {
+            program: PathBuf::from("/opt/home based/homebased"),
+            home: PathBuf::from("/var/lib/homebased"),
+            job,
+        };
+        let command = CommandLine::try_from_argv(vec!["true".into()]).unwrap();
+        let argv = checkout.wrap(
+            Path::new("/ci/p/rust-1"),
+            &InnerPath::top(),
+            &command,
+            &source,
+        );
+        assert!(argv[2].contains(&format!(
+            "bundle=$('/opt/home based/homebased' --home '/var/lib/homebased' ci fetch-bundle {job})"
+        )));
+        assert!(argv[2].contains("git fetch -q --no-tags \"$bundle\" \"$commit\""));
+        assert!(!argv[2].contains("github.com"));
     }
 
     #[test]
@@ -1310,7 +1407,12 @@ mod tests {
         };
         let command = CommandLine::try_from_argv(vec!["true".into()]).unwrap();
         let workdir = InnerPath::parse("workdir", Path::new("-")).unwrap();
-        let argv = checkout.wrap(Path::new("/ci/app/rust-1"), &workdir, &command);
+        let argv = checkout.wrap(
+            Path::new("/ci/app/rust-1"),
+            &workdir,
+            &command,
+            &CommitSource::Remote,
+        );
         assert!(argv[2].contains("git init -q --object-format=sha256 \"$dir\""));
         assert!(argv[2].contains("cd './-'\n"));
     }

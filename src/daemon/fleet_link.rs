@@ -122,14 +122,15 @@ pub struct LinkPeer {
 }
 
 impl LinkPeer {
-    /// Refuse unless the stream comes from the pool member `machine`
+    /// Refuse unless the stream comes from the pool member `machine`, which
+    /// runs the work the request is about
     pub fn require_member(&self, machine: MachineId) -> Result<(), AppError> {
         if self.grant == Some(Grant::PoolMember { machine }) {
             return Ok(());
         }
         Err(AppError::Permission {
             message: format!(
-                "link peer {} may only send events for its own work",
+                "link peer {} may only reach its own work",
                 self.endpoint.fmt_short()
             ),
         })
