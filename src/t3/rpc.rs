@@ -142,7 +142,6 @@ fn issue_ticket(origin: &str, token: &str, timeout: Duration) -> Result<String, 
         method: CurlMethod::Post,
         url: &format!("{origin}/api/auth/websocket-ticket"),
         bearer: Some(token),
-        headers: &[],
         json_body: None,
         timeout,
     })

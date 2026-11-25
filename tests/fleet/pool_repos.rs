@@ -200,11 +200,23 @@ fn pool_jobs_on_a_private_repository_run_from_one_commit_bundles() {
     };
     let wait_for_go = format!("; while [ ! -f {} ]; do sleep 0.2; done", go.display());
     let (first, output) = git_job(&origin, thread, &commits["two"], &report(&wait_for_go));
-    assert!(output.status.success(), "{}", refusal(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let (retried, output) = git_job(&origin, thread, &commits["three"], &report(""));
-    assert!(output.status.success(), "{}", refusal(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let (broken, output) = git_job(&origin, thread, &commits["four"], &report(""));
-    assert!(output.status.success(), "{}", refusal(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // the bundle holds the job's commit alone, under one ref
     let bundles = origin.home.join("pools/afv/bundles");
@@ -281,7 +293,11 @@ fn pool_jobs_on_a_private_repository_run_from_one_commit_bundles() {
             &report(""),
         ],
     );
-    assert!(output.status.success(), "{}", refusal(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let path = format!("/v1/cluster/pool/jobs/{first}/bundle");
     assert_eq!(
         link_request(&lease, iroh::SecretKey::generate(), &get(&path)),
@@ -334,4 +350,100 @@ fn pool_jobs_on_a_private_repository_run_from_one_commit_bundles() {
         pool(&origin, thread, "afv")
     );
     assert!(!origin.home.join("pools/afv").exists());
+}
+
+#[test]
+fn a_job_admitted_while_its_pool_releases_fails_with_the_pool() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    let commits = private_repository(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "afv",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+
+    // the coordinator's mirror sets a ref while it makes the job's bundle; a
+    // hook there holds admission, after the pool saw it open, until `go`. It
+    // reads all its input, since git fails a transaction whose hook did not.
+    // The release removes the pool's mirror, which would fail admission, so
+    // the hook puts it back: as if the bundle was done just before the release.
+    // It gives up after a minute, so a failed test leaves no hook behind
+    let hooks = origin.user_home.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let entered = origin.user_home.join("entered");
+    let go = origin.user_home.join("go");
+    let pool_dir = origin.home.join("pools/afv");
+    let saved = origin.user_home.join("saved-pool");
+    let hook = hooks.join("reference-transaction");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh
+refs=$(cat)
+case \"$1 $refs\" in prepared*refs/homebased/bundle/*) ;; *) exit 0 ;; esac
+cp -a {pool} {saved}
+touch {entered}
+i=0
+while [ ! -f {go} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+[ -d {pool} ] || cp -a {saved} {pool}
+",
+            pool = pool_dir.display(),
+            saved = saved.display(),
+            entered = entered.display(),
+            go = go.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = origin.user_home.join(".gitconfig");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[core]\n\thooksPath = {}\n", hooks.display()));
+    fs::write(&config, text).unwrap();
+
+    let job = std::thread::scope(|scope| {
+        let submit = scope.spawn(|| git_job(&origin, thread, &commits["two"], "true"));
+        assert!(
+            wait_until(Duration::from_secs(30), || entered.exists()),
+            "admission never made the bundle"
+        );
+        cli(&origin, thread, &["pool", "release", "afv"]);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                pool(&origin, thread, "afv")["state"] == "released"
+            }),
+            "the pool never released: {}",
+            pool(&origin, thread, "afv")
+        );
+        fs::write(&go, "").unwrap();
+        let (job, output) = submit.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        job
+    });
+
+    // the released pool no longer ends its class's held jobs, so the job
+    // ends with the pool at submit instead of waiting forever
+    assert!(
+        wait_until(Duration::from_secs(10), || final_event(&origin, job)
+            .is_some()),
+        "the job admitted while its pool released never ended"
+    );
+    let ended = final_event(&origin, job).unwrap();
+    assert_eq!(ended.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&ended), "pool_released", "{ended:?}");
 }

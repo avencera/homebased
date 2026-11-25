@@ -45,7 +45,6 @@ homebased pool release afv
 | `--slots` | CI slots of the class on each machine (default 1) |
 | `--idle-limit` | A machine with no work for this long releases itself (default 10m); on an hourly-billed provider it stays until shortly before its paid hour ends, if that is later |
 | `--stall-after` | Running work with no output for this long stops keeping its machine (default 30m) |
-| `--boot-timeout` | A machine that has not joined this long after its create is released. By default a minute before cloudlease's boot grace ends, or a quarter of the grace for one under 4 minutes; the coordinator reads the grace from each lease's first `heartbeat_deadline_at`, so DigitalOcean's 8 minutes gives 7m and phoenixNAP's 20 gives 19m. A machine renews only once it joined, so cloudlease deletes it at the end of the grace anyway; a value past the grace only changes the reason to `heartbeat_lapsed`. Must be shorter than `--deadline`; `pool create` refuses an equal or longer value with `usage`, because no machine could then join before the pool ends |
 | `--min-free-disk` | Free disk, in GiB, below which a machine of the pool admits no CI run (default 1; a Fleet machine's `[ci] min_free_disk_gib` is 10). The boot data writes it as the machine's `[ci] min_free_disk_gib`. Set it to what one job needs, within what the class has free after boot; a machine below it takes no job, idles out, and a fresh one replaces it |
 | `--env-file` | `NAME=value` lines on the coordinator that every run on the pool's machines gets |
 | `--spend-cap` | Most the pool's cloudlease run may spend, in US dollars, such as `25` or `12.50`. cloudlease's own per-run cap applies without it, and refuses a larger value |
@@ -53,13 +52,13 @@ homebased pool release afv
 
 The pool's name is the CI class its jobs name. A job of an open pool's class is accepted even before any machine exists. Submit pool jobs on the coordinator: only it reaches pool machines, and it counts only its own waiting jobs when it asks for machines.
 
-A pool owns its class until it is released: when it ends, it fails the class's jobs that never got a machine, even if a Fleet machine also offers the class. Once it is released the class is the Fleet's again: a job submitted then is accepted only if a Fleet machine offers the class, waits for that machine's slot, and the released pool never ends it.
+A pool owns its class until it is released: when it ends, it fails the class's jobs that never got a machine. So `pool create` refuses, with `class_offered` (exit 5), a name that a Fleet machine already offers as a CI class. Do not give a Fleet machine an open pool's class: the coordinator does not refuse that, and the pool still fails the class's waiting jobs when it ends. Once a pool is released the class is the Fleet's again: a job submitted then is accepted only if a Fleet machine offers the class, waits for that machine's slot, and the released pool never ends it.
 
 Placement never sends a job to a machine that cloudlease will delete before the job's kill limit, and every machine of the pool ends by its deadline, or sooner when the cloudlease class has a shorter lifetime. So the coordinator keeps each job within reach of some machine:
 
-- At submit, a job is refused with `pool_deadline_too_close` unless a machine the pool has (booting or joined) outlives its `--kill-after` from now, or a machine asked for now would, once it joined: the boot timeout from now plus the kill limit must end by the pool's deadline, or by the end of the class's lifetime, which a lease that ends before the deadline shows. Before a lease of the pool has shown the grace, it uses `--boot-timeout` when set, and otherwise assumes cloudlease's default 8-minute grace; set `--boot-timeout` on a class with a longer grace, such as `19m` on phoenixNAP, so the first jobs are not admitted on the shorter estimate. The message names the longest `--kill-after` the pool takes.
+- At submit, a job is refused with `pool_deadline_too_close` unless a machine the pool has (booting or joined) outlives its `--kill-after` from now, or a machine asked for now would, once it joined: cloudlease's boot grace from now plus the kill limit must end by the pool's deadline, or by the end of the class's lifetime, which a lease that ends before the deadline shows. Each lease shows the grace; before the pool has one, it assumes cloudlease's default 8 minutes, so on a class with a longer grace, such as phoenixNAP's 20 minutes, the first jobs are sized for the shorter boot. The message names the longest `--kill-after` the pool takes.
 - Each pass, a job that has not started and has fallen out of that reach, for example while its `--after` dependency ran, ends with `JOB_FAILED` whose `held_ending` has code `pool_deadline_too_close`. Time only takes reach away, so such a job could never run.
-- The pool asks for machines only for ready jobs that a new machine could run; a job that only a machine it has could run waits for that machine's slot. A free or coming slot counts against a job only on a machine that outlives the job's kill limit, so a slot on a machine about to end does not stand in for a new one. Once a lease has shown the boot grace, a `--boot-timeout` past it counts as the grace, since cloudlease deletes an unjoined machine then.
+- The pool asks for machines only for ready jobs that a new machine could run; a job that only a machine it has could run waits for that machine's slot. A free or coming slot counts against a job only on a machine that outlives the job's kill limit, so a slot on a machine about to end does not stand in for a new one.
 
 ## Lifecycle
 
@@ -76,7 +75,7 @@ The coordinator moves each machine through these states, all from what cloudleas
 Each pass, about every 15 seconds, the coordinator:
 
 1. creates the pool's cloudlease run on its first pass;
-2. reads the run, moves each machine to its lease's state, and releases a machine that has not joined within the boot timeout;
+2. reads the run and moves each machine to its lease's state. A machine renews only once it joined, so cloudlease deletes one that has not joined when its boot grace ends; it is `released` with reason `heartbeat_lapsed` once cloudlease confirms it gone, and its place under `--max` frees then;
 3. ends waiting jobs out of reach (see above), then asks for machines while ready jobs of the class that a new machine could run outnumber the free slots on joined machines plus the slots of machines still booting, up to `--max`. A machine the provider could not create comes back from cloudlease already releasing with reason `create_failed`; the coordinator then waits 4 passes (a minute at the default interval) before it asks again, twice that after a second failure in a row, and stops the pool after a third;
 4. for each machine cloudlease reports `released`, removes it from the Fleet. A job it still held whose machine was `interrupted` is queued again for another machine, within `--job-retries` (see [Interrupted machines](#interrupted-machines)); every other job it held ends with `JOB_FAILED`, and every job pinned to it with `--machine` that never reached it, such as one waiting on its `--after` entries, with `JOB_FAILED` whose `held_ending` has code `machine_released`;
 5. at the deadline, or after `pool release`, releases the run, fails the class's jobs submitted before the release that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool whose run cloudlease no longer has ends the same way with `run_not_found`. The pool is marked released only once cloudlease took the run's release.
@@ -113,9 +112,7 @@ The machine's boot data, written by the coordinator and passed through cloudleas
 
 A renewal that fails, such as with no answer or `401 unauthorized`, is tried again every 5 seconds within the round, then the next round; cloudlease's heartbeat window, 3 minutes by default, spans several rounds. Its hard deadline applies whatever the machine decides.
 
-On a provider that bills every started hour, phoenixNAP and Latitude.sh, cloudlease names in each renew answer when the machine's paid hour ends, less 10 minutes for the release to finish, as `idle_hold_until`. An idle machine stays until then instead of releasing at `--idle-limit`, so a job that arrives in that window uses time already paid for. The hold applies at once in the first hour. After it, cloudlease names no hold within the boot grace after each hour from create turns, when the provider's next hour could start before then, since it does not know exactly when the provider's billing started; nor when the hold would pass the lease's hard deadline, and so the pool's deadline; or on a provider that bills by the second, DigitalOcean and AWS. A hold never starts a new hour, so it adds nothing to the run's spend or its spend cap. If `--idle-limit` ends after the hold, the machine releases at `--idle-limit` as before. A machine also waits for its first renew answer before an idle release, so even `--idle-limit 0s` keeps a hold cloudlease names.
-
-5. when `lease.json` has `"interruption_notice": "aws_imds"`, as cloudlease writes it for AWS Spot machines, it reads EC2's instance metadata service with IMDSv2 every 5 seconds for a Spot interruption notice (`spot/instance-action`). `[temporary] imds_endpoint` overrides the service's address, `http://169.254.169.254` by default. On a notice, about two minutes before AWS takes the instance back, it stops offering the CI class for good, writes the notice to the file every run finds in `HOMEBASED_INTERRUPTION_FILE`, and tells the coordinator; see [Interrupted machines](#interrupted-machines). Machines on other providers never poll.
+On a provider that bills every started hour, phoenixNAP and Latitude.sh, an idle machine stays until about 10 minutes before its paid hour ends, as cloudlease names in each renew answer (`idle_hold_until`), instead of releasing at `--idle-limit`, and a job that arrives meanwhile uses time already paid for. A hold never starts a new paid hour or passes the pool's deadline, so it adds nothing to the run's spend. If `--idle-limit` ends later, the machine releases then. DigitalOcean and AWS bill by the second, so their machines release at `--idle-limit`.
 
 ## Code on the machine
 
@@ -145,18 +142,18 @@ Anything the job wrote on the machine and had not uploaded is gone; the task log
 
 ## Interrupted machines
 
-A machine is `interrupted` when its provider took it back while its lease was live, such as an AWS Spot interruption: cloudlease's presence check finds it gone, within about a minute of the provider ending it, or the machine reports the provider's notice first. The job did nothing wrong, so the coordinator queues it again for another machine of the pool, up to `--job-retries` times per job, and the pool asks for a replacement machine as it would for any waiting job. cloudlease's AWS launches leave out the Spot pools (instance type and zone) that interrupted the run within the last hour, so a replacement lands elsewhere when the class allows.
+A machine is `interrupted` when its provider took it back while its lease was live, such as an AWS Spot interruption: cloudlease's presence check finds it gone, within about a minute of the provider ending it. The job did nothing wrong, so the coordinator queues it again for another machine of the pool, up to `--job-retries` times per job, and the pool asks for a replacement machine as it would for any waiting job. The replacement can land in the same Spot pool (instance type and zone), since cloudlease lets EC2 choose among all of the class's pools by spare capacity and price.
 
 The submitter sees each rerun as a `JOB_PREEMPTED` (a progress event: a sleeping thread does not wake for it) with `machine_lost`:
 
 ```json
 "machine_lost": {
   "pool": "afv", "machine": "afv-4fa9bd9a", "reason": "interrupted",
-  "ends_at": "2026-11-25T02:02:00Z", "attempt": 2, "max_attempts": 3
+  "attempt": 2, "max_attempts": 3
 }
 ```
 
-`attempt` is the run now queued, and `ends_at`, present when the machine gave notice, is when the provider ends it. The job's later events follow in the same sequence, and its final event comes from the run that ended it.
+`attempt` is the run now queued. The job's later events follow in the same sequence, and its final event comes from the run that ended it.
 
 A job whose machine was interrupted ends with `JOB_FAILED` and `machine_released` instead, with `not_rerun` saying why:
 
@@ -170,11 +167,7 @@ A job whose machine was interrupted ends with `JOB_FAILED` and `machine_released
 
 A rerun never outlives the pool: the deadline bounds every machine, and when the replacement's create would pass the spend cap, cloudlease refuses it with `spend_cap_reached`, the pool stops, and the queued job ends with that code in `held_ending`. Other reasons a machine goes away are never rerun: `heartbeat_lapsed` usually means every run on the machine stalled, which a rerun would repeat, and `hard_deadline` or `requested` mean the pool's time or its release ended the work.
 
-On an AWS interruption notice the machine closes its class, so nothing more is placed on it, and the coordinator queues the machine's jobs at once, without waiting for cloudlease. Once every one of them is queued again, it counts the machine as `releasing`. A job it does not rerun, such as one on a pool with `--job-retries 0`, keeps its machine `joined`, so a run that ends before AWS takes the machine still reports its result. It keeps the lease: AWS ends the machine at the notice's time, and until then the interrupted run goes on. A run can read `HOMEBASED_INTERRUPTION_FILE`, which appears with `{"action": "terminate", "ends_at": "..."}` on a notice, to save a checkpoint somewhere off the machine. The rerun may start on another machine while the interrupted run still has up to two minutes, until AWS shuts the machine down. The interrupted machine keeps its place under `--max` until cloudlease confirms it gone, so with `--max 1` the rerun waits a few minutes for it; give Spot pools room for a replacement.
-
-So every job on a pool with `--job-retries` above 0 must be safe to run again, and to run beside a dying copy of itself for up to two minutes: write each output under a name derived from the job's input, upload it whole (write, then rename or put the object at once), and skip work whose output already exists. A job that cannot be rerun belongs on a pool with `--job-retries 0`.
-
-The machine does not act on EC2's rebalance recommendation. It is an early, often false, signal, and draining machines on it would churn the pool; the price-capacity-optimized launch already prefers the pools least likely to be interrupted.
+So every job on a pool with `--job-retries` above 0 must be safe to run again: write each output under a name derived from the job's input, upload it whole (write, then rename or put the object at once), and skip work whose output already exists. A job that cannot be rerun belongs on a pool with `--job-retries 0`.
 
 ## Secrets
 
@@ -191,7 +184,7 @@ Each side serves an endpoint id only what it granted that id:
 | Who | Grant | What the link lets it do |
 | --- | --- | --- |
 | Endpoint not bound to a lease | none (enrollment) | Only `POST /v1/cluster/pool/join`. The single-use join token binds its endpoint id to the machine's lease; a failed join closes the connection |
-| Machine of a joined lease | pool member | Join again, report its provider's interruption notice (`/v1/cluster/pool/notice`, for its own lease only), the Fleet probe (`/v1/cluster/machine`), event delivery (`/v1/cluster/job-events`, `/v1/cluster/events`) for work it runs itself, and the bundles of jobs placed on it (`/v1/cluster/pool/jobs/{job}/bundle`). No route that starts work, sends messages, or reads other machines' tasks |
+| Machine of a joined lease | pool member | Join again, the Fleet probe (`/v1/cluster/machine`), event delivery (`/v1/cluster/job-events`, `/v1/cluster/events`) for work it runs itself, and the bundles of jobs placed on it (`/v1/cluster/pool/jobs/{job}/bundle`). No route that starts work, sends messages, or reads other machines' tasks |
 | Coordinator, on the machine | peer | Every route of the machine's own API, over streams it opens on the machine's connection |
 
 The coordinator grants an id when its join succeeds, and revokes it and closes its connection when the lease leaves `joined`. The lease stays bound to that one id: a join from another id for the same lease is refused, and so is a join that names a machine id the coordinator already knows, its own or another Fleet or pool machine's. The machine grants only the coordinator's id, from its boot data.
@@ -218,7 +211,7 @@ The full contract is the "Temporary machines contract" section of the cloudlease
 | `POST /v1/leases/{lease}/release` | Release one machine |
 | `POST /v1/runs/{run}/release` | Release the pool |
 
-The machine calls, with its lease token, `POST /v1/leases/{lease}/renew` and `POST /v1/leases/{lease}/release` (`{"reason": "idle"}`). A renew answers `heartbeat_deadline_at`, `hard_deadline_at`, and `idle_hold_until` (a time or `null`); a `410 lease_ended` answer means the machine is going away. It reads `interruption_notice` from `lease.json` (`aws_imds` on AWS, absent elsewhere and from an older cloudlease) to decide whether to watch for a Spot interruption notice. A lease cloudlease ended because the provider took the machine back has release reason `interrupted`.
+The machine calls, with its lease token, `POST /v1/leases/{lease}/renew` and `POST /v1/leases/{lease}/release` (`{"reason": "idle"}`). A renew answers `heartbeat_deadline_at`, `hard_deadline_at`, and `idle_hold_until` (a time or `null`); a `410 lease_ended` answer means the machine is going away. A lease cloudlease ended because the provider took the machine back has release reason `interrupted`.
 
 ## Not covered
 

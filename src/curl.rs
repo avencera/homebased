@@ -17,8 +17,6 @@ pub(crate) enum CurlMethod {
     Get,
     /// Send a POST request
     Post,
-    /// Send a PUT request
-    Put,
 }
 
 /// Input for one blocking curl request
@@ -29,8 +27,6 @@ pub(crate) struct CurlRequest<'a> {
     pub(crate) url: &'a str,
     /// Optional bearer token
     pub(crate) bearer: Option<&'a str>,
-    /// Other headers, as names and values
-    pub(crate) headers: &'a [(&'a str, &'a str)],
     /// Optional JSON request body
     pub(crate) json_body: Option<&'a serde_json::Value>,
     /// Maximum request time
@@ -115,12 +111,8 @@ fn render_config(request: &CurlRequest<'_>) -> Result<String, String> {
         match request.method {
             CurlMethod::Get => "GET",
             CurlMethod::Post => "POST",
-            CurlMethod::Put => "PUT",
         },
     );
-    for (name, value) in request.headers {
-        push_config_value(&mut config, "header", &format!("{name}: {value}"));
-    }
 
     if let Some(bearer) = request.bearer {
         push_config_value(
@@ -277,7 +269,6 @@ mod tests {
             method: CurlMethod::Post,
             url: "https://example.test/path?q=\"\\\n\r\t",
             bearer: Some(token),
-            headers: &[],
             json_body: Some(&body),
             timeout: Duration::from_secs(5),
         };
@@ -317,7 +308,6 @@ mod tests {
             method: CurlMethod::Post,
             url: &url,
             bearer: Some("unit-test-token"),
-            headers: &[],
             json_body: Some(&body),
             timeout: Duration::from_secs(5),
         })

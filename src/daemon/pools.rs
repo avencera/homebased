@@ -25,6 +25,7 @@ use super::AppState;
 use super::actors::{StoreMsg, call};
 use super::dependencies::held_ci_routes;
 use super::fleet_link::{FleetLink, Grant, LinkPeer};
+use super::fleet_view::Scope;
 use crate::config::PoolsConfig;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
@@ -35,11 +36,10 @@ use crate::pool::cloudlease::{
 };
 use crate::pool::{
     ComingSlots, DEFAULT_IDLE_LIMIT, DEFAULT_JOB_RETRIES, DEFAULT_MIN_FREE_DISK_GIB,
-    DEFAULT_STALL_AFTER, InterruptionNotice, JoinAnswer, JoinRequest, JoinToken, JoinedMachine,
-    MAX_JOB_RETRIES, MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease, MachineLost,
-    MachineReleased, MachineState, NoticeAnswer, Pool, PoolCode, PoolEnd, PoolError, PoolMachine,
-    PoolName, PoolReach, PoolSettings, PoolState, PoolView, ReleaseReason, Rerun, RerunPolicy,
-    RunEndCause, SlotId, parse_env_file,
+    DEFAULT_STALL_AFTER, JoinAnswer, JoinRequest, JoinToken, JoinedMachine, MAX_JOB_RETRIES,
+    MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease, MachineReleased, MachineState, Pool,
+    PoolCode, PoolEnd, PoolError, PoolMachine, PoolName, PoolReach, PoolSettings, PoolState,
+    PoolView, ReleaseReason, Rerun, RerunPolicy, RunEndCause, SlotId, parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
 use crate::queue::delivery::{HeldJobEnding, JobRoute};
@@ -62,10 +62,6 @@ pub fn read_routes() -> Router<AppState> {
 /// Route a temporary machine joins through, over the Fleet link
 pub const JOIN_PATH: &str = "/v1/cluster/pool/join";
 
-/// Route a joined temporary machine reports its provider's interruption
-/// notice through, over the Fleet link
-pub const NOTICE_PATH: &str = "/v1/cluster/pool/notice";
-
 /// How long after its join a machine's slots count as coming even while it
 /// cannot yet say what it offers
 const JOIN_SETTLE: Duration = Duration::from_secs(120);
@@ -85,7 +81,6 @@ pub(super) fn enrollment_routes() -> Router<AppState> {
 /// other machines' tasks
 pub(super) fn member_routes(state: &AppState) -> Router<AppState> {
     let routes = enrollment_routes()
-        .route(NOTICE_PATH, post(notice))
         .route(
             "/v1/cluster/job-events",
             post(super::queue_api::member_job_event),
@@ -140,8 +135,6 @@ struct CreateBody {
     idle_limit: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     stall_after: Option<Duration>,
-    #[serde(default, with = "humantime_serde")]
-    boot_timeout: Option<Duration>,
     #[serde(default)]
     env_file: Option<std::path::PathBuf>,
     #[serde(default)]
@@ -173,25 +166,6 @@ impl CreateBody {
         if let Some(path) = &self.env_file {
             read_env(path).map_err(usage)?;
         }
-        if self
-            .boot_timeout
-            .is_some_and(|timeout| timeout.is_zero() || timeout > MAX_LIFETIME)
-        {
-            return Err(usage(
-                "--boot-timeout must be more than 0 and at most 24h".into(),
-            ));
-        }
-        // a machine could never join before the pool ends, so every job would be
-        // refused before the first lease shows the real boot grace
-        if let Some(timeout) = self.boot_timeout
-            && timeout >= self.deadline
-        {
-            return Err(usage(format!(
-                "--boot-timeout {} must be shorter than --deadline {}",
-                humantime::format_duration(timeout),
-                humantime::format_duration(self.deadline),
-            )));
-        }
         let job_retries = self.job_retries.unwrap_or(DEFAULT_JOB_RETRIES);
         if job_retries > MAX_JOB_RETRIES {
             return Err(usage(format!(
@@ -217,7 +191,6 @@ impl CreateBody {
                 slots,
                 idle_limit: self.idle_limit.unwrap_or(DEFAULT_IDLE_LIMIT),
                 stall_after: self.stall_after.unwrap_or(DEFAULT_STALL_AFTER),
-                boot_timeout: self.boot_timeout,
                 min_free_disk_gib,
                 env_file: self.env_file,
                 spend_cap_cents: self.spend_cap_cents,
@@ -256,6 +229,7 @@ async fn create(
         });
     }
     let pool = body.into_pool()?;
+    refuse_fleet_class(&state, &pool.name).await?;
     let inserted = call(&state.store, |reply| StoreMsg::InsertPool {
         pool: Box::new(pool),
         reply,
@@ -280,6 +254,33 @@ async fn create(
         pool,
         machines: Vec::new(),
     })?))
+}
+
+/// Refuse a pool whose class a Fleet machine already offers
+///
+/// An open pool owns its class: it asks for machines for every waiting job
+/// of the class and fails those still waiting when it ends, so it must not
+/// share the class with a Fleet machine. A Fleet machine that starts
+/// offering the class while the pool is open is not refused, since its
+/// offer is its own config: the pool keeps the class until it is released
+async fn refuse_fleet_class(state: &AppState, name: &PoolName) -> Result<(), AppError> {
+    let (_, statuses) = super::ci_api::fleet_status(state, Scope::All).await?;
+    let offered = statuses.iter().any(|status| {
+        status
+            .offer
+            .class(name.class())
+            .is_some_and(|offer| offer.capacity.get() > 0)
+    });
+    if !offered {
+        return Ok(());
+    }
+    Err(PoolError::new(
+        PoolCode::ClassOffered,
+        format!(
+            "a Fleet machine already offers CI class {name} (see `ci slots`); name the pool after a class no Fleet machine offers"
+        ),
+    )
+    .into())
 }
 
 async fn list(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -398,6 +399,43 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
             Ok(true)
         }
     }
+}
+
+/// End a just-saved job its pool admitted if the pool stopped taking jobs
+/// since
+///
+/// Admission fetches the job's commit before the route is saved, and the
+/// pool can wind down to released meanwhile. A released pool no longer ends
+/// its class's held jobs, so the job would wait forever. The caller holds the
+/// job's submission lock; the route it gets back is the saved one
+pub(super) async fn end_if_closed(state: &AppState, route: JobRoute) -> Result<JobRoute, AppError> {
+    let Some(ci) = &route.spec.ci else {
+        return Ok(route);
+    };
+    let name = PoolName::from_class(ci.class.clone());
+    let pool = call(&state.store, |reply| StoreMsg::Pool { name, reply }).await?;
+    let Some(pool) = pool else {
+        return Ok(route);
+    };
+    let end = match &pool.state {
+        PoolState::Open => return Ok(route),
+        PoolState::Stopped { end }
+        | PoolState::Releasing { end }
+        | PoolState::Released { end, .. } => end,
+    };
+    let job = route.job;
+    let ending = HeldJobEnding::Refused {
+        code: end.job_code().to_owned(),
+        message: end.job_message(&pool.name),
+    };
+    call(&state.store, |reply| StoreMsg::EndPoolJob {
+        job,
+        ending,
+        reply,
+    })
+    .await?;
+    let saved = call(&state.store, |reply| StoreMsg::JobRoute { job, reply }).await?;
+    Ok(saved.unwrap_or(route))
 }
 
 /// Make the bundle of a job pinned to `machine` when it is a machine of the
@@ -545,103 +583,6 @@ pub(super) async fn join(
     }))
 }
 
-/// `POST /v1/cluster/pool/notice` over the Fleet link: a joined machine says
-/// its provider ends it soon, such as with an AWS Spot interruption notice
-///
-/// Its unfinished jobs that may run again are queued for other machines at
-/// once, rather than when cloudlease finds the machine gone a few minutes
-/// later, and the machine counts as releasing. Its lease is kept: the
-/// provider ends the machine at the notice's time, and until then a run may
-/// save what it can. A retry gets the same answer, with the jobs already
-/// queued left out
-pub(super) async fn notice(
-    State(state): State<AppState>,
-    Extension(peer): Extension<LinkPeer>,
-    Json(notice): Json<InterruptionNotice>,
-) -> Result<Json<NoticeAnswer>, AppError> {
-    configured(&state)?;
-    let refused =
-        |message: String| -> AppError { PoolError::new(PoolCode::NoticeRefused, message).into() };
-    if notice.api_version != API_VERSION {
-        return Err(refused(format!("api_version must be {API_VERSION}")));
-    }
-    let slot = notice.slot;
-    let _guard = state.locks.pool_joins.lock(slot).await;
-    let Some(mut machine) =
-        call(&state.store, |reply| StoreMsg::PoolMachine { slot, reply }).await?
-    else {
-        return Err(refused(format!("no pool machine {slot}")));
-    };
-    let (lease, joined) = match &machine.state {
-        MachineState::Joined { lease, joined }
-        | MachineState::Releasing {
-            lease,
-            joined: Some(joined),
-            ..
-        } if machine.pool == notice.pool
-            && lease.lease == notice.lease
-            && joined.endpoint == peer.endpoint =>
-        {
-            (lease.clone(), joined.clone())
-        }
-        _ => {
-            return Err(refused(format!(
-                "pool machine {slot} is not a joined machine of this notice's endpoint"
-            )));
-        }
-    };
-
-    let pool = read_pool(&state, &machine.pool).await?;
-    let policy = rerun_policy(&state, &pool, slot).await?;
-    let lost = MachineLost {
-        pool: pool.name.clone(),
-        machine: machine.name.clone(),
-        reason: ReleaseReason::Interrupted,
-        ends_at: Some(notice.ends_at),
-        // each job's own next attempt replaces this
-        attempt: 0,
-        max_attempts: policy.max_attempts,
-    };
-    let jobs = call(&state.store, |reply| StoreMsg::UnfinishedJobsOn {
-        machine: joined.machine,
-        reply,
-    })
-    .await?;
-    let unfinished = jobs.len();
-    let mut queued = Vec::new();
-    for job in jobs {
-        let _job_guard = state.locks.job_submissions.lock(job).await;
-        let rerun = call(&state.store, |reply| StoreMsg::RerunJobOfEndingMachine {
-            job,
-            machine: joined.machine,
-            lost: Box::new(lost.clone()),
-            policy,
-            reply,
-        })
-        .await?;
-        if rerun {
-            queued.push(job);
-        }
-    }
-
-    warn!(pool = %pool.name, machine = %machine.name, action = %notice.action, ends_at = %notice.ends_at, queued = queued.len(), unfinished, "temporary machine gave an interruption notice");
-    // a job left running there, such as one past its retry limit, may
-    // still finish before AWS takes the machine, so the machine keeps its
-    // link until cloudlease confirms it gone
-    if queued.len() == unfinished && matches!(machine.state, MachineState::Joined { .. }) {
-        machine.state = MachineState::Releasing {
-            lease,
-            joined: Some(joined),
-            reason: ReleaseReason::Interrupted,
-        };
-        save_machine(&state, &machine).await?;
-    }
-    Ok(Json(NoticeAnswer {
-        api_version: API_VERSION,
-        queued,
-    }))
-}
-
 /// Whether a joining machine's id is one this coordinator has never seen
 ///
 /// The machine names its own id, and when its lease ends the coordinator
@@ -741,13 +682,10 @@ pub(super) async fn run(state: AppState) {
                 client: &client,
                 config: &config,
             };
-            // a job whose machine refused it after the pool's last pass is held
-            // again with no pool left to place it, so a released pool keeps
-            // ending its held jobs; it needs no cloudlease call for that
-            if let PoolState::Released { end, .. } = &pool.state {
-                if let Err(error) = pass.end_held_jobs(&pool, end).await {
-                    warn!(pool = %name, "ending a released pool's held jobs: {error}");
-                }
+            // a released pool ended its held jobs as it wound down; a job of
+            // its class submitted since waits for a Fleet machine that
+            // offers the class, so it is not the pool's to end
+            if let PoolState::Released { .. } = &pool.state {
                 if let Err(error) = super::bundles::remove_if_released(&state, &name).await {
                     warn!(pool = %name, "removing a released pool's bundles: {error}");
                 }
@@ -978,13 +916,14 @@ impl Pass<'_> {
                     lease: machine_lease(lease),
                 };
             }
-            (Some(_), MachineState::Booting { lease }) => {
-                if Utc::now() >= pool.settings.boot_released_at(lease) {
-                    self.release_lease(&mut machine, ReleaseReason::BootTimeout)
-                        .await;
-                }
-            }
-            (Some(_), MachineState::Joined { .. } | MachineState::Released { .. }) => {}
+            // cloudlease deletes a machine that has not joined by the end of
+            // its boot grace, which the arm above then reads as releasing
+            (
+                Some(_),
+                MachineState::Booting { .. }
+                | MachineState::Joined { .. }
+                | MachineState::Released { .. },
+            ) => {}
             (None, MachineState::Requested) => match run {
                 // the create may not have reached cloudlease: send it again
                 Some(_) if self.still_open(pool).await? => {
@@ -1396,7 +1335,8 @@ impl Pass<'_> {
     /// End the pool's jobs that have not started and that no machine of the
     /// pool can run to their kill limit any more: time only takes reach away
     async fn end_out_of_reach(&self, pool: &Pool, reach: &PoolReach) -> Result<(), AppError> {
-        for route in self.owned_jobs(pool).await? {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        for route in held.ready.into_iter().chain(held.waiting) {
             let Some(kill) = route.spec.ci.as_ref().map(|ci| ci.kill_after.get()) else {
                 continue;
             };
@@ -1423,21 +1363,10 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Held jobs of the pool's class that the pool owns, ready or not;
-    /// the class's other held jobs wait for a Fleet machine that offers it
-    async fn owned_jobs(&self, pool: &Pool) -> Result<Vec<JobRoute>, AppError> {
-        let held = held_ci_routes(self.state, pool.name.class()).await?;
-        Ok(held
-            .ready
-            .into_iter()
-            .chain(held.waiting)
-            .filter(|route| pool.owns(route.submitted_at))
-            .collect())
-    }
-
     /// End the pool's jobs that have not started, with why the pool ended
     async fn end_held_jobs(&self, pool: &Pool, end: &PoolEnd) -> Result<(), AppError> {
-        for route in self.owned_jobs(pool).await? {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        for route in held.ready.into_iter().chain(held.waiting) {
             let job = route.job;
             let ending = HeldJobEnding::Refused {
                 code: end.job_code().to_owned(),
@@ -1518,7 +1447,7 @@ fn machine_lease(lease: &Lease) -> MachineLease {
         lease: lease.lease_id.clone(),
         hard_deadline_at: lease.hard_deadline_at,
         created_at: lease.created_at,
-        boot_deadline_at: Some(lease.heartbeat_deadline_at),
+        boot_deadline_at: lease.heartbeat_deadline_at,
     }
 }
 
@@ -1617,45 +1546,5 @@ fn local_reason(state: &MachineState) -> Option<ReleaseReason> {
     match state {
         MachineState::Releasing { reason, .. } => Some(reason.clone()),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{Value, json};
-
-    use super::{AppError, CreateBody};
-
-    fn create(deadline: &str, boot_timeout: Option<&str>) -> Result<(), AppError> {
-        let mut body = json!({
-            "api_version": crate::domain::API_VERSION,
-            "name": "ci",
-            "machine_class": "do-c16",
-            "max_machines": 1,
-            "deadline": deadline,
-        });
-        if let Some(timeout) = boot_timeout {
-            body["boot_timeout"] = Value::from(timeout);
-        }
-        serde_json::from_value::<CreateBody>(body)
-            .unwrap()
-            .into_pool()
-            .map(drop)
-    }
-
-    #[test]
-    fn a_boot_timeout_must_be_shorter_than_the_deadline() {
-        for (deadline, timeout) in [("30m", "55m"), ("30m", "30m")] {
-            let Err(AppError::Usage { message }) = create(deadline, Some(timeout)) else {
-                panic!("{timeout} against {deadline} was accepted");
-            };
-            assert_eq!(
-                message,
-                format!("--boot-timeout {timeout} must be shorter than --deadline {deadline}")
-            );
-        }
-
-        create("30m", Some("29m")).unwrap();
-        create("30m", None).unwrap();
     }
 }

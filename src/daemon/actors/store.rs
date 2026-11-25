@@ -700,11 +700,6 @@ pub(crate) enum StoreMsg {
     TemporaryActivity {
         reply: RpcReplyPort<Result<crate::store::StoredActivity, AppError>>,
     },
-    /// Jobs this origin sent to a machine that have no final event
-    UnfinishedJobsOn {
-        machine: MachineId,
-        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
-    },
     /// Jobs this origin sent to a machine or holds pinned to it that have no
     /// final event
     JobsOfReleasedMachine {
@@ -719,15 +714,6 @@ pub(crate) enum StoreMsg {
         released: Box<crate::pool::MachineReleased>,
         policy: crate::pool::RerunPolicy,
         reply: RpcReplyPort<Result<Option<crate::pool::Rerun>, AppError>>,
-    },
-    /// Queue again a job this origin sent to a machine that gave notice its
-    /// provider ends it
-    RerunJobOfEndingMachine {
-        job: crate::queue::JobId,
-        machine: MachineId,
-        lost: Box<crate::pool::MachineLost>,
-        policy: crate::pool::RerunPolicy,
-        reply: RpcReplyPort<Result<bool, AppError>>,
     },
     /// Save a new service
     InsertService {
@@ -1577,9 +1563,6 @@ impl Actor for StoreActor {
                 send_reply(reply, state.update_pool_machine(&machine));
             }
             StoreMsg::TemporaryActivity { reply } => send_reply(reply, state.temporary_activity()),
-            StoreMsg::UnfinishedJobsOn { machine, reply } => {
-                send_reply(reply, state.unfinished_jobs_on(machine));
-            }
             StoreMsg::JobsOfReleasedMachine { machine, reply } => {
                 send_reply(reply, state.jobs_of_released_machine(machine));
             }
@@ -1592,16 +1575,6 @@ impl Actor for StoreActor {
             } => send_reply(
                 reply,
                 state.end_job_of_released_machine(job, machine, &released, &policy),
-            ),
-            StoreMsg::RerunJobOfEndingMachine {
-                job,
-                machine,
-                lost,
-                policy,
-                reply,
-            } => send_reply(
-                reply,
-                state.rerun_job_of_ending_machine(job, machine, &lost, &policy),
             ),
             StoreMsg::InsertService { service, reply } => {
                 send_reply(reply, state.insert_service(&service));

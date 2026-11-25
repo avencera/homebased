@@ -41,11 +41,6 @@ pub enum PoolCommand {
         /// Running work with no output for this long stops keeping its machine
         #[arg(long = "stall-after", value_parser = humantime::parse_duration)]
         stall_after: Option<Duration>,
-        /// A machine that has not joined this long after its create is
-        /// released; by default shortly before cloudlease's boot grace ends,
-        /// which each lease shows
-        #[arg(long = "boot-timeout", value_parser = humantime::parse_duration)]
-        boot_timeout: Option<Duration>,
         /// Free disk, in GiB, below which a machine of the pool admits no CI
         /// run (default 1)
         #[arg(long = "min-free-disk", value_name = "GIB")]
@@ -91,7 +86,6 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
             slots,
             idle_limit,
             stall_after,
-            boot_timeout,
             min_free_disk,
             env_file,
             spend_cap,
@@ -110,7 +104,6 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
                 "slots": slots,
                 "idle_limit": format(idle_limit),
                 "stall_after": format(stall_after),
-                "boot_timeout": format(boot_timeout),
                 "env_file": env_file,
                 "spend_cap_cents": spend_cap,
                 "min_free_disk_gib": min_free_disk,

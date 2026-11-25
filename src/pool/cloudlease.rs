@@ -314,12 +314,7 @@ pub struct LeaseCredential {
     /// cloudlease deletes the machine at this time whatever happens
     pub hard_deadline_at: DateTime<Utc>,
     /// cloudlease deletes the machine this long after its last renew
-    #[serde(default)]
-    heartbeat_ttl_secs: Option<u64>,
-    /// The notice the machine's provider gives before it ends the machine;
-    /// absent for a provider that gives none, and from an older cloudlease
-    #[serde(default)]
-    pub interruption_notice: Option<super::notice::NoticeSource>,
+    heartbeat_ttl_secs: u64,
 }
 
 impl std::fmt::Debug for LeaseCredential {
@@ -345,10 +340,11 @@ impl LeaseCredential {
     /// of the lease's heartbeat window, so a failed renew has rounds to spare
     #[must_use]
     pub fn renew_interval(&self, configured: Duration) -> Duration {
-        self.heartbeat_ttl_secs
-            .map(|ttl| Duration::from_secs(ttl) / 4)
-            .filter(|quarter| !quarter.is_zero())
-            .map_or(configured, |quarter| configured.min(quarter))
+        let quarter = Duration::from_secs(self.heartbeat_ttl_secs) / 4;
+        if quarter.is_zero() {
+            return configured;
+        }
+        configured.min(quarter)
     }
 
     /// Move the heartbeat deadline; `410 lease_ended` means the machine is going away
@@ -413,7 +409,6 @@ fn request<T: DeserializeOwned>(
         method,
         url,
         bearer: Some(token),
-        headers: &[],
         json_body: body,
         timeout: REQUEST_TIMEOUT,
     })
@@ -456,7 +451,7 @@ mod tests {
 
     use super::LeaseCredential;
 
-    fn lease(ttl: Option<u64>) -> LeaseCredential {
+    fn lease(ttl: u64) -> LeaseCredential {
         serde_json::from_value(serde_json::json!({
             "lease_id": "run_1-1",
             "token": "cll_secret",
@@ -471,12 +466,11 @@ mod tests {
     fn renewals_come_at_least_four_times_per_heartbeat_window() {
         let configured = Duration::from_secs(30);
         // the default 3-minute window leaves the configured 30 s alone
-        assert_eq!(lease(Some(180)).renew_interval(configured), configured);
+        assert_eq!(lease(180).renew_interval(configured), configured);
         // the shortest window cloudlease allows forces 15 s
         assert_eq!(
-            lease(Some(60)).renew_interval(configured),
+            lease(60).renew_interval(configured),
             Duration::from_secs(15)
         );
-        assert_eq!(lease(None).renew_interval(configured), configured);
     }
 }

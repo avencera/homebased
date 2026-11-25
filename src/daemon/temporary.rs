@@ -10,15 +10,8 @@
 //! says the provider's paid time runs on. Before an idle release it stops
 //! offering the class and checks again, so a job placed in that instant
 //! keeps it alive and none can be queued after the check
-//!
-//! When `lease.json` says the provider gives notice before it ends the
-//! machine, as AWS does for a Spot interruption, a watcher polls for it. On a
-//! notice the machine stops offering the class for good, writes the notice
-//! where its runs find it (`HOMEBASED_INTERRUPTION_FILE`), and tells the
-//! coordinator, which queues its jobs again for other machines at once
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -29,8 +22,7 @@ use tracing::{info, warn};
 use super::AppState;
 use super::actors::{StoreMsg, call};
 use super::fleet_link::Grant;
-use super::keyed_locks::KeyedLocks;
-use super::pools::{JOIN_PATH, NOTICE_PATH};
+use super::pools::JOIN_PATH;
 use super::queue_api::forward;
 use crate::config::TemporaryConfig;
 use crate::domain::API_VERSION;
@@ -38,9 +30,8 @@ use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
 use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
 use crate::pool::cloudlease::{CloudleaseError, LeaseCredential, Renewed, SelfRelease};
-use crate::pool::notice::{AwsImds, NoticeSource, POLL_INTERVAL, ProviderNotice};
 use crate::pool::renewal::{Activity, IdleClock, IdleHold, Limits, Renewal};
-use crate::pool::{InterruptionNotice, JoinAnswer, JoinRequest, NoticeAnswer};
+use crate::pool::{JoinAnswer, JoinRequest};
 use crate::queue::ci::SlotCapacity;
 use crate::store::queue::interface::QueueRequest;
 
@@ -93,19 +84,7 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
     let coordinator = start_link(&state, &config).await;
     let answer = join_until_accepted(&state, &config, &coordinator, &lease).await;
     info!(pool = %answer.pool, "temporary machine joined its pool");
-    let gate = OfferGate::default();
-    let mut offered = setup(&state, &gate, &coordinator, &answer).await;
-    if let Some(source) = lease.interruption_notice {
-        let watcher = NoticeWatcher {
-            state: state.clone(),
-            config: config.clone(),
-            coordinator: coordinator.clone(),
-            lease: lease.clone(),
-            answer: answer.clone(),
-            gate: gate.clone(),
-        };
-        tokio::spawn(watcher.run(source));
-    }
+    let mut offered = setup(&state, &coordinator, &answer).await;
 
     let limits = Limits {
         idle_limit: answer.idle_limit,
@@ -133,7 +112,7 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
         // a setup or a reopen that failed is tried again each round the
         // machine is not releasing; until then it takes no CI job
         if !offered && !matches!(decision, Renewal::Release { .. }) {
-            offered = setup(&state, &gate, &coordinator, &answer).await;
+            offered = setup(&state, &coordinator, &answer).await;
         }
         match decision {
             Renewal::Renew | Renewal::Hold { .. } => {
@@ -150,7 +129,7 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
                     }
                     RenewOutcome::Failed => {}
                     RenewOutcome::Ended => {
-                        close_class(&state, &gate, &answer).await;
+                        close_class(&state, &answer).await;
                         break;
                     }
                 }
@@ -162,8 +141,7 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
                 withheld = true;
             }
             Renewal::Release { idle_since } => {
-                let end =
-                    release_idle(&state, &gate, &lease, &answer, idle_since, &mut offered).await;
+                let end = release_idle(&state, &lease, &answer, idle_since, &mut offered).await;
                 if end == LeaseEnd::Ended {
                     break;
                 }
@@ -263,13 +241,8 @@ async fn join(
 }
 
 /// Apply the join answer; whether the machine now offers the pool's class
-async fn setup(
-    state: &AppState,
-    gate: &OfferGate,
-    coordinator: &MachineAddress,
-    answer: &JoinAnswer,
-) -> bool {
-    match apply(state, gate, coordinator, answer).await {
+async fn setup(state: &AppState, coordinator: &MachineAddress, answer: &JoinAnswer) -> bool {
+    match apply(state, coordinator, answer).await {
         Ok(()) => true,
         Err(error) => {
             warn!("temporary machine setup: {error}");
@@ -282,7 +255,6 @@ async fn setup(
 /// offer the pool's class
 async fn apply(
     state: &AppState,
-    gate: &OfferGate,
     coordinator: &MachineAddress,
     answer: &JoinAnswer,
 ) -> Result<(), AppError> {
@@ -301,42 +273,7 @@ async fn apply(
         .map(|(name, value)| format!("{name}={value}\n"))
         .collect();
     write_private(&path, &text)?;
-    gate.offer(state, answer, answer.slots).await
-}
-
-/// Changes to how many slots of the pool's class this machine offers, one
-/// at a time, so none reopens the class after a notice closed it for good
-#[derive(Clone, Default)]
-struct OfferGate {
-    // one key: the machine offers one class, and the daemon allows no other mutex
-    changes: KeyedLocks<()>,
-    closed: Arc<AtomicBool>,
-}
-
-impl OfferGate {
-    /// Offer `capacity` slots, unless a notice closed the class for good;
-    /// closing it always applies
-    async fn offer(
-        &self,
-        state: &AppState,
-        answer: &JoinAnswer,
-        capacity: SlotCapacity,
-    ) -> Result<(), AppError> {
-        let _change = self.changes.lock(()).await;
-        if self.closed.load(Ordering::Acquire) && capacity.get() > 0 {
-            return Err(AppError::Usage {
-                message: "the provider gave notice that it ends this machine".into(),
-            });
-        }
-        offer(state, answer, capacity).await
-    }
-
-    /// Stop offering the class, and never offer it again
-    async fn close_for_good(&self, state: &AppState, answer: &JoinAnswer) -> Result<(), AppError> {
-        let _change = self.changes.lock(()).await;
-        self.closed.store(true, Ordering::Release);
-        offer(state, answer, SlotCapacity::default()).await
-    }
+    offer(state, answer, answer.slots).await
 }
 
 /// Set how many slots of the pool's class this machine offers
@@ -449,10 +386,10 @@ async fn renew(lease: &LeaseCredential, round: Duration) -> RenewOutcome {
 /// Stop offering the pool's class once cloudlease ended the lease, so no
 /// job is placed on a machine about to be deleted; running jobs go on
 /// until it is
-async fn close_class(state: &AppState, gate: &OfferGate, answer: &JoinAnswer) {
+async fn close_class(state: &AppState, answer: &JoinAnswer) {
     // the queue is this daemon's own, so a failure is brief; the machine is
     // deleted soon whatever happens
-    while let Err(error) = gate.offer(state, answer, SlotCapacity::default()).await {
+    while let Err(error) = offer(state, answer, SlotCapacity::default()).await {
         warn!("close the class after the lease ended: {error}");
         tokio::time::sleep(RETRY).await;
     }
@@ -461,7 +398,6 @@ async fn close_class(state: &AppState, gate: &OfferGate, answer: &JoinAnswer) {
 /// Stop offering the class, make sure nothing arrived, then release the lease
 async fn release_idle(
     state: &AppState,
-    gate: &OfferGate,
     lease: &LeaseCredential,
     answer: &JoinAnswer,
     idle_since: DateTime<Utc>,
@@ -469,7 +405,7 @@ async fn release_idle(
 ) -> LeaseEnd {
     // with no slots of its class the queue refuses a job of it in the same
     // store write that would queue it, so none can land after the check below
-    if let Err(error) = gate.offer(state, answer, SlotCapacity::default()).await {
+    if let Err(error) = offer(state, answer, SlotCapacity::default()).await {
         warn!("close the class before release: {error}");
         return LeaseEnd::Live;
     }
@@ -480,8 +416,7 @@ async fn release_idle(
         .map_or(true, |activity| activity != Activity::default());
     if busy {
         // a failed reopen is tried again next round
-        *offered = gate
-            .offer(state, answer, answer.slots)
+        *offered = offer(state, answer, answer.slots)
             .await
             .inspect_err(|error| warn!("reopen after a late job: {error}"))
             .is_ok();
@@ -508,117 +443,4 @@ async fn release_idle(
             LeaseEnd::Live
         }
     }
-}
-
-/// Watches for the provider's notice that it ends this machine, and acts on
-/// the first one
-struct NoticeWatcher {
-    state: AppState,
-    config: TemporaryConfig,
-    coordinator: MachineAddress,
-    lease: LeaseCredential,
-    answer: JoinAnswer,
-    gate: OfferGate,
-}
-
-impl NoticeWatcher {
-    async fn run(self, source: NoticeSource) {
-        let NoticeSource::AwsImds = source;
-        let notice = self.wait_for_notice().await;
-        warn!(action = %notice.action, ends_at = %notice.ends_at, "the provider gave notice that it ends this machine");
-
-        // first the file, so a run can start saving its work at once
-        if let Err(error) = write_notice(&self.state, &notice) {
-            warn!("write the interruption notice for runs: {error}");
-        }
-        while let Err(error) = self.gate.close_for_good(&self.state, &self.answer).await {
-            warn!("close the class after the interruption notice: {error}");
-            tokio::time::sleep(RETRY).await;
-        }
-        self.report(&notice).await;
-    }
-
-    /// Poll the metadata service until it shows a notice
-    async fn wait_for_notice(&self) -> ProviderNotice {
-        let mut imds = AwsImds::new(&self.config.imds_endpoint);
-        let mut failing = false;
-        let mut tick = tokio::time::interval(POLL_INTERVAL);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            let polled = tokio::task::spawn_blocking(move || {
-                let action = imds.instance_action();
-                (imds, action)
-            })
-            .await;
-            let action = match polled {
-                Ok((back, action)) => {
-                    imds = back;
-                    action
-                }
-                Err(error) => {
-                    imds = AwsImds::new(&self.config.imds_endpoint);
-                    Err(format!("metadata poll thread: {error}"))
-                }
-            };
-            match action {
-                Ok(Some(notice)) => return notice,
-                Ok(None) => failing = false,
-                // warn once per outage, since the poll runs every few seconds
-                Err(error) if !failing => {
-                    warn!("read the Spot interruption notice: {error}");
-                    failing = true;
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    /// Tell the coordinator until it answers, it refuses, or the machine
-    /// should be gone
-    async fn report(&self, notice: &ProviderNotice) {
-        let body = InterruptionNotice {
-            api_version: API_VERSION,
-            pool: self.answer.pool.clone(),
-            slot: self.config.slot,
-            lease: self.lease.lease_id.clone(),
-            action: notice.action.clone(),
-            ends_at: notice.ends_at,
-        };
-        let give_up = notice.ends_at + chrono::Duration::minutes(1);
-        while Utc::now() < give_up {
-            let response = ClusterClient::new(JOIN_TIMEOUT, DEFAULT_MAX_BODY)
-                .post_json(&self.coordinator, NOTICE_PATH, &body)
-                .await;
-            let error = match response {
-                Ok(response) if response.status.is_success() => {
-                    let queued = serde_json::from_slice::<NoticeAnswer>(&response.body)
-                        .map_or(0, |answer| answer.queued.len());
-                    info!(queued, "the coordinator queued this machine's jobs again");
-                    return;
-                }
-                Ok(response) if response.status.is_client_error() => {
-                    let error = crate::client::map_error(response.status, &response.body);
-                    warn!("the coordinator refused the interruption notice: {error}");
-                    return;
-                }
-                Ok(response) => format!("status {}", response.status),
-                Err(error) => error.to_string(),
-            };
-            warn!("report the interruption notice, retrying: {error}");
-            tokio::time::sleep(RETRY).await;
-        }
-    }
-}
-
-/// Write the notice where runs find it, whole or not at all
-fn write_notice(state: &AppState, notice: &ProviderNotice) -> Result<(), AppError> {
-    let path = state.home.interruption_notice_path();
-    let partial = path.with_extension("json.partial");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&partial, serde_json::to_vec(notice)?)?;
-    std::fs::rename(&partial, &path)?;
-    Ok(())
 }
