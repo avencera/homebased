@@ -407,12 +407,13 @@ async fn submit(
                 });
             }
             let held = waits || ci;
+            let mut pooled = false;
             if ci {
                 let choice = match body.spec.machine {
                     Some(_) => MachineChoice::Pinned(authority),
                     None => MachineChoice::Any,
                 };
-                super::ci_api::check_offered(&state, &body.spec, choice).await?;
+                pooled = super::ci_api::check_offered(&state, &body.spec, choice).await?;
             } else if held {
                 check_held_authority(&state, authority, &body.spec, body.placement).await?;
             }
@@ -441,11 +442,16 @@ async fn submit(
                 rerun: None,
                 cancel_requested: false,
             };
-            call(&state.store, |reply| StoreMsg::InsertJobRoute {
+            let route = call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),
                 reply,
             })
-            .await?
+            .await?;
+            if pooled {
+                super::pools::end_if_closed(&state, route).await?
+            } else {
+                route
+            }
         }
     };
     if let Some(view) = held_view(&state, &route).await? {

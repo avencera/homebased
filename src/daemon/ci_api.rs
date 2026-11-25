@@ -116,13 +116,16 @@ pub(super) async fn fleet_status(
 }
 
 /// Refuse a CI job no reachable machine it may run on offers its class
+///
+/// Returns whether an open pool admitted the job; the caller then saves its
+/// route and passes it to [`super::pools::end_if_closed`]
 pub(super) async fn check_offered(
     state: &AppState,
     spec: &JobSpec,
     choice: MachineChoice,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let Some(ci) = &spec.ci else {
-        return Ok(());
+        return Ok(false);
     };
     // a pool's class is offered by machines it creates on demand. A pool
     // that is not released owns its class, so its refusal stands even if a
@@ -137,7 +140,7 @@ pub(super) async fn check_offered(
         }
     };
     if pool {
-        return Ok(());
+        return Ok(true);
     }
     let scope = match choice {
         MachineChoice::Any => Scope::All,
@@ -151,7 +154,7 @@ pub(super) async fn check_offered(
             .is_some_and(|offer| offer.capacity.get() > 0)
     };
     if statuses.iter().any(offered) {
-        return Ok(());
+        return Ok(false);
     }
     let mut classes: Vec<JobClass> = statuses
         .iter()
@@ -434,7 +437,7 @@ async fn move_job(
     };
     let mut moved = route.spec.clone();
     moved.machine.clone_from(&machine);
-    check_offered(
+    let pooled = check_offered(
         &state,
         &moved,
         if machine.is_some() {
@@ -452,6 +455,11 @@ async fn move_job(
         reply,
     })
     .await?;
+    let route = if pooled {
+        super::pools::end_if_closed(&state, route).await?
+    } else {
+        route
+    };
     Ok(Json(serde_json::json!({
         "api_version": API_VERSION,
         "job_id": route.job,

@@ -42,7 +42,7 @@ use crate::pool::{
     PoolView, ReleaseReason, Rerun, RerunPolicy, RunEndCause, SlotId, parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
-use crate::queue::delivery::HeldJobEnding;
+use crate::queue::delivery::{HeldJobEnding, JobRoute};
 use crate::store::PoolInsert;
 
 /// Socket routes that change pools: create and release
@@ -399,6 +399,43 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
             Ok(true)
         }
     }
+}
+
+/// End a just-saved job its pool admitted if the pool stopped taking jobs
+/// since
+///
+/// Admission fetches the job's commit before the route is saved, and the
+/// pool can wind down to released meanwhile. A released pool no longer ends
+/// its class's held jobs, so the job would wait forever. The caller holds the
+/// job's submission lock; the route it gets back is the saved one
+pub(super) async fn end_if_closed(state: &AppState, route: JobRoute) -> Result<JobRoute, AppError> {
+    let Some(ci) = &route.spec.ci else {
+        return Ok(route);
+    };
+    let name = PoolName::from_class(ci.class.clone());
+    let pool = call(&state.store, |reply| StoreMsg::Pool { name, reply }).await?;
+    let Some(pool) = pool else {
+        return Ok(route);
+    };
+    let end = match &pool.state {
+        PoolState::Open => return Ok(route),
+        PoolState::Stopped { end }
+        | PoolState::Releasing { end }
+        | PoolState::Released { end, .. } => end,
+    };
+    let job = route.job;
+    let ending = HeldJobEnding::Refused {
+        code: end.job_code().to_owned(),
+        message: end.job_message(&pool.name),
+    };
+    call(&state.store, |reply| StoreMsg::EndPoolJob {
+        job,
+        ending,
+        reply,
+    })
+    .await?;
+    let saved = call(&state.store, |reply| StoreMsg::JobRoute { job, reply }).await?;
+    Ok(saved.unwrap_or(route))
 }
 
 /// Make the bundle of a job pinned to `machine` when it is a machine of the
