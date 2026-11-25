@@ -378,7 +378,8 @@ fn a_job_admitted_while_its_pool_releases_fails_with_the_pool() {
     // hook there holds admission, after the pool saw it open, until `go`. It
     // reads all its input, since git fails a transaction whose hook did not.
     // The release removes the pool's mirror, which would fail admission, so
-    // the hook puts it back: as if the bundle was done just before the release
+    // the hook puts it back: as if the bundle was done just before the release.
+    // It gives up after a minute, so a failed test leaves no hook behind
     let hooks = origin.user_home.join("hooks");
     fs::create_dir_all(&hooks).unwrap();
     let entered = origin.user_home.join("entered");
@@ -394,7 +395,8 @@ refs=$(cat)
 case \"$1 $refs\" in prepared*refs/homebased/bundle/*) ;; *) exit 0 ;; esac
 cp -a {pool} {saved}
 touch {entered}
-while [ ! -f {go} ]; do sleep 0.1; done
+i=0
+while [ ! -f {go} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
 [ -d {pool} ] || cp -a {saved} {pool}
 ",
             pool = pool_dir.display(),
