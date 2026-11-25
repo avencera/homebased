@@ -1415,7 +1415,7 @@ fn machine_lease(lease: &Lease) -> MachineLease {
         lease: lease.lease_id.clone(),
         hard_deadline_at: lease.hard_deadline_at,
         created_at: lease.created_at,
-        boot_deadline_at: Some(lease.heartbeat_deadline_at),
+        boot_deadline_at: lease.heartbeat_deadline_at,
     }
 }
 
