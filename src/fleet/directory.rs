@@ -786,11 +786,17 @@ impl PeerDirectory {
             })
             .collect();
         // most preferred source first, configured addresses in their
-        // transports order, then the most recent confirmation
+        // transports order, then the most recent confirmation; an explicit
+        // address shares the configured tier but has no position, so it goes
+        // after them rather than ahead of an iroh-first entry
         ranked.sort_by(|(a_position, a), (b_position, b)| {
             AddressPreference::from(a.source)
                 .cmp(&AddressPreference::from(b.source))
-                .then_with(|| a_position.cmp(b_position))
+                .then_with(|| {
+                    a_position
+                        .unwrap_or(usize::MAX)
+                        .cmp(&b_position.unwrap_or(usize::MAX))
+                })
                 .then_with(|| b.verified_at.cmp(&a.verified_at))
                 .then_with(|| a.address.cmp(&b.address))
         });
@@ -1072,8 +1078,10 @@ mod tests {
             position: 1,
             link: None,
         };
-        // iroh first, then HTTP, then what discovery found
+        // iroh first, then HTTP, then an address saved with `fleet add`,
+        // then what discovery found
         dir.set_configured(&[http.clone(), link.clone()], BTreeSet::new());
+        assert!(dir.add_explicit(addr("http://code-explicit:7677")));
         dir.record_sighting(sighting(
             "http://10.0.0.2:7677",
             SightingProvider::Mdns,
@@ -1082,6 +1090,7 @@ mod tests {
         let bound: Vec<bool> = [
             "http://10.0.0.2:7677",
             "http://code:7677",
+            "http://code-explicit:7677",
             "http://127.0.0.1:41000",
             "http://127.0.0.1:41000",
         ]
@@ -1089,7 +1098,7 @@ mod tests {
         .map(|raw| dir.record_probe(&addr(raw), &probed(machine, boot, "code"), now))
         .collect();
         // only the first probe over the link binds, so the caller saves once
-        assert_eq!(bound, vec![false, false, true, false]);
+        assert_eq!(bound, vec![false, false, false, true, false]);
         let order = |dir: &PeerDirectory| -> Vec<String> {
             dir.route(machine, now).map_or_else(
                 |_| Vec::new(),
@@ -1106,6 +1115,7 @@ mod tests {
             vec![
                 "http://127.0.0.1:41000",
                 "http://code:7677",
+                "http://code-explicit:7677",
                 "http://10.0.0.2:7677"
             ]
         );
@@ -1132,8 +1142,8 @@ mod tests {
         restarted.set_configured(&[], BTreeSet::new());
         assert_eq!(
             restarted.route(machine, now).unwrap().addresses.len(),
-            2,
-            "without link_only the cached HTTP addresses route again"
+            3,
+            "without link_only the cached and explicit HTTP addresses route again"
         );
     }
 
