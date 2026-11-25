@@ -944,16 +944,15 @@ fn a_job_no_pool_machine_can_run_gets_no_machine_and_fails() {
             "--max",
             "2",
             "--deadline",
-            "3m",
-            "--boot-timeout",
-            "10s",
+            "10m",
             "--idle-limit",
             "3s",
         ],
     );
 
-    // inside the deadline, but not once a new machine has booted: refused
-    let (_, late) = ci_run(&origin, thread, "tight", "2m55s", &[], "true");
+    // inside the deadline, but not once a new machine has had cloudlease's
+    // default 8 minute boot grace: refused
+    let (_, late) = ci_run(&origin, thread, "tight", "2m5s", &[], "true");
     assert!(!late.status.success());
     let refusal =
         String::from_utf8_lossy(&late.stderr).into_owned() + &String::from_utf8_lossy(&late.stdout);
@@ -961,12 +960,12 @@ fn a_job_no_pool_machine_can_run_gets_no_machine_and_fails() {
 
     // a new machine could still run this job now, but it waits for a task
     // that ends only after no machine could
-    let task = sleeper(&origin, thread, 25);
+    let task = sleeper(&origin, thread, 30);
     let job = accepted(ci_run(
         &origin,
         thread,
         "tight",
-        "2m40s",
+        "1m40s",
         &["--after", &task],
         "true",
     ));
@@ -1109,52 +1108,41 @@ fn a_run_cloudlease_ends_outside_the_coordinator_ends_the_pool() {
 }
 
 #[test]
-fn a_machine_that_never_joins_is_released_before_its_boot_grace_ends() {
+fn a_machine_that_never_joins_frees_its_slot_when_its_boot_grace_ends() {
     let fake = FakeCloudlease::start(Duration::from_secs(4));
-    // a lease's first heartbeat deadline gives the boot grace; no flag
+    // a lease's first heartbeat deadline gives the boot grace
     fake.set_boot_grace(Duration::from_secs(8));
     let origin = coordinator(&fake);
     let thread = thread(&origin);
-    cli(
-        &origin,
-        thread,
-        &[
-            "pool",
-            "create",
-            "slowboot",
-            "--machine-class",
-            "do-c16",
-            "--max",
-            "1",
-            "--deadline",
-            "1h",
-        ],
-    );
+    create_pool(&origin, thread, "slowboot", &["--max", "1"]);
     run(&origin, thread, "slowboot", "true");
 
-    // the machine never boots here: the coordinator releases it a quarter of
-    // the grace before cloudlease would let its heartbeat lapse
+    // no machine boots here, so cloudlease lets the first lease's heartbeat
+    // lapse at the end of its grace, and the job that still waits gets a
+    // second machine under --max 1
     assert!(
-        wait_until(Duration::from_secs(30), || {
-            fake.leases()
-                .first()
-                .is_some_and(|lease| lease.release.is_some())
-        }),
-        "the machine was never released: {}",
-        pool(&origin, thread, "slowboot")
+        wait_until(Duration::from_secs(40), || fake.leases().len() == 2),
+        "no second machine was asked for: {}\n{:?}",
+        pool(&origin, thread, "slowboot"),
+        fake.leases()
     );
-    let lease = fake.leases().remove(0);
+    let first = fake.leases().remove(0);
     assert_eq!(
-        lease.release.as_ref().unwrap(),
-        &("requested".to_owned(), "client"),
-        "{lease:?}"
+        first.release.as_ref().unwrap(),
+        &("heartbeat_lapsed".to_owned(), "cloudlease"),
+        "{first:?}"
     );
-    assert!(
-        wait_until(Duration::from_secs(10), || {
-            pool(&origin, thread, "slowboot")["machines"][0]["reason"] == "boot_timeout"
-        }),
-        "{}",
-        pool(&origin, thread, "slowboot")
+    let shown = pool(&origin, thread, "slowboot");
+    let machine = shown["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|machine| machine["name"] == first.hostname.as_str())
+        .unwrap();
+    assert_eq!(
+        (&machine["state"], &machine["reason"]),
+        (&json!("released"), &json!("heartbeat_lapsed")),
+        "{shown}"
     );
     cli(&origin, thread, &["pool", "release", "slowboot"]);
 }
@@ -1543,11 +1531,11 @@ fn a_job_interrupted_on_every_machine_stops_at_its_retry_limit() {
 #[test]
 fn a_rerun_that_would_outlast_the_pool_deadline_fails_instead() {
     let fake = FakeCloudlease::start(Duration::from_secs(4));
-    // a long grace, so the pool's boot timeout bounds a new machine's join
-    fake.set_boot_grace(Duration::from_secs(600));
+    // a 9 minute grace, a minute past the 8 the pool assumes before its
+    // first lease shows the class's own
+    fake.set_boot_grace(Duration::from_secs(9 * 60));
     let origin = coordinator(&fake);
     let thread = thread(&origin);
-    let created = std::time::Instant::now();
     cli(
         &origin,
         thread,
@@ -1561,14 +1549,12 @@ fn a_rerun_that_would_outlast_the_pool_deadline_fails_instead() {
             "1",
             "--deadline",
             "20m",
-            "--boot-timeout",
-            "150s",
         ],
     );
-    // a new machine joins within 150 s, so a 17 minute job fits one for the
-    // first 30 s; the running machine still fits it for 3 minutes
+    // an 11m40s job fits a new machine on the assumed 8 minute grace, but
+    // not on the 9 minutes the first lease shows
     let starts = origin.user_home.join("starts");
-    let job = run_with_kill(&origin, thread, "late", "17m", &always_works(&starts));
+    let job = run_with_kill(&origin, thread, "late", "11m40s", &always_works(&starts));
 
     let mut machines = Machines::default();
     assert!(
@@ -1576,9 +1562,6 @@ fn a_rerun_that_would_outlast_the_pool_deadline_fails_instead() {
         "the job never started: {}",
         pool(&origin, thread, "late")
     );
-    while created.elapsed() < Duration::from_secs(40) {
-        std::thread::sleep(Duration::from_millis(200));
-    }
     let lease = live_lease(&fake).unwrap();
     fake.end_lease(&lease.lease_id, "interrupted");
 

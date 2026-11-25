@@ -134,8 +134,6 @@ struct CreateBody {
     idle_limit: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     stall_after: Option<Duration>,
-    #[serde(default, with = "humantime_serde")]
-    boot_timeout: Option<Duration>,
     #[serde(default)]
     env_file: Option<std::path::PathBuf>,
     #[serde(default)]
@@ -167,25 +165,6 @@ impl CreateBody {
         if let Some(path) = &self.env_file {
             read_env(path).map_err(usage)?;
         }
-        if self
-            .boot_timeout
-            .is_some_and(|timeout| timeout.is_zero() || timeout > MAX_LIFETIME)
-        {
-            return Err(usage(
-                "--boot-timeout must be more than 0 and at most 24h".into(),
-            ));
-        }
-        // a machine could never join before the pool ends, so every job would be
-        // refused before the first lease shows the real boot grace
-        if let Some(timeout) = self.boot_timeout
-            && timeout >= self.deadline
-        {
-            return Err(usage(format!(
-                "--boot-timeout {} must be shorter than --deadline {}",
-                humantime::format_duration(timeout),
-                humantime::format_duration(self.deadline),
-            )));
-        }
         let job_retries = self.job_retries.unwrap_or(DEFAULT_JOB_RETRIES);
         if job_retries > MAX_JOB_RETRIES {
             return Err(usage(format!(
@@ -211,7 +190,6 @@ impl CreateBody {
                 slots,
                 idle_limit: self.idle_limit.unwrap_or(DEFAULT_IDLE_LIMIT),
                 stall_after: self.stall_after.unwrap_or(DEFAULT_STALL_AFTER),
-                boot_timeout: self.boot_timeout,
                 min_free_disk_gib,
                 env_file: self.env_file,
                 spend_cap_cents: self.spend_cap_cents,
@@ -875,13 +853,14 @@ impl Pass<'_> {
                     lease: machine_lease(lease),
                 };
             }
-            (Some(_), MachineState::Booting { lease }) => {
-                if Utc::now() >= pool.settings.boot_released_at(lease) {
-                    self.release_lease(&mut machine, ReleaseReason::BootTimeout)
-                        .await;
-                }
-            }
-            (Some(_), MachineState::Joined { .. } | MachineState::Released { .. }) => {}
+            // cloudlease deletes a machine that has not joined by the end of
+            // its boot grace, which the arm above then reads as releasing
+            (
+                Some(_),
+                MachineState::Booting { .. }
+                | MachineState::Joined { .. }
+                | MachineState::Released { .. },
+            ) => {}
             (None, MachineState::Requested) => match run {
                 // the create may not have reached cloudlease: send it again
                 Some(_) if self.still_open(pool).await? => {
@@ -1514,45 +1493,5 @@ fn local_reason(state: &MachineState) -> Option<ReleaseReason> {
     match state {
         MachineState::Releasing { reason, .. } => Some(reason.clone()),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{Value, json};
-
-    use super::{AppError, CreateBody};
-
-    fn create(deadline: &str, boot_timeout: Option<&str>) -> Result<(), AppError> {
-        let mut body = json!({
-            "api_version": crate::domain::API_VERSION,
-            "name": "ci",
-            "machine_class": "do-c16",
-            "max_machines": 1,
-            "deadline": deadline,
-        });
-        if let Some(timeout) = boot_timeout {
-            body["boot_timeout"] = Value::from(timeout);
-        }
-        serde_json::from_value::<CreateBody>(body)
-            .unwrap()
-            .into_pool()
-            .map(drop)
-    }
-
-    #[test]
-    fn a_boot_timeout_must_be_shorter_than_the_deadline() {
-        for (deadline, timeout) in [("30m", "55m"), ("30m", "30m")] {
-            let Err(AppError::Usage { message }) = create(deadline, Some(timeout)) else {
-                panic!("{timeout} against {deadline} was accepted");
-            };
-            assert_eq!(
-                message,
-                format!("--boot-timeout {timeout} must be shorter than --deadline {deadline}")
-            );
-        }
-
-        create("30m", Some("29m")).unwrap();
-        create("30m", None).unwrap();
     }
 }
