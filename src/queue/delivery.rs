@@ -51,7 +51,9 @@ pub enum HeldJobEnding {
     },
     /// Someone cancelled the job while it was held
     Requested,
-    /// The queue's machine refused the job once its tasks succeeded
+    /// The job was refused before it joined a queue: by the queue's machine
+    /// once its `after` entries succeeded, or by its pool or machine ending
+    /// while it waited, whatever state its `after` entries were in
     Refused {
         /// Error code of the refusal
         code: String,
@@ -135,10 +137,10 @@ impl HeldJobEnding {
                 format!("after {dependency} ended {outcome}, so the job never queued")
             }
             Self::Requested => "cancelled while it waited for its after entries".to_owned(),
+            // the code and message say who refused it, since a pool or
+            // machine release can end it before its after entries do
             Self::Refused { code, message } => {
-                format!(
-                    "the queue refused the job once its after entries succeeded: {code}: {message}"
-                )
+                format!("the job was refused before it queued: {code}: {message}")
             }
         }
     }

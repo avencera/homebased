@@ -52,6 +52,8 @@ homebased pool release afv
 
 The pool's name is the CI class its jobs name. A job of an open pool's class is accepted even before any machine exists. Submit pool jobs on the coordinator: only it reaches pool machines, and it counts only its own waiting jobs when it asks for machines.
 
+A pool owns its class until it is released: when it ends, it fails the class's jobs that never got a machine, even if a Fleet machine also offers the class. Once it is released the class is the Fleet's again: a job submitted then is accepted only if a Fleet machine offers the class, waits for that machine's slot, and the released pool never ends it.
+
 Placement never sends a job to a machine that cloudlease will delete before the job's kill limit, and every machine of the pool ends by its deadline, or sooner when the cloudlease class has a shorter lifetime. So the coordinator keeps each job within reach of some machine:
 
 - At submit, a job is refused with `pool_deadline_too_close` unless a machine the pool has (booting or joined) outlives its `--kill-after` from now, or a machine asked for now would, once it joined: the boot timeout from now plus the kill limit must end by the pool's deadline, or by the end of the class's lifetime, which a lease that ends before the deadline shows. Before a lease of the pool has shown the grace, it uses `--boot-timeout` when set, and otherwise assumes cloudlease's default 8-minute grace; set `--boot-timeout` on a class with a longer grace, such as `19m` on phoenixNAP, so the first jobs are not admitted on the shorter estimate. The message names the longest `--kill-after` the pool takes.
@@ -75,8 +77,8 @@ Each pass, about every 15 seconds, the coordinator:
 1. creates the pool's cloudlease run on its first pass;
 2. reads the run, moves each machine to its lease's state, and releases a machine that has not joined within the boot timeout;
 3. ends waiting jobs out of reach (see above), then asks for machines while ready jobs of the class that a new machine could run outnumber the free slots on joined machines plus the slots of machines still booting, up to `--max`. A machine the provider could not create comes back from cloudlease already releasing with reason `create_failed`; the coordinator then waits 4 passes (a minute at the default interval) before it asks again, twice that after a second failure in a row, and stops the pool after a third;
-4. for each machine cloudlease reports `released`, removes it from the Fleet and ends every job it still held with `JOB_FAILED`;
-5. at the deadline, or after `pool release`, releases the run, fails the pool's jobs that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool whose run cloudlease no longer has ends the same way with `run_not_found`. The pool is marked released only once cloudlease took the run's release.
+4. for each machine cloudlease reports `released`, removes it from the Fleet and ends every job it still held with `JOB_FAILED`, and every job pinned to it with `--machine` that never reached it, such as one waiting on its `--after` entries, with `JOB_FAILED` whose `held_ending` has code `machine_released`;
+5. at the deadline, or after `pool release`, releases the run, fails the class's jobs submitted before the release that have not started with `JOB_FAILED` whose `held_ending` has code `pool_deadline` or `pool_released`, and marks the pool released once every machine is gone. A pool whose run cloudlease no longer has ends the same way with `run_not_found`. The pool is marked released only once cloudlease took the run's release.
 6. when it reads the run as `releasing` or `released` while the pool is open, cloudlease ended the run without the coordinator asking: at its spend cap, or by an operator's release. The pool ends the same way with code `run_ended` and a `cause`: `spend_cap` when a lease of the run was released with `spend_cap`, `released` otherwise (the run has no reason of its own). Its machines are already releasing, and each drops out of the Fleet once cloudlease confirms it gone; a job running on one ends with `machine_released`.
 
 A pool stops when cloudlease refuses a machine for good, or after three `create_failed` machines in a row. A stopped pool asks for no more machines, takes no new job, and fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries the code; jobs already running finish on their machines, which then release themselves when idle, and the pool is released once they are gone. `pool release` releases a stopped pool at once.
@@ -94,7 +96,7 @@ The machine's boot data, written by the coordinator and passed through cloudleas
 
 1. reads `/etc/cloudlease/lease.json`, the lease and its lease-scoped token;
 2. makes its iroh key, dials the coordinator, and joins with the single-use join token from its boot data, which binds its endpoint id to its lease; it gets the pool's settings and the `--env-file` variables in the answer;
-3. writes those variables to a 0600 file in its state directory, which every task and job run on the machine gets, and offers the pool's class with `--slots` slots;
+3. writes those variables to a 0600 file in its state directory, which every task and job run on the machine gets, and offers the pool's class with `--slots` slots. The variables reach the run's process, not the daemon: a `PATH` among them applies inside the run, but the daemon finds a command's program on its own `PATH`, so name a program installed elsewhere by its full path or start it from a `--git` script;
 4. every 30 seconds (`[temporary] renew_interval`), and never less often than a quarter of the heartbeat window `lease.json` gives as `heartbeat_ttl_secs`, decides whether to renew its lease:
 
 | On the machine | Decision |
@@ -121,7 +123,7 @@ A job must finish its own uploads before it exits; the machine releases itself o
 }
 ```
 
-Anything the job wrote on the machine and had not uploaded is gone; the task log on the machine is gone too.
+Anything the job wrote on the machine and had not uploaded is gone; the task log on the machine is gone too. `resource job show <job>` on the coordinator still answers once the machine is gone: it shows the job under `ended`, with its `state` (`succeeded`, `failed`, or `cancelled`) and the final `event` the coordinator saved, instead of asking the deleted machine.
 
 ## Secrets
 

@@ -539,6 +539,21 @@ impl Pool {
         }
     }
 
+    /// Whether a held CI job of the pool's class that its origin took at
+    /// `submitted_at` is the pool's to end if it never got a machine
+    ///
+    /// A pool owns its class until it is released. A job taken after its
+    /// release was admitted for a Fleet machine that offers the class, so it
+    /// is never the released pool's to end. A route with no submit time
+    /// predates pools
+    #[must_use]
+    pub fn owns(&self, submitted_at: Option<DateTime<Utc>>) -> bool {
+        match (&self.state, submitted_at) {
+            (PoolState::Released { at, .. }, Some(submitted_at)) => submitted_at <= *at,
+            _ => true,
+        }
+    }
+
     /// The provider took a create, so earlier failures were not the class's fault
     pub fn create_succeeded(&mut self) {
         self.create_failures = None;

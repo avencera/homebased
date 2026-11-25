@@ -1200,6 +1200,22 @@ pub enum JobEventKind {
 }
 
 impl JobEventKind {
+    /// The state a final event leaves its job in: `succeeded`, `failed`, or
+    /// `cancelled`; `None` for any other event
+    #[must_use]
+    pub const fn final_state(self) -> Option<&'static str> {
+        match self {
+            Self::JobSucceeded => Some("succeeded"),
+            Self::JobFailed => Some("failed"),
+            Self::JobCancelled => Some("cancelled"),
+            Self::JobPreempted
+            | Self::JobAttention
+            | Self::JobBlocked
+            | Self::JobCheckDue
+            | Self::JobGpuIdle => None,
+        }
+    }
+
     /// Whether the authority may suppress this notice before delivery once
     /// the condition it reports has ended
     #[must_use]

@@ -1149,3 +1149,149 @@ fn a_machine_that_never_joins_is_released_before_its_boot_grace_ends() {
     );
     cli(&origin, thread, &["pool", "release", "slowboot"]);
 }
+
+#[test]
+fn a_released_pool_leaves_later_jobs_of_its_class_to_the_fleet() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "shared",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    let task = sleeper(&origin, thread, 12);
+    let during = accepted(ci_run(
+        &origin,
+        thread,
+        "shared",
+        "1m",
+        &["--after", &task],
+        "true",
+    ));
+    cli(&origin, thread, &["pool", "release", "shared"]);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            pool(&origin, thread, "shared")["state"] == "released"
+        }),
+        "the pool never released: {}",
+        pool(&origin, thread, "shared")
+    );
+    assert!(wait_until(Duration::from_secs(30), || final_event(
+        &origin, during
+    )
+    .is_some()));
+    let ended = final_event(&origin, during).unwrap();
+    assert_eq!(ended.event, JobEventKind::JobFailed);
+    assert_eq!(held_code(&ended), "pool_released", "{ended:?}");
+
+    // the coordinator now offers the class itself, as a permanent Fleet
+    // machine would, so a new job waits for its slot and runs there
+    cli(&origin, thread, &["ci", "capacity", "shared", "1"]);
+    let after = accepted(ci_run(
+        &origin,
+        thread,
+        "shared",
+        "1m",
+        &["--after", &task],
+        "true",
+    ));
+    assert!(
+        wait_until(Duration::from_secs(40), || final_event(&origin, after)
+            .is_some()),
+        "the job submitted after the release never ended"
+    );
+    let event = final_event(&origin, after).unwrap();
+    assert_eq!(event.event, JobEventKind::JobSucceeded, "{event:?}");
+}
+
+#[test]
+fn a_deleted_pool_machine_leaves_every_job_an_ending_and_a_status() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "gone",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+            "--idle-limit",
+            "4s",
+        ],
+    );
+    let done = run(&origin, thread, "gone", "true");
+    let mut machines = Machines::default();
+    assert!(
+        machines.drive(&fake, Duration::from_secs(60), || final_event(
+            &origin, done
+        )
+        .is_some()),
+        "the job never ended: {}",
+        pool(&origin, thread, "gone")
+    );
+    assert_eq!(
+        final_event(&origin, done).unwrap().event,
+        JobEventKind::JobSucceeded
+    );
+
+    // a job pinned to the machine waits on a task that outlasts its idle limit
+    let hostname = fake.leases()[0].hostname.clone();
+    let task = sleeper(&origin, thread, 60);
+    let pinned = accepted(ci_run(
+        &origin,
+        thread,
+        "gone",
+        "1m",
+        &["--machine", &hostname, "--after", &task],
+        "true",
+    ));
+
+    assert!(
+        machines.drive(&fake, Duration::from_secs(40), || {
+            machine_states(&pool(&origin, thread, "gone")) == ["released"]
+        }),
+        "the machine never released: {}",
+        pool(&origin, thread, "gone")
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), || final_event(&origin, pinned)
+            .is_some()),
+        "the pinned job never ended once its machine was gone"
+    );
+    assert_eq!(
+        final_event(&origin, pinned).unwrap().event,
+        JobEventKind::JobFailed
+    );
+
+    // the origin still answers for a job whose machine is gone
+    let shown = cli(
+        &origin,
+        thread,
+        &["resource", "job", "show", &done.to_string()],
+    );
+    assert_eq!(shown["ended"]["state"], "succeeded", "{shown}");
+    let shown = cli(
+        &origin,
+        thread,
+        &["resource", "job", "show", &pinned.to_string()],
+    );
+    assert_eq!(shown["held"]["state"], "failed", "{shown}");
+}

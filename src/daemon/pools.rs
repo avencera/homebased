@@ -41,7 +41,7 @@ use crate::pool::{
     parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
-use crate::queue::delivery::HeldJobEnding;
+use crate::queue::delivery::{HeldJobEnding, JobRoute};
 use crate::store::PoolInsert;
 
 /// Socket routes that change pools: create and release
@@ -1257,8 +1257,7 @@ impl Pass<'_> {
     /// End the pool's jobs that have not started and that no machine of the
     /// pool can run to their kill limit any more: time only takes reach away
     async fn end_out_of_reach(&self, pool: &Pool, reach: &PoolReach) -> Result<(), AppError> {
-        let held = held_ci_routes(self.state, pool.name.class()).await?;
-        for route in held.ready.into_iter().chain(held.waiting) {
+        for route in self.owned_jobs(pool).await? {
             let Some(kill) = route.spec.ci.as_ref().map(|ci| ci.kill_after.get()) else {
                 continue;
             };
@@ -1285,10 +1284,21 @@ impl Pass<'_> {
         Ok(())
     }
 
+    /// Held jobs of the pool's class that the pool owns, ready or not;
+    /// the class's other held jobs wait for a Fleet machine that offers it
+    async fn owned_jobs(&self, pool: &Pool) -> Result<Vec<JobRoute>, AppError> {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        Ok(held
+            .ready
+            .into_iter()
+            .chain(held.waiting)
+            .filter(|route| pool.owns(route.submitted_at))
+            .collect())
+    }
+
     /// End the pool's jobs that have not started, with why the pool ended
     async fn end_held_jobs(&self, pool: &Pool, end: &PoolEnd) -> Result<(), AppError> {
-        let held = held_ci_routes(self.state, pool.name.class()).await?;
-        for route in held.ready.into_iter().chain(held.waiting) {
+        for route in self.owned_jobs(pool).await? {
             let job = route.job;
             let ending = HeldJobEnding::Refused {
                 code: end.job_code().to_owned(),

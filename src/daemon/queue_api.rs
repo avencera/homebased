@@ -261,9 +261,66 @@ async fn show(
         return Ok(Json(held_response(view)));
     }
     let machine = job_authority(&state, job, query.machine.as_ref()).await?;
-    forward(&state, machine, QueueRequest::Show { job })
-        .await
-        .map(Json)
+    let error = match forward(&state, machine, QueueRequest::Show { job }).await {
+        Ok(value) => return Ok(Json(value)),
+        Err(error) => error,
+    };
+    // a temporary machine is deleted soon after its jobs end, and a Fleet
+    // machine may be offline, so the origin answers from the final event it
+    // saved once the queue cannot
+    if !matches!(
+        error,
+        AppError::MachineNotFound { .. } | AppError::MachineUnavailable { .. }
+    ) {
+        return Err(error);
+    }
+    match ended_view(&state, job, machine).await? {
+        Some(view) => Ok(Json(
+            json!({ "api_version": API_VERSION, "job_id": job, "ended": view }),
+        )),
+        None => Err(error),
+    }
+}
+
+/// The origin's record of a job it sent to `machine`, once the job's final
+/// event is in its inbox
+#[derive(Debug, Serialize)]
+struct EndedJobView {
+    job_id: JobId,
+    name: String,
+    /// Machine whose queue ran it
+    machine: MachineId,
+    /// `succeeded`, `failed`, or `cancelled`
+    state: &'static str,
+    /// The final event, as the origin stored it
+    event: crate::queue::JobEvent,
+}
+
+async fn ended_view(
+    state: &AppState,
+    job: JobId,
+    machine: MachineId,
+) -> Result<Option<EndedJobView>, AppError> {
+    let Some(route) = call(&state.store, |reply| StoreMsg::JobRoute { job, reply }).await? else {
+        return Ok(None);
+    };
+    if route.authority != machine {
+        return Ok(None);
+    }
+    let Some(event) = call(&state.store, |reply| StoreMsg::JobFinalEvent { job, reply }).await?
+    else {
+        return Ok(None);
+    };
+    let Some(final_state) = event.event.final_state() else {
+        return Ok(None);
+    };
+    Ok(Some(EndedJobView {
+        job_id: job,
+        name: route.spec.name.to_string(),
+        machine,
+        state: final_state,
+        event,
+    }))
 }
 
 /// This origin's view of `job` while it holds it, or `None` when it holds
@@ -343,6 +400,9 @@ async fn submit(
             // a CI job waits on its origin until placement picks a machine,
             // and is refused now when no machine it may use offers its class
             let ci = body.spec.ci.is_some();
+            // taken before admission reads any pool, so a job a pool admitted
+            // reads as taken before that pool's release
+            let taken_at = chrono::Utc::now();
             if ci && body.placement.is_some() {
                 return Err(AppError::Usage {
                     message: "a CI job runs on CI slots, which have no queue order to place it in"
@@ -379,7 +439,7 @@ async fn submit(
                 },
                 after: body.after,
                 owes_final_event: held,
-                submitted_at: ci.then(chrono::Utc::now),
+                submitted_at: ci.then_some(taken_at),
                 placement: body.placement,
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {

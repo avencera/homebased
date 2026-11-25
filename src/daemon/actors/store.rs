@@ -133,6 +133,11 @@ pub(crate) enum StoreMsg {
         job: crate::queue::JobId,
         reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
     },
+    /// First final event in a job's origin inbox
+    JobFinalEvent {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<Option<crate::queue::JobEvent>, AppError>>,
+    },
     /// Save origin routing before any submit reaches the authority
     InsertJobRoute {
         route: Box<crate::queue::delivery::JobRoute>,
@@ -1123,6 +1128,7 @@ impl Actor for StoreActor {
                 state.commit_gpu_idle(task, *watch, source, alert.map(|alert| *alert), now),
             ),
             StoreMsg::JobRoute { job, reply } => send_reply(reply, state.job_route(job)),
+            StoreMsg::JobFinalEvent { job, reply } => send_reply(reply, state.job_final_event(job)),
             StoreMsg::HeldJobRoutes { reply } => send_reply(reply, state.held_job_routes()),
             StoreMsg::ReleaseHeldJob { job, reply } => {
                 send_reply(reply, state.release_held_job(job));
