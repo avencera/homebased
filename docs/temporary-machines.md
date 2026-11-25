@@ -112,7 +112,7 @@ The machine's boot data, written by the coordinator and passed through cloudleas
 
 A renewal that fails, such as with no answer or `401 unauthorized`, is tried again every 5 seconds within the round, then the next round; cloudlease's heartbeat window, 3 minutes by default, spans several rounds. Its hard deadline applies whatever the machine decides.
 
-On a provider that bills every started hour, phoenixNAP and Latitude.sh, cloudlease names in each renew answer when the machine's paid hour ends, less 10 minutes for the release to finish, as `idle_hold_until`. An idle machine stays until then instead of releasing at `--idle-limit`, so a job that arrives in that window uses time already paid for. The hold applies at once in the first hour. After it, cloudlease names no hold within the boot grace after each hour from create turns, when the provider's next hour could start before then, since it does not know exactly when the provider's billing started; nor when the hold would pass the lease's hard deadline, and so the pool's deadline; or on a provider that bills by the second, DigitalOcean and AWS. A hold never starts a new hour, so it adds nothing to the run's spend or its spend cap. If `--idle-limit` ends after the hold, the machine releases at `--idle-limit` as before. A machine also waits for its first renew answer before an idle release, so even `--idle-limit 0s` keeps a hold cloudlease names.
+On a provider that bills every started hour, phoenixNAP and Latitude.sh, an idle machine stays until about 10 minutes before its paid hour ends, as cloudlease names in each renew answer (`idle_hold_until`), instead of releasing at `--idle-limit`, and a job that arrives meanwhile uses time already paid for. A hold never starts a new paid hour or passes the pool's deadline, so it adds nothing to the run's spend. If `--idle-limit` ends later, the machine releases then. DigitalOcean and AWS bill by the second, so their machines release at `--idle-limit`.
 
 ## Code on the machine
 
@@ -168,8 +168,6 @@ A job whose machine was interrupted ends with `JOB_FAILED` and `machine_released
 A rerun never outlives the pool: the deadline bounds every machine, and when the replacement's create would pass the spend cap, cloudlease refuses it with `spend_cap_reached`, the pool stops, and the queued job ends with that code in `held_ending`. Other reasons a machine goes away are never rerun: `heartbeat_lapsed` usually means every run on the machine stalled, which a rerun would repeat, and `hard_deadline` or `requested` mean the pool's time or its release ended the work.
 
 So every job on a pool with `--job-retries` above 0 must be safe to run again: write each output under a name derived from the job's input, upload it whole (write, then rename or put the object at once), and skip work whose output already exists. A job that cannot be rerun belongs on a pool with `--job-retries 0`.
-
-The machine does not act on EC2's rebalance recommendation. It is an early, often false, signal, and draining machines on it would churn the pool; the price-capacity-optimized launch already prefers the pools least likely to be interrupted.
 
 ## Secrets
 
