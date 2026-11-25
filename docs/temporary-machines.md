@@ -142,7 +142,7 @@ Anything the job wrote on the machine and had not uploaded is gone; the task log
 
 ## Interrupted machines
 
-A machine is `interrupted` when its provider took it back while its lease was live, such as an AWS Spot interruption: cloudlease's presence check finds it gone, within about a minute of the provider ending it. The job did nothing wrong, so the coordinator queues it again for another machine of the pool, up to `--job-retries` times per job, and the pool asks for a replacement machine as it would for any waiting job. cloudlease's AWS launches leave out the Spot pools (instance type and zone) that interrupted the run within the last hour, so a replacement lands elsewhere when the class allows.
+A machine is `interrupted` when its provider took it back while its lease was live, such as an AWS Spot interruption: cloudlease's presence check finds it gone, within about a minute of the provider ending it. The job did nothing wrong, so the coordinator queues it again for another machine of the pool, up to `--job-retries` times per job, and the pool asks for a replacement machine as it would for any waiting job. The replacement can land in the same Spot pool (instance type and zone), since cloudlease lets EC2 choose among all of the class's pools by spare capacity and price.
 
 The submitter sees each rerun as a `JOB_PREEMPTED` (a progress event: a sleeping thread does not wake for it) with `machine_lost`:
 
