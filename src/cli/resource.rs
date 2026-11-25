@@ -695,6 +695,40 @@ fn print_held(ctx: &Ctx, held: &Value) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A job whose queue machine is gone, from the final event its origin saved
+fn print_ended(ctx: &Ctx, ended: &Value) -> Result<(), AppError> {
+    let text = |key: &str| ended[key].as_str().unwrap_or("-").to_owned();
+    if ctx.output == OutputMode::Quiet {
+        println!("{}", text("job_id"));
+        return Ok(());
+    }
+    println!(
+        "{}  {}\nstate: {}\nqueue: {} (unreachable; shown from the final event saved here)",
+        text("job_id"),
+        text("name"),
+        text("state"),
+        text("machine")
+    );
+    let event = &ended["event"];
+    if let Some(message) = event["held_ending"]["message"].as_str() {
+        println!("reason: {message}");
+    }
+    let released = &event["machine_released"];
+    if let Some(reason) = released["reason"].as_str() {
+        let lost = if released["output_lost"].as_bool() == Some(true) {
+            "; output on it was lost"
+        } else {
+            ""
+        };
+        println!(
+            "machine {} of pool {} released: {reason}{lost}",
+            released["machine"].as_str().unwrap_or("-"),
+            released["pool"].as_str().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
 fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     if ctx.output == OutputMode::Json {
         return ctx.print_json(value);
@@ -753,6 +787,9 @@ fn print_job(ctx: &Ctx, value: Value) -> Result<(), AppError> {
     }
     if let Some(held) = value.get("held") {
         return print_held(ctx, held);
+    }
+    if let Some(ended) = value.get("ended") {
+        return print_ended(ctx, ended);
     }
     let detail: JobDetail = decode(value)?;
     let job = &detail.job;

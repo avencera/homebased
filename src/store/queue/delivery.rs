@@ -52,6 +52,24 @@ impl Store {
             .transpose()
     }
 
+    /// The first final event in the job's origin inbox, which outlives the
+    /// machine that sent it
+    pub fn job_final_event(&self, job: JobId) -> Result<Option<JobEvent>, AppError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT event_json FROM resource_job_inbox WHERE job_id = ?1 ORDER BY seq")?;
+        let events = statement
+            .query_map([job.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for json in events {
+            let envelope: RoutedJobEvent = serde_json::from_str(&json)?;
+            if envelope.event.event.final_state().is_some() {
+                return Ok(Some(envelope.event));
+            }
+        }
+        Ok(None)
+    }
+
     /// Last event stored in the job's origin inbox, and last one delivered
     pub fn job_route_cursors(&self, job: JobId) -> Result<Option<JobCursors>, AppError> {
         let saved: Option<(i64, i64)> = self
@@ -266,10 +284,13 @@ impl Store {
     /// to run or refuse, so it is left alone
     pub fn end_pool_job(&self, job: JobId, ending: HeldJobEnding) -> Result<bool, AppError> {
         self.immediate(|| {
-            let held = self
-                .job_route(job)?
-                .is_some_and(|route| matches!(route.submission, JobSubmission::Held));
-            if !held {
+            // a move may have pinned the job to a machine since the pool read it
+            let pooled = self.job_route(job)?.is_some_and(|route| {
+                matches!(route.submission, JobSubmission::Held)
+                    && route.spec.ci.is_some()
+                    && route.spec.machine.is_none()
+            });
+            if !pooled {
                 return Ok(false);
             }
             self.end_held_job_inner(job, ending)
@@ -322,11 +343,9 @@ impl Store {
                     HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested,
                 ) => true,
                 (JobSubmission::Unknown, HeldJobEnding::Refused { .. }) => route.owes_final_event,
-                // a pool that ended before the job got a machine refuses it,
-                // unless a move pinned it to a machine since the pool read it
-                (JobSubmission::Held, HeldJobEnding::Refused { .. }) => {
-                    route.spec.ci.is_some() && route.spec.machine.is_none()
-                }
+                // a pool that ended, or a machine that is gone, refuses a job
+                // before it reached a queue
+                (JobSubmission::Held, HeldJobEnding::Refused { .. }) => true,
                 _ => false,
             };
             let accepted = self
@@ -378,13 +397,15 @@ impl Store {
         }
     }
 
-    /// End every job this origin sent to `machine` that has no final event,
-    /// once cloudlease confirmed the machine gone
+    /// End every job this origin sent to `machine` or holds for it that has
+    /// no final event, once cloudlease confirmed the machine gone
     ///
-    /// The machine can never send another event, so each such job gets a
+    /// The machine can never send another event, so each sent job gets a
     /// `JOB_FAILED` after the last event it did send, carrying `released`.
-    /// A job whose final event already arrived is left alone. Returns the
-    /// jobs it ended
+    /// A job still held for the machine, pinned to it while it waited for
+    /// its `after` entries or a slot, can never reach it, so it fails with
+    /// `held_ending` code `machine_released`. A job whose final event already
+    /// arrived is left alone. Returns the jobs it ended
     pub fn end_jobs_of_released_machine(
         &self,
         machine: MachineId,
@@ -394,7 +415,8 @@ impl Store {
             let mut statement = self.conn.prepare(
                 "SELECT r.job_id FROM resource_job_routes r
                  WHERE json_extract(r.route_json, '$.authority') = ?1
-                   AND json_extract(r.route_json, '$.submission.state') IN ('accepted', 'unknown')
+                   AND json_extract(r.route_json, '$.submission.state')
+                       IN ('accepted', 'unknown', 'held')
                    AND NOT EXISTS (
                        SELECT 1 FROM resource_job_inbox i
                        WHERE i.job_id = r.job_id
@@ -408,8 +430,25 @@ impl Store {
             let mut ended = Vec::with_capacity(jobs.len());
             for job in jobs {
                 let job: JobId = job.parse()?;
-                self.append_released_failure(job, released)?;
-                ended.push(job);
+                let held = self
+                    .job_route(job)?
+                    .is_some_and(|route| matches!(route.submission, JobSubmission::Held));
+                if !held {
+                    self.append_released_failure(job, released)?;
+                    ended.push(job);
+                    continue;
+                }
+
+                let ending = HeldJobEnding::Refused {
+                    code: "machine_released".to_owned(),
+                    message: format!(
+                        "machine {} of pool {} was released ({}) before the job reached it",
+                        released.machine, released.pool, released.reason
+                    ),
+                };
+                if self.end_held_job_inner(job, ending)? {
+                    ended.push(job);
+                }
             }
             Ok(ended)
         })
